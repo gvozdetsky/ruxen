@@ -1,0 +1,1742 @@
+// Request processing pipeline.
+//
+// Nginx structures request handling as a fixed ordered list of phases, each
+// composed of registered checker/handler pairs; `ngx_http_core_run_phases`
+// walks that list per request. This module currently runs the request flow
+// directly in `process_with_meta` (explicit steps + reroute loop), not via
+// a generic phase-engine dispatcher. The `Phase` enum below is kept as the
+// nginx-compatible planned phase list and as a reference for future
+// refactoring toward a real phase runner.
+//
+// Host-missing-on-HTTP/1.1 → 400 is modelled as a pre-FindConfig guard, not
+// a separate phase: nginx does the same (process_host is a per-header
+// handler that runs before the phase machinery).
+
+use crate::auth;
+use crate::config::{ValuePart, Variable};
+use crate::http::Method;
+use crate::uri;
+use crate::worker::{
+    MatchedLocation, PreparedAuthBasic, PreparedErrorLog, PreparedHttp, PreparedListen,
+    PreparedLocation, PreparedServer, RewriteOutcome, RewriteState, normalize_request_uri_into,
+    run_location_handler, run_rewrite_program,
+};
+use std::borrow::Cow;
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
+
+/// Maximum internal reroute hops before we declare a loop. nginx uses
+/// `NGX_HTTP_MAX_URI_CHANGES` (default 10) for the same purpose; we pick
+/// 8 as a slightly tighter budget since our reroute surface is narrower
+/// (no rewrite engine, only try_files fallback).
+const MAX_REROUTES: u32 = 8;
+
+/// Planned nginx-compatible phase list.
+///
+/// Currently used for documentation and future extension; `process_with_meta`
+/// still executes the flow directly.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Phase {
+    PostRead,
+    ServerRewrite,
+    FindConfig,
+    Rewrite,
+    PostRewrite,
+    PreAccess,
+    Access,
+    PostAccess,
+    PreContent,
+    Content,
+    Log,
+}
+
+/// Per-request inputs the pipeline needs from the parser + connection.
+/// Narrow on purpose — each field added here is a new dependency between
+/// the worker's parse loop and the phase machinery.
+#[derive(Copy, Clone)]
+pub struct RequestCtx<'a> {
+    pub method: Method,
+    /// Raw method bytes from the request line. Carries the original
+    /// spelling of methods that classify to `Method::Other`
+    /// (POST/PUT/DELETE/PATCH/etc.) so the proxy can build a faithful
+    /// upstream request line. Always uppercase ASCII per RFC 7230 §3.1.1.
+    pub method_bytes: &'a [u8],
+    pub path: &'a [u8],
+    pub http_11: bool,
+    pub host: Option<&'a [u8]>,
+    /// SNI hostname captured at TLS handshake time, lowercased. `None` for
+    /// plain-HTTP connections and for TLS connections where the client
+    /// didn't send a `server_name` extension. Used by `find_config` as a
+    /// routing fallback when the HTTP `Host` header is missing or doesn't
+    /// match any server block on this listen.
+    pub sni: Option<&'a [u8]>,
+    /// Index into `PreparedHttp::listens` for the socket that accepted
+    /// this connection.
+    pub listen_index: usize,
+    /// Client IP rendered by `$remote_addr`.
+    pub remote_addr: &'a [u8],
+    /// Client source port rendered by `$remote_port`.
+    pub remote_port: u16,
+    pub if_modified_since: Option<&'a [u8]>,
+    pub if_unmodified_since: Option<&'a [u8]>,
+    pub if_none_match: Option<&'a [u8]>,
+    pub if_match: Option<&'a [u8]>,
+    pub range: Option<&'a [u8]>,
+    pub if_range: Option<&'a [u8]>,
+    /// Raw header block bytes — used by `$http_NAME` expansion to scan for
+    /// arbitrary request headers at render time. Already lowercased in the
+    /// worker's read buffer because `parse_header_line` writes the lowercased
+    /// name back in place; values are left byte-for-byte.
+    pub headers_raw: &'a [u8],
+    /// Process-global monotonic connection id (nginx's `$connection`).
+    pub connection_id: u64,
+    /// Requests already served on this connection before the current one
+    /// (nginx's `$connection_requests`). Zero on the first request.
+    pub connection_requests: u64,
+    /// Time since connection accept, in microseconds. Rendered as
+    /// `seconds.milliseconds` for `$connection_time`.
+    pub connection_time_us: u64,
+    /// Time spent processing this request, in microseconds. Rendered as
+    /// `seconds.milliseconds` for `$request_time`.
+    pub request_time_us: u64,
+    /// Port substring of the request authority (`Host: host:port` or
+    /// absolute-form). Empty if no explicit port was sent. Rendered by
+    /// `$request_port`; `$is_request_port` reads its emptiness.
+    pub request_port: &'a [u8],
+    /// `p` if pipelined, `.` otherwise. Driven by the worker loop:
+    /// `read_start > 0` at parse time means a previous request already
+    /// consumed bytes from this read buffer.
+    pub pipe: u8,
+    /// Bytes consumed by the parser for this request (request line +
+    /// headers + body). Surface for `$request_length`.
+    pub request_length: u64,
+    /// Wall-clock seconds since UNIX epoch — captured at request start so
+    /// `$time_iso8601` / `$time_local` / `$msec` agree on the same instant
+    /// across access-log entries.
+    pub epoch_secs: u64,
+    /// Millisecond fraction component for `$msec`.
+    pub epoch_ms: u16,
+    /// Request body bytes the worker already buffered. Empty when the
+    /// request had no body or when `proxy_pass_request_body off;` is set.
+    /// Both Content-Length and chunked client bodies arrive here decoded
+    /// as plain bytes; proxy forwarding recomputes `Content-Length`.
+    pub body: &'a [u8],
+    /// Path to a temp file containing the request body when the worker
+    /// spilled it. Empty when no spill file exists.
+    pub body_file: &'a [u8],
+    /// Negotiated TLS handshake info, taken once at handshake completion.
+    /// `None` for plain-HTTP connections. Drives `$scheme` and `$ssl_*`
+    /// variable rendering; otherwise untouched on the hot path.
+    pub tls: Option<&'a crate::tls::HandshakeInfo>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct KeepaliveMeta {
+    pub allow: bool,
+    pub idle_timeout_ms: Option<u64>,
+    pub header_timeout_secs: Option<u64>,
+    pub max_requests: u64,
+    pub max_time_ms: u64,
+    pub disable_msie6: bool,
+    pub disable_safari: bool,
+}
+
+impl Default for KeepaliveMeta {
+    fn default() -> Self {
+        KeepaliveMeta {
+            allow: true,
+            idle_timeout_ms: None,
+            header_timeout_secs: None,
+            max_requests: 1_000,
+            max_time_ms: 3_600_000,
+            disable_msie6: true,
+            disable_safari: false,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct LogMeta {
+    pub error_logs: &'static [PreparedErrorLog],
+    pub log_not_found: bool,
+}
+
+impl Default for LogMeta {
+    fn default() -> Self {
+        LogMeta {
+            error_logs: &[],
+            log_not_found: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessMeta {
+    pub keepalive: KeepaliveMeta,
+    pub log: LogMeta,
+    /// `$server_port` for access-log rendering on this request.
+    pub server_port: u16,
+    /// `access_log` sinks for the matched location (or server scope if no
+    /// location matched). The worker uses this list — not `PreparedHttp::
+    /// access_logs` — so location-scope `access_log` directives fire
+    /// against the right format/path for the request that landed.
+    pub access_logs: &'static [crate::worker::PreparedAccessLog],
+    /// Authenticated user from HTTP Basic auth, for `$remote_user`.
+    pub remote_user: Option<Vec<u8>>,
+    /// Location-scope `add_header` list to apply to a `proxy_pass`-served
+    /// response. The worker awaits the upstream future, then reuses these
+    /// to inject headers (with `$upstream_http_*` populated). Empty when
+    /// the request didn't land on a proxied location.
+    pub proxy_add_headers: &'static [crate::worker::PreparedAddHeader],
+    /// Location-scope `add_trailer` list to apply to a `proxy_pass`-served
+    /// response. Same lifecycle as `proxy_add_headers` — applied after the
+    /// upstream future resolves so `$upstream_response_length` and
+    /// `$upstream_http_*` are populated.
+    pub proxy_add_trailers: &'static [crate::worker::PreparedAddHeader],
+    /// `chunked_transfer_encoding` knob carried through to the post-await
+    /// trailer filter. False suppresses the trailer block (matching nginx's
+    /// chunked filter, which skips chunked encoding entirely when off).
+    pub proxy_chunked_transfer_encoding: bool,
+    /// `$server_name` value for the matched server, surfaced for the
+    /// post-await proxy add_header render.
+    pub server_name: &'static [u8],
+    /// `$proxy_host` value (upstream URL authority) for the proxy plan.
+    pub proxy_host: &'static [u8],
+    /// Pre-write delay in milliseconds, applied by the worker via
+    /// `monoio::time::sleep` before sending the response. Set by the
+    /// access-control phase to defer 401 replies (`auth_delay`) without
+    /// blocking the runtime thread.
+    pub response_delay_ms: u64,
+    /// Effective `underscores_in_headers` for the matched server, used by
+    /// post-await render paths to filter `$http_*` lookups.
+    pub underscores_in_headers: bool,
+    /// Effective `client_body_in_file_only` for the matched location.
+    /// `On` keeps the spilled request body file after the response;
+    /// `Off`/`Clean` unlink it.
+    pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    /// Effective `post_action` target for the matched location/server.
+    /// The worker runs this after the client response is written and
+    /// suppresses its output.
+    pub post_action: Option<&'static [u8]>,
+    /// `$upstream_response_time` value in milliseconds, set by
+    /// `settle_proxy_response` after the upstream future resolves. `None`
+    /// when the request didn't go through `proxy_pass`.
+    pub upstream_response_time_ms: Option<u64>,
+    /// Effective `expires` directive for the matched location, applied to
+    /// proxied responses after the upstream future resolves (so the
+    /// upstream's `Last-Modified` is visible for `expires modified ...`).
+    pub proxy_expires: crate::worker::PreparedExpires,
+}
+
+impl Default for ProcessMeta {
+    fn default() -> Self {
+        Self {
+            keepalive: KeepaliveMeta::default(),
+            log: LogMeta::default(),
+            server_port: 0,
+            access_logs: &[],
+            remote_user: None,
+            proxy_add_headers: &[],
+            proxy_add_trailers: &[],
+            proxy_chunked_transfer_encoding: true,
+            server_name: &[],
+            proxy_host: &[],
+            response_delay_ms: 0,
+            underscores_in_headers: false,
+            client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
+            post_action: None,
+            upstream_response_time_ms: None,
+            proxy_expires: crate::worker::PreparedExpires::Off,
+        }
+    }
+}
+
+/// What to write back on the socket. `Prebuilt` is a `&'static` slice baked
+/// at startup (return directive, error responses). `Owned` is a per-request
+/// buffered response — on the hot path this `Vec<u8>` is the worker's
+/// per-connection scratch buffer, taken by `std::mem::take` and returned
+/// after `write_all`, so no fresh allocation happens per request. `File`
+/// splits small headers from a streamed file-body descriptor so large
+/// static-file responses avoid full-body allocation. `Reroute` is an internal
+/// signal from the content handler that the request URL should be rewritten
+/// and matching re-run — callers outside this module should never observe it
+/// because `process` consumes `Reroute` variants in its hop loop. Keep-alive
+/// lives on `Request`, not here — a phase outcome doesn't decide connection
+/// persistence.
+pub enum Response {
+    Prebuilt(&'static [u8]),
+    Owned(Vec<u8>),
+    File {
+        headers: Vec<u8>,
+        body: FileBody,
+    },
+    Reroute(Reroute),
+    /// Deferred reverse-proxy attempt. The location handler builds a
+    /// `ProxyPlan` synchronously; the worker task awaits
+    /// `proxy::run_proxy(plan)` to perform the upstream connect/send/recv,
+    /// then re-enters the existing write path with `Owned` / `Prebuilt`
+    /// bytes. Mirrors how `File` carries an fd that the worker streams.
+    Proxy(crate::proxy::ProxyPlan),
+}
+
+pub struct FileBody {
+    /// Already-opened, root-contained fd produced by the resolver. The
+    /// streaming path consumes this by value — no second `open(2)`.
+    pub fd: OwnedFd,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Status handling requested by `error_page` after an internal redirect.
+/// We only apply these overrides when the target handler completes with a
+/// successful/non-redirect status; if the target itself returns a redirect
+/// or another error, that terminal status wins.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ErrorPageStatus {
+    Preserve(u16),
+    Override(u16),
+}
+
+/// Internal redirect target. URI redirects rematch the normal location tree
+/// after normalization; named redirects jump straight to an internal-only
+/// `location @name` without changing the current URI.
+pub enum RerouteTarget {
+    Uri(Vec<u8>),
+    Named(Vec<u8>),
+}
+
+/// Internal-use redirect signal. `args: None` means "preserve current
+/// args", while `Some(vec![])` means "replace with an explicitly empty
+/// query string".
+pub struct Reroute {
+    pub target: RerouteTarget,
+    pub args: Option<Vec<u8>>,
+    pub error_page_status: Option<ErrorPageStatus>,
+    pub enters_error_page: bool,
+    /// `Location:` header bytes preserved across an `error_page` intercept
+    /// of a 3xx response. nginx's `r->headers_out.location` survives the
+    /// internal redirect because `ngx_http_send_header` later overrides
+    /// the new handler's status with `r->err_status`. We mirror that by
+    /// re-injecting this header into the final response at finalize time
+    /// when the preserved status is in the 3xx range.
+    pub preserved_location: Option<Vec<u8>>,
+    /// `WWW-Authenticate:` header values preserved across an `error_page`
+    /// intercept of a 401. nginx preserves `r->headers_out.www_authenticate`
+    /// (a list — `ticket #485`) so multi-value challenges survive. Re-
+    /// injected at finalize time when the preserved status is 401.
+    pub preserved_www_authenticate: Vec<Vec<u8>>,
+}
+
+/// Test-only helper: run the pipeline and return only the response,
+/// dropping keepalive metadata. Allocates its own URL scratch; production
+/// callers pass a reusable per-connection buffer into `process_with_meta`.
+#[cfg(test)]
+pub fn process(http: &'static PreparedHttp, req: &RequestCtx<'_>) -> Response {
+    let mut url_scratch = Vec::new();
+    process_with_meta(http, req, &mut url_scratch).0
+}
+
+/// Same as `process`, but also returns keepalive policy resolved from the
+/// terminal matched location. `url_scratch` holds the normalized request
+/// URI across the reroute loop — production callers reuse the same `Vec`
+/// across requests on a connection to keep the hot path allocation-free.
+/// The control flow here is intentionally explicit for now (no generic
+/// phase dispatcher yet).
+pub fn process_with_meta(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+) -> (Response, ProcessMeta) {
+    process_with_meta_inner(http, req, url_scratch, None)
+}
+
+/// Re-enter the pipeline starting from an already-resolved reroute target.
+/// Used by the worker for proxy-side `proxy_intercept_errors` outcomes so
+/// the same reroute machinery handles URI/named jumps, args replacement,
+/// and `error_page` status overrides.
+pub fn process_with_meta_from_reroute(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    reroute: Reroute,
+) -> (Response, ProcessMeta) {
+    process_with_meta_inner(http, req, url_scratch, Some(reroute))
+}
+
+fn process_with_meta_inner(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    initial_reroute: Option<Reroute>,
+) -> (Response, ProcessMeta) {
+    // RFC 7230 §5.4: a missing Host header on HTTP/1.1 is a client error.
+    // Nginx enforces this in ngx_http_process_request_header
+    // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
+    // — empty Host is treated as "default server".
+    if req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
+        return (
+            Response::Prebuilt(http.bad_request.pick(req.method)),
+            ProcessMeta::default(),
+        );
+    }
+    let Some(listen) = select_listen(http, req.listen_index) else {
+        let server_bytes = default_server_header(http);
+        return (
+            Response::Owned(crate::http::build_response_for_method(
+                500,
+                "Internal Server Error\n",
+                req.method,
+                server_bytes,
+            )),
+            ProcessMeta::default(),
+        );
+    };
+
+    if matches!(req.method, Method::Trace | Method::Connect) {
+        // No server selected yet — use this listen's default server header
+        // bytes. nginx returns 405 here from the request-line parser
+        // before any per-server `server_tokens` could differ anyway.
+        let server_bytes = listen.servers[listen.default_server].server_header;
+        return (
+            Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
+            ProcessMeta::default(),
+        );
+    }
+
+    let (server, regex_captures) = find_config(listen, req.host, req.sni);
+    let mut named_target: Option<Vec<u8>> = None;
+    let mut current_args: Option<Vec<u8>> = None;
+    let mut error_page_status: Option<ErrorPageStatus> = None;
+    let mut in_error_page = false;
+    let mut preserved_location: Option<Vec<u8>> = None;
+    let mut preserved_www_authenticate: Vec<Vec<u8>> = Vec::new();
+    match initial_reroute {
+        None => {
+            // Normalize the URI once at FindConfig entry; Rewrite / internal
+            // redirects (our try_files reroute loop) reuse the already-normalized
+            // form. The original request-target stays on `RequestCtx` so later
+            // rendering can still expose `$request_uri`, `$args`, `$is_args`, and
+            // `$arg_*` from the client-facing URI even after internal reroutes.
+            // `url_scratch` is reused across hops and (for production callers)
+            // across requests on the same connection.
+            url_scratch.clear();
+            if let Err(resp) =
+                normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
+            {
+                return (resp, ProcessMeta::default());
+            }
+        }
+        Some(reroute) => {
+            if let Some(args) = reroute.args {
+                current_args = Some(args);
+            }
+            if let Some(status) = reroute.error_page_status {
+                error_page_status = Some(status);
+            }
+            if reroute.enters_error_page {
+                in_error_page = true;
+            }
+            if let Some(loc) = reroute.preserved_location {
+                preserved_location = Some(loc);
+            }
+            if !reroute.preserved_www_authenticate.is_empty() {
+                preserved_www_authenticate = reroute.preserved_www_authenticate;
+            }
+            match reroute.target {
+                RerouteTarget::Uri(uri) => {
+                    url_scratch.clear();
+                    match uri::normalize_with(&uri, server.merge_slashes, url_scratch) {
+                        Ok(_) => {}
+                        Err(uri::UriError::EscapesRoot) => {
+                            return (
+                                Response::Prebuilt(http.forbidden.pick(req.method)),
+                                ProcessMeta::default(),
+                            );
+                        }
+                        Err(_) => {
+                            return (
+                                Response::Prebuilt(http.bad_request.pick(req.method)),
+                                ProcessMeta::default(),
+                            );
+                        }
+                    }
+                }
+                RerouteTarget::Named(name) => {
+                    // Named-location jumps preserve the current URI. Seed the
+                    // normalized request URI and start the loop with a named target.
+                    url_scratch.clear();
+                    if let Err(resp) =
+                        normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
+                    {
+                        return (resp, ProcessMeta::default());
+                    }
+                    named_target = Some(name);
+                }
+            }
+        }
+    }
+    let mut rewrite_state = RewriteState::default();
+    let mut meta = ProcessMeta::default();
+    meta.server_port = server.listen_port;
+
+    // Reroute loop — nginx calls this `r->internal` handling inside
+    // `ngx_http_internal_redirect`; the counter is `r->uri_changes`. We
+    // bound at MAX_REROUTES to guarantee termination on cyclic configs
+    // (`try_files / =404` pointing at a URI that re-triggers try_files).
+    for _ in 0..MAX_REROUTES {
+        let loc = if let Some(name) = named_target.take() {
+            match match_named_location(server, &name) {
+                Some(loc) => loc,
+                None => {
+                    return (
+                        Response::Owned(crate::http::build_response_for_method(
+                            500,
+                            "Internal Server Error\n",
+                            req.method,
+                            server.server_header,
+                        )),
+                        meta,
+                    );
+                }
+            }
+        } else {
+            match match_location(server, url_scratch, &mut rewrite_state) {
+                Some(loc) => loc,
+                None => match server.server_default.as_ref() {
+                    // Server-scope `return` fires for any request that
+                    // didn't land on an explicit location, matching nginx's
+                    // rewrite-phase behavior.
+                    Some(default) => MatchedLocation::from_prefix(default),
+                    None => {
+                        meta.server_port = server.listen_port;
+                        meta.log = LogMeta {
+                            error_logs: server.error_logs,
+                            log_not_found: server.log_not_found,
+                        };
+                        // No location matched; fall back to the server-scope
+                        // access_log list so the request still gets logged.
+                        meta.access_logs = server.access_logs;
+                        meta.post_action = server.post_action;
+                        meta.remote_user = None;
+                        match run_access_control(
+                            req,
+                            server.auth_basic,
+                            server.auth_basic_user_file,
+                            server.auth_delay_ms,
+                            server.server_header,
+                        ) {
+                            AccessControl::Allow { remote_user } => {
+                                meta.remote_user = remote_user;
+                            }
+                            AccessControl::Deny { response, delay_ms } => {
+                                meta.response_delay_ms = delay_ms;
+                                return (response, meta);
+                            }
+                        }
+                        return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+                    }
+                },
+            }
+        };
+        meta.keepalive = KeepaliveMeta {
+            allow: loc.keepalive.allow,
+            idle_timeout_ms: loc.keepalive.idle_timeout_ms,
+            header_timeout_secs: loc.keepalive.header_timeout_secs,
+            max_requests: loc.keepalive.max_requests,
+            max_time_ms: loc.keepalive.max_time_ms,
+            disable_msie6: loc.keepalive.disable_msie6,
+            disable_safari: loc.keepalive.disable_safari,
+        };
+        meta.access_logs = loc.access_logs;
+        meta.post_action = loc.post_action;
+        meta.log = LogMeta {
+            error_logs: loc.error_logs,
+            log_not_found: loc.log_not_found,
+        };
+        if let Some(target) = loc.auto_redirect_to {
+            let args = current_args
+                .as_deref()
+                .unwrap_or_else(|| request_args(req.path));
+            return (
+                build_auto_redirect_response(server, loc.server_header, req, target, args),
+                meta,
+            );
+        }
+        match run_rewrite_program(
+            http,
+            server,
+            loc,
+            req,
+            url_scratch,
+            &mut current_args,
+            &mut rewrite_state,
+            regex_captures.as_ref(),
+        ) {
+            RewriteOutcome::Continue => {}
+            RewriteOutcome::Reroute => continue,
+            RewriteOutcome::Respond(response) => return (response, meta),
+        }
+        // Access-control phase (auth_basic/auth_basic_user_file): runs after
+        // rewrite and before content dispatch.
+        meta.remote_user = None;
+        match run_access_control(
+            req,
+            loc.auth_basic,
+            loc.auth_basic_user_file,
+            loc.auth_delay_ms,
+            loc.server_header,
+        ) {
+            AccessControl::Allow { remote_user } => {
+                meta.remote_user = remote_user;
+            }
+            AccessControl::Deny { response, delay_ms } => {
+                meta.response_delay_ms = delay_ms;
+                return (response, meta);
+            }
+        }
+        // Surface the location's `add_header` list onto `meta` ahead of
+        // the handler call. The proxy path consumes the plan async on the
+        // worker, by which point the caller has lost direct access to
+        // `loc`; threading the slice through `meta` lets the worker apply
+        // these headers (with `$upstream_http_*` available) once the
+        // upstream future resolves. For non-proxy outcomes the field is
+        // simply unused.
+        let loc_add_headers = loc.add_headers;
+        let loc_add_trailers = loc.add_trailers;
+        let loc_chunked_te = loc.chunked_transfer_encoding;
+        let loc_expires = loc.expires;
+        meta.client_body_in_file_only = loc.client_body_in_file_only;
+        // Mark this as a proxy attempt up front so `$upstream_response_time`
+        // renders as `0.000` even on the short-circuit Prebuilt 502 paths
+        // (no peer / pick failure inside the handler). The settle step
+        // overwrites this with the actual `run_proxy` elapsed time once an
+        // attempt actually flies on the wire.
+        if matches!(loc.handler, crate::worker::PreparedHandler::Proxy(_)) {
+            meta.upstream_response_time_ms = Some(0);
+        }
+        match run_location_handler(
+            http,
+            server,
+            loc,
+            req,
+            url_scratch,
+            current_args.as_deref(),
+            meta.remote_user.as_deref(),
+            &rewrite_state,
+            error_page_status,
+            in_error_page,
+            preserved_location.as_deref(),
+            &preserved_www_authenticate,
+            regex_captures.as_ref(),
+        ) {
+            Response::Reroute(next) => {
+                if let Some(args) = next.args {
+                    current_args = Some(args);
+                }
+                if let Some(status) = next.error_page_status {
+                    error_page_status = Some(status);
+                }
+                if next.enters_error_page {
+                    in_error_page = true;
+                }
+                if let Some(loc_header) = next.preserved_location {
+                    preserved_location = Some(loc_header);
+                }
+                if !next.preserved_www_authenticate.is_empty() {
+                    preserved_www_authenticate = next.preserved_www_authenticate;
+                }
+                match next.target {
+                    RerouteTarget::Uri(uri) => {
+                        url_scratch.clear();
+                        match uri::normalize_with(&uri, server.merge_slashes, url_scratch) {
+                            Ok(_) => {}
+                            Err(uri::UriError::EscapesRoot) => {
+                                return (Response::Prebuilt(http.forbidden.pick(req.method)), meta);
+                            }
+                            Err(_) => {
+                                return (
+                                    Response::Prebuilt(http.bad_request.pick(req.method)),
+                                    meta,
+                                );
+                            }
+                        }
+                    }
+                    RerouteTarget::Named(name) => {
+                        named_target = Some(name);
+                    }
+                }
+            }
+            Response::Proxy(plan) => {
+                meta.proxy_add_headers = loc_add_headers;
+                meta.proxy_add_trailers = loc_add_trailers;
+                meta.proxy_chunked_transfer_encoding = loc_chunked_te;
+                meta.proxy_expires = loc_expires;
+                meta.server_name = server.primary_server_name;
+                meta.underscores_in_headers = server.underscores_in_headers;
+                return (Response::Proxy(plan), meta);
+            }
+            other => return (other, meta),
+        }
+    }
+    // Budget exhausted: nginx returns 500; we match.
+    (
+        Response::Owned(crate::http::build_response_for_method(
+            500,
+            "Internal Server Error\n",
+            req.method,
+            server.server_header,
+        )),
+        meta,
+    )
+}
+
+enum AccessControl {
+    Allow {
+        remote_user: Option<Vec<u8>>,
+    },
+    /// `delay_ms` is non-zero only for credential failures (missing,
+    /// malformed, or wrong) — the worker awaits an async sleep before
+    /// writing the 401. Configuration errors (no user file, unreadable)
+    /// fail-fast with no delay, matching nginx.
+    Deny {
+        response: Response,
+        delay_ms: u64,
+    },
+}
+
+fn run_access_control(
+    req: &RequestCtx<'_>,
+    auth_basic: PreparedAuthBasic,
+    auth_basic_user_file: Option<&Path>,
+    auth_delay_ms: u64,
+    server_header: &'static [u8],
+) -> AccessControl {
+    let PreparedAuthBasic::Realm(realm) = auth_basic else {
+        return AccessControl::Allow { remote_user: None };
+    };
+    let Some(user_file) = auth_basic_user_file else {
+        return AccessControl::Deny {
+            response: Response::Owned(crate::http::build_response_for_method(
+                500,
+                "Internal Server Error\n",
+                req.method,
+                server_header,
+            )),
+            delay_ms: 0,
+        };
+    };
+    let user_file = match resolve_auth_basic_user_file(req, user_file) {
+        Some(path) => path,
+        None => {
+            return AccessControl::Deny {
+                response: Response::Owned(crate::http::build_response_for_method(
+                    500,
+                    "Internal Server Error\n",
+                    req.method,
+                    server_header,
+                )),
+                delay_ms: 0,
+            };
+        }
+    };
+    let creds = match auth::decode_basic_authorization(req.headers_raw) {
+        Ok(creds) => creds,
+        Err(auth::BasicHeaderError::Missing | auth::BasicHeaderError::Malformed) => {
+            let response = auth::build_unauthorized_response(req.method, server_header, realm);
+            return AccessControl::Deny {
+                response: Response::Owned(response),
+                delay_ms: auth_delay_ms,
+            };
+        }
+    };
+    match auth::verify_credentials(user_file.as_ref(), &creds) {
+        Ok(true) => AccessControl::Allow {
+            remote_user: Some(creds.username),
+        },
+        Ok(false) => {
+            let response = auth::build_unauthorized_response(req.method, server_header, realm);
+            AccessControl::Deny {
+                response: Response::Owned(response),
+                delay_ms: auth_delay_ms,
+            }
+        }
+        // Hash compare or htpasswd I/O failed. Don't apply `auth_delay`
+        // here: the delay's purpose is to throttle credential-probing
+        // attackers; an internal verification fault isn't a probe and
+        // shouldn't have the request held open.
+        Err(_) => AccessControl::Deny {
+            response: Response::Owned(crate::http::build_response_for_method(
+                500,
+                "Internal Server Error\n",
+                req.method,
+                server_header,
+            )),
+            delay_ms: 0,
+        },
+    }
+}
+
+fn resolve_auth_basic_user_file<'a>(req: &RequestCtx<'_>, user_file: &'a Path) -> Option<Cow<'a, Path>> {
+    let raw = user_file.to_string_lossy();
+    if !raw.as_bytes().contains(&b'$') {
+        return Some(Cow::Borrowed(user_file));
+    }
+    let parts = crate::config::parse_value_with_vars(&raw).ok()?;
+    let mut rendered = Vec::with_capacity(raw.len());
+    let args = request_args(req.path);
+    let uri = request_uri_path(req.path);
+    for part in parts {
+        match part {
+            ValuePart::Literal(s) => rendered.extend_from_slice(s.as_bytes()),
+            ValuePart::Var(var) => write_auth_path_var(&var, req, args, uri, &mut rendered),
+        }
+    }
+    let rendered = String::from_utf8_lossy(&rendered);
+    Some(Cow::Owned(PathBuf::from(rendered.as_ref())))
+}
+
+fn write_auth_path_var(
+    var: &Variable,
+    req: &RequestCtx<'_>,
+    args: &[u8],
+    uri_path: &[u8],
+    out: &mut Vec<u8>,
+) {
+    match var {
+        Variable::Uri => out.extend_from_slice(uri_path),
+        Variable::RequestUri => out.extend_from_slice(req.path),
+        Variable::Host => out.extend_from_slice(req.host.unwrap_or(b"")),
+        Variable::Args => out.extend_from_slice(args),
+        Variable::IsArgs => {
+            if !args.is_empty() {
+                out.push(b'?');
+            }
+        }
+        Variable::Arg(name) => {
+            if let Some(value) = request_arg_value(args, name.as_bytes()) {
+                write_unescaped_arg_value(out, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn request_uri_path(request_uri: &[u8]) -> &[u8] {
+    match request_uri.iter().position(|&b| b == b'?') {
+        Some(i) => &request_uri[..i],
+        None => request_uri,
+    }
+}
+
+fn request_args(request_uri: &[u8]) -> &[u8] {
+    match request_uri.iter().position(|&b| b == b'?') {
+        Some(i) if i + 1 < request_uri.len() => &request_uri[i + 1..],
+        Some(_) | None => &[],
+    }
+}
+
+fn request_arg_value<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    if args.is_empty() {
+        return None;
+    }
+    for pair in args.split(|&b| b == b'&') {
+        let (key, value) = match pair.iter().position(|&b| b == b'=') {
+            Some(eq) => (&pair[..eq], &pair[eq + 1..]),
+            None => (pair, &[][..]),
+        };
+        if key == name {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn write_unescaped_arg_value(out: &mut Vec<u8>, raw: &[u8]) {
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%'
+            && i + 2 < raw.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(raw[i + 1]), hex_nibble(raw[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// One server-name regex hit, with the named-capture values surfaced for
+/// `$name` rendering. Owns the captured bytes so the type carries no
+/// borrow lifetime — the captures live as long as the `ProcessMeta` /
+/// render path needs them, regardless of when the request `Host` slice
+/// is dropped.
+pub struct ServerNameCaptures {
+    pub names: Vec<(&'static str, Vec<u8>)>,
+}
+
+fn select_listen<'h>(http: &'h PreparedHttp, listen_index: usize) -> Option<&'h PreparedListen> {
+    http.listens.get(listen_index)
+}
+
+fn default_server_header(http: &PreparedHttp) -> &'static [u8] {
+    http.listens
+        .first()
+        .and_then(|listen| listen.servers.get(listen.default_server))
+        .map(|server| server.server_header)
+        .unwrap_or(b"ruxen")
+}
+
+/// FIND_CONFIG phase — pick a server block by Host, then a location
+/// within it. Selection priority follows nginx's
+/// `ngx_http_find_virtual_server` (`ngx_http_request.c`), with an SNI
+/// fallback for TLS connections (mirrors nginx's
+/// `ngx_http_ssl_servername` initial-server-from-SNI behavior):
+///
+/// 1. Run the exact / leading-wildcard / trailing-wildcard / regex ladder
+///    against the HTTP `Host` header.
+/// 2. If `Host` is absent, claim the request for any `server_name "";`
+///    block before falling through.
+/// 3. Run the same ladder against the SNI hostname for TLS connections —
+///    a `Host` header that contradicts SNI keeps step 1, but a missing or
+///    unmatched `Host` lets SNI pick the server.
+/// 4. Default server for the listen address.
+fn find_config<'h, 'r>(
+    listen: &'h PreparedListen,
+    host: Option<&'r [u8]>,
+    sni: Option<&'r [u8]>,
+) -> (&'h PreparedServer, Option<ServerNameCaptures>) {
+    if let Some(host_raw) = host {
+        if let Some(hit) = match_server_name(listen, host_raw) {
+            return hit;
+        }
+    } else {
+        // No Host header — `server_name "";` claims the request before
+        // SNI fallback. Matches nginx's pre-SNI behavior on plain HTTP.
+        for server in &listen.servers {
+            if server.matches_empty {
+                return (server, None);
+            }
+        }
+    }
+
+    if let Some(sni_raw) = sni
+        && let Some(hit) = match_server_name(listen, sni_raw)
+    {
+        return hit;
+    }
+
+    (&listen.servers[listen.default_server], None)
+}
+
+/// Run the exact / leading-wildcard / trailing-wildcard / regex ladder
+/// for one candidate hostname. Used both for the HTTP `Host` header pass
+/// and the TLS SNI fallback pass — the matching logic is identical, only
+/// the input bytes differ. Returns `None` when nothing matches so the
+/// caller can chain candidates and only fall back to the default server
+/// once all of them have failed.
+fn match_server_name<'h, 'r>(
+    listen: &'h PreparedListen,
+    host_raw: &'r [u8],
+) -> Option<(&'h PreparedServer, Option<ServerNameCaptures>)> {
+    // Lowercase host once for case-insensitive matching against
+    // already-lowercased prepared names. Hot path is the all-lowercase
+    // input; falls back to a 256-byte stack buffer, then a heap Vec for
+    // the rare oversized hostnames seen in pathological clients.
+    let mut host_lc_buf: [u8; 256] = [0; 256];
+    let owned_lc: Vec<u8>;
+    let host_lc: &[u8] = if host_raw.iter().all(|b| !b.is_ascii_uppercase()) {
+        host_raw
+    } else if host_raw.len() <= host_lc_buf.len() {
+        for (i, &b) in host_raw.iter().enumerate() {
+            host_lc_buf[i] = b.to_ascii_lowercase();
+        }
+        &host_lc_buf[..host_raw.len()]
+    } else {
+        owned_lc = host_raw.iter().map(|b| b.to_ascii_lowercase()).collect();
+        &owned_lc[..]
+    };
+
+    // 1. Exact match.
+    for server in &listen.servers {
+        for name in &server.exact_names {
+            if *name == host_lc {
+                return Some((server, None));
+            }
+        }
+    }
+
+    // 2. Longest leading-wildcard. Each list is sorted by descending
+    // length; we still scan all servers to find the global longest.
+    let mut best_lead: Option<(usize, &PreparedServer)> = None;
+    for server in &listen.servers {
+        for suffix in &server.wildcard_leading {
+            if host_matches_leading_wildcard(host_lc, suffix) {
+                let len = suffix.len();
+                if best_lead.is_none_or(|(blen, _)| len > blen) {
+                    best_lead = Some((len, server));
+                }
+            }
+        }
+    }
+    if let Some((_, server)) = best_lead {
+        return Some((server, None));
+    }
+
+    // 3. Longest trailing-wildcard.
+    let mut best_trail: Option<(usize, &PreparedServer)> = None;
+    for server in &listen.servers {
+        for head in &server.wildcard_trailing {
+            if host_matches_trailing_wildcard(host_lc, head) {
+                let len = head.len();
+                if best_trail.is_none_or(|(blen, _)| len > blen) {
+                    best_trail = Some((len, server));
+                }
+            }
+        }
+    }
+    if let Some((_, server)) = best_trail {
+        return Some((server, None));
+    }
+
+    // 4. First regex match in declaration order. Captures are surfaced
+    // for `$name` rendering on the request that landed.
+    for server in &listen.servers {
+        for rn in &server.regex_names {
+            if let Some(caps) = rn.regex.captures(host_raw) {
+                let mut names: Vec<(&'static str, Vec<u8>)> = Vec::new();
+                for &cn in &rn.capture_names {
+                    if let Some(m) = caps.name(cn) {
+                        names.push((cn, m.as_bytes().to_vec()));
+                    }
+                }
+                let caps_out = if names.is_empty() {
+                    None
+                } else {
+                    Some(ServerNameCaptures { names })
+                };
+                return Some((server, caps_out));
+            }
+        }
+    }
+
+    None
+}
+
+/// Match `host` against a `*.suffix` wildcard. Matches when the host
+/// equals the suffix or ends with `.suffix` — the dot has to be present
+/// or the wildcard would also match `xexample.com` against
+/// `*.example.com`.
+fn host_matches_leading_wildcard(host: &[u8], suffix: &[u8]) -> bool {
+    if host == suffix {
+        return true;
+    }
+    if host.len() <= suffix.len() {
+        return false;
+    }
+    let split = host.len() - suffix.len();
+    host[split - 1] == b'.' && &host[split..] == suffix
+}
+
+/// Match `host` against a `head.*` wildcard. Matches when the host
+/// equals the head or starts with `head.`.
+fn host_matches_trailing_wildcard(host: &[u8], head: &[u8]) -> bool {
+    if host == head {
+        return true;
+    }
+    if host.len() <= head.len() {
+        return false;
+    }
+    &host[..head.len()] == head && host[head.len()] == b'.'
+}
+
+/// Location match — five-step ladder mirroring nginx's
+/// `ngx_http_core_find_static_location` + the regex loop in
+/// `ngx_http_core_find_location` (core_module.c:1454):
+///
+/// 1. Scan exact (`=`) candidates → on hit, return immediately.
+/// 2. Scan prefix candidates, pre-sorted by descending pattern length, and
+///    record the first hit as `best` — which by construction is also the
+///    longest prefix match, because the list is sorted.
+/// 3. If `best` is set and carries the `^~` flag → return it without
+///    consulting regex (`clcf->noregex`).
+/// 4. Walk regex_locations in declaration order → first match wins.
+/// 5. Fall back to `best` (or `None` → 404).
+///
+/// All lists are tiny in practice (<20 in any realistic config) so linear
+/// scans beat tree lookups for both cache and code-size reasons. Cost when
+/// no regex locations are configured: one `Vec::is_empty()` check. Named
+/// locations are looked up separately on internal redirects and are never
+/// part of this external URI ladder.
+pub(crate) fn match_location<'a>(
+    server: &'a PreparedServer,
+    path: &[u8],
+    rewrite_state: &mut RewriteState,
+) -> Option<MatchedLocation<'a>> {
+    rewrite_state.clear_numbered_captures();
+    for loc in &server.exact_locations {
+        if loc.pattern == path {
+            return Some(MatchedLocation::from_prefix(loc));
+        }
+    }
+
+    if let Some(loc) = auto_redirect_match(&server.exact_locations, path)
+        .or_else(|| auto_redirect_match(&server.prefix_locations, path))
+    {
+        return Some(loc);
+    }
+
+    let best = server
+        .prefix_locations
+        .iter()
+        .find(|loc| path.starts_with(loc.pattern));
+
+    if let Some(loc) = best {
+        if loc.noregex {
+            return Some(MatchedLocation::from_prefix(loc));
+        }
+    }
+
+    if !server.regex_locations.is_empty() {
+        // Bytes mode: percent-decoding in `uri::normalize` can leave the
+        // path as arbitrary octets (e.g. `/img%FF.gif` decodes to `…0xFF…`).
+        // Going through `from_utf8` would silently skip the regex pass for
+        // any non-UTF-8 sequence — nginx matches PCRE against
+        // `r->uri.data` as raw bytes, and so do we.
+        for rloc in &server.regex_locations {
+            if let Some(captures) = rloc.regex.captures(path) {
+                rewrite_state.set_numbered_from_regex_captures(&captures, path);
+                return Some(MatchedLocation::from_regex(rloc));
+            }
+        }
+    }
+
+    best.map(MatchedLocation::from_prefix)
+}
+
+fn build_auto_redirect_response(
+    server: &PreparedServer,
+    server_header: &[u8],
+    req: &RequestCtx<'_>,
+    target: &[u8],
+    args: &[u8],
+) -> Response {
+    let escaped = escape_redirect_uri(target);
+    let mut path = Vec::with_capacity(escaped.len() + usize::from(!args.is_empty()) + args.len());
+    path.extend_from_slice(&escaped);
+    if !args.is_empty() {
+        path.push(b'?');
+        path.extend_from_slice(args);
+    }
+    let location = build_absolute_redirect_location(
+        &path,
+        req.host.unwrap_or(server.primary_server_name),
+        server.listen_port,
+        req.tls.is_some(),
+    );
+    Response::Owned(crate::http::build_redirect_response(
+        301,
+        &location,
+        req.method,
+        server_header,
+    ))
+}
+
+fn build_absolute_redirect_location(path: &[u8], host: &[u8], port: u16, tls: bool) -> Vec<u8> {
+    let scheme: &[u8] = if tls { b"https" } else { b"http" };
+    let default_port = if tls { 443 } else { 80 };
+    let mut out = Vec::with_capacity(scheme.len() + 3 + host.len() + 6 + path.len());
+    out.extend_from_slice(scheme);
+    out.extend_from_slice(b"://");
+    out.extend_from_slice(host);
+    if port != default_port {
+        out.push(b':');
+        out.extend_from_slice(port.to_string().as_bytes());
+    }
+    out.extend_from_slice(path);
+    out
+}
+
+fn escape_redirect_uri(raw: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = Vec::with_capacity(raw.len());
+    for &b in raw {
+        if redirect_uri_byte_needs_escape(b) {
+            out.push(b'%');
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0x0f) as usize]);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+fn redirect_uri_byte_needs_escape(b: u8) -> bool {
+    matches!(
+        b,
+        0x00..=0x20
+            | 0x7f..=0xff
+            | b'"'
+            | b'#'
+            | b'%'
+            | b'<'
+            | b'>'
+            | b'?'
+            | b'\\'
+            | b'^'
+            | b'`'
+            | b'{'
+            | b'|'
+            | b'}'
+    )
+}
+
+fn auto_redirect_match<'a>(
+    locations: &'a [PreparedLocation],
+    path: &[u8],
+) -> Option<MatchedLocation<'a>> {
+    locations
+        .iter()
+        .find(|loc| {
+            loc.auto_redirect
+                && loc.pattern.len() == path.len() + 1
+                && loc.pattern.starts_with(path)
+                && loc.pattern.ends_with(b"/")
+        })
+        .map(MatchedLocation::from_auto_redirect)
+}
+
+fn match_named_location<'a>(
+    server: &'a PreparedServer,
+    name: &[u8],
+) -> Option<MatchedLocation<'a>> {
+    server
+        .named_locations
+        .iter()
+        .find(|loc| loc.pattern == name)
+        .map(MatchedLocation::from_prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config;
+    use std::path::Path;
+    use crate::worker::prepare;
+    use std::path::PathBuf;
+
+    fn build(src: &str) -> &'static PreparedHttp {
+        prepare(config::parse(src).unwrap())
+    }
+
+    fn unique_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "ruxen-phase-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir(&d).unwrap();
+        d
+    }
+
+    fn response_bytes(r: Response) -> Vec<u8> {
+        match r {
+            Response::Prebuilt(b) => b.to_vec(),
+            Response::Owned(b) => b,
+            Response::File { .. } => {
+                panic!("phase::process test helper expected buffered response")
+            }
+            Response::Reroute(_) => panic!("phase::process must consume Reroute"),
+            Response::Proxy(_) => panic!("phase::process test helper expected buffered response"),
+        }
+    }
+
+    fn method_bytes_for(method: Method) -> &'static [u8] {
+        match method {
+            Method::Get => b"GET",
+            Method::Head => b"HEAD",
+            Method::Trace => b"TRACE",
+            Method::Connect => b"CONNECT",
+            Method::Other => b"GET",
+        }
+    }
+
+    fn response_body(bytes: &[u8]) -> &[u8] {
+        bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| &bytes[i + 4..])
+            .unwrap_or(&[])
+    }
+
+    fn ctx_with_method<'a>(
+        method: Method,
+        path: &'a [u8],
+        host: Option<&'a [u8]>,
+        http_11: bool,
+    ) -> RequestCtx<'a> {
+        RequestCtx {
+            method,
+            method_bytes: method_bytes_for(method),
+            path,
+            http_11,
+            host,
+            sni: None,
+            listen_index: 0,
+            remote_addr: b"127.0.0.1",
+            remote_port: 12345,
+            if_modified_since: None,
+            if_unmodified_since: None,
+            if_none_match: None,
+            if_match: None,
+            range: None,
+            if_range: None,
+            headers_raw: &[],
+            connection_id: 0,
+            connection_requests: 0,
+            connection_time_us: 0,
+            request_time_us: 0,
+            request_port: &[],
+            pipe: b'.',
+            request_length: 0,
+            epoch_secs: 0,
+            epoch_ms: 0,
+            body: &[],
+            body_file: &[],
+            tls: None,
+        }
+    }
+
+    fn ctx<'a>(path: &'a [u8], host: Option<&'a [u8]>, http_11: bool) -> RequestCtx<'a> {
+        ctx_with_method(Method::Get, path, host, http_11)
+    }
+
+    #[test]
+    fn auth_basic_user_file_expands_arg_variable() {
+        let req = ctx(b"/var/?f=htpasswd", Some(b"localhost"), true);
+        let resolved = resolve_auth_basic_user_file(&req, Path::new("$arg_f")).unwrap();
+        assert_eq!(resolved.as_ref(), Path::new("htpasswd"));
+    }
+
+    #[test]
+    fn auth_basic_user_file_decodes_percent_encoded_arg_value() {
+        let req = ctx(b"/var/?f=sub%2Fhtpasswd", Some(b"localhost"), true);
+        let resolved = resolve_auth_basic_user_file(&req, Path::new("$arg_f")).unwrap();
+        assert_eq!(resolved.as_ref(), Path::new("sub/htpasswd"));
+    }
+
+    #[test]
+    fn host_selects_server() {
+        let http = build(
+            r#"
+                http {
+                    server { listen 80; server_name a.example; location / { return 200 "A"; } }
+                    server { listen 80; server_name b.example; location / { return 200 "B"; } }
+                }
+            "#,
+        );
+        let ra = response_bytes(process(http, &ctx(b"/", Some(b"a.example"), true)));
+        let rb = response_bytes(process(http, &ctx(b"/", Some(b"b.example"), true)));
+        assert!(std::str::from_utf8(&ra).unwrap().ends_with("A"));
+        assert!(std::str::from_utf8(&rb).unwrap().ends_with("B"));
+    }
+
+    #[test]
+    fn unknown_host_falls_to_default_server() {
+        let http = build(
+            r#"
+                http {
+                    server { listen 80; server_name a.example; location / { return 200 "A"; } }
+                    server { listen 80; server_name b.example; location / { return 200 "B"; } }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/", Some(b"unknown.host"), true)));
+        // Default is the first server block (A).
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("A"));
+    }
+
+    #[test]
+    fn m36_server_match_is_scoped_to_accept_listen() {
+        let http = build(
+            r#"
+                http {
+                    server { listen 80; server_name same.example; location / { return 200 "L80"; } }
+                    server { listen 81; server_name same.example; location / { return 200 "L81"; } }
+                }
+            "#,
+        );
+        let r80 = response_bytes(process(http, &ctx(b"/", Some(b"same.example"), true)));
+        assert!(std::str::from_utf8(&r80).unwrap().ends_with("L80"));
+
+        let mut req81 = ctx(b"/", Some(b"same.example"), true);
+        req81.listen_index = 1;
+        let r81 = response_bytes(process(http, &req81));
+        assert!(std::str::from_utf8(&r81).unwrap().ends_with("L81"));
+    }
+
+    #[test]
+    fn m36_unknown_host_uses_default_server_per_listen() {
+        let http = build(
+            r#"
+                http {
+                    server { listen 80; server_name a.example; location / { return 200 "A80"; } }
+                    server { listen 80; server_name b.example; location / { return 200 "B80"; } }
+                    server { listen 81; server_name c.example; location / { return 200 "C81"; } }
+                    server { listen 81; server_name d.example; location / { return 200 "D81"; } }
+                }
+            "#,
+        );
+        let r80 = response_bytes(process(http, &ctx(b"/", Some(b"unknown.host"), true)));
+        assert!(std::str::from_utf8(&r80).unwrap().ends_with("A80"));
+
+        let mut req81 = ctx(b"/", Some(b"unknown.host"), true);
+        req81.listen_index = 1;
+        let r81 = response_bytes(process(http, &req81));
+        assert!(std::str::from_utf8(&r81).unwrap().ends_with("C81"));
+    }
+
+    #[test]
+    fn invalid_listen_index_returns_500() {
+        let http = build(r#"http { server { listen 80; location / { return 200 "ok"; } } }"#);
+        let mut req = ctx(b"/", Some(b"h"), true);
+        req.listen_index = 999;
+        let r = response_bytes(process(http, &req));
+        assert!(
+            std::str::from_utf8(&r)
+                .unwrap()
+                .starts_with("HTTP/1.1 500 Internal Server Error")
+        );
+    }
+
+    #[test]
+    fn missing_host_on_http_11_is_400() {
+        let http = build(r#"http { server { listen 80; location / { return 200 "ok"; } } }"#);
+        let r = response_bytes(process(http, &ctx(b"/", None, true)));
+        assert!(std::str::from_utf8(&r).unwrap().starts_with("HTTP/1.1 400"));
+    }
+
+    #[test]
+    fn empty_host_on_http_11_is_400() {
+        let http = build(r#"http { server { listen 80; location / { return 200 "ok"; } } }"#);
+        let r = response_bytes(process(http, &ctx(b"/", Some(b""), true)));
+        assert!(std::str::from_utf8(&r).unwrap().starts_with("HTTP/1.1 400"));
+    }
+
+    #[test]
+    fn missing_host_on_http_10_is_allowed() {
+        let http = build(r#"http { server { listen 80; location / { return 200 "ok"; } } }"#);
+        let r = response_bytes(process(http, &ctx(b"/", None, false)));
+        assert!(std::str::from_utf8(&r).unwrap().starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn head_reroute_loop_500_has_no_body() {
+        let root = unique_dir();
+        let http = build(&format!(
+            "http {{ server {{ listen 80; location / {{ root {}; try_files $uri /missing; }} }} }}",
+            root.display()
+        ));
+        let req = ctx_with_method(Method::Head, b"/loop", Some(b"h"), true);
+
+        let r = response_bytes(process(http, &req));
+        assert!(
+            std::str::from_utf8(&r)
+                .unwrap()
+                .starts_with("HTTP/1.1 500 Internal Server Error")
+        );
+        assert_eq!(response_body(&r), b"");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exact_location_beats_prefix() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location = / { return 200 "root"; }
+                        location / { return 200 "prefix"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("root"));
+        // A non-exact path falls through to prefix.
+        let r = response_bytes(process(http, &ctx(b"/other", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("prefix"));
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location /a { return 200 "a"; }
+                        location /a/b { return 200 "ab"; }
+                        location / { return 200 "root"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/a/b/c", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("ab"));
+        let r = response_bytes(process(http, &ctx(b"/a/xxx", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("a"));
+        let r = response_bytes(process(http, &ctx(b"/z", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("root"));
+    }
+
+    #[test]
+    fn proxy_slash_location_auto_redirects_bare_uri_before_regex() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        server_name h;
+                        location / { return 200 "root"; }
+                        location /a/ { proxy_pass http://127.0.0.1:8080/a-a; }
+                        location ~ ^/a$ { return 200 "regex"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/a?x=1", Some(b"h"), true)));
+        let s = std::str::from_utf8(&r).unwrap();
+        assert!(s.starts_with("HTTP/1.1 301 Moved Permanently"), "{s}");
+        assert!(s.contains("Location: http://h/a/?x=1\r\n"), "{s}");
+    }
+
+    #[test]
+    fn non_proxy_slash_location_does_not_auto_redirect() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location / { return 200 "root"; }
+                        location /a/ { return 200 "slash"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/a", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("root"));
+    }
+
+    #[test]
+    fn no_location_match_is_404() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location /a { return 200 "a"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/b", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn external_requests_do_not_match_named_locations() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location @hidden { return 200 "hidden"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/@hidden", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn server_name_match_is_case_insensitive() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        server_name Example.COM;
+                        location / { return 200 "ex"; }
+                    }
+                    server {
+                        listen 80;
+                        location / { return 200 "default"; }
+                    }
+                }
+            "#,
+        );
+        // Parser lowercases incoming Host; server_name is lowercased at
+        // prepare time. Both mixed-case inputs here simulate what the
+        // worker would pass in without relying on the parser.
+        let r = response_bytes(process(http, &ctx(b"/", Some(b"example.com"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("ex"));
+    }
+
+    // M9: regex + ^~ location modifiers.
+    //
+    // Precedence ladder validated end-to-end via `process` so the test
+    // exercises the actual `match_location` call path the worker hits.
+
+    #[test]
+    fn m9_regex_runs_after_prefix_when_no_caret_tilde() {
+        // A normal prefix is recorded as `best`, but the regex pass still
+        // runs and wins because `noregex` is false.
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location / { return 200 "prefix"; }
+                        location ~ \.gif$ { return 200 "regex"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/foo.gif", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("regex"));
+        // Non-matching path falls back to the prefix.
+        let r = response_bytes(process(http, &ctx(b"/foo.txt", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("prefix"));
+    }
+
+    #[test]
+    fn m9_caret_tilde_prefix_suppresses_regex() {
+        // `^~ /images/` matches /images/x.gif as the longest prefix and
+        // sets noregex, so the regex is not consulted even though it would
+        // match too. Without `^~` the regex would win.
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location / { return 200 "root"; }
+                        location ^~ /images/ { return 200 "images"; }
+                        location ~* \.(gif|jpg)$ { return 200 "regex"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/images/foo.gif", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("images"));
+        // Regex still wins outside the `^~` prefix.
+        let r = response_bytes(process(http, &ctx(b"/foo.gif", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("regex"));
+    }
+
+    #[test]
+    fn m9_regex_first_declared_wins() {
+        // Two regexes both match /casefull/x.gif; declaration order
+        // decides — the first regex (`\.gif$`) wins.
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location / { return 200 "root"; }
+                        location ~* \.gif$ { return 200 "first"; }
+                        location ~ casefull { return 200 "second"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/casefull/x.gif", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("first"));
+    }
+
+    #[test]
+    fn m9_tilde_is_case_sensitive_and_tilde_star_is_not() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location / { return 200 "root"; }
+                        location ~ casefull { return 200 "cs"; }
+                        location ~* \.png$  { return 200 "ci"; }
+                    }
+                }
+            "#,
+        );
+        // ~ casefull matches lowercase, not uppercase
+        let r = response_bytes(process(http, &ctx(b"/casefull/x", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("cs"));
+        let r = response_bytes(process(http, &ctx(b"/CASEFULL/x", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("root"));
+        // ~* matches both cases
+        let r = response_bytes(process(http, &ctx(b"/foo.PNG", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("ci"));
+    }
+
+    #[test]
+    fn m9_regex_matches_percent_encoded_non_ascii_path() {
+        // `/img%FF.gif` decodes to bytes `…0xFF.gif`, which is not valid
+        // UTF-8. An earlier implementation routed match_location through
+        // `from_utf8(path)` and silently skipped the regex pass on Err,
+        // so this request would land on the prefix `/` instead of the
+        // regex location. The bytes-mode regex makes it match correctly,
+        // mirroring nginx's byte-oriented PCRE behavior.
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location / { return 200 "prefix"; }
+                        location ~ \.gif$ { return 200 "regex"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/img%FF.gif", Some(b"h"), true)));
+        assert!(
+            std::str::from_utf8(&r).unwrap().ends_with("regex"),
+            "non-UTF-8 path must still hit the regex location: {}",
+            String::from_utf8_lossy(&r)
+        );
+    }
+
+    #[test]
+    fn m9_exact_beats_regex() {
+        let http = build(
+            r#"
+                http {
+                    server {
+                        listen 80;
+                        location = /foo { return 200 "exact"; }
+                        location ~ /foo { return 200 "regex"; }
+                        location / { return 200 "root"; }
+                    }
+                }
+            "#,
+        );
+        let r = response_bytes(process(http, &ctx(b"/foo", Some(b"h"), true)));
+        assert!(std::str::from_utf8(&r).unwrap().ends_with("exact"));
+    }
+}

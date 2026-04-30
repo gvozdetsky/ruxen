@@ -1,0 +1,6 @@
+/target
+/.idea/
+/.claude/
+/bench/runs/
+/bench/m19/*.bin
+/.nginx-tests-out/

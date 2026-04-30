@@ -1,0 +1,1235 @@
+// Reverse proxy / upstream forwarder.
+//
+// The path negotiates response framing (Content-Length /
+// Transfer-Encoding: chunked / Connection: close), supports
+// `proxy_http_version 1.1`, applies proxy_next_upstream failover, and
+// returns reusable upstream sockets to the per-worker keepalive pool.
+//
+// The plan is built synchronously by `worker::run_location_handler` (in
+// the `PreparedHandler::Proxy` arm) and packaged into
+// `Response::Proxy(plan)`. The worker connection task awaits
+// `run_proxy(plan)` after `process_with_meta` returns, then feeds the
+// resulting bytes back into the existing write path (Connection-header
+// injection, access logging, etc.). This keeps phase.rs itself sync and
+// isolates monoio I/O to one site.
+//
+// Notes from `ngx_http_upstream.c` and `ngx_http_upstream_keepalive_module.c`
+// are distilled in DESIGN.md.
+
+use std::cell::RefCell;
+use std::time::Duration;
+use std::time::Instant;
+
+use monoio::io::AsyncReadRent;
+use monoio::io::AsyncWriteRentExt;
+use monoio::net::TcpStream;
+use monoio::time::timeout;
+
+use crate::config::ProxyNextUpstream;
+use crate::http::Method;
+use crate::phase::Response;
+use crate::upstream;
+use crate::upstream::LeasedPeer;
+use crate::worker::PreparedUpstream;
+
+// Per-worker reusable scratch buffers for proxy::attempt. The proxy hot path
+// otherwise allocates `accum` (~4 KiB) and `read_buf` (4 KiB zero-filled) on
+// every upstream request — at >500 k req/s that's ~10M alloc/s plus 4 GB/s of
+// memset. The pool returns the same buffer on subsequent requests; the
+// kernel-write read side never reads from uninit bytes, so we avoid the
+// zero-fill by tracking capacity rather than length.
+const PROXY_SCRATCH_CAP: usize = 4096;
+const PROXY_POOL_LIMIT: usize = 32;
+
+thread_local! {
+    static PROXY_BUF_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn take_proxy_buf() -> Vec<u8> {
+    PROXY_BUF_POOL.with(|p| {
+        if let Some(mut v) = p.borrow_mut().pop() {
+            v.clear();
+            return v;
+        }
+        Vec::with_capacity(PROXY_SCRATCH_CAP)
+    })
+}
+
+fn return_proxy_buf(mut v: Vec<u8>) {
+    // Cap individual buffer growth so a giant chunked body doesn't keep an
+    // oversized Vec alive in the pool forever.
+    if v.capacity() > PROXY_SCRATCH_CAP * 16 {
+        return;
+    }
+    v.clear();
+    PROXY_BUF_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < PROXY_POOL_LIMIT {
+            pool.push(v);
+        }
+    });
+}
+
+/// Per-request upstream attempt plan. Built synchronously inside the
+/// location handler; consumed by `run_proxy` on the worker async task.
+pub struct ProxyPlan {
+    /// Pointer to the prepared upstream (owns peers + keepalive config).
+    pub upstream: &'static PreparedUpstream,
+    /// First peer to try, leased at plan-build time. Subsequent
+    /// `proxy_next_upstream` retries lease their own peers inside
+    /// `run_proxy`. Wrapped in `Option` so the run loop can `.take()`
+    /// without fighting partial moves out of the plan struct.
+    pub initial_peer: Option<LeasedPeer>,
+    /// Pre-rendered upstream request bytes — request line + headers +
+    /// `\r\n\r\n` + body. The location handler folds proxy_set_header
+    /// overrides + the forwarded client header set into this buffer
+    /// before handing the plan off. Stored as `Bytes` (refcounted slice)
+    /// so per-attempt cloning is an Arc bump, not an alloc + memcpy —
+    /// matters because retries hold the original while the in-flight
+    /// `write_all` consumes a clone.
+    pub request: bytes::Bytes,
+    /// Method of the *client* request — needed to strip the body for
+    /// HEAD responses on the way back when the upstream sends one
+    /// anyway.
+    pub method: Method,
+    /// `Server:` header bytes for synthesized 502/504 errors.
+    #[allow(dead_code)]
+    pub server_bytes: &'static [u8],
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub send_timeout: Duration,
+    /// `proxy_limit_rate` in bytes/sec; `0` means unlimited. When non-zero,
+    /// the response-body read loop sleeps after each chunk so that the total
+    /// bytes received from the upstream don't outpace this rate.
+    pub limit_rate: u64,
+    /// Cached `Bad Gateway` prebuilt for connect/upstream-protocol errors.
+    pub bad_gateway: &'static crate::worker::Prebuilt,
+    /// Cached `Gateway Timeout` prebuilt for any timeout in the attempt.
+    pub gateway_timeout: &'static crate::worker::Prebuilt,
+    /// True when the upstream attempt is HTTP/1.1 + the upstream block
+    /// has `keepalive N;` configured. Drives whether `run_proxy` returns
+    /// the socket to the pool or drops it.
+    pub keepalive_eligible: bool,
+    /// `proxy_next_upstream` mask — gates failover triggers across the
+    /// retry loop.
+    pub next_upstream: ProxyNextUpstream,
+    /// `proxy_next_upstream_tries` cap. `0` = "as many as we have peers".
+    pub next_upstream_tries: u32,
+    /// `proxy_next_upstream_timeout` overall budget. `Duration::ZERO`
+    /// means no overall cap (per-attempt timeouts still apply).
+    pub next_upstream_timeout: Duration,
+    /// True if `proxy_pass_request_body` would have shipped a non-empty
+    /// body on the wire. Drives idempotent-retry gating: nginx will not
+    /// retry a non-idempotent request once its body has started flowing,
+    /// unless `proxy_next_upstream non_idempotent` was set.
+    pub has_request_body: bool,
+    /// Whether the request method is idempotent per RFC 9110 §9.2.2.
+    /// `Method::Other` covers POST/PUT/PATCH/DELETE/OPTIONS at our
+    /// classification granularity, so we precompute this against the
+    /// raw method bytes in the worker before building the plan.
+    pub method_idempotent: bool,
+    /// `proxy_intercept_errors on;` (M43): when `Some`, an upstream
+    /// status that matches one of these rules is reflected back as a
+    /// `Response::Reroute` instead of being forwarded to the client. The
+    /// rules are pre-rendered (against the request's `RenderCtx`) at
+    /// plan-build time, so `run_proxy` doesn't need to re-render
+    /// `$variables`.
+    pub intercept: Option<Vec<InterceptRule>>,
+}
+
+/// One pre-rendered `error_page` rule for the intercept path. Mirrors
+/// `PreparedErrorPage` but with the `target` bytes already rendered for
+/// this specific request.
+pub struct InterceptRule {
+    pub status: u16,
+    pub action: crate::worker::PreparedErrorPageAction,
+    pub target: Vec<u8>,
+}
+
+#[allow(dead_code)] // direct callers without a plan still want hardcoded fallback constants
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+#[allow(dead_code)]
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+#[allow(dead_code)]
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One header to write into the upstream request line block. Names are
+/// fixed bytes; values are owned (already-rendered).
+pub struct ProxyHeader<'a> {
+    pub name: &'a [u8],
+    pub value: &'a [u8],
+}
+
+/// Build the upstream request bytes. `http_version_minor` selects HTTP/1.0
+/// vs HTTP/1.1. The headers slice is the final ordered set: caller is
+/// responsible for any `Connection:` header (no auto-injection here —
+/// nginx + the keepalive module manage Connection via `proxy_set_header`
+/// instead, and ruxen mirrors that). A `Host:` header MUST be present.
+pub fn build_request_bytes_with_headers(
+    method_bytes: &[u8],
+    uri: &[u8],
+    http_version_minor: u8,
+    headers: &[ProxyHeader<'_>],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut size = method_bytes.len() + uri.len() + body.len() + 64;
+    for h in headers {
+        size += h.name.len() + h.value.len() + 4;
+    }
+    let mut buf = Vec::with_capacity(size);
+    buf.extend_from_slice(method_bytes);
+    buf.push(b' ');
+    buf.extend_from_slice(uri);
+    buf.extend_from_slice(if http_version_minor == 1 {
+        b" HTTP/1.1\r\n"
+    } else {
+        b" HTTP/1.0\r\n"
+    });
+    for h in headers {
+        // Skip empty-value headers — nginx semantics for
+        // `proxy_set_header NAME ""` is "do not forward this header".
+        if h.value.is_empty() {
+            continue;
+        }
+        buf.extend_from_slice(h.name);
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(h.value);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(body);
+    buf
+}
+
+#[cfg(test)]
+pub fn build_request_bytes(method_bytes: &[u8], uri: &[u8], host_header: &[u8]) -> Vec<u8> {
+    build_request_bytes_with_headers(
+        method_bytes,
+        uri,
+        0,
+        &[
+            ProxyHeader {
+                name: b"Host",
+                value: host_header,
+            },
+            ProxyHeader {
+                name: b"Connection",
+                value: b"close",
+            },
+        ],
+        &[],
+    )
+}
+
+/// True when the named header is hop-by-hop and must be stripped both
+/// from forwarded request headers and upstream response headers.
+pub fn is_hop_by_hop_name(name: &[u8]) -> bool {
+    is_hop_by_hop(name)
+}
+
+/// Run an upstream attempt with `proxy_next_upstream` failover. Returns a
+/// `Response` ready to flow into the existing write path. The high-level
+/// shape mirrors nginx's `ngx_http_upstream_next` (line 4573):
+///
+///   - Attempt with the leased peer (or a pooled conn for it).
+///   - On a stale-pool first-write failure with an idempotent method
+///     (or `proxy_next_upstream non_idempotent` set), retry once on a
+///     fresh socket against the same peer.
+///   - On a "real" failure (connect/timeout/protocol/upstream-status):
+///     report the failure to the LB; if `next_upstream` allows AND we
+///     haven't exhausted `next_upstream_tries` AND idempotency permits,
+///     pick the next peer (with the tried mask blocking the failed one)
+///     and retry.
+///   - Pool the upstream socket on success when the upstream and request
+///     framing both permit it.
+pub async fn run_proxy(mut plan: ProxyPlan) -> Response {
+    let upstream = plan.upstream;
+    let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
+    let overall_deadline = if plan.next_upstream_timeout.is_zero() {
+        None
+    } else {
+        Some(Instant::now() + plan.next_upstream_timeout)
+    };
+    // Take ownership of the initial leased peer. `current` always names
+    // the peer we're about to try; tried_mask records peers already
+    // attempted (and reported FAILED) so the next pick skips them.
+    let mut current = plan
+        .initial_peer
+        .take()
+        .expect("ruxen: run_proxy entered without an initial leased peer");
+    let mut tried_mask: u64 = 1u64 << current.peer_idx.min(63);
+    let mut attempts: u32 = 0;
+    // Idempotent methods may always be retried. POST/PATCH/etc. only when
+    // either the request body is empty (no risk of replay) or the user
+    // opted in via `proxy_next_upstream non_idempotent`.
+    let body_safe_to_retry =
+        plan.method_idempotent || !plan.has_request_body || plan.next_upstream.non_idempotent;
+    // Tracks the last response we'd return if the next failover branch
+    // doesn't fire. The first iteration always overwrites it before any
+    // read — `unused_assignments` complains about the initializer, but
+    // returning a generic 502 if every peer is unreachable mid-loop is
+    // safer than juggling MaybeUninit.
+    #[allow(unused_assignments)]
+    let mut last_failure: Option<Response> = None;
+
+    loop {
+        attempts += 1;
+        // 1. Try the pool first for this peer. On any failure before the
+        //    response headers parse, drop the socket and retry once with
+        //    a fresh connect — the pooled conn was likely stale. The
+        //    stale-retry counts as part of the same `attempt` budget.
+        let pooled = upstream::pool_take(upstream, current.peer_idx);
+        let outcome = if let Some(c) = pooled {
+            match attempt(&plan, current.peer_idx, Some(c)).await {
+                AttemptOutcome::PooledStale => {
+                    // M43: only retry the same peer with a fresh socket
+                    // if the body can be safely re-sent.
+                    if body_safe_to_retry {
+                        attempt(&plan, current.peer_idx, None).await
+                    } else {
+                        AttemptOutcome::Failed(
+                            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                            FailKind::Error,
+                        )
+                    }
+                }
+                other => other,
+            }
+        } else {
+            attempt(&plan, current.peer_idx, None).await
+        };
+
+        match outcome {
+            AttemptOutcome::Ok(resp) => {
+                // Inspect status against next_upstream's http_* mask. A
+                // status that triggers failover is treated like a soft
+                // failure (the upstream answered, but we want to retry
+                // elsewhere).
+                let status = response_status(&resp).unwrap_or(0);
+                if plan.next_upstream.matches_status(status) {
+                    upstream::report_failure(upstream, current.peer_idx);
+                    last_failure = Some(resp);
+                    // Failover budget check.
+                    if attempts >= max_tries
+                        || !body_safe_to_retry
+                        || deadline_exceeded(overall_deadline)
+                    {
+                        return last_failure
+                            .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                    }
+                    let Some(next) = upstream::pick_peer(upstream, tried_mask) else {
+                        return last_failure
+                            .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                    };
+                    tried_mask |= 1u64 << next.peer_idx.min(63);
+                    drop(current);
+                    current = next;
+                    continue;
+                }
+                // Healthy response — record the success on the LB. Then
+                // check `proxy_intercept_errors`: an upstream status that
+                // matches a configured `error_page` rule turns into a
+                // Reroute instead of being forwarded.
+                upstream::report_success(upstream, current.peer_idx);
+                if let Some(rules) = plan.intercept.as_ref()
+                    && let Some(rule) = rules.iter().find(|r| r.status == status)
+                {
+                    return build_intercept_reroute(rule, status, &resp);
+                }
+                return resp;
+            }
+            AttemptOutcome::PooledStale => {
+                // The pre-match collapses PooledStale into either a fresh
+                // retry or a Failed; reaching here is a logic bug.
+                unreachable!("ruxen: pooled-stale outcome leaked past stale-retry collapse");
+            }
+            AttemptOutcome::Failed(resp, kind) => {
+                upstream::report_failure(upstream, current.peer_idx);
+                let triggers = match kind {
+                    FailKind::Error => plan.next_upstream.error,
+                    FailKind::Timeout => plan.next_upstream.timeout,
+                    FailKind::InvalidHeader => plan.next_upstream.invalid_header,
+                };
+                last_failure = Some(resp);
+                if !triggers
+                    || attempts >= max_tries
+                    || !body_safe_to_retry
+                    || deadline_exceeded(overall_deadline)
+                {
+                    return last_failure
+                        .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                }
+                let Some(next) = upstream::pick_peer(upstream, tried_mask) else {
+                    return last_failure
+                        .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                };
+                tried_mask |= 1u64 << next.peer_idx.min(63);
+                drop(current);
+                current = next;
+                continue;
+            }
+        }
+    }
+}
+
+/// `proxy_next_upstream_tries 0;` is "no cap"; everything else caps the
+/// retry loop at the configured value. `peers.len()` is the natural upper
+/// bound when no cap is set (we never re-try the same peer).
+fn compute_max_tries(configured: u32, peers: usize) -> u32 {
+    let peer_cap = (peers as u32).max(1);
+    if configured == 0 {
+        peer_cap
+    } else {
+        configured.min(peer_cap)
+    }
+}
+
+fn deadline_exceeded(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
+fn response_status(resp: &Response) -> Option<u16> {
+    match resp {
+        Response::Prebuilt(b) => parse_response_status(b),
+        Response::Owned(b) => parse_response_status(b),
+        Response::File { headers, .. } => parse_response_status(headers),
+        _ => None,
+    }
+}
+
+/// Build a `Response::Reroute` from a matched `proxy_intercept_errors`
+/// rule. `target[0] == b'/'` → URI internal redirect; `target[0] == b'@'`
+/// → named-location jump; anything else (absolute URL) is *not* supported
+/// for intercept in v0.1 (nginx itself produces a 302 redirect there;
+/// surface a 502 since intercepting to an external target through the
+/// proxy makes little sense).
+fn build_intercept_reroute(
+    rule: &InterceptRule,
+    upstream_status: u16,
+    upstream_resp: &Response,
+) -> Response {
+    use crate::phase::{ErrorPageStatus, Reroute, RerouteTarget};
+    use crate::worker::PreparedErrorPageAction;
+    if rule.target.is_empty() {
+        return Response::Owned(Vec::new());
+    }
+    let error_page_status = match rule.action {
+        PreparedErrorPageAction::PreserveOriginal => Some(ErrorPageStatus::Preserve(upstream_status)),
+        PreparedErrorPageAction::UseTargetStatus => None,
+        PreparedErrorPageAction::Override(code) => Some(ErrorPageStatus::Override(code)),
+    };
+    // Preserve the upstream's `WWW-Authenticate:` challenge(s) when
+    // intercepting a 401 — nginx keeps every challenge value (ticket
+    // #485). Empty for non-401 statuses.
+    let preserved_www_authenticate = if upstream_status == 401 {
+        let bytes: &[u8] = match upstream_resp {
+            Response::Prebuilt(b) => b,
+            Response::Owned(b) => b,
+            Response::File { headers, .. } => headers,
+            _ => &[],
+        };
+        crate::worker::response_header_values_all(bytes, b"www-authenticate")
+    } else {
+        Vec::new()
+    };
+    if rule.target[0] == b'/' {
+        let (uri, args) = match rule.target.iter().position(|&b| b == b'?') {
+            Some(i) => (rule.target[..i].to_vec(), Some(rule.target[i + 1..].to_vec())),
+            None => (rule.target.clone(), None),
+        };
+        return Response::Reroute(Reroute {
+            target: RerouteTarget::Uri(uri),
+            args,
+            error_page_status,
+            enters_error_page: true,
+            preserved_location: None,
+            preserved_www_authenticate,
+        });
+    }
+    if rule.target[0] == b'@' {
+        return Response::Reroute(Reroute {
+            target: RerouteTarget::Named(rule.target.clone()),
+            args: None,
+            error_page_status,
+            enters_error_page: true,
+            preserved_location: None,
+            preserved_www_authenticate,
+        });
+    }
+    // Absolute-URL intercept target — punt for v0.1.
+    Response::Owned(Vec::new())
+}
+
+fn parse_response_status(bytes: &[u8]) -> Option<u16> {
+    // Status lives at offset 9 in `HTTP/1.1 NNN ...`. Be defensive — the
+    // builder always emits this shape, but if anything regresses we'd
+    // rather return None than panic.
+    if bytes.len() < 12 {
+        return None;
+    }
+    let d = &bytes[9..12];
+    if !d.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(((d[0] - b'0') as u16) * 100 + ((d[1] - b'0') as u16) * 10 + (d[2] - b'0') as u16)
+}
+
+#[derive(Debug, Copy, Clone)]
+enum FailKind {
+    Error,
+    Timeout,
+    InvalidHeader,
+}
+
+enum AttemptOutcome {
+    Ok(Response),
+    /// The pooled connection failed before we received any response data
+    /// — caller should retry the same peer with a fresh socket (gated by
+    /// idempotency in the outer loop).
+    PooledStale,
+    /// Hard failure. Carries the response we'd return if no failover
+    /// fires, plus a classification for the next_upstream check.
+    Failed(Response, FailKind),
+}
+
+
+async fn attempt(
+    plan: &ProxyPlan,
+    peer_idx: usize,
+    pooled: Option<upstream::PooledConn>,
+) -> AttemptOutcome {
+    let from_pool = pooled.is_some();
+    let peer_addr = plan.upstream.peers[peer_idx].addr;
+    let (mut stream, opened_at, requests_served) = if let Some(c) = pooled {
+        (c.stream, c.opened_at, c.requests_served)
+    } else {
+        let connect_fut = TcpStream::connect(peer_addr);
+        let stream = match timeout(plan.connect_timeout, connect_fut).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => {
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                    FailKind::Error,
+                );
+            }
+            Err(_) => {
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+                    FailKind::Timeout,
+                );
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        (stream, Instant::now(), 0)
+    };
+
+    // 2. Send the request. Cloning here keeps the original bytes available
+    // for `proxy_next_upstream` retries when this attempt fails — monoio's
+    // write_all consumes the buffer, and on `timeout()` cancellation the
+    // future drops the buffer with the kernel-completion still pending, so
+    // the original on `plan.request` is the only way to recover. With
+    // `Bytes` the clone is just an Arc bump; the underlying request bytes
+    // are never copied per attempt.
+    let req = plan.request.clone();
+    let send_fut = stream.write_all(req);
+    let (res, _returned) = match timeout(plan.send_timeout, send_fut).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            return AttemptOutcome::Failed(
+                Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+                FailKind::Timeout,
+            );
+        }
+    };
+    if res.is_err() {
+        if from_pool {
+            return AttemptOutcome::PooledStale;
+        }
+        return AttemptOutcome::Failed(
+            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+            FailKind::Error,
+        );
+    }
+
+    // 3. Receive the header block. We need at least the head/body
+    // separator before we can decide framing. `read_buf` is a single
+    // 4 KiB scratch that gets handed to monoio for each `read()` and
+    // returned via the `(res, returned)` pair — we reuse it across
+    // every read in this attempt (header pull, body pull, chunked
+    // decoder) so the hot path does one alloc instead of one per read.
+    //
+    // Both `accum` and `read_buf` come from a per-worker pool so the
+    // common case is zero allocation per request. The buffers are
+    // capacity-tracked Vecs (no zero-fill); monoio's IoBufMut writes
+    // through `write_ptr() = as_mut_ptr()` over `bytes_total() =
+    // capacity()` and updates len via `set_init`, so uninit capacity is
+    // safe — the kernel writes before we read.
+    let mut accum: Vec<u8> = take_proxy_buf();
+    let mut read_buf: Vec<u8> = take_proxy_buf();
+    let head_end_terminator: (usize, usize); // (head_end, terminator_len)
+    loop {
+        let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+                    FailKind::Timeout,
+                );
+            }
+        };
+        read_buf = returned;
+        match res {
+            Ok(0) => {
+                if accum.is_empty() && from_pool {
+                    return AttemptOutcome::PooledStale;
+                }
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                    FailKind::Error,
+                );
+            }
+            Ok(n) => accum.extend_from_slice(&read_buf[..n]),
+            Err(_) => {
+                if accum.is_empty() && from_pool {
+                    return AttemptOutcome::PooledStale;
+                }
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                    FailKind::Error,
+                );
+            }
+        }
+        if let Some(p) = find_head_end(&accum) {
+            head_end_terminator = p;
+            break;
+        }
+        // Sanity bound on header block size — refuse 64 KiB+ headers.
+        if accum.len() > 64 * 1024 {
+            return AttemptOutcome::Failed(
+                Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                FailKind::InvalidHeader,
+            );
+        }
+    }
+
+    let head_end = head_end_terminator.0;
+    let term_len = head_end_terminator.1;
+    let body_start = head_end + term_len;
+
+    // 4. Parse the status line.
+    let first_line_end = match find_line_end(&accum[..head_end]) {
+        Some(p) => p.0,
+        None => {
+            return AttemptOutcome::Failed(
+                Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                FailKind::InvalidHeader,
+            );
+        }
+    };
+    // `status_line` is `accum[..first_line_end]`, but binding it as a
+    // slice would hold an immutable borrow across the body-pull loop
+    // (which mutates accum). Re-borrow on each use instead.
+    let upstream_is_11 = if accum[..first_line_end].starts_with(b"HTTP/1.1 ") {
+        true
+    } else if accum[..first_line_end].starts_with(b"HTTP/1.0 ") {
+        false
+    } else {
+        return AttemptOutcome::Failed(
+            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+            FailKind::InvalidHeader,
+        );
+    };
+    let status_code = parse_status_code(&accum[..first_line_end]);
+    if status_code == 444 {
+        // nginx's internal "close connection with no response" status.
+        // Treat as an upstream error so `proxy_next_upstream error` can
+        // fail over to the next peer. nginx's own `proxy_next_upstream`
+        // semantics distinguish `error`, `timeout`, `invalid_header`,
+        // `non_idempotent`, and several `http_*` masks; we map 444 to
+        // `Error` here because the upstream never produced a response,
+        // which matches the spirit of nginx's `non_response` bucket
+        // (covered by `error` in default `proxy_next_upstream` mode).
+        return AttemptOutcome::Failed(
+            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+            FailKind::Error,
+        );
+    }
+
+    // 5. Parse framing-relevant headers.
+    let head_after_status = &accum
+        [first_line_end + first_line_terminator_len(&accum, first_line_end)..head_end];
+    let mut content_length: Option<u64> = None;
+    let mut chunked = false;
+    let mut upstream_close = !upstream_is_11; // HTTP/1.0 closes by default
+    {
+        let mut cursor = 0;
+        while cursor < head_after_status.len() {
+            let (line_len, t) = match find_line_end(&head_after_status[cursor..]) {
+                Some(v) => v,
+                None => (head_after_status.len() - cursor, 0),
+            };
+            let line = &head_after_status[cursor..cursor + line_len];
+            cursor += line_len + t;
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                continue;
+            };
+            let name = trim_ascii(&line[..colon]);
+            let value = trim_ascii(&line[colon + 1..]);
+            if name.eq_ignore_ascii_case(b"content-length") {
+                if let Ok(s) = std::str::from_utf8(value) {
+                    if let Ok(n) = s.trim().parse::<u64>() {
+                        content_length = Some(n);
+                    }
+                }
+            } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                if value
+                    .split(|&b| b == b',')
+                    .any(|t| trim_ascii(t).eq_ignore_ascii_case(b"chunked"))
+                {
+                    chunked = true;
+                }
+            } else if name.eq_ignore_ascii_case(b"connection") {
+                if value
+                    .split(|&b| b == b',')
+                    .any(|t| trim_ascii(t).eq_ignore_ascii_case(b"close"))
+                {
+                    upstream_close = true;
+                }
+                if value
+                    .split(|&b| b == b',')
+                    .any(|t| trim_ascii(t).eq_ignore_ascii_case(b"keep-alive"))
+                    && upstream_is_11
+                {
+                    upstream_close = false;
+                }
+            }
+        }
+    }
+
+    // 6. Pull the rest of the body. HEAD / 204 / 304 have no body even if
+    //    a Content-Length header is present.
+    //
+    // For non-chunked framings the body is grown directly inside `accum`
+    // so the response bytes — header block + body — live in one buffer.
+    // The stitch step (step 7) slices the body out of `accum` instead of
+    // copying through an intermediate `body_owned`. For chunked, we still
+    // need a separate decoded buffer because the wire bytes carry chunk
+    // sizes that would otherwise leak into the forwarded body.
+    let body_has_content = !matches!(plan.method, Method::Head)
+        && status_code != 204
+        && status_code != 304
+        && !(status_code >= 100 && status_code < 200);
+    let mut body_len_in_accum: usize = accum.len() - body_start;
+    let mut decoded_chunked_body: Option<Vec<u8>> = None;
+    // proxy_limit_rate pacer state — anchors at the moment body collection
+    // begins. `paced_bytes` counts body bytes received from the upstream so
+    // far; we sleep when bytes/elapsed would exceed `plan.limit_rate`. Bytes
+    // already pulled in with the header read are counted as received.
+    let body_pacer_start = Instant::now();
+    let mut paced_body_bytes: u64 = body_len_in_accum as u64;
+    if !body_has_content {
+        // Body length is whatever already came in with the header read.
+    } else if chunked {
+        let mut body = Vec::with_capacity(body_len_in_accum + 4096);
+        body.extend_from_slice(&accum[body_start..]);
+        // Truncate accum to just the header block — the chunked-encoded
+        // bytes after `body_start` are not what we'll forward.
+        accum.truncate(body_start);
+        body_len_in_accum = 0;
+        match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout).await {
+            Ok(()) => {}
+            Err(stale) => {
+                if stale && from_pool && body.is_empty() {
+                    return AttemptOutcome::PooledStale;
+                }
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                    FailKind::Error,
+                );
+            }
+        }
+        decoded_chunked_body = Some(body);
+    } else if let Some(cl) = content_length {
+        let cl_usize = cl as usize;
+        // We may have already read more than cl_usize bytes in the header
+        // pull (the upstream pipelined another response or sent stray
+        // bytes). Trim the over-read so we forward exactly cl_usize body
+        // bytes and don't pollute the keepalive socket — but only if the
+        // socket isn't going back to the pool. For simplicity we always
+        // trim; pool-release happens after this and the socket has no
+        // pending bytes to recover from in either case.
+        if body_len_in_accum > cl_usize {
+            accum.truncate(body_start + cl_usize);
+            body_len_in_accum = cl_usize;
+        }
+        // Reserve the rest up front so the read loop never reallocates.
+        accum.reserve(cl_usize - body_len_in_accum);
+        while body_len_in_accum < cl_usize {
+            let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+                        FailKind::Timeout,
+                    );
+                }
+            };
+            read_buf = returned;
+            match res {
+                Ok(0) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::Error,
+                    );
+                }
+                Ok(n) => {
+                    let need = cl_usize - body_len_in_accum;
+                    let take = n.min(need);
+                    accum.extend_from_slice(&read_buf[..take]);
+                    body_len_in_accum += take;
+                    paced_body_bytes += take as u64;
+                    pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
+                }
+                Err(_) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::Error,
+                    );
+                }
+            }
+        }
+    } else if upstream_close {
+        // No length, no chunked, "close" semantics — read until EOF
+        // straight into `accum`.
+        loop {
+            let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+                        FailKind::Timeout,
+                    );
+                }
+            };
+            read_buf = returned;
+            match res {
+                Ok(0) => break,
+                Ok(n) => {
+                    accum.extend_from_slice(&read_buf[..n]);
+                    body_len_in_accum += n;
+                    paced_body_bytes += n as u64;
+                    pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
+                }
+                Err(_) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::Error,
+                    );
+                }
+            }
+            if body_len_in_accum > 64 * 1024 * 1024 {
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                    FailKind::Error,
+                );
+            }
+        }
+    } else {
+        // HTTP/1.1 with no Content-Length, no chunked, no Connection:
+        // close — protocol error. Treat as bad gateway.
+        return AttemptOutcome::Failed(
+            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+            FailKind::InvalidHeader,
+        );
+    }
+
+    // 7. Stitch the rewritten response: status line forced to HTTP/1.1,
+    //    drop hop-by-hop + Transfer-Encoding (we've decoded chunked for
+    //    the client; the client framing is done by the worker write
+    //    path), append a synthesized Content-Length when we re-framed.
+    let body_len = decoded_chunked_body
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or(body_len_in_accum);
+    let mut out = Vec::with_capacity(head_end + 64 + body_len);
+    out.extend_from_slice(b"HTTP/1.1");
+    out.extend_from_slice(&accum[8..first_line_end]);
+    out.extend_from_slice(b"\r\n");
+    let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
+    let mut have_content_length = false;
+    while cursor < head_end {
+        let (line_len, t) = match find_line_end(&accum[cursor..head_end]) {
+            Some(v) => v,
+            None => (head_end - cursor, 0),
+        };
+        let line = &accum[cursor..cursor + line_len];
+        cursor += line_len + t;
+        if line.is_empty() {
+            break;
+        }
+        let colon = match line.iter().position(|&b| b == b':') {
+            Some(p) => p,
+            None => continue,
+        };
+        let name = trim_ascii(&line[..colon]);
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        // We re-framed chunked → identity, so drop the original
+        // Content-Length too (it would conflict with the chunked-encoded
+        // body bytes upstream sent us). When the upstream was identity
+        // / Content-Length-framed, keep its CL line as-is.
+        if chunked && name.eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            have_content_length = true;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+        if t == 0 {
+            break;
+        }
+    }
+    if chunked && !have_content_length {
+        // Re-frame chunked → identity for the client.
+        out.extend_from_slice(b"Content-Length: ");
+        let mut buf = itoa_buf();
+        let s = u64_to_decimal(body_len as u64, &mut buf);
+        out.extend_from_slice(s);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    if let Some(decoded) = decoded_chunked_body.as_ref() {
+        out.extend_from_slice(decoded);
+    } else {
+        out.extend_from_slice(&accum[body_start..body_start + body_len_in_accum]);
+    }
+
+    // 8. Pool eligibility — return the socket only if all of these hold:
+    //    - upstream block opted into keepalive (plan.keepalive_eligible)
+    //    - upstream did not signal close
+    //    - the upstream announced HTTP/1.1
+    //    - we framed the body (chunked or content-length) so we know we
+    //      consumed exactly the right number of bytes
+    let response_framed = chunked || content_length.is_some() || !body_has_content;
+    if plan.keepalive_eligible && !upstream_close && upstream_is_11 && response_framed {
+        upstream::pool_release(
+            plan.upstream,
+            peer_idx,
+            upstream::PooledConn {
+                stream,
+                last_used: Instant::now(),
+                opened_at,
+                requests_served: requests_served + 1,
+            },
+        );
+    }
+
+    // Return scratch to the per-worker pool only on the success path. Error
+    // returns (timeout, bad upstream framing, etc.) are rare in steady state
+    // and just drop the buffers; the pool refills naturally on subsequent
+    // requests.
+    return_proxy_buf(accum);
+    return_proxy_buf(read_buf);
+    AttemptOutcome::Ok(Response::Owned(out))
+}
+
+/// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body
+/// bytes received so far don't exceed `limit_rate` bytes/second since
+/// `started`. `limit_rate == 0` is a no-op (unlimited). Mirrors nginx's
+/// `ngx_http_proxy_module.c`: pacing is computed from the start of the body
+/// transfer, not per-chunk, so a slow first read isn't "credited" against
+/// later reads.
+async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: Instant) {
+    if limit_rate == 0 {
+        return;
+    }
+    let allowed_micros = paced_bytes.saturating_mul(1_000_000) / limit_rate;
+    let allowed = Duration::from_micros(allowed_micros);
+    let elapsed = started.elapsed();
+    if allowed > elapsed {
+        monoio::time::sleep(allowed - elapsed).await;
+    }
+}
+
+/// Read a chunked transfer-encoding body, decoding it into `body`. Strips
+/// chunk-size and trailing CRLF lines so the resulting `body` is the
+/// dechunked payload only. Stops at the terminating zero-length chunk.
+///
+/// `read_buf` is a caller-owned scratch passed through from `attempt`'s
+/// header-pull loop and reused for every read here too — `attempt` does
+/// one allocation for it per request and threads it through both phases.
+///
+/// Returns `Err(true)` if no bytes were read at all (indicates a stale
+/// pooled connection); `Err(false)` for any other failure.
+async fn read_chunked_body_with_buf(
+    stream: &mut TcpStream,
+    body: &mut Vec<u8>,
+    read_buf: &mut Vec<u8>,
+    read_timeout: Duration,
+) -> Result<(), bool> {
+    // Buffered reader over the stream — chunked decoding is line-oriented
+    // and we already may have leftover bytes from the header read in
+    // `body`.
+    let mut buf = std::mem::take(body);
+    let mut decoded: Vec<u8> = Vec::with_capacity(buf.len() + 4096);
+    let mut pos = 0usize;
+    let mut nothing_read = buf.is_empty();
+
+    loop {
+        // Find chunk-size line.
+        let line_end = loop {
+            if let Some(rel) = buf[pos..].iter().position(|&b| b == b'\n') {
+                break pos + rel;
+            }
+            // Need more bytes — borrow the shared read scratch.
+            let scratch = std::mem::take(read_buf);
+            let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    *read_buf = vec![0u8; 4096];
+                    return Err(false);
+                }
+            };
+            *read_buf = returned;
+            match res {
+                Ok(0) => return Err(nothing_read),
+                Ok(n) => {
+                    buf.extend_from_slice(&read_buf[..n]);
+                    nothing_read = false;
+                }
+                Err(_) => return Err(nothing_read),
+            }
+        };
+        let line = trim_crlf(&buf[pos..line_end]);
+        // Chunk extension after `;` is allowed; ignore.
+        let size_part = match line.iter().position(|&b| b == b';') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let size_str = match std::str::from_utf8(size_part) {
+            Ok(s) => s.trim(),
+            Err(_) => return Err(false),
+        };
+        let chunk_size = match u64::from_str_radix(size_str, 16) {
+            Ok(n) => n,
+            Err(_) => return Err(false),
+        };
+        pos = line_end + 1;
+        if chunk_size == 0 {
+            // Read the trailing CRLF (or any trailers, but we don't
+            // forward them — drain until the empty line).
+            loop {
+                let line_end = loop {
+                    if let Some(rel) = buf[pos..].iter().position(|&b| b == b'\n') {
+                        break pos + rel;
+                    }
+                    let scratch = std::mem::take(read_buf);
+                    let (res, returned) =
+                        match timeout(read_timeout, stream.read(scratch)).await {
+                            Ok(pair) => pair,
+                            Err(_) => {
+                                *read_buf = vec![0u8; 4096];
+                                return Err(false);
+                            }
+                        };
+                    *read_buf = returned;
+                    match res {
+                        Ok(0) => return Err(false),
+                        Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                        Err(_) => return Err(false),
+                    }
+                };
+                let line = trim_crlf(&buf[pos..line_end]);
+                pos = line_end + 1;
+                if line.is_empty() {
+                    break;
+                }
+                // Trailer line — ignore.
+            }
+            *body = decoded;
+            return Ok(());
+        }
+        // Pull `chunk_size` bytes plus trailing CRLF.
+        let need_total = chunk_size as usize + 2;
+        while buf.len() - pos < need_total {
+            let scratch = std::mem::take(read_buf);
+            let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    *read_buf = vec![0u8; 4096];
+                    return Err(false);
+                }
+            };
+            *read_buf = returned;
+            match res {
+                Ok(0) => return Err(false),
+                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                Err(_) => return Err(false),
+            }
+        }
+        decoded.extend_from_slice(&buf[pos..pos + chunk_size as usize]);
+        pos += chunk_size as usize + 2;
+        if decoded.len() > 64 * 1024 * 1024 {
+            return Err(false);
+        }
+    }
+}
+
+fn trim_crlf(s: &[u8]) -> &[u8] {
+    let mut end = s.len();
+    while end > 0 && (s[end - 1] == b'\n' || s[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn parse_status_code(status_line: &[u8]) -> u16 {
+    if status_line.len() < 12 {
+        return 0;
+    }
+    let d = &status_line[9..12];
+    if !d.iter().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    ((d[0] - b'0') as u16) * 100 + ((d[1] - b'0') as u16) * 10 + (d[2] - b'0') as u16
+}
+
+fn itoa_buf() -> [u8; 20] {
+    [0u8; 20]
+}
+
+fn u64_to_decimal(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
+    if n == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let len = buf.len() - i;
+    buf.copy_within(i.., 0);
+    &buf[..len]
+}
+
+/// Find the head/body boundary (`\r\n\r\n` or `\n\n`). Returns
+/// `(position, terminator_len)`. nginx tolerates the LF-only form.
+fn find_head_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let lflf = buf.windows(2).position(|w| w == b"\n\n");
+    match (crlf, lflf) {
+        (Some(a), Some(b)) if a < b => Some((a, 4)),
+        (Some(_), Some(b)) => Some((b, 2)),
+        (Some(a), None) => Some((a, 4)),
+        (None, Some(b)) => Some((b, 2)),
+        (None, None) => None,
+    }
+}
+
+/// Find the next line terminator (`\r\n` or `\n`). Returns
+/// `(line_len, terminator_len)`.
+fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' {
+            if i > 0 && buf[i - 1] == b'\r' {
+                return Some((i - 1, 2));
+            }
+            return Some((i, 1));
+        }
+    }
+    None
+}
+
+fn first_line_terminator_len(buf: &[u8], line_end: usize) -> usize {
+    if line_end + 1 < buf.len() && buf[line_end] == b'\r' && buf[line_end + 1] == b'\n' {
+        2
+    } else {
+        1
+    }
+}
+
+/// RFC 7230 §6.1 hop-by-hop header set, plus `Proxy-Authenticate` /
+/// `Proxy-Authorization`. Compared case-insensitively against the header
+/// name (everything before the `:`). nginx blanks these in both directions
+/// (`ngx_http_proxy_module.c::ngx_http_proxy_create_request` for request,
+/// `ngx_http_upstream.c` upstream-header handlers for response).
+fn is_hop_by_hop(name: &[u8]) -> bool {
+    const HOP_BY_HOP: &[&[u8]] = &[
+        b"connection",
+        b"keep-alive",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"te",
+        b"trailers",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    let trimmed = trim_ascii(name);
+    for &h in HOP_BY_HOP {
+        if trimmed.eq_ignore_ascii_case(h) {
+            return true;
+        }
+    }
+    false
+}
+
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = s.len();
+    while start < end && (s[start] == b' ' || s[start] == b'\t') {
+        start += 1;
+    }
+    while end > start && (s[end - 1] == b' ' || s[end - 1] == b'\t') {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_request_minimal() {
+        let bytes = build_request_bytes(b"GET", b"/foo?bar=1", b"backend.example");
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("GET /foo?bar=1 HTTP/1.0\r\n"));
+        assert!(s.contains("Host: backend.example\r\n"));
+        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn build_request_http11_no_auto_connection() {
+        let bytes = build_request_bytes_with_headers(
+            b"GET",
+            b"/",
+            1,
+            &[ProxyHeader {
+                name: b"Host",
+                value: b"x",
+            }],
+            &[],
+        );
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("GET / HTTP/1.1\r\n"));
+        // No Connection: header injected — caller decides.
+        assert!(!s.to_ascii_lowercase().contains("connection:"));
+    }
+
+    #[test]
+    fn hop_by_hop_classification() {
+        assert!(is_hop_by_hop(b"Connection"));
+        assert!(is_hop_by_hop(b"connection"));
+        assert!(is_hop_by_hop(b"  Transfer-Encoding "));
+        assert!(is_hop_by_hop(b"Keep-Alive"));
+        assert!(is_hop_by_hop(b"TE"));
+        assert!(!is_hop_by_hop(b"Content-Length"));
+        assert!(!is_hop_by_hop(b"Server"));
+        assert!(!is_hop_by_hop(b"Date"));
+    }
+}

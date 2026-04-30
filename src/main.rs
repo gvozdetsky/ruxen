@@ -1,0 +1,484 @@
+// ruxen — nginx-tests interop bootstrap.
+//
+// Startup-only surface:
+// - nginx-style CLI flags (`-c`, `-p`, `-e`, `-g`, `-t`, `-T`, `-V`)
+// - config validation mode
+// - pid file creation
+// - SIGQUIT-driven graceful shutdown
+
+use std::io;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
+mod auth;
+mod autoindex;
+mod config;
+mod file;
+mod fs_resolve;
+mod http;
+mod phase;
+mod proxy;
+mod tls;
+mod tls_certs;
+mod tls_session;
+mod upstream;
+mod uri;
+mod worker;
+
+static SIGQUIT_SEEN: AtomicBool = AtomicBool::new(false);
+static SIGHUP_SEEN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+const SIGHUP: i32 = 1;
+#[cfg(unix)]
+const SIGQUIT: i32 = 3;
+#[cfg(unix)]
+const SIGPIPE: i32 = 13;
+#[cfg(unix)]
+const SIGUSR1: i32 = 10;
+#[cfg(unix)]
+const SIGUSR2: i32 = 12;
+#[cfg(unix)]
+const SIG_UNBLOCK: i32 = 1;
+#[cfg(unix)]
+const SIG_IGN: usize = 1;
+
+/// Linux glibc `sigset_t` is 128 bytes (16 u64s); only the first element
+/// covers signals 1..64, which is all we touch.
+#[cfg(unix)]
+type SigSet = [u64; 16];
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn sigprocmask(how: i32, set: *const SigSet, oldset: *mut SigSet) -> i32;
+}
+
+extern "C" fn sigquit_handler(_sig: i32) {
+    SIGQUIT_SEEN.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn sighup_handler(_sig: i32) {
+    SIGHUP_SEEN.store(true, Ordering::SeqCst);
+}
+
+struct Cli {
+    config_path: PathBuf,
+    prefix: Option<PathBuf>,
+    errlog: Option<PathBuf>,
+    globals: Vec<String>,
+    test_only: bool,
+    dump: bool,
+    show_version: bool,
+    signal: Option<String>,
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            config_path: PathBuf::from("ruxen.conf"),
+            prefix: None,
+            errlog: None,
+            globals: Vec::new(),
+            test_only: false,
+            dump: false,
+            show_version: false,
+            signal: None,
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    match real_main() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ruxen: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn real_main() -> io::Result<()> {
+    let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
+
+    if cli.show_version {
+        print!("{}", version_output());
+        return Ok(());
+    }
+    if let Some(sig) = cli.signal {
+        return Err(io::Error::other(format!("`-s {sig}` is not supported yet")));
+    }
+
+    if let Some(prefix) = &cli.prefix {
+        std::env::set_current_dir(prefix)
+            .map_err(|e| io::Error::new(e.kind(), format!("chdir {}: {e}", prefix.display())))?;
+    }
+    // `-e errlog` is the runtime error-log destination — nginx keeps it
+    // separate from the pre-init stderr that carries `-t`/`-T` messages.
+    // Defer the redirect until after the test/dump short-circuit so config
+    // failures still surface on the controlling terminal (and match the
+    // upstream `nginx -T` behavior the Test::Nginx helpers rely on).
+
+    let (main_path, file_src) = read_main_config(&cli)?;
+    let globals_src = if cli.globals.is_empty() {
+        None
+    } else {
+        let mut merged = String::new();
+        for g in &cli.globals {
+            merged.push_str(g);
+            if !g.ends_with('\n') {
+                merged.push('\n');
+            }
+        }
+        Some(merged)
+    };
+
+    let cfg = match config::parse_with_main(main_path.clone(), file_src, globals_src) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("ruxen: [emerg] {e}");
+            if cli.test_only {
+                // Match nginx's `-T` failure tail so upstream tests' regexes
+                // (e.g. `qr/file <main> test failed/`) match our output.
+                eprintln!(
+                    "ruxen: configuration file {} test failed",
+                    main_path.display()
+                );
+            }
+            return Err(io::Error::new(std::io::ErrorKind::InvalidData, "config"));
+        }
+    };
+
+    for w in &cfg.warnings {
+        eprintln!("ruxen: [warn] {w}");
+    }
+
+    if cli.dump {
+        for entry in &cfg.dump_files {
+            println!("# configuration file {}:", entry.path.display());
+            print!("{}", entry.contents);
+            if !entry.contents.ends_with('\n') {
+                println!();
+            }
+            println!();
+        }
+    }
+    if cli.test_only {
+        return Ok(());
+    }
+
+    if let Some(errlog) = &cli.errlog {
+        redirect_stderr(errlog)?;
+    }
+
+    install_signal_handlers()?;
+
+    let pid_path = cfg.runtime.pid.clone();
+    // Resolve `worker_processes` (or `auto`) from the config; nginx
+    // defaults to 1 when unset. RUXEN_WORKERS still overrides for
+    // benchmarking convenience.
+    let config_workers = match cfg.runtime.worker_processes {
+        Some(config::WorkerProcesses::Count(n)) => n,
+        Some(config::WorkerProcesses::Auto) => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        None => 1,
+    };
+    let http: &'static worker::PreparedHttp = worker::prepare(cfg);
+    let runtime = Arc::new(worker::RuntimeState::default());
+
+    let n_workers: usize = std::env::var("RUXEN_WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(config_workers);
+    let pin = matches!(std::env::var("RUXEN_PIN").as_deref(), Ok("1"));
+
+    let mut handles = Vec::with_capacity(n_workers);
+    for i in 0..n_workers {
+        let cpu = if pin { Some(i) } else { None };
+        let runtime = runtime.clone();
+        let handle = thread::Builder::new()
+            .name(format!("ruxen-worker-{i}"))
+            .spawn(move || worker::run(http, cpu, runtime))?;
+        handles.push(handle);
+    }
+
+    if let Some(path) = &pid_path {
+        write_pid_file(path)?;
+    }
+
+    let signal_runtime = runtime.clone();
+    let signal_monitor = thread::spawn(move || {
+        while !signal_runtime.is_shutting_down() {
+            if SIGQUIT_SEEN.load(Ordering::SeqCst) {
+                signal_runtime.begin_shutdown();
+                return;
+            }
+            // Drain any pending SIGHUP into a reload-gen bump. The signal
+            // handler stores `true`; clearing it here means we coalesce
+            // multiple HUPs that arrive within one tick into a single
+            // bump, which is fine — the per-connection check is just
+            // `gen != start_gen`.
+            if SIGHUP_SEEN.swap(false, Ordering::SeqCst) {
+                signal_runtime.bump_reload_gen();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+
+    for handle in handles {
+        if handle.join().is_err() {
+            runtime.begin_shutdown();
+            return Err(io::Error::other("worker thread panicked"));
+        }
+    }
+
+    runtime.begin_shutdown();
+    let _ = signal_monitor.join();
+
+    if let Some(path) = &pid_path {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn parse_cli<I>(args: I) -> Result<Cli, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut cli = Cli::default();
+    let mut args = args.into_iter();
+    let mut saw_positional = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" => {
+                let value = args.next().ok_or("option `-c` requires a file name")?;
+                cli.config_path = PathBuf::from(value);
+            }
+            "-p" => {
+                let value = args.next().ok_or("option `-p` requires a directory")?;
+                cli.prefix = Some(PathBuf::from(value));
+            }
+            "-e" => {
+                let value = args.next().ok_or("option `-e` requires a file name")?;
+                cli.errlog = Some(PathBuf::from(value));
+            }
+            "-g" => {
+                let value = args.next().ok_or("option `-g` requires directives")?;
+                cli.globals.push(value);
+            }
+            "-t" => cli.test_only = true,
+            "-T" => {
+                cli.test_only = true;
+                cli.dump = true;
+            }
+            "-V" => cli.show_version = true,
+            "-s" => {
+                let value = args.next().ok_or("option `-s` requires a signal name")?;
+                cli.signal = Some(value);
+            }
+            other if other.starts_with('-') => return Err(format!("unknown option `{other}`")),
+            other => {
+                if saw_positional {
+                    return Err(format!("unexpected extra positional argument `{other}`"));
+                }
+                cli.config_path = PathBuf::from(other);
+                saw_positional = true;
+            }
+        }
+    }
+
+    Ok(cli)
+}
+
+fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
+    let abs = cli.config_path.canonicalize().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("opening {}: {e}", cli.config_path.display()),
+        )
+    })?;
+    let src = std::fs::read_to_string(&abs)
+        .map_err(|e| io::Error::new(e.kind(), format!("reading {}: {e}", abs.display())))?;
+    Ok((abs, src))
+}
+
+fn version_output() -> &'static str {
+    concat!(
+        "nginx version: nginx/1.29.2\n",
+        "TLS SNI support enabled\n",
+        "configure arguments:",
+        " --with-http_ssl_module",
+        " --without-pcre",
+        " --without-http-cache",
+        " --without-http_charset_module",
+        " --without-http_gzip_module",
+        " --without-http_ssi_module",
+        " --without-http_mirror_module",
+        " --without-http_userid_module",
+        " --without-http_access_module",
+        " --without-http_geo_module",
+        " --without-http_referer_module",
+        " --without-http_fastcgi_module",
+        " --without-http_uwsgi_module",
+        " --without-http_scgi_module",
+        " --without-http_grpc_module",
+        " --without-http_memcached_module",
+        " --without-http_limit_conn_module",
+        " --without-http_limit_req_module",
+        " --without-http_empty_gif_module",
+        " --without-http_browser_module",
+        " --without-http_upstream_hash_module",
+        " --without-http_upstream_ip_hash_module",
+        " --without-http_upstream_least_conn_module",
+        " --without-http_upstream_random_module",
+        " --without-http_upstream_zone_module",
+        " --without-http_upstream_sticky_module",
+        " --without-mail_pop3_module",
+        " --without-mail_imap_module",
+        " --without-mail_smtp_module",
+        "\n",
+    )
+}
+
+fn write_pid_file(path: &Path) -> io::Result<()> {
+    std::fs::write(path, format!("{}\n", std::process::id())).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("writing pid file {}: {e}", path.display()),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn redirect_stderr(path: &Path) -> io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let rc = unsafe { dup2(file.as_raw_fd(), 2) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() -> io::Result<()> {
+    let rc = unsafe { signal(SIGQUIT, sigquit_handler as *const () as usize) };
+    if rc == usize::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    // SIGHUP triggers a "reload" — we don't actually re-read config or
+    // re-exec workers, but we do bump the reload generation so that
+    // already-accepted connections close (idle keepalive bails out, the
+    // post-request keepalive check sets `Connection: close`). New
+    // connections accepted after the bump keep going.
+    if unsafe { signal(SIGHUP, sighup_handler as *const () as usize) } == usize::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    // SIGUSR1 / SIGUSR2 (log reopen, binary upgrade) and SIGPIPE are not
+    // implemented yet, but their default disposition is "terminate" — the
+    // upstream test harness sends them and we don't want to die. Ignore.
+    for sig in [SIGUSR1, SIGUSR2, SIGPIPE] {
+        if unsafe { signal(sig, SIG_IGN) } == usize::MAX {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // A parent with SIGQUIT masked (some shells, many CI harnesses) would
+    // otherwise leave the signal pending forever — the handler is installed
+    // but the kernel can't find a thread with it unblocked. Runs on the main
+    // thread before workers spawn, so children inherit the unblocked mask.
+    let mut set: SigSet = [0; 16];
+    set[0] = 1u64 << (SIGQUIT - 1);
+    if unsafe { sigprocmask(SIG_UNBLOCK, &set, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_output_is_pinned() {
+        assert_eq!(
+            version_output(),
+            concat!(
+                "nginx version: nginx/1.29.2\n",
+                "TLS SNI support enabled\n",
+                "configure arguments:",
+                " --with-http_ssl_module",
+                " --without-pcre",
+                " --without-http-cache",
+                " --without-http_charset_module",
+                " --without-http_gzip_module",
+                " --without-http_ssi_module",
+                " --without-http_mirror_module",
+                " --without-http_userid_module",
+                " --without-http_access_module",
+                " --without-http_geo_module",
+                " --without-http_referer_module",
+                " --without-http_fastcgi_module",
+                " --without-http_uwsgi_module",
+                " --without-http_scgi_module",
+                " --without-http_grpc_module",
+                " --without-http_memcached_module",
+                " --without-http_limit_conn_module",
+                " --without-http_limit_req_module",
+                " --without-http_empty_gif_module",
+                " --without-http_browser_module",
+                " --without-http_upstream_hash_module",
+                " --without-http_upstream_ip_hash_module",
+                " --without-http_upstream_least_conn_module",
+                " --without-http_upstream_random_module",
+                " --without-http_upstream_zone_module",
+                " --without-http_upstream_sticky_module",
+                " --without-mail_pop3_module",
+                " --without-mail_imap_module",
+                " --without-mail_smtp_module",
+                "\n",
+            )
+        );
+    }
+
+    #[test]
+    fn parse_cli_supports_nginx_flags() {
+        let cli = parse_cli([
+            "-p".into(),
+            "/tmp/prefix".into(),
+            "-c".into(),
+            "nginx.conf".into(),
+            "-e".into(),
+            "error.log".into(),
+            "-g".into(),
+            "pid logs/nginx.pid;".into(),
+            "-t".into(),
+        ])
+        .unwrap();
+        assert_eq!(cli.prefix.as_deref(), Some(Path::new("/tmp/prefix")));
+        assert_eq!(cli.config_path, PathBuf::from("nginx.conf"));
+        assert_eq!(cli.errlog.as_deref(), Some(Path::new("error.log")));
+        assert_eq!(cli.globals, vec!["pid logs/nginx.pid;"]);
+        assert!(cli.test_only);
+    }
+}
