@@ -6,6 +6,8 @@
 //! against a single upstream peer and checking that the backend saw
 //! fewer accept events than requests.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -102,7 +104,12 @@ struct Backend {
 
 impl Backend {
     fn spawn(response: &'static [u8]) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bind under SETUP_LOCK so a parallel test can't grab this port in the
+        // window between its pick_port() drop and its ruxen's bind.
+        let listener = {
+            let _g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            TcpListener::bind("127.0.0.1:0").unwrap()
+        };
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -272,9 +279,8 @@ fn m42_down_peer_is_skipped() {
     let live = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nL");
     // Pick a port that's almost certainly free; using a random :0 binding
     // and immediately closing it gives us a "should-fail-to-connect" port.
-    let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_port = dead_listener.local_addr().unwrap().port();
-    drop(dead_listener);
+    let dead = common::ports::DeadPort::new();
+    let dead_port = dead.port();
 
     let conf = format!(
         r#"

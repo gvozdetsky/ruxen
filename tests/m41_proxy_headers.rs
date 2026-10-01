@@ -100,7 +100,12 @@ struct Backend {
 
 impl Backend {
     fn spawn(response: Vec<u8>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bind under SETUP_LOCK so a parallel test can't grab this port in the
+        // window between its pick_port() drop and its ruxen's bind.
+        let listener = {
+            let _g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            TcpListener::bind("127.0.0.1:0").unwrap()
+        };
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -7,4 +7,5 @@
 
 #![allow(dead_code)] // not every integration test consumes every helper
 
+pub mod ports;
 pub mod tls;
