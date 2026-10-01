@@ -18,6 +18,9 @@ pub(crate) struct LexerFrame {
 
 pub(crate) struct Lexer {
     frames: Vec<LexerFrame>,
+    /// Directory of the main config file — nginx's `cycle->conf_prefix`.
+    /// `None` for inline test parses.
+    conf_prefix: Option<PathBuf>,
     dump_files: Vec<DumpFile>,
     dump_seen: std::collections::HashSet<PathBuf>,
 }
@@ -30,6 +33,7 @@ impl Lexer {
                 bytes: src.as_bytes().to_vec(),
                 pos: 0,
             }],
+            conf_prefix: None,
             dump_files: Vec::new(),
             dump_seen: std::collections::HashSet::new(),
         }
@@ -38,6 +42,7 @@ impl Lexer {
     pub(crate) fn new_with_main(path: PathBuf, src: String) -> Self {
         let mut s = Self {
             frames: Vec::new(),
+            conf_prefix: path.parent().map(Path::to_path_buf),
             dump_files: Vec::new(),
             dump_seen: std::collections::HashSet::new(),
         };
@@ -62,6 +67,10 @@ impl Lexer {
             bytes: src.into_bytes(),
             pos: 0,
         });
+    }
+
+    pub(crate) fn conf_prefix(&self) -> Option<&Path> {
+        self.conf_prefix.as_deref()
     }
 
     pub(crate) fn take_dump_files(&mut self) -> Vec<DumpFile> {

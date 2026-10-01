@@ -520,6 +520,7 @@ fn process_with_meta_inner(
                         meta.post_action = server.post_action;
                         meta.remote_user = None;
                         match run_access_control(
+                            http,
                             req,
                             server.auth_basic,
                             server.auth_basic_user_file,
@@ -563,7 +564,7 @@ fn process_with_meta_inner(
                 meta,
             );
         }
-        match run_rewrite_program(
+        let rewrite_broke = match run_rewrite_program(
             http,
             server,
             loc,
@@ -573,26 +574,36 @@ fn process_with_meta_inner(
             &mut rewrite_state,
             regex_captures.as_ref(),
         ) {
-            RewriteOutcome::Continue => {}
+            RewriteOutcome::Continue => false,
+            RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
             RewriteOutcome::Respond(response) => return (response, meta),
-        }
+        };
         // Access-control phase (auth_basic/auth_basic_user_file): runs after
-        // rewrite and before content dispatch.
+        // rewrite and before content dispatch. A top-level `return` is a
+        // rewrite-module directive in nginx, so it answers in the rewrite
+        // phase and access control never runs for it — unless a `break`
+        // ended the rewrite program first, in which case nginx never reaches
+        // the `return` and does run access control.
         meta.remote_user = None;
-        match run_access_control(
-            req,
-            loc.auth_basic,
-            loc.auth_basic_user_file,
-            loc.auth_delay_ms,
-            loc.server_header,
-        ) {
-            AccessControl::Allow { remote_user } => {
-                meta.remote_user = remote_user;
-            }
-            AccessControl::Deny { response, delay_ms } => {
-                meta.response_delay_ms = delay_ms;
-                return (response, meta);
+        let answered_in_rewrite_phase =
+            !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
+        if !answered_in_rewrite_phase {
+            match run_access_control(
+                http,
+                req,
+                loc.auth_basic,
+                loc.auth_basic_user_file,
+                loc.auth_delay_ms,
+                loc.server_header,
+            ) {
+                AccessControl::Allow { remote_user } => {
+                    meta.remote_user = remote_user;
+                }
+                AccessControl::Deny { response, delay_ms } => {
+                    meta.response_delay_ms = delay_ms;
+                    return (response, meta);
+                }
             }
         }
         // Surface the location's `add_header` list onto `meta` ahead of
@@ -706,6 +717,7 @@ enum AccessControl {
 }
 
 fn run_access_control(
+    http: &PreparedHttp,
     req: &RequestCtx<'_>,
     auth_basic: PreparedAuthBasic,
     auth_basic_user_file: Option<&Path>,
@@ -726,7 +738,7 @@ fn run_access_control(
             delay_ms: 0,
         };
     };
-    let user_file = match resolve_auth_basic_user_file(req, user_file) {
+    let user_file = match resolve_auth_basic_user_file(req, user_file, http.conf_prefix) {
         Some(path) => path,
         None => {
             return AccessControl::Deny {
@@ -777,7 +789,15 @@ fn run_access_control(
     }
 }
 
-fn resolve_auth_basic_user_file<'a>(req: &RequestCtx<'_>, user_file: &'a Path) -> Option<Cow<'a, Path>> {
+/// Literal paths were already resolved against the config directory at
+/// parse time. Paths with variables are rendered per request; a relative
+/// result is then resolved against the config directory too, matching
+/// nginx's `ccv.conf_prefix = 1` for this directive.
+fn resolve_auth_basic_user_file<'a>(
+    req: &RequestCtx<'_>,
+    user_file: &'a Path,
+    conf_prefix: Option<&Path>,
+) -> Option<Cow<'a, Path>> {
     let raw = user_file.to_string_lossy();
     if !raw.as_bytes().contains(&b'$') {
         return Some(Cow::Borrowed(user_file));
@@ -792,8 +812,8 @@ fn resolve_auth_basic_user_file<'a>(req: &RequestCtx<'_>, user_file: &'a Path) -
             ValuePart::Var(var) => write_auth_path_var(&var, req, args, uri, &mut rendered),
         }
     }
-    let rendered = String::from_utf8_lossy(&rendered);
-    Some(Cow::Owned(PathBuf::from(rendered.as_ref())))
+    let rendered = PathBuf::from(String::from_utf8_lossy(&rendered).as_ref());
+    Some(Cow::Owned(crate::config::resolve_conf_path(conf_prefix, rendered)))
 }
 
 fn write_auth_path_var(
@@ -1328,14 +1348,14 @@ mod tests {
     #[test]
     fn auth_basic_user_file_expands_arg_variable() {
         let req = ctx(b"/var/?f=htpasswd", Some(b"localhost"), true);
-        let resolved = resolve_auth_basic_user_file(&req, Path::new("$arg_f")).unwrap();
+        let resolved = resolve_auth_basic_user_file(&req, Path::new("$arg_f"), None).unwrap();
         assert_eq!(resolved.as_ref(), Path::new("htpasswd"));
     }
 
     #[test]
     fn auth_basic_user_file_decodes_percent_encoded_arg_value() {
         let req = ctx(b"/var/?f=sub%2Fhtpasswd", Some(b"localhost"), true);
-        let resolved = resolve_auth_basic_user_file(&req, Path::new("$arg_f")).unwrap();
+        let resolved = resolve_auth_basic_user_file(&req, Path::new("$arg_f"), None).unwrap();
         assert_eq!(resolved.as_ref(), Path::new("sub/htpasswd"));
     }
 

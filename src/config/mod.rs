@@ -158,6 +158,7 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
     let mut http = http.ok_or(Error::UnexpectedEof)?;
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
+    http.conf_prefix = lx.conf_prefix().map(Path::to_path_buf);
     Ok(http)
 }
 
@@ -222,6 +223,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     servers,
                     warnings,
                     dump_files: Vec::new(),
+                    conf_prefix: None,
                 }),
                 Terminator::Eof => Err(Error::UnclosedBlock),
                 _ => Err(Error::UnexpectedEof),
@@ -469,7 +471,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 if auth_basic_user_file.is_some() {
                     return Err(Error::Duplicate("auth_basic_user_file"));
                 }
-                auth_basic_user_file = Some(parse_auth_basic_user_file_args(&args[1..])?);
+                auth_basic_user_file =
+                    Some(parse_auth_basic_user_file_args(&args[1..], lx.conf_prefix())?);
             }
             ("auth_delay", Terminator::Semi) => {
                 if auth_delay_ms.is_some() {
