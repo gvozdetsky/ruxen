@@ -22,6 +22,8 @@ ensure_file_size "${BENCH_ROOT}/m3/hello.txt" "1024"
 ensure_file_size "${BENCH_ROOT}/m5/hello.txt" "1024"
 ensure_file_size "${BENCH_ROOT}/static_8k/hello.txt" "8192"
 "${BENCH_ROOT}/m19/generate.sh"
+"${BENCH_ROOT}/auth_basic/generate.sh"
+"${BENCH_ROOT}/tls/generate.sh"
 
 ls -lh "${BENCH_ROOT}/m3/hello.txt" "${BENCH_ROOT}/m5/hello.txt" \
     "${BENCH_ROOT}/static_8k/hello.txt" \

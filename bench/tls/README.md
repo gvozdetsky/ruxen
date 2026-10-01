@@ -37,18 +37,15 @@ OpenSSL in nginx).
 
 ## Steady-state throughput
 
-Driven by the existing harness:
+Driven by the per-scenario harness:
 
 ```
-./bench/scripts/run_all.sh --scenario tls_hello --server both \
-    --variants workers_32 --server-order nginx-first \
-    --output-dir /tmp/abba_tls
-./bench/scripts/run_all.sh --scenario tls_hello --server both \
-    --variants workers_32 --server-order ruxen-first \
-    --output-dir /tmp/abba_tls
+bench/scripts/prepare_fixtures.sh
+bench/scripts/baseline.sh tls_hello          # nginx reference
+bench/scripts/measure.sh tls_hello --runs 3  # ruxen
 ```
 
-Numbers are in [`bench/RESULTS.md`](../RESULTS.md) under "TLS — hello".
+Numbers are in [`RESULTS.md`](RESULTS.md).
 
 ## Handshake measurement
 

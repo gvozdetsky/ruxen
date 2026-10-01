@@ -6,8 +6,8 @@
    `bench/<config-dir>/RESULTS.md` next to the config.
 
 `bench/scenarios/manifest.tsv` is the single source of truth for what each
-scenario does (URL, wrk shape, config path, headers). Both workflows read
-from it.
+scenario does (URL, wrk shape, config path, headers). `baseline.sh` and
+`measure.sh` read from it.
 
 ## Layout
 
@@ -22,9 +22,6 @@ from it.
 - `bench/<config-dir>/RESULTS.md` — auto-rendered from the two TSVs above;
   do not hand-edit.
 - `bench/scenarios/manifest.tsv` — workload matrix.
-- `bench/variants/ruxen.tsv` — ruxen runtime config variants (`RUXEN_*` env)
-  for the matrix runner.
-- `bench/runs/<timestamp>/` — output of full matrix sweeps.
 
 ## Prerequisites
 
@@ -37,9 +34,12 @@ cargo build --release
 Required in `PATH`: `wrk`, `curl`, `nginx`.
 
 Some scenarios need fixtures (the `m19` 1MiB / 128MiB blobs, TLS certs,
-htpasswd files). The matrix runner runs those automatically;
-`baseline.sh` / `measure.sh` do not. Run `bench/scripts/prepare_fixtures.sh`
-once if you're not using `run_all.sh`.
+htpasswd files). `baseline.sh` / `measure.sh` don't create them — run
+`bench/scripts/prepare_fixtures.sh` once first.
+
+Both servers are started with the config's own directory as the prefix
+(`-p bench/<config-dir>/`), so relative `root` and `auth_basic_user_file`
+paths in the configs work from any checkout location.
 
 ---
 
@@ -95,19 +95,6 @@ investigating.
 
 ---
 
-## Full matrix sweep
-
-```bash
-bench/scripts/prepare_fixtures.sh
-bench/scripts/run_all.sh
-```
-
-Runs every scenario in `manifest.tsv`, the nginx baseline (`variant=default`),
-and every ruxen variant in `variants/ruxen.tsv`. Output lands in
-`bench/runs/<run_id>/`.
-
----
-
 ## Adding a new scenario
 
 Append a line to `bench/scenarios/manifest.tsv`:
@@ -118,40 +105,15 @@ id|description|port|path|threads|connections|duration|warmup|cooldown|nginx_conf
 
 Field notes:
 
-- `header_mode`: `none`, `static`, or `etag`.
+- `header_mode`: `none`, `static`, `etag`, or `last_modified`.
   - `static` reads `headers` as `Header: v;Header2: v2`.
   - `etag` fetches the live ETag and sends it as `If-None-Match`.
-- `prepare_script` is optional; must be executable when set.
+  - `last_modified` fetches the live `Last-Modified` and sends it as
+    `If-Modified-Since` (so the 304 path works regardless of checkout mtime).
+- `prepare_script` is optional and documents which fixture generator the
+  scenario needs; `prepare_fixtures.sh` runs all of them.
 - `scheme` defaults to `http`; set to `https` for TLS scenarios.
 - Multiple scenarios can share a `nginx_config` (e.g. `m3` has two, `m5`
   has five) — they'll appear as separate sections in the same `RESULTS.md`.
 
 After adding, run `baseline.sh <new_id>` to capture the reference.
-
-## Adding a new ruxen variant (matrix runner only)
-
-Append to `bench/variants/ruxen.tsv`:
-
-```
-id|description|ENV1=val ENV2=val
-```
-
-The runner injects this env when starting ruxen.
-
----
-
-## Tips
-
-- **Interpreting Δ.** The Δ columns compare ruxen's measured value to the
-  nginx baseline *median*, not its mean. Median is robust to the
-  warmup-of-warmup outlier that often shows up in iteration 1.
-- **Reading noise.** Re-run `measure.sh --runs 3` (or higher) before chasing
-  a small regression; on this hardware single-iteration noise is comfortably
-  ±2-3% on req/s.
-- **Recapture cadence.** Recapture the baseline if the deltas start drifting
-  in the same direction across unrelated changes — that's a sign the
-  reference has gone stale, not that ruxen is regressing.
-- **Governor matters.** On a laptop with `governor=powersave` the absolute
-  numbers are lower than `performance`, but the *relative* deltas between
-  nginx and ruxen on the same machine are what we track. The baseline
-  records the governor so you can see when this changed.

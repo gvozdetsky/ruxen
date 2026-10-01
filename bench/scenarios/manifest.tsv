@@ -1,0 +1,29 @@
+# id|description|port|path|threads|connections|duration|warmup|cooldown|nginx_config|prepare_script|header_mode|headers|scheme
+#
+# Reconstructed 2026-10-01: the original manifest was not included in the
+# initial public commit. Ports, paths and fixtures come from each config; the
+# wrk shape (-t16 -c512, 30s measure, 5s warmup, 20s cooldown) comes from
+# DESIGN.md / bench/README.md. The *_low_concurrency shape (-t4 -c32) is a
+# best guess, so re-capture those baselines before comparing against them.
+m1_hello|return 200 "hello", keep-alive|8080|/|16|512|30s|5s|20|bench/m1/nginx.conf||none||http
+m1_no_keepalive|return 200 "hello", keepalive_timeout 0|8081|/|16|512|30s|5s|20|bench/m1_no_keepalive/nginx.conf||none||http
+m1_keepalive_requests_1|return 200 "hello", keepalive_requests 1|8082|/|16|512|30s|5s|20|bench/m1_keepalive_requests_1/nginx.conf||none||http
+m3_static_1k|static 1 KiB file, keep-alive|8090|/hello.txt|16|512|30s|5s|20|bench/m3/nginx.conf||none||http
+m3_static_1k_low_concurrency|static 1 KiB file, low concurrency|8090|/hello.txt|4|32|30s|5s|20|bench/m3/nginx.conf||none||http
+m3_static_1k_no_keepalive|static 1 KiB file, keepalive disabled|8091|/hello.txt|16|512|30s|5s|20|bench/m3_no_keepalive/nginx.conf||none||http
+m5_conditional_304|If-None-Match -> 304|8090|/hello.txt|16|512|30s|5s|20|bench/m5/nginx.conf||etag||http
+m5_if_modified_since_304|If-Modified-Since -> 304|8090|/hello.txt|16|512|30s|5s|20|bench/m5/nginx.conf||last_modified||http
+m5_range_206|Range bytes=0-511 -> 206|8090|/hello.txt|16|512|30s|5s|20|bench/m5/nginx.conf||static|Range: bytes=0-511|http
+m5_range_open_ended_206|Range bytes=512- -> 206|8090|/hello.txt|16|512|30s|5s|20|bench/m5/nginx.conf||static|Range: bytes=512-|http
+m5_range_suffix_206|Range bytes=-512 -> 206|8090|/hello.txt|16|512|30s|5s|20|bench/m5/nginx.conf||static|Range: bytes=-512|http
+m19_stream_1m|streamed 1 MiB file|8090|/1M.bin|16|512|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
+m19_stream_1m_low_concurrency|streamed 1 MiB file, low concurrency|8090|/1M.bin|4|32|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
+m19_stream_128m|streamed 128 MiB file|8090|/128M.bin|16|512|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
+static_8k|static 8 KiB file, keep-alive|8102|/hello.txt|16|512|30s|5s|20|bench/static_8k/nginx.conf||none||http
+add_header_many|return 200 + 6 add_header|8101|/|16|512|30s|5s|20|bench/add_header_many/nginx.conf||none||http
+auth_basic_hello|auth_basic {SHA} verify + return 200|8096|/|16|512|30s|5s|20|bench/auth_basic/nginx.conf|bench/auth_basic/generate.sh|static|Authorization: Basic dXNlcjpoZWxsbw==|http
+error_page_intercept|try_files 404 -> error_page = /fallback|8104|/missing.txt|16|512|30s|5s|20|bench/error_page_intercept/nginx.conf||none||http
+rewrite_hello|rewrite /foo -> /bar last|8097|/foo|16|512|30s|5s|20|bench/rewrite/nginx.conf||none||http
+vars_map|map $http_user_agent -> return 200 $kind|8100|/|16|512|30s|5s|20|bench/vars_map/nginx.conf||static|User-Agent: wrk|http
+proxy_hello|proxy_pass to in-process upstream with keepalive|8095|/|16|512|30s|5s|20|bench/proxy_pass/nginx.conf||none||http
+tls_hello|TLS 1.3 return 200 "hello"|8443|/|16|512|30s|5s|20|bench/tls/nginx.conf|bench/tls/generate.sh|none||https

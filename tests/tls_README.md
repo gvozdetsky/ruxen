@@ -114,7 +114,7 @@ from the `server_name b.example` block.
 
 ## Bench (mirror of `bench/m1` for HTTPS)
 
-Long-form lives in `bench/RESULTS.md` under "TLS — hello". Quick smoke:
+Long-form lives in [`bench/tls/RESULTS.md`](../bench/tls/RESULTS.md). Quick smoke:
 
 ```bash
 wrk -t8 -c128 -d10s --latency \

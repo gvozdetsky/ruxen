@@ -37,16 +37,25 @@ wait_for_http() {
     return 1
 }
 
+# Both servers run with the config's own directory as the prefix (`-p`), so
+# relative `root` / `auth_basic_user_file` paths in bench configs resolve the
+# same way for nginx and ruxen, regardless of where the repo is checked out.
+conf_prefix() {
+    printf '%s/\n' "$(dirname "$1")"
+}
+
 start_nginx() {
     local conf="$1"
     local server_log="$2"
-    nginx -p /tmp -c "$conf" -s quit >/dev/null 2>&1 || true
-    nginx -p /tmp -c "$conf" >"$server_log" 2>&1
+    local prefix
+    prefix="$(conf_prefix "$conf")"
+    nginx -p "$prefix" -c "$conf" -s quit >/dev/null 2>&1 || true
+    nginx -p "$prefix" -c "$conf" >"$server_log" 2>&1
 }
 
 stop_nginx() {
     local conf="$1"
-    nginx -p /tmp -c "$conf" -s quit >/dev/null 2>&1 || true
+    nginx -p "$(conf_prefix "$conf")" -c "$conf" -s quit >/dev/null 2>&1 || true
 }
 
 start_ruxen() {
@@ -59,7 +68,7 @@ start_ruxen() {
         read -r -a env_parts <<<"$env_line"
     fi
 
-    env "${env_parts[@]}" "${REPO_ROOT}/target/release/ruxen" -c "$conf" >"$server_log" 2>&1 &
+    env "${env_parts[@]}" "${REPO_ROOT}/target/release/ruxen" -p "$(conf_prefix "$conf")" -c "$conf" >"$server_log" 2>&1 &
     echo $!
 }
 
@@ -83,6 +92,18 @@ extract_etag() {
     curl -fsSI "${tls_opts[@]}" "$url" \
         | tr -d '\r' \
         | awk 'BEGIN { IGNORECASE=1 } $1=="ETag:" { print $2; exit }'
+}
+
+extract_last_modified() {
+    local url="$1"
+    local scheme="${2:-http}"
+    local -a tls_opts=()
+    if [[ "$scheme" == "https" ]]; then
+        tls_opts=(-k)
+    fi
+    curl -fsSI "${tls_opts[@]}" "$url" \
+        | tr -d '\r' \
+        | awk 'BEGIN { IGNORECASE=1 } tolower($1)=="last-modified:" { sub(/^[^:]*: */, ""); print; exit }'
 }
 
 wrk_metric_requests_sec() {
@@ -227,6 +248,12 @@ resolve_wrk_headers() {
             etag="$(extract_etag "$url" "$scheme")"
             [[ -n "$etag" ]] || die "failed to fetch ETag for $url"
             printf 'If-None-Match: %s\n' "$etag"
+            ;;
+        last_modified)
+            local lm
+            lm="$(extract_last_modified "$url" "$scheme")"
+            [[ -n "$lm" ]] || die "failed to fetch Last-Modified for $url"
+            printf 'If-Modified-Since: %s\n' "$lm"
             ;;
         *)
             die "unknown header_mode '$header_mode'"
