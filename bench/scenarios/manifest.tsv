@@ -4,7 +4,9 @@
 # initial public commit. Ports, paths and fixtures come from each config; the
 # wrk shape (-t16 -c512, 30s measure, 5s warmup, 20s cooldown) comes from
 # DESIGN.md / bench/README.md. The *_low_concurrency shape (-t4 -c32) is a
-# best guess, so re-capture those baselines before comparing against them.
+# best guess; baselines re-captured with it on 2026-10-01. m19_stream_128m
+# uses -c64: at -c512 each 128 MiB response takes longer than wrk's 2s
+# timeout on loopback.
 m1_hello|return 200 "hello", keep-alive|8080|/|16|512|30s|5s|20|bench/m1/nginx.conf||none||http
 m1_no_keepalive|return 200 "hello", keepalive_timeout 0|8081|/|16|512|30s|5s|20|bench/m1_no_keepalive/nginx.conf||none||http
 m1_keepalive_requests_1|return 200 "hello", keepalive_requests 1|8082|/|16|512|30s|5s|20|bench/m1_keepalive_requests_1/nginx.conf||none||http
@@ -18,7 +20,7 @@ m5_range_open_ended_206|Range bytes=512- -> 206|8090|/hello.txt|16|512|30s|5s|20
 m5_range_suffix_206|Range bytes=-512 -> 206|8090|/hello.txt|16|512|30s|5s|20|bench/m5/nginx.conf||static|Range: bytes=-512|http
 m19_stream_1m|streamed 1 MiB file|8090|/1M.bin|16|512|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
 m19_stream_1m_low_concurrency|streamed 1 MiB file, low concurrency|8090|/1M.bin|4|32|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
-m19_stream_128m|streamed 128 MiB file|8090|/128M.bin|16|512|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
+m19_stream_128m|streamed 128 MiB file|8090|/128M.bin|16|64|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
 static_8k|static 8 KiB file, keep-alive|8102|/hello.txt|16|512|30s|5s|20|bench/static_8k/nginx.conf||none||http
 add_header_many|return 200 + 6 add_header|8101|/|16|512|30s|5s|20|bench/add_header_many/nginx.conf||none||http
 auth_basic_hello|auth_basic {SHA} verify + 5-byte static file|8096|/hello.txt|16|512|30s|5s|20|bench/auth_basic/nginx.conf|bench/auth_basic/generate.sh|static|Authorization: Basic dXNlcjpoZWxsbw==|http
