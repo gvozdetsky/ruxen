@@ -35,6 +35,10 @@ use super::*;
 
 pub enum RewriteOutcome {
     Continue,
+    /// The program ended on `break` (or `rewrite ... break`): the rest of
+    /// the location's rewrite-module directives, including a top-level
+    /// `return`, must not run.
+    Break,
     Reroute,
     Respond(Response),
 }
@@ -416,7 +420,8 @@ pub(crate) fn run_rewrite_program(
         rewrite_state,
         server_name_captures,
     ) {
-        RewriteControl::Continue | RewriteControl::Stop => RewriteOutcome::Continue,
+        RewriteControl::Continue => RewriteOutcome::Continue,
+        RewriteControl::Stop => RewriteOutcome::Break,
         RewriteControl::Reroute => RewriteOutcome::Reroute,
         RewriteControl::Respond(resp) => RewriteOutcome::Respond(resp),
     }

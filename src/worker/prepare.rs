@@ -57,6 +57,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
         servers,
         warnings: _,
         dump_files: _,
+        conf_prefix,
     } = cfg;
 
     if servers.is_empty() {
@@ -172,6 +173,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
         bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),
         gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
         upstreams: prepared_upstreams,
+        conf_prefix: conf_prefix.map(leak_path_buf),
     }))
 }
 

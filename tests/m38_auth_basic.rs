@@ -55,6 +55,11 @@ fn wait_for_listen(port: u16) {
 }
 
 fn spawn_server(conf_body: &str) -> (ServerGuard, u16, PathBuf) {
+    spawn_server_with_args(conf_body, &[])
+}
+
+/// `extra_args` go before `-c`, e.g. `["-p", "/some/prefix/"]`.
+fn spawn_server_with_args(conf_body: &str, extra_args: &[&str]) -> (ServerGuard, u16, PathBuf) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
     let conf_path = dir.join("ruxen.conf");
@@ -67,6 +72,7 @@ fn spawn_server(conf_body: &str) -> (ServerGuard, u16, PathBuf) {
     .unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+        .args(extra_args)
         .args(["-c", conf_path.to_str().unwrap()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -155,6 +161,13 @@ fn write_htpasswd(path: &std::path::Path) {
     .unwrap();
 }
 
+/// Static file served through the content phase. Auth tests need a content
+/// handler: a location `return` answers in nginx's rewrite phase, before
+/// access control runs.
+fn write_ok_file(dir: &std::path::Path) {
+    std::fs::write(dir.join("ok.txt"), "ok").unwrap();
+}
+
 #[test]
 fn missing_and_malformed_authorization_get_401_with_realm_header() {
     let conf = r#"
@@ -164,21 +177,22 @@ http {
     listen 127.0.0.1:%%PORT%%;
     auth_basic "Admin Zone";
     auth_basic_user_file %%DIR%%/users.htpasswd;
-    location / { return 200 "ok"; }
+    location / { root %%DIR%%; }
   }
 }
 "#;
     let (_guard, port, dir) = spawn_server(conf);
     write_htpasswd(&dir.join("users.htpasswd"));
+    write_ok_file(&dir);
 
-    let no_header = http_get(port, "/", &[]);
+    let no_header = http_get(port, "/ok.txt", &[]);
     assert_eq!(status(&no_header), 401);
     assert_eq!(
         header(&no_header, "WWW-Authenticate").as_deref(),
         Some(r#"Basic realm="Admin Zone""#)
     );
 
-    let bad_b64 = http_get(port, "/", &[("Authorization", "Basic !!!")]);
+    let bad_b64 = http_get(port, "/ok.txt", &[("Authorization", "Basic !!!")]);
     assert_eq!(status(&bad_b64), 401);
     assert_eq!(
         header(&bad_b64, "WWW-Authenticate").as_deref(),
@@ -195,25 +209,29 @@ http {
     listen 127.0.0.1:%%PORT%%;
     auth_basic "Ruxen";
     auth_basic_user_file %%DIR%%/users.htpasswd;
-    location / { return 200 "ok"; }
+    location / { root %%DIR%%; }
   }
 }
 "#;
     let (_guard, port, dir) = spawn_server(conf);
     write_htpasswd(&dir.join("users.htpasswd"));
+    write_ok_file(&dir);
 
-    let alice = http_get(port, "/", &[("Authorization", "Basic YWxpY2U6c2VjcmV0")]);
+    let alice = http_get(port, "/ok.txt", &[("Authorization", "Basic YWxpY2U6c2VjcmV0")]);
     assert_eq!(status(&alice), 200);
     assert_eq!(body(&alice), b"ok");
 
-    let bob = http_get(port, "/", &[("Authorization", "Basic Ym9iOnNlY3JldA==")]);
+    let bob = http_get(port, "/ok.txt", &[("Authorization", "Basic Ym9iOnNlY3JldA==")]);
     assert_eq!(status(&bob), 200);
 
-    let carol = http_get(port, "/", &[("Authorization", "Basic Y2Fyb2w6c2VjcmV0")]);
+    let carol = http_get(port, "/ok.txt", &[("Authorization", "Basic Y2Fyb2w6c2VjcmV0")]);
     assert_eq!(status(&carol), 200);
 
-    let dave = http_get(port, "/", &[("Authorization", "Basic ZGF2ZTpzZWNyZXQ=")]);
+    let dave = http_get(port, "/ok.txt", &[("Authorization", "Basic ZGF2ZTpzZWNyZXQ=")]);
     assert_eq!(status(&dave), 200);
+
+    let wrong = http_get(port, "/ok.txt", &[("Authorization", "Basic YWxpY2U6d3Jvbmc=")]);
+    assert_eq!(status(&wrong), 401);
 }
 
 #[test]
@@ -225,23 +243,27 @@ http {
   auth_basic_user_file %%DIR%%/users.htpasswd;
   server {
     listen 127.0.0.1:%%PORT%%;
-    location /secure { return 200 "secure"; }
-    location /open {
+    root %%DIR%%;
+    location /secure/ { }
+    location /open/ {
       auth_basic off;
-      return 200 "open";
     }
   }
 }
 "#;
     let (_guard, port, dir) = spawn_server(conf);
     write_htpasswd(&dir.join("users.htpasswd"));
+    for sub in ["secure", "open"] {
+        std::fs::create_dir(dir.join(sub)).unwrap();
+        write_ok_file(&dir.join(sub));
+    }
 
-    let secure = http_get(port, "/secure", &[]);
+    let secure = http_get(port, "/secure/ok.txt", &[]);
     assert_eq!(status(&secure), 401);
 
-    let open = http_get(port, "/open", &[]);
+    let open = http_get(port, "/open/ok.txt", &[]);
     assert_eq!(status(&open), 200);
-    assert_eq!(body(&open), b"open");
+    assert_eq!(body(&open), b"ok");
 }
 
 #[test]
@@ -268,4 +290,91 @@ http {
     sleep(Duration::from_millis(50));
     let logged = std::fs::read_to_string(dir.join("access.log")).unwrap();
     assert_eq!(logged, "alice\n");
+}
+
+#[test]
+fn return_answers_in_rewrite_phase_before_auth_basic() {
+    // nginx: `return` is a rewrite-module directive, so it responds before
+    // the access phase and auth_basic never runs. A `break` ends the rewrite
+    // program before the `return` is reached, so access control does run.
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    auth_basic "Zone";
+    auth_basic_user_file %%DIR%%/users.htpasswd;
+    location /ret { return 200 "ret"; }
+    location /brk {
+      break;
+      return 200 "brk";
+    }
+    location /if {
+      if ($arg_x) { return 200 "if"; }
+      return 200 "after-if";
+    }
+  }
+}
+"#;
+    let (_guard, port, dir) = spawn_server(conf);
+    write_htpasswd(&dir.join("users.htpasswd"));
+
+    let ret = http_get(port, "/ret", &[]);
+    assert_eq!(status(&ret), 200);
+    assert_eq!(body(&ret), b"ret");
+
+    let brk = http_get(port, "/brk", &[]);
+    assert_eq!(status(&brk), 401);
+
+    let in_if = http_get(port, "/if?x=1", &[]);
+    assert_eq!(status(&in_if), 200);
+    assert_eq!(body(&in_if), b"if");
+
+    let after_if = http_get(port, "/if", &[]);
+    assert_eq!(status(&after_if), 200);
+    assert_eq!(body(&after_if), b"after-if");
+}
+
+#[test]
+fn relative_user_file_resolves_against_config_dir_not_prefix() {
+    // The config lives in %%DIR%%; the `-p` prefix is a different, empty
+    // directory. nginx resolves auth_basic_user_file against the config
+    // directory (conf prefix), for literal and variable paths alike.
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    root %%DIR%%;
+    location /lit/ {
+      auth_basic "Lit";
+      auth_basic_user_file users.htpasswd;
+    }
+    location /var/ {
+      auth_basic "Var";
+      auth_basic_user_file $arg_f;
+    }
+  }
+}
+"#;
+    let prefix = unique_dir();
+    let prefix_arg = format!("{}/", prefix.display());
+    let (_guard, port, dir) = spawn_server_with_args(conf, &["-p", &prefix_arg]);
+    write_htpasswd(&dir.join("users.htpasswd"));
+    for sub in ["lit", "var"] {
+        std::fs::create_dir(dir.join(sub)).unwrap();
+        write_ok_file(&dir.join(sub));
+    }
+    let alice = [("Authorization", "Basic YWxpY2U6c2VjcmV0")];
+
+    let lit = http_get(port, "/lit/ok.txt", &alice);
+    assert_eq!(status(&lit), 200);
+    assert_eq!(body(&lit), b"ok");
+    assert_eq!(status(&http_get(port, "/lit/ok.txt", &[])), 401);
+
+    let var = http_get(port, "/var/ok.txt?f=users.htpasswd", &alice);
+    assert_eq!(status(&var), 200);
+    assert_eq!(body(&var), b"ok");
+
+    let _ = std::fs::remove_dir_all(&prefix);
 }

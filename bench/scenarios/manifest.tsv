@@ -21,7 +21,7 @@ m19_stream_1m_low_concurrency|streamed 1 MiB file, low concurrency|8090|/1M.bin|
 m19_stream_128m|streamed 128 MiB file|8090|/128M.bin|16|512|30s|5s|20|bench/m19/nginx.conf|bench/m19/generate.sh|none||http
 static_8k|static 8 KiB file, keep-alive|8102|/hello.txt|16|512|30s|5s|20|bench/static_8k/nginx.conf||none||http
 add_header_many|return 200 + 6 add_header|8101|/|16|512|30s|5s|20|bench/add_header_many/nginx.conf||none||http
-auth_basic_hello|auth_basic {SHA} verify + return 200|8096|/|16|512|30s|5s|20|bench/auth_basic/nginx.conf|bench/auth_basic/generate.sh|static|Authorization: Basic dXNlcjpoZWxsbw==|http
+auth_basic_hello|auth_basic {SHA} verify + 5-byte static file|8096|/hello.txt|16|512|30s|5s|20|bench/auth_basic/nginx.conf|bench/auth_basic/generate.sh|static|Authorization: Basic dXNlcjpoZWxsbw==|http
 error_page_intercept|try_files 404 -> error_page = /fallback|8104|/missing.txt|16|512|30s|5s|20|bench/error_page_intercept/nginx.conf||none||http
 rewrite_hello|rewrite /foo -> /bar last|8097|/foo|16|512|30s|5s|20|bench/rewrite/nginx.conf||none||http
 vars_map|map $http_user_agent -> return 200 $kind|8100|/|16|512|30s|5s|20|bench/vars_map/nginx.conf||static|User-Agent: wrk|http

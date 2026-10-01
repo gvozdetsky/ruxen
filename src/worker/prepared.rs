@@ -909,6 +909,9 @@ pub struct PreparedHttp {
     /// path for round-robin selection.
     #[allow(dead_code)]
     pub upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream>,
+    /// Directory of the main config file, for resolving relative paths that
+    /// are only known per request (e.g. `auth_basic_user_file $var`).
+    pub conf_prefix: Option<&'static Path>,
 }
 
 #[derive(Default)]

@@ -582,7 +582,8 @@ pub(crate) fn parse_location_block(
                 if auth_basic_user_file.is_some() {
                     return Err(Error::Duplicate("auth_basic_user_file"));
                 }
-                auth_basic_user_file = Some(parse_auth_basic_user_file_args(&args[1..])?);
+                auth_basic_user_file =
+                    Some(parse_auth_basic_user_file_args(&args[1..], lx.conf_prefix())?);
             }
             ("auth_delay", Terminator::Semi) => {
                 if auth_delay_ms.is_some() {
@@ -941,14 +942,34 @@ pub(crate) fn parse_auth_basic_args(args: &[String]) -> Result<AuthBasic, Error>
     Ok(AuthBasic::Realm(realm))
 }
 
-pub(crate) fn parse_auth_basic_user_file_args(args: &[String]) -> Result<PathBuf, Error> {
+/// nginx resolves `auth_basic_user_file` against the config directory, not
+/// the `-p` prefix. Literal paths are resolved here, once; paths containing
+/// variables are resolved after rendering, per request.
+pub(crate) fn parse_auth_basic_user_file_args(
+    args: &[String],
+    conf_prefix: Option<&Path>,
+) -> Result<PathBuf, Error> {
     if args.len() != 1 {
         return Err(Error::BadValue {
             what: "auth_basic_user_file",
             got: args.join(" "),
         });
     }
-    Ok(PathBuf::from(&args[0]))
+    let path = PathBuf::from(&args[0]);
+    if args[0].contains('$') {
+        return Ok(path);
+    }
+    Ok(resolve_conf_path(conf_prefix, path))
+}
+
+/// Resolve `path` against the config directory when it is relative
+/// (`ngx_conf_full_name(cycle, name, 1)`). Absolute paths, and every path
+/// when there is no config directory (inline test parses), pass through.
+pub fn resolve_conf_path(conf_prefix: Option<&Path>, path: PathBuf) -> PathBuf {
+    match conf_prefix {
+        Some(prefix) if path.is_relative() => prefix.join(path),
+        _ => path,
+    }
 }
 
 pub(crate) fn parse_on_off_args(args: &[String], what: &'static str) -> Result<bool, Error> {

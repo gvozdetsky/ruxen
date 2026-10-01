@@ -454,7 +454,8 @@ pub(crate) fn parse_server_block(
                 if auth_basic_user_file.is_some() {
                     return Err(Error::Duplicate("auth_basic_user_file"));
                 }
-                auth_basic_user_file = Some(parse_auth_basic_user_file_args(&args[1..])?);
+                auth_basic_user_file =
+                    Some(parse_auth_basic_user_file_args(&args[1..], lx.conf_prefix())?);
             }
             ("auth_delay", Terminator::Semi) => {
                 if auth_delay_ms.is_some() {

@@ -86,6 +86,10 @@ pub struct HttpConfig {
     /// `nginx -T` dump emitted by `main.rs`. The first entry is the main
     /// config file (or absent for inline test parses).
     pub dump_files: Vec<DumpFile>,
+    /// Directory of the main config file (nginx's conf prefix). Relative
+    /// paths that nginx resolves against the config directory rather than
+    /// the `-p` prefix use this. `None` for inline test parses.
+    pub conf_prefix: Option<PathBuf>,
 }
 
 /// One entry in the `nginx -T` config dump: an absolute path plus the raw
