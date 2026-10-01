@@ -336,13 +336,13 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             ("ssl_certificate", Terminator::Semi) => {
                 let path = args.get(1).ok_or(Error::MissingArg("ssl_certificate"))?;
-                ssl_certs.push(PathBuf::from(path));
+                ssl_certs.push(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
             ("ssl_certificate_key", Terminator::Semi) => {
                 let path = args
                     .get(1)
                     .ok_or(Error::MissingArg("ssl_certificate_key"))?;
-                ssl_keys.push(PathBuf::from(path));
+                ssl_keys.push(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
             ("ssl_protocols", Terminator::Semi) => {
                 if ssl_protocols.is_some() {
