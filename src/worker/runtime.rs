@@ -642,6 +642,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // showing up as ~3% memset / ~1% calloc in the proxy bench profile.
     let mut scratch_owned: Vec<u8> = Vec::with_capacity(READ_BUF);
     let mut url_scratch_owned: Vec<u8> = Vec::with_capacity(256);
+    // Set once the zero-copy `sendfile` path has put the socket in
+    // O_NONBLOCK mode; see `send_head_and_file`.
+    let mut sock_nonblocking = false;
     let mut buf_owned: Vec<u8> = vec![0u8; READ_BUF];
     let scratch = &mut scratch_owned;
     let url_scratch = &mut url_scratch_owned;
@@ -998,7 +1001,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         // once per worker and avoid per-request Vec copies.
                         scratch.clear();
                         let mut prebuilt_base: Option<&'static [u8]> = None;
-                        let file_body: Option<phase::FileBody> = match response {
+                        let mut file_body: Option<phase::FileBody> = match response {
                             Response::Prebuilt(bytes) => {
                                 prebuilt_base = Some(bytes);
                                 None
@@ -1103,14 +1106,27 @@ pub(crate) async fn handle<S: ConnIo>(
                                 };
                                 insert_header_at(&mut *scratch, &mut scan.head_end, header);
                             }
-                            // Hand scratch to monoio for the io_uring write;
-                            // it returns the Vec after the write completes so
-                            // we reuse the same allocation next request.
-                            let taken = std::mem::take(&mut *scratch);
-                            let (res, returned) = stream.write_all(taken).await;
-                            *scratch = returned;
-                            if res.is_err() {
-                                return;
+                            if process_meta.sendfile
+                                && file_body.is_some()
+                                && stream.sendfile_fd().is_some()
+                            {
+                                let body = file_body.take().expect("checked is_some");
+                                if !send_head_and_file(&*stream, &mut sock_nonblocking, scratch, body)
+                                    .await
+                                {
+                                    return;
+                                }
+                            } else {
+                                // Hand scratch to monoio for the io_uring
+                                // write; it returns the Vec after the write
+                                // completes so we reuse the same allocation
+                                // next request.
+                                let taken = std::mem::take(&mut *scratch);
+                                let (res, returned) = stream.write_all(taken).await;
+                                *scratch = returned;
+                                if res.is_err() {
+                                    return;
+                                }
                             }
                             response_for_logs = &*scratch;
                         }

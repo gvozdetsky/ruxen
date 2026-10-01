@@ -658,6 +658,9 @@ pub struct PreparedLocation {
     /// the spilled body file after the request; `Clean` and `Off` unlink
     /// at end-of-request.
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    /// Effective `sendfile` (location → server → http, default off). When
+    /// on, file bodies are sent zero-copy on plain TCP connections.
+    pub sendfile: bool,
     /// Effective `post_action` target, if any. A leading `/` is an
     /// internal URI redirect; a leading `@` is a named-location jump.
     pub post_action: Option<&'static [u8]>,
@@ -696,6 +699,9 @@ pub struct PreparedRegexLocation {
     pub auth_delay_ms: u64,
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    /// Effective `sendfile` (location → server → http, default off). When
+    /// on, file bodies are sent zero-copy on plain TCP connections.
+    pub sendfile: bool,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
@@ -723,6 +729,9 @@ pub struct MatchedLocation<'a> {
     pub auth_delay_ms: u64,
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    /// Effective `sendfile` (location → server → http, default off). When
+    /// on, file bodies are sent zero-copy on plain TCP connections.
+    pub sendfile: bool,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
@@ -747,6 +756,7 @@ impl<'a> MatchedLocation<'a> {
             auth_delay_ms: loc.auth_delay_ms,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
+            sendfile: loc.sendfile,
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
@@ -777,6 +787,7 @@ impl<'a> MatchedLocation<'a> {
             auth_delay_ms: loc.auth_delay_ms,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
+            sendfile: loc.sendfile,
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,

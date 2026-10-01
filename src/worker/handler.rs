@@ -649,6 +649,7 @@ pub(crate) fn run_location_handler(
                         last_modified_override: last_modified_override.as_deref(),
                     },
                     server_bytes,
+                    loc.sendfile,
                 ),
                 fs_resolve::Outcome::Redirect(location) => {
                     let abs = build_absolute_redirect_location(

@@ -60,6 +60,7 @@ pub(crate) fn parse_server_block(
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
     let mut client_max_body_size: Option<u64> = None;
+    let mut sendfile: Option<bool> = None;
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_set_headers: Option<Vec<ProxySetHeader>> = None;
@@ -161,6 +162,7 @@ pub(crate) fn parse_server_block(
                         auth_basic_user_file,
                         auth_delay_ms,
                         client_max_body_size,
+                        sendfile,
                         post_action,
                         expires,
                         proxy_set_headers,
@@ -470,6 +472,12 @@ pub(crate) fn parse_server_block(
                 }
                 client_max_body_size = Some(parse_client_max_body_size_args(&args[1..])?);
             }
+            ("sendfile", Terminator::Semi) => {
+                if sendfile.is_some() {
+                    return Err(Error::Duplicate("sendfile"));
+                }
+                sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
+            }
             ("post_action", Terminator::Semi) => {
                 if post_action.is_some() {
                     return Err(Error::Duplicate("post_action"));
@@ -502,6 +510,7 @@ pub(crate) fn parse_server_block(
                     None,
                     None,
                     client_max_body_size.or(inherited_client_max_body_size),
+                    None,
                     None,
                     None,
                     &mut locations,

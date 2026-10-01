@@ -17,7 +17,7 @@ We are not doing:
 - HTTP/1.1 only, keep-alive required (benchmarks use it)
 - TLS termination via rustls (server-side only); no modules; no caching
 - **Thread-per-core** worker model with `SO_REUSEPORT` from day one (single-threaded wouldn't match nginx)
-- **Zero-alloc request parsing and prebuilt `return` path.** Static-file responses still allocate a per-request output `Vec<u8>`; eliminating that is a later optimization problem, not current scope.
+- **Zero-alloc request parsing and prebuilt `return` path.** Static-file responses still build a per-request header `Vec<u8>`; with `sendfile on` the body itself is sent zero-copy (see "Static file bodies and `sendfile`").
 - Config: the smallest subset that proves the architecture
 
 ## Performance contract
@@ -297,6 +297,16 @@ The last arg is the fallback:
 - `proxy_intercept_errors`'s pre-render-then-reroute shape avoids needing `RenderCtx` to live across an `await`. The downside is that the same target bytes are rendered for every request even when intercept never fires; cheap for typical configs (one or two `error_page` rules) and avoids a second-pass render.
 - `is_idempotent_method_bytes` lives in worker.rs because it reads raw method bytes; the `Method` enum's coarse classification (Get/Head/Trace/Connect/Other) loses PUT/DELETE/OPTIONS distinction needed for the gate.
 - `proxy_intercept_errors` and `proxy_next_upstream*` stay in `IGNORED_STMT` so http-scope occurrences (TEST_GLOBALS_HTTP preambles) keep loading; the explicit handlers at server/location scope take precedence via match-arm ordering.
+
+## Static file bodies and `sendfile`
+
+`sendfile on|off` (http / server / location, default off as in nginx) picks how file bodies leave the process. Measured on static_8k (8 KiB, `wrk -t16 -c512`): the copying path was at 89% of nginx; with sendfile on both servers ruxen is at ~96.5%.
+
+- **`sendfile off`** (and any TLS connection): bodies up to 8 KiB are `pread` into the response buffer and written with one io_uring write; larger bodies stream through a 64 KiB buffer (`stream_file`). Two user-space copies per body byte.
+- **`sendfile on`, plain TCP, body ≥ 4 KiB**: `serve_path` returns `Response::File` and the worker calls `send_head_and_file`. The header block goes out with `send(MSG_MORE)` so the kernel coalesces it with the first file pages (nginx gets the same from `tcp_nopush`). The body goes out with `sendfile(2)` in ≤ 2 MiB chunks (`sendfile_max_chunk` default). No user-space copy.
+- **Non-blocking without a new io_uring op.** monoio's `Pipe` doesn't expose its fds, so io_uring `splice` isn't reachable from outside the crate. Instead the socket is switched to `O_NONBLOCK` on first use and `send`/`sendfile` are called directly; on `EAGAIN` the worker awaits `TcpStream::writable()` (an io_uring PollAdd). io_uring ops on the same socket behave the same with or without the flag, because the kernel already tries non-blocking first and arms a poll on EAGAIN. `tests/m45_sendfile.rs` checks that a stalled reader doesn't block the worker.
+- **Why 4 KiB.** Below it, `pread` + one io_uring write beats two direct syscalls: against the inline path, 1 KiB was −3%, 2 KiB break-even, 4 KiB +6%, 8 KiB +8%. nginx itself uses sendfile for every size.
+- **File side is synchronous**, like the `pread` it replaces: a page-cache miss blocks the worker for the disk read. nginx has the same property without `aio`.
 
 ## TLS architecture
 

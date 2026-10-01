@@ -399,6 +399,52 @@ mod tests {
     }
 
     #[test]
+    fn sendfile_inherits_http_server_location_and_defaults_off() {
+        // http-scope `sendfile` after the server block still applies, as in
+        // nginx's merge: inheritance is resolved at prepare time.
+        let cfg = parse_cfg(
+            r#"
+                http {
+                    server {
+                        listen 8080;
+                        location /inherit { return 200; }
+                        location /off { sendfile off; return 200; }
+                        location /nested {
+                            sendfile off;
+                            return 200;
+                            location /nested/child { return 200; }
+                        }
+                    }
+                    server {
+                        listen 8081;
+                        sendfile off;
+                        location /srv { return 200; }
+                    }
+                    sendfile on;
+                }
+            "#,
+        );
+        let http = prepare(cfg);
+        let find = |listen: usize, pat: &[u8]| {
+            http.listens[listen].servers[0]
+                .prefix_locations
+                .iter()
+                .find(|loc| loc.pattern == pat)
+                .unwrap()
+                .sendfile
+        };
+        assert!(find(0, b"/inherit"));
+        assert!(!find(0, b"/off"));
+        assert!(!find(0, b"/nested/child"));
+        assert!(!find(1, b"/srv"));
+
+        let default_off = prepare(parse_cfg(
+            "http { server { listen 8082; location / { return 200; } } }",
+        ));
+        assert!(!default_off.listens[0].servers[0].prefix_locations[0].sendfile);
+    }
+
+    #[test]
     pub(crate) fn error_pages_inherit_and_replace_per_location() {
         let cfg = parse_cfg(
             r#"
