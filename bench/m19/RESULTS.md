@@ -19,6 +19,7 @@ Captured 2026-10-01T19:00:23Z over 5 iterations. nginx 1.24.0, kernel 7.0.0-38-g
 | date | commit | req/s | Δ req/s | p50 (ms) | Δ p50 | p99 (ms) | Δ p99 | non-2xx | note |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 2026-10-01T19:17:24Z | 92148f1* | 142 | +11.9% | 405.180 | -0.4% | 950.450 | -37.5% | 0 |  |
+| 2026-10-01T21:24:01Z | 17ddc3b* | 160 | +26.1% | 373.470 | -8.2% | 860.590 | -43.4% | 0 | full refresh 2026-10-01 |
 
 _`*` after a commit hash means working tree was dirty when measured. Δ is vs the nginx baseline median._
 
@@ -39,6 +40,7 @@ Captured 2026-10-01T18:56:06Z over 5 iterations. nginx 1.24.0, kernel 7.0.0-38-g
 | date | commit | req/s | Δ req/s | p50 (ms) | Δ p50 | p99 (ms) | Δ p99 | non-2xx | note |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 2026-10-01T19:14:58Z | 92148f1* | 19275 | -3.0% | 1.030 | +5.1% | 2.600 | -3.3% | 0 |  |
+| 2026-10-01T21:21:35Z | 17ddc3b* | 20684 | +4.1% | 0.940 | -4.1% | 2.250 | -16.4% | 0 | full refresh 2026-10-01 |
 
 _`*` after a commit hash means working tree was dirty when measured. Δ is vs the nginx baseline median._
 
@@ -59,6 +61,7 @@ Captured 2026-10-01T18:51:50Z over 5 iterations. nginx 1.24.0, kernel 7.0.0-38-g
 | date | commit | req/s | Δ req/s | p50 (ms) | Δ p50 | p99 (ms) | Δ p99 | non-2xx | note |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 2026-10-01T19:12:33Z | 92148f1* | 19681 | -3.0% | 15.060 | -0.9% | 61.450 | -44.1% | 0 |  |
+| 2026-10-01T21:19:09Z | 17ddc3b* | 22223 | +9.6% | 13.220 | -13.0% | 53.050 | -51.7% | 0 | full refresh 2026-10-01 |
 
 _`*` after a commit hash means working tree was dirty when measured. Δ is vs the nginx baseline median._
 
