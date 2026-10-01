@@ -19,6 +19,7 @@ Captured 2026-04-30T14:03:32Z over 5 iterations. nginx 1.24.0, kernel 6.17.0-20-
 | date | commit | req/s | Δ req/s | p50 (ms) | Δ p50 | p99 (ms) | Δ p99 | non-2xx | note |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 2026-04-30T14:05:28Z | 2634c9b* | 1461596 | +18.1% | 0.191 | -15.5% | 3.880 | -14.3% | 0 |  |
+| 2026-10-01T19:02:49Z | 92148f1* | 1207858 | -2.4% | 0.236 | +4.4% | 3.930 | -13.2% | 0 |  |
 
 _`*` after a commit hash means working tree was dirty when measured. Δ is vs the nginx baseline median._
 

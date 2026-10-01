@@ -108,6 +108,16 @@ for ((i = 1; i <= RUNS; i++)); do
     p99_raw="$(wrk_metric_latency "$iter_log" "99%")"
     [[ -n "$req" && -n "$p50_raw" && -n "$p99_raw" ]] \
         || die "missing metrics in $iter_log (look there for wrk output)"
+    # A baseline over error responses is meaningless (e.g. a missing fixture
+    # turns every request into a cheap 404). wrk counts statuses >= 400.
+    non2xx="$(wrk_metric_non2xx "$iter_log")"
+    [[ "$non2xx" == "0" ]] \
+        || die "nginx returned ${non2xx} error responses on ${url} (see $iter_log)"
+    # Timed-out requests are dropped from wrk's latency histogram, which is
+    # then capped at --timeout (2s): the numbers stop meaning anything.
+    timeouts="$(wrk_metric_socket_error "$iter_log" timeout)"
+    [[ "$timeouts" == "0" ]] \
+        || die "wrk hit ${timeouts} request timeouts on ${url}; lower the scenario's connections"
 
     p50_ms="$(latency_to_ms "$p50_raw")"
     p99_ms="$(latency_to_ms "$p99_raw")"

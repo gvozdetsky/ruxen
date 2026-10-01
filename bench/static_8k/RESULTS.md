@@ -16,5 +16,9 @@ Captured 2026-04-30T15:38:04Z over 1 iterations. nginx 1.24.0, kernel 6.17.0-20-
 
 ### ruxen history
 
-_No measurements yet._ Run: `bench/scripts/measure.sh static_8k`
+| date | commit | req/s | Δ req/s | p50 (ms) | Δ p50 | p99 (ms) | Δ p99 | non-2xx | note |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-10-01T19:10:07Z | 92148f1* | 674472 | -3.1% | 0.399 | -2.9% | 5.150 | -23.4% | 0 |  |
+
+_`*` after a commit hash means working tree was dirty when measured. Δ is vs the nginx baseline median._
 
