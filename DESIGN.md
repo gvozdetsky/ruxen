@@ -40,6 +40,7 @@ Original baseline (measured 2026-04-16; the raw run log was not carried into the
 ## Architectural decisions still in force
 
 - **Graceful shutdown** lives in `worker::RuntimeState` — a shared `AtomicBool` polled between `accept` calls in the accept loop. The per-connection hot path is untouched.
+- **Two path prefixes, as in nginx.** `-p` (the cycle prefix) is applied by `chdir` at startup, so `root`, `alias`, logs, and `pid` resolve against cwd. `include`, `ssl_certificate`, `ssl_certificate_key`, and `auth_basic_user_file` resolve against the main config's directory (nginx's conf prefix, `ngx_conf_full_name(cycle, name, 1)`), recorded by the lexer and applied at parse time. The two differ whenever `-c` points outside `-p`.
 - **`-g` inline directives** are prepended as a synthesized prefix before the config file is tokenized. Matches nginx semantics and reuses the existing parser.
 - **`-V` feature claims** are intentionally minimal — only the `http` + `rewrite` "absence of `--without-…`" regexes in `Test::Nginx::has_module()` are satisfied. Expanding this is how we opt in to each new test group; a too-generous `-V` silently unlocks tests that fail for bad reasons.
 - **Unknown-directive policy** is an explicit allowlist, not "accept everything". An unknown directive in a test config almost always means the test exercises a feature we don't implement; silently accepting would produce a wrong-looking pass instead of a clear "not yet" failure.

@@ -210,7 +210,7 @@ pub(crate) fn parse_server_block(
                     ssl_keys.clear();
                 }
                 let path = args.get(1).ok_or(Error::MissingArg("ssl_certificate"))?;
-                ssl_certs.push(PathBuf::from(path));
+                ssl_certs.push(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
             ("ssl_certificate_key", Terminator::Semi) => {
                 saw_any_ssl_directive = true;
@@ -222,7 +222,7 @@ pub(crate) fn parse_server_block(
                 let path = args
                     .get(1)
                     .ok_or(Error::MissingArg("ssl_certificate_key"))?;
-                ssl_keys.push(PathBuf::from(path));
+                ssl_keys.push(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
             ("ssl_protocols", Terminator::Semi) => {
                 saw_any_ssl_directive = true;
@@ -830,6 +830,18 @@ pub(crate) fn classify_server_name(raw: &str) -> Result<Vec<ServerNameSpec>, Err
         ]);
     }
     Ok(vec![ServerNameSpec::Exact(raw.to_ascii_lowercase())])
+}
+
+/// nginx resolves `ssl_certificate` / `ssl_certificate_key` against the
+/// config directory. `data:` values and paths with variables are loaded per
+/// handshake in nginx; ruxen supports neither, so they pass through as
+/// written and fail at load time under their original spelling.
+pub(crate) fn resolve_ssl_file_arg(conf_prefix: Option<&Path>, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if raw.starts_with("data:") || raw.contains('$') {
+        return path;
+    }
+    resolve_conf_path(conf_prefix, path)
 }
 
 pub(crate) fn parse_server_tokens_args(args: &[String]) -> Result<ServerTokens, Error> {

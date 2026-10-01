@@ -1,7 +1,7 @@
 //! Hand-written tokenizer + `read_directive` driver. Frame stack supports
-//! `include` directives with relative-path resolution against the current
-//! frame's source path. Maintains the `nginx -T` dump-order list as a
-//! side effect of resolving frames.
+//! `include` directives with relative paths resolved against the main
+//! config's directory. Maintains the `nginx -T` dump-order list as a side
+//! effect of resolving frames.
 
 use super::*;
 
@@ -9,8 +9,8 @@ use super::*;
 /// chunk) currently being tokenized. `include` pushes a new frame; we pop on
 /// EOF and resume the parent. The originating file path is captured at
 /// `push_include` time and pushed straight into `dump_files`; relative
-/// include targets resolve against cwd (which `main.rs` sets to the prefix
-/// dir before parsing), so the per-frame path isn't needed at lex time.
+/// include targets resolve against the main config's directory (not the
+/// including file's), so the per-frame path isn't needed at lex time.
 pub(crate) struct LexerFrame {
     bytes: Vec<u8>,
     pos: usize,
@@ -94,15 +94,19 @@ impl Lexer {
     }
 
     fn push_include(&mut self, raw_path: &str) -> Result<(), Error> {
-        let resolved = if Path::new(raw_path).is_absolute() {
-            PathBuf::from(raw_path)
+        let path = PathBuf::from(raw_path);
+        let resolved = if path.is_absolute() {
+            path
+        } else if let Some(prefix) = &self.conf_prefix {
+            // nginx resolves relative include paths against the config
+            // directory (`ngx_conf_full_name(cycle, file, 1)` in
+            // `ngx_conf_include`), not the `-p` prefix.
+            prefix.join(path)
         } else {
-            // nginx resolves relative include paths against the cycle prefix
-            // (`-p`). main.rs already chdir'd into that prefix before parsing,
-            // so cwd-relative resolution gives the right answer.
+            // Inline test parses have no config file; fall back to cwd.
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
-                .join(raw_path)
+                .join(path)
         };
         let bytes = std::fs::read(&resolved).map_err(|e| Error::IncludeOpen {
             path: resolved.display().to_string(),
