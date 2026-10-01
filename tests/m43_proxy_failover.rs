@@ -6,6 +6,8 @@
 //! answer; the tests assert the wire-level behavior of the proxy attempt
 //! machine + LB state.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -106,7 +108,12 @@ enum Mode {
 
 impl Backend {
     fn spawn(mode: Mode) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bind under SETUP_LOCK so a parallel test can't grab this port in the
+        // window between its pick_port() drop and its ruxen's bind.
+        let listener = {
+            let _g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            TcpListener::bind("127.0.0.1:0").unwrap()
+        };
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -251,9 +258,8 @@ fn status_of(resp: &[u8]) -> u16 {
 #[test]
 fn m43_proxy_next_upstream_fails_over_to_next_peer_on_connect_refused() {
     // Bind a port and immediately drop it so connect() fails.
-    let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = dead_listener.local_addr().unwrap().port();
-    drop(dead_listener);
+    let dead_port = common::ports::DeadPort::new();
+    let dead = dead_port.port();
     let live = Backend::spawn(Mode::Ok);
 
     let conf = format!(
@@ -296,9 +302,8 @@ http {{
 
 #[test]
 fn m43_proxy_next_upstream_off_returns_502_without_failover() {
-    let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = dead_listener.local_addr().unwrap().port();
-    drop(dead_listener);
+    let dead_port = common::ports::DeadPort::new();
+    let dead = dead_port.port();
     let live = Backend::spawn(Mode::Ok);
 
     let conf = format!(

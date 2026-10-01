@@ -4,6 +4,7 @@
 Reads env vars:
   RESULTS_TSV  — path to TSV (status \\t file \\t failed \\t total \\t reason)
   OUT_MD       — path to NGINX_TEST_PROGRESS.md to overwrite
+  TODAY, NGINX_TESTS_REV — optional; recorded in the header when set
 """
 
 from __future__ import annotations
@@ -59,6 +60,10 @@ def main() -> int:
         "Run files sequentially — running the suite in parallel introduces flakes from "
         "shared TLS-session-cache / port races and gives false negatives.\n\n"
     )
+
+    rev = os.environ.get("NGINX_TESTS_REV")
+    if rev:
+        parts.append(f"Last run: {os.environ.get('TODAY', 'unknown')} against `nginx-tests` {rev}.\n\n")
 
     parts.append("## Summary\n\n")
     parts.append(f"- **Total tests tracked:** {total_files}\n")

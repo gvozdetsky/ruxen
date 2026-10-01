@@ -1,6 +1,6 @@
 # ruxen — design notes
 
-Working document. Captures what we've decided, why, and what we've learned from reading the nginx C source. Grows as we go. See `README.md` for the current feature set; milestone-by-milestone history lives in `git log`.
+Working document. Captures what we've decided, why, and what we've learned from reading the nginx C source. Grows as we go. See `README.md` for the current feature set. Pre-release development history was squashed into the initial public commit; the milestone notes that still matter (M40–M43) live inline below.
 
 ## Philosophy
 
@@ -24,7 +24,7 @@ We are not doing:
 
 **ruxen v0.1 must serve its minimal config at ≥ 95% of nginx 1.24.0's throughput on the same hardware, with p99 latency ≤ 4 ms and zero errors.**
 
-Baseline (measured 2026-04-16, see [`bench/RESULTS.md`](bench/RESULTS.md)):
+Original baseline (measured 2026-04-16; the raw run log was not carried into the public repo — the current frozen nginx baseline for this workload is in [`bench/m1/RESULTS.md`](bench/m1/RESULTS.md)):
 
 - nginx 1.24.0, 32 workers, `wrk -t16 -c512 -d30s` → **1,675,733 req/s**, p50 158 µs, p99 3.57 ms, 0 errors.
 
@@ -372,4 +372,4 @@ snapshot) and `src/tls_certs.rs` (PEM loader + SNI resolver +
 ## Open questions
 
 - `bumpalo` vs. fixed per-connection buffers vs. both. Current: fixed per-connection `Vec<u8>` (8 KiB, one alloc per connection, reused for every keep-alive request). No arena needed yet — revisit when we have a module/handler system that wants short-lived per-request allocations.
-- CPU pinning strategy. **Decided (2026-04-16): opt-in via `RUXEN_PIN=1`, using `monoio::utils::bind_to_cpu_set` (no `core_affinity` dep — it's just a portability shim over the same `sched_setaffinity` syscall).** Default off, matches nginx's default (`worker_processes auto` + no `worker_cpu_affinity`). When enabled on the i9-13900HX (8P × 2 SMT + 16E), the tested layout is 16 workers pinned to CPUs 0–15 (all P-core logical threads, SMT on): per monoio/glommio and TFB plaintext results, naïve 0..31 pinning costs tail latency because SO_REUSEPORT doesn't rebalance and E-core queues back up. On a *colocated* client bench the effect is mixed — p99 improves ~37% but throughput drops because wrk on E-cores becomes the bottleneck (see [`bench/RESULTS.md`](bench/RESULTS.md) "Affinity comparison"). With a dedicated client machine, pinning should be a clean win on both axes.
+- CPU pinning strategy. **Decided (2026-04-16): opt-in via `RUXEN_PIN=1`, using `monoio::utils::bind_to_cpu_set` (no `core_affinity` dep — it's just a portability shim over the same `sched_setaffinity` syscall).** Default off, matches nginx's default (`worker_processes auto` + no `worker_cpu_affinity`). When enabled on the i9-13900HX (8P × 2 SMT + 16E), the tested layout is 16 workers pinned to CPUs 0–15 (all P-core logical threads, SMT on): per monoio/glommio and TFB plaintext results, naïve 0..31 pinning costs tail latency because SO_REUSEPORT doesn't rebalance and E-core queues back up. On a *colocated* client bench the effect is mixed — p99 improves ~37% but throughput drops because wrk on E-cores becomes the bottleneck (measured 2026-04-16; the raw affinity-comparison numbers were not carried into the public repo). With a dedicated client machine, pinning should be a clean win on both axes.

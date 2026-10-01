@@ -14,7 +14,7 @@ A Rust port of [nginx](https://nginx.org), the high-performance HTTP server and 
 - **Directives:** `return` (with `$var` expansion; 3xx forms emit `Location` redirects), `add_header NAME VALUE [always];` and `add_trailer NAME VALUE [always];` (server + location scope, nginx merge semantics, `add_header Last-Modified` suppress/override for static responses), `expires`, `error_page STATUS... [=NNN] URI;` (server + location scope, internal URI, named-location, or external URL targets), `post_action`, rewrite-module core (`set`, `if (...) { ... }`, `rewrite ... [last|break|redirect|permanent]`), `split_clients` at http scope, `map $source $dest { ... }` at http scope (exact / `~` / `~*` / `default`), `auth_basic "realm"` + `auth_basic_user_file` (http/server/location scope with `off` inheritance break; htpasswd `{PLAIN}` / `{SHA}` / `{SSHA}` / `$apr1$` / `$1$` and system `crypt(3)` entries).
 - **Logging:** minimal `log_format` + `access_log` sinks at http/server/location scope, including `if=$arg_*` gating and `$sent_http_*` rendering, plus server/location `error_log` + `log_not_found` 404 side effects with per-sink levels, multiple sinks, and `syslog:` targets (`server=unix:...` and UDP server forms).
 - **Variables:** `$uri`, `$request_uri`, `$host`, `$server_name`, `$status`, `$args`/`$query_string`, `$is_args`, `$arg_*`, `$cookie_*`, `$scheme`, `$remote_addr`, `$remote_port`, `$remote_user`, `$hostname`, `$http_NAME`, `$sent_http_NAME`, `$sent_trailer_NAME`, `$request_body`, `$request_body_file`, `$connection`, `$connection_requests`, `$connection_time`, `$request_time`, `$limit_rate`, `$upstream_http_NAME`, `$upstream_cookie_NAME`, `$upstream_response_length`, `$upstream_response_time`, `$ssl_protocol`, `$ssl_cipher`, `$ssl_server_name`, `$ssl_session_reused`, rewrite captures `$1..$9`, and user-defined `$name` from `set` / `split_clients`.
-- **Interop:** nginx-compatible CLI (`-c / -p / -e / -g / -t / -T / -V / -s`), `pid` file, SIGQUIT graceful shutdown. Upstream Perl test suite (`nginx-tests`) runs end-to-end against several files.
+- **Interop:** nginx-compatible CLI (`-c / -p / -e / -g / -t / -T / -V / -s`), `pid` file, SIGQUIT graceful shutdown. Upstream Perl test suite (`nginx-tests`): 49 of the 104 files that ruxen's `-V` profile opts into pass end-to-end — per-file status in [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md).
 
 ## What's intentionally not in v0.1 TLS
 
@@ -42,7 +42,7 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ## Running tests
 
-From the repository root (`/home/eugene/ruxen`):
+From the repository root:
 
 The HTTPS integration tests in `tests/tls.rs` shell out to the system
 `curl` binary and generate ephemeral certs at runtime via the `rcgen`

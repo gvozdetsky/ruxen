@@ -5,6 +5,8 @@
 //! shapes are exercised in parallel: literal `proxy_pass http://127.0.0.1:N`
 //! and `proxy_pass http://upstream_name` with a declared `upstream {}` block.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -105,7 +107,12 @@ struct Backend {
 
 impl Backend {
     fn spawn(response: Vec<u8>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bind under SETUP_LOCK so a parallel test can't grab this port in the
+        // window between its pick_port() drop and its ruxen's bind.
+        let listener = {
+            let _g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            TcpListener::bind("127.0.0.1:0").unwrap()
+        };
         listener.set_nonblocking(false).unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -360,9 +367,8 @@ http {{
 fn m40_502_when_upstream_unreachable() {
     // No backend bound here — pick an ephemeral port then close it before
     // ruxen even starts. The address will refuse connections.
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = probe.local_addr().unwrap();
-    drop(probe);
+    let dead_port = common::ports::DeadPort::new();
+    let dead = SocketAddr::from(([127, 0, 0, 1], dead_port.port()));
 
     let conf = format!(
         r#"

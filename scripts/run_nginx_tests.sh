@@ -171,7 +171,9 @@ echo "Per-file logs: ${OUT_DIR}/logs/"
 
 if ((UPDATE_PROGRESS == 1)); then
     log "rewriting ${PROGRESS_MD}"
+    tests_rev="$(git -C "${TESTS_DIR}" log -1 --format='%h (%cs)' 2>/dev/null || echo unknown)"
     OUT_MD="${PROGRESS_MD}" RESULTS_TSV="${RESULTS_TSV}" TODAY="$(date -u +%Y-%m-%d)" \
+        NGINX_TESTS_REV="${tests_rev}" \
         python3 "${SCRIPT_DIR}/_render_test_progress.py" \
         || die "rendering NGINX_TEST_PROGRESS.md failed"
     echo "Wrote ${PROGRESS_MD}"
