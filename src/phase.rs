@@ -198,8 +198,8 @@ pub struct ProcessMeta {
     /// trailer filter. False suppresses the trailer block (matching nginx's
     /// chunked filter, which skips chunked encoding entirely when off).
     pub proxy_chunked_transfer_encoding: bool,
-    /// `$server_name` value for the matched server, surfaced for the
-    /// post-await proxy add_header render.
+    /// `$server_name` value for the matched server, for the post-await
+    /// proxy add_header render and the `server: …` part of error-log lines.
     pub server_name: &'static [u8],
     /// `$proxy_host` value (upstream URL authority) for the proxy plan.
     pub proxy_host: &'static [u8],
@@ -484,6 +484,7 @@ fn process_with_meta_inner(
     let mut rewrite_state = RewriteState::default();
     let mut meta = ProcessMeta::default();
     meta.server_port = server.listen_port;
+    meta.server_name = server.primary_server_name;
 
     // Reroute loop — nginx calls this `r->internal` handling inside
     // `ngx_http_internal_redirect`; the counter is `r->uri_changes`. We
@@ -689,7 +690,6 @@ fn process_with_meta_inner(
                 meta.proxy_add_trailers = loc_add_trailers;
                 meta.proxy_chunked_transfer_encoding = loc_chunked_te;
                 meta.proxy_expires = loc_expires;
-                meta.server_name = server.primary_server_name;
                 meta.underscores_in_headers = server.underscores_in_headers;
                 return (Response::Proxy(plan), meta);
             }
