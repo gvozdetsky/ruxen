@@ -5,7 +5,8 @@
 // - `load_certified_key`: parse a PEM cert chain + matching private key into
 //   a `rustls::sign::CertifiedKey`. Accepts PKCS#8, PKCS#1 (RSA), and SEC1
 //   (EC) private keys via `rustls_pemfile::private_key`. Cert/key mismatch
-//   is caught here through `CertifiedKey::from_der`'s `keys_match` check.
+//   is caught by comparing SubjectPublicKeyInfo bytes, like rustls's
+//   `keys_match`, but without webpki so X.509 v1 leaves load too.
 //
 // - `ServerNameResolver`: a `rustls::server::ResolvesServerCert` that
 //   dispatches by SNI host (exact then leading-wildcard `*.example.com`),
@@ -60,7 +61,8 @@ impl std::error::Error for LoadCertError {}
 
 /// Parse a PEM cert chain and a matching PEM private key, building a
 /// `CertifiedKey` whose private key was loaded by the active rustls
-/// `CryptoProvider`. `keys_match` rejects mismatched cert/key pairs.
+/// `CryptoProvider`. A key that doesn't match the leaf certificate is
+/// rejected (`InconsistentKeys::KeyMismatch`).
 pub fn load_certified_key(cert_pem: &Path, key_pem: &Path) -> Result<CertifiedKey, LoadCertError> {
     let cert_bytes = std::fs::read(cert_pem).map_err(|err| LoadCertError::Io {
         path: cert_pem.to_path_buf(),
@@ -99,7 +101,87 @@ fn parse_certified_key(
         .ok_or_else(|| LoadCertError::NoKey(key_path.to_path_buf()))?;
 
     let provider = active_provider();
-    CertifiedKey::from_der(certs, key, provider.as_ref()).map_err(LoadCertError::Rustls)
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(LoadCertError::Rustls)?;
+    let certified = CertifiedKey::new(certs, signing_key);
+    keys_match(&certified).map_err(LoadCertError::Rustls)?;
+    Ok(certified)
+}
+
+/// `CertifiedKey::from_der` checks the key against the leaf with webpki,
+/// which rejects X.509 v1 certificates (`UnsupportedCertVersion`). OpenSSL,
+/// and so nginx, serves them, and nginx-tests generates every certificate
+/// as v1. Same check, same errors, minus the version requirement: compare
+/// the key's SubjectPublicKeyInfo with the one in the leaf's
+/// TBSCertificate. A key type that can't report its SPKI passes, as in
+/// `from_der`.
+fn keys_match(certified: &CertifiedKey) -> Result<(), rustls::Error> {
+    let Some(key_spki) = certified.key.public_key() else {
+        return Ok(());
+    };
+    let leaf = certified.end_entity_cert()?;
+    let cert_spki = leaf_spki(leaf.as_ref()).ok_or(rustls::Error::InvalidCertificate(
+        rustls::CertificateError::BadEncoding,
+    ))?;
+    if key_spki.as_ref() == cert_spki {
+        Ok(())
+    } else {
+        Err(rustls::InconsistentKeys::KeyMismatch.into())
+    }
+}
+
+/// The DER `SubjectPublicKeyInfo` (outer SEQUENCE included, as webpki
+/// returns it) of a certificate of any version (RFC 5280 §4.1):
+/// `Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { [0] version
+/// OPTIONAL, serialNumber, signature, issuer, validity, subject,
+/// subjectPublicKeyInfo, … }, … }`. v1 certificates omit `[0] version`.
+fn leaf_spki(cert: &[u8]) -> Option<&[u8]> {
+    const SEQUENCE: u8 = 0x30;
+    const EXPLICIT_VERSION: u8 = 0xa0;
+    let (tag, _, cert, _) = der_tlv(cert)?;
+    if tag != SEQUENCE {
+        return None;
+    }
+    let (tag, _, mut tbs, _) = der_tlv(cert)?;
+    if tag != SEQUENCE {
+        return None;
+    }
+    if tbs.first() == Some(&EXPLICIT_VERSION) {
+        tbs = der_tlv(tbs)?.3;
+    }
+    // serialNumber, signature, issuer, validity, subject
+    for _ in 0..5 {
+        tbs = der_tlv(tbs)?.3;
+    }
+    let (tag, spki, _, _) = der_tlv(tbs)?;
+    (tag == SEQUENCE).then_some(spki)
+}
+
+/// Split one DER element off `input`: `(tag, whole element, contents,
+/// rest)`. Single-byte tags only, which is all a certificate's top levels
+/// use; lengths up to 4 bytes.
+fn der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
+    let (&tag, after_tag) = input.split_first()?;
+    let (&first, after_len) = after_tag.split_first()?;
+    let (len, body) = if first < 0x80 {
+        (first as usize, after_len)
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || after_len.len() < n {
+            return None;
+        }
+        let len = after_len[..n]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | b as usize);
+        (len, &after_len[n..])
+    };
+    if body.len() < len {
+        return None;
+    }
+    let header = input.len() - body.len();
+    Some((tag, &input[..header + len], &body[..len], &body[len..]))
 }
 
 /// Returns the process-wide rustls `CryptoProvider`, falling back to the
@@ -284,6 +366,12 @@ mod tests {
     const EC_KEY_SEC1: &[u8] = include_bytes!("testdata/tls/ec_sec1.key");
     const ALT_CRT: &[u8] = include_bytes!("testdata/tls/alt.crt");
     const ALT_KEY: &[u8] = include_bytes!("testdata/tls/alt.key");
+    // X.509 v1, made the way nginx-tests makes its certificates:
+    // `openssl req -x509 -new` with a config that has no extensions.
+    const V1_RSA_CRT: &[u8] = include_bytes!("testdata/tls/v1_rsa.crt");
+    const V1_RSA_KEY: &[u8] = include_bytes!("testdata/tls/v1_rsa.key");
+    const V1_EC_CRT: &[u8] = include_bytes!("testdata/tls/v1_ec.crt");
+    const V1_EC_KEY: &[u8] = include_bytes!("testdata/tls/v1_ec.key");
 
     fn load(cert: &[u8], key: &[u8]) -> Result<CertifiedKey, LoadCertError> {
         parse_certified_key(cert, key, Path::new("cert"), Path::new("key"))
@@ -328,6 +416,47 @@ mod tests {
         match err {
             LoadCertError::Rustls(rustls::Error::InconsistentKeys(_)) => {}
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loads_x509_v1_certificates() {
+        load(V1_RSA_CRT, V1_RSA_KEY).expect("v1 RSA");
+        load(V1_EC_CRT, V1_EC_KEY).expect("v1 EC");
+    }
+
+    #[test]
+    fn rejects_x509_v1_certificate_with_wrong_key() {
+        for (cert, key) in [(V1_RSA_CRT, RSA_KEY_PKCS8), (V1_EC_CRT, EC_KEY_PKCS8)] {
+            let err = load(cert, key).expect_err("must reject mismatched key");
+            assert!(
+                matches!(
+                    err,
+                    LoadCertError::Rustls(rustls::Error::InconsistentKeys(
+                        rustls::InconsistentKeys::KeyMismatch
+                    ))
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_spki_matches_webpki_for_v3_certificates() {
+        // Same bytes webpki's `keys_match` compares, for certs it accepts.
+        for (cert, key) in [(RSA_CRT, RSA_KEY_PKCS8), (EC_CRT, EC_KEY_PKCS8)] {
+            let certified = ck(cert, key);
+            let ours = leaf_spki(certified.cert[0].as_ref()).expect("spki");
+            assert_eq!(ours, certified.key.public_key().unwrap().as_ref());
+        }
+    }
+
+    #[test]
+    fn leaf_spki_rejects_truncated_der() {
+        let certified = ck(RSA_CRT, RSA_KEY_PKCS8);
+        let der = certified.cert[0].as_ref();
+        for cut in [0, 1, 4, 64, der.len() / 2] {
+            assert!(leaf_spki(&der[..cut]).is_none(), "cut at {cut}");
         }
     }
 

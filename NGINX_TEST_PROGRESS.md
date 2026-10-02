@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-01 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-02 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 49
+- **Passing in ruxen:** 52
 - **Intentionally skipped (`-V` banner excludes the module):** 401
-- **Failing — work in progress:** 55
+- **Failing — work in progress:** 52
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (49)
+## Passing in ruxen (52)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`).
 
@@ -60,6 +60,9 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `server_tokens.t`
 - `split_clients.t`
 - `ssl_certificate_chain.t`
+- `ssl_certificates.t`
+- `ssl_curve.t`
+- `ssl_sni_sessions.t`
 - `trailers.t`
 - `upstream.t`
 - `upstream_keepalive.t`
@@ -67,65 +70,62 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (55)
+## Failing — actively being worked on (52)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
 - `http_absolute_redirect.t` — 16/25
 - `http_listen.t` — 0/0
 - `http_resolver.t` — 0/0
-- `http_resolver_cleanup.t` — 3/3
-- `http_resolver_cname.t` — 13/13
+- `http_resolver_cleanup.t` — 1/3
+- `http_resolver_cname.t` — 11/13
 - `http_variables.t` — 3/9
 - `limit_rate.t` — 3/9
-- `map.t` — 21/21
+- `map.t` — 19/21
 - `map_volatile.t` — 0/0
-- `proxy.t` — 30/30
+- `proxy.t` — 28/30
 - `proxy_bind.t` — 3/7
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 12/16
 - `proxy_duplicate_headers.t` — 7/10
-- `proxy_if.t` — 17/17
+- `proxy_if.t` — 15/17
 - `proxy_method.t` — 3/6
 - `proxy_next_upstream.t` — 2/10
-- `proxy_next_upstream_tries.t` — 10/10
+- `proxy_next_upstream_tries.t` — 8/10
 - `proxy_non_idempotent.t` — 7/10
-- `proxy_protocol2_tlv.t` — 16/16
-- `proxy_redirect.t` — 17/17
+- `proxy_protocol2_tlv.t` — 14/16
+- `proxy_redirect.t` — 15/17
 - `proxy_request_buffering.t` — 2/20
 - `proxy_request_buffering_chunked.t` — 3/24
-- `proxy_request_buffering_ssl.t` — 20/20
+- `proxy_request_buffering_ssl.t` — 18/20
 - `proxy_set_body.t` — 2/4
-- `proxy_ssl.t` — 10/10
-- `proxy_ssl_certificate.t` — 7/7
+- `proxy_ssl.t` — 8/10
+- `proxy_ssl_certificate.t` — 5/7
 - `proxy_ssl_certificate_empty.t` — 0/0
 - `proxy_ssl_certificate_vars.t` — 0/0
-- `proxy_ssl_crl.t` — 7/7
-- `proxy_ssl_keepalive.t` — 5/5
-- `proxy_ssl_verify.t` — 8/8
-- `proxy_ssl_verify_ip.t` — 10/10
-- `proxy_unix.t` — 7/7
+- `proxy_ssl_crl.t` — 5/7
+- `proxy_ssl_keepalive.t` — 3/5
+- `proxy_ssl_verify.t` — 6/8
+- `proxy_ssl_verify_ip.t` — 8/10
+- `proxy_unix.t` — 5/7
 - `proxy_variables.t` — 2/6
-- `proxy_xar.t` — 18/18
+- `proxy_xar.t` — 16/18
 - `ssl.t` — 4/23
-- `ssl_cache.t` — 6/6
+- `ssl_cache.t` — 4/6
 - `ssl_certificate_aux.t` — 0/0
-- `ssl_certificates.t` — 0/0
-- `ssl_client_escaped_cert.t` — 3/5
-- `ssl_crl.t` — 7/7
-- `ssl_curve.t` — 0/0
+- `ssl_client_escaped_cert.t` — 2/5
+- `ssl_crl.t` — 5/7
 - `ssl_ocsp.t` — 0/0
 - `ssl_password_file.t` — 3/5
-- `ssl_proxy_upgrade.t` — 30/32
-- `ssl_reject_handshake.t` — 9/9
-- `ssl_session_reuse.t` — 8/10
-- `ssl_session_ticket_key.t` — 4/4
-- `ssl_sni.t` — 8/10
-- `ssl_sni_reneg.t` — 10/10
-- `ssl_sni_sessions.t` — 0/0
-- `ssl_stapling.t` — 12/12
-- `ssl_verify_client.t` — 16/16
-- `ssl_verify_depth.t` — 11/11
+- `ssl_proxy_upgrade.t` — 28/32
+- `ssl_reject_handshake.t` — 7/9
+- `ssl_session_reuse.t` — 2/10
+- `ssl_session_ticket_key.t` — 2/4
+- `ssl_sni.t` — 1/10
+- `ssl_sni_reneg.t` — 8/10
+- `ssl_stapling.t` — 10/12
+- `ssl_verify_client.t` — 14/16
+- `ssl_verify_depth.t` — 9/11
 
 ## Intentionally skipped (401)
 
