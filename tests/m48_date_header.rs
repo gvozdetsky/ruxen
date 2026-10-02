@@ -191,10 +191,8 @@ fn unix_now() -> u64 {
 fn assert_current_date<'a>(head: &'a str, after_server: bool) -> &'a str {
     assert_eq!(head.matches("\r\nDate: ").count(), 1, "{head}");
     if after_server {
-        assert!(
-            head.contains("\r\nServer: nginx/1.29.2\r\nDate: "),
-            "{head}"
-        );
+        let server = format!("\r\nServer: ruxen/{}\r\nDate: ", env!("CARGO_PKG_VERSION"));
+        assert!(head.contains(&server), "{head}");
     }
     let date = header(head, "date").unwrap();
     let at = parse_http_date(date);

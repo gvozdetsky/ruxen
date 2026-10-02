@@ -15,7 +15,7 @@ The three groups below are mutually exclusive and sum to 505.
 
 ## Passing in ruxen (52)
 
-Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`).
+Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
 - `access_log_variables.t`
 - `auth_basic.t`

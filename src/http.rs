@@ -1270,19 +1270,48 @@ pub fn normalize_host_in_place(buf: &mut [u8], start: usize, end: usize) -> Opti
     })
 }
 
-/// Bytes pinned for the `Server:` header value when `server_tokens` is
-/// `on`/`build` (default). Matches the version pinned in `-V`. `Off` swaps
-/// in `NGINX_PLAIN_BYTES` instead. Both live here so all response builders
-/// share a single source of truth.
-pub const NGINX_VER_BYTES: &[u8] = b"nginx/1.29.2";
-pub const NGINX_PLAIN_BYTES: &[u8] = b"nginx";
+/// The name the `Server` header and the built-in error pages' footer
+/// carry: `versioned` for `server_tokens on|build` (the default), `plain`
+/// for `off`.
+pub struct Identity {
+    pub versioned: &'static [u8],
+    pub plain: &'static [u8],
+}
+
+pub const RUXEN_IDENTITY: Identity = Identity {
+    versioned: concat!("ruxen/", env!("CARGO_PKG_VERSION")).as_bytes(),
+    plain: b"ruxen",
+};
+
+/// What nginx-tests expects (`server_tokens.t`, error-page bodies): the
+/// nginx version `-V` reports.
+pub const NGINX_IDENTITY: Identity = Identity {
+    versioned: b"nginx/1.29.2",
+    plain: b"nginx",
+};
+
+/// Set by `scripts/run_nginx_tests.sh` so responses name nginx, as the
+/// upstream tests assert. Everyone else gets ruxen's own name.
+pub const NGINX_IDENTITY_ENV: &str = "RUXEN_NGINX_IDENTITY";
+
+/// Read once; only config preparation calls this, never the request path.
+pub fn identity() -> &'static Identity {
+    static IDENTITY: std::sync::OnceLock<&'static Identity> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        if std::env::var_os(NGINX_IDENTITY_ENV).is_some_and(|v| v == "1") {
+            &NGINX_IDENTITY
+        } else {
+            &RUXEN_IDENTITY
+        }
+    })
+}
 
 /// Resolve the `Server:` header value for a given `server_tokens` setting.
 pub fn server_header_value(t: crate::config::ServerTokens) -> &'static [u8] {
     use crate::config::ServerTokens::*;
     match t {
-        Off => NGINX_PLAIN_BYTES,
-        On | Build => NGINX_VER_BYTES,
+        Off => identity().plain,
+        On | Build => identity().versioned,
     }
 }
 
@@ -1298,11 +1327,11 @@ pub fn write_server_and_date(out: &mut Vec<u8>, server: &[u8]) {
     out.extend_from_slice(&crate::http_date::now());
 }
 
-/// Default error-page body (`<html>...<center>nginx/X.Y.Z</center>...`)
+/// Default error-page body (`<html>...<center>ruxen/X.Y.Z</center>...`)
 /// for the given status. `None` if the status doesn't have a canned
 /// nginx page (matches `ngx_http_error_pages` in
-/// `ngx_http_special_response.c`). The footer's signature respects
-/// `server_tokens` — `Off` uses plain `nginx`, otherwise the version.
+/// `ngx_http_special_response.c`). The footer is the `Server` value, so
+/// it follows `server_tokens` and the identity (see `identity`).
 pub fn default_error_page_body(status: u16, t: crate::config::ServerTokens) -> Option<Vec<u8>> {
     let (title, h1) = error_page_title(status)?;
     let mut body = Vec::with_capacity(title.len() + h1.len() + 96);
@@ -1316,16 +1345,13 @@ fn write_default_error_page_into(
     h1: &str,
     t: crate::config::ServerTokens,
 ) {
-    let sig: &[u8] = match t {
-        crate::config::ServerTokens::Off => b"<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n",
-        _ => b"<hr><center>nginx/1.29.2</center>\r\n</body>\r\n</html>\r\n",
-    };
     out.extend_from_slice(b"<html>\r\n<head><title>");
     out.extend_from_slice(title.as_bytes());
     out.extend_from_slice(b"</title></head>\r\n<body>\r\n<center><h1>");
     out.extend_from_slice(h1.as_bytes());
-    out.extend_from_slice(b"</h1></center>\r\n");
-    out.extend_from_slice(sig);
+    out.extend_from_slice(b"</h1></center>\r\n<hr><center>");
+    out.extend_from_slice(server_header_value(t));
+    out.extend_from_slice(b"</center>\r\n</body>\r\n</html>\r\n");
 }
 
 /// Title and `<h1>` text for the default error page corresponding to
@@ -1988,7 +2014,7 @@ mod tests {
 
     #[test]
     fn response_has_content_length_and_body() {
-        let out = build_response(200, "hello", NGINX_VER_BYTES);
+        let out = build_response(200, "hello", NGINX_IDENTITY.versioned);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Server: nginx/1.29.2\r\n"));
@@ -1998,7 +2024,7 @@ mod tests {
 
     #[test]
     fn head_response_has_headers_but_no_body() {
-        let out = build_head_response(200, 5, NGINX_VER_BYTES);
+        let out = build_head_response(200, 5, NGINX_IDENTITY.versioned);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 5\r\n"));
@@ -2010,9 +2036,21 @@ mod tests {
     #[test]
     fn server_header_value_respects_tokens() {
         use crate::config::ServerTokens::*;
-        assert_eq!(server_header_value(Off), b"nginx");
-        assert_eq!(server_header_value(On), b"nginx/1.29.2");
-        assert_eq!(server_header_value(Build), b"nginx/1.29.2");
+        assert_eq!(server_header_value(Off), identity().plain);
+        assert_eq!(server_header_value(On), identity().versioned);
+        assert_eq!(server_header_value(Build), identity().versioned);
+    }
+
+    #[test]
+    fn identities() {
+        assert_eq!(
+            RUXEN_IDENTITY.versioned,
+            format!("ruxen/{}", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+        assert_eq!(RUXEN_IDENTITY.plain, b"ruxen");
+        // Must match the `nginx version:` line of `-V`.
+        assert_eq!(NGINX_IDENTITY.versioned, b"nginx/1.29.2");
+        assert_eq!(NGINX_IDENTITY.plain, b"nginx");
     }
 
     #[test]
@@ -2022,10 +2060,16 @@ mod tests {
         let off = default_error_page_body(404, Off).unwrap();
         let on_str = std::str::from_utf8(&on).unwrap();
         let off_str = std::str::from_utf8(&off).unwrap();
+        let footer = |name: &[u8]| {
+            format!(
+                "<hr><center>{}</center>",
+                std::str::from_utf8(name).unwrap()
+            )
+        };
         assert!(on_str.contains("<title>404 Not Found</title>"));
-        assert!(on_str.contains("<center>nginx/1.29.2</center>"));
-        assert!(off_str.contains("<center>nginx</center>"));
-        assert!(!off_str.contains("nginx/"));
+        assert!(on_str.contains(&footer(identity().versioned)));
+        assert!(off_str.contains(&footer(identity().plain)));
+        assert!(!off_str.contains(std::str::from_utf8(identity().versioned).unwrap()));
         assert!(default_error_page_body(200, On).is_none());
     }
 }

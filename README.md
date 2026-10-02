@@ -234,6 +234,8 @@ The currently implemented nginx-style command-line surface includes:
 
 `-V` starts with `nginx version: nginx/1.29.2`, followed by `ruxen version: ruxen/<version>`. The nginx line and the `configure arguments` list are what the nginx-tests harness reads to decide which tests apply, so they describe ruxen as an nginx build: the arguments list only the modules ruxen actually implements.
 
+Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.29.2` instead, because the upstream tests assert nginx's header.
+
 ruxen also supports pid files and graceful shutdown via `SIGQUIT`.
 
 The nginx `-s` command interface is not implemented yet.

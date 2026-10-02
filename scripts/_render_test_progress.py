@@ -75,7 +75,8 @@ def main() -> int:
     parts.append(f"## Passing in ruxen ({n_pass})\n\n")
     parts.append(
         "Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end "
-        "(sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`).\n\n"
+        "(sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, "
+        "`RUXEN_NGINX_IDENTITY=1`).\n\n"
     )
     for name in passing:
         parts.append(f"- `{name}`\n")
