@@ -59,6 +59,8 @@ pub struct HttpConfig {
     pub auth_delay_ms: Option<u64>,
     /// http-scope `client_max_body_size` in bytes. `None` means "not set".
     pub client_max_body_size: Option<u64>,
+    /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
+    pub sendfile: Option<bool>,
     /// http-scope `post_action URI|@name;`. `None` means "not set";
     /// server/location scopes inherit it.
     pub post_action: Option<String>,
@@ -340,6 +342,8 @@ pub struct Server {
     pub auth_delay_ms: Option<u64>,
     /// Server-scope `client_max_body_size` in bytes. `None` inherits from http.
     pub client_max_body_size: Option<u64>,
+    /// Server-scope `sendfile on|off`. `None` inherits from http.
+    pub sendfile: Option<bool>,
     /// Server-scope `post_action URI|@name;`. `None` inherits from http.
     pub post_action: Option<String>,
     /// Server-scope `expires` directive. `None` inherits from http.
@@ -475,6 +479,9 @@ pub struct Location {
     /// Location-scope `client_max_body_size` in bytes. `None` inherits from
     /// server.
     pub client_max_body_size: Option<u64>,
+    /// Location-scope `sendfile on|off`, inherited through nested locations
+    /// at parse time. `None` inherits from server/http at prepare time.
+    pub sendfile: Option<bool>,
     /// Location-scope `client_body_in_file_only on|clean|off;`. `None`
     /// inherits from server (default `off`). When `on`, the spilled
     /// request body file is kept after the request completes; `clean`

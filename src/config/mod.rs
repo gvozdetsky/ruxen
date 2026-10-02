@@ -178,6 +178,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
     let mut client_max_body_size: Option<u64> = None;
+    let mut sendfile: Option<bool> = None;
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
@@ -215,6 +216,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     auth_basic_user_file,
                     auth_delay_ms,
                     client_max_body_size,
+                    sendfile,
                     post_action,
                     expires,
                     ignore_invalid_headers,
@@ -486,6 +488,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     return Err(Error::Duplicate("client_max_body_size"));
                 }
                 client_max_body_size = Some(parse_client_max_body_size_args(&args[1..])?);
+            }
+            ("sendfile", Terminator::Semi) => {
+                if sendfile.is_some() {
+                    return Err(Error::Duplicate("sendfile"));
+                }
+                sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
             }
             ("post_action", Terminator::Semi) => {
                 if post_action.is_some() {

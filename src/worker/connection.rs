@@ -113,6 +113,14 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         idle: Option<Duration>,
         start_reload_gen: u64,
     ) -> bool;
+
+    /// Raw socket fd for the zero-copy `sendfile` path, or `None` when the
+    /// transport has to see the bytes (TLS).
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd>;
+
+    /// Wait until the socket accepts more data. Only used by the zero-copy
+    /// path, which writes to the fd directly.
+    async fn wait_writable(&self) -> std::io::Result<()>;
 }
 
 impl ConnIo for TcpStream {
@@ -123,6 +131,15 @@ impl ConnIo for TcpStream {
         start_reload_gen: u64,
     ) -> bool {
         wait_readable_or_shutdown(self, state, idle, start_reload_gen).await
+    }
+
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.as_raw_fd())
+    }
+
+    async fn wait_writable(&self) -> std::io::Result<()> {
+        self.writable(false).await
     }
 }
 
@@ -135,6 +152,105 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     ) -> bool {
         !state.is_shutting_down() && state.reload_gen() == start_reload_gen
     }
+
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
+
+    async fn wait_writable(&self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+/// Upper bound for one `sendfile(2)` call, matching nginx's
+/// `sendfile_max_chunk` default (2m since 1.21.4).
+const SENDFILE_MAX_CHUNK: usize = 2 * 1024 * 1024;
+
+/// `sendfile on` path for plain TCP: write the response header block, then
+/// the file range with `sendfile(2)`, so the body never passes through user
+/// space (nginx's `ngx_linux_sendfile_chain`).
+///
+/// The socket is switched to `O_NONBLOCK` on first use (`nonblocking`
+/// remembers that per connection). io_uring ops on the same socket behave
+/// the same either way — the kernel arms an internal poll on EAGAIN — so
+/// only the direct `send` / `sendfile` calls here see the flag, and they
+/// wait for writability instead of blocking the worker.
+///
+/// Returns `false` on any write error or if the file is shorter than the
+/// `Content-Length` already promised; the caller drops the connection.
+pub(crate) async fn send_head_and_file<S: ConnIo>(
+    stream: &S,
+    nonblocking: &mut bool,
+    head: &[u8],
+    body: phase::FileBody,
+) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Some(sock) = stream.sendfile_fd() else {
+        return false;
+    };
+    if !*nonblocking {
+        // SAFETY: fcntl on an fd we own for the connection's lifetime.
+        let flags = unsafe { libc::fcntl(sock, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(sock, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return false;
+        }
+        *nonblocking = true;
+    }
+
+    // MSG_MORE holds the header back so the kernel coalesces it with the
+    // first file pages instead of pushing a short segment on its own (nginx
+    // gets the same effect from `tcp_nopush` + sendfile).
+    let mut sent = 0usize;
+    while sent < head.len() {
+        // SAFETY: the pointer/len pair stays within `head`.
+        let n = unsafe {
+            libc::send(
+                sock,
+                head[sent..].as_ptr().cast(),
+                head.len() - sent,
+                libc::MSG_MORE | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n >= 0 {
+            sent += n as usize;
+            continue;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if stream.wait_writable().await.is_err() {
+                    return false;
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return false,
+        }
+    }
+
+    let file = body.fd.as_raw_fd();
+    let mut offset = body.offset as libc::off_t;
+    let end = offset + body.len as libc::off_t;
+    while offset < end {
+        let chunk = ((end - offset) as usize).min(SENDFILE_MAX_CHUNK);
+        // SAFETY: both fds are open; the kernel advances `offset`.
+        let n = unsafe { libc::sendfile(sock, file, &mut offset, chunk) };
+        if n > 0 {
+            continue;
+        }
+        if n == 0 {
+            // File shrank below the Content-Length we already sent.
+            return false;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if stream.wait_writable().await.is_err() {
+                    return false;
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(stream: &mut S, body: phase::FileBody) -> bool {

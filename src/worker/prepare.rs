@@ -49,6 +49,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
         auth_basic_user_file,
         auth_delay_ms,
         client_max_body_size,
+        sendfile,
         post_action,
         expires: http_expires,
         ignore_invalid_headers,
@@ -89,6 +90,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
     let http_auth_basic_user_file = auth_basic_user_file.map(leak_path_buf);
     let http_auth_delay_ms = auth_delay_ms.unwrap_or(0);
     let http_client_max_body_size = client_max_body_size;
+    let http_sendfile = sendfile;
     let http_post_action = post_action.map(|target| leak_bytes(target.as_bytes()));
     let http_expires = http_expires
         .map(prepare_expires)
@@ -141,6 +143,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
                     http_auth_basic_user_file,
                     http_auth_delay_ms,
                     http_client_max_body_size,
+                    http_sendfile,
                     http_post_action,
                     http_expires,
                     http_ignore_invalid_headers,
@@ -582,6 +585,7 @@ pub(crate) fn prepare_server(
     http_auth_basic_user_file: Option<&'static Path>,
     http_auth_delay_ms: u64,
     http_client_max_body_size: Option<u64>,
+    http_sendfile: Option<bool>,
     http_post_action: Option<&'static [u8]>,
     http_expires: PreparedExpires,
     http_ignore_invalid_headers: bool,
@@ -725,6 +729,7 @@ pub(crate) fn prepare_server(
         .or(http_auth_basic_user_file);
     let server_auth_delay_ms = server.auth_delay_ms.unwrap_or(http_auth_delay_ms);
     let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
+    let server_sendfile = server.sendfile.or(http_sendfile).unwrap_or(false);
     let server_post_action = server
         .post_action
         .as_ref()
@@ -785,6 +790,7 @@ pub(crate) fn prepare_server(
                 server_auth_basic_user_file,
                 server_auth_delay_ms,
                 server_client_max_body_size,
+                server_sendfile,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -811,6 +817,7 @@ pub(crate) fn prepare_server(
                 server_auth_basic_user_file,
                 server_auth_delay_ms,
                 server_client_max_body_size,
+                server_sendfile,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -837,6 +844,7 @@ pub(crate) fn prepare_server(
                 server_auth_basic_user_file,
                 server_auth_delay_ms,
                 server_client_max_body_size,
+                server_sendfile,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -864,6 +872,7 @@ pub(crate) fn prepare_server(
                 server_auth_basic_user_file,
                 server_auth_delay_ms,
                 server_client_max_body_size,
+                server_sendfile,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -927,6 +936,7 @@ pub(crate) fn prepare_server(
             auth_basic_user_file: server_auth_basic_user_file,
             auth_delay_ms: server_auth_delay_ms,
             client_max_body_size: server_client_max_body_size,
+            sendfile: server_sendfile,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             post_action: server_post_action,
             expires: server_expires,
@@ -975,6 +985,7 @@ pub(crate) fn prepare_server(
             auth_basic_user_file: server_auth_basic_user_file,
             auth_delay_ms: server_auth_delay_ms,
             client_max_body_size: server_client_max_body_size,
+            sendfile: server_sendfile,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             post_action: server_post_action,
             expires: server_expires,
@@ -1670,6 +1681,7 @@ pub(crate) fn build_prefix_or_exact(
     server_auth_basic_user_file: Option<&'static Path>,
     server_auth_delay_ms: u64,
     server_client_max_body_size: Option<u64>,
+    server_sendfile: bool,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
@@ -1704,6 +1716,7 @@ pub(crate) fn build_prefix_or_exact(
         auth_basic_user_file: location_auth_basic_user_file,
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
+        sendfile: location_sendfile,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
@@ -1787,6 +1800,7 @@ pub(crate) fn build_prefix_or_exact(
         .or(server_auth_basic_user_file);
     let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let post_action = location_post_action
         .map(|target| leak_bytes(target.as_bytes()))
         .or(server_post_action);
@@ -1813,6 +1827,7 @@ pub(crate) fn build_prefix_or_exact(
         auth_basic_user_file,
         auth_delay_ms,
         client_max_body_size,
+        sendfile,
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
         post_action,
@@ -1841,6 +1856,7 @@ pub(crate) fn build_regex_location(
     server_auth_basic_user_file: Option<&'static Path>,
     server_auth_delay_ms: u64,
     server_client_max_body_size: Option<u64>,
+    server_sendfile: bool,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
@@ -1875,6 +1891,7 @@ pub(crate) fn build_regex_location(
         auth_basic_user_file: location_auth_basic_user_file,
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
+        sendfile: location_sendfile,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
@@ -1969,6 +1986,7 @@ pub(crate) fn build_regex_location(
         .or(server_auth_basic_user_file);
     let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let post_action = location_post_action
         .map(|target| leak_bytes(target.as_bytes()))
         .or(server_post_action);
@@ -1993,6 +2011,7 @@ pub(crate) fn build_regex_location(
         auth_basic_user_file,
         auth_delay_ms,
         client_max_body_size,
+        sendfile,
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
         post_action,

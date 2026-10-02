@@ -140,6 +140,7 @@ Supported functionality includes:
 - conditional requests
 - byte ranges
 - streamed large files
+- zero-copy `sendfile on|off` (plain TCP)
 - URI decoding and normalization
 - trailing-slash redirects
 - `autoindex`

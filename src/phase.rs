@@ -215,6 +215,10 @@ pub struct ProcessMeta {
     /// `On` keeps the spilled request body file after the response;
     /// `Off`/`Clean` unlink it.
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    /// Effective `sendfile` for the matched location. The worker sends a
+    /// `Response::File` body zero-copy when this is on and the transport
+    /// allows it (plain TCP).
+    pub sendfile: bool,
     /// Effective `post_action` target for the matched location/server.
     /// The worker runs this after the client response is written and
     /// suppresses its output.
@@ -245,6 +249,7 @@ impl Default for ProcessMeta {
             response_delay_ms: 0,
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
+            sendfile: false,
             post_action: None,
             upstream_response_time_ms: None,
             proxy_expires: crate::worker::PreparedExpires::Off,
@@ -618,6 +623,7 @@ fn process_with_meta_inner(
         let loc_chunked_te = loc.chunked_transfer_encoding;
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
+        meta.sendfile = loc.sendfile;
         // Mark this as a proxy attempt up front so `$upstream_response_time`
         // renders as `0.000` even on the short-circuit Prebuilt 502 paths
         // (no peer / pick failure inside the handler). The settle step
