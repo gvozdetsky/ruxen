@@ -92,24 +92,16 @@ pub(crate) fn parse_server_block(
                     if listens.is_empty() {
                         return Err(Error::MissingArg("listen"));
                     }
-                    let any_ssl_listen = listens.iter().any(|l| l.ssl);
-                    if any_ssl_listen && ssl_certs.is_empty() {
-                        return Err(Error::BadValue {
-                            what: "ssl_certificate (required when `listen ssl;`)",
-                            got: "<missing>".into(),
-                        });
-                    }
+                    // Whether this server's certificates are required, and
+                    // whether its ssl_* lines take effect, depends on the
+                    // other servers on the same address (`ssl` belongs to
+                    // the listening socket): `prepare` and
+                    // `warn_ssl_without_ssl_listen` decide.
                     if ssl_certs.len() != ssl_keys.len() {
                         return Err(Error::BadValue {
                             what: "ssl_certificate / ssl_certificate_key count mismatch",
                             got: format!("{} cert(s), {} key(s)", ssl_certs.len(), ssl_keys.len()),
                         });
-                    }
-                    if !any_ssl_listen && saw_any_ssl_directive {
-                        warnings.push(
-                            "server with ssl_* directives but no `listen … ssl;` — TLS settings ignored"
-                                .into(),
-                        );
                     }
                     if matches!(ssl_prefer_server_ciphers, Some(false)) {
                         warnings.push(
@@ -150,6 +142,7 @@ pub(crate) fn parse_server_block(
                         keepalive_requests: kar,
                         keepalive_time_ms: katm,
                         keepalive_disable: kad,
+                        ssl_directives: saw_any_ssl_directive || saw_local_ssl_cert_or_key,
                         client_timeouts: client_timeouts.inherit(inherited_client_timeouts),
                         merge_slashes,
                         ignore_invalid_headers,

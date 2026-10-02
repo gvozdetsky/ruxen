@@ -467,6 +467,23 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn ssl_address_needs_a_certificate_on_its_default_server() {
+        // nginx (ngx_http_ssl_init): only the default server must have one.
+        let err = prepare_err("http { server { listen 127.0.0.1:8443 ssl; } }");
+        assert!(
+            err.starts_with(
+                "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive"
+            ),
+            "{err}"
+        );
+        let err = prepare_err(
+            "http { server { listen 127.0.0.1:8443; }
+                    server { listen 127.0.0.1:8443 ssl; server_name b; } }",
+        );
+        assert!(err.starts_with("no \"ssl_certificate\""), "{err}");
+    }
+
+    #[test]
     pub(crate) fn prepare_rejects_proxy_uri_in_regex_location() {
         let err = prepare_err(
             "http { server { listen 127.0.0.1:8080; location ~ ^/a { proxy_pass http://127.0.0.1:1/x; } } }",

@@ -238,8 +238,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ignore_invalid_headers,
                     underscores_in_headers,
                     upstreams,
+                    warnings: warn_ssl_without_ssl_listen(&servers, warnings),
                     servers,
-                    warnings,
                     dump_files: Vec::new(),
                     conf_prefix: None,
                 }),
@@ -827,6 +827,25 @@ pub(crate) fn warn_ignored_tls_policy(args: &[String], warnings: &mut Vec<String
     if !warnings.contains(&w) {
         warnings.push(w);
     }
+}
+
+/// A server's ssl_* lines take effect when any server on its address
+/// listens with `ssl` (the flag belongs to the socket, as in nginx). Warn
+/// only when none does: then they are ignored.
+fn warn_ssl_without_ssl_listen(servers: &[Server], mut warnings: Vec<String>) -> Vec<String> {
+    let ignored = servers.iter().any(|s| {
+        s.ssl_directives
+            && !servers
+                .iter()
+                .any(|other| other.listen.addr == s.listen.addr && other.listen.ssl)
+    });
+    if ignored {
+        warnings.push(
+            "server with ssl_* directives but no `listen … ssl;` on its address — TLS settings ignored"
+                .into(),
+        );
+    }
+    warnings
 }
 
 /// `events { … }`: `worker_connections` is used; the other event-module
@@ -1584,22 +1603,23 @@ mod tests {
     }
 
     #[test]
-    fn listen_ssl_without_certificate_is_rejected() {
-        let src = r#"
-            http {
-                server {
-                    listen 443 ssl;
-                    location / { return 200 ""; }
-                }
-            }
-        "#;
-        let err = parse(src).unwrap_err();
-        match err {
-            Error::BadValue { what, .. } => {
-                assert!(what.starts_with("ssl_certificate"), "got what={what}");
-            }
-            other => panic!("expected BadValue, got {other:?}"),
-        }
+    fn ssl_warning_considers_the_whole_address() {
+        let warned = |src: &str| {
+            parse(src)
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|w| w.contains("TLS settings ignored"))
+        };
+        // Another server on the address listens with ssl: the settings apply.
+        assert!(!warned(
+            "http { server { listen 127.0.0.1:443 ssl; ssl_certificate a.pem; ssl_certificate_key a.key; }
+                    server { listen 127.0.0.1:443; server_name b; ssl_certificate b.pem; ssl_certificate_key b.key; } }"
+        ));
+        // Nobody on the address does.
+        assert!(warned(
+            "http { server { listen 127.0.0.1:80; ssl_certificate b.pem; ssl_certificate_key b.key; } }"
+        ));
     }
 
     #[test]

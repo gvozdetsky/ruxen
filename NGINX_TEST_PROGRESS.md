@@ -7,13 +7,13 @@ Last run: 2026-10-02 against `nginx-tests` 0b70854 (2026-09-30).
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 53
+- **Passing in ruxen:** 54
 - **Intentionally skipped (`-V` banner excludes the module):** 401
-- **Failing — work in progress:** 51
+- **Failing — work in progress:** 50
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (53)
+## Passing in ruxen (54)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -63,6 +63,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `ssl_certificate_chain.t`
 - `ssl_certificates.t`
 - `ssl_curve.t`
+- `ssl_sni.t`
 - `ssl_sni_sessions.t`
 - `trailers.t`
 - `upstream.t`
@@ -71,7 +72,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (51)
+## Failing — actively being worked on (50)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -121,7 +122,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_reject_handshake.t` — 7/9
 - `ssl_session_reuse.t` — 2/10
 - `ssl_session_ticket_key.t` — 2/4
-- `ssl_sni.t` — 1/10
 - `ssl_sni_reneg.t` — 8/10
 - `ssl_stapling.t` — 10/12
 - `ssl_verify_client.t` — 14/16
