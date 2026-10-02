@@ -290,7 +290,35 @@ async fn run_post_action(
     }
 }
 
+/// Give this worker thread its own copy of the fd table.
+///
+/// Threads share one fd table, and every `open(2)` / `close(2)` takes its
+/// spinlock (`alloc_fd`, `file_close_fd`). With one open + close per static
+/// request and 32 workers, that lock was ~5–8% of CPU on the 304 bench.
+/// nginx doesn't pay this: its workers are processes. After
+/// `unshare(CLONE_FILES)` each worker has a private table, like an nginx
+/// worker.
+///
+/// Safe because no fd crosses threads after startup: fds opened before the
+/// workers spawn (root dirs, stdio) are copied into each private table, and
+/// everything else — listeners, the io_uring ring, accepted sockets,
+/// per-request files, access-log handles — is opened by the worker that
+/// uses it. `RUXEN_UNSHARE_FILES=0` keeps the shared table (for A/B runs).
+fn unshare_fd_table() {
+    if matches!(std::env::var("RUXEN_UNSHARE_FILES").as_deref(), Ok("0")) {
+        return;
+    }
+    // SAFETY: plain syscall; affects only the calling thread's fd table.
+    if unsafe { libc::unshare(libc::CLONE_FILES) } != 0 {
+        eprintln!(
+            "ruxen: unshare(CLONE_FILES) failed: {}; worker keeps the shared fd table",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 pub fn run(http: &'static PreparedHttp, cpu: Option<usize>, state: Arc<RuntimeState>) {
+    unshare_fd_table();
     if let Some(c) = cpu {
         // Pin before building the runtime so io_uring setup + the submission
         // queue end up on the target CPU's kernel workers too.

@@ -35,7 +35,7 @@ use super::*;
 
 pub(crate) fn finalize_location_response(
     response: Response,
-    add_headers: &[PreparedAddHeader],
+    add_headers: &'static [PreparedAddHeader],
     add_trailers: &[PreparedAddHeader],
     trailers_allowed: bool,
     render_ctx_base: &RenderCtx<'_>,
@@ -86,6 +86,18 @@ pub(crate) fn finalize_location_response(
                 && !needs_expires
             {
                 return Response::Prebuilt(bytes);
+            }
+            if add_trailers.is_empty()
+                && status == base_status
+                && inject_location.is_none()
+                && inject_www_authenticate.is_empty()
+                && !needs_expires
+            {
+                if let Some(cached) =
+                    prebuilt_with_literal_add_headers(bytes, add_headers, status, render_ctx_base)
+                {
+                    return Response::Prebuilt(cached);
+                }
             }
             let mut out = if status == base_status {
                 bytes.to_vec()
@@ -829,4 +841,52 @@ pub(crate) fn run_location_handler(
         preserved_www_authenticate,
         loc.expires,
     )
+}
+
+thread_local! {
+    /// `(prebuilt ptr, add_headers ptr)` → the prebuilt with those headers
+    /// applied, or `None` when some value has variables. Both keys are
+    /// `'static` config data, so the map is bounded by the config.
+    static PREBUILT_ADD_HEADERS: std::cell::RefCell<
+        std::collections::HashMap<(usize, usize), Option<&'static [u8]>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A static `return` with `add_header`s whose values are all literals
+/// produces the same bytes on every request, so build them once per worker
+/// and serve them as a prebuilt. Before this, every request copied the
+/// response, rendered and spliced each header, and re-scanned the result
+/// (`add_header_many` ran at ~93% of nginx).
+///
+/// The bytes come from `inject_add_headers` itself, so the output is the
+/// same as the per-request path, including the `Last-Modified` / `ETag`
+/// special cases. `status` is fixed for a given prebuilt here (no error-page
+/// override), which is all `add_header`'s status eligibility depends on.
+fn prebuilt_with_literal_add_headers(
+    bytes: &'static [u8],
+    add_headers: &'static [PreparedAddHeader],
+    status: u16,
+    render_ctx_base: &RenderCtx<'_>,
+) -> Option<&'static [u8]> {
+    let key = (bytes.as_ptr() as usize, add_headers.as_ptr() as usize);
+    PREBUILT_ADD_HEADERS.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&key) {
+            return *hit;
+        }
+        let literal = add_headers
+            .iter()
+            .all(|h| h.value.iter().all(|p| matches!(p, PreparedValuePart::Literal(_))));
+        let built = literal.then(|| {
+            // Literal values ignore the render context; it is only needed
+            // to satisfy the signature (and `status` for eligibility).
+            let ctx = RenderCtx {
+                status,
+                ..*render_ctx_base
+            };
+            let out = inject_add_headers(bytes.to_vec(), add_headers, &ctx);
+            &*Box::leak(out.into_boxed_slice())
+        });
+        cache.borrow_mut().insert(key, built);
+        built
+    })
 }

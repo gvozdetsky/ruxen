@@ -117,6 +117,7 @@ We use OS threads, not processes. Consequences:
 - Shared address space → `&'static PreparedServer` works, no IPC needed for config.
 - Worker crash = whole-process crash; no per-worker supervision.
 - No live reload via `SIGHUP`-then-exec-then-handoff-listen-fds (nginx's binary upgrade path).
+- **One fd table per worker anyway.** Threads share the process fd table, and every `open`/`close` takes its spinlock (`alloc_fd`, `file_close_fd`). With one open + close per static request on 32 workers, that lock was 5–8% of CPU on the 304 bench (`native_queued_spin_lock_slowpath`); nginx's worker processes never contend on it. Each worker calls `unshare(CLONE_FILES)` first thing, which gives the thread a private copy of the table. That is safe because no fd crosses threads after startup (root-dir fds and stdio are opened before the workers spawn and get copied; listeners, the io_uring ring, connections, per-request files, and access-log handles are opened by the worker that uses them). Measured with ABBA pairs on one binary (`RUXEN_UNSHARE_FILES=0` restores the shared table): 304 +4.7%, 1 KiB static +3.6%, `return 200` unchanged. `tests/m46_worker_fd_table.rs` checks it via `/proc/<pid>/task/*/fd`.
 
 All acceptable for v0.1. Reload-without-drop is a v1+ concern; we can either re-exec like nginx or move to a master-supervisor model later.
 
