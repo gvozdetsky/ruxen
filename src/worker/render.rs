@@ -1043,4 +1043,3 @@ pub(crate) fn render_variable_to_vec(var: &Variable, ctx: &RenderCtx<'_>) -> Vec
     ctx.write_var(var, &mut out);
     out
 }
-

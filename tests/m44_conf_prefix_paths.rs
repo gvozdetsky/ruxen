@@ -87,7 +87,10 @@ fn include_and_ssl_paths_resolve_against_config_dir() {
     let (port, _lock) = pick_port();
     write(
         &conf_dir.join("nginx.conf"),
-        &format!("pid {}/ruxen.pid;\nevents {{}}\nhttp {{\n  include conf.d/server.conf;\n}}\n", conf_dir.display()),
+        &format!(
+            "pid {}/ruxen.pid;\nevents {{}}\nhttp {{\n  include conf.d/server.conf;\n}}\n",
+            conf_dir.display()
+        ),
     );
     // The nested include is written relative to the config directory, not
     // to conf.d/ — nginx resolves every include against the conf prefix.
@@ -128,7 +131,11 @@ fn include_and_ssl_paths_resolve_against_config_dir() {
         .arg(format!("https://127.0.0.1:{port}/"))
         .output()
         .expect("run curl");
-    assert!(out.status.success(), "curl failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "curl failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(out.stdout, b"tls-ok");
 }
 

@@ -21,26 +21,26 @@ use std::path::{Path, PathBuf};
 mod ast;
 mod error;
 mod lexer;
-mod values;
-mod parse_server;
 mod parse_location;
-mod parse_rewrite;
-mod parse_upstream;
 mod parse_log;
 mod parse_map;
+mod parse_rewrite;
+mod parse_server;
+mod parse_upstream;
+mod values;
 
 pub use ast::*;
 pub use error::*;
 pub use values::parse_value_with_vars;
 
 pub(crate) use lexer::*;
-pub(crate) use values::*;
-pub(crate) use parse_server::*;
 pub(crate) use parse_location::*;
-pub(crate) use parse_rewrite::*;
-pub(crate) use parse_upstream::*;
 pub(crate) use parse_log::*;
 pub(crate) use parse_map::*;
+pub(crate) use parse_rewrite::*;
+pub(crate) use parse_server::*;
+pub(crate) use parse_upstream::*;
+pub(crate) use values::*;
 
 /// Test-only parse entry that takes inline source and synthesizes a single
 /// nameless frame. Production code goes through `parse_with_main`.
@@ -473,8 +473,10 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 if auth_basic_user_file.is_some() {
                     return Err(Error::Duplicate("auth_basic_user_file"));
                 }
-                auth_basic_user_file =
-                    Some(parse_auth_basic_user_file_args(&args[1..], lx.conf_prefix())?);
+                auth_basic_user_file = Some(parse_auth_basic_user_file_args(
+                    &args[1..],
+                    lx.conf_prefix(),
+                )?);
             }
             ("auth_delay", Terminator::Semi) => {
                 if auth_delay_ms.is_some() {

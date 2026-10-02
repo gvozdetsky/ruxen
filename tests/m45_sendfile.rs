@@ -64,18 +64,12 @@ fn wait_for_listen(port: u16) {
 
 /// Deterministic, non-repeating-looking content so offset bugs show up.
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| ((i * 31 + seed as usize) % 251) as u8).collect()
+    (0..len)
+        .map(|i| ((i * 31 + seed as usize) % 251) as u8)
+        .collect()
 }
 
-const SIZES: &[usize] = &[
-    1,
-    4095,
-    4096,
-    8192,
-    8193,
-    65_536,
-    3_000_001,
-];
+const SIZES: &[usize] = &[1, 4095, 4096, 8192, 8193, 65_536, 3_000_001];
 
 fn spawn(conf_body: impl Fn(u16, &Path) -> String) -> (ServerGuard, u16, PathBuf) {
     let (port, _lock) = pick_port();
@@ -93,7 +87,14 @@ fn spawn(conf_body: impl Fn(u16, &Path) -> String) -> (ServerGuard, u16, PathBuf
         .spawn()
         .expect("spawn ruxen");
     wait_for_listen(port);
-    (ServerGuard { child, dir: dir.clone() }, port, dir)
+    (
+        ServerGuard {
+            child,
+            dir: dir.clone(),
+        },
+        port,
+        dir,
+    )
 }
 
 fn plain_conf(sendfile: &'static str) -> impl Fn(u16, &Path) -> String {
@@ -107,7 +108,11 @@ fn plain_conf(sendfile: &'static str) -> impl Fn(u16, &Path) -> String {
 
 /// Read one HTTP/1.1 response framed by Content-Length (or header-only for
 /// HEAD / 304) off `stream`, consuming exactly its bytes.
-fn read_response(stream: &mut TcpStream, pending: &mut Vec<u8>, head_only: bool) -> (String, Vec<u8>) {
+fn read_response(
+    stream: &mut TcpStream,
+    pending: &mut Vec<u8>,
+    head_only: bool,
+) -> (String, Vec<u8>) {
     let mut buf = [0u8; 65_536];
     let head_end = loop {
         if let Some(i) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -122,7 +127,8 @@ fn read_response(stream: &mut TcpStream, pending: &mut Vec<u8>, head_only: bool)
         .lines()
         .find_map(|l| {
             let (k, v) = l.split_once(':')?;
-            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().unwrap())
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().unwrap())
         })
         .unwrap_or(0);
     let body_len = if head_only { 0 } else { len };
@@ -138,7 +144,9 @@ fn read_response(stream: &mut TcpStream, pending: &mut Vec<u8>, head_only: bool)
 
 fn get_all_on_one_connection(port: u16, dir: &Path) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut pending = Vec::new();
     for &len in SIZES {
         write!(stream, "GET /f{len}.bin HTTP/1.1\r\nHost: t\r\n\r\n").unwrap();
@@ -166,7 +174,9 @@ fn sendfile_off_serves_identical_bytes_over_keepalive() {
 fn sendfile_on_handles_pipelining_ranges_and_head() {
     let (_g, port, dir) = spawn(plain_conf("on"));
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     // Three requests in one write: two full bodies above the zero-copy
     // threshold, then a range from the middle of the large file.
     stream
@@ -189,7 +199,10 @@ fn sendfile_on_handles_pipelining_ranges_and_head() {
 
     let (h, b) = read_response(&mut stream, &mut pending, false);
     assert!(h.starts_with("HTTP/1.1 206"), "{h}");
-    assert!(h.contains("Content-Range: bytes 1000000-1009999/3000001"), "{h}");
+    assert!(
+        h.contains("Content-Range: bytes 1000000-1009999/3000001"),
+        "{h}"
+    );
     let full = std::fs::read(dir.join("f3000001.bin")).unwrap();
     assert!(b == full[1_000_000..1_010_000]);
 
@@ -202,7 +215,10 @@ fn sendfile_on_handles_pipelining_ranges_and_head() {
 #[test]
 fn sendfile_on_over_tls_falls_back_to_copying() {
     let certs = common::tls::make_self_signed("localhost");
-    let (cert, key) = (certs.cert_path().to_path_buf(), certs.key_path().to_path_buf());
+    let (cert, key) = (
+        certs.cert_path().to_path_buf(),
+        certs.key_path().to_path_buf(),
+    );
     let (_g, port, dir) = spawn(move |port, dir| {
         format!(
             "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{\n  access_log off;\n  sendfile on;\n  server {{\n    listen 127.0.0.1:{port} ssl;\n    ssl_certificate {c};\n    ssl_certificate_key {k};\n    root {d};\n  }}\n}}\n",
@@ -229,19 +245,25 @@ fn stalled_reader_does_not_block_the_worker() {
     // client B meanwhile, then finish A's body intact once A drains.
     let (_g, port, dir) = spawn(plain_conf("on"));
     let mut slow = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    slow.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    slow.write_all(b"GET /f3000001.bin HTTP/1.1\r\nHost: t\r\n\r\n").unwrap();
+    slow.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    slow.write_all(b"GET /f3000001.bin HTTP/1.1\r\nHost: t\r\n\r\n")
+        .unwrap();
     sleep(Duration::from_millis(200));
 
     let started = Instant::now();
     let mut fast = TcpStream::connect(("127.0.0.1", port)).unwrap();
     fast.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    fast.write_all(b"GET /f8192.bin HTTP/1.1\r\nHost: t\r\n\r\n").unwrap();
+    fast.write_all(b"GET /f8192.bin HTTP/1.1\r\nHost: t\r\n\r\n")
+        .unwrap();
     let mut pending = Vec::new();
     let (h, b) = read_response(&mut fast, &mut pending, false);
     assert!(h.starts_with("HTTP/1.1 200"), "{h}");
     assert!(b == std::fs::read(dir.join("f8192.bin")).unwrap());
-    assert!(started.elapsed() < Duration::from_secs(1), "worker was blocked");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "worker was blocked"
+    );
 
     let mut pending = Vec::new();
     let (h, b) = read_response(&mut slow, &mut pending, false);

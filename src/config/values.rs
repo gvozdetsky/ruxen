@@ -113,7 +113,10 @@ pub(crate) fn parse_value_with_vars_impl(
     Ok(out)
 }
 
-pub(crate) fn parse_single_variable(token: &str, allow_numeric_capture: bool) -> Result<Variable, Error> {
+pub(crate) fn parse_single_variable(
+    token: &str,
+    allow_numeric_capture: bool,
+) -> Result<Variable, Error> {
     let parts = parse_value_with_vars_impl(token, allow_numeric_capture)?;
     if parts.len() != 1 {
         return Err(Error::BadValue {
@@ -250,4 +253,3 @@ pub(crate) fn is_var_name_first(c: u8) -> bool {
 pub(crate) fn is_var_name_cont(c: u8) -> bool {
     matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
 }
-

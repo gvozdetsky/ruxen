@@ -2,8 +2,8 @@
 //! parsers. The error-log syslog grammar is the nginx-compatible
 //! `syslog:server=...,facility=...,tag=...,severity=...` form.
 
-use std::net::SocketAddr;
 use super::*;
+use std::net::SocketAddr;
 
 pub(crate) enum ParsedAccessLog {
     Off,
@@ -214,4 +214,3 @@ pub(crate) fn parse_error_log_level(raw: &str) -> Result<ErrorLogLevel, Error> {
         }),
     }
 }
-

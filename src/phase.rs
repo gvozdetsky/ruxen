@@ -819,7 +819,10 @@ fn resolve_auth_basic_user_file<'a>(
         }
     }
     let rendered = PathBuf::from(String::from_utf8_lossy(&rendered).as_ref());
-    Some(Cow::Owned(crate::config::resolve_conf_path(conf_prefix, rendered)))
+    Some(Cow::Owned(crate::config::resolve_conf_path(
+        conf_prefix,
+        rendered,
+    )))
 }
 
 fn write_auth_path_var(
@@ -1259,8 +1262,8 @@ fn match_named_location<'a>(
 mod tests {
     use super::*;
     use crate::config;
-    use std::path::Path;
     use crate::worker::prepare;
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn build(src: &str) -> &'static PreparedHttp {

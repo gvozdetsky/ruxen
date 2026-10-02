@@ -85,7 +85,10 @@ pub(crate) fn write_not_found_error_log(meta: phase::LogMeta, request_uri: &[u8]
     }
 }
 
-pub(crate) fn send_syslog_error(target: PreparedErrorLogSyslogTarget, message: &[u8]) -> std::io::Result<()> {
+pub(crate) fn send_syslog_error(
+    target: PreparedErrorLogSyslogTarget,
+    message: &[u8],
+) -> std::io::Result<()> {
     // PRI 11 = user facility (1) + error severity (3).
     let mut payload = Vec::with_capacity(message.len() + target.tag.len() + 8);
     payload.extend_from_slice(b"<11>");
@@ -104,4 +107,3 @@ pub(crate) fn send_syslog_error(target: PreparedErrorLogSyslogTarget, message: &
         }
     }
 }
-

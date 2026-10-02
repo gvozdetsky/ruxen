@@ -66,11 +66,7 @@ fn spawn_ruxen(conf_body: &str) -> (ServerGuard, u16) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
     let conf_path = dir.join("ruxen.conf");
-    std::fs::write(
-        &conf_path,
-        conf_body.replace("%%PORT%%", &port.to_string()),
-    )
-    .unwrap();
+    std::fs::write(&conf_path, conf_body.replace("%%PORT%%", &port.to_string())).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
@@ -112,56 +108,59 @@ impl Backend {
         let seen = std::sync::Arc::new(Mutex::new(None));
         let stop_clone = stop.clone();
         let seen_clone = seen.clone();
-        thread::spawn(move || loop {
-            if stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let (mut s, _) = match listener.accept() {
-                Ok(v) => v,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(_) => return,
-            };
-            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            // Read until we have the headers, then read body if CL given.
-            let mut head_end: Option<usize> = None;
+        thread::spawn(move || {
             loop {
-                match s.read(&mut tmp) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&tmp[..n]);
-                        if head_end.is_none() {
-                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                head_end = Some(p + 4);
-                            }
-                        }
-                        if let Some(he) = head_end {
-                            // Look up Content-Length in headers.
-                            let head = &buf[..he];
-                            let mut cl: usize = 0;
-                            for line in std::str::from_utf8(head).unwrap_or("").lines() {
-                                if let Some(rest) = line.strip_prefix("Content-Length:")
-                                    .or_else(|| line.strip_prefix("content-length:"))
-                                {
-                                    if let Ok(n) = rest.trim().parse::<usize>() {
-                                        cl = n;
-                                    }
+                if stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let (mut s, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                // Read until we have the headers, then read body if CL given.
+                let mut head_end: Option<usize> = None;
+                loop {
+                    match s.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if head_end.is_none() {
+                                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    head_end = Some(p + 4);
                                 }
                             }
-                            if buf.len() >= he + cl {
-                                break;
+                            if let Some(he) = head_end {
+                                // Look up Content-Length in headers.
+                                let head = &buf[..he];
+                                let mut cl: usize = 0;
+                                for line in std::str::from_utf8(head).unwrap_or("").lines() {
+                                    if let Some(rest) = line
+                                        .strip_prefix("Content-Length:")
+                                        .or_else(|| line.strip_prefix("content-length:"))
+                                    {
+                                        if let Ok(n) = rest.trim().parse::<usize>() {
+                                            cl = n;
+                                        }
+                                    }
+                                }
+                                if buf.len() >= he + cl {
+                                    break;
+                                }
                             }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
+                *seen_clone.lock().unwrap() = Some(buf.clone());
+                let _ = s.write_all(&response);
             }
-            *seen_clone.lock().unwrap() = Some(buf.clone());
-            let _ = s.write_all(&response);
         });
         Backend { addr, stop, seen }
     }
@@ -173,14 +172,15 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 fn http_send(port: u16, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     stream.write_all(request).unwrap();
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
@@ -216,9 +216,7 @@ fn body_after_headers(req: &[u8]) -> &[u8] {
 
 #[test]
 fn m41_proxy_set_header_overrides_host_and_adds_xff() {
-    let backend = Backend::spawn(
-        b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
-    );
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
     let conf = format!(
         r#"
 http {{
@@ -257,8 +255,7 @@ http {{
 
 #[test]
 fn m41_x_forwarded_for_appends_to_existing() {
-    let backend =
-        Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
     let conf = format!(
         r#"
 http {{
@@ -287,9 +284,7 @@ http {{
 
 #[test]
 fn m41_proxy_pass_request_body_forwards_content_length_body() {
-    let backend = Backend::spawn(
-        b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
-    );
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
     let conf = format!(
         r#"
 http {{
@@ -319,9 +314,7 @@ http {{
 
 #[test]
 fn m41_proxy_pass_request_body_off_drops_body() {
-    let backend = Backend::spawn(
-        b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
-    );
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
     let conf = format!(
         r#"
 http {{
@@ -337,8 +330,7 @@ http {{
         backend.addr.port()
     );
     let (_guard, port) = spawn_ruxen(&conf);
-    let req =
-        b"POST / HTTP/1.1\r\nHost: c\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    let req = b"POST / HTTP/1.1\r\nHost: c\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
     let _ = http_send(port, req);
     let captured = backend.last_request().unwrap();
     assert_eq!(header_value(&captured, "Content-Length"), Some("0"));
@@ -347,9 +339,7 @@ http {{
 
 #[test]
 fn m41_proxy_pass_request_headers_off_strips_client_headers() {
-    let backend = Backend::spawn(
-        b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
-    );
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
     let conf = format!(
         r#"
 http {{
@@ -411,9 +401,7 @@ http {
 
 #[test]
 fn m41_proxy_set_header_empty_value_drops_header() {
-    let backend = Backend::spawn(
-        b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
-    );
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
     let conf = format!(
         r#"
 http {{

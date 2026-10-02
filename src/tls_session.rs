@@ -60,10 +60,7 @@ impl StoresServerSessions for ExpiringSessionStorage {
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
         let stored = self.inner.put(key.clone(), value);
         if stored {
-            self.timestamps
-                .lock()
-                .unwrap()
-                .insert(key, Instant::now());
+            self.timestamps.lock().unwrap().insert(key, Instant::now());
         }
         stored
     }

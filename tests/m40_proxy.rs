@@ -150,18 +150,15 @@ impl Backend {
                 }
                 let text = String::from_utf8_lossy(&buf).to_string();
                 let first_line = text.lines().next().unwrap_or("").to_string();
-                let host = text
-                    .lines()
-                    .skip(1)
-                    .find_map(|l| {
-                        l.split_once(':').and_then(|(k, v)| {
-                            if k.eq_ignore_ascii_case("Host") {
-                                Some(v.trim().to_string())
-                            } else {
-                                None
-                            }
-                        })
-                    });
+                let host = text.lines().skip(1).find_map(|l| {
+                    l.split_once(':').and_then(|(k, v)| {
+                        if k.eq_ignore_ascii_case("Host") {
+                            Some(v.trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                });
                 *seen_clone.lock().unwrap() = Some((first_line, host));
                 let _ = s.write_all(&response);
                 // No shutdown — closing the stream by drop is enough; the
@@ -179,17 +176,16 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 fn http_get_close(port: u16, path: &str) -> Vec<u8> {
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     stream.write_all(req.as_bytes()).unwrap();
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
@@ -242,8 +238,7 @@ fn has_header(resp: &[u8], name: &str) -> bool {
 #[test]
 fn m40_proxy_pass_direct_forwards_get() {
     let backend = Backend::spawn(
-        b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
-            .to_vec(),
+        b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
     );
     let conf = format!(
         r#"
@@ -261,14 +256,22 @@ http {{
     let (_guard, port, _dir) = spawn_ruxen(&conf);
 
     let resp = http_get_close(port, "/some/path?a=1");
-    assert_eq!(status_code(&resp), 200, "response: {}", String::from_utf8_lossy(&resp));
+    assert_eq!(
+        status_code(&resp),
+        200,
+        "response: {}",
+        String::from_utf8_lossy(&resp)
+    );
     assert_eq!(body(&resp), b"hello");
 
     // Backend saw the forwarded request.
     let (line, host) = backend
         .last_request()
         .expect("backend should have received the proxied request");
-    assert!(line.starts_with("GET /some/path?a=1 "), "first line: {line}");
+    assert!(
+        line.starts_with("GET /some/path?a=1 "),
+        "first line: {line}"
+    );
     // M40 sends the upstream URL's authority as the Host header — for a
     // literal `proxy_pass http://127.0.0.1:N`, that's `127.0.0.1:N`, not
     // the client's `localhost`.
@@ -278,10 +281,8 @@ http {{
 
 #[test]
 fn m40_proxy_pass_upstream_block_forwards() {
-    let backend = Backend::spawn(
-        b"HTTP/1.0 201 Created\r\nContent-Length: 6\r\n\r\nworld!"
-            .to_vec(),
-    );
+    let backend =
+        Backend::spawn(b"HTTP/1.0 201 Created\r\nContent-Length: 6\r\n\r\nworld!".to_vec());
     let conf = format!(
         r#"
 http {{
@@ -301,7 +302,12 @@ http {{
     let (_guard, port, _dir) = spawn_ruxen(&conf);
 
     let resp = http_get_close(port, "/up");
-    assert_eq!(status_code(&resp), 201, "response: {}", String::from_utf8_lossy(&resp));
+    assert_eq!(
+        status_code(&resp),
+        201,
+        "response: {}",
+        String::from_utf8_lossy(&resp)
+    );
     assert_eq!(body(&resp), b"world!");
 
     let (line, host) = backend.last_request().unwrap();
@@ -352,7 +358,11 @@ http {{
                 .unwrap_or(false)
         })
         .collect();
-    assert_eq!(connection_lines.len(), 1, "exactly one Connection header in {head_str}");
+    assert_eq!(
+        connection_lines.len(),
+        1,
+        "exactly one Connection header in {head_str}"
+    );
     assert!(
         !has_header(&resp, "Keep-Alive"),
         "Keep-Alive must be stripped; full head:\n{head_str}"
@@ -415,6 +425,9 @@ http {
         .args(["-t", "-c", conf_path.to_str().unwrap()])
         .output()
         .expect("run ruxen -t");
-    assert!(!out.status.success(), "ruxen -t should reject unknown upstream");
+    assert!(
+        !out.status.success(),
+        "ruxen -t should reject unknown upstream"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

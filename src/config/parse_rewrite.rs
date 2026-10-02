@@ -337,4 +337,3 @@ pub(crate) fn parse_rewrite_variable_name(raw: &str, what: &'static str) -> Resu
     }
     Ok(name.to_string())
 }
-

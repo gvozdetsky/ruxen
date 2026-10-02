@@ -3,8 +3,8 @@
 //! upstream block names against `proxy_pass` references after the full
 //! tree has been parsed.
 
-use std::net::SocketAddr;
 use super::*;
+use std::net::SocketAddr;
 
 /// Parse `try_files arg1 arg2 ... fallback`. The last argument is the
 /// terminal fallback; everything before it is a probe. Matches
@@ -40,7 +40,10 @@ pub(crate) fn validate_proxy_upstream_refs(http: &HttpConfig) -> Result<(), Erro
 /// Parse `upstream NAME { server <host:port> [params]; ... }`. Validates
 /// that the head args are `[NAME]` and the body has at least one `server`
 /// entry (matching nginx's `ngx_http_upstream_module.c::ngx_http_upstream`).
-pub(crate) fn parse_upstream_block(head: &[String], lx: &mut Lexer) -> Result<UpstreamBlock, Error> {
+pub(crate) fn parse_upstream_block(
+    head: &[String],
+    lx: &mut Lexer,
+) -> Result<UpstreamBlock, Error> {
     if head.len() != 1 {
         return Err(Error::BadValue {
             what: "upstream",
@@ -432,4 +435,3 @@ pub(crate) fn parse_proxy_http_version_args(args: &[String]) -> Result<u8, Error
         }),
     }
 }
-

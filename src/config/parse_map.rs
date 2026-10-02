@@ -4,7 +4,10 @@
 
 use super::*;
 
-pub(crate) fn parse_split_clients_block(args: &[String], lx: &mut Lexer) -> Result<SplitClients, Error> {
+pub(crate) fn parse_split_clients_block(
+    args: &[String],
+    lx: &mut Lexer,
+) -> Result<SplitClients, Error> {
     if args.len() != 2 {
         return Err(Error::BadValue {
             what: "split_clients",
@@ -280,4 +283,3 @@ pub(crate) fn compile_map_regex(pattern: &str, case_insensitive: bool) -> Result
         got: pattern.to_string(),
     })
 }
-

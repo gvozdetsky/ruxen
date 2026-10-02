@@ -253,7 +253,10 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
     true
 }
 
-pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(stream: &mut S, body: phase::FileBody) -> bool {
+pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
+    body: phase::FileBody,
+) -> bool {
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
     // duplicating the fd. Dropping `file` at the end closes the fd.
@@ -429,4 +432,3 @@ pub(crate) async fn read_chunked_request_body<S: ConnIo>(
         cursor += 2;
     }
 }
-

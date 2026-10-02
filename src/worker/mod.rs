@@ -48,24 +48,24 @@ use crate::http::{self, Method, Parse, ParseState, READ_BUF};
 use crate::phase::{self, Response};
 use crate::{autoindex, file, fs_resolve, uri};
 
-mod prepared;
+mod connection;
+mod handler;
+mod log;
 mod prepare;
+mod prepared;
 mod render;
 mod response;
-mod handler;
 mod rewrite;
-mod connection;
-mod log;
 mod runtime;
 
-pub(crate) use prepared::*;
+pub(crate) use connection::*;
+pub(crate) use handler::*;
+pub(crate) use log::*;
 pub(crate) use prepare::*;
+pub(crate) use prepared::*;
 pub(crate) use render::*;
 pub(crate) use response::*;
-pub(crate) use handler::*;
 pub(crate) use rewrite::*;
-pub(crate) use connection::*;
-pub(crate) use log::*;
 pub(crate) use runtime::*;
 
 thread_local! {

@@ -116,5 +116,8 @@ fn unshare_can_be_disabled_for_ab_runs() {
     let (_g, pid, _port) = spawn(Some("0"));
     let tables = worker_fd_tables(pid);
     assert_eq!(tables.len(), 2, "expected two worker threads");
-    assert_eq!(tables[0], tables[1], "workers should share the process fd table");
+    assert_eq!(
+        tables[0], tables[1],
+        "workers should share the process fd table"
+    );
 }

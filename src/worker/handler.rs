@@ -77,8 +77,8 @@ pub(crate) fn finalize_location_response(
         Response::Prebuilt(bytes) => {
             let base_status = response_status(bytes);
             let status = effective_error_page_status(base_status, forced_status);
-            let needs_expires = !matches!(expires, PreparedExpires::Off)
-                && is_safe_status_for_expires_pub(status);
+            let needs_expires =
+                !matches!(expires, PreparedExpires::Off) && is_safe_status_for_expires_pub(status);
             if add_headers.is_empty()
                 && add_trailers.is_empty()
                 && status == base_status
@@ -147,9 +147,7 @@ pub(crate) fn finalize_location_response(
             if !inject_www_authenticate.is_empty() {
                 out = inject_www_authenticate_headers(out, inject_www_authenticate);
             }
-            if !matches!(expires, PreparedExpires::Off)
-                && is_safe_status_for_expires_pub(status)
-            {
+            if !matches!(expires, PreparedExpires::Off) && is_safe_status_for_expires_pub(status) {
                 let ctx = RenderCtx {
                     status,
                     ..*render_ctx_base
@@ -186,9 +184,7 @@ pub(crate) fn finalize_location_response(
             if !inject_www_authenticate.is_empty() {
                 out = inject_www_authenticate_headers(out, inject_www_authenticate);
             }
-            if !matches!(expires, PreparedExpires::Off)
-                && is_safe_status_for_expires_pub(status)
-            {
+            if !matches!(expires, PreparedExpires::Off) && is_safe_status_for_expires_pub(status) {
                 let ctx = RenderCtx {
                     status,
                     ..*render_ctx_base
@@ -234,7 +230,10 @@ pub(crate) enum HeaderNamePolicy {
     InvalidFatal,
 }
 
-pub(crate) fn classify_header_name_policy(name: &[u8], underscores_in_headers: bool) -> HeaderNamePolicy {
+pub(crate) fn classify_header_name_policy(
+    name: &[u8],
+    underscores_in_headers: bool,
+) -> HeaderNamePolicy {
     if name.is_empty() {
         return HeaderNamePolicy::InvalidFatal;
     }
@@ -297,9 +296,7 @@ pub(crate) fn forward_client_headers<'a>(
         }
         // Skip headers that we recompute or that an override already
         // emitted (Host, Content-Length, etc.).
-        let overridden = overrides
-            .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case(name));
+        let overridden = overrides.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
         if overridden {
             continue;
         }
@@ -873,9 +870,11 @@ fn prebuilt_with_literal_add_headers(
         if let Some(hit) = cache.borrow().get(&key) {
             return *hit;
         }
-        let literal = add_headers
-            .iter()
-            .all(|h| h.value.iter().all(|p| matches!(p, PreparedValuePart::Literal(_))));
+        let literal = add_headers.iter().all(|h| {
+            h.value
+                .iter()
+                .all(|p| matches!(p, PreparedValuePart::Literal(_)))
+        });
         let built = literal.then(|| {
             // Literal values ignore the render context; it is only needed
             // to satisfy the signature (and `status` for eligibility).

@@ -37,14 +37,8 @@ use crate::config::TlsVersionSet;
 
 #[derive(Debug)]
 pub enum LoadCertError {
-    Io {
-        path: PathBuf,
-        err: std::io::Error,
-    },
-    Pem {
-        path: PathBuf,
-        err: std::io::Error,
-    },
+    Io { path: PathBuf, err: std::io::Error },
+    Pem { path: PathBuf, err: std::io::Error },
     NoCerts(PathBuf),
     NoKey(PathBuf),
     Rustls(rustls::Error),
@@ -67,10 +61,7 @@ impl std::error::Error for LoadCertError {}
 /// Parse a PEM cert chain and a matching PEM private key, building a
 /// `CertifiedKey` whose private key was loaded by the active rustls
 /// `CryptoProvider`. `keys_match` rejects mismatched cert/key pairs.
-pub fn load_certified_key(
-    cert_pem: &Path,
-    key_pem: &Path,
-) -> Result<CertifiedKey, LoadCertError> {
+pub fn load_certified_key(cert_pem: &Path, key_pem: &Path) -> Result<CertifiedKey, LoadCertError> {
     let cert_bytes = std::fs::read(cert_pem).map_err(|err| LoadCertError::Io {
         path: cert_pem.to_path_buf(),
         err,
@@ -464,8 +455,8 @@ mod tests {
         let key = ck(RSA_CRT, RSA_KEY_PKCS8);
         let mut r = ServerNameResolver::new();
         r.add_exact("test.ruxen.local", key);
-        let cfg =
-            build_server_config(r, TlsVersionSet::default(), None).expect("default protocols build");
+        let cfg = build_server_config(r, TlsVersionSet::default(), None)
+            .expect("default protocols build");
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
