@@ -133,6 +133,11 @@ pub struct RequestCtx<'a> {
     /// `None` for plain-HTTP connections. Drives `$scheme` and `$ssl_*`
     /// variable rendering; otherwise untouched on the hot path.
     pub tls: Option<&'a crate::tls::HandshakeInfo>,
+    /// The worker already refused the request with this status (400 for an
+    /// invalid Host, 400/501 for Transfer-Encoding) and didn't read its
+    /// body. `process` answers it at the server level, where the server's
+    /// `error_page` applies, as in nginx.
+    pub refuse: Option<u16>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -281,6 +286,30 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
     }
 }
 
+/// Answer a request refused at the server level: the server's
+/// `error_page` for the status if it has one (nginx's special response
+/// handler runs with the server's configuration here), else `response`.
+/// `close` ends the connection afterwards, as nginx does for 400 and 501.
+fn refuse(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    server: &'static PreparedServer,
+    response: Response,
+    close: bool,
+) -> (Response, ProcessMeta) {
+    let (response, mut meta) = match crate::worker::intercept_refusal(http, req, server, response) {
+        Response::Reroute(reroute) => {
+            process_with_meta_inner(http, req, url_scratch, Some(reroute))
+        }
+        response => (response, refused_meta(server, false)),
+    };
+    if close {
+        meta.keepalive.allow = false;
+    }
+    (response, meta)
+}
+
 /// What to write back on the socket. `Prebuilt` is a `&'static` slice baked
 /// at startup (return directive, error responses). `Owned` is a per-request
 /// buffered response — on the hot path this `Vec<u8>` is the worker's
@@ -412,30 +441,39 @@ fn process_with_meta_inner(
         );
     };
 
+    // The checks of nginx's ngx_http_process_request_header, in its order.
+    // An error page reached from one of them doesn't run them again.
+    let refusing = initial_reroute.is_none();
+
     // RFC 7230 §5.4: a missing Host header on HTTP/1.1 is a client error.
     // Nginx enforces this in ngx_http_process_request_header
     // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
     // — empty Host is treated as "default server".
-    if req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
+    if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
         let server = &listen.servers[listen.default_server];
-        return (
-            Response::Prebuilt(http.bad_request.pick(req.method)),
-            refused_meta(server, false),
-        );
+        let response = Response::Prebuilt(http.bad_request.pick(req.method));
+        return refuse(http, req, url_scratch, server, response, true);
     }
 
     let (server, regex_captures) = find_config(listen, req.host, req.sni);
 
-    if matches!(req.method, Method::Trace | Method::Connect) {
-        // nginx refuses these in ngx_http_process_request_header, once the
-        // server is chosen by Host and before any location.
-        return (
-            Response::Owned(crate::file::method_not_allowed(
+    if refusing {
+        if let Some(status) = req.refuse {
+            let canned = if status == 501 {
+                &http.not_implemented
+            } else {
+                &http.bad_request
+            };
+            let response = Response::Prebuilt(canned.pick(req.method));
+            return refuse(http, req, url_scratch, server, response, true);
+        }
+        if matches!(req.method, Method::Trace | Method::Connect) {
+            let response = Response::Owned(crate::file::method_not_allowed(
                 req.method,
                 server.server_header,
-            )),
-            refused_meta(server, false),
-        );
+            ));
+            return refuse(http, req, url_scratch, server, response, false);
+        }
     }
     let mut named_target: Option<Vec<u8>> = None;
     let mut current_args: Option<Vec<u8>> = None;
@@ -1375,6 +1413,7 @@ mod tests {
             body_len: 0,
             body_file: &[],
             tls: None,
+            refuse: None,
         }
     }
 

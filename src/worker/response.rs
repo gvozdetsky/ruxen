@@ -797,6 +797,78 @@ fn proxy_render_ctx<'a>(
     }
 }
 
+/// Apply the server's own `error_page` list to a request refused before
+/// any location (nginx runs the special response handler with the
+/// server's configuration then). A match becomes a `Reroute`; anything
+/// else returns `response` unchanged.
+pub(crate) fn intercept_refusal(
+    http: &'static PreparedHttp,
+    req: &phase::RequestCtx<'_>,
+    server: &'static PreparedServer,
+    response: Response,
+) -> Response {
+    if server.error_pages.is_empty() {
+        return response;
+    }
+    let request_uri = req.path;
+    let args = request_args(request_uri);
+    let uri = request_uri
+        .iter()
+        .position(|&b| b == b'?')
+        .map(|i| &request_uri[..i])
+        .unwrap_or(request_uri);
+    let ctx = RenderCtx {
+        uri,
+        request_uri,
+        request_method: req.method_bytes,
+        host: req.host.unwrap_or(server.primary_server_name),
+        remote_addr: req.remote_addr,
+        remote_port: req.remote_port,
+        remote_user: b"",
+        server_name: server.primary_server_name,
+        status: 0,
+        args,
+        is_args: if args.is_empty() { b"" } else { b"?" },
+        scheme: if req.tls.is_some() { b"https" } else { b"http" },
+        hostname: hostname(),
+        headers_raw: req.headers_raw,
+        underscores_in_headers: server.underscores_in_headers,
+        sent_headers: &[],
+        connection_id: req.connection_id,
+        connection_requests: req.connection_requests,
+        connection_time_us: req.connection_time_us,
+        request_time_us: req.request_time_us,
+        server_port: server.listen_port,
+        request_port: req.request_port,
+        pipe: req.pipe,
+        request_length: req.request_length,
+        request_body: req.body,
+        request_body_file: req.body_file,
+        bytes_sent: 0,
+        body_bytes_sent: 0,
+        epoch_secs: req.epoch_secs,
+        epoch_ms: req.epoch_ms,
+        server_name_captures: &[],
+        rewrite_state: None,
+        split_clients: Some(&http.split_clients),
+        maps: Some(&http.maps),
+        proxy_host: &[],
+        upstream_headers: &[],
+        upstream_response_length: None,
+        upstream_response_time_ms: None,
+        sent_trailers: &[],
+        tls: req.tls,
+    };
+    maybe_intercept_error_page(
+        response,
+        server.error_pages,
+        req,
+        &ctx,
+        false,
+        server.server_header,
+    )
+}
+
 /// `proxy_redirect`: rewrite the proxied response's `Location` and
 /// `Refresh` (after `url=`) headers with the first matching rule, as
 /// ngx_http_proxy_rewrite_redirect does. A prefix rule replaces the

@@ -1214,6 +1214,7 @@ pub(crate) fn prepare_server(
         auth_delay_ms: server_auth_delay_ms,
         underscores_in_headers: server_underscores_in_headers,
         post_action: server_post_action,
+        error_pages: server_error_pages,
     })
 }
 

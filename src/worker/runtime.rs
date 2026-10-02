@@ -336,6 +336,7 @@ async fn run_post_action(
         body: empty,
         body_len: 0,
         body_file: empty,
+        refuse: None,
         ..*base_ctx
     };
 
@@ -1075,6 +1076,10 @@ pub(crate) async fn handle<S: ConnIo>(
                         let method_bytes: &[u8] = &method_buf[..method_len];
                         let method = http::classify_method(method_bytes);
                         let method_is_post = method_bytes.eq_ignore_ascii_case(b"POST");
+                        // Refused below at the server level, where its
+                        // `error_page` applies (`phase::process`). The body
+                        // is not read and the connection closes.
+                        let mut refuse: Option<u16> = None;
                         if let Some(te) = lookup_request_header(
                             &buf[base + req.headers_start..base + req.headers_end],
                             b"transfer-encoding",
@@ -1082,46 +1087,17 @@ pub(crate) async fn handle<S: ConnIo>(
                             // nginx request-body gate:
                             // - Transfer-Encoding is HTTP/1.1-only.
                             // - Transfer-Encoding + Content-Length is rejected.
-                            if !req.http_11 || req.content_length.is_some() {
-                                reject_request(
-                                    stream,
-                                    &mut *scratch,
-                                    http,
-                                    http.bad_request.pick(method),
-                                    &buf[read_start..filled],
-                                    conn_log!(),
-                                )
-                                .await;
-                                return;
-                            }
-                            match classify_request_transfer_encoding(te) {
-                                RequestTransferEncoding::ChunkedOnly => {}
-                                RequestTransferEncoding::Unsupported => {
-                                    reject_request(
-                                        stream,
-                                        &mut *scratch,
-                                        http,
-                                        http.not_implemented.pick(method),
-                                        &buf[read_start..filled],
-                                        conn_log!(),
-                                    )
-                                    .await;
-                                    return;
+                            refuse = if !req.http_11 || req.content_length.is_some() {
+                                Some(400)
+                            } else {
+                                match classify_request_transfer_encoding(te) {
+                                    RequestTransferEncoding::ChunkedOnly => None,
+                                    RequestTransferEncoding::Unsupported => Some(501),
+                                    RequestTransferEncoding::Invalid => Some(400),
                                 }
-                                RequestTransferEncoding::Invalid => {
-                                    reject_request(
-                                        stream,
-                                        &mut *scratch,
-                                        http,
-                                        http.bad_request.pick(method),
-                                        &buf[read_start..filled],
-                                        conn_log!(),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
+                            };
                         }
+                        let mut bad_host = false;
                         let request_line_host =
                             req.request_line_host.map(|(s, e)| (base + s, base + e));
                         let header_host = req.host.map(|(s, e)| (base + s, base + e));
@@ -1129,16 +1105,13 @@ pub(crate) async fn handle<S: ConnIo>(
                             Some((s, e)) => match http::normalize_host_in_place(&mut *buf, s, e) {
                                 Some(nh) => Some(nh),
                                 None => {
-                                    reject_request(
-                                        stream,
-                                        &mut *scratch,
-                                        http,
-                                        http.bad_request.pick(method),
-                                        &buf[read_start..filled],
-                                        conn_log!(),
-                                    )
-                                    .await;
-                                    return;
+                                    // An invalid Host is refused by the
+                                    // default server, before the checks
+                                    // above (nginx validates it while
+                                    // reading the headers).
+                                    refuse = Some(400);
+                                    bad_host = true;
+                                    None
                                 }
                             },
                             None => None,
@@ -1147,16 +1120,13 @@ pub(crate) async fn handle<S: ConnIo>(
                             Some((s, e)) => match http::normalize_host_in_place(&mut *buf, s, e) {
                                 Some(nh) => Some(nh),
                                 None => {
-                                    reject_request(
-                                        stream,
-                                        &mut *scratch,
-                                        http,
-                                        http.bad_request.pick(method),
-                                        &buf[read_start..filled],
-                                        conn_log!(),
-                                    )
-                                    .await;
-                                    return;
+                                    // An invalid Host is refused by the
+                                    // default server, before the checks
+                                    // above (nginx validates it while
+                                    // reading the headers).
+                                    refuse = Some(400);
+                                    bad_host = true;
+                                    None
                                 }
                             },
                             None => None,
@@ -1166,7 +1136,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // priority for absolute-form requests). Both `host`
                         // and `request_port` come from the same chosen
                         // authority so they stay consistent.
-                        let chosen_authority = request_line_host.as_ref().or(header_host.as_ref());
+                        let chosen_authority = if bad_host {
+                            None
+                        } else {
+                            request_line_host.as_ref().or(header_host.as_ref())
+                        };
                         let host = chosen_authority.map(|nh| &buf[nh.host.0..nh.host.1]);
                         let request_port: &[u8] = chosen_authority
                             .and_then(|nh| nh.port.map(|(s, e)| &buf[s..e]))
@@ -1200,7 +1174,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         let range = req.range.map(|(s, e)| &buf[base + s..base + e]);
                         let if_range = req.if_range.map(|(s, e)| &buf[base + s..base + e]);
                         let headers_raw = &buf[base + req.headers_start..base + req.headers_end];
-                        let keep_alive = req.keep_alive;
+                        let keep_alive = req.keep_alive && refuse.is_none();
                         // `as u64` saturates only at ~584k years of uptime;
                         // the explicit clamp would be unreachable.
                         let connection_time_us = connection_start.elapsed().as_micros() as u64;
@@ -1222,7 +1196,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         // / unknown) are silently ignored — RFC says 417, but
                         // nginx never implemented that branch and the upstream
                         // test marks it TODO.
-                        if req.http_11 {
+                        if req.http_11 && refuse.is_none() {
                             if let Some(expect) = lookup_request_header(
                                 &buf[base + req.headers_start..base + req.headers_end],
                                 b"expect",
@@ -1245,9 +1219,9 @@ pub(crate) async fn handle<S: ConnIo>(
                         let max_body = http.max_request_body;
                         let mut pipelined_tail: Vec<u8> = Vec::new();
                         let mut sink = BodySink::with_capacity(req.content_length.unwrap_or(0));
-                        let (body_in_buf, request_body_len): (usize, u64) = if let Some(cl) =
-                            req.content_length
-                        {
+                        let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
+                            (0, 0)
+                        } else if let Some(cl) = req.content_length {
                             if cl > max_body {
                                 // nginx answers 413 from the Content-Length
                                 // alone, without reading the body.
@@ -1384,6 +1358,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             body_len,
                             body_file,
                             tls,
+                            refuse,
                         };
                         let (response, mut process_meta) =
                             phase::process_with_meta(http, &ctx, &mut *url_scratch);
