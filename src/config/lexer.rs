@@ -184,31 +184,20 @@ impl Lexer {
                 }
                 quote @ (b'"' | b'\'') => {
                     f.pos += 1;
-                    let mut out: Vec<u8> = Vec::new();
+                    let start = f.pos;
                     while f.pos < f.bytes.len() && f.bytes[f.pos] != quote {
-                        let c = f.bytes[f.pos];
-                        // nginx's ngx_conf_read_token only consumes the
-                        // backslash for `\"`, `\'`, `\\` — every other byte
-                        // pair is passed through verbatim, so `"a\tb"` is
-                        // the four bytes `a\tb`, not `a<TAB>b`.
-                        if c == b'\\' && f.pos + 1 < f.bytes.len() {
-                            let next = f.bytes[f.pos + 1];
-                            if matches!(next, b'"' | b'\'' | b'\\') {
-                                f.pos += 1;
-                                out.push(next);
-                            } else {
-                                out.push(c);
-                            }
-                        } else {
-                            out.push(c);
+                        // A backslash protects the next byte, so `\"`
+                        // doesn't end the string.
+                        if f.bytes[f.pos] == b'\\' && f.pos + 1 < f.bytes.len() {
+                            f.pos += 1;
                         }
                         f.pos += 1;
                     }
                     if f.pos >= f.bytes.len() {
                         return Err(Error::UnterminatedString);
                     }
+                    args.push(unescape(&f.bytes[start..f.pos]));
                     f.pos += 1;
-                    args.push(String::from_utf8_lossy(&out).into_owned());
                 }
                 _ => {
                     let start = f.pos;
@@ -226,6 +215,12 @@ impl Lexer {
                             }
                             continue;
                         }
+                        // As in quoted strings, a backslash protects the
+                        // next byte: `a\;b` is one token.
+                        if f.bytes[f.pos] == b'\\' && f.pos + 1 < f.bytes.len() {
+                            f.pos += 2;
+                            continue;
+                        }
                         if matches!(
                             f.bytes[f.pos],
                             b' ' | b'\t' | b'\r' | b'\n' | b';' | b'{' | b'}'
@@ -234,9 +229,70 @@ impl Lexer {
                         }
                         f.pos += 1;
                     }
-                    args.push(String::from_utf8_lossy(&f.bytes[start..f.pos]).into_owned());
+                    args.push(unescape(&f.bytes[start..f.pos]));
                 }
             }
         }
+    }
+}
+
+/// The copy step of nginx's `ngx_conf_read_token`, applied to every token,
+/// quoted or not: `\"`, `\'` and `\\` lose the backslash, `\t`, `\r` and
+/// `\n` become the control characters, and any other pair (`\.` or `\d`
+/// in a regex) is kept as written.
+fn unescape(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\\' && i + 1 < raw.len() {
+            let replaced = match raw[i + 1] {
+                c @ (b'"' | b'\'' | b'\\') => Some(c),
+                b't' => Some(b'\t'),
+                b'r' => Some(b'\r'),
+                b'n' => Some(b'\n'),
+                _ => None,
+            };
+            if let Some(c) = replaced {
+                out.push(c);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(src: &str) -> Vec<String> {
+        let mut lexer = Lexer::new_inline(src);
+        lexer.read_directive().unwrap().0
+    }
+
+    #[test]
+    fn quoted_escapes_follow_nginx() {
+        assert_eq!(args(r#"return 200 "a\tb\r\nc";"#)[2], "a\tb\r\nc");
+        assert_eq!(args(r#"return 200 "say \"hi\"";"#)[2], "say \"hi\"");
+        assert_eq!(args(r#"return 200 'it\'s';"#)[2], "it's");
+        assert_eq!(args(r#"return 200 "a\\b";"#)[2], "a\\b");
+        // `\\n` is an escaped backslash followed by `n`, not a newline.
+        assert_eq!(args(r#"return 200 "a\\nb";"#)[2], "a\\nb");
+        // Any other pair is kept as written.
+        assert_eq!(args(r#"return 200 "a\.b\x";"#)[2], "a\\.b\\x");
+    }
+
+    #[test]
+    fn unquoted_escapes_follow_nginx() {
+        // Regex escapes other than \t \r \n \" \' \\ pass through.
+        assert_eq!(args(r"location ~ \.(gif|jpg)$ {")[2], r"\.(gif|jpg)$");
+        assert_eq!(args(r"rewrite ^/(\d+)$ /n/$1;")[1], r"^/(\d+)$");
+        assert_eq!(args(r"set $a x\\y;")[2], r"x\y");
+        // A backslash keeps `;` and a space inside the token; like any
+        // other unlisted pair, the backslash itself stays.
+        assert_eq!(args(r"set $a a\;b\ c;"), vec!["set", "$a", r"a\;b\ c"]);
     }
 }

@@ -92,8 +92,8 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_non_idempotent.t` — 7/10
 - `proxy_protocol2_tlv.t` — 16/16
 - `proxy_redirect.t` — 17/17
-- `proxy_request_buffering.t` — 3/20
-- `proxy_request_buffering_chunked.t` — 4/24
+- `proxy_request_buffering.t` — 2/20
+- `proxy_request_buffering_chunked.t` — 3/24
 - `proxy_request_buffering_ssl.t` — 20/20
 - `proxy_set_body.t` — 2/4
 - `proxy_ssl.t` — 10/10
