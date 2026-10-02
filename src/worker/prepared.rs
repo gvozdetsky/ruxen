@@ -805,6 +805,26 @@ pub struct PreparedRegexName {
     pub capture_names: Vec<&'static str>,
 }
 
+/// `client_header_timeout`, `client_body_timeout`, `send_timeout`,
+/// resolved against nginx's 60 s defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedClientTimeouts {
+    pub header: Duration,
+    pub body: Duration,
+    pub send: Duration,
+}
+
+impl PreparedClientTimeouts {
+    pub(crate) fn resolve(t: crate::config::ClientTimeouts) -> Self {
+        const DEFAULT_MS: u64 = 60_000;
+        PreparedClientTimeouts {
+            header: Duration::from_millis(t.header_ms.unwrap_or(DEFAULT_MS)),
+            body: Duration::from_millis(t.body_ms.unwrap_or(DEFAULT_MS)),
+            send: Duration::from_millis(t.send_ms.unwrap_or(DEFAULT_MS)),
+        }
+    }
+}
+
 /// One `server {}` block after preparation. `exact_locations` and
 /// `prefix_locations` are pre-split: exact-match candidates are scanned
 /// first and return immediately on a hit; prefix candidates are sorted by
@@ -819,6 +839,9 @@ pub struct PreparedRegexName {
 /// server; cross-server selection happens in `phase::find_config` which
 /// walks the table priorities in nginx order.
 pub struct PreparedServer {
+    /// Client-side timeouts. The worker uses the listen's default server's
+    /// values for the whole connection (see `handle`).
+    pub timeouts: PreparedClientTimeouts,
     /// Lowercased exact-match names (e.g. `localhost`,
     /// `www.example.com`). HostCheck compares byte-for-byte.
     pub exact_names: Vec<&'static [u8]>,

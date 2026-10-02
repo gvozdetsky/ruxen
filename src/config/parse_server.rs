@@ -22,8 +22,10 @@ pub(crate) fn parse_server_block(
     inherited_keepalive_requests: Option<u64>,
     inherited_keepalive_time_ms: Option<u64>,
     inherited_keepalive_disable: Option<KeepaliveDisable>,
+    inherited_client_timeouts: ClientTimeouts,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Server>, Error> {
+    let mut client_timeouts = ClientTimeouts::default();
     let mut listens: Vec<Listen> = Vec::new();
     let mut ssl_certs: Vec<PathBuf> = Vec::new();
     let mut ssl_keys: Vec<PathBuf> = Vec::new();
@@ -147,6 +149,7 @@ pub(crate) fn parse_server_block(
                         keepalive_requests: kar,
                         keepalive_time_ms: katm,
                         keepalive_disable: kad,
+                        client_timeouts: client_timeouts.inherit(inherited_client_timeouts),
                         merge_slashes,
                         ignore_invalid_headers,
                         underscores_in_headers,
@@ -372,6 +375,12 @@ pub(crate) fn parse_server_block(
                     return Err(Error::Duplicate("keepalive_disable"));
                 }
                 keepalive_disable = Some(parse_keepalive_disable_args(&args[1..])?);
+            }
+            (
+                name @ ("client_header_timeout" | "client_body_timeout" | "send_timeout"),
+                Terminator::Semi,
+            ) => {
+                client_timeouts.parse(name, &args)?;
             }
             ("merge_slashes", Terminator::Semi) => {
                 let raw = args.get(1).ok_or(Error::MissingArg("merge_slashes"))?;

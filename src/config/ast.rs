@@ -6,6 +6,48 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+/// `client_header_timeout`, `client_body_timeout` and `send_timeout`
+/// (milliseconds); `None` means nginx's default, 60 s.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientTimeouts {
+    pub header_ms: Option<u64>,
+    pub body_ms: Option<u64>,
+    pub send_ms: Option<u64>,
+}
+
+impl ClientTimeouts {
+    /// Parse one of the three directives into `self`; `false` when `name`
+    /// is none of them.
+    pub(crate) fn parse(
+        &mut self,
+        name: &str,
+        args: &[String],
+    ) -> Result<bool, super::error::Error> {
+        use super::error::Error;
+        let (slot, what) = match name {
+            "client_header_timeout" => (&mut self.header_ms, "client_header_timeout"),
+            "client_body_timeout" => (&mut self.body_ms, "client_body_timeout"),
+            "send_timeout" => (&mut self.send_ms, "send_timeout"),
+            _ => return Ok(false),
+        };
+        if slot.is_some() {
+            return Err(Error::Duplicate(what));
+        }
+        let raw = args.get(1).ok_or(Error::MissingArg(what))?;
+        *slot = Some(super::parse_server::parse_duration_ms(raw, what)?);
+        Ok(true)
+    }
+
+    /// Server values win; unset ones come from http scope.
+    pub(crate) fn inherit(self, parent: ClientTimeouts) -> ClientTimeouts {
+        ClientTimeouts {
+            header_ms: self.header_ms.or(parent.header_ms),
+            body_ms: self.body_ms.or(parent.body_ms),
+            send_ms: self.send_ms.or(parent.send_ms),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RuntimeOpts {
     pub pid: Option<PathBuf>,
@@ -308,6 +350,9 @@ pub struct Server {
     pub keepalive_time_ms: Option<u64>,
     /// Server-scope `keepalive_disable` policy.
     pub keepalive_disable: Option<KeepaliveDisable>,
+    /// `client_header_timeout` / `client_body_timeout` / `send_timeout`,
+    /// merged with the http-scope values.
+    pub client_timeouts: ClientTimeouts,
     /// `merge_slashes off` disables the `//` → `/` collapse in URI
     /// normalization. Default (`true`) matches nginx's default `on`.
     pub merge_slashes: bool,

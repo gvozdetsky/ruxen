@@ -198,6 +198,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
+    let mut client_timeouts = ClientTimeouts::default();
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut ignore_invalid_headers: Option<bool> = None;
@@ -261,6 +262,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 keepalive_requests,
                 keepalive_time_ms,
                 keepalive_disable,
+                client_timeouts,
                 &mut warnings,
             )?),
             ("server", _) => {
@@ -598,6 +600,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     return Err(Error::Duplicate("keepalive_disable"));
                 }
                 keepalive_disable = Some(parse_keepalive_disable_args(&args[1..])?);
+            }
+            (
+                name @ ("client_header_timeout" | "client_body_timeout" | "send_timeout"),
+                Terminator::Semi,
+            ) => {
+                client_timeouts.parse(name, &args)?;
             }
             (n, Terminator::Semi) if is_ignored_stmt(n) => {}
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
@@ -1415,6 +1423,42 @@ mod tests {
         assert_eq!(tls_warnings.len(), 2, "{:?}", cfg.warnings);
         assert!(tls_warnings[0].starts_with("\"ssl_ciphers\" is not supported yet"));
         assert!(tls_warnings[1].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
+    }
+
+    #[test]
+    fn client_timeouts_parse_and_inherit() {
+        let cfg = parse(
+            r#"
+            http {
+                client_header_timeout 5s;
+                send_timeout 7s;
+                server { listen 80; client_body_timeout 3s; send_timeout 9s; }
+                server { listen 81; }
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.servers[0].client_timeouts,
+            ClientTimeouts {
+                header_ms: Some(5_000),
+                body_ms: Some(3_000),
+                send_ms: Some(9_000),
+            }
+        );
+        assert_eq!(
+            cfg.servers[1].client_timeouts,
+            ClientTimeouts {
+                header_ms: Some(5_000),
+                body_ms: None,
+                send_ms: Some(7_000),
+            }
+        );
+        assert!(matches!(
+            parse("http { send_timeout 1s; send_timeout 2s; }"),
+            Err(Error::Duplicate("send_timeout"))
+        ));
+        assert!(parse("http { client_body_timeout soon; }").is_err());
     }
 
     #[test]
