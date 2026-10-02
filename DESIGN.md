@@ -370,14 +370,17 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   TLS-specific method. The handler `fn handle<S: ConnIo>(…)` is
   monomorphized for `TcpStream` and `ServerTlsStream<TcpStream>`. Plain
   TCP polls the kernel socket for readability without allocating a
-  buffer (mirrors nginx's `wait_request_handler`); TLS skips the kernel
-  poll because rustls can hold decrypted bytes in its internal buffer
-  after the handshake (TLS 1.3 ships Finished + early app data in the
-  same flight) — a TCP-readable wait would hang on already-drained
-  bytes. TLS keepalive idle-timeout enforcement is therefore a known
-  v0.1 limitation: TLS keepalive connections rely on TCP EOF / FIN to
-  reclaim. A future pass adds a deadline-driven select inside the
-  rustls read path.
+  buffer (mirrors nginx's `wait_request_handler`). TLS does the same
+  poll, with the keepalive deadline, unless the stream already holds
+  input the socket won't signal again: ciphertext read but not yet
+  handed to rustls, or plaintext rustls hasn't returned
+  (`TlsStream::has_buffered_input`; TLS 1.3 clients send the first
+  request in the same flight as Finished). Then it goes straight to the
+  read. Until 2026-10 TLS skipped the poll entirely and never enforced
+  the idle timeout. The poll costs `tls_hello` about 2–4% (ABBA vs the
+  no-poll build): a keep-alive request now takes a readiness wait plus
+  a read instead of one read, as plain TCP already does. A single read
+  raced against the deadline would avoid that for both.
 - **Handshake timeout is hardcoded to 60s.** Matches nginx's
   `ssl_handshake_timeout` default. The directive itself isn't yet
   wired; falls into the silent-accept allowlist for v0.1.
