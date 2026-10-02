@@ -991,8 +991,15 @@ fn parse_header_line(buf: &[u8], start: usize) -> HeaderParse {
         i += 1;
     }
     let val_start = i;
-    while i < n && buf[i] != b'\r' && buf[i] != b'\n' {
-        i += 1;
+    while i < n {
+        match buf[i] {
+            b'\r' | b'\n' => break,
+            // nginx rejects a NUL anywhere in a field value
+            // (ngx_http_parse_header_line → NGX_HTTP_PARSE_INVALID_HEADER);
+            // forwarded upstream it would truncate or confuse a C backend.
+            0 => return HeaderParse::Invalid,
+            _ => i += 1,
+        }
     }
     if i >= n {
         return HeaderParse::Incomplete;
@@ -1783,6 +1790,22 @@ mod tests {
         // And at offset 1 too:
         req = b"GET \0foo HTTP/1.1\r\n\r\n".to_vec();
         assert!(matches!(parse_fresh(&req), Parse::Invalid));
+    }
+
+    #[test]
+    fn rejects_nul_in_header_value() {
+        // nginx: NGX_HTTP_PARSE_INVALID_HEADER → 400, wherever the NUL sits.
+        for req in [
+            &b"GET / HTTP/1.1\r\nHost: x\r\nX-A: a\0b\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: x\r\nX-A: \0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nX-A: ab\0\r\n\r\n",
+        ] {
+            assert!(matches!(parse_fresh(req), Parse::Invalid), "{req:?}");
+        }
+        assert!(matches!(
+            parse_fresh(b"GET / HTTP/1.1\r\nHost: x\r\nX-A: ab\r\n\r\n"),
+            Parse::Complete(_)
+        ));
     }
 
     #[test]
