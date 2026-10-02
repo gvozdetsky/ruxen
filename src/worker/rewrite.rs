@@ -202,8 +202,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
         maps: Some(&http.maps),
         proxy_host: &[],
         upstream_headers: &[],
-        upstream_response_length: None,
-        upstream_response_time_ms: None,
+        upstream_states: req.upstream_states,
         sent_trailers: &[],
         tls: req.tls,
     }

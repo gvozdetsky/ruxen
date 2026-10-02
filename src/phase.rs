@@ -65,6 +65,10 @@ pub struct RequestCtx<'a> {
     pub path: &'a [u8],
     /// The request line without its CRLF (`$request`).
     pub request_line: &'a [u8],
+    /// Upstream attempts made so far, for `$upstream_*` in an error page
+    /// reached through `proxy_intercept_errors` (nginx keeps them across
+    /// the internal redirect). Empty otherwise.
+    pub upstream_states: &'a [crate::proxy::UpstreamState],
     pub http_11: bool,
     pub host: Option<&'a [u8]>,
     /// SNI hostname captured at TLS handshake time, lowercased. `None` for
@@ -234,10 +238,12 @@ pub struct ProcessMeta {
     /// The worker runs this after the client response is written and
     /// suppresses its output.
     pub post_action: Option<&'static [u8]>,
-    /// `$upstream_response_time` value in milliseconds, set by
-    /// `settle_proxy_response` after the upstream future resolves. `None`
-    /// when the request didn't go through `proxy_pass`.
-    pub upstream_response_time_ms: Option<u64>,
+    /// One entry per upstream attempt (`$upstream_addr` and friends), set
+    /// by `settle_proxy_response`. Empty when the request wasn't proxied.
+    pub upstream_states: Vec<crate::proxy::UpstreamState>,
+    /// The upstream's header lines, for `$upstream_http_*` in access_log
+    /// (kept only when a format reads them).
+    pub upstream_headers: Vec<u8>,
     /// Effective `expires` directive for the matched location, applied to
     /// proxied responses after the upstream future resolves (so the
     /// upstream's `Last-Modified` is visible for `expires modified ...`).
@@ -265,7 +271,8 @@ impl Default for ProcessMeta {
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
             post_action: None,
-            upstream_response_time_ms: None,
+            upstream_states: Vec::new(),
+            upstream_headers: Vec::new(),
             proxy_expires: crate::worker::PreparedExpires::Off,
             invalid_uri: false,
         }
@@ -692,13 +699,8 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
-        // Mark this as a proxy attempt up front so `$upstream_response_time`
-        // renders as `0.000` even on the short-circuit Prebuilt 502 paths
-        // (no peer / pick failure inside the handler). The settle step
-        // overwrites this with the actual `run_proxy` elapsed time once an
-        // attempt actually flies on the wire.
-        if matches!(loc.handler, crate::worker::PreparedHandler::Proxy(_)) {
-            meta.upstream_response_time_ms = Some(0);
+        if let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler {
+            meta.proxy_host = proxy.host_header;
         }
         match run_location_handler(
             http,
@@ -1390,6 +1392,7 @@ mod tests {
             method_bytes: method_bytes_for(method),
             path,
             request_line: b"",
+            upstream_states: &[],
             http_11,
             host,
             sni: None,

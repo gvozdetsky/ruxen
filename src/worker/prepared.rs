@@ -302,6 +302,9 @@ pub struct PreparedAccessLog {
     pub path: &'static Path,
     pub format: &'static [PreparedValuePart],
     pub escape: crate::config::LogEscape,
+    /// The format uses `$upstream_http_*` / `$upstream_cookie_*`, so the
+    /// upstream's header block has to be kept for the log line.
+    pub reads_upstream_headers: bool,
     pub condition: Option<&'static [PreparedValuePart]>,
     pub file_index: usize,
 }
@@ -535,8 +538,7 @@ impl ProxyEffective {
 pub struct PreparedUpstream {
     /// Display name. For named upstream blocks: the block name.
     /// For synthesized direct-form blocks: the literal host:port.
-    /// Reserved for diagnostics and a future `$upstream_addr` variable.
-    #[allow(dead_code)]
+    /// `$upstream_addr` shows it when no peer could be tried.
     pub name: &'static [u8],
     pub peers: &'static [PreparedPeer],
     /// Max idle pool slots per worker (`keepalive N;`). `None` means no

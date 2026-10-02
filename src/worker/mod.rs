@@ -680,8 +680,7 @@ mod tests {
             maps: None,
             proxy_host: &[],
             upstream_headers: &[],
-            upstream_response_length: None,
-            upstream_response_time_ms: None,
+            upstream_states: &[],
             sent_trailers: &[],
             tls: None,
         };
@@ -710,6 +709,7 @@ mod tests {
             method_bytes: b"HEAD",
             path: b"/loop",
             request_line: b"",
+            upstream_states: &[],
             http_11: true,
             host: Some(b"h"),
             sni: None,
@@ -871,8 +871,7 @@ mod tests {
             maps: None,
             proxy_host: &[],
             upstream_headers: &[],
-            upstream_response_length: None,
-            upstream_response_time_ms: None,
+            upstream_states: &[],
             sent_trailers: &[],
             tls: None,
         };
@@ -927,8 +926,7 @@ mod tests {
             maps: None,
             proxy_host: &[],
             upstream_headers: &[],
-            upstream_response_length: None,
-            upstream_response_time_ms: None,
+            upstream_states: &[],
             sent_trailers: &[],
             tls: None,
         };
@@ -991,8 +989,7 @@ mod tests {
             maps: None,
             proxy_host: &[],
             upstream_headers: &[],
-            upstream_response_length: None,
-            upstream_response_time_ms: None,
+            upstream_states: &[],
             sent_trailers: &[],
             tls: None,
         };
