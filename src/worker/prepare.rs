@@ -184,8 +184,10 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
 
     let canonical_access_logs = alp.finish();
 
+    let max_request_body = largest_body_limit(&listens);
     Ok(Box::leak(Box::new(PreparedHttp {
         worker_connections: runtime.worker_connections.unwrap_or(512),
+        max_request_body,
         listens,
         access_logs: canonical_access_logs,
         split_clients: prepared_split_clients,
@@ -196,9 +198,37 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         forbidden: Prebuilt::leak(403, "Forbidden\n", http_server_bytes),
         bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),
         gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
+        entity_too_large: Prebuilt::leak(413, "413 Request Entity Too Large\n", http_server_bytes),
         upstreams: prepared_upstreams,
         conf_prefix: conf_prefix.map(leak_path_buf),
     })))
+}
+
+/// The most any location accepts: `None` is nginx's default 1m, `0` means
+/// unlimited.
+fn largest_body_limit(listens: &[PreparedListen]) -> u64 {
+    let limit = |l: Option<u64>| match l.unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE) {
+        0 => u64::MAX,
+        n => n,
+    };
+    let mut max = DEFAULT_CLIENT_MAX_BODY_SIZE;
+    for server in listens.iter().flat_map(|l| &l.servers) {
+        let plain = server
+            .exact_locations
+            .iter()
+            .chain(&server.prefix_locations)
+            .chain(&server.named_locations)
+            .chain(&server.server_default)
+            .map(|l| l.client_max_body_size);
+        let regex = server
+            .regex_locations
+            .iter()
+            .map(|l| l.client_max_body_size);
+        for l in plain.chain(regex) {
+            max = max.max(limit(l));
+        }
+    }
+    max
 }
 
 /// TLS-relevant snapshot for one `server {}` block, captured before

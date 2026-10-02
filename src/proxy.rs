@@ -135,6 +135,15 @@ pub struct ProxyPlan {
     /// plan-build time, so `run_proxy` doesn't need to re-render
     /// `$variables`.
     pub intercept: Option<Vec<InterceptRule>>,
+    /// A request body too large to keep in memory: sent from this file
+    /// after `request` (which then holds only the header block).
+    pub body_file: Option<RequestBodyFile>,
+}
+
+/// The temp file holding a large request body, and its length.
+pub struct RequestBodyFile {
+    pub path: std::path::PathBuf,
+    pub len: u64,
 }
 
 /// One pre-rendered `error_page` rule for the intercept path. Mirrors
@@ -751,6 +760,23 @@ async fn attempt(
             Box::new(UpstreamError::SendFailed(e)),
         );
     }
+    if let Some(file) = &plan.body_file
+        && let Err(error) = send_body_file(&mut stream, file, plan.send_timeout).await
+    {
+        let kind = match error {
+            UpstreamError::TimedOut(_) => FailKind::Timeout,
+            _ => FailKind::Error,
+        };
+        let response = match kind {
+            FailKind::Timeout => plan.gateway_timeout,
+            _ => plan.bad_gateway,
+        };
+        return AttemptOutcome::Failed(
+            Response::Prebuilt(response.pick(plan.method)),
+            kind,
+            Box::new(error),
+        );
+    }
 
     // 3. Receive the header block. We need at least the head/body
     // separator before we can decide framing. `read_buf` is a single
@@ -1198,6 +1224,39 @@ async fn attempt(
     return_proxy_buf(accum);
     return_proxy_buf(read_buf);
     AttemptOutcome::Ok(Response::Owned(out))
+}
+
+/// Stream a request body that was too large to keep in memory from its
+/// temp file. Opened per attempt, so a retry on the next peer re-sends it
+/// from the start; `proxy_send_timeout` bounds each write.
+async fn send_body_file(
+    stream: &mut TcpStream,
+    file: &RequestBodyFile,
+    send_timeout: Duration,
+) -> Result<(), UpstreamError> {
+    use monoio::buf::IoBuf;
+    use std::io::Read;
+    let mut source = std::fs::File::open(&file.path).map_err(UpstreamError::SendFailed)?;
+    let mut left = file.len;
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n = source
+            .read(&mut buf[..want])
+            .map_err(UpstreamError::SendFailed)?;
+        if n == 0 {
+            return Err(UpstreamError::SendFailed(
+                std::io::ErrorKind::UnexpectedEof.into(),
+            ));
+        }
+        let (res, returned) = timeout(send_timeout, stream.write_all(buf.slice(..n)))
+            .await
+            .map_err(|_| UpstreamError::TimedOut(Stage::SendingRequest))?;
+        buf = returned.into_inner();
+        res.map_err(UpstreamError::SendFailed)?;
+        left -= n as u64;
+    }
+    Ok(())
 }
 
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body

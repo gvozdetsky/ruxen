@@ -225,6 +225,7 @@ async fn run_post_action(
     let post_ctx = phase::RequestCtx {
         path: post_path,
         body: empty,
+        body_len: 0,
         body_file: empty,
         ..*base_ctx
     };
@@ -1088,89 +1089,106 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             }
                         }
-                        // Read and buffer request bodies up to 1 MiB.
-                        // Supports Content-Length and chunked framing so
-                        // `$request_body` and proxy forwarding work for
-                        // both forms.
-                        const MAX_REQUEST_BODY: usize = 1 << 20;
+                        // Request bodies stay in memory up to
+                        // REQUEST_BODY_IN_MEMORY and go to a temp file past
+                        // that (`BodySink`). The read is bounded by the
+                        // largest client_max_body_size of any location —
+                        // routing comes after — and the matched location
+                        // checks its own limit.
+                        let max_body = http.max_request_body;
                         let mut pipelined_tail: Vec<u8> = Vec::new();
-                        let (body_vec, body_in_buf, request_body_len): (Vec<u8>, usize, usize) =
-                            if let Some(cl) = req.content_length {
-                                if cl == 0 {
-                                    (Vec::new(), 0, 0)
-                                } else if cl > MAX_REQUEST_BODY as u64 {
+                        let mut sink = BodySink::with_capacity(req.content_length.unwrap_or(0));
+                        let (body_in_buf, request_body_len): (usize, u64) = if let Some(cl) =
+                            req.content_length
+                        {
+                            if cl > max_body {
+                                // nginx answers 413 from the Content-Length
+                                // alone, without reading the body.
+                                scratch.clear();
+                                scratch.extend_from_slice(http.entity_too_large.pick(method));
+                                inject_connection_header(&mut *scratch, true);
+                                refresh_date_header(&mut *scratch);
+                                let taken = std::mem::take(&mut *scratch);
+                                let _ = stream.write_all(taken).await;
+                                return;
+                            }
+                            let body_start = base + req.consumed;
+                            let already = filled.saturating_sub(body_start);
+                            let take = (already as u64).min(cl) as usize;
+                            if !sink.extend(&buf[body_start..body_start + take]) {
+                                return;
+                            }
+                            // One read buffer for the whole body; each read
+                            // stops at the body's end so a pipelined next
+                            // request isn't consumed.
+                            let mut chunk: Vec<u8> = Vec::with_capacity(64 * 1024);
+                            while sink.len() < cl {
+                                let want = (cl - sink.len()).min(chunk.capacity() as u64) as usize;
+                                chunk.clear();
+                                let slice = std::mem::take(&mut chunk).slice_mut(0..want);
+                                // client_body_timeout between reads.
+                                let Some((res, returned)) = with_timeout(
+                                    timers.io.as_mut(),
+                                    timeouts.body,
+                                    stream.read(slice),
+                                )
+                                .await
+                                else {
+                                    return;
+                                };
+                                chunk = returned.into_inner();
+                                match res {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => {
+                                        if !sink.extend(&chunk[..n]) {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            (take, cl)
+                        } else if req.transfer_encoding_chunked {
+                            let body_start = base + req.consumed;
+                            let initial = &buf[body_start..filled];
+                            match read_chunked_request_body(
+                                stream,
+                                initial,
+                                max_body,
+                                &mut sink,
+                                timers.io.as_mut(),
+                                timeouts.body,
+                            )
+                            .await
+                            {
+                                Ok(decoded) => {
+                                    pipelined_tail = decoded.pipelined_tail;
+                                    (decoded.consumed_initial, decoded.raw_consumed)
+                                }
+                                Err(error) => {
+                                    let response = match error {
+                                        ChunkedBodyError::TooLarge => &http.entity_too_large,
+                                        ChunkedBodyError::Invalid => &http.bad_request,
+                                    };
                                     scratch.clear();
-                                    scratch.extend_from_slice(http.bad_request.pick(method));
+                                    scratch.extend_from_slice(response.pick(method));
                                     inject_connection_header(&mut *scratch, true);
                                     refresh_date_header(&mut *scratch);
                                     let taken = std::mem::take(&mut *scratch);
                                     let _ = stream.write_all(taken).await;
                                     return;
-                                } else {
-                                    let cl_usize = cl as usize;
-                                    let body_start = base + req.consumed;
-                                    let already = filled.saturating_sub(body_start);
-                                    let take = already.min(cl_usize);
-                                    let mut body = Vec::with_capacity(cl_usize);
-                                    body.extend_from_slice(&buf[body_start..body_start + take]);
-                                    while body.len() < cl_usize {
-                                        let need = cl_usize - body.len();
-                                        let chunk_cap = need.min(8192);
-                                        let chunk: Vec<u8> = vec![0u8; chunk_cap];
-                                        // client_body_timeout between reads.
-                                        let Some((res, returned)) = with_timeout(
-                                            timers.io.as_mut(),
-                                            timeouts.body,
-                                            stream.read(chunk),
-                                        )
-                                        .await
-                                        else {
-                                            return;
-                                        };
-                                        match res {
-                                            Ok(0) => return,
-                                            Ok(n) => body.extend_from_slice(&returned[..n]),
-                                            Err(_) => return,
-                                        }
-                                    }
-                                    (body, take, cl_usize)
                                 }
-                            } else if req.transfer_encoding_chunked {
-                                let body_start = base + req.consumed;
-                                let initial = &buf[body_start..filled];
-                                match read_chunked_request_body(
-                                    stream,
-                                    initial,
-                                    MAX_REQUEST_BODY,
-                                    timers.io.as_mut(),
-                                    timeouts.body,
-                                )
-                                .await
-                                {
-                                    Some(decoded) => {
-                                        pipelined_tail = decoded.pipelined_tail;
-                                        (
-                                            decoded.body,
-                                            decoded.consumed_initial,
-                                            decoded.raw_consumed,
-                                        )
-                                    }
-                                    None => {
-                                        scratch.clear();
-                                        scratch.extend_from_slice(http.bad_request.pick(method));
-                                        inject_connection_header(&mut *scratch, true);
-                                        refresh_date_header(&mut *scratch);
-                                        let taken = std::mem::take(&mut *scratch);
-                                        let _ = stream.write_all(taken).await;
-                                        return;
-                                    }
-                                }
-                            } else {
-                                (Vec::new(), 0, 0)
-                            };
+                            }
+                        } else {
+                            (0, 0)
+                        };
+                        let body_len = sink.len();
+                        let (body_vec, spooled) = sink.finish();
                         // Bound to this request iteration; holds the
                         // temp-file path bytes for `$request_body_file`.
-                        let request_body_file = maybe_spill_request_body_to_file(&body_vec);
+                        let request_body_file = match spooled {
+                            Some(file) => Some(file),
+                            None => maybe_spill_request_body_to_file(&body_vec),
+                        };
                         let body_file = request_body_file
                             .as_ref()
                             .map(SpilledBody::path_bytes)
@@ -1210,6 +1228,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             epoch_secs,
                             epoch_ms,
                             body: body_vec.as_slice(),
+                            body_len,
                             body_file,
                             tls,
                         };

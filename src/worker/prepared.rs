@@ -936,6 +936,11 @@ pub struct PreparedHttp {
     /// worker holds. As in nginx, each listening socket uses one of them;
     /// see `client_slots`.
     pub worker_connections: usize,
+    /// The largest request body any location accepts
+    /// (`client_max_body_size`, default 1m; `0` = no limit): bodies are
+    /// read before routing, so this bounds the read, and the matched
+    /// location checks its own limit afterwards.
+    pub max_request_body: u64,
     pub access_logs: &'static [PreparedAccessLog],
     pub split_clients: std::collections::HashMap<&'static str, PreparedSplitClients>,
     /// http-scope `map` programs, keyed by output variable name. Rendered
@@ -951,6 +956,8 @@ pub struct PreparedHttp {
     pub forbidden: Prebuilt,
     pub bad_gateway: Prebuilt,
     pub gateway_timeout: Prebuilt,
+    /// 413 for a body over `max_request_body`, sent before reading it.
+    pub entity_too_large: Prebuilt,
     /// http-scope `upstream {}` blocks keyed by name. `proxy_pass http://NAME`
     /// resolves through this map at prepare time. M42 reads it on the hot
     /// path for round-robin selection.
