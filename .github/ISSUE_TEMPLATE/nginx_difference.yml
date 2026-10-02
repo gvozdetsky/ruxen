@@ -1,0 +1,51 @@
+name: nginx/ruxen behave differently
+description: The same config and request give a different result in ruxen than in nginx.
+labels: ["nginx-compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The smaller the config, the faster this gets fixed. If you found it through an
+        nginx-tests file, name the file and the failing subtest.
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: A minimal config that shows the difference.
+      render: nginx
+    validations:
+      required: true
+  - type: textarea
+    id: request
+    attributes:
+      label: Request
+      description: How to trigger it, e.g. a curl command.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: nginx
+    attributes:
+      label: nginx response
+      description: Status line, relevant headers, body (or the error).
+    validations:
+      required: true
+  - type: textarea
+    id: ruxen
+    attributes:
+      label: ruxen response
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: nginx version (nginx -v) and ruxen commit (git rev-parse --short HEAD).
+      placeholder: "nginx 1.24.0, ruxen a1b2c3d"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else — nginx source pointers, which nginx-tests file, ideas.

@@ -322,6 +322,8 @@ Good ways to contribute include:
 
 If you find something interesting, open an issue — even if you are not planning to implement it yourself.
 
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup (tests, nginx-tests, benchmarks) and how changes are reviewed.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
