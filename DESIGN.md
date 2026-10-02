@@ -312,18 +312,29 @@ The last arg is the fallback:
 ## TLS architecture
 
 Server-side HTTPS lives in `src/tls.rs` (handshake glue + post-handshake
-snapshot) and `src/tls_certs.rs` (PEM loader + SNI resolver +
-`ServerConfig` builder). Wired into the worker accept loop via
+snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
+`src/tls_certs.rs` (PEM loader + SNI resolver + `ServerConfig` builder). Wired into the worker accept loop via
 `spawn_connection`, which branches on `PreparedListen::tls`.
 
-- **rustls 0.23 over `monoio-rustls`.** Pure-Rust API surface, no
-  OpenSSL link, MIT/Apache-2.0. The monoio↔rustls owned-buffer adapter
-  is already maintained upstream by the monoio team; rolling our own is
-  the kind of yak-shave that delays a v0.1. BoringSSL via `boring`
-  would likely be faster on some workloads but adds a C build dep and
-  forces a private adapter. Revisit only if HTTPS bench shows a >20%
-  gap to nginx and profiling traces it to crypto rather than I/O. Crypto
-  provider is rustls's default `aws-lc-rs`.
+- **rustls 0.23.** Pure-Rust API surface, no OpenSSL link,
+  MIT/Apache-2.0. BoringSSL via `boring` would likely be faster on some
+  workloads but adds a C build dep. Revisit only if HTTPS bench shows a
+  >20% gap to nginx and profiling traces it to crypto rather than I/O.
+  Crypto provider is rustls's default `aws-lc-rs`.
+- **Own rustls ↔ monoio adapter (`src/tls_stream.rs`).** Until
+  2026-10 this was the `monoio-rustls` crate. We needed the negotiated
+  session (`get_ref`) for `HandshakeInfo`, upstream left the PR adding
+  it unreviewed and has had no release since 0.4.0 (May 2024), and
+  crates.io refuses a package whose build depends on a git
+  `[patch]`. The adapter is server-only, ~250 lines, and keeps the
+  state ruxen needs visible: the negotiated `ServerConnection` and the
+  ciphertext buffered ahead of rustls (needed for a TLS keepalive idle
+  wait). Ciphertext buffers are allocated on first use rather than as
+  two zeroed 16 KiB blocks per connection; each write drains rustls's
+  whole outgoing queue into one socket write (upstream wrote in 16 KiB
+  pieces); `writev` encrypts all iovecs as one run of records.
+  Throughput on `tls_hello` is unchanged (ABBA pairs vs the old
+  adapter, 2026-10-02: 99–100%).
 - **Per-listen `TlsAcceptor`, built once at startup.** `build_listen_tls`
   walks every `server {}` on a given listen address, loads each
   `ssl_certificate` / `ssl_certificate_key` pair into a
@@ -376,11 +387,6 @@ snapshot) and `src/tls_certs.rs` (PEM loader + SNI resolver +
   often than under nginx's shared cache. Session ticket key rotation,
   client cert auth, OCSP stapling, 0-RTT, hot cert reload, password-
   protected keys, and `proxy_ssl_*` are out of v0.1 scope (see README).
-- **`monoio-rustls` upstream patch.** `HandshakeInfo` reads negotiated
-  state via `Stream::get_ref()`, added by an in-flight PR against
-  `monoio-rs/monoio-tls`. Pulled via `[patch.crates-io]` in
-  `Cargo.toml`; drop the patch once a release containing the accessor
-  is published.
 
 ## Open questions
 

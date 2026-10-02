@@ -1,24 +1,16 @@
-// TLS adapter — thin wrapper over `monoio-rustls`.
+// TLS glue on top of the rustls ↔ monoio stream in `tls_stream.rs`:
 //
-// `monoio-rustls` already bridges rustls's sync state machine to monoio's
-// owned-buffer async traits; this file is the ruxen-specific glue:
-//
-// - re-exports of the upstream types used elsewhere in the crate
+// - re-exports of the stream types used elsewhere in the crate
 // - `accept_with_timeout` so a stalled handshake can't pin a worker
 // - `HandshakeInfo`, the post-handshake snapshot used by request routing
 //   and `$ssl_*` variable rendering
 //
 #![allow(dead_code)] // helper API is partly test-only / future directive surface
 
-// Note: `HandshakeInfo` reads post-handshake state via `Stream::get_ref()`,
-// added upstream by an in-flight PR against monoio-rs/monoio-tls. The
-// crate is pulled via a `[patch.crates-io]` entry in `Cargo.toml`; drop
-// the patch once a published release carries the accessor.
-
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use monoio_rustls::{ServerTlsStream, TlsAcceptor, TlsError};
+pub use crate::tls_stream::{TlsAcceptor, TlsStream as ServerTlsStream};
 pub use rustls::ServerConfig;
 
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
@@ -30,12 +22,12 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub enum AcceptError {
-    Tls(TlsError),
+    Tls(std::io::Error),
     Timeout,
 }
 
-impl From<TlsError> for AcceptError {
-    fn from(e: TlsError) -> Self {
+impl From<std::io::Error> for AcceptError {
+    fn from(e: std::io::Error) -> Self {
         AcceptError::Tls(e)
     }
 }
@@ -92,7 +84,7 @@ pub struct HandshakeInfo {
 
 impl HandshakeInfo {
     fn from_stream<IO>(stream: &ServerTlsStream<IO>) -> Self {
-        let (_io, conn) = stream.get_ref();
+        let conn = stream.connection();
         Self {
             alpn_protocol: conn.alpn_protocol().map(|s| s.to_vec()),
             server_name: conn.server_name().map(|s| s.to_string()),
