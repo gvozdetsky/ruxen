@@ -373,6 +373,7 @@ pub(crate) fn run_location_handler(
         uri: url_path,
         request_uri,
         request_method: req.method_bytes,
+        request_line: req.request_line,
         host,
         remote_addr: req.remote_addr,
         remote_port: req.remote_port,

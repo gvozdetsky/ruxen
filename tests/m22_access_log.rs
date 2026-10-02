@@ -163,8 +163,9 @@ http {
     assert_eq!(c2, "timeout=9\n-\n");
 }
 
+/// A bare `access_log` uses nginx's predefined `combined` format.
 #[test]
-fn bare_access_log_uses_minimal_combined_fallback() {
+fn bare_access_log_uses_combined_format() {
     let conf = r#"
 events {}
 http {
@@ -178,13 +179,59 @@ http {
     let (_guard, port, dir) = spawn_server(conf);
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .unwrap();
+    s.write_all(
+        b"GET /?a=1 HTTP/1.1\r\nHost: localhost\r\nUser-Agent: t/1\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
     let _ = read_one_response(&mut s);
     sleep(Duration::from_millis(30));
 
     let access = std::fs::read_to_string(dir.join("access.log")).unwrap();
-    assert!(access.contains("\"GET /\" 200 0"));
+    let line = access.lines().next().unwrap_or_default();
+    assert!(line.starts_with("127.0.0.1 - - ["), "{line}");
+    assert!(
+        line.ends_with("] \"GET /?a=1 HTTP/1.1\" 200 0 \"-\" \"t/1\""),
+        "{line}"
+    );
+}
+
+/// Variable values are escaped as in nginx, and a variable that isn't set
+/// is `-` (`escape=default`), or empty with `escape=json` / `none`.
+#[test]
+fn log_values_are_escaped_and_unset_ones_are_dashes() {
+    let conf = r#"
+events {}
+http {
+  log_format d '$request|$server_protocol|$http_x|$http_none|$arg_none|$remote_user|$uri';
+  log_format j escape=json '{"x":"$http_x","none":"$http_none"}';
+  log_format n escape=none '$http_x|$http_none';
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    access_log %%DIR%%/d.log d;
+    access_log %%DIR%%/j.log j;
+    access_log %%DIR%%/n.log n;
+    location / { return 200 ""; }
+  }
+}
+"#;
+    let (_guard, port, dir) = spawn_server(conf);
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(b"GET /p HTTP/1.0\r\nHost: localhost\r\nX: a\"b\\c\x01\xc3\xa9\r\n\r\n")
+        .unwrap();
+    let _ = read_one_response(&mut s);
+    sleep(Duration::from_millis(30));
+
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&read("d.log")),
+        "GET /p HTTP/1.0|HTTP/1.0|a\\x22b\\x5Cc\\x01\\xC3\\xA9|-|-|-|/p\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read("j.log")),
+        "{\"x\":\"a\\\"b\\\\c\\u0001\u{e9}\",\"none\":\"\"}\n"
+    );
+    assert_eq!(read("n.log"), b"a\"b\\c\x01\xc3\xa9|\n");
 }
 
 /// Requests refused with 400/405/501 are logged like nginx: before a server is

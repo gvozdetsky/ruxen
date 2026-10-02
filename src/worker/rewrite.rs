@@ -168,6 +168,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
         uri,
         request_uri: req.path,
         request_method: req.method_bytes,
+        request_line: req.request_line,
         host: req.host.unwrap_or(b""),
         remote_addr: req.remote_addr,
         remote_port: req.remote_port,

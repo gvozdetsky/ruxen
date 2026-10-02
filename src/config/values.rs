@@ -150,6 +150,8 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"uri" => Variable::Uri,
         b"request_uri" => Variable::RequestUri,
         b"request_method" => Variable::RequestMethod,
+        b"request" => Variable::Request,
+        b"server_protocol" => Variable::ServerProtocol,
         b"host" => Variable::Host,
         b"server_name" => Variable::ServerName,
         b"status" => Variable::Status,

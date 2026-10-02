@@ -38,6 +38,7 @@ pub(crate) async fn write_access_logs(
     logs: &'static [PreparedAccessLog],
     request_uri: &[u8],
     request_method: &[u8],
+    request_line: &[u8],
     host: Option<&[u8]>,
     remote_addr: &[u8],
     remote_port: u16,
@@ -87,6 +88,7 @@ pub(crate) async fn write_access_logs(
         uri,
         request_uri,
         request_method,
+        request_line,
         host: host.unwrap_or(b""),
         remote_addr,
         remote_port,
@@ -145,7 +147,7 @@ pub(crate) async fn write_access_logs(
         }
 
         let mut line = Vec::with_capacity(64);
-        render_parts(log.format, &ctx, &mut line);
+        render_log_parts(log.format, log.escape, &ctx, &mut line);
         if line.is_empty() {
             line.push(b'-');
         }
@@ -170,6 +172,12 @@ pub(crate) async fn write_access_logs(
             );
         }
     }
+}
+
+/// `line` without its trailing CRLF (or bare LF).
+fn trim_crlf(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 /// What an early rejection needs for its access-log line.
@@ -208,14 +216,14 @@ async fn reject_request<S: ConnIo>(
     if server.access_logs.is_empty() {
         return;
     }
-    // Whatever of the request line arrived: method, then URI.
+    // Whatever of the request line arrived (nginx's `$request` then is up
+    // to the first CR or LF): method, then URI.
     let line_end = request_head
         .iter()
         .position(|&b| b == b'\r' || b == b'\n')
         .unwrap_or(request_head.len());
-    let mut words = request_head[..line_end]
-        .split(|&b| b == b' ')
-        .filter(|w| !w.is_empty());
+    let request_line = &request_head[..line_end];
+    let mut words = request_line.split(|&b| b == b' ').filter(|w| !w.is_empty());
     let method = words.next().unwrap_or(b"");
     let uri = words.next().unwrap_or(b"");
     let header_len = response
@@ -229,6 +237,7 @@ async fn reject_request<S: ConnIo>(
         server.access_logs,
         uri,
         method,
+        request_line,
         None,
         conn.remote_addr,
         conn.remote_port,
@@ -379,6 +388,7 @@ async fn run_post_action(
             post_meta.access_logs,
             log_request_uri,
             base_ctx.method_bytes,
+            base_ctx.request_line,
             base_ctx.host,
             base_ctx.remote_addr,
             base_ctx.remote_port,
@@ -1328,10 +1338,13 @@ pub(crate) async fn handle<S: ConnIo>(
                         let epoch_secs = now.as_secs();
                         let epoch_ms = (now.subsec_millis() as u16) % 1000;
 
+                        let request_line =
+                            trim_crlf(&buf[base + req.method_start..base + req.headers_start]);
                         let ctx = phase::RequestCtx {
                             method,
                             method_bytes,
                             path,
+                            request_line,
                             http_11: req.http_11,
                             host,
                             sni,
@@ -1588,6 +1601,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 process_meta.access_logs,
                                 path,
                                 method_bytes,
+                                request_line,
                                 host,
                                 &remote_addr,
                                 remote_port,

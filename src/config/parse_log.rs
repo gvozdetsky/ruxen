@@ -15,12 +15,29 @@ pub(crate) fn parse_log_format_args(args: &[String]) -> Result<LogFormatDef, Err
         return Err(Error::MissingArg("log_format"));
     }
     let name = args[0].clone();
+    let mut rest = &args[1..];
+    let mut escape = LogEscape::Default;
+    if let Some(mode) = rest[0].strip_prefix("escape=") {
+        escape = match mode {
+            "default" => LogEscape::Default,
+            "json" => LogEscape::Json,
+            "none" => LogEscape::None,
+            _ => {
+                return Err(Error::BadValue {
+                    what: "log_format escape",
+                    got: mode.to_string(),
+                });
+            }
+        };
+        rest = &rest[1..];
+    }
     let mut value = String::new();
-    for chunk in &args[1..] {
+    for chunk in rest {
         value.push_str(chunk);
     }
     Ok(LogFormatDef {
         name,
+        escape,
         value: parse_value_with_vars(&value)?,
     })
 }

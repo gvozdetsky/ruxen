@@ -43,6 +43,9 @@ pub(crate) struct RenderCtx<'a> {
     /// Raw request-line method bytes, uppercase. Empty when no request is
     /// in flight (e.g. some access-log paths reconstruct without it).
     pub request_method: &'a [u8],
+    /// The request line without its CRLF (`$request`). Empty where no
+    /// request line is at hand.
+    pub request_line: &'a [u8],
     pub host: &'a [u8],
     pub remote_addr: &'a [u8],
     pub remote_port: u16,
@@ -143,6 +146,8 @@ impl RenderCtx<'_> {
             Variable::Uri => out.extend_from_slice(self.uri),
             Variable::RequestUri => out.extend_from_slice(self.request_uri),
             Variable::RequestMethod => out.extend_from_slice(self.request_method),
+            Variable::Request => out.extend_from_slice(self.request_line),
+            Variable::ServerProtocol => out.extend_from_slice(server_protocol(self.request_line)),
             Variable::Host => out.extend_from_slice(self.host),
             Variable::RemoteAddr => out.extend_from_slice(self.remote_addr),
             Variable::RemotePort => write_u16_decimal(out, self.remote_port),
@@ -731,6 +736,118 @@ pub(crate) fn render_parts(parts: &[PreparedValuePart], ctx: &RenderCtx<'_>, out
         match p {
             PreparedValuePart::Literal(b) => out.extend_from_slice(b),
             PreparedValuePart::Var(v) => ctx.write_var(v, out),
+        }
+    }
+}
+
+/// `HTTP/1.x` at the end of a request line; empty if there is none.
+fn server_protocol(request_line: &[u8]) -> &[u8] {
+    match request_line.iter().rposition(|&b| b == b' ') {
+        Some(i) if request_line[i + 1..].starts_with(b"HTTP/") => &request_line[i + 1..],
+        _ => b"",
+    }
+}
+
+/// Render a `log_format` line the way nginx's log module does: variable
+/// values are escaped per `escape=`, and with the default escaping a
+/// variable that isn't set is written as `-`.
+pub(crate) fn render_log_parts(
+    parts: &[PreparedValuePart],
+    escape: LogEscape,
+    ctx: &RenderCtx<'_>,
+    out: &mut Vec<u8>,
+) {
+    let mut value = Vec::new();
+    for p in parts {
+        match p {
+            PreparedValuePart::Literal(b) => out.extend_from_slice(b),
+            PreparedValuePart::Var(v) => {
+                value.clear();
+                ctx.write_var(v, &mut value);
+                if value.is_empty() && unset_when_empty(v) {
+                    if escape == LogEscape::Default {
+                        out.push(b'-');
+                    }
+                    continue;
+                }
+                match escape {
+                    LogEscape::Default => log_escape_into(&value, out),
+                    LogEscape::Json => json_escape_into(&value, out),
+                    LogEscape::None => out.extend_from_slice(&value),
+                }
+            }
+        }
+    }
+}
+
+/// Variables that nginx reports as "not found", rather than as an empty
+/// value, when there is nothing to show: absent headers, cookies and
+/// arguments, no authenticated user, no upstream, no TLS, no body.
+fn unset_when_empty(v: &Variable) -> bool {
+    matches!(
+        v,
+        Variable::Http(_)
+            | Variable::SentHttp(_)
+            | Variable::SentTrailer(_)
+            | Variable::Cookie(_)
+            | Variable::Arg(_)
+            | Variable::Args
+            | Variable::ContentLength
+            | Variable::ContentType
+            | Variable::RemoteUser
+            | Variable::RequestBody
+            | Variable::RequestBodyFile
+            | Variable::ProxyHost
+            | Variable::UpstreamHttp(_)
+            | Variable::UpstreamCookie(_)
+            | Variable::UpstreamResponseLength
+            | Variable::UpstreamResponseTime
+            | Variable::SslProtocol
+            | Variable::SslCipher
+            | Variable::SslCiphers
+            | Variable::SslServerName
+            | Variable::SslSessionId
+            | Variable::SslClientVerify
+            | Variable::SslClientIDn
+            | Variable::SslClientIDnLegacy
+            | Variable::SslClientSDn
+            | Variable::SslClientSDnLegacy
+            | Variable::SslClientVStart
+            | Variable::SslClientVEnd
+            | Variable::SslClientVRemain
+    )
+}
+
+/// nginx's `ngx_http_log_escape`: `"`, `\`, control bytes, DEL and
+/// non-ASCII bytes become `\xHH`.
+fn log_escape_into(value: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in value {
+        if b < 0x20 || b >= 0x7f || b == b'"' || b == b'\\' {
+            out.extend_from_slice(&[b'\\', b'x', HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]]);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
+/// nginx's `ngx_escape_json`.
+fn json_escape_into(value: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in value {
+        match b {
+            b'"' | b'\\' => out.extend_from_slice(&[b'\\', b]),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0..=0x1f => {
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[(b >> 4) as usize]);
+                out.push(HEX[(b & 0xf) as usize]);
+            }
+            _ => out.push(b),
         }
     }
 }

@@ -840,11 +840,25 @@ pub struct ProxySetHeader {
     pub value: Vec<ValuePart>,
 }
 
-/// One `log_format NAME FORMAT...;` definition.
+/// One `log_format NAME [escape=...] FORMAT...;` definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogFormatDef {
     pub name: String,
+    pub escape: LogEscape,
     pub value: Vec<ValuePart>,
+}
+
+/// How `log_format` writes variable values (`escape=`).
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub enum LogEscape {
+    /// A value that isn't set is `-`; `"`, `\`, control and non-ASCII
+    /// bytes become `\xHH`.
+    #[default]
+    Default,
+    /// JSON string escaping; a value that isn't set is empty.
+    Json,
+    /// Bytes as they are; a value that isn't set is empty.
+    None,
 }
 
 /// One `access_log path [format] [if=expr];` sink.
@@ -1278,6 +1292,10 @@ pub enum Variable {
     /// line (`GET`, `POST`, `HEAD`, …). Mirrors nginx's
     /// `r->method_name` rendering.
     RequestMethod,
+    /// `$request` — the request line as received, without the CRLF.
+    Request,
+    /// `$server_protocol` — `HTTP/1.0` or `HTTP/1.1` from the request line.
+    ServerProtocol,
     /// Unrecognized `$name`. Renders empty at runtime, matching nginx's
     /// lenient lookup: unknown variables don't fail the config.
     Unknown(String),
