@@ -640,3 +640,103 @@ http {{
     assert!(head.contains("\r\nX-Up-Accel: 10"), "{head}");
     assert!(resp.ends_with("\r\n\r\nok"));
 }
+
+/// Upstream that answers every request with a redirect built from its own
+/// port.
+fn spawn_redirecting_backend(response: impl Fn(u16) -> String + Send + 'static) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = response(port);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(body.as_bytes());
+        }
+    });
+    port
+}
+
+fn location_of(resp: &[u8]) -> String {
+    let text = String::from_utf8_lossy(resp);
+    text.lines()
+        .find_map(|l| l.strip_prefix("Location: ").map(str::to_string))
+        .unwrap_or_else(|| panic!("no Location in {text}"))
+}
+
+/// proxy_redirect (#32): nginx's implicit `default`, explicit prefix and
+/// regex rules with variables, `Refresh`, and `off`.
+#[test]
+fn m40_proxy_redirect_rewrites_upstream_location() {
+    let up = spawn_redirecting_backend(|p| {
+        format!(
+            "HTTP/1.0 302 Found\r\nLocation: http://127.0.0.1:{p}/new/x\r\n\
+             Refresh: 5; url=http://127.0.0.1:{p}/new/y\r\nContent-Length: 0\r\n\r\n"
+        )
+    });
+    let elsewhere = spawn_redirecting_backend(|_| {
+        "HTTP/1.0 302 Found\r\nLocation: http://other.example/x\r\nContent-Length: 0\r\n\r\n"
+            .to_string()
+    });
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        server_name localhost;
+        location /d/ {{ proxy_pass http://127.0.0.1:{up}/; }}
+        location /nouri/ {{ proxy_pass http://127.0.0.1:{up}; }}
+        location /rule/ {{
+            proxy_pass http://127.0.0.1:{up}/;
+            proxy_redirect http://127.0.0.1:{up}/ http://$host/mapped/;
+        }}
+        location /re/ {{
+            proxy_pass http://127.0.0.1:{up}/;
+            proxy_redirect ~^http://[^/]+/new/(.*)$ /caught/$1;
+        }}
+        location /off/ {{
+            proxy_pass http://127.0.0.1:{up}/;
+            proxy_redirect off;
+        }}
+        location /elsewhere/ {{ proxy_pass http://127.0.0.1:{elsewhere}/; }}
+    }}
+}}
+"#
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+
+    // default, proxy_pass with a URI: the URL becomes the location prefix,
+    // and the relative result is made absolute like nginx's header filter.
+    let resp = http_get_close(port, "/d/a");
+    assert_eq!(
+        location_of(&resp),
+        format!("http://localhost:{port}/d/new/x")
+    );
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.contains("\r\nRefresh: 5; url=/d/new/y\r\n"), "{text}");
+    // default, no URI: URL + "/" becomes "/".
+    assert_eq!(
+        location_of(&http_get_close(port, "/nouri/a")),
+        format!("http://localhost:{port}/new/x")
+    );
+    // An explicit rule with a variable.
+    assert_eq!(
+        location_of(&http_get_close(port, "/rule/a")),
+        "http://localhost/mapped/new/x"
+    );
+    // A regex rule replaces the whole value; $1 is the capture.
+    assert_eq!(
+        location_of(&http_get_close(port, "/re/a")),
+        format!("http://localhost:{port}/caught/x")
+    );
+    // off, and a Location no rule matches, are left alone.
+    assert_eq!(
+        location_of(&http_get_close(port, "/off/a")),
+        format!("http://127.0.0.1:{up}/new/x")
+    );
+    assert_eq!(
+        location_of(&http_get_close(port, "/elsewhere/a")),
+        "http://other.example/x"
+    );
+}

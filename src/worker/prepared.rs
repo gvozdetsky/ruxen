@@ -374,6 +374,21 @@ pub enum PreparedHandler {
     Proxy(PreparedProxy),
 }
 
+/// One prepared `proxy_redirect` rule.
+#[derive(Debug)]
+pub enum PreparedRedirect {
+    /// Replace this prefix of the header value.
+    Prefix {
+        pattern: &'static [PreparedValuePart],
+        replacement: &'static [PreparedValuePart],
+    },
+    /// On a match, the whole value becomes `replacement` (with `$1`…).
+    Regex {
+        regex: &'static regex::bytes::Regex,
+        replacement: &'static [PreparedValuePart],
+    },
+}
+
 /// Resolved `proxy_pass` target for a prepared location. Always carries a
 /// pointer to a `PreparedUpstream` — for `proxy_pass http://host:port`
 /// direct forms, the prepare path synthesizes a single-peer upstream block
@@ -431,6 +446,9 @@ pub struct PreparedProxy {
     pub location_prefix: &'static [u8],
     /// `proxy_pass http://up/path;` URI part. Empty when no path rewriting.
     pub request_path: &'static [u8],
+    /// `proxy_redirect` rules for upstream `Location` / `Refresh` headers,
+    /// tried in order; empty for `proxy_redirect off`.
+    pub redirects: &'static [PreparedRedirect],
 }
 
 /// One prepared `proxy_set_header NAME VALUE;` entry. Name is a static
@@ -464,6 +482,9 @@ pub(crate) struct ProxyEffective {
     pub intercept_errors: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
+    /// The nearest scope's `proxy_redirect` lines; `None` = nginx's
+    /// implicit `proxy_redirect default`.
+    pub redirect: Option<&'static crate::config::ProxyRedirect>,
 }
 
 impl ProxyEffective {
@@ -485,6 +506,7 @@ impl ProxyEffective {
             intercept_errors: false,
             ignore_invalid_headers: true,
             underscores_in_headers: false,
+            redirect: None,
         }
     }
 }

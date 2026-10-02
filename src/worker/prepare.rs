@@ -429,6 +429,24 @@ pub(crate) fn build_proxy(
         }
         _ => (b"".as_slice(), b"".as_slice()),
     };
+    let redirects = {
+        let (ProxyPass::Direct {
+            host_header,
+            request_path,
+            ..
+        }
+        | ProxyPass::UpstreamRef {
+            host_header,
+            request_path,
+            ..
+        }) = &pp;
+        prepare_redirects(
+            eff.redirect,
+            host_header,
+            request_path.as_deref(),
+            location_pattern,
+        )?
+    };
     Ok(match pp {
         ProxyPass::Direct {
             addr, host_header, ..
@@ -475,6 +493,7 @@ pub(crate) fn build_proxy(
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
                 request_path,
+                redirects,
             }
         }
         ProxyPass::UpstreamRef {
@@ -507,9 +526,68 @@ pub(crate) fn build_proxy(
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
                 request_path,
+                redirects,
             }
         }
     })
+}
+
+/// The `proxy_redirect` rules for one `proxy_pass`. Without any
+/// `proxy_redirect` in scope nginx applies `default`: with a URI part in
+/// `proxy_pass`, the whole URL is replaced by the location prefix
+/// (`http://up:1/` → `/d/` in `location /d/`); without one, the URL plus
+/// `/` becomes `/` (ngx_http_proxy_merge_loc_conf).
+fn prepare_redirects(
+    config: Option<&'static crate::config::ProxyRedirect>,
+    authority: &str,
+    uri: Option<&str>,
+    location: &'static [u8],
+) -> Result<&'static [PreparedRedirect], String> {
+    use crate::config::{ProxyRedirect, ProxyRedirectRule};
+    let literal = |s: String| prepare_value_parts(vec![ValuePart::Literal(s)]);
+    let default_rule = || {
+        let url = format!("http://{authority}{}", uri.unwrap_or(""));
+        let (pattern, replacement) = match uri {
+            Some(_) => (url, String::from_utf8_lossy(location).into_owned()),
+            None => (format!("{url}/"), "/".to_string()),
+        };
+        PreparedRedirect::Prefix {
+            pattern: literal(pattern),
+            replacement: literal(replacement),
+        }
+    };
+    let rules: Vec<PreparedRedirect> = match config {
+        None => vec![default_rule()],
+        Some(ProxyRedirect::Off) => Vec::new(),
+        Some(ProxyRedirect::Rules(rules)) => rules
+            .iter()
+            .map(|rule| match rule {
+                ProxyRedirectRule::Default => Ok(default_rule()),
+                ProxyRedirectRule::Prefix {
+                    pattern,
+                    replacement,
+                } => Ok(PreparedRedirect::Prefix {
+                    pattern: prepare_value_parts(pattern.clone()),
+                    replacement: prepare_value_parts(replacement.clone()),
+                }),
+                ProxyRedirectRule::Regex {
+                    pattern,
+                    case_insensitive,
+                    replacement,
+                } => {
+                    let regex = regex::bytes::RegexBuilder::new(pattern)
+                        .case_insensitive(*case_insensitive)
+                        .build()
+                        .map_err(|e| format!("invalid proxy_redirect regex \"{pattern}\": {e}"))?;
+                    Ok(PreparedRedirect::Regex {
+                        regex: leak_regex(regex),
+                        replacement: prepare_value_parts(replacement.clone()),
+                    })
+                }
+            })
+            .collect::<Result<_, String>>()?,
+    };
+    Ok(Box::leak(rules.into_boxed_slice()))
 }
 
 /// Server-scope proxy defaults — used as the parent in location-scope
@@ -530,6 +608,7 @@ pub(crate) struct ServerProxyDefaults {
     pub intercept_errors: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
+    pub redirect: Option<&'static crate::config::ProxyRedirect>,
 }
 
 impl ServerProxyDefaults {
@@ -549,6 +628,7 @@ impl ServerProxyDefaults {
         proxy_intercept_errors: Option<bool>,
         ignore_invalid_headers: bool,
         underscores_in_headers: bool,
+        proxy_redirect: Option<crate::config::ProxyRedirect>,
     ) -> Self {
         let defaults = ProxyEffective::defaults();
         let set_headers: &'static [PreparedProxySetHeader] = match proxy_set_headers {
@@ -572,6 +652,7 @@ impl ServerProxyDefaults {
             intercept_errors: proxy_intercept_errors.unwrap_or(defaults.intercept_errors),
             ignore_invalid_headers,
             underscores_in_headers,
+            redirect: proxy_redirect.map(|r| &*Box::leak(Box::new(r))),
         }
     }
 }
@@ -602,6 +683,7 @@ pub(crate) fn resolve_proxy_effective(
     location_next_upstream_tries: Option<u32>,
     location_next_upstream_timeout_ms: Option<u64>,
     location_intercept_errors: Option<bool>,
+    location_redirect: Option<crate::config::ProxyRedirect>,
     server_defaults: ServerProxyDefaults,
 ) -> ProxyEffective {
     let set_headers: &'static [PreparedProxySetHeader] = match location_set_headers {
@@ -627,6 +709,10 @@ pub(crate) fn resolve_proxy_effective(
         intercept_errors: location_intercept_errors.unwrap_or(server_defaults.intercept_errors),
         ignore_invalid_headers: server_defaults.ignore_invalid_headers,
         underscores_in_headers: server_defaults.underscores_in_headers,
+        redirect: match location_redirect {
+            Some(r) => Some(&*Box::leak(Box::new(r))),
+            None => server_defaults.redirect,
+        },
     }
 }
 
@@ -675,6 +761,7 @@ pub(crate) fn prepare_server(
         server.proxy_intercept_errors,
         server_ignore_invalid_headers,
         server_underscores_in_headers,
+        server.proxy_redirect.take(),
     );
     // Split the parsed `server_name` specs into the four match buckets
     // plus the `matches_empty` flag. Lowercasing is already handled
@@ -1816,6 +1903,7 @@ pub(crate) fn build_prefix_or_exact(
         proxy_next_upstream_tries: location_proxy_next_upstream_tries,
         proxy_next_upstream_timeout_ms: location_proxy_next_upstream_timeout_ms,
         proxy_intercept_errors: location_proxy_intercept_errors,
+        proxy_redirect: location_proxy_redirect,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
     } = l;
@@ -1832,6 +1920,7 @@ pub(crate) fn build_prefix_or_exact(
         location_proxy_next_upstream_tries,
         location_proxy_next_upstream_timeout_ms,
         location_proxy_intercept_errors,
+        location_proxy_redirect,
         server_proxy_defaults,
     );
     let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
@@ -1991,6 +2080,7 @@ pub(crate) fn build_regex_location(
         proxy_next_upstream_tries: location_proxy_next_upstream_tries,
         proxy_next_upstream_timeout_ms: location_proxy_next_upstream_timeout_ms,
         proxy_intercept_errors: location_proxy_intercept_errors,
+        proxy_redirect: location_proxy_redirect,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
     } = l;
@@ -2007,6 +2097,7 @@ pub(crate) fn build_regex_location(
         location_proxy_next_upstream_tries,
         location_proxy_next_upstream_timeout_ms,
         location_proxy_intercept_errors,
+        location_proxy_redirect,
         server_proxy_defaults,
     );
     // The parser already validated this with the same flags + the same

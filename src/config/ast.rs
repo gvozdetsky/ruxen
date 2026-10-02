@@ -430,6 +430,9 @@ pub struct Server {
     pub proxy_next_upstream_timeout_ms: Option<u64>,
     /// Server-scope `proxy_intercept_errors on|off;`. `None` inherits.
     pub proxy_intercept_errors: Option<bool>,
+    /// Server-scope `proxy_redirect` directives. `None` inherits (nginx's
+    /// implicit `default`).
+    pub proxy_redirect: Option<ProxyRedirect>,
     /// Server-scope `chunked_transfer_encoding on|off;`. `None` inherits the
     /// nginx default (`on`). When `false`, response bodies stay framed by
     /// `Content-Length` and `add_trailer` directives are silently dropped
@@ -572,6 +575,8 @@ pub struct Location {
     pub proxy_next_upstream_timeout_ms: Option<u64>,
     /// Location-scope `proxy_intercept_errors`. `None` inherits.
     pub proxy_intercept_errors: Option<bool>,
+    /// Location-scope `proxy_redirect` directives. `None` inherits.
+    pub proxy_redirect: Option<ProxyRedirect>,
     /// Location-scope `chunked_transfer_encoding on|off;`. `None` inherits
     /// from server scope, which itself defaults to nginx's `on`. When
     /// `false`, the response body uses `Content-Length` framing and any
@@ -1353,6 +1358,33 @@ pub enum Handler {
 /// configured with a proxy_pass URL that has a path, nginx rewrites the
 /// outgoing path: strip the matched location prefix from the client URI,
 /// prepend `request_path`.
+/// The `proxy_redirect` directives of one scope: `off`, or rules tried in
+/// order on upstream `Location` / `Refresh` headers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProxyRedirect {
+    Off,
+    Rules(Vec<ProxyRedirectRule>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProxyRedirectRule {
+    /// `proxy_redirect default;`: derived from `proxy_pass` and the
+    /// location at prepare time.
+    Default,
+    /// A prefix to replace; both sides may contain variables.
+    Prefix {
+        pattern: Vec<ValuePart>,
+        replacement: Vec<ValuePart>,
+    },
+    /// `~` / `~*`: on a match the whole value becomes `replacement`, which
+    /// may use `$1`…`$9`.
+    Regex {
+        pattern: String,
+        case_insensitive: bool,
+        replacement: Vec<ValuePart>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyPass {
     UpstreamRef {

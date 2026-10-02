@@ -141,6 +141,9 @@ pub struct ProxyPlan {
     /// Keep the upstream's header lines in `ProxyReport` because the
     /// location's add_header / add_trailer may read `$upstream_http_*`.
     pub keep_upstream_headers: bool,
+    /// `proxy_redirect` rules; the worker applies them when
+    /// `ProxyReport::redirect_header` says there is something to rewrite.
+    pub redirects: &'static [crate::worker::PreparedRedirect],
 }
 
 /// The temp file holding a large request body, and its length.
@@ -289,6 +292,7 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
 pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Response {
     let failures = &mut report.failures;
     let upstream_headers = &mut report.upstream_headers;
+    let redirect_header = &mut report.redirect_header;
     let upstream = plan.upstream;
     let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
     let overall_deadline = if plan.next_upstream_timeout.is_zero() {
@@ -331,12 +335,27 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
         //    stale-retry counts as part of the same `attempt` budget.
         let pooled = upstream::pool_take(upstream, current.peer_idx);
         let outcome = if let Some(c) = pooled {
-            match attempt(&plan, current.peer_idx, Some(c), upstream_headers).await {
+            match attempt(
+                &plan,
+                current.peer_idx,
+                Some(c),
+                upstream_headers,
+                redirect_header,
+            )
+            .await
+            {
                 AttemptOutcome::PooledStale => {
                     // M43: only retry the same peer with a fresh socket
                     // if the body can be safely re-sent.
                     if body_safe_to_retry {
-                        attempt(&plan, current.peer_idx, None, upstream_headers).await
+                        attempt(
+                            &plan,
+                            current.peer_idx,
+                            None,
+                            upstream_headers,
+                            redirect_header,
+                        )
+                        .await
                     } else {
                         AttemptOutcome::Failed(
                             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
@@ -348,7 +367,14 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 other => other,
             }
         } else {
-            attempt(&plan, current.peer_idx, None, upstream_headers).await
+            attempt(
+                &plan,
+                current.peer_idx,
+                None,
+                upstream_headers,
+                redirect_header,
+            )
+            .await
         };
 
         match outcome {
@@ -690,6 +716,9 @@ pub struct ProxyReport {
     /// the ones hidden from the client, for `$upstream_http_*`. Filled
     /// only when `ProxyPlan::keep_upstream_headers` is set.
     pub upstream_headers: Vec<u8>,
+    /// The response has a `Location` or `Refresh` header and there are
+    /// `proxy_redirect` rules to apply to it.
+    pub redirect_header: bool,
 }
 
 /// One failed attempt, for the error log: what went wrong and where. The
@@ -721,6 +750,7 @@ async fn attempt(
     peer_idx: usize,
     pooled: Option<upstream::PooledConn>,
     upstream_headers: &mut Vec<u8>,
+    redirect_header: &mut bool,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     let peer_addr = plan.upstream.peers[peer_idx].addr;
@@ -1182,21 +1212,27 @@ async fn attempt(
             upstream_headers.extend_from_slice(line);
             upstream_headers.extend_from_slice(b"\r\n");
         }
-        if is_hop_by_hop(name) || is_hidden_by_default(name) {
-            continue;
-        }
-        // nginx keeps the first of a repeated single-valued header and
-        // drops the rest (ngx_http_upstream_process_header_line).
-        if let Some(bit) = single_header_bit(name) {
-            if seen_single & bit != 0 {
-                continue;
+        match classify_upstream_header(name) {
+            UpstreamHeader::Dropped => continue,
+            // nginx keeps the first of a repeated single-valued header and
+            // drops the rest (ngx_http_upstream_process_header_line).
+            UpstreamHeader::Single(bit) => {
+                if seen_single & bit != 0 {
+                    continue;
+                }
+                seen_single |= bit;
             }
-            seen_single |= bit;
-        }
-        // Step 5 rejected Content-Length together with chunked, so a
-        // Content-Length here is the upstream's own framing: keep it.
-        if name.eq_ignore_ascii_case(b"content-length") {
-            have_content_length = true;
+            UpstreamHeader::Redirect(bit) => {
+                if seen_single & bit != 0 {
+                    continue;
+                }
+                seen_single |= bit;
+                *redirect_header |= !plan.redirects.is_empty();
+            }
+            // Step 5 rejected Content-Length together with chunked, so a
+            // Content-Length here is the upstream's own framing: keep it.
+            UpstreamHeader::ContentLength => have_content_length = true,
+            UpstreamHeader::Other => {}
         }
         out.extend_from_slice(line);
         out.extend_from_slice(b"\r\n");
@@ -1451,45 +1487,52 @@ const MAX_UNFRAMED_BODY: usize = 64 * 1024 * 1024;
 /// Upper bound on the up-front reservation for a `Content-Length` body.
 const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 
-/// Headers nginx's proxy module drops from the upstream response by
-/// default (`ngx_http_proxy_hide_headers`): it writes its own `Date` and
-/// `Server`, and `X-Accel-*` are instructions for the proxy, not for
-/// clients. `proxy_pass_header` would re-enable them (not implemented).
-fn is_hidden_by_default(name: &[u8]) -> bool {
-    const HIDDEN: [&[u8]; 8] = [
-        b"date",
-        b"server",
-        b"x-pad",
-        b"x-accel-expires",
-        b"x-accel-redirect",
-        b"x-accel-limit-rate",
-        b"x-accel-buffering",
-        b"x-accel-charset",
-    ];
-    HIDDEN
-        .iter()
-        .any(|h| h.len() == name.len() && h.eq_ignore_ascii_case(name))
+/// How the response stitch treats one upstream header.
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamHeader {
+    /// Hop-by-hop, or hidden by default like nginx's
+    /// `ngx_http_proxy_hide_headers` (Date, Server, X-Pad, X-Accel-*): it
+    /// writes its own Date and Server, and X-Accel-* are instructions for
+    /// the proxy, not for clients (`proxy_pass_header` would re-enable
+    /// them; not implemented).
+    Dropped,
+    /// Single-valued in nginx (`ngx_http_upstream_process_header_line` and
+    /// friends): later copies are ignored. The bit tracks "seen".
+    Single(u16),
+    /// `Location` / `Refresh`: single-valued, and subject to
+    /// `proxy_redirect`.
+    Redirect(u16),
+    ContentLength,
+    Other,
 }
 
-/// Bit for each header nginx treats as single-valued in upstream responses
-/// (`ngx_http_upstream_process_header_line` and friends); later copies are
-/// ignored. `Date` is dropped altogether before this check.
-fn single_header_bit(name: &[u8]) -> Option<u16> {
-    const SINGLE: [&[u8]; 9] = [
-        b"content-type",
-        b"last-modified",
-        b"etag",
-        b"server",
-        b"location",
-        b"refresh",
-        b"expires",
-        b"x-accel-expires",
-        b"x-accel-redirect",
-    ];
-    SINGLE
-        .iter()
-        .position(|h| h.len() == name.len() && h.eq_ignore_ascii_case(name))
-        .map(|i| 1 << i)
+/// One dispatch on the name's length, then at most a few compares: this
+/// runs for every upstream header line on the proxy hot path.
+fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
+    use UpstreamHeader::*;
+    let is = |h: &[u8]| name.eq_ignore_ascii_case(h);
+    match name.len() {
+        2 if is(b"te") => Dropped,
+        4 if is(b"date") => Dropped,
+        4 if is(b"etag") => Single(1 << 0),
+        5 if is(b"x-pad") => Dropped,
+        6 if is(b"server") => Dropped,
+        7 if is(b"upgrade") => Dropped,
+        7 if is(b"expires") => Single(1 << 1),
+        7 if is(b"refresh") => Redirect(1 << 2),
+        8 if is(b"trailers") => Dropped,
+        8 if is(b"location") => Redirect(1 << 3),
+        10 if is(b"connection") || is(b"keep-alive") => Dropped,
+        12 if is(b"content-type") => Single(1 << 4),
+        13 if is(b"last-modified") => Single(1 << 5),
+        14 if is(b"content-length") => ContentLength,
+        15 if is(b"x-accel-expires") || is(b"x-accel-charset") => Dropped,
+        16 if is(b"x-accel-redirect") => Dropped,
+        17 if is(b"transfer-encoding") || is(b"x-accel-buffering") => Dropped,
+        18 if is(b"proxy-authenticate") || is(b"x-accel-limit-rate") => Dropped,
+        19 if is(b"proxy-authorization") => Dropped,
+        _ => Other,
+    }
 }
 
 /// `Content-Length` value as nginx's `ngx_atoof` accepts it: decimal
@@ -1681,24 +1724,51 @@ mod tests {
     }
 
     #[test]
-    fn single_valued_headers_match_nginx() {
+    fn upstream_headers_classify_like_nginx() {
+        use UpstreamHeader::*;
         for name in [
-            &b"Expires"[..],
-            b"content-type",
-            b"ETag",
-            b"X-Accel-Redirect",
-            b"Location",
+            &b"Date"[..],
+            b"Server",
+            b"X-Pad",
+            b"X-Accel-Expires",
+            b"x-accel-redirect",
+            b"X-Accel-Limit-Rate",
+            b"X-Accel-Buffering",
+            b"X-Accel-Charset",
+            b"Connection",
+            b"Keep-Alive",
+            b"Transfer-Encoding",
+            b"TE",
+            b"Trailers",
+            b"Upgrade",
+            b"Proxy-Authenticate",
+            b"Proxy-Authorization",
         ] {
-            assert!(single_header_bit(name).is_some(), "{:?}", name);
+            assert_eq!(classify_upstream_header(name), Dropped, "{:?}", name);
         }
+        for name in [&b"Expires"[..], b"content-type", b"ETag", b"Last-Modified"] {
+            assert!(
+                matches!(classify_upstream_header(name), Single(_)),
+                "{:?}",
+                name
+            );
+        }
+        for name in [&b"Location"[..], b"refresh"] {
+            assert!(
+                matches!(classify_upstream_header(name), Redirect(_)),
+                "{:?}",
+                name
+            );
+        }
+        assert_eq!(classify_upstream_header(b"Content-Length"), ContentLength);
         for name in [
             &b"Set-Cookie"[..],
             b"Cache-Control",
             b"Vary",
             b"X-Custom",
-            b"Link",
+            b"X-Accel-Other",
         ] {
-            assert!(single_header_bit(name).is_none(), "{:?}", name);
+            assert_eq!(classify_upstream_header(name), Other, "{:?}", name);
         }
     }
 }

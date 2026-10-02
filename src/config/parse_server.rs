@@ -77,6 +77,7 @@ pub(crate) fn parse_server_block(
     let mut proxy_next_upstream_tries: Option<u32> = None;
     let mut proxy_next_upstream_timeout_ms: Option<u64> = None;
     let mut proxy_intercept_errors: Option<bool> = None;
+    let mut proxy_redirect: Option<ProxyRedirect> = None;
     let mut chunked_transfer_encoding: Option<bool> = None;
 
     loop {
@@ -180,6 +181,7 @@ pub(crate) fn parse_server_block(
                         proxy_next_upstream_tries,
                         proxy_next_upstream_timeout_ms,
                         proxy_intercept_errors,
+                        proxy_redirect,
                         chunked_transfer_encoding,
                         ssl,
                         locations,
@@ -627,6 +629,9 @@ pub(crate) fn parse_server_block(
                 proxy_next_upstream_timeout_ms =
                     Some(parse_duration_ms(v, "proxy_next_upstream_timeout")?);
             }
+            ("proxy_redirect", Terminator::Semi) => {
+                parse_proxy_redirect(&args, &mut proxy_redirect)?;
+            }
             ("proxy_intercept_errors", Terminator::Semi) => {
                 if proxy_intercept_errors.is_some() {
                     return Err(Error::Duplicate("proxy_intercept_errors"));
@@ -682,6 +687,7 @@ pub(crate) fn parse_server_block(
                 | "proxy_next_upstream_tries"
                 | "proxy_next_upstream_timeout"
                 | "proxy_intercept_errors"
+                | "proxy_redirect"
                 | "ssl_certificate"
                 | "ssl_certificate_key"
                 | "ssl_protocols"
@@ -970,6 +976,64 @@ pub(crate) fn parse_size_bytes(raw: &str) -> Option<u64> {
         _ => (raw, 1),
     };
     num.parse::<u64>().ok()?.checked_mul(mult)
+}
+
+/// One `proxy_redirect off | default | <pattern> <replacement>;` into the
+/// scope's `slot`, with nginx's rules: `off` can't be mixed with other
+/// `proxy_redirect` lines in the same scope.
+pub(crate) fn parse_proxy_redirect(
+    args: &[String],
+    slot: &mut Option<ProxyRedirect>,
+) -> Result<(), Error> {
+    let rule = match &args[1..] {
+        [one] if one == "off" => {
+            if slot.is_some() {
+                return Err(Error::Duplicate("proxy_redirect"));
+            }
+            *slot = Some(ProxyRedirect::Off);
+            return Ok(());
+        }
+        [one] if one == "default" => ProxyRedirectRule::Default,
+        [pattern, replacement] => {
+            if let Some(regex) = pattern.strip_prefix('~') {
+                // A regex rule's replacement may use its captures, $1…$9.
+                let replacement = super::values::parse_value_with_vars_rewrite(replacement)?;
+                let (regex, case_insensitive) = match regex.strip_prefix('*') {
+                    Some(r) => (r, true),
+                    None => (regex, false),
+                };
+                regex::bytes::RegexBuilder::new(regex)
+                    .case_insensitive(case_insensitive)
+                    .build()
+                    .map_err(|e| Error::InvalidRegex {
+                        pattern: regex.to_string(),
+                        msg: e.to_string(),
+                    })?;
+                ProxyRedirectRule::Regex {
+                    pattern: regex.to_string(),
+                    case_insensitive,
+                    replacement,
+                }
+            } else {
+                ProxyRedirectRule::Prefix {
+                    pattern: crate::config::parse_value_with_vars(pattern)?,
+                    replacement: crate::config::parse_value_with_vars(replacement)?,
+                }
+            }
+        }
+        _ => {
+            return Err(Error::BadValue {
+                what: "proxy_redirect",
+                got: args[1..].join(" "),
+            });
+        }
+    };
+    match slot {
+        None => *slot = Some(ProxyRedirect::Rules(vec![rule])),
+        Some(ProxyRedirect::Rules(rules)) => rules.push(rule),
+        Some(ProxyRedirect::Off) => return Err(Error::Duplicate("proxy_redirect")),
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_duration_ms(raw: &str, what: &'static str) -> Result<u64, Error> {
