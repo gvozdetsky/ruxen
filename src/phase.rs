@@ -122,6 +122,10 @@ pub struct RequestCtx<'a> {
     /// Both Content-Length and chunked client bodies arrive here decoded
     /// as plain bytes; proxy forwarding recomputes `Content-Length`.
     pub body: &'a [u8],
+    /// Length of the request body: `body.len()`, unless the body was too
+    /// large to keep in memory and is only in `body_file` (then `body` is
+    /// empty, and `$request_body` too, as in nginx).
+    pub body_len: u64,
     /// Path to a temp file containing the request body when the worker
     /// spilled it. Empty when no spill file exists.
     pub body_file: &'a [u8],
@@ -1345,6 +1349,7 @@ mod tests {
             epoch_secs: 0,
             epoch_ms: 0,
             body: &[],
+            body_len: 0,
             body_file: &[],
             tls: None,
         }

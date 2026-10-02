@@ -341,10 +341,11 @@ pub(crate) fn run_location_handler(
     preserved_www_authenticate: &[Vec<u8>],
     server_name_captures: Option<&phase::ServerNameCaptures>,
 ) -> Response {
-    if let Some(limit) = loc.client_max_body_size
-        && limit > 0
-        && (req.body.len() as u64) > limit
-    {
+    // nginx's default client_max_body_size is 1m; `0` turns the check off.
+    let body_limit = loc
+        .client_max_body_size
+        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
+    if body_limit > 0 && req.body_len > body_limit {
         let body = "413 Request Entity Too Large\n";
         let response = if matches!(req.method, Method::Head) {
             http::build_head_response(413, body.len(), loc.server_header)
@@ -536,13 +537,26 @@ pub(crate) fn run_location_handler(
         } else {
             &[]
         };
+        let forward_len = if proxy.pass_request_body {
+            req.body_len
+        } else {
+            0
+        };
+        // A body too large to keep in memory is only in the temp file;
+        // `run_proxy` streams it after the header block.
+        let body_file = (forward_len > forward_body.len() as u64).then(|| {
+            use std::os::unix::ffi::OsStrExt;
+            crate::proxy::RequestBodyFile {
+                path: std::path::PathBuf::from(std::ffi::OsStr::from_bytes(req.body_file)),
+                len: forward_len,
+            }
+        });
         // Synthesize Content-Length when forwarding a body; nginx always
         // emits CL on the upstream side, recomputed from the actual
         // forwarded byte count regardless of the client header.
         if !have_content_length_override {
-            if !forward_body.is_empty() {
-                let n = forward_body.len();
-                overrides_buf.push((b"Content-Length", n.to_string().into_bytes()));
+            if forward_len > 0 {
+                overrides_buf.push((b"Content-Length", forward_len.to_string().into_bytes()));
             } else if matches!(req.method, Method::Get | Method::Head) {
                 // Drop Content-Length entirely for GET/HEAD with no body.
             } else {
@@ -620,7 +634,8 @@ pub(crate) fn run_location_handler(
             next_upstream: proxy.next_upstream,
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
-            has_request_body: !forward_body.is_empty(),
+            has_request_body: forward_len > 0,
+            body_file,
             method_idempotent: is_idempotent_method_bytes(req.method_bytes),
             intercept,
         });

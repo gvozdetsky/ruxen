@@ -181,6 +181,87 @@ pub(crate) fn maybe_spill_request_body_to_file(body: &[u8]) -> Option<SpilledBod
     })
 }
 
+/// Request bodies up to this size stay in memory, where the proxy forwards
+/// them without a copy; larger ones go to a temp file as they arrive, like
+/// nginx past `client_body_buffer_size`.
+pub(crate) const REQUEST_BODY_IN_MEMORY: usize = 1 << 20;
+
+/// nginx's default `client_max_body_size`.
+pub(crate) const DEFAULT_CLIENT_MAX_BODY_SIZE: u64 = 1 << 20;
+
+/// Collects a request body: in memory up to `REQUEST_BODY_IN_MEMORY`, then
+/// in a temp file (removed with the `SpilledBody` unless kept).
+pub(crate) struct BodySink {
+    mem: Vec<u8>,
+    file: Option<(std::fs::File, SpilledBody)>,
+    len: u64,
+}
+
+impl BodySink {
+    pub(crate) fn with_capacity(expected: u64) -> Self {
+        BodySink {
+            mem: Vec::with_capacity(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
+            file: None,
+            len: 0,
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Append `data`; `false` if the temp file couldn't be written.
+    pub(crate) fn extend(&mut self, data: &[u8]) -> bool {
+        if self.file.is_none() && self.mem.len() + data.len() > REQUEST_BODY_IN_MEMORY {
+            let Some(spilled) = new_body_file() else {
+                return false;
+            };
+            let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&spilled.path) else {
+                return false;
+            };
+            if file.write_all(&self.mem).is_err() {
+                return false;
+            }
+            self.mem = Vec::new();
+            self.file = Some((file, spilled));
+        }
+        let ok = match &mut self.file {
+            Some((file, _)) => file.write_all(data).is_ok(),
+            None => {
+                self.mem.extend_from_slice(data);
+                true
+            }
+        };
+        self.len += data.len() as u64;
+        ok
+    }
+
+    /// The in-memory body (empty when spilled) and the file, if any.
+    pub(crate) fn finish(self) -> (Vec<u8>, Option<SpilledBody>) {
+        match self.file {
+            Some((_, spilled)) => (Vec::new(), Some(spilled)),
+            None => (self.mem, None),
+        }
+    }
+}
+
+fn new_body_file() -> Option<SpilledBody> {
+    let seq = REQUEST_BODY_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!("ruxen-body-{}-{}.tmp", std::process::id(), seq));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    let path_bytes = path.to_string_lossy().into_owned().into_bytes();
+    Some(SpilledBody {
+        path,
+        path_bytes,
+        keep: std::cell::Cell::new(false),
+    })
+}
+
 /// Normalize the raw request path. Used by `phase::process` before entering
 /// the reroute loop; bubbles URI errors up as appropriate status codes.
 /// `merge_slashes` threads the per-server directive through — the
@@ -633,6 +714,7 @@ mod tests {
             epoch_secs: 0,
             epoch_ms: 0,
             body: &[],
+            body_len: 0,
             body_file: &[],
             tls: None,
         };

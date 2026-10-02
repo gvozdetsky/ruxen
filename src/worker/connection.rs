@@ -384,19 +384,27 @@ pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
 
 /// Outcome of decoding a chunked request body.
 pub(crate) struct ChunkedBody {
-    /// Decoded body bytes.
-    pub(crate) body: Vec<u8>,
     /// Bytes consumed from the caller's `initial` buffer (the slice we
     /// were handed at body-start). Used to advance `read_start` for the
     /// keep-alive resumption path.
     pub(crate) consumed_initial: usize,
-    /// Total raw chunked bytes — request_line+headers framing plus chunk
-    /// sizes, data, CRLFs, trailers — for `$request_length` accounting.
-    pub(crate) raw_consumed: usize,
+    /// Total raw chunked bytes — chunk sizes, data, CRLFs, trailers — for
+    /// `$request_length` accounting.
+    pub(crate) raw_consumed: u64,
     /// Bytes that were read from the socket past the chunked terminator.
     /// These belong to the next pipelined request and are spliced back
     /// into the worker's read buffer by the caller.
     pub(crate) pipelined_tail: Vec<u8>,
+}
+
+/// Why a chunked body was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChunkedBodyError {
+    /// Over the size limit: 413, as nginx.
+    TooLarge,
+    /// Malformed framing, a line or trailer block too long, EOF, a read
+    /// error or timeout, or a failed temp-file write: 400.
+    Invalid,
 }
 
 /// Maximum length of any single chunk-size or trailer line, including the
@@ -409,126 +417,132 @@ pub(crate) const MAX_CHUNK_LINE_BYTES: usize = 8192;
 /// Maximum trailer block size in bytes. Bounds total trailer-line growth.
 pub(crate) const MAX_TRAILER_BLOCK_BYTES: usize = 16 * 1024;
 
-/// Read and decode a chunked request body from the connection.
-///
-/// `None` means malformed framing, body too large, line/trailer too long,
-/// or socket EOF/error. The caller responds with 400 in that case.
+/// Read and decode a chunked request body from the connection into `sink`
+/// (memory, then a temp file for large bodies). Chunk data is passed on as
+/// it arrives and consumed input is dropped, so memory stays bounded
+/// whatever the chunk sizes.
 pub(crate) async fn read_chunked_request_body<S: ConnIo>(
     stream: &mut S,
     initial: &[u8],
-    max_body: usize,
+    max_body: u64,
+    sink: &mut BodySink,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
-) -> Option<ChunkedBody> {
+) -> Result<ChunkedBody, ChunkedBodyError> {
+    use ChunkedBodyError::{Invalid, TooLarge};
+
+    // `raw[cursor..]` is unread input; `raw_base` is how many stream bytes
+    // (counted from `initial[0]`) were dropped from the front of `raw`.
     let mut raw = Vec::with_capacity(initial.len().saturating_add(128));
     raw.extend_from_slice(initial);
+    let mut raw_base: u64 = 0;
     let mut cursor: usize = 0;
-    let mut body = Vec::new();
     let mut trailer_bytes: usize = 0;
 
-    loop {
-        // Find the next CRLF for the chunk-size line, capped to bound growth.
-        let line_end = loop {
-            if let Some(pos) = raw[cursor..].windows(2).position(|w| w == b"\r\n") {
-                break cursor + pos;
+    // Drop consumed input, then read more after what's left.
+    macro_rules! read_more {
+        ($cap:expr) => {{
+            if cursor > 0 {
+                raw.drain(..cursor);
+                raw_base += cursor as u64;
+                cursor = 0;
             }
-            if raw.len() - cursor > MAX_CHUNK_LINE_BYTES {
-                return None;
-            }
-            let chunk: Vec<u8> = vec![0u8; 4096];
-            let (res, returned) =
-                with_timeout(timer.as_mut(), read_timeout, stream.read(chunk)).await?;
+            let chunk: Vec<u8> = vec![0u8; $cap];
+            let (res, returned) = with_timeout(timer.as_mut(), read_timeout, stream.read(chunk))
+                .await
+                .ok_or(Invalid)?;
             match res {
-                Ok(0) | Err(_) => return None,
+                Ok(0) | Err(_) => return Err(Invalid),
                 Ok(n) => raw.extend_from_slice(&returned[..n]),
             }
-        };
-        if line_end - cursor > MAX_CHUNK_LINE_BYTES {
-            return None;
+        }};
+    }
+
+    // The next CRLF-terminated line (chunk size or trailer), excluding the
+    // CRLF, as an index past `cursor`.
+    macro_rules! line_end {
+        ($cap:expr) => {{
+            loop {
+                if let Some(pos) = raw[cursor..].windows(2).position(|w| w == b"\r\n") {
+                    break cursor + pos;
+                }
+                if raw.len() - cursor > MAX_CHUNK_LINE_BYTES {
+                    return Err(Invalid);
+                }
+                read_more!($cap);
+            }
+        }};
+    }
+
+    loop {
+        let end = line_end!(4096);
+        if end - cursor > MAX_CHUNK_LINE_BYTES {
+            return Err(Invalid);
         }
-        let line = &raw[cursor..line_end];
+        let line = &raw[cursor..end];
         let size_field = line.split(|&b| b == b';').next().unwrap_or(line);
-        let size_text = std::str::from_utf8(size_field).ok()?.trim();
+        let size_text = std::str::from_utf8(size_field).map_err(|_| Invalid)?.trim();
         if size_text.is_empty() {
-            return None;
+            return Err(Invalid);
         }
-        let chunk_len = usize::from_str_radix(size_text, 16).ok()?;
-        // Reject oversize chunks before allocating; also guards arithmetic
-        // below against `cursor + chunk_len + 2` overflow.
-        if chunk_len > max_body {
-            return None;
-        }
-        cursor = line_end + 2;
+        let chunk_len = u64::from_str_radix(size_text, 16).map_err(|_| Invalid)?;
+        cursor = end + 2;
 
         if chunk_len == 0 {
             // Trailers: zero or more header-style lines, then an empty line.
             loop {
-                let trailer_end = loop {
-                    if let Some(pos) = raw[cursor..].windows(2).position(|w| w == b"\r\n") {
-                        break cursor + pos;
-                    }
-                    if raw.len() - cursor > MAX_CHUNK_LINE_BYTES {
-                        return None;
-                    }
-                    let chunk: Vec<u8> = vec![0u8; 1024];
-                    let (res, returned) =
-                        with_timeout(timer.as_mut(), read_timeout, stream.read(chunk)).await?;
-                    match res {
-                        Ok(0) | Err(_) => return None,
-                        Ok(n) => raw.extend_from_slice(&returned[..n]),
-                    }
-                };
-                let trailer = &raw[cursor..trailer_end];
-                trailer_bytes = trailer_bytes.saturating_add(trailer.len() + 2);
+                let end = line_end!(1024);
+                let trailer_len = end - cursor;
+                trailer_bytes = trailer_bytes.saturating_add(trailer_len + 2);
                 if trailer_bytes > MAX_TRAILER_BLOCK_BYTES {
-                    return None;
+                    return Err(Invalid);
                 }
-                cursor = trailer_end + 2;
-                if trailer.is_empty() {
-                    let consumed_initial = cursor.min(initial.len());
+                cursor = end + 2;
+                if trailer_len == 0 {
+                    let consumed = raw_base + cursor as u64;
+                    let consumed_initial = consumed.min(initial.len() as u64) as usize;
                     // Bytes past the chunked terminator belong to the next
                     // pipelined request. If the terminator landed within
-                    // `initial`, those bytes are still in the worker's
-                    // read buffer at their original position — leave them
-                    // there. If we read past `initial` from the socket,
-                    // hand the over-read back to the caller so it can
-                    // splice them into the next-request slot.
-                    let pipelined_tail = if cursor > initial.len() {
+                    // `initial`, those bytes are still in the worker's read
+                    // buffer at their original position — leave them there.
+                    // If we read past `initial` from the socket, hand the
+                    // over-read back to the caller so it can splice them
+                    // into the next-request slot.
+                    let pipelined_tail = if consumed > initial.len() as u64 {
                         raw[cursor..].to_vec()
                     } else {
                         Vec::new()
                     };
-                    return Some(ChunkedBody {
-                        body,
+                    return Ok(ChunkedBody {
                         consumed_initial,
-                        raw_consumed: cursor,
+                        raw_consumed: consumed,
                         pipelined_tail,
                     });
                 }
             }
         }
 
-        // Body cap check before extending; chunk_len <= max_body was
-        // already enforced, so the add can't wrap.
-        if body.len() + chunk_len > max_body {
-            return None;
+        if chunk_len > max_body.saturating_sub(sink.len()) {
+            return Err(TooLarge);
         }
-
-        while raw.len() < cursor + chunk_len + 2 {
-            let need = (cursor + chunk_len + 2) - raw.len();
-            let cap = need.min(8192);
-            let chunk: Vec<u8> = vec![0u8; cap];
-            let (res, returned) =
-                with_timeout(timer.as_mut(), read_timeout, stream.read(chunk)).await?;
-            match res {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => raw.extend_from_slice(&returned[..n]),
+        // Pass the chunk on as it arrives instead of buffering all of it.
+        let mut left = chunk_len;
+        while left > 0 {
+            if cursor == raw.len() {
+                read_more!((left.min(64 * 1024)) as usize);
             }
+            let take = (left.min((raw.len() - cursor) as u64)) as usize;
+            if !sink.extend(&raw[cursor..cursor + take]) {
+                return Err(Invalid);
+            }
+            cursor += take;
+            left -= take as u64;
         }
-        body.extend_from_slice(&raw[cursor..cursor + chunk_len]);
-        cursor += chunk_len;
+        while raw.len() - cursor < 2 {
+            read_more!(64);
+        }
         if raw[cursor..cursor + 2] != *b"\r\n" {
-            return None;
+            return Err(Invalid);
         }
         cursor += 2;
     }
