@@ -951,6 +951,9 @@ pub struct PreparedServer {
     /// Effective server-scope `post_action`, used for server-default and
     /// no-location fallback paths.
     pub post_action: Option<&'static [u8]>,
+    /// Server-scope `error_page` list, for requests refused before any
+    /// location (bad or missing Host, Transfer-Encoding, TRACE).
+    pub error_pages: &'static [PreparedErrorPage],
 }
 
 /// One prepared listen address plus all `server {}` blocks bound to it.

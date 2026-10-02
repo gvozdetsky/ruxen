@@ -243,3 +243,77 @@ fn m12_error_page_redirect_targets_clear_old_location_and_update_args() {
             .contains("Location: first")
     );
 }
+
+fn raw_exchange(port: u16, raw: &[u8]) -> Vec<u8> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(raw).unwrap();
+    let mut out = Vec::new();
+    // A timeout here means the connection was left open.
+    s.read_to_end(&mut out)
+        .expect("connection closed after the response");
+    out
+}
+
+/// Requests refused before any location (invalid or missing Host,
+/// Transfer-Encoding, TRACE) get the server's own `error_page`, as in
+/// nginx: the default server's for an invalid Host, the Host's server
+/// otherwise. They used to always get the built-in page.
+#[test]
+fn m12_server_error_page_applies_to_refused_requests() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    server_name dflt;
+    error_page 400 /bad;
+    location = /bad { return 200 "dflt bad"; }
+  }
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    server_name other;
+    error_page 400 /bad;
+    error_page 501 =200 /te;
+    error_page 405 /m;
+    location = /bad { return 200 "other bad"; }
+    location = /te { return 200 "other te"; }
+    location = /m { return 200 "other method"; }
+  }
+}
+"#;
+    let (_guard, port) = spawn_server(conf);
+
+    // Invalid Host: the default server, without waiting for the body.
+    let r = raw_exchange(
+        port,
+        b"POST / HTTP/1.1\r\nHost: other/x\r\nContent-Length: 100\r\n\r\n",
+    );
+    assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request", "{r:?}");
+    assert_eq!(body(&r), b"dflt bad");
+    assert_eq!(header_value(&r, "connection"), Some("close"));
+
+    // Missing Host on HTTP/1.1: also the default server.
+    let r = raw_exchange(port, b"GET / HTTP/1.1\r\n\r\n");
+    assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request");
+    assert_eq!(body(&r), b"dflt bad");
+
+    // Transfer-Encoding problems: the server chosen by Host.
+    let r = raw_exchange(
+        port,
+        b"POST / HTTP/1.1\r\nHost: other\r\nTransfer-Encoding: gzip\r\n\r\n",
+    );
+    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    assert_eq!(body(&r), b"other te");
+    let r = raw_exchange(
+        port,
+        b"POST / HTTP/1.1\r\nHost: other\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+    );
+    assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request");
+    assert_eq!(body(&r), b"other bad");
+
+    // TRACE: 405 with the Host's server page.
+    let r = raw_exchange(port, b"TRACE / HTTP/1.1\r\nHost: other\r\n\r\n");
+    assert_eq!(status_line(&r), "HTTP/1.1 405 Not Allowed");
+    assert_eq!(body(&r), b"other method");
+}

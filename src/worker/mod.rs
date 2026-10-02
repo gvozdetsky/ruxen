@@ -734,6 +734,7 @@ mod tests {
             body_len: 0,
             body_file: &[],
             tls: None,
+            refuse: None,
         };
 
         let rewrite_state = RewriteState::default();
