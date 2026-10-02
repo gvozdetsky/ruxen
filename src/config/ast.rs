@@ -1223,6 +1223,15 @@ pub enum Variable {
     /// `$upstream_cookie_NAME` — value of a named cookie from the upstream
     /// `Set-Cookie` response header(s).
     UpstreamCookie(String),
+    /// `$upstream_addr`, `$upstream_status`, `$upstream_connect_time`,
+    /// `$upstream_header_time`, `$upstream_bytes_received`,
+    /// `$upstream_bytes_sent`: one value per upstream attempt.
+    UpstreamAddr,
+    UpstreamStatus,
+    UpstreamConnectTime,
+    UpstreamHeaderTime,
+    UpstreamBytesReceived,
+    UpstreamBytesSent,
     /// `$upstream_response_length` — total bytes of the upstream response
     /// body (excluding upstream headers). Empty outside a proxy context.
     UpstreamResponseLength,

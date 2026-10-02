@@ -686,14 +686,7 @@ pub(crate) fn apply_proxy_add_headers(
     };
     // `$upstream_http_*` read the upstream's own header lines, which still
     // include the ones hidden from the client (Server, Date, X-Accel-*).
-    let render_ctx = proxy_render_ctx(
-        http,
-        ctx,
-        meta,
-        response_status(&bytes),
-        upstream_body_len(&bytes),
-        upstream_headers,
-    );
+    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(&bytes), upstream_headers);
     let mut out = bytes;
     if needs_expires {
         out = apply_expires(out, meta.proxy_expires, &render_ctx);
@@ -724,15 +717,6 @@ pub(crate) fn apply_proxy_add_headers(
     Response::Owned(out)
 }
 
-/// Body length of a stitched proxy response, for
-/// `$upstream_response_length`.
-fn upstream_body_len(response: &[u8]) -> u64 {
-    match response.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(p) => response.len().saturating_sub(p + 4) as u64,
-        None => 0,
-    }
-}
-
 /// The variable context for rendering against a proxied response
 /// (`add_header`, `proxy_redirect`).
 fn proxy_render_ctx<'a>(
@@ -740,7 +724,6 @@ fn proxy_render_ctx<'a>(
     ctx: &'a phase::RequestCtx<'a>,
     meta: &'a phase::ProcessMeta,
     status: u16,
-    upstream_response_length: u64,
     upstream_headers: &'a [u8],
 ) -> RenderCtx<'a> {
     let request_uri = ctx.path;
@@ -791,8 +774,7 @@ fn proxy_render_ctx<'a>(
         maps: Some(&http.maps),
         proxy_host: meta.proxy_host,
         upstream_headers,
-        upstream_response_length: Some(upstream_response_length),
-        upstream_response_time_ms: meta.upstream_response_time_ms,
+        upstream_states: &meta.upstream_states,
         sent_trailers: &[],
         tls: ctx.tls,
     }
@@ -856,8 +838,7 @@ pub(crate) fn intercept_refusal(
         maps: Some(&http.maps),
         proxy_host: &[],
         upstream_headers: &[],
-        upstream_response_length: None,
-        upstream_response_time_ms: None,
+        upstream_states: req.upstream_states,
         sent_trailers: &[],
         tls: req.tls,
     };
@@ -892,14 +873,7 @@ pub(crate) fn rewrite_proxy_redirects(
     let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
         return Response::Owned(bytes);
     };
-    let render_ctx = proxy_render_ctx(
-        http,
-        ctx,
-        meta,
-        response_status(&bytes),
-        upstream_body_len(&bytes),
-        upstream_headers,
-    );
+    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(&bytes), upstream_headers);
 
     let mut out = Vec::with_capacity(bytes.len() + 64);
     let mut changed = false;

@@ -1503,6 +1503,12 @@ impl<'a> AccessLogPrep<'a> {
             path: Box::leak(log.path.clone().into_boxed_path()),
             format,
             escape,
+            reads_upstream_headers: format.iter().any(|p| {
+                matches!(
+                    p,
+                    PreparedValuePart::Var(Variable::UpstreamHttp(_) | Variable::UpstreamCookie(_))
+                )
+            }),
             condition: log.condition.clone().map(prepare_value_parts),
             file_index,
         };

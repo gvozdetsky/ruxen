@@ -119,17 +119,10 @@ pub(crate) struct RenderCtx<'a> {
     /// trailing CRLF of the last header included). Empty outside a proxy
     /// context. Consulted by `$upstream_http_*` and `$upstream_cookie_*`.
     pub upstream_headers: &'a [u8],
-    /// Total bytes received from the upstream as the response body
-    /// (excludes headers and the status line). Rendered by
-    /// `$upstream_response_length`. `None` outside a proxy context — the
-    /// variable then renders as empty.
-    pub upstream_response_length: Option<u64>,
-    /// Upstream response time in milliseconds, source for
-    /// `$upstream_response_time`. `None` outside a proxy context. No
-    /// rate-limiting subsystem yet, so for proxied requests this just
-    /// reflects the wall-clock time from `run_proxy` start to finish
-    /// (typically ~0ms).
-    pub upstream_response_time_ms: Option<u64>,
+    /// One entry per upstream attempt, for `$upstream_addr`,
+    /// `$upstream_status`, `$upstream_response_time` and the rest. Empty
+    /// outside a proxy context.
+    pub upstream_states: &'a [crate::proxy::UpstreamState],
     /// Pre-rendered `add_trailer` lines, joined with CRLF and rendered as
     /// `Name: value\r\n` per entry. Used by `$sent_trailer_*` lookups via
     /// the same scanner that handles request/response headers.
@@ -141,6 +134,20 @@ pub(crate) struct RenderCtx<'a> {
 }
 
 impl RenderCtx<'_> {
+    /// nginx's `$upstream_*` lists: one value per attempt, `, `-separated.
+    fn write_upstream_list(
+        &self,
+        out: &mut Vec<u8>,
+        one: impl Fn(&mut Vec<u8>, &crate::proxy::UpstreamState),
+    ) {
+        for (i, state) in self.upstream_states.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b", ");
+            }
+            one(out, state);
+        }
+    }
+
     pub(crate) fn write_var(&self, var: &Variable, out: &mut Vec<u8>) {
         match var {
             Variable::Uri => out.extend_from_slice(self.uri),
@@ -277,26 +284,37 @@ impl RenderCtx<'_> {
             Variable::UpstreamCookie(name) => {
                 write_upstream_cookie_value(out, self.upstream_headers, name.as_bytes());
             }
-            Variable::UpstreamResponseLength => {
-                if let Some(n) = self.upstream_response_length {
-                    write_u64_decimal(out, n);
+            Variable::UpstreamAddr => self.write_upstream_list(out, |out, s| match s.peer {
+                crate::proxy::UpstreamPeerName::Addr(addr) => {
+                    use std::io::Write;
+                    let _ = write!(out, "{addr}");
                 }
+                crate::proxy::UpstreamPeerName::Group(name) => out.extend_from_slice(name),
+            }),
+            Variable::UpstreamStatus => self.write_upstream_list(out, |out, s| {
+                if s.status == 0 {
+                    out.push(b'-');
+                } else {
+                    write_u64_decimal(out, s.status as u64);
+                }
+            }),
+            Variable::UpstreamConnectTime => {
+                self.write_upstream_list(out, |out, s| write_upstream_ms(out, s.connect_ms))
+            }
+            Variable::UpstreamHeaderTime => {
+                self.write_upstream_list(out, |out, s| write_upstream_ms(out, s.header_ms))
             }
             Variable::UpstreamResponseTime => {
-                // No rate-limiting subsystem yet: every proxy attempt
-                // completes synchronously as fast as the upstream socket
-                // can deliver, so the millisecond count is essentially the
-                // network round-trip. Empty outside a proxy context (matches
-                // nginx, where the variable is unset for non-proxied requests).
-                if let Some(ms) = self.upstream_response_time_ms {
-                    let secs = ms / 1_000;
-                    let frac = (ms % 1_000) as u32;
-                    write_u64_decimal(out, secs);
-                    out.push(b'.');
-                    out.push(b'0' + ((frac / 100) % 10) as u8);
-                    out.push(b'0' + ((frac / 10) % 10) as u8);
-                    out.push(b'0' + (frac % 10) as u8);
-                }
+                self.write_upstream_list(out, |out, s| write_upstream_ms(out, s.response_ms))
+            }
+            Variable::UpstreamResponseLength => {
+                self.write_upstream_list(out, |out, s| write_u64_decimal(out, s.response_length))
+            }
+            Variable::UpstreamBytesReceived => {
+                self.write_upstream_list(out, |out, s| write_u64_decimal(out, s.bytes_received))
+            }
+            Variable::UpstreamBytesSent => {
+                self.write_upstream_list(out, |out, s| write_u64_decimal(out, s.bytes_sent))
             }
             Variable::SentTrailer(name) => {
                 write_all_request_header_values(out, self.sent_trailers, name.as_bytes());
@@ -740,6 +758,22 @@ pub(crate) fn render_parts(parts: &[PreparedValuePart], ctx: &RenderCtx<'_>, out
     }
 }
 
+/// Milliseconds as nginx's `%T.%03M`, or `-` when the stage wasn't reached.
+fn write_upstream_ms(out: &mut Vec<u8>, ms: Option<u64>) {
+    let Some(ms) = ms else {
+        out.push(b'-');
+        return;
+    };
+    write_u64_decimal(out, ms / 1_000);
+    let frac = ms % 1_000;
+    out.extend_from_slice(&[
+        b'.',
+        b'0' + (frac / 100) as u8,
+        b'0' + (frac / 10 % 10) as u8,
+        b'0' + (frac % 10) as u8,
+    ]);
+}
+
 /// `HTTP/1.x` at the end of a request line; empty if there is none.
 fn server_protocol(request_line: &[u8]) -> &[u8] {
     match request_line.iter().rposition(|&b| b == b' ') {
@@ -802,6 +836,12 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::UpstreamCookie(_)
             | Variable::UpstreamResponseLength
             | Variable::UpstreamResponseTime
+            | Variable::UpstreamAddr
+            | Variable::UpstreamStatus
+            | Variable::UpstreamConnectTime
+            | Variable::UpstreamHeaderTime
+            | Variable::UpstreamBytesReceived
+            | Variable::UpstreamBytesSent
             | Variable::SslProtocol
             | Variable::SslCipher
             | Variable::SslCiphers

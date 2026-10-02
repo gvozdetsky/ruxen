@@ -409,8 +409,7 @@ pub(crate) fn run_location_handler(
         maps: Some(&http.maps),
         proxy_host: &[],
         upstream_headers: &[],
-        upstream_response_length: None,
-        upstream_response_time_ms: None,
+        upstream_states: req.upstream_states,
         sent_trailers: &[],
         tls: req.tls,
     };
@@ -637,7 +636,9 @@ pub(crate) fn run_location_handler(
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
             has_request_body: forward_len > 0,
             body_file,
-            keep_upstream_headers: !loc.add_headers.is_empty() || !loc.add_trailers.is_empty(),
+            keep_upstream_headers: !loc.add_headers.is_empty()
+                || !loc.add_trailers.is_empty()
+                || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
             response: proxy.response,
             method_idempotent: is_idempotent_method_bytes(req.method_bytes),
             intercept,

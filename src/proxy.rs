@@ -294,6 +294,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     let failures = &mut report.failures;
     let upstream_headers = &mut report.upstream_headers;
     let redirect_header = &mut report.redirect_header;
+    let states = &mut report.states;
     let upstream = plan.upstream;
     let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
     let overall_deadline = if plan.next_upstream_timeout.is_zero() {
@@ -307,6 +308,11 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     // No initial peer: every peer is `down` or cooling off after
     // `max_fails`.
     let Some(mut current) = plan.initial_peer.take() else {
+        states.push(UpstreamState {
+            status: 502,
+            response_ms: Some(0),
+            ..UpstreamState::new(UpstreamPeerName::Group(upstream.name))
+        });
         failures.push(AttemptFailure {
             error: UpstreamError::NoLiveUpstreams,
             upstream: String::new(),
@@ -330,6 +336,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
 
     loop {
         attempts += 1;
+        let started = Instant::now();
+        let mut state = UpstreamState::new(UpstreamPeerName::Addr(
+            upstream.peers[current.peer_idx].addr,
+        ));
         // 1. Try the pool first for this peer. On any failure before the
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
@@ -342,12 +352,16 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 Some(c),
                 upstream_headers,
                 redirect_header,
+                &mut state,
+                started,
             )
             .await
             {
                 AttemptOutcome::PooledStale => {
                     // M43: only retry the same peer with a fresh socket
-                    // if the body can be safely re-sent.
+                    // if the body can be safely re-sent. The stale socket
+                    // isn't an attempt of its own in nginx's terms.
+                    state = UpstreamState::new(state.peer);
                     if body_safe_to_retry {
                         attempt(
                             &plan,
@@ -355,6 +369,8 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                             None,
                             upstream_headers,
                             redirect_header,
+                            &mut state,
+                            started,
                         )
                         .await
                     } else {
@@ -374,9 +390,20 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 None,
                 upstream_headers,
                 redirect_header,
+                &mut state,
+                started,
             )
             .await
         };
+        state.response_ms = Some(elapsed_ms(started));
+        if let AttemptOutcome::Failed(_, kind, _) = &outcome {
+            state.status = if matches!(kind, FailKind::Timeout) {
+                504
+            } else {
+                502
+            };
+        }
+        states.push(state);
 
         match outcome {
             AttemptOutcome::Ok(resp) => {
@@ -720,6 +747,52 @@ pub struct ProxyReport {
     /// The response has a `Location` or `Refresh` header and there are
     /// `proxy_redirect` rules to apply to it.
     pub redirect_header: bool,
+    /// One entry per attempt, for `$upstream_addr`, `$upstream_status` and
+    /// the other per-attempt variables.
+    pub states: Vec<UpstreamState>,
+}
+
+/// One upstream attempt, as nginx's `ngx_http_upstream_state_t`: what the
+/// `$upstream_*` list variables print, one entry per attempt.
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamState {
+    pub peer: UpstreamPeerName,
+    /// Status from the upstream, or 502/504 when the attempt failed.
+    pub status: u16,
+    /// Milliseconds from the start of the attempt; `None` until reached.
+    pub connect_ms: Option<u64>,
+    pub header_ms: Option<u64>,
+    pub response_ms: Option<u64>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    /// Body bytes as received.
+    pub response_length: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UpstreamPeerName {
+    Addr(std::net::SocketAddr),
+    /// No peer could be tried (`no live upstreams`): the upstream's name.
+    Group(&'static [u8]),
+}
+
+impl UpstreamState {
+    fn new(peer: UpstreamPeerName) -> Self {
+        UpstreamState {
+            peer,
+            status: 0,
+            connect_ms: None,
+            header_ms: None,
+            response_ms: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+            response_length: 0,
+        }
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis() as u64
 }
 
 /// One failed attempt, for the error log: what went wrong and where. The
@@ -752,6 +825,8 @@ async fn attempt(
     pooled: Option<upstream::PooledConn>,
     upstream_headers: &mut Vec<u8>,
     redirect_header: &mut bool,
+    state: &mut UpstreamState,
+    started: Instant,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     let peer_addr = plan.upstream.peers[peer_idx].addr;
@@ -779,6 +854,7 @@ async fn attempt(
         let _ = stream.set_nodelay(true);
         (stream, Instant::now(), 0)
     };
+    state.connect_ms = Some(elapsed_ms(started));
 
     // 2. Send the request. Cloning here keeps the original bytes available
     // for `proxy_next_upstream` retries when this attempt fails — monoio's
@@ -809,6 +885,7 @@ async fn attempt(
             Box::new(UpstreamError::SendFailed(e)),
         );
     }
+    state.bytes_sent = plan.request.len() as u64;
     if let Some(file) = &plan.body_file
         && let Err(error) = send_body_file(&mut stream, file, plan.send_timeout).await
     {
@@ -825,6 +902,9 @@ async fn attempt(
             kind,
             Box::new(error),
         );
+    }
+    if let Some(file) = &plan.body_file {
+        state.bytes_sent += file.len;
     }
 
     // 3. Receive the header block. We need at least the head/body
@@ -866,7 +946,10 @@ async fn attempt(
                     Box::new(UpstreamError::PrematurelyClosed(Stage::ReadingHeader)),
                 );
             }
-            Ok(n) => accum.extend_from_slice(&read_buf[..n]),
+            Ok(n) => {
+                state.bytes_received += n as u64;
+                accum.extend_from_slice(&read_buf[..n]);
+            }
             Err(e) => {
                 if accum.is_empty() && from_pool {
                     return AttemptOutcome::PooledStale;
@@ -922,6 +1005,8 @@ async fn attempt(
         );
     };
     let status_code = parse_status_code(&accum[..first_line_end]);
+    state.status = status_code;
+    state.header_ms = Some(elapsed_ms(started));
     if status_code == 444 {
         // nginx's internal "close connection with no response" status.
         // Treat as an upstream error so `proxy_next_upstream error` can
@@ -1056,7 +1141,7 @@ async fn attempt(
         match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout)
             .await
         {
-            Ok(()) => {}
+            Ok(read) => state.bytes_received += read,
             Err((stale, error)) => {
                 if stale && from_pool && body.is_empty() {
                     return AttemptOutcome::PooledStale;
@@ -1107,6 +1192,7 @@ async fn attempt(
                     );
                 }
                 Ok(n) => {
+                    state.bytes_received += n as u64;
                     let need = cl_usize - body_len_in_accum;
                     let take = n.min(need);
                     accum.extend_from_slice(&read_buf[..take]);
@@ -1141,6 +1227,7 @@ async fn attempt(
             match res {
                 Ok(0) => break,
                 Ok(n) => {
+                    state.bytes_received += n as u64;
                     accum.extend_from_slice(&read_buf[..n]);
                     body_len_in_accum += n;
                     paced_body_bytes += n as u64;
@@ -1176,6 +1263,7 @@ async fn attempt(
     //    drop hop-by-hop + Transfer-Encoding (we've decoded chunked for
     //    the client; the client framing is done by the worker write
     //    path), append a synthesized Content-Length when we re-framed.
+    state.response_length = state.bytes_received.saturating_sub(body_start as u64);
     let body_len = decoded_chunked_body
         .as_ref()
         .map(Vec::len)
@@ -1379,11 +1467,12 @@ async fn read_chunked_body_with_buf(
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
-) -> Result<(), (bool, UpstreamError)> {
+) -> Result<u64, (bool, UpstreamError)> {
     // Buffered reader over the stream — chunked decoding is line-oriented
     // and we already may have leftover bytes from the header read in
-    // `body`.
+    // `body`. Returns the bytes read from the stream.
     let mut buf = std::mem::take(body);
+    let leftover = buf.len();
     let mut decoded: Vec<u8> = Vec::with_capacity(buf.len() + 4096);
     let mut pos = 0usize;
     let mut nothing_read = buf.is_empty();
@@ -1481,7 +1570,7 @@ async fn read_chunked_body_with_buf(
                 // Trailer line — ignore.
             }
             *body = decoded;
-            return Ok(());
+            return Ok((buf.len() - leftover) as u64);
         }
         // Pull `chunk_size` bytes plus trailing CRLF.
         let need_total = chunk_size as usize + 2;

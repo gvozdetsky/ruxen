@@ -58,7 +58,10 @@ pub(crate) async fn write_access_logs(
     epoch_secs: u64,
     epoch_ms: u16,
     tls: Option<&crate::tls::HandshakeInfo>,
-    upstream_response_time_ms: Option<u64>,
+    http: &'static PreparedHttp,
+    // The request's processing result, for `$proxy_host` and the
+    // upstream variables; `None` for a request refused before routing.
+    meta: Option<&phase::ProcessMeta>,
     valid_uri: bool,
 ) {
     if logs.is_empty() {
@@ -123,16 +126,11 @@ pub(crate) async fn write_access_logs(
         // discarded after request termination).
         server_name_captures: &[],
         rewrite_state: None,
-        split_clients: None,
-        // Access-log render doesn't carry `&PreparedHttp`, so `map`
-        // references render empty here — same deferred shape as
-        // `split_clients` above. Threading prepared http through to the
-        // access-log path is a follow-up.
-        maps: None,
-        proxy_host: &[],
-        upstream_headers: &[],
-        upstream_response_length: None,
-        upstream_response_time_ms,
+        split_clients: Some(&http.split_clients),
+        maps: Some(&http.maps),
+        proxy_host: meta.map_or(&[][..], |m| m.proxy_host),
+        upstream_headers: meta.map_or(&[][..], |m| &m.upstream_headers),
+        upstream_states: meta.map_or(&[][..], |m| &m.upstream_states),
         sent_trailers: &[],
         tls,
     };
@@ -257,6 +255,7 @@ async fn reject_request<S: ConnIo>(
         now.as_secs(),
         now.subsec_millis() as u16,
         conn.tls,
+        http,
         None,
         true,
     )
@@ -274,11 +273,9 @@ async fn settle_proxy_response(
         return (response, process_meta);
     };
 
-    let upstream_started = Instant::now();
     let redirects = plan.response.redirects;
     let mut report = crate::proxy::ProxyReport::default();
     let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
-    let upstream_elapsed_ms = upstream_started.elapsed().as_millis() as u64;
     if !report.failures.is_empty() {
         write_upstream_error_log(
             &process_meta.log,
@@ -287,14 +284,21 @@ async fn settle_proxy_response(
         );
     }
     if let Response::Reroute(rr) = upstream_resp {
-        let (resp2, meta2) = phase::process_with_meta_from_reroute(http, ctx, url_scratch, rr);
+        // `proxy_intercept_errors`: the error page still sees the
+        // attempts in `$upstream_*`, as in nginx.
+        let ctx = phase::RequestCtx {
+            upstream_states: &report.states,
+            ..*ctx
+        };
+        let (resp2, mut meta2) = phase::process_with_meta_from_reroute(http, &ctx, url_scratch, rr);
+        meta2.upstream_states = report.states;
         return (resp2, meta2);
     }
 
     // Apply the proxy location's `add_header` directives now that the
     // upstream headers are visible to `$upstream_http_*` / `$upstream_cookie_*`.
     let mut process_meta = process_meta;
-    process_meta.upstream_response_time_ms = Some(upstream_elapsed_ms);
+    process_meta.upstream_states = std::mem::take(&mut report.states);
     // nginx rewrites Location / Refresh while processing the upstream
     // header, before the add_header filter sees the response.
     let upstream_resp = if report.redirect_header {
@@ -316,6 +320,7 @@ async fn settle_proxy_response(
         &process_meta,
         &report.upstream_headers,
     );
+    process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
 }
 
@@ -413,7 +418,8 @@ async fn run_post_action(
             base_ctx.epoch_secs,
             base_ctx.epoch_ms,
             base_ctx.tls,
-            post_meta.upstream_response_time_ms,
+            http,
+            Some(&post_meta),
             !post_meta.invalid_uri,
         )
         .await;
@@ -1345,6 +1351,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             method_bytes,
                             path,
                             request_line,
+                            upstream_states: &[],
                             http_11: req.http_11,
                             host,
                             sni,
@@ -1621,7 +1628,8 @@ pub(crate) async fn handle<S: ConnIo>(
                                 epoch_secs,
                                 epoch_ms,
                                 tls,
-                                process_meta.upstream_response_time_ms,
+                                http,
+                                Some(&process_meta),
                                 !process_meta.invalid_uri,
                             )
                             .await;
