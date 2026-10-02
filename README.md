@@ -48,21 +48,41 @@ See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status.
 
 ### Requirements
 
-You need:
+- Linux on x86_64 with `io_uring` available. ruxen is developed and tested on kernels 6.x–7.0. `io_uring` must not be turned off with the `kernel.io_uring_disabled` sysctl.
+- To build from source (including `cargo install`): Rust 1.88 or newer, plus `cmake` and a C compiler for the `aws-lc-rs` crypto backend that rustls uses.
+- `curl` to try the server.
 
-- Linux with `io_uring` support
-- a recent stable Rust toolchain
-- `curl` to try the server
+### Install
 
-Clone and build ruxen:
+**Prebuilt binary** (x86_64 Linux, glibc 2.35 or newer) from [GitHub Releases](https://github.com/gvozdetsky/ruxen/releases):
+
+```bash
+curl -LO https://github.com/gvozdetsky/ruxen/releases/download/v0.1.0/ruxen-v0.1.0-x86_64-linux-gnu.tar.gz
+tar xzf ruxen-v0.1.0-x86_64-linux-gnu.tar.gz
+cd ruxen-v0.1.0-x86_64-linux-gnu
+./ruxen -V
+```
+
+**From crates.io:**
+
+```bash
+cargo install ruxen --locked
+```
+
+**From source:**
 
 ```bash
 git clone https://github.com/gvozdetsky/ruxen.git
 cd ruxen
 cargo build --release
+# the binary is target/release/ruxen
 ```
 
-Create `ruxen.conf`:
+**In Docker**, the default seccomp profile blocks `io_uring`, so ruxen cannot create its `io_uring` runtime. Run the container with `--security-opt seccomp=unconfined` (or a profile that allows the `io_uring_*` syscalls).
+
+### Run
+
+[`examples/minimal.conf`](examples/minimal.conf) is the smallest useful configuration:
 
 ```nginx
 worker_processes 1;
@@ -72,31 +92,22 @@ events {
 }
 
 http {
-    default_type text/plain;
-
     server {
         listen 8080;
         server_name _;
 
         location / {
-            return 200 "hello from ruxen";
+            return 200 "hello from ruxen\n";
         }
     }
 }
 ```
 
-Check the configuration:
+Check the configuration (a valid one exits with status 0 and prints nothing), then start the server in the foreground:
 
 ```bash
-./target/release/ruxen -t -c ruxen.conf
-```
-
-A valid configuration exits successfully.
-
-Start the server:
-
-```bash
-./target/release/ruxen -c ruxen.conf
+ruxen -t -c examples/minimal.conf
+ruxen -c examples/minimal.conf
 ```
 
 Then, from another terminal:
@@ -110,6 +121,8 @@ You should get a `200` response with:
 ```text
 hello from ruxen
 ```
+
+[`examples/static.conf`](examples/static.conf) serves files from a directory and [`examples/proxy.conf`](examples/proxy.conf) proxies to two backends with keep-alive upstream connections.
 
 You are now serving an nginx-style configuration with ruxen.
 
@@ -216,6 +229,8 @@ The currently implemented nginx-style command-line surface includes:
 -T
 -V
 ```
+
+`-V` starts with `nginx version: nginx/1.29.2`, followed by `ruxen version: ruxen/<version>`. The nginx line and the `configure arguments` list are what the nginx-tests harness reads to decide which tests apply, so they describe ruxen as an nginx build: the arguments list only the modules ruxen actually implements.
 
 ruxen also supports pid files and graceful shutdown via `SIGQUIT`.
 

@@ -25,3 +25,13 @@ jobs:
         run: cargo build --release --all-targets --locked
       - name: Test
         run: cargo test --release --locked
+
+  msrv:
+    # Keeps `rust-version` in Cargo.toml honest.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --all-targets --locked

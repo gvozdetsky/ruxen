@@ -2,10 +2,26 @@
 name = "ruxen"
 version = "0.1.0"
 edition = "2024"
+# Let-chains (`if let … && let …`) need 1.88; CI checks it (job `msrv`).
+rust-version = "1.88"
 license = "Apache-2.0"
-description = "Rust port of nginx, Linux-only, HTTP/1.1, no modules, no cache"
+description = "Experimental nginx-compatible HTTP server and reverse proxy for Linux, written in Rust on io_uring"
 repository = "https://github.com/gvozdetsky/ruxen"
+readme = "README.md"
+keywords = ["nginx", "http", "web-server", "io-uring", "reverse-proxy"]
+categories = ["web-programming::http-server", "network-programming", "command-line-utilities"]
 authors = ["Eugene Gvozdetsky <gvozdet@gmail.com>"]
+# The crate is a server binary: ship the sources and docs `cargo install`
+# needs, not the benches, integration tests or CI files.
+include = [
+    "/src/**",
+    "/examples/*.conf",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/DESIGN.md",
+    "/LICENSE",
+]
 
 [dependencies]
 bytes = "1"

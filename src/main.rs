@@ -180,6 +180,20 @@ fn real_main() -> io::Result<()> {
         redirect_stderr(errlog)?;
     }
 
+    // Workers can't run without io_uring; say why up front instead of
+    // letting every worker thread panic on runtime setup.
+    if !monoio::utils::detect_uring() {
+        eprintln!(
+            "ruxen: [emerg] io_uring is not available: it is blocked by seccomp \
+             (in Docker, run with --security-opt seccomp=unconfined), disabled \
+             via the kernel.io_uring_disabled sysctl, or the kernel is too old"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "io_uring unavailable",
+        ));
+    }
+
     install_signal_handlers()?;
 
     let pid_path = cfg.runtime.pid.clone();
@@ -316,6 +330,9 @@ fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
 fn version_output() -> &'static str {
     concat!(
         "nginx version: nginx/1.29.2\n",
+        "ruxen version: ruxen/",
+        env!("CARGO_PKG_VERSION"),
+        "\n",
         "TLS SNI support enabled\n",
         "configure arguments:",
         " --with-http_ssl_module",
@@ -427,6 +444,9 @@ mod tests {
             version_output(),
             concat!(
                 "nginx version: nginx/1.29.2\n",
+                "ruxen version: ruxen/",
+                env!("CARGO_PKG_VERSION"),
+                "\n",
                 "TLS SNI support enabled\n",
                 "configure arguments:",
                 " --with-http_ssl_module",
