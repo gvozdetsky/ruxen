@@ -100,13 +100,11 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// allocating a buffer (mirrors nginx's
     /// `keepalive_handler` / `wait_request_handler` split).
     ///
-    /// TLS skips the kernel poll: rustls can hold decrypted bytes in its
-    /// internal buffer after the handshake (TLS 1.3 ships Finished and
-    /// early application data in the same flight), so a TCP-readable
-    /// poll would hang on those already-drained bytes. The next `read`
-    /// call surfaces them. Idle-timeout enforcement for TLS keepalives is
-    /// a known v0.1 limitation — connections rely on TCP EOF / FIN to
-    /// reclaim.
+    /// TLS does the same poll, except when the stream already holds input
+    /// the socket won't signal again: ciphertext or decrypted bytes left
+    /// over from the handshake (TLS 1.3 clients send the first request in
+    /// the same flight as Finished) or from a previous read. Then it
+    /// proceeds straight to the read.
     async fn idle_wait(
         &self,
         state: &RuntimeState,
@@ -147,10 +145,13 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     async fn idle_wait(
         &self,
         state: &RuntimeState,
-        _idle: Option<Duration>,
+        idle: Option<Duration>,
         start_reload_gen: u64,
     ) -> bool {
-        !state.is_shutting_down() && state.reload_gen() == start_reload_gen
+        if self.has_buffered_input() {
+            return !state.is_shutting_down() && state.reload_gen() == start_reload_gen;
+        }
+        wait_readable_or_shutdown(self.io(), state, idle, start_reload_gen).await
     }
 
     fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {

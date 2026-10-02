@@ -625,3 +625,119 @@ fn ssl_variables_on_plain_listener() {
         header_value(&resp.stdout, "X-Proto"),
     );
 }
+
+const KEEPALIVE_CONF: &str = r#"
+daemon off;
+events { }
+
+http {
+    keepalive_timeout %%TIMEOUT%%;
+    server {
+        listen 127.0.0.1:%%PORT%% ssl;
+        server_name localhost;
+
+        ssl_certificate     %%CERT%%;
+        ssl_certificate_key %%KEY%%;
+
+        location / {
+            return 200 "ok\n";
+        }
+    }
+}
+"#;
+
+type TlsClient = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+/// A rustls client that trusts `ca_pem`, for tests that need to hold a TLS
+/// connection open between requests (curl can't).
+fn tls_connect(port: u16, ca_pem: &Path) -> TlsClient {
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read(ca_pem).unwrap();
+    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+    let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    rustls::StreamOwned::new(conn, sock)
+}
+
+/// Send one keep-alive GET and read back one Content-Length framed
+/// response; returns the head.
+fn tls_get(c: &mut TlsClient) -> String {
+    use std::io::{Read, Write};
+    c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(i) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8(got[..i + 4].to_vec()).unwrap();
+            let len: usize = header_value(&head, "Content-Length")
+                .map(|v| v.trim().parse().unwrap())
+                .unwrap_or(0);
+            while got.len() < i + 4 + len {
+                let n = c.read(&mut buf).unwrap();
+                assert!(n > 0, "connection closed mid-response");
+                got.extend_from_slice(&buf[..n]);
+            }
+            return head;
+        }
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed before a response");
+        got.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// `keepalive_timeout` closes an idle TLS connection, as it does a plain
+/// one (it used to stay open until the client went away).
+#[test]
+fn tls_keepalive_idle_timeout_closes_connection() {
+    use std::io::Read;
+    let certs = make_ca_and_leaf("localhost");
+    let ca = certs.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server(&KEEPALIVE_CONF.replace("%%TIMEOUT%%", "1"), certs);
+    let mut c = tls_connect(server.port, &ca);
+    let head = tls_get(&mut c);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let idle_from = Instant::now();
+    let mut rest = Vec::new();
+    // Ends on close_notify (Ok) or a bare FIN (UnexpectedEof); a read
+    // timeout (WouldBlock after 5s) means the connection was never closed.
+    let res = c.read_to_end(&mut rest);
+    let waited = idle_from.elapsed();
+    if let Err(e) = &res {
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof, "{e}");
+    }
+    assert!(rest.is_empty());
+    assert!(
+        waited >= Duration::from_millis(800) && waited < Duration::from_secs(4),
+        "closed after {waited:?}"
+    );
+}
+
+/// An idle TLS connection still wakes up for the next request before the
+/// timeout, and a request sent right behind the handshake (possibly in the
+/// same flight as the client's Finished) is answered without waiting for
+/// more socket input.
+#[test]
+fn tls_keepalive_serves_requests_around_idle_waits() {
+    let certs = make_ca_and_leaf("localhost");
+    let ca = certs.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server(&KEEPALIVE_CONF.replace("%%TIMEOUT%%", "3"), certs);
+
+    for _ in 0..20 {
+        let mut c = tls_connect(server.port, &ca);
+        assert!(tls_get(&mut c).starts_with("HTTP/1.1 200"));
+    }
+
+    let mut c = tls_connect(server.port, &ca);
+    assert!(tls_get(&mut c).starts_with("HTTP/1.1 200"));
+    sleep(Duration::from_millis(1200));
+    assert!(tls_get(&mut c).starts_with("HTTP/1.1 200"));
+}

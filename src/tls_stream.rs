@@ -87,6 +87,22 @@ impl<IO> TlsStream<IO> {
     pub fn connection(&self) -> &ServerConnection {
         &self.conn
     }
+
+    /// The underlying transport, for waiting on the socket directly.
+    pub fn io(&self) -> &IO {
+        &self.io
+    }
+
+    /// Whether the next `read` can make progress without new bytes from
+    /// the socket: ciphertext already read but not yet handed to rustls, or
+    /// plaintext (or a close_notify) rustls hasn't returned yet. TLS 1.3
+    /// clients often send the first request in the same flight as their
+    /// Finished, so it is already here when the handshake completes.
+    pub fn has_buffered_input(&self) -> bool {
+        // After the handshake `wants_read` is false exactly when rustls
+        // holds unread plaintext or has seen close_notify.
+        self.rpos < self.rbuf.len() || !self.conn.wants_read()
+    }
 }
 
 impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
