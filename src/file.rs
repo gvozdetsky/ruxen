@@ -737,7 +737,6 @@ pub(crate) fn format_http_date(secs: u64) -> [u8; 29] {
         b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
         b"Dec",
     ];
-    const DAYS_PER_MONTH: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
     let secs = secs.min(MAX_HTTP_DATE_SECS);
     let days = secs / 86_400;
@@ -747,34 +746,7 @@ pub(crate) fn format_http_date(secs: u64) -> [u8; 29] {
     let second = (hms % 60) as u8;
     let dow_idx = (days % 7) as usize;
 
-    // Year walk terminates at 9999 because `secs <= MAX_HTTP_DATE_SECS`.
-    // No guard inside the loop; the saturation above is the invariant.
-    let mut year: u32 = 1970;
-    let mut day_of_year = days;
-    loop {
-        let yd = if is_leap(year) { 366 } else { 365 } as u64;
-        if day_of_year < yd {
-            break;
-        }
-        day_of_year -= yd;
-        year += 1;
-    }
-
-    let mut mon = 0usize;
-    loop {
-        let md = if mon == 1 && is_leap(year) {
-            29
-        } else {
-            DAYS_PER_MONTH[mon]
-        };
-        if day_of_year < md {
-            break;
-        }
-        day_of_year -= md;
-        mon += 1;
-    }
-
-    let day = (day_of_year + 1) as u8;
+    let (year, mon, day) = civil_from_days(days);
 
     let mut buf = *b"Thu, 00 Jan 1970 00:00:00 GMT";
     buf[..3].copy_from_slice(DOW[dow_idx]);
@@ -792,6 +764,26 @@ pub(crate) fn format_http_date(secs: u64) -> [u8; 29] {
     buf[23] = b'0' + second / 10;
     buf[24] = b'0' + second % 10;
     buf
+}
+
+/// Days since 1970-01-01 → (year, month index 0..=11, day of month 1..=31),
+/// in O(1). Howard Hinnant's `civil_from_days` for the proleptic Gregorian
+/// calendar, restricted to non-negative day counts (`days` is unsigned).
+/// Replaces a year-by-year walk from 1970 that ran on every response
+/// (`format_http_date` was ~1.3% of CPU on the 304 bench).
+fn civil_from_days(days: u64) -> (u32, usize, u8) {
+    // Shift the epoch to 0000-03-01 so leap days fall at the end of each
+    // 400-year era.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // March-based month [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8; // [1, 31]
+    let mon = if mp < 10 { mp + 2 } else { mp - 10 } as usize; // Jan = 0
+    let year = (yoe + era * 400) as u32 + u32::from(mon <= 1);
+    (year, mon, day)
 }
 
 /// RFC 7231 §7.1.1.1 requires servers to accept three `HTTP-date` formats:
@@ -1793,4 +1785,43 @@ mod tests {
         assert!(s.contains("Content-Range: bytes */10\r\n"));
         assert!(s.contains("Content-Length: 0\r\n"));
     }
+
+    /// The year/month walk `civil_from_days` replaced, kept as the oracle.
+    fn civil_from_days_walk(days: u64) -> (u32, usize, u8) {
+        const DAYS_PER_MONTH: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut year: u32 = 1970;
+        let mut d = days;
+        loop {
+            let yd = if is_leap(year) { 366 } else { 365 };
+            if d < yd {
+                break;
+            }
+            d -= yd;
+            year += 1;
+        }
+        let mut mon = 0usize;
+        loop {
+            let md = if mon == 1 && is_leap(year) { 29 } else { DAYS_PER_MONTH[mon] };
+            if d < md {
+                break;
+            }
+            d -= md;
+            mon += 1;
+        }
+        (year, mon, (d + 1) as u8)
+    }
+
+    #[test]
+    fn civil_from_days_matches_calendar_walk() {
+        // Every day through 2400 covers a full 400-year Gregorian cycle
+        // (including the 2100/2200/2300 non-leap centuries and 2400); then
+        // a coprime stride plus the last day reaches the 9999 cap.
+        let full_until = 157_000; // ~2399-11
+        let last_day = MAX_HTTP_DATE_SECS / 86_400;
+        let sampled = (full_until..=last_day).step_by(97).chain(std::iter::once(last_day));
+        for days in (0..full_until).chain(sampled) {
+            assert_eq!(civil_from_days(days), civil_from_days_walk(days), "day {days}");
+        }
+    }
+
 }
