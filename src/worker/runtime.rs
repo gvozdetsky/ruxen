@@ -442,7 +442,7 @@ pub fn run(
                         );
                     }
                     Ok(None) => {}
-                    Err(e) => accept_failed(&e).await,
+                    Err(e) => accept_failed(http, &e).await,
                 }
             }
         } else {
@@ -490,7 +490,7 @@ pub(crate) async fn run_listener(
                 );
             }
             Ok(None) => {}
-            Err(e) => accept_failed(&e).await,
+            Err(e) => accept_failed(http, &e).await,
         }
     }
 }
@@ -540,12 +540,13 @@ pub(crate) fn spawn_connection(
 /// nginx logs it and stops accepting for `accept_mutex_delay` (500 ms,
 /// `ngx_event_accept.c`); do the same. Other errors (a client that reset
 /// before we accepted) are per-connection: just carry on.
-pub(crate) async fn accept_failed(err: &std::io::Error) {
+pub(crate) async fn accept_failed(http: &PreparedHttp, err: &std::io::Error) {
     if matches!(
         err.raw_os_error(),
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
     ) {
         write_worker_log(
+            http.error_logs,
             ErrorLogLevel::Crit,
             &format!("accept() failed ({})", errno_text(err)),
         );
@@ -704,6 +705,7 @@ fn log_connections_not_enough(
         .unwrap_or(0);
     if w.logged_at.replace(now) != now {
         write_worker_log(
+            http.error_logs,
             level,
             &format!(
                 "{} worker_connections are not enough{tail}",

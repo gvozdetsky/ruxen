@@ -954,6 +954,9 @@ pub struct PreparedListen {
 /// Top-level prepared state.
 pub struct PreparedHttp {
     pub listens: Vec<PreparedListen>,
+    /// Top-level `error_log` sinks, for worker-level lines (`accept()
+    /// failed`, `worker_connections are not enough`); empty = stderr.
+    pub error_logs: &'static [PreparedErrorLog],
     /// `worker_connections` (nginx's default 512): the most connections one
     /// worker holds. As in nginx, each listening socket uses one of them;
     /// see `client_slots`.

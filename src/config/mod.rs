@@ -144,6 +144,9 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
+            ("error_log", Terminator::Semi) => {
+                runtime.error_logs.push(parse_error_log_args(&args[1..])?);
+            }
             // `user name [group];` — recorded so `main` can refuse a switch
             // it can't make (see `check_privileges`).
             ("user", Terminator::Semi) => {
@@ -199,6 +202,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut keepalive_time_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
     let mut client_timeouts = ClientTimeouts::default();
+    let mut error_logs: Option<Vec<ErrorLog>> = None;
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut ignore_invalid_headers: Option<bool> = None;
@@ -219,6 +223,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             return match term {
                 Terminator::BlockClose => Ok(HttpConfig {
                     runtime: RuntimeOpts::default(),
+                    error_logs,
                     log_formats,
                     access_logs,
                     server_tokens,
@@ -606,6 +611,11 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 Terminator::Semi,
             ) => {
                 client_timeouts.parse(name, &args)?;
+            }
+            ("error_log", Terminator::Semi) => {
+                error_logs
+                    .get_or_insert_with(Vec::new)
+                    .push(parse_error_log_args(&args[1..])?);
             }
             (n, Terminator::Semi) if is_ignored_stmt(n) => {}
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,

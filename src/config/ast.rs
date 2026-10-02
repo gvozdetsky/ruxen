@@ -58,6 +58,9 @@ pub struct RuntimeOpts {
     /// `events { worker_connections N; }`. `None` means nginx's default,
     /// 512.
     pub worker_connections: Option<usize>,
+    /// Top-level `error_log` lines: worker-level messages, and the
+    /// fallback for servers and http without their own.
+    pub error_logs: Vec<ErrorLog>,
     /// `user name [group];` — the user name only. ruxen doesn't switch
     /// users; `main` uses this to decide whether running as root is
     /// what the config asked for.
@@ -73,6 +76,8 @@ pub enum WorkerProcesses {
 #[derive(Debug)]
 pub struct HttpConfig {
     pub runtime: RuntimeOpts,
+    /// http-scope `error_log` lines; `None` inherits the top-level ones.
+    pub error_logs: Option<Vec<ErrorLog>>,
     /// `log_format name <format...>;` definitions declared at http scope.
     pub log_formats: Vec<LogFormatDef>,
     /// `access_log` directives declared at http scope.

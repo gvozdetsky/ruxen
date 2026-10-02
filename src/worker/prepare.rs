@@ -57,6 +57,7 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         runtime,
+        error_logs: http_error_logs,
         log_formats,
         access_logs,
         server_tokens,
@@ -127,6 +128,13 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     // canonical list (returned by `finish` after all servers are
     // prepared) becomes `PreparedHttp::access_logs` for the per-worker fd
     // table.
+    // error_log inheritance, as nginx: server ← http ← top level; with
+    // none anywhere, lines go to stderr (`write_error_log`).
+    let main_error_logs = prepare_error_logs(runtime.error_logs)?;
+    let http_error_logs = match http_error_logs {
+        Some(list) => prepare_error_logs(list)?,
+        None => main_error_logs,
+    };
     let mut alp = AccessLogPrep::new(&log_formats);
     let http_access_logs: &'static [PreparedAccessLog] = alp.prepare_list(&access_logs)?;
     let prepared_split_clients = prepare_split_clients(split_clients);
@@ -155,6 +163,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                     s,
                     http_tokens,
                     http_access_logs,
+                    http_error_logs,
                     http_autoindex,
                     http_autoindex_exact_size,
                     http_autoindex_localtime,
@@ -187,6 +196,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let max_request_body = largest_body_limit(&listens);
     Ok(Box::leak(Box::new(PreparedHttp {
         worker_connections: runtime.worker_connections.unwrap_or(512),
+        error_logs: main_error_logs,
         max_request_body,
         listens,
         access_logs: canonical_access_logs,
@@ -711,6 +721,7 @@ pub(crate) fn prepare_server(
     mut server: Server,
     http_tokens: crate::config::ServerTokens,
     http_access_logs: &'static [PreparedAccessLog],
+    http_error_logs: &'static [PreparedErrorLog],
     http_autoindex: bool,
     http_autoindex_exact_size: bool,
     http_autoindex_localtime: bool,
@@ -851,7 +862,7 @@ pub(crate) fn prepare_server(
     );
     let server_error_logs: &'static [PreparedErrorLog] = match server.error_logs {
         Some(list) => prepare_error_logs(list)?,
-        None => &[],
+        None => http_error_logs,
     };
     let server_log_not_found = server.log_not_found.unwrap_or(true);
     let server_auth_basic = server

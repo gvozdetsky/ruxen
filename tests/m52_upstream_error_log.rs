@@ -215,3 +215,96 @@ fn configured_error_log_takes_upstream_errors() {
     let stderr = read(&server.dir.join("stderr.log"));
     assert!(!stderr.contains("connect() failed"), "{stderr}");
 }
+
+/// error_log is inherited like nginx: server ← http ← top level. Before,
+/// http- and top-level lines were ignored.
+#[test]
+fn error_log_inherits_from_http_and_top_level() {
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let dir = std::env::temp_dir().join(format!("ruxen-m52-inherit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("www")).unwrap();
+    let d = dir.display();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "error_log {d}/main.log;\nevents {{}}\nhttp {{\n\
+               server {{ listen 127.0.0.1:{port}; server_name main; root {d}/www; }}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    // A second config adds http- and server-level logs.
+    let port2 = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    std::fs::write(
+        dir.join("nginx2.conf"),
+        format!(
+            "error_log {d}/main2.log;\nevents {{}}\nhttp {{ error_log {d}/http.log;\n\
+               server {{ listen 127.0.0.1:{port2}; server_name a; root {d}/www; }}\n\
+               server {{ listen 127.0.0.1:{port2}; server_name b; root {d}/www;\n\
+                         error_log {d}/server.log; }}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    let spawn = |conf: &str, port: u16| {
+        let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join(conf))
+            .arg("-e")
+            .arg(dir.join("stderr.log"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "ruxen did not start");
+            sleep(Duration::from_millis(20));
+        }
+        child
+    };
+    let get_host = |port: u16, host: &str, path: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    };
+
+    let mut one = spawn("nginx.conf", port);
+    assert!(get_host(port, "main", "/from-main").starts_with("HTTP/1.1 404"));
+    let mut two = spawn("nginx2.conf", port2);
+    assert!(get_host(port2, "a", "/from-http").starts_with("HTTP/1.1 404"));
+    assert!(get_host(port2, "b", "/from-server").starts_with("HTTP/1.1 404"));
+    for c in [&mut one, &mut two] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    // Top level only: it takes the request errors.
+    line_with(&read("main.log"), "open() \"/from-main\" failed");
+    // http overrides the top level; server overrides http.
+    line_with(&read("http.log"), "open() \"/from-http\" failed");
+    assert!(!read("main2.log").contains("from-http"));
+    line_with(&read("server.log"), "open() \"/from-server\" failed");
+    assert!(!read("http.log").contains("from-server"));
+    // Nothing reached stderr: every request had a configured log.
+    assert!(
+        !read("stderr.log").contains("open()"),
+        "{}",
+        read("stderr.log")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
