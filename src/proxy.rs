@@ -138,6 +138,9 @@ pub struct ProxyPlan {
     /// A request body too large to keep in memory: sent from this file
     /// after `request` (which then holds only the header block).
     pub body_file: Option<RequestBodyFile>,
+    /// Keep the upstream's header lines in `ProxyReport` because the
+    /// location's add_header / add_trailer may read `$upstream_http_*`.
+    pub keep_upstream_headers: bool,
 }
 
 /// The temp file holding a large request body, and its length.
@@ -283,7 +286,9 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
 /// failed attempt is appended to `failures` so the worker can log it with
 /// the request's context; on the happy path nothing is pushed and the
 /// caller's empty `Vec` never allocates.
-pub async fn run_proxy(mut plan: ProxyPlan, failures: &mut Vec<AttemptFailure>) -> Response {
+pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Response {
+    let failures = &mut report.failures;
+    let upstream_headers = &mut report.upstream_headers;
     let upstream = plan.upstream;
     let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
     let overall_deadline = if plan.next_upstream_timeout.is_zero() {
@@ -326,12 +331,12 @@ pub async fn run_proxy(mut plan: ProxyPlan, failures: &mut Vec<AttemptFailure>) 
         //    stale-retry counts as part of the same `attempt` budget.
         let pooled = upstream::pool_take(upstream, current.peer_idx);
         let outcome = if let Some(c) = pooled {
-            match attempt(&plan, current.peer_idx, Some(c)).await {
+            match attempt(&plan, current.peer_idx, Some(c), upstream_headers).await {
                 AttemptOutcome::PooledStale => {
                     // M43: only retry the same peer with a fresh socket
                     // if the body can be safely re-sent.
                     if body_safe_to_retry {
-                        attempt(&plan, current.peer_idx, None).await
+                        attempt(&plan, current.peer_idx, None, upstream_headers).await
                     } else {
                         AttemptOutcome::Failed(
                             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
@@ -343,7 +348,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, failures: &mut Vec<AttemptFailure>) 
                 other => other,
             }
         } else {
-            attempt(&plan, current.peer_idx, None).await
+            attempt(&plan, current.peer_idx, None, upstream_headers).await
         };
 
         match outcome {
@@ -675,6 +680,18 @@ impl std::fmt::Display for UpstreamError {
     }
 }
 
+/// What `run_proxy` reports besides the response.
+#[derive(Default)]
+pub struct ProxyReport {
+    /// Every failed attempt, for the error log (empty on the happy path,
+    /// so no allocation then).
+    pub failures: Vec<AttemptFailure>,
+    /// The upstream's own header lines (each ending in CRLF), including
+    /// the ones hidden from the client, for `$upstream_http_*`. Filled
+    /// only when `ProxyPlan::keep_upstream_headers` is set.
+    pub upstream_headers: Vec<u8>,
+}
+
 /// One failed attempt, for the error log: what went wrong and where. The
 /// worker adds the request context (client, server, request, host).
 #[derive(Debug)]
@@ -703,6 +720,7 @@ async fn attempt(
     plan: &ProxyPlan,
     peer_idx: usize,
     pooled: Option<upstream::PooledConn>,
+    upstream_headers: &mut Vec<u8>,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     let peer_addr = plan.upstream.peers[peer_idx].addr;
@@ -1134,11 +1152,14 @@ async fn attempt(
     let mut out = Vec::with_capacity(head_end + 64 + body_len);
     out.extend_from_slice(b"HTTP/1.1");
     out.extend_from_slice(&accum[8..first_line_end]);
-    // nginx hides the upstream's `Date` (`ngx_http_proxy_hide_headers`) and
-    // its header filter writes its own; the worker write path stamps it.
-    out.extend_from_slice(b"\r\nDate: ");
-    out.extend_from_slice(&crate::http_date::now());
+    // nginx hides the upstream's `Server` and `Date`
+    // (`ngx_http_proxy_hide_headers`) and its header filter writes its own;
+    // the worker write path stamps the date.
+    crate::http::write_server_and_date(&mut out, plan.server_bytes);
     out.extend_from_slice(b"\r\n");
+    if plan.keep_upstream_headers {
+        upstream_headers.clear();
+    }
     let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
     let mut have_content_length = false;
     let mut seen_single: u16 = 0;
@@ -1157,7 +1178,11 @@ async fn attempt(
             None => continue,
         };
         let name = trim_ascii(&line[..colon]);
-        if is_hop_by_hop(name) || name.eq_ignore_ascii_case(b"date") {
+        if plan.keep_upstream_headers {
+            upstream_headers.extend_from_slice(line);
+            upstream_headers.extend_from_slice(b"\r\n");
+        }
+        if is_hop_by_hop(name) || is_hidden_by_default(name) {
             continue;
         }
         // nginx keeps the first of a repeated single-valued header and
@@ -1425,6 +1450,26 @@ const MAX_UNFRAMED_BODY: usize = 64 * 1024 * 1024;
 
 /// Upper bound on the up-front reservation for a `Content-Length` body.
 const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
+
+/// Headers nginx's proxy module drops from the upstream response by
+/// default (`ngx_http_proxy_hide_headers`): it writes its own `Date` and
+/// `Server`, and `X-Accel-*` are instructions for the proxy, not for
+/// clients. `proxy_pass_header` would re-enable them (not implemented).
+fn is_hidden_by_default(name: &[u8]) -> bool {
+    const HIDDEN: [&[u8]; 8] = [
+        b"date",
+        b"server",
+        b"x-pad",
+        b"x-accel-expires",
+        b"x-accel-redirect",
+        b"x-accel-limit-rate",
+        b"x-accel-buffering",
+        b"x-accel-charset",
+    ];
+    HIDDEN
+        .iter()
+        .any(|h| h.len() == name.len() && h.eq_ignore_ascii_case(name))
+}
 
 /// Bit for each header nginx treats as single-valued in upstream responses
 /// (`ngx_http_upstream_process_header_line` and friends); later copies are

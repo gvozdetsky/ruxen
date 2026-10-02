@@ -636,6 +636,7 @@ pub(crate) fn run_location_handler(
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
             has_request_body: forward_len > 0,
             body_file,
+            keep_upstream_headers: !loc.add_headers.is_empty() || !loc.add_trailers.is_empty(),
             method_idempotent: is_idempotent_method_bytes(req.method_bytes),
             intercept,
         });
