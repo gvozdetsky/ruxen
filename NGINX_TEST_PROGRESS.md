@@ -7,13 +7,13 @@ Last run: 2026-10-02 against `nginx-tests` 0b70854 (2026-09-30).
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 52
+- **Passing in ruxen:** 53
 - **Intentionally skipped (`-V` banner excludes the module):** 401
-- **Failing — work in progress:** 52
+- **Failing — work in progress:** 51
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (52)
+## Passing in ruxen (53)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -46,6 +46,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `post_action.t`
 - `proxy_available.t`
 - `proxy_chunked_extra.t`
+- `proxy_duplicate_headers.t`
 - `proxy_intercept_errors.t`
 - `proxy_limit_rate.t`
 - `proxy_max_temp_file_size.t`
@@ -70,7 +71,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (52)
+## Failing — actively being worked on (51)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -87,7 +88,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_bind.t` — 3/7
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 12/16
-- `proxy_duplicate_headers.t` — 7/10
 - `proxy_if.t` — 15/17
 - `proxy_method.t` — 3/6
 - `proxy_next_upstream.t` — 2/10

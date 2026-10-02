@@ -87,6 +87,11 @@ thread_local! {
 /// request; passing `0` requests the first peer. Bits beyond the peer
 /// count are ignored. Used by the `proxy_next_upstream` retry loop in
 /// `proxy.rs` to avoid re-trying a peer that already failed.
+/// One primary peer and no backups: nginx's `peers->single`.
+fn is_single(upstream: &PreparedUpstream) -> bool {
+    matches!(upstream.peers, [only] if !only.backup)
+}
+
 pub fn pick_peer(upstream: &'static PreparedUpstream, tried_mask: u64) -> Option<LeasedPeer> {
     let now = Instant::now();
     LB_STATE.with(|state| {
@@ -262,6 +267,14 @@ fn least_conn_pick(
 /// `weight / max_fails` from `effective_weight` (floor at 0). Failures are
 /// counted within a `fail_timeout` window measured from the most recent fail.
 pub fn report_failure(upstream: &'static PreparedUpstream, peer_idx: usize) {
+    // nginx never marks a lone server unavailable: with one peer and no
+    // backups (`peers->single`), max_fails and fail_timeout are ignored and
+    // failures aren't even counted (ngx_http_upstream_free_round_robin_peer
+    // returns early). Otherwise one bad response would turn the next
+    // fail_timeout seconds into `no live upstreams` 502s.
+    if is_single(upstream) {
+        return;
+    }
     LB_STATE.with(|state| {
         let mut map = state.borrow_mut();
         let key = upstream as *const PreparedUpstream;

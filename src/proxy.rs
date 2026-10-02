@@ -565,6 +565,10 @@ pub enum UpstreamError {
     InvalidChunked,
     TooBigBody,
     NoLiveUpstreams,
+    DuplicateHeader { line: String, previous: String },
+    LengthAndTransferEncoding,
+    InvalidContentLength(String),
+    UnknownTransferEncoding(String),
 }
 
 impl std::fmt::Display for UpstreamError {
@@ -636,6 +640,28 @@ impl std::fmt::Display for UpstreamError {
                 Stage::ReadingBody.as_str()
             ),
             NoLiveUpstreams => write!(f, "no live upstreams while {}", Stage::Connecting.as_str()),
+            DuplicateHeader { line, previous } => write!(
+                f,
+                "upstream sent duplicate header line: \"{line}\", previous value: \"{previous}\" \
+                 while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            LengthAndTransferEncoding => write!(
+                f,
+                "upstream sent \"Content-Length\" and \"Transfer-Encoding\" headers at the same \
+                 time while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            InvalidContentLength(line) => write!(
+                f,
+                "upstream sent invalid \"Content-Length\" header: \"{line}\" while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            UnknownTransferEncoding(value) => write!(
+                f,
+                "upstream sent unknown \"Transfer-Encoding\": \"{value}\" while {}",
+                Stage::ReadingHeader.as_str()
+            ),
         }
     }
 }
@@ -843,6 +869,15 @@ async fn attempt(
     let mut content_length: Option<u64> = None;
     let mut chunked = false;
     let mut upstream_close = !upstream_is_11; // HTTP/1.0 closes by default
+    // Framing is validated as strictly as nginx does
+    // (ngx_http_upstream_process_content_length / _transfer_encoding): a
+    // second Content-Length or Transfer-Encoding, both together, a
+    // non-numeric length, or any coding but `chunked` is a 502. Forwarding
+    // them would let the upstream split the client's response stream or
+    // desync a pooled connection.
+    // The first Content-Length / Transfer-Encoding line, and whether it was
+    // the length.
+    let mut framing_line: Option<(&[u8], bool)> = None;
     {
         let mut cursor = 0;
         while cursor < head_after_status.len() {
@@ -857,19 +892,44 @@ async fn attempt(
             };
             let name = trim_ascii(&line[..colon]);
             let value = trim_ascii(&line[colon + 1..]);
-            if name.eq_ignore_ascii_case(b"content-length") {
-                if let Ok(s) = std::str::from_utf8(value) {
-                    if let Ok(n) = s.trim().parse::<u64>() {
-                        content_length = Some(n);
+            let is_length = name.eq_ignore_ascii_case(b"content-length");
+            if is_length || name.eq_ignore_ascii_case(b"transfer-encoding") {
+                let header_line = trim_ascii(line);
+                let invalid = if let Some((previous, previous_is_length)) = framing_line {
+                    Some(if previous_is_length == is_length {
+                        UpstreamError::DuplicateHeader {
+                            line: String::from_utf8_lossy(header_line).into_owned(),
+                            previous: String::from_utf8_lossy(previous).into_owned(),
+                        }
+                    } else {
+                        UpstreamError::LengthAndTransferEncoding
+                    })
+                } else if is_length {
+                    match parse_content_length(value) {
+                        Some(n) => {
+                            content_length = Some(n);
+                            None
+                        }
+                        None => Some(UpstreamError::InvalidContentLength(
+                            String::from_utf8_lossy(header_line).into_owned(),
+                        )),
                     }
-                }
-            } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-                if value
-                    .split(|&b| b == b',')
-                    .any(|t| trim_ascii(t).eq_ignore_ascii_case(b"chunked"))
-                {
+                } else if value.eq_ignore_ascii_case(b"chunked") {
                     chunked = true;
+                    None
+                } else {
+                    Some(UpstreamError::UnknownTransferEncoding(
+                        String::from_utf8_lossy(value).into_owned(),
+                    ))
+                };
+                if let Some(error) = invalid {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::InvalidHeader,
+                        Box::new(error),
+                    );
                 }
+                framing_line = Some((header_line, is_length));
             } else if name.eq_ignore_ascii_case(b"connection") {
                 if value
                     .split(|&b| b == b',')
@@ -1055,6 +1115,7 @@ async fn attempt(
     out.extend_from_slice(b"\r\n");
     let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
     let mut have_content_length = false;
+    let mut seen_single: u16 = 0;
     while cursor < head_end {
         let (line_len, t) = match find_line_end(&accum[cursor..head_end]) {
             Some(v) => v,
@@ -1073,13 +1134,16 @@ async fn attempt(
         if is_hop_by_hop(name) || name.eq_ignore_ascii_case(b"date") {
             continue;
         }
-        // We re-framed chunked → identity, so drop the original
-        // Content-Length too (it would conflict with the chunked-encoded
-        // body bytes upstream sent us). When the upstream was identity
-        // / Content-Length-framed, keep its CL line as-is.
-        if chunked && name.eq_ignore_ascii_case(b"content-length") {
-            continue;
+        // nginx keeps the first of a repeated single-valued header and
+        // drops the rest (ngx_http_upstream_process_header_line).
+        if let Some(bit) = single_header_bit(name) {
+            if seen_single & bit != 0 {
+                continue;
+            }
+            seen_single |= bit;
         }
+        // Step 5 rejected Content-Length together with chunked, so a
+        // Content-Length here is the upstream's own framing: keep it.
         if name.eq_ignore_ascii_case(b"content-length") {
             have_content_length = true;
         }
@@ -1089,8 +1153,11 @@ async fn attempt(
             break;
         }
     }
-    if chunked && !have_content_length {
-        // Re-frame chunked → identity for the client.
+    if body_has_content && !have_content_length {
+        // The body is fully buffered, so frame it for the client with its
+        // length: chunked was decoded to identity, and a close-delimited
+        // body (HTTP/1.0 or `Connection: close` without a length) would
+        // otherwise go out unframed on a keep-alive client connection.
         out.extend_from_slice(b"Content-Length: ");
         let mut buf = itoa_buf();
         let s = u64_to_decimal(body_len as u64, &mut buf);
@@ -1300,6 +1367,38 @@ const MAX_UNFRAMED_BODY: usize = 64 * 1024 * 1024;
 /// Upper bound on the up-front reservation for a `Content-Length` body.
 const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 
+/// Bit for each header nginx treats as single-valued in upstream responses
+/// (`ngx_http_upstream_process_header_line` and friends); later copies are
+/// ignored. `Date` is dropped altogether before this check.
+fn single_header_bit(name: &[u8]) -> Option<u16> {
+    const SINGLE: [&[u8]; 9] = [
+        b"content-type",
+        b"last-modified",
+        b"etag",
+        b"server",
+        b"location",
+        b"refresh",
+        b"expires",
+        b"x-accel-expires",
+        b"x-accel-redirect",
+    ];
+    SINGLE
+        .iter()
+        .position(|h| h.len() == name.len() && h.eq_ignore_ascii_case(name))
+        .map(|i| 1 << i)
+}
+
+/// `Content-Length` value as nginx's `ngx_atoof` accepts it: decimal
+/// digits only, no sign, no overflow.
+fn parse_content_length(value: &[u8]) -> Option<u64> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    value.iter().try_fold(0u64, |n, &d| {
+        n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+    })
+}
+
 fn trim_crlf(s: &[u8]) -> &[u8] {
     let mut end = s.len();
     while end > 0 && (s[end - 1] == b'\n' || s[end - 1] == b'\r') {
@@ -1454,5 +1553,48 @@ mod tests {
         assert!(!is_hop_by_hop(b"Content-Length"));
         assert!(!is_hop_by_hop(b"Server"));
         assert!(!is_hop_by_hop(b"Date"));
+    }
+
+    #[test]
+    fn content_length_parses_like_ngx_atoof() {
+        assert_eq!(parse_content_length(b"0"), Some(0));
+        assert_eq!(parse_content_length(b"1234"), Some(1234));
+        assert_eq!(
+            parse_content_length(b"18446744073709551615"),
+            Some(u64::MAX)
+        );
+        for bad in [
+            &b""[..],
+            b"foo",
+            b"+5",
+            b"-5",
+            b"5 5",
+            b"0x10",
+            b"18446744073709551616",
+        ] {
+            assert_eq!(parse_content_length(bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn single_valued_headers_match_nginx() {
+        for name in [
+            &b"Expires"[..],
+            b"content-type",
+            b"ETag",
+            b"X-Accel-Redirect",
+            b"Location",
+        ] {
+            assert!(single_header_bit(name).is_some(), "{:?}", name);
+        }
+        for name in [
+            &b"Set-Cookie"[..],
+            b"Cache-Control",
+            b"Vary",
+            b"X-Custom",
+            b"Link",
+        ] {
+            assert!(single_header_bit(name).is_none(), "{:?}", name);
+        }
     }
 }

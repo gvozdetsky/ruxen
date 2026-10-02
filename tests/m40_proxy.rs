@@ -480,3 +480,103 @@ http {{
         assert_eq!(body(&resp), b"alive");
     }
 }
+
+fn proxy_conf(backend_port: u16) -> String {
+    format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location /up/ {{
+            proxy_pass http://127.0.0.1:{backend_port};
+        }}
+        location /alive {{
+            return 200 "alive";
+        }}
+    }}
+}}
+"#
+    )
+}
+
+/// Upstream framing is validated like nginx
+/// (ngx_http_upstream_process_content_length / _transfer_encoding): each
+/// of these is a 502, never forwarded. A duplicated Content-Length used to
+/// reach the client as two headers with an injected second response in
+/// the body.
+#[test]
+fn m40_invalid_upstream_framing_is_502() {
+    let responses: [&[u8]; 6] = [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 30\r\n\r\nhelloHTTP/1.1 200 OK\r\nX-Inj: 1\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhello",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    ];
+    for response in responses {
+        let backend = Backend::spawn(response.to_vec());
+        let (_guard, port, _dir) = spawn_ruxen(&proxy_conf(backend.addr.port()));
+        let resp = http_get_close(port, "/up/");
+        assert_eq!(
+            status_code(&resp),
+            502,
+            "upstream {:?}: {}",
+            String::from_utf8_lossy(response),
+            String::from_utf8_lossy(&resp)
+        );
+        assert_eq!(status_code(&http_get_close(port, "/alive")), 200);
+    }
+}
+
+/// nginx keeps the first of a repeated single-valued header (Expires,
+/// Content-Type, Location, …) and drops the rest
+/// (proxy_duplicate_headers.t "duplicate expires ignored").
+#[test]
+fn m40_repeated_single_headers_keep_the_first() {
+    let backend = Backend::spawn(
+        b"HTTP/1.0 200 OK\r\nExpires: foo\r\nExpires: bar\r\nContent-Type: text/a\r\n\
+          Content-Type: text/b\r\nX-Multi: 1\r\nX-Multi: 2\r\nContent-Length: 2\r\n\r\nok"
+            .to_vec(),
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&proxy_conf(backend.addr.port()));
+    let resp = String::from_utf8_lossy(&http_get_close(port, "/up/")).into_owned();
+    assert!(resp.contains("\r\nExpires: foo\r\n"), "{resp}");
+    assert!(!resp.contains("bar"), "{resp}");
+    assert!(resp.contains("\r\nContent-Type: text/a\r\n"), "{resp}");
+    assert!(!resp.contains("text/b"), "{resp}");
+    // Headers nginx doesn't treat as single-valued pass through repeated.
+    assert_eq!(resp.matches("\r\nX-Multi: ").count(), 2, "{resp}");
+}
+
+/// A body delimited by the upstream closing (HTTP/1.0, no Content-Length)
+/// is buffered whole, so ruxen frames it with Content-Length for the
+/// client. It used to go out with neither Content-Length nor chunked on a
+/// keep-alive connection: the client hung, and a pipelined second response
+/// was glued onto the body.
+#[test]
+fn m40_close_delimited_upstream_body_is_framed_for_keepalive_clients() {
+    let backend = Backend::spawn(
+        b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nbody-until-eof".to_vec(),
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&proxy_conf(backend.addr.port()));
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    // Two requests on one keep-alive connection.
+    stream
+        .write_all(b"GET /up/ HTTP/1.1\r\nHost: x\r\n\r\nGET /alive HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = stream.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out);
+    let (first, second) = text
+        .split_once("body-until-eof")
+        .unwrap_or_else(|| panic!("no proxied body in: {text}"));
+    assert!(first.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(first.contains("\r\nContent-Length: 14\r\n"), "{text}");
+    assert!(second.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(second.ends_with("alive"), "{text}");
+}
