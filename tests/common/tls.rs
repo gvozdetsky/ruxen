@@ -78,6 +78,22 @@ pub fn make_self_signed(cn: &str) -> CertSet {
     }
 }
 
+/// Copy a checked-in PEM pair (e.g. from `src/testdata/tls/`) into a
+/// tempdir, for certificates rcgen can't make, such as X.509 v1.
+pub fn from_pem_files(cert: &Path, key: &Path) -> CertSet {
+    let dir = unique_dir("pem");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::copy(cert, &cert_path).expect("copy cert");
+    std::fs::copy(key, &key_path).expect("copy key");
+    CertSet {
+        dir,
+        cert_path,
+        key_path,
+        ca_path: None,
+    }
+}
+
 /// CA + leaf signed by it. Lets curl verify with `--cacert` instead of `-k`.
 /// `cert.pem` is the concatenated `leaf || ca` chain (nginx-style).
 pub fn make_ca_and_leaf(cn: &str) -> CertSet {

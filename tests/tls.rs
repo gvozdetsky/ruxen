@@ -265,6 +265,25 @@ fn smoke() {
     assert!(resp.stdout.contains("ok"), "body: {}", resp.stdout);
 }
 
+/// X.509 v1 certificates (no extensions, which is what nginx-tests and a
+/// bare `openssl req -x509` make) load and serve, as with nginx/OpenSSL.
+/// webpki rejects them with `UnsupportedCertVersion`, so ruxen used to
+/// refuse to start.
+#[test]
+fn x509_v1_certificates_serve() {
+    let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/tls");
+    for kind in ["rsa", "ec"] {
+        let certs = common::tls::from_pem_files(
+            &testdata.join(format!("v1_{kind}.crt")),
+            &testdata.join(format!("v1_{kind}.key")),
+        );
+        let server = spawn_https_server(SMOKE_CONF, certs);
+        let resp = curl_get(server.port, "localhost", "/", None, true);
+        assert!(resp.ok, "{kind}: curl failed: stderr={}", resp.stderr);
+        assert_eq!(resp.status(), Some(200), "{kind}: stdout={}", resp.stdout);
+    }
+}
+
 const SNI_DISPATCH_CONF: &str = r#"
 daemon off;
 events { }
