@@ -374,6 +374,20 @@ pub enum PreparedHandler {
     Proxy(PreparedProxy),
 }
 
+/// Per-location rules for an upstream's response headers, behind one
+/// pointer so the proxy plan stays small.
+#[derive(Debug)]
+pub struct ProxyResponseRules {
+    /// `proxy_redirect` rules for `Location` / `Refresh`, tried in order;
+    /// empty for `proxy_redirect off`.
+    pub redirects: &'static [PreparedRedirect],
+    /// Lowercased `proxy_hide_header` names beyond nginx's default list.
+    pub hide: &'static [&'static [u8]],
+    /// Default-hidden headers let through by `proxy_pass_header`, as
+    /// `proxy::default_hidden_bit` bits.
+    pub pass_mask: u16,
+}
+
 /// One prepared `proxy_redirect` rule.
 #[derive(Debug)]
 pub enum PreparedRedirect {
@@ -446,9 +460,8 @@ pub struct PreparedProxy {
     pub location_prefix: &'static [u8],
     /// `proxy_pass http://up/path;` URI part. Empty when no path rewriting.
     pub request_path: &'static [u8],
-    /// `proxy_redirect` rules for upstream `Location` / `Refresh` headers,
-    /// tried in order; empty for `proxy_redirect off`.
-    pub redirects: &'static [PreparedRedirect],
+    /// What to do with the upstream's response headers.
+    pub response: &'static ProxyResponseRules,
 }
 
 /// One prepared `proxy_set_header NAME VALUE;` entry. Name is a static
@@ -485,6 +498,10 @@ pub(crate) struct ProxyEffective {
     /// The nearest scope's `proxy_redirect` lines; `None` = nginx's
     /// implicit `proxy_redirect default`.
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
+    /// The nearest scope's `proxy_hide_header` / `proxy_pass_header` names
+    /// (each list inherits on its own, as in nginx).
+    pub hide_headers: Option<&'static [String]>,
+    pub pass_headers: Option<&'static [String]>,
 }
 
 impl ProxyEffective {
@@ -507,6 +524,8 @@ impl ProxyEffective {
             ignore_invalid_headers: true,
             underscores_in_headers: false,
             redirect: None,
+            hide_headers: None,
+            pass_headers: None,
         }
     }
 }

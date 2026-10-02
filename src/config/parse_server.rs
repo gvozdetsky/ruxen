@@ -78,6 +78,8 @@ pub(crate) fn parse_server_block(
     let mut proxy_next_upstream_timeout_ms: Option<u64> = None;
     let mut proxy_intercept_errors: Option<bool> = None;
     let mut proxy_redirect: Option<ProxyRedirect> = None;
+    let mut proxy_hide_headers: Option<Vec<String>> = None;
+    let mut proxy_pass_headers: Option<Vec<String>> = None;
     let mut chunked_transfer_encoding: Option<bool> = None;
 
     loop {
@@ -175,6 +177,8 @@ pub(crate) fn parse_server_block(
                         proxy_next_upstream_timeout_ms,
                         proxy_intercept_errors,
                         proxy_redirect,
+                        proxy_hide_headers,
+                        proxy_pass_headers,
                         chunked_transfer_encoding,
                         ssl,
                         locations,
@@ -625,6 +629,18 @@ pub(crate) fn parse_server_block(
             ("proxy_redirect", Terminator::Semi) => {
                 parse_proxy_redirect(&args, &mut proxy_redirect)?;
             }
+            ("proxy_hide_header", Terminator::Semi) => {
+                let name = args.get(1).ok_or(Error::MissingArg("proxy_hide_header"))?;
+                proxy_hide_headers
+                    .get_or_insert_with(Vec::new)
+                    .push(name.clone());
+            }
+            ("proxy_pass_header", Terminator::Semi) => {
+                let name = args.get(1).ok_or(Error::MissingArg("proxy_pass_header"))?;
+                proxy_pass_headers
+                    .get_or_insert_with(Vec::new)
+                    .push(name.clone());
+            }
             ("proxy_intercept_errors", Terminator::Semi) => {
                 if proxy_intercept_errors.is_some() {
                     return Err(Error::Duplicate("proxy_intercept_errors"));
@@ -681,6 +697,8 @@ pub(crate) fn parse_server_block(
                 | "proxy_next_upstream_timeout"
                 | "proxy_intercept_errors"
                 | "proxy_redirect"
+                | "proxy_hide_header"
+                | "proxy_pass_header"
                 | "ssl_certificate"
                 | "ssl_certificate_key"
                 | "ssl_protocols"

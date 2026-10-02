@@ -357,6 +357,8 @@ pub(crate) fn parse_location_block(
     let mut proxy_next_upstream_timeout_ms: Option<u64> = None;
     let mut proxy_intercept_errors: Option<bool> = None;
     let mut proxy_redirect: Option<ProxyRedirect> = None;
+    let mut proxy_hide_headers: Option<Vec<String>> = None;
+    let mut proxy_pass_headers: Option<Vec<String>> = None;
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
     // Children parsed inside this block — appended to `sink` after the
@@ -456,6 +458,8 @@ pub(crate) fn parse_location_block(
                         proxy_next_upstream_timeout_ms,
                         proxy_intercept_errors,
                         proxy_redirect: proxy_redirect.clone(),
+                        proxy_hide_headers: proxy_hide_headers.clone(),
+                        proxy_pass_headers: proxy_pass_headers.clone(),
                         chunked_transfer_encoding,
                         alias_prefix_override,
                     });
@@ -774,6 +778,18 @@ pub(crate) fn parse_location_block(
             ("proxy_redirect", Terminator::Semi) => {
                 parse_proxy_redirect(&args, &mut proxy_redirect)?;
             }
+            ("proxy_hide_header", Terminator::Semi) => {
+                let name = args.get(1).ok_or(Error::MissingArg("proxy_hide_header"))?;
+                proxy_hide_headers
+                    .get_or_insert_with(Vec::new)
+                    .push(name.clone());
+            }
+            ("proxy_pass_header", Terminator::Semi) => {
+                let name = args.get(1).ok_or(Error::MissingArg("proxy_pass_header"))?;
+                proxy_pass_headers
+                    .get_or_insert_with(Vec::new)
+                    .push(name.clone());
+            }
             ("proxy_intercept_errors", Terminator::Semi) => {
                 if proxy_intercept_errors.is_some() {
                     return Err(Error::Duplicate("proxy_intercept_errors"));
@@ -898,6 +914,8 @@ pub(crate) fn parse_location_block(
                 | "proxy_next_upstream_timeout"
                 | "proxy_intercept_errors"
                 | "proxy_redirect"
+                | "proxy_hide_header"
+                | "proxy_pass_header"
                 | "location",
                 _,
             ) => {

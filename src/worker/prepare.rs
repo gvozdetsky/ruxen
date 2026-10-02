@@ -448,6 +448,7 @@ pub(crate) fn build_proxy(
             location_pattern,
         )?
     };
+    let response = prepare_response_rules(redirects, eff.hide_headers, eff.pass_headers);
     Ok(match pp {
         ProxyPass::Direct {
             addr, host_header, ..
@@ -494,7 +495,7 @@ pub(crate) fn build_proxy(
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
                 request_path,
-                redirects,
+                response,
             }
         }
         ProxyPass::UpstreamRef {
@@ -527,10 +528,36 @@ pub(crate) fn build_proxy(
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
                 request_path,
-                redirects,
+                response,
             }
         }
     })
+}
+
+/// nginx's hidden set: its defaults, plus `proxy_hide_header`, minus
+/// `proxy_pass_header` (ngx_http_upstream_hide_headers_hash).
+fn prepare_response_rules(
+    redirects: &'static [PreparedRedirect],
+    hide: Option<&'static [String]>,
+    pass: Option<&'static [String]>,
+) -> &'static ProxyResponseRules {
+    let pass = pass.unwrap_or(&[]);
+    let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
+    let pass_mask = pass
+        .iter()
+        .filter_map(|p| crate::proxy::default_hidden_bit(p.as_bytes()))
+        .fold(0, |mask, bit| mask | bit);
+    let hide: Vec<&'static [u8]> = hide
+        .unwrap_or(&[])
+        .iter()
+        .filter(|h| !passed(h) && crate::proxy::default_hidden_bit(h.as_bytes()).is_none())
+        .map(|h| leak_bytes(h.to_ascii_lowercase().as_bytes()))
+        .collect();
+    Box::leak(Box::new(ProxyResponseRules {
+        redirects,
+        hide: Box::leak(hide.into_boxed_slice()),
+        pass_mask,
+    }))
 }
 
 /// The `proxy_redirect` rules for one `proxy_pass`. Without any
@@ -610,6 +637,13 @@ pub(crate) struct ServerProxyDefaults {
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
+    pub hide_headers: Option<&'static [String]>,
+    pub pass_headers: Option<&'static [String]>,
+}
+
+/// Leak a directive's list for the lifetime of the config.
+fn leak_list(list: Option<Vec<String>>) -> Option<&'static [String]> {
+    list.map(|l| &*Box::leak(l.into_boxed_slice()))
 }
 
 impl ServerProxyDefaults {
@@ -630,6 +664,8 @@ impl ServerProxyDefaults {
         ignore_invalid_headers: bool,
         underscores_in_headers: bool,
         proxy_redirect: Option<crate::config::ProxyRedirect>,
+        proxy_hide_headers: Option<Vec<String>>,
+        proxy_pass_headers: Option<Vec<String>>,
     ) -> Self {
         let defaults = ProxyEffective::defaults();
         let set_headers: &'static [PreparedProxySetHeader] = match proxy_set_headers {
@@ -654,6 +690,8 @@ impl ServerProxyDefaults {
             ignore_invalid_headers,
             underscores_in_headers,
             redirect: proxy_redirect.map(|r| &*Box::leak(Box::new(r))),
+            hide_headers: leak_list(proxy_hide_headers),
+            pass_headers: leak_list(proxy_pass_headers),
         }
     }
 }
@@ -685,6 +723,8 @@ pub(crate) fn resolve_proxy_effective(
     location_next_upstream_timeout_ms: Option<u64>,
     location_intercept_errors: Option<bool>,
     location_redirect: Option<crate::config::ProxyRedirect>,
+    location_hide_headers: Option<Vec<String>>,
+    location_pass_headers: Option<Vec<String>>,
     server_defaults: ServerProxyDefaults,
 ) -> ProxyEffective {
     let set_headers: &'static [PreparedProxySetHeader] = match location_set_headers {
@@ -714,6 +754,8 @@ pub(crate) fn resolve_proxy_effective(
             Some(r) => Some(&*Box::leak(Box::new(r))),
             None => server_defaults.redirect,
         },
+        hide_headers: leak_list(location_hide_headers).or(server_defaults.hide_headers),
+        pass_headers: leak_list(location_pass_headers).or(server_defaults.pass_headers),
     }
 }
 
@@ -764,6 +806,8 @@ pub(crate) fn prepare_server(
         server_ignore_invalid_headers,
         server_underscores_in_headers,
         server.proxy_redirect.take(),
+        server.proxy_hide_headers.take(),
+        server.proxy_pass_headers.take(),
     );
     // Split the parsed `server_name` specs into the four match buckets
     // plus the `matches_empty` flag. Lowercasing is already handled
@@ -1906,6 +1950,8 @@ pub(crate) fn build_prefix_or_exact(
         proxy_next_upstream_timeout_ms: location_proxy_next_upstream_timeout_ms,
         proxy_intercept_errors: location_proxy_intercept_errors,
         proxy_redirect: location_proxy_redirect,
+        proxy_hide_headers: location_proxy_hide_headers,
+        proxy_pass_headers: location_proxy_pass_headers,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
     } = l;
@@ -1923,6 +1969,8 @@ pub(crate) fn build_prefix_or_exact(
         location_proxy_next_upstream_timeout_ms,
         location_proxy_intercept_errors,
         location_proxy_redirect,
+        location_proxy_hide_headers,
+        location_proxy_pass_headers,
         server_proxy_defaults,
     );
     let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
@@ -2083,6 +2131,8 @@ pub(crate) fn build_regex_location(
         proxy_next_upstream_timeout_ms: location_proxy_next_upstream_timeout_ms,
         proxy_intercept_errors: location_proxy_intercept_errors,
         proxy_redirect: location_proxy_redirect,
+        proxy_hide_headers: location_proxy_hide_headers,
+        proxy_pass_headers: location_proxy_pass_headers,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
     } = l;
@@ -2100,6 +2150,8 @@ pub(crate) fn build_regex_location(
         location_proxy_next_upstream_timeout_ms,
         location_proxy_intercept_errors,
         location_proxy_redirect,
+        location_proxy_hide_headers,
+        location_proxy_pass_headers,
         server_proxy_defaults,
     );
     // The parser already validated this with the same flags + the same
