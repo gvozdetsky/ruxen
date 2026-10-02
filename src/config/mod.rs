@@ -1514,6 +1514,45 @@ mod tests {
     }
 
     #[test]
+    fn proxy_redirect_parses_like_nginx() {
+        let loc = |body: &str| {
+            let cfg = parse(&format!(
+                "http {{ server {{ listen 80; location / {{ proxy_pass http://127.0.0.1:1/; {body} }} }} }}"
+            ))?;
+            Ok::<_, Error>(cfg.servers[0].locations[0].proxy_redirect.clone())
+        };
+        assert_eq!(loc("").unwrap(), None);
+        assert_eq!(
+            loc("proxy_redirect off;").unwrap(),
+            Some(ProxyRedirect::Off)
+        );
+        match loc(
+            "proxy_redirect default; proxy_redirect http://a/ /b/; proxy_redirect ~*^x(.*) /y$1;",
+        )
+        .unwrap()
+        {
+            Some(ProxyRedirect::Rules(rules)) => {
+                assert_eq!(rules.len(), 3);
+                assert_eq!(rules[0], ProxyRedirectRule::Default);
+                assert!(matches!(rules[1], ProxyRedirectRule::Prefix { .. }));
+                assert!(matches!(
+                    rules[2],
+                    ProxyRedirectRule::Regex {
+                        case_insensitive: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("{other:?}"),
+        }
+        // `off` can't be combined with other lines in one scope.
+        assert!(loc("proxy_redirect default; proxy_redirect off;").is_err());
+        assert!(loc("proxy_redirect off; proxy_redirect default;").is_err());
+        assert!(loc("proxy_redirect a b c;").is_err());
+        assert!(loc("proxy_redirect ~( /x;").is_err());
+    }
+
+    #[test]
     fn user_directive_is_recorded() {
         let cfg = parse("user www-data www-data;\nhttp { }").unwrap();
         assert_eq!(cfg.runtime.user.as_deref(), Some("www-data"));

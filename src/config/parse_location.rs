@@ -356,6 +356,7 @@ pub(crate) fn parse_location_block(
     let mut proxy_next_upstream_tries: Option<u32> = None;
     let mut proxy_next_upstream_timeout_ms: Option<u64> = None;
     let mut proxy_intercept_errors: Option<bool> = None;
+    let mut proxy_redirect: Option<ProxyRedirect> = None;
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
     // Children parsed inside this block — appended to `sink` after the
@@ -454,6 +455,7 @@ pub(crate) fn parse_location_block(
                         proxy_next_upstream_tries,
                         proxy_next_upstream_timeout_ms,
                         proxy_intercept_errors,
+                        proxy_redirect: proxy_redirect.clone(),
                         chunked_transfer_encoding,
                         alias_prefix_override,
                     });
@@ -769,6 +771,9 @@ pub(crate) fn parse_location_block(
                 proxy_next_upstream_timeout_ms =
                     Some(parse_duration_ms(v, "proxy_next_upstream_timeout")?);
             }
+            ("proxy_redirect", Terminator::Semi) => {
+                parse_proxy_redirect(&args, &mut proxy_redirect)?;
+            }
             ("proxy_intercept_errors", Terminator::Semi) => {
                 if proxy_intercept_errors.is_some() {
                     return Err(Error::Duplicate("proxy_intercept_errors"));
@@ -892,6 +897,7 @@ pub(crate) fn parse_location_block(
                 | "proxy_next_upstream_tries"
                 | "proxy_next_upstream_timeout"
                 | "proxy_intercept_errors"
+                | "proxy_redirect"
                 | "location",
                 _,
             ) => {

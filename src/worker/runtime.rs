@@ -178,6 +178,7 @@ async fn settle_proxy_response(
     };
 
     let upstream_started = Instant::now();
+    let redirects = plan.redirects;
     let mut report = crate::proxy::ProxyReport::default();
     let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
     let upstream_elapsed_ms = upstream_started.elapsed().as_millis() as u64;
@@ -197,6 +198,20 @@ async fn settle_proxy_response(
     // upstream headers are visible to `$upstream_http_*` / `$upstream_cookie_*`.
     let mut process_meta = process_meta;
     process_meta.upstream_response_time_ms = Some(upstream_elapsed_ms);
+    // nginx rewrites Location / Refresh while processing the upstream
+    // header, before the add_header filter sees the response.
+    let upstream_resp = if report.redirect_header {
+        rewrite_proxy_redirects(
+            upstream_resp,
+            redirects,
+            http,
+            ctx,
+            &process_meta,
+            &report.upstream_headers,
+        )
+    } else {
+        upstream_resp
+    };
     let response = apply_proxy_add_headers(
         upstream_resp,
         http,

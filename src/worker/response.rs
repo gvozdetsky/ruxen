@@ -684,6 +684,65 @@ pub(crate) fn apply_proxy_add_headers(
     let Response::Owned(bytes) = response else {
         return response;
     };
+    // `$upstream_http_*` read the upstream's own header lines, which still
+    // include the ones hidden from the client (Server, Date, X-Accel-*).
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_body_len(&bytes),
+        upstream_headers,
+    );
+    let mut out = bytes;
+    if needs_expires {
+        out = apply_expires(out, meta.proxy_expires, &render_ctx);
+    }
+    out = inject_add_headers(out, meta.proxy_add_headers, &render_ctx);
+    let trailers_allowed = ctx.http_11
+        && !matches!(ctx.method, crate::http::Method::Head)
+        && meta.proxy_chunked_transfer_encoding;
+    if trailers_allowed {
+        // Refresh `$msec` / `$time_local` / `$time_iso8601` to wall-clock-now
+        // for the trailer block. Trailers are emitted after the upstream body
+        // has finished arriving, which under `proxy_limit_rate` can lag the
+        // request-start epoch by seconds; nginx's variable cache likewise
+        // advances across that gap. Headers keep the request-start epoch via
+        // the outer `render_ctx`, so a `$msec` rendered into both `add_header`
+        // and `add_trailer` reflects the time difference.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let render_ctx = RenderCtx {
+            status: response_status(&out),
+            epoch_secs: now.as_secs(),
+            epoch_ms: (now.subsec_millis()) as u16,
+            ..render_ctx
+        };
+        out = inject_add_trailers(out, meta.proxy_add_trailers, &render_ctx);
+    }
+    Response::Owned(out)
+}
+
+/// Body length of a stitched proxy response, for
+/// `$upstream_response_length`.
+fn upstream_body_len(response: &[u8]) -> u64 {
+    match response.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => response.len().saturating_sub(p + 4) as u64,
+        None => 0,
+    }
+}
+
+/// The variable context for rendering against a proxied response
+/// (`add_header`, `proxy_redirect`).
+fn proxy_render_ctx<'a>(
+    http: &'static PreparedHttp,
+    ctx: &'a phase::RequestCtx<'a>,
+    meta: &'a phase::ProcessMeta,
+    status: u16,
+    upstream_response_length: u64,
+    upstream_headers: &'a [u8],
+) -> RenderCtx<'a> {
     let request_uri = ctx.path;
     let args = request_args(request_uri);
     let uri = request_uri
@@ -691,19 +750,11 @@ pub(crate) fn apply_proxy_add_headers(
         .position(|&b| b == b'?')
         .map(|i| &request_uri[..i])
         .unwrap_or(request_uri);
-    let status = response_status(&bytes);
-    let host = ctx.host.unwrap_or(b"");
-    // `$upstream_http_*` read the upstream's own header lines, which still
-    // include the ones hidden from the client (Server, Date, X-Accel-*).
-    let upstream_response_length: u64 = match bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(p) => bytes.len().saturating_sub(p + 4) as u64,
-        None => 0,
-    };
-    let render_ctx = RenderCtx {
+    RenderCtx {
         uri,
         request_uri,
         request_method: ctx.method_bytes,
-        host,
+        host: ctx.host.unwrap_or(b""),
         remote_addr: ctx.remote_addr,
         remote_port: ctx.remote_port,
         remote_user: b"",
@@ -743,35 +794,137 @@ pub(crate) fn apply_proxy_add_headers(
         upstream_response_time_ms: meta.upstream_response_time_ms,
         sent_trailers: &[],
         tls: ctx.tls,
+    }
+}
+
+/// `proxy_redirect`: rewrite the proxied response's `Location` and
+/// `Refresh` (after `url=`) headers with the first matching rule, as
+/// ngx_http_proxy_rewrite_redirect does. A prefix rule replaces the
+/// matched prefix; a regex rule replaces the whole value. A rewritten
+/// `Location` that ends up relative is made absolute with this request's
+/// scheme, host and port, as nginx's header filter does with
+/// `absolute_redirect on`.
+pub(crate) fn rewrite_proxy_redirects(
+    response: Response,
+    rules: &[PreparedRedirect],
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    upstream_headers: &[u8],
+) -> Response {
+    let Response::Owned(bytes) = response else {
+        return response;
     };
-    let mut out = bytes;
-    if needs_expires {
-        out = apply_expires(out, meta.proxy_expires, &render_ctx);
+    let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Response::Owned(bytes);
+    };
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_body_len(&bytes),
+        upstream_headers,
+    );
+
+    let mut out = Vec::with_capacity(bytes.len() + 64);
+    let mut changed = false;
+    let mut lines = bytes[..head_end]
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    if let Some(status_line) = lines.next() {
+        out.extend_from_slice(status_line);
     }
-    out = inject_add_headers(out, meta.proxy_add_headers, &render_ctx);
-    let trailers_allowed = ctx.http_11
-        && !matches!(ctx.method, crate::http::Method::Head)
-        && meta.proxy_chunked_transfer_encoding;
-    if trailers_allowed {
-        // Refresh `$msec` / `$time_local` / `$time_iso8601` to wall-clock-now
-        // for the trailer block. Trailers are emitted after the upstream body
-        // has finished arriving, which under `proxy_limit_rate` can lag the
-        // request-start epoch by seconds; nginx's variable cache likewise
-        // advances across that gap. Headers keep the request-start epoch via
-        // the outer `render_ctx`, so a `$msec` rendered into both `add_header`
-        // and `add_trailer` reflects the time difference.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let render_ctx = RenderCtx {
-            status: response_status(&out),
-            epoch_secs: now.as_secs(),
-            epoch_ms: (now.subsec_millis()) as u16,
-            ..render_ctx
-        };
-        out = inject_add_trailers(out, meta.proxy_add_trailers, &render_ctx);
+    for line in lines {
+        out.extend_from_slice(b"\r\n");
+        let rewritten = line.iter().position(|&b| b == b':').and_then(|colon| {
+            let name = line[..colon].trim_ascii();
+            let value = line[colon + 1..].trim_ascii();
+            let is_location = name.eq_ignore_ascii_case(b"location");
+            let prefix = if is_location {
+                0
+            } else if name.eq_ignore_ascii_case(b"refresh") {
+                find_ascii_ci(value, b"url=")? + 4
+            } else {
+                return None;
+            };
+            let mut new = apply_redirect_rules(rules, value, prefix, &render_ctx)?;
+            if is_location && new.first() == Some(&b'/') {
+                new = build_absolute_redirect_location(
+                    &new,
+                    ctx.host.unwrap_or(meta.server_name),
+                    meta.server_port,
+                    ctx.tls.is_some(),
+                );
+            }
+            let mut line_out = line[..colon + 1].to_vec();
+            line_out.push(b' ');
+            line_out.extend_from_slice(&new);
+            Some(line_out)
+        });
+        match rewritten {
+            Some(new_line) => {
+                out.extend_from_slice(&new_line);
+                changed = true;
+            }
+            None => out.extend_from_slice(line),
+        }
     }
+    if !changed {
+        return Response::Owned(bytes);
+    }
+    out.extend_from_slice(&bytes[head_end..]);
     Response::Owned(out)
+}
+
+/// The first rule that matches `value[prefix..]`, applied; `None` if none
+/// does (the header is left as the upstream sent it).
+fn apply_redirect_rules(
+    rules: &[PreparedRedirect],
+    value: &[u8],
+    prefix: usize,
+    render_ctx: &RenderCtx<'_>,
+) -> Option<Vec<u8>> {
+    let tail = &value[prefix..];
+    for rule in rules {
+        match rule {
+            PreparedRedirect::Prefix {
+                pattern,
+                replacement,
+            } => {
+                let mut pat = Vec::new();
+                render_parts(pattern, render_ctx, &mut pat);
+                if !tail.starts_with(&pat) {
+                    continue;
+                }
+                let mut new = value[..prefix].to_vec();
+                render_parts(replacement, render_ctx, &mut new);
+                new.extend_from_slice(&tail[pat.len()..]);
+                return Some(new);
+            }
+            PreparedRedirect::Regex { regex, replacement } => {
+                let Some(captures) = regex.captures(tail) else {
+                    continue;
+                };
+                let mut state = RewriteState::default();
+                state.set_numbered_from_regex_captures(&captures, tail);
+                let ctx = RenderCtx {
+                    rewrite_state: Some(&state),
+                    ..*render_ctx
+                };
+                let mut new = value[..prefix].to_vec();
+                render_parts(replacement, &ctx, &mut new);
+                return Some(new);
+            }
+        }
+    }
+    None
+}
+
+fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Whether the response status family permits a chunked-encoded body. nginx's
