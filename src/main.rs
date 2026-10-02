@@ -316,6 +316,9 @@ fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
 fn version_output() -> &'static str {
     concat!(
         "nginx version: nginx/1.29.2\n",
+        "ruxen version: ruxen/",
+        env!("CARGO_PKG_VERSION"),
+        "\n",
         "TLS SNI support enabled\n",
         "configure arguments:",
         " --with-http_ssl_module",
@@ -427,6 +430,9 @@ mod tests {
             version_output(),
             concat!(
                 "nginx version: nginx/1.29.2\n",
+                "ruxen version: ruxen/",
+                env!("CARGO_PKG_VERSION"),
+                "\n",
                 "TLS SNI support enabled\n",
                 "configure arguments:",
                 " --with-http_ssl_module",
