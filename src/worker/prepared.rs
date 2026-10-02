@@ -301,6 +301,7 @@ pub struct PreparedAddHeader {
 pub struct PreparedAccessLog {
     pub path: &'static Path,
     pub format: &'static [PreparedValuePart],
+    pub escape: crate::config::LogEscape,
     pub condition: Option<&'static [PreparedValuePart]>,
     pub file_index: usize,
 }

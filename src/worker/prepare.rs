@@ -1459,16 +1459,16 @@ pub(crate) fn prepare_maps(
 /// slices share `file_index` values that point back into it, so the
 /// per-worker fd table opened from the canonical list serves all scopes.
 pub(crate) struct AccessLogPrep<'a> {
-    format_map: std::collections::HashMap<&'a str, &'a [ValuePart]>,
+    format_map: std::collections::HashMap<&'a str, &'a LogFormatDef>,
     canonical: Vec<PreparedAccessLog>,
 }
 
 impl<'a> AccessLogPrep<'a> {
     pub(crate) fn new(formats: &'a [LogFormatDef]) -> Self {
-        let mut format_map: std::collections::HashMap<&'a str, &'a [ValuePart]> =
+        let mut format_map: std::collections::HashMap<&'a str, &'a LogFormatDef> =
             std::collections::HashMap::new();
         for f in formats {
-            format_map.insert(f.name.as_str(), f.value.as_slice());
+            format_map.insert(f.name.as_str(), f);
         }
         Self {
             format_map,
@@ -1480,29 +1480,16 @@ impl<'a> AccessLogPrep<'a> {
         // nginx default format name.
         const DEFAULT_FORMAT_NAME: &str = "combined";
         let chosen_format = log.format.as_deref().unwrap_or(DEFAULT_FORMAT_NAME);
-        let format = if let Some(parts) = self.format_map.get(chosen_format) {
-            prepare_value_parts(parts.to_vec())
+        let (format, escape) = if let Some(def) = self.format_map.get(chosen_format) {
+            (prepare_value_parts(def.value.clone()), def.escape)
         } else if chosen_format == DEFAULT_FORMAT_NAME {
-            // Built-in fallback for bare `access_log /path;` in harness
-            // preambles when no explicit `log_format combined ...` is
-            // declared. It is intentionally narrower than nginx's full
-            // combined format, but keeps the request line/status/size
-            // fields that upstream tests inspect.
-            prepare_value_parts(vec![
-                ValuePart::Var(Variable::RemoteAddr),
-                ValuePart::Literal(" - ".into()),
-                ValuePart::Var(Variable::RemoteUser),
-                ValuePart::Literal(" [".into()),
-                ValuePart::Var(Variable::TimeLocal),
-                ValuePart::Literal("] \"".into()),
-                ValuePart::Var(Variable::RequestMethod),
-                ValuePart::Literal(" ".into()),
-                ValuePart::Var(Variable::RequestUri),
-                ValuePart::Literal("\" ".into()),
-                ValuePart::Var(Variable::Status),
-                ValuePart::Literal(" ".into()),
-                ValuePart::Var(Variable::BodyBytesSent),
-            ])
+            // nginx's predefined `combined` format.
+            let parts = crate::config::parse_value_with_vars(
+                "$remote_addr - $remote_user [$time_local] \"$request\" $status \
+                 $body_bytes_sent \"$http_referer\" \"$http_user_agent\"",
+            )
+            .map_err(|e| e.to_string())?;
+            (prepare_value_parts(parts), LogEscape::Default)
         } else {
             return Err(format!("unknown log format \"{chosen_format}\""));
         };
@@ -1515,6 +1502,7 @@ impl<'a> AccessLogPrep<'a> {
         let prepared = PreparedAccessLog {
             path: Box::leak(log.path.clone().into_boxed_path()),
             format,
+            escape,
             condition: log.condition.clone().map(prepare_value_parts),
             file_index,
         };

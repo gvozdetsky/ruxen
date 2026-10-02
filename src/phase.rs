@@ -63,6 +63,8 @@ pub struct RequestCtx<'a> {
     /// upstream request line. Always uppercase ASCII per RFC 7230 §3.1.1.
     pub method_bytes: &'a [u8],
     pub path: &'a [u8],
+    /// The request line without its CRLF (`$request`).
+    pub request_line: &'a [u8],
     pub http_11: bool,
     pub host: Option<&'a [u8]>,
     /// SNI hostname captured at TLS handshake time, lowercased. `None` for
@@ -1387,6 +1389,7 @@ mod tests {
             method,
             method_bytes: method_bytes_for(method),
             path,
+            request_line: b"",
             http_11,
             host,
             sni: None,

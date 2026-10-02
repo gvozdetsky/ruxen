@@ -1833,6 +1833,22 @@ mod tests {
     }
 
     #[test]
+    fn log_format_escape_modes() {
+        let cfg = parse(
+            "http { log_format a escape=json $uri; log_format b $uri; \
+             server { listen 80; } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.log_formats[0].escape, LogEscape::Json);
+        assert_eq!(
+            cfg.log_formats[0].value,
+            vec![ValuePart::Var(Variable::Uri)]
+        );
+        assert_eq!(cfg.log_formats[1].escape, LogEscape::Default);
+        assert!(parse("http { log_format a escape=xml $uri; server { listen 80; } }").is_err());
+    }
+
+    #[test]
     fn access_log_off_clears_http_logs() {
         let src = r#"
             http {
