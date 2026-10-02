@@ -1,69 +1,326 @@
 # ruxen
 
-A Rust port of [nginx](https://nginx.org), the high-performance HTTP server and reverse proxy.
+**An experimental nginx-compatible HTTP server and reverse proxy written from scratch in Rust.**
 
-**Status:** active prototype. v0.1 scope is intentionally tiny: Linux-only, HTTP/1.1, no modules, no cache.
+ruxen explores how nginx's architecture and configuration semantics can be reimplemented in idiomatic Rust — without translating the C code line by line.
+
+It is Linux-only, built around a thread-per-core model using [monoio](https://github.com/bytedance/monoio) and `io_uring`, and currently targets HTTP/1.1.
+
+> [!WARNING]
+> **ruxen is an active prototype. It is not production-ready yet.**
+
+## Why ruxen?
+
+nginx has decades of engineering behind its event loop, HTTP state machine, configuration system, request routing, and upstream handling.
+
+The goal of ruxen is to study those ideas and reproduce their behaviour using Rust's ownership model and type system rather than copying nginx's C implementation.
+
+Three things guide the project:
+
+- **nginx compatibility** — support a useful subset of nginx configuration and behaviour;
+- **external validation** — test against the upstream [`nginx-tests`](https://github.com/nginx/nginx-tests) suite, not only project-specific tests;
+- **performance as a constraint** — compare ruxen and nginx on reproducible workloads throughout development.
+
+See [`DESIGN.md`](DESIGN.md) for the architecture notes and the reasoning behind individual design decisions.
+
+## Current status
+
+The v0.1 scope is deliberately limited:
+
+- Linux only
+- HTTP/1.1 only
+- hand-written HTTP parser
+- thread-per-core workers
+- `io_uring` via monoio
+- nginx-style configuration
+- static file serving
+- reverse proxying and upstreams
+- TLS 1.2/1.3 termination via rustls
+- no module system
+- no HTTP cache
+- no HTTP/2 yet
+
+The upstream `nginx-tests` suite is used as a compatibility test. **49 of the 104 test files that ruxen currently opts into pass end-to-end.**
+
+See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status.
+
+## Quick start
+
+### Requirements
+
+You need:
+
+- Linux with `io_uring` support
+- a recent stable Rust toolchain
+- `curl` to try the server
+
+Clone and build ruxen:
+
+```bash
+git clone https://github.com/gvozdetsky/ruxen.git
+cd ruxen
+cargo build --release
+```
+
+Create `ruxen.conf`:
+
+```nginx
+worker_processes 1;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    default_type text/plain;
+
+    server {
+        listen 8080;
+        server_name _;
+
+        location / {
+            return 200 "hello from ruxen";
+        }
+    }
+}
+```
+
+Check the configuration:
+
+```bash
+./target/release/ruxen -t -c ruxen.conf
+```
+
+A valid configuration exits successfully.
+
+Start the server:
+
+```bash
+./target/release/ruxen -c ruxen.conf
+```
+
+Then, from another terminal:
+
+```bash
+curl -i http://127.0.0.1:8080/
+```
+
+You should get a `200` response with:
+
+```text
+hello from ruxen
+```
+
+You are now serving an nginx-style configuration with ruxen.
 
 ## What works
 
-- **Core serving:** hand-written HTTP/1.1 parser, keep-alive, response-side `Connection` header parity, `keepalive_timeout` semantics (`0` disables reuse; optional `Keep-Alive: timeout=N` hint; idle timeout actively closes idle sockets), `keepalive_requests` (default cap 1000, server/location override), `keepalive_disable` (`none|msie6|safari`) and `keepalive_time` policy semantics, thread-per-core on io_uring via monoio, `SO_REUSEPORT`.
-- **Routing:** virtual hosts across multiple `listen` addresses, `server_name` (case-insensitive exact, wildcard, regex, and empty-name forms), `location` (`=`, longest-prefix, `^~`, `~`, `~*`, internal-only named `@name`), hash-indexed header dispatch.
-- **Static files:** `root`, `alias` (prefix/exact/regex, including regex `add_uri_to_alias` flow), URI decoding + normalization, strong ETag / `Last-Modified`, single-range `Range`/`If-Range`, conditional `If-Modified-Since`/`If-Unmodified-Since`/`If-None-Match`/`If-Match`, streamed large-file bodies (bounded-memory write path), `index` (including `$var` entries and nginx-style internal reroute), `try_files` (including named-location fallback), 301 trailing-slash redirect, symlink-escape-safe containment, `autoindex on;` in `html|xml|json|jsonp` formats with `autoindex_exact_size` and `autoindex_localtime`.
-- **TLS termination:** `listen … ssl;` via [rustls](https://github.com/rustls/rustls) 0.23 (over the upstream [`monoio-rustls`](https://crates.io/crates/monoio-rustls) adapter), TLS 1.2 + 1.3 (insecure SSLv2/SSLv3/TLSv1/TLSv1.1 rejected at `-t`), `ssl_certificate` / `ssl_certificate_key` (PKCS#8, PKCS#1 RSA, SEC1 EC), multi-cert per server (RSA + ECDSA picked by client signature schemes), SNI dispatch with exact + leading-wildcard match, ALPN advertising `http/1.1` only, in-memory session cache with `ssl_session_timeout`, 60s handshake timeout. Common `$ssl_*` variables are wired into `add_header` / `return` / `log_format`.
-- **Reverse proxy/upstream:** `proxy_pass` (literal `http://host:port`, named `upstream`, and path-rewrite form `proxy_pass http://up/path;`), `upstream { server ... }` with weighted round-robin and `least_conn`, `down`/`backup`, `max_fails`/`fail_timeout`, per-worker keepalive pools (`keepalive`, `keepalive_requests`, `keepalive_timeout`, `keepalive_time`), `proxy_http_version 1.0|1.1`, `proxy_set_header`, `proxy_pass_request_headers`, `proxy_pass_request_body`, `proxy_next_upstream` (+ `_tries`, `_timeout`), `proxy_intercept_errors`, and buffered Content-Length or chunked client request bodies up to 1 MiB.
-- **Directives:** `return` (with `$var` expansion; 3xx forms emit `Location` redirects), `add_header NAME VALUE [always];` and `add_trailer NAME VALUE [always];` (server + location scope, nginx merge semantics, `add_header Last-Modified` suppress/override for static responses), `expires`, `error_page STATUS... [=NNN] URI;` (server + location scope, internal URI, named-location, or external URL targets), `post_action`, rewrite-module core (`set`, `if (...) { ... }`, `rewrite ... [last|break|redirect|permanent]`), `split_clients` at http scope, `map $source $dest { ... }` at http scope (exact / `~` / `~*` / `default`), `auth_basic "realm"` + `auth_basic_user_file` (http/server/location scope with `off` inheritance break; htpasswd `{PLAIN}` / `{SHA}` / `{SSHA}` / `$apr1$` / `$1$` and system `crypt(3)` entries).
-- **Logging:** minimal `log_format` + `access_log` sinks at http/server/location scope, including `if=$arg_*` gating and `$sent_http_*` rendering, plus server/location `error_log` + `log_not_found` 404 side effects with per-sink levels, multiple sinks, and `syslog:` targets (`server=unix:...` and UDP server forms).
-- **Variables:** `$uri`, `$request_uri`, `$host`, `$server_name`, `$status`, `$args`/`$query_string`, `$is_args`, `$arg_*`, `$cookie_*`, `$scheme`, `$remote_addr`, `$remote_port`, `$remote_user`, `$hostname`, `$http_NAME`, `$sent_http_NAME`, `$sent_trailer_NAME`, `$request_body`, `$request_body_file`, `$connection`, `$connection_requests`, `$connection_time`, `$request_time`, `$limit_rate`, `$upstream_http_NAME`, `$upstream_cookie_NAME`, `$upstream_response_length`, `$upstream_response_time`, `$ssl_protocol`, `$ssl_cipher`, `$ssl_server_name`, `$ssl_session_reused`, rewrite captures `$1..$9`, and user-defined `$name` from `set` / `split_clients`.
-- **Interop:** nginx-compatible CLI (`-c / -p / -e / -g / -t / -T / -V / -s`), `pid` file, SIGQUIT graceful shutdown. Upstream Perl test suite (`nginx-tests`): 49 of the 104 files that ruxen's `-V` profile opts into pass end-to-end — per-file status in [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md).
+### HTTP and routing
 
-## What's intentionally not in v0.1 TLS
+- hand-written HTTP/1.1 parser
+- persistent connections and nginx-style keep-alive behaviour
+- virtual hosts on multiple `listen` addresses
+- `server_name` exact, wildcard and regex matching
+- nginx-style `location` matching:
+  - exact (`=`)
+  - longest prefix
+  - `^~`
+  - regex (`~`, `~*`)
+  - named locations
 
-The TLS surface is deliberately minimal so the v0.1 scope stays
-finishable. The following are tracked as future work, not bugs — please
-don't file issues for them:
+### Static files
 
-- HTTP/2 (ALPN advertises `http/1.1` only)
-- OCSP stapling (`ssl_stapling*` parse and are silently ignored)
-- Client certificate auth (`ssl_verify_client`, `ssl_client_certificate`, `ssl_trusted_certificate`, `ssl_crl`, `$ssl_client_*` variables)
-- Session ticket key rotation, persistent / shared session cache (`ssl_session_ticket_key`, `ssl_session_tickets`, `ssl_session_cache shared:…`)
-- 0-RTT / early data (`ssl_early_data`)
-- TLS to upstreams (`proxy_ssl_*`)
-- Per-location TLS overrides (TLS config is per-listen, resolved at startup)
-- Hot certificate reload (cert/key files are read once at startup)
-- Password-protected keys (`ssl_password_file`)
-- Rehandshake / renegotiation (rustls does not support it)
-- TLS hot-path perf tuning (buffer sizes, syscall counts in the read/write pump, owned-buffer round-trips, session cache size). The first measured number is in [`bench/tls/RESULTS.md`](bench/tls/RESULTS.md) — currently within ~10% of nginx on steady-state throughput and ~15% slower on single-thread fresh handshakes; expected to close.
+Supported functionality includes:
 
-See [`DESIGN.md`](DESIGN.md) for philosophy, architecture decisions, and roadmap; [`bench/README.md`](bench/README.md) for the benchmark suite and per-scenario results vs nginx 1.24.0.
+- `root`
+- `alias`
+- `index`
+- `try_files`
+- ETag and `Last-Modified`
+- conditional requests
+- byte ranges
+- streamed large files
+- URI decoding and normalization
+- trailing-slash redirects
+- `autoindex`
+
+### Reverse proxy and upstreams
+
+ruxen supports a growing subset of nginx's proxy functionality, including:
+
+- `proxy_pass`
+- named `upstream` blocks
+- path rewriting
+- weighted round-robin
+- `least_conn`
+- backup and down peers
+- `max_fails` / `fail_timeout`
+- per-worker upstream keep-alive pools
+- `proxy_http_version`
+- `proxy_set_header`
+- request-body forwarding
+- `proxy_next_upstream`
+- `proxy_intercept_errors`
+
+### TLS
+
+TLS termination uses [rustls](https://github.com/rustls/rustls).
+
+Currently supported:
+
+- TLS 1.2 and TLS 1.3
+- `ssl_certificate`
+- `ssl_certificate_key`
+- RSA and ECDSA certificates
+- multiple certificates per server
+- SNI
+- in-memory TLS session cache
+- nginx-style `$ssl_*` variables
+
+ALPN currently advertises HTTP/1.1 only.
+
+### Configuration and request processing
+
+A growing nginx-compatible configuration surface is implemented, including:
+
+- `return`
+- `add_header`
+- `add_trailer`
+- `expires`
+- `error_page`
+- `post_action`
+- `set`
+- `if`
+- `rewrite`
+- `map`
+- `split_clients`
+- `auth_basic`
+- `auth_basic_user_file`
+- `log_format`
+- `access_log`
+- `error_log`
+
+Many common nginx variables are also available, including request, response, upstream, TLS, cookie, header and rewrite variables.
+
+### nginx CLI compatibility
+
+The currently implemented nginx-style command-line surface includes:
+
+```text
+-c
+-p
+-e
+-g
+-t
+-T
+-V
+```
+
+ruxen also supports pid files and graceful shutdown via `SIGQUIT`.
+
+The nginx `-s` command interface is not implemented yet.
+
+## Compatibility philosophy
+
+ruxen is **not** a line-by-line Rust port of nginx.
+
+The approach is:
+
+> understand why nginx does something, then implement that behaviour in a way that makes sense in Rust.
+
+For example, nginx uses memory pools, pointer-based configuration structures and arrays of function pointers because those are natural solutions in C.
+
+ruxen does not reproduce those mechanisms where Rust already provides safer or simpler alternatives.
+
+The aim is behavioural and architectural compatibility where it matters — not source-code similarity.
+
+More detail is in [`DESIGN.md`](DESIGN.md).
+
+## Testing
+
+Run the Rust unit and integration tests:
+
+```bash
+cargo test --release
+```
+
+The HTTPS integration tests use the system `curl` binary and generate temporary certificates at runtime.
+
+### nginx-tests
+
+ruxen can also run the upstream nginx Perl test suite.
+
+From the repository root:
+
+```bash
+scripts/run_nginx_tests.sh
+```
+
+Run only selected groups:
+
+```bash
+scripts/run_nginx_tests.sh --no-build 'http_*.t' 'proxy_*.t'
+```
+
+By default the script expects an `nginx-tests` checkout at:
+
+```text
+../nginx-tests
+```
+
+A different location can be supplied with:
+
+```bash
+scripts/run_nginx_tests.sh --tests-dir /path/to/nginx-tests
+```
+
+Passing tests, failing tests and skipped tests are tracked in [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md).
+
+## Performance
+
+Performance is treated as part of the design, not as a final optimization pass.
+
+The benchmark suite runs equivalent scenarios against nginx and ruxen and stores the nginx baseline and ruxen history for each workload.
+
+See [`bench/README.md`](bench/README.md) for the benchmark methodology and individual scenarios.
+
+The current v0.1 performance contract for the minimal serving path is to reach at least **95% of nginx's throughput on the same hardware**, while keeping p99 latency within the project's target and producing zero errors.
+
+See [`DESIGN.md`](DESIGN.md) for the current baseline and performance notes.
+
+## v0.1 limitations
+
+The following are intentionally outside the current v0.1 scope:
+
+- HTTP/2
+- nginx's module ecosystem
+- HTTP caching
+- TLS to upstream servers (`proxy_ssl_*`)
+- OCSP stapling
+- client certificate authentication
+- 0-RTT / TLS early data
+- persistent or shared TLS session caches
+- hot certificate reload
+- password-protected private keys
+- full nginx process supervision and binary upgrade behaviour
+
+Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
+
+## Contributing
+
+ruxen is still early enough that small experiments and compatibility reports can be genuinely useful.
+
+Good ways to contribute include:
+
+- finding a configuration where nginx and ruxen behave differently;
+- reducing a compatibility problem to a small reproducible example;
+- running the benchmark suite on different hardware;
+- investigating a failing upstream `nginx-tests` case;
+- improving documentation;
+- implementing a missing nginx behaviour.
+
+If you find something interesting, open an issue — even if you are not planning to implement it yourself.
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
-
-## Running tests
-
-From the repository root:
-
-The HTTPS integration tests in `tests/tls.rs` shell out to the system
-`curl` binary and generate ephemeral certs at runtime via the `rcgen`
-dev-dependency — install `curl` if it isn't already on your `PATH`. No
-checked-in `.pem` files; nothing to refresh on cert expiry.
-
-```bash
-# 1) Run all Rust unit + integration tests.
-cargo test --release
-
-# 2) Run the upstream nginx-tests sweep (every .t file, sequential).
-#    Builds target/release/ruxen automatically; per-file prove logs land
-#    under .nginx-tests-out/logs/.
-scripts/run_nginx_tests.sh
-
-# 3) Run only selected test-file globs.
-scripts/run_nginx_tests.sh --no-build 'http_*.t' 'proxy_*.t'
-```
-
-The sweep always runs every `.t` file (skipped tests are recorded as
-SKIP with the `has_module` reason; tests that ran but failed are
-recorded with their failed/total subtest fraction). If your
-`nginx-tests` checkout is not at `../nginx-tests`, pass
-`--tests-dir /path/to/nginx-tests`.
