@@ -110,7 +110,9 @@ for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
     logfile="${OUT_DIR}/logs/${name}.log"
 
-    TEST_NGINX_BINARY="${RUXEN_BIN}" TEST_NGINX_GLOBALS='' \
+    # RUXEN_NGINX_IDENTITY=1: answer as nginx/1.29.2 (Server header,
+    # error-page footer), the version -V reports, as the tests assert.
+    RUXEN_NGINX_IDENTITY=1 TEST_NGINX_BINARY="${RUXEN_BIN}" TEST_NGINX_GLOBALS='' \
         timeout --kill-after=10 "${TIMEOUT_SECS}" \
         prove -I "${TESTS_DIR}/lib" "$f" >"${logfile}" 2>&1
     rc=$?
