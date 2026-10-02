@@ -106,6 +106,7 @@ fn line_with<'a>(log: &'a str, needle: &str) -> &'a str {
 fn upstream_failures_are_logged_like_nginx() {
     let refused = DeadPort::new();
     let dead = DeadPort::new();
+    let dead2 = DeadPort::new();
     // Accepts and never answers: a read timeout.
     let silent = TcpListener::bind("127.0.0.1:0").unwrap();
     let silent_port = silent.local_addr().unwrap().port();
@@ -123,15 +124,19 @@ fn upstream_failures_are_logged_like_nginx() {
     let server = start(
         "upstream",
         &format!(
-            "upstream down {{ server 127.0.0.1:{dead} max_fails=1 fail_timeout=60s; }} \
+            "upstream single {{ server 127.0.0.1:{refused} max_fails=1 fail_timeout=60s; }} \
+             upstream down {{ server 127.0.0.1:{dead} max_fails=1 fail_timeout=60s; \
+                              server 127.0.0.1:{dead2} max_fails=1 fail_timeout=60s; }} \
              server {{ listen 127.0.0.1:%%PORT%%; server_name example.test; root %%DIR%%/www; \
                location /refused/ {{ proxy_pass http://127.0.0.1:{refused}; }} \
                location /down/ {{ proxy_pass http://down; }} \
+               location /single/ {{ proxy_pass http://single; }} \
                location /silent/ {{ proxy_pass http://127.0.0.1:{silent_port}; \
                                    proxy_read_timeout 1s; }} \
                location /closing/ {{ proxy_pass http://127.0.0.1:{closing_port}; }} \
              }}",
             dead = dead.port(),
+            dead2 = dead2.port(),
             refused = refused.port(),
         ),
     );
@@ -139,6 +144,8 @@ fn upstream_failures_are_logged_like_nginx() {
     assert!(get(server.port, "/refused/x?a=1").starts_with("HTTP/1.1 502"));
     assert!(get(server.port, "/down/1").starts_with("HTTP/1.1 502"));
     assert!(get(server.port, "/down/2").starts_with("HTTP/1.1 502"));
+    assert!(get(server.port, "/single/1").starts_with("HTTP/1.1 502"));
+    assert!(get(server.port, "/single/2").starts_with("HTTP/1.1 502"));
     assert!(get(server.port, "/silent/").starts_with("HTTP/1.1 504"));
     assert!(get(server.port, "/closing/").starts_with("HTTP/1.1 502"));
     assert!(get(server.port, "/missing").starts_with("HTTP/1.1 404"));
@@ -154,14 +161,29 @@ fn upstream_failures_are_logged_like_nginx() {
         )),
         "{line}"
     );
-    // The first request marks the only peer failed; the second finds none.
-    assert!(line_with(&log, "GET /down/1 ").contains("connect() failed (111: "));
+    // The first request tries both peers and marks them failed; the second
+    // finds none.
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains("GET /down/1 ") && l.contains("connect() failed (111: "))
+            .count(),
+        2,
+        "{log}"
+    );
     let line = line_with(&log, "GET /down/2 ");
     assert!(
         line.contains("no live upstreams while connecting to upstream, client: 127.0.0.1"),
         "{line}"
     );
     assert!(!line.contains("upstream: \""), "{line}");
+    // A lone server is never marked unavailable (nginx's `peers->single`):
+    // both requests try it.
+    for path in ["GET /single/1 ", "GET /single/2 "] {
+        assert!(
+            line_with(&log, path).contains("connect() failed (111: "),
+            "{log}"
+        );
+    }
     assert!(line_with(&log, "GET /silent/ ").contains(
         "upstream timed out (110: Connection timed out) while reading response header from upstream"
     ));
