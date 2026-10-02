@@ -814,6 +814,15 @@ pub struct PreparedClientTimeouts {
     pub send: Duration,
 }
 
+impl PreparedHttp {
+    /// Client connections one worker may hold.
+    pub(crate) fn client_slots(&self) -> usize {
+        self.worker_connections
+            .saturating_sub(self.listens.len())
+            .max(1)
+    }
+}
+
 impl PreparedClientTimeouts {
     pub(crate) fn resolve(t: crate::config::ClientTimeouts) -> Self {
         const DEFAULT_MS: u64 = 60_000;
@@ -923,6 +932,10 @@ pub struct PreparedListen {
 /// Top-level prepared state.
 pub struct PreparedHttp {
     pub listens: Vec<PreparedListen>,
+    /// `worker_connections` (nginx's default 512): the most connections one
+    /// worker holds. As in nginx, each listening socket uses one of them;
+    /// see `client_slots`.
+    pub worker_connections: usize,
     pub access_logs: &'static [PreparedAccessLog],
     pub split_clients: std::collections::HashMap<&'static str, PreparedSplitClients>,
     /// http-scope `map` programs, keyed by output variable name. Rendered

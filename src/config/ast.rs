@@ -55,6 +55,9 @@ pub struct RuntimeOpts {
     /// matching nginx). `Some(0)` represents `auto` — resolved at runtime
     /// via `available_parallelism()`.
     pub worker_processes: Option<WorkerProcesses>,
+    /// `events { worker_connections N; }`. `None` means nginx's default,
+    /// 512.
+    pub worker_connections: Option<usize>,
     /// `user name [group];` — the user name only. ruxen doesn't switch
     /// users; `main` uses this to decide whether running as root is
     /// what the config asked for.
