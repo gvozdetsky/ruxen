@@ -9,6 +9,9 @@ and [`help wanted`](https://github.com/gvozdetsky/ruxen/labels/help%20wanted) ar
 ones the maintainer is not working on. Comment on one before starting so two
 people don't do the same work.
 
+Found a security problem? Please don't open an issue; see
+[`SECURITY.md`](SECURITY.md) for how to report it privately.
+
 ## The one rule: behave like nginx
 
 ruxen aims for nginx's observable behaviour, not its source structure (see
