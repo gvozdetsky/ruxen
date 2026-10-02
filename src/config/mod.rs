@@ -216,6 +216,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_ciphers: Option<String> = None;
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
+    let mut resumption = SessionResumption::default();
     let mut warnings: Vec<String> = Vec::new();
     loop {
         let (args, term) = lx.read_directive()?;
@@ -262,6 +263,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 ssl_ciphers.as_deref(),
                 ssl_prefer_server_ciphers,
                 ssl_session_timeout_ms,
+                resumption,
                 client_max_body_size,
                 keepalive_timeout,
                 keepalive_requests,
@@ -423,10 +425,11 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
                 ssl_session_timeout_ms = Some(parse_duration_ms(v, "ssl_session_timeout")?);
             }
+            (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
+                resumption.parse(name, &args)?;
+            }
             (
-                "ssl_session_cache"
-                | "ssl_session_tickets"
-                | "ssl_session_ticket_key"
+                "ssl_session_ticket_key"
                 | "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"
@@ -1579,6 +1582,28 @@ mod tests {
         assert!(loc("proxy_redirect off; proxy_redirect default;").is_err());
         assert!(loc("proxy_redirect a b c;").is_err());
         assert!(loc("proxy_redirect ~( /x;").is_err());
+    }
+
+    #[test]
+    fn ssl_session_cache_and_tickets_parse_and_inherit() {
+        let cfg = parse(
+            "http { ssl_session_cache shared:SSL:1m builtin:1000; ssl_session_tickets off;
+                    server { listen 443 ssl; ssl_certificate c; ssl_certificate_key k; }
+                    server { listen 444 ssl; ssl_certificate c; ssl_certificate_key k;
+                             ssl_session_cache none; } }",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.servers[0].ssl.resumption,
+            SessionResumption {
+                cache: Some(true),
+                tickets: Some(false)
+            }
+        );
+        assert_eq!(cfg.servers[1].ssl.resumption.cache, Some(false));
+        assert_eq!(cfg.servers[1].ssl.resumption.tickets, Some(false));
+        assert!(parse("http { ssl_session_cache bogus; }").is_err());
+        assert!(parse("http { ssl_session_tickets maybe; }").is_err());
     }
 
     #[test]

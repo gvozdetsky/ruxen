@@ -17,6 +17,7 @@ pub(crate) fn parse_server_block(
     inherited_ssl_ciphers: Option<&str>,
     inherited_ssl_prefer_server_ciphers: Option<bool>,
     inherited_ssl_session_timeout_ms: Option<u64>,
+    inherited_resumption: SessionResumption,
     inherited_client_max_body_size: Option<u64>,
     inherited_keepalive_timeout: Option<KeepaliveTimeout>,
     inherited_keepalive_requests: Option<u64>,
@@ -34,6 +35,7 @@ pub(crate) fn parse_server_block(
     let mut ssl_ciphers: Option<String> = None;
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
+    let mut resumption = SessionResumption::default();
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -121,6 +123,7 @@ pub(crate) fn parse_server_block(
                             .or(inherited_ssl_prefer_server_ciphers),
                         session_timeout_ms: ssl_session_timeout_ms
                             .or(inherited_ssl_session_timeout_ms),
+                        resumption: resumption.inherit(inherited_resumption),
                     };
                     let kat = keepalive_timeout.or(inherited_keepalive_timeout);
                     let kar = keepalive_requests.or(inherited_keepalive_requests);
@@ -289,10 +292,12 @@ pub(crate) fn parse_server_block(
             // also catches "ssl_session_cache shared:foo:1m" without a real
             // ssl_certificate, which is still a misconfiguration we want to
             // warn about.
+            (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                resumption.parse(name, &args)?;
+            }
             (
-                "ssl_session_cache"
-                | "ssl_session_tickets"
-                | "ssl_session_ticket_key"
+                "ssl_session_ticket_key"
                 | "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"

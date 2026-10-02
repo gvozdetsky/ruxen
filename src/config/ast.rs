@@ -310,6 +310,77 @@ pub struct ServerSsl {
     /// `None` means directive absent. The prepared TLS config wraps
     /// rustls's session cache and ticketer with this timeout.
     pub session_timeout_ms: Option<u64>,
+    /// `ssl_session_cache` / `ssl_session_tickets`, merged with http scope.
+    pub resumption: SessionResumption,
+}
+
+/// How TLS sessions can be resumed. `None` fields take nginx's defaults:
+/// no session-ID cache (`ssl_session_cache none`), tickets on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionResumption {
+    /// `ssl_session_cache`: `builtin` / `shared:…` = true, `off` / `none` =
+    /// false.
+    pub cache: Option<bool>,
+    /// `ssl_session_tickets on|off`.
+    pub tickets: Option<bool>,
+}
+
+impl SessionResumption {
+    /// Parse `ssl_session_cache` or `ssl_session_tickets` into `self`;
+    /// `false` when `name` is neither.
+    pub(crate) fn parse(
+        &mut self,
+        name: &str,
+        args: &[String],
+    ) -> Result<bool, super::error::Error> {
+        use super::error::Error;
+        match name {
+            "ssl_session_cache" => {
+                if self.cache.is_some() {
+                    return Err(Error::Duplicate("ssl_session_cache"));
+                }
+                // off | none | [builtin[:size]] [shared:name:size]
+                let enabled = match &args[1..] {
+                    [] => return Err(Error::MissingArg("ssl_session_cache")),
+                    [one] if one == "off" || one == "none" => false,
+                    caches => {
+                        for c in caches {
+                            if !(c == "builtin"
+                                || c.starts_with("builtin:")
+                                || c.starts_with("shared:"))
+                            {
+                                return Err(Error::BadValue {
+                                    what: "ssl_session_cache",
+                                    got: c.clone(),
+                                });
+                            }
+                        }
+                        true
+                    }
+                };
+                self.cache = Some(enabled);
+                Ok(true)
+            }
+            "ssl_session_tickets" => {
+                if self.tickets.is_some() {
+                    return Err(Error::Duplicate("ssl_session_tickets"));
+                }
+                self.tickets = Some(super::parse_location::parse_on_off_args(
+                    &args[1..],
+                    "ssl_session_tickets",
+                )?);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn inherit(self, parent: SessionResumption) -> SessionResumption {
+        SessionResumption {
+            cache: self.cache.or(parent.cache),
+            tickets: self.tickets.or(parent.tickets),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
