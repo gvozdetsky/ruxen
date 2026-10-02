@@ -580,3 +580,63 @@ fn m40_close_delimited_upstream_body_is_framed_for_keepalive_clients() {
     assert!(second.starts_with("HTTP/1.1 200"), "{text}");
     assert!(second.ends_with("alive"), "{text}");
 }
+
+/// nginx's proxy hides the upstream's Server, Date, X-Pad and X-Accel-*
+/// headers by default and writes its own Server and Date (#31), while
+/// `$upstream_http_*` still read the upstream's values.
+#[test]
+fn m40_upstream_server_date_and_x_accel_are_hidden() {
+    let backend = Backend::spawn(
+        b"HTTP/1.0 200 OK\r\nServer: backend/9.9\r\nDate: Mon, 01 Jan 2001 00:00:00 GMT\r\n\
+          X-Pad: avoid browser bug\r\nX-Accel-Expires: 10\r\nX-Accel-Redirect: /internal\r\n\
+          X-Accel-Buffering: no\r\nX-Custom: kept\r\nContent-Length: 2\r\n\r\nok"
+            .to_vec(),
+    );
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://127.0.0.1:{};
+            add_header X-Up-Server $upstream_http_server;
+            add_header X-Up-Date $upstream_http_date;
+            add_header X-Up-Accel $upstream_http_x_accel_expires;
+        }}
+    }}
+}}
+"#,
+        backend.addr.port()
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let resp = String::from_utf8_lossy(&http_get_close(port, "/")).into_owned();
+    let head = resp.split("\r\n\r\n").next().unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{resp}");
+    // Exactly one Server, ours.
+    let servers: Vec<&str> = head.lines().filter(|l| l.starts_with("Server: ")).collect();
+    assert_eq!(
+        servers,
+        [format!("Server: ruxen/{}", env!("CARGO_PKG_VERSION"))],
+        "{head}"
+    );
+    let dates: Vec<&str> = head.lines().filter(|l| l.starts_with("Date: ")).collect();
+    assert_eq!(dates.len(), 1, "{head}");
+    assert!(!dates[0].contains("2001"), "upstream Date leaked: {head}");
+    for hidden in [
+        "X-Pad:",
+        "X-Accel-Expires:",
+        "X-Accel-Redirect:",
+        "X-Accel-Buffering:",
+    ] {
+        assert!(!head.contains(hidden), "{hidden} leaked: {head}");
+    }
+    assert!(head.contains("\r\nX-Custom: kept"), "{head}");
+    // The variables see the upstream's own headers.
+    assert!(head.contains("\r\nX-Up-Server: backend/9.9"), "{head}");
+    assert!(
+        head.contains("\r\nX-Up-Date: Mon, 01 Jan 2001 00:00:00 GMT"),
+        "{head}"
+    );
+    assert!(head.contains("\r\nX-Up-Accel: 10"), "{head}");
+    assert!(resp.ends_with("\r\n\r\nok"));
+}

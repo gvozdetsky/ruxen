@@ -178,14 +178,14 @@ async fn settle_proxy_response(
     };
 
     let upstream_started = Instant::now();
-    let mut failures = Vec::new();
-    let upstream_resp = crate::proxy::run_proxy(plan, &mut failures).await;
+    let mut report = crate::proxy::ProxyReport::default();
+    let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
     let upstream_elapsed_ms = upstream_started.elapsed().as_millis() as u64;
-    if !failures.is_empty() {
+    if !report.failures.is_empty() {
         write_upstream_error_log(
             &process_meta.log,
             &ErrorLogRequest::new(ctx, process_meta.server_name),
-            &failures,
+            &report.failures,
         );
     }
     if let Response::Reroute(rr) = upstream_resp {
@@ -197,7 +197,13 @@ async fn settle_proxy_response(
     // upstream headers are visible to `$upstream_http_*` / `$upstream_cookie_*`.
     let mut process_meta = process_meta;
     process_meta.upstream_response_time_ms = Some(upstream_elapsed_ms);
-    let response = apply_proxy_add_headers(upstream_resp, http, ctx, &process_meta);
+    let response = apply_proxy_add_headers(
+        upstream_resp,
+        http,
+        ctx,
+        &process_meta,
+        &report.upstream_headers,
+    );
     (response, process_meta)
 }
 

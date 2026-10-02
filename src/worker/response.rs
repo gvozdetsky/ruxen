@@ -675,6 +675,7 @@ pub(crate) fn apply_proxy_add_headers(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
+    upstream_headers: &[u8],
 ) -> Response {
     let needs_expires = !matches!(meta.proxy_expires, PreparedExpires::Off);
     if meta.proxy_add_headers.is_empty() && meta.proxy_add_trailers.is_empty() && !needs_expires {
@@ -692,9 +693,8 @@ pub(crate) fn apply_proxy_add_headers(
         .unwrap_or(request_uri);
     let status = response_status(&bytes);
     let host = ctx.host.unwrap_or(b"");
-    // Copy the upstream header block into a side buffer so we can move
-    // `bytes` into `inject_add_headers` without borrowing conflict.
-    let upstream_headers_owned = upstream_header_block(&bytes).to_vec();
+    // `$upstream_http_*` read the upstream's own header lines, which still
+    // include the ones hidden from the client (Server, Date, X-Accel-*).
     let upstream_response_length: u64 = match bytes.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(p) => bytes.len().saturating_sub(p + 4) as u64,
         None => 0,
@@ -738,7 +738,7 @@ pub(crate) fn apply_proxy_add_headers(
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.proxy_host,
-        upstream_headers: &upstream_headers_owned,
+        upstream_headers,
         upstream_response_length: Some(upstream_response_length),
         upstream_response_time_ms: meta.upstream_response_time_ms,
         sent_trailers: &[],
@@ -772,22 +772,6 @@ pub(crate) fn apply_proxy_add_headers(
         out = inject_add_trailers(out, meta.proxy_add_trailers, &render_ctx);
     }
     Response::Owned(out)
-}
-
-/// Slice of the upstream response that contains every header line from
-/// after the status line up to and including the trailing `\r\n` of the
-/// last header (stops short of the empty CRLF that ends the header
-/// section). Returns `&[]` if the response isn't well-formed.
-pub(crate) fn upstream_header_block(response: &[u8]) -> &[u8] {
-    let Some(sep) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return &[];
-    };
-    let head = &response[..sep + 2];
-    let line_end = match head.windows(2).position(|w| w == b"\r\n") {
-        Some(i) => i + 2,
-        None => return &[],
-    };
-    &head[line_end..]
 }
 
 /// Whether the response status family permits a chunked-encoded body. nginx's
