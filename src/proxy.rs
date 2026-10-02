@@ -141,9 +141,10 @@ pub struct ProxyPlan {
     /// Keep the upstream's header lines in `ProxyReport` because the
     /// location's add_header / add_trailer may read `$upstream_http_*`.
     pub keep_upstream_headers: bool,
-    /// `proxy_redirect` rules; the worker applies them when
-    /// `ProxyReport::redirect_header` says there is something to rewrite.
-    pub redirects: &'static [crate::worker::PreparedRedirect],
+    /// Header rules for the response: `proxy_redirect` (applied by the
+    /// worker when `ProxyReport::redirect_header` is set), and the hide /
+    /// pass lists.
+    pub response: &'static crate::worker::ProxyResponseRules,
 }
 
 /// The temp file holding a large request body, and its length.
@@ -1185,7 +1186,21 @@ async fn attempt(
     // nginx hides the upstream's `Server` and `Date`
     // (`ngx_http_proxy_hide_headers`) and its header filter writes its own;
     // the worker write path stamps the date.
-    crate::http::write_server_and_date(&mut out, plan.server_bytes);
+    let rules = plan.response;
+    if rules.pass_mask & (HIDDEN_DATE | HIDDEN_SERVER) == 0 {
+        crate::http::write_server_and_date(&mut out, plan.server_bytes);
+    } else {
+        // `proxy_pass_header Server` / `Date`: the upstream's line stays,
+        // and ruxen doesn't write its own.
+        if rules.pass_mask & HIDDEN_SERVER == 0 {
+            out.extend_from_slice(b"\r\nServer: ");
+            out.extend_from_slice(plan.server_bytes);
+        }
+        if rules.pass_mask & HIDDEN_DATE == 0 {
+            out.extend_from_slice(b"\r\nDate: ");
+            out.extend_from_slice(&crate::http_date::now());
+        }
+    }
     out.extend_from_slice(b"\r\n");
     if plan.keep_upstream_headers {
         upstream_headers.clear();
@@ -1212,8 +1227,19 @@ async fn attempt(
             upstream_headers.extend_from_slice(line);
             upstream_headers.extend_from_slice(b"\r\n");
         }
-        match classify_upstream_header(name) {
-            UpstreamHeader::Dropped => continue,
+        let class = classify_upstream_header(name);
+        match class {
+            UpstreamHeader::HopByHop => continue,
+            UpstreamHeader::Hidden(bit) if rules.pass_mask & bit == 0 => continue,
+            _ if !rules.hide.is_empty()
+                && rules.hide.iter().any(|h| h.eq_ignore_ascii_case(name)) =>
+            {
+                continue;
+            }
+            _ => {}
+        }
+        match class {
+            UpstreamHeader::HopByHop | UpstreamHeader::Hidden(_) => {}
             // nginx keeps the first of a repeated single-valued header and
             // drops the rest (ngx_http_upstream_process_header_line).
             UpstreamHeader::Single(bit) => {
@@ -1227,7 +1253,7 @@ async fn attempt(
                     continue;
                 }
                 seen_single |= bit;
-                *redirect_header |= !plan.redirects.is_empty();
+                *redirect_header |= !rules.redirects.is_empty();
             }
             // Step 5 rejected Content-Length together with chunked, so a
             // Content-Length here is the upstream's own framing: keep it.
@@ -1490,12 +1516,13 @@ const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 /// How the response stitch treats one upstream header.
 #[derive(Debug, PartialEq, Eq)]
 enum UpstreamHeader {
-    /// Hop-by-hop, or hidden by default like nginx's
-    /// `ngx_http_proxy_hide_headers` (Date, Server, X-Pad, X-Accel-*): it
-    /// writes its own Date and Server, and X-Accel-* are instructions for
-    /// the proxy, not for clients (`proxy_pass_header` would re-enable
-    /// them; not implemented).
-    Dropped,
+    /// Hop-by-hop: never forwarded.
+    HopByHop,
+    /// Hidden by default like nginx's `ngx_http_proxy_hide_headers` (Date,
+    /// Server, X-Pad, X-Accel-*): it writes its own Date and Server, and
+    /// X-Accel-* are instructions for the proxy, not for clients.
+    /// `proxy_pass_header` lets one through; the bit identifies it.
+    Hidden(u16),
     /// Single-valued in nginx (`ngx_http_upstream_process_header_line` and
     /// friends): later copies are ignored. The bit tracks "seen".
     Single(u16),
@@ -1506,32 +1533,46 @@ enum UpstreamHeader {
     Other,
 }
 
+const HIDDEN_DATE: u16 = 1 << 0;
+const HIDDEN_SERVER: u16 = 1 << 1;
+
 /// One dispatch on the name's length, then at most a few compares: this
 /// runs for every upstream header line on the proxy hot path.
 fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
     use UpstreamHeader::*;
     let is = |h: &[u8]| name.eq_ignore_ascii_case(h);
     match name.len() {
-        2 if is(b"te") => Dropped,
-        4 if is(b"date") => Dropped,
+        2 if is(b"te") => HopByHop,
+        4 if is(b"date") => Hidden(HIDDEN_DATE),
         4 if is(b"etag") => Single(1 << 0),
-        5 if is(b"x-pad") => Dropped,
-        6 if is(b"server") => Dropped,
-        7 if is(b"upgrade") => Dropped,
+        5 if is(b"x-pad") => Hidden(1 << 2),
+        6 if is(b"server") => Hidden(HIDDEN_SERVER),
+        7 if is(b"upgrade") => HopByHop,
         7 if is(b"expires") => Single(1 << 1),
         7 if is(b"refresh") => Redirect(1 << 2),
-        8 if is(b"trailers") => Dropped,
+        8 if is(b"trailers") => HopByHop,
         8 if is(b"location") => Redirect(1 << 3),
-        10 if is(b"connection") || is(b"keep-alive") => Dropped,
+        10 if is(b"connection") || is(b"keep-alive") => HopByHop,
         12 if is(b"content-type") => Single(1 << 4),
         13 if is(b"last-modified") => Single(1 << 5),
         14 if is(b"content-length") => ContentLength,
-        15 if is(b"x-accel-expires") || is(b"x-accel-charset") => Dropped,
-        16 if is(b"x-accel-redirect") => Dropped,
-        17 if is(b"transfer-encoding") || is(b"x-accel-buffering") => Dropped,
-        18 if is(b"proxy-authenticate") || is(b"x-accel-limit-rate") => Dropped,
-        19 if is(b"proxy-authorization") => Dropped,
+        15 if is(b"x-accel-expires") => Hidden(1 << 3),
+        15 if is(b"x-accel-charset") => Hidden(1 << 4),
+        16 if is(b"x-accel-redirect") => Hidden(1 << 5),
+        17 if is(b"transfer-encoding") => HopByHop,
+        17 if is(b"x-accel-buffering") => Hidden(1 << 6),
+        18 if is(b"x-accel-limit-rate") => Hidden(1 << 7),
+        18 if is(b"proxy-authenticate") => HopByHop,
+        19 if is(b"proxy-authorization") => HopByHop,
         _ => Other,
+    }
+}
+
+/// The bit of a header nginx hides by default, for `proxy_pass_header`.
+pub fn default_hidden_bit(name: &[u8]) -> Option<u16> {
+    match classify_upstream_header(name) {
+        UpstreamHeader::Hidden(bit) => Some(bit),
+        _ => None,
     }
 }
 
@@ -1735,7 +1776,15 @@ mod tests {
             b"X-Accel-Limit-Rate",
             b"X-Accel-Buffering",
             b"X-Accel-Charset",
-            b"Connection",
+        ] {
+            assert!(
+                matches!(classify_upstream_header(name), Hidden(_)),
+                "{:?}",
+                name
+            );
+        }
+        for name in [
+            &b"Connection"[..],
             b"Keep-Alive",
             b"Transfer-Encoding",
             b"TE",
@@ -1744,7 +1793,7 @@ mod tests {
             b"Proxy-Authenticate",
             b"Proxy-Authorization",
         ] {
-            assert_eq!(classify_upstream_header(name), Dropped, "{:?}", name);
+            assert_eq!(classify_upstream_header(name), HopByHop, "{:?}", name);
         }
         for name in [&b"Expires"[..], b"content-type", b"ETag", b"Last-Modified"] {
             assert!(
@@ -1769,6 +1818,22 @@ mod tests {
             b"X-Accel-Other",
         ] {
             assert_eq!(classify_upstream_header(name), Other, "{:?}", name);
+        }
+        // Every hidden header has its own bit for proxy_pass_header.
+        let mut bits = 0u16;
+        for name in [
+            &b"date"[..],
+            b"server",
+            b"x-pad",
+            b"x-accel-expires",
+            b"x-accel-charset",
+            b"x-accel-redirect",
+            b"x-accel-buffering",
+            b"x-accel-limit-rate",
+        ] {
+            let bit = default_hidden_bit(name).unwrap();
+            assert_eq!(bits & bit, 0, "{:?}", name);
+            bits |= bit;
         }
     }
 }

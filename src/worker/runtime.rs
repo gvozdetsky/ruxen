@@ -178,7 +178,7 @@ async fn settle_proxy_response(
     };
 
     let upstream_started = Instant::now();
-    let redirects = plan.redirects;
+    let redirects = plan.response.redirects;
     let mut report = crate::proxy::ProxyReport::default();
     let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
     let upstream_elapsed_ms = upstream_started.elapsed().as_millis() as u64;

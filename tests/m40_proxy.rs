@@ -740,3 +740,60 @@ http {{
         "http://other.example/x"
     );
 }
+
+/// proxy_hide_header / proxy_pass_header: nginx's hidden set is its
+/// defaults, plus proxy_hide_header, minus proxy_pass_header; each list
+/// inherits on its own.
+#[test]
+fn m40_proxy_hide_and_pass_header() {
+    let backend = Backend::spawn(
+        b"HTTP/1.0 200 OK\r\nServer: backend/9.9\r\nX-Accel-Expires: 10\r\nX-Hide: secret\r\n\
+          X-Keep: yes\r\nContent-Length: 2\r\n\r\nok"
+            .to_vec(),
+    );
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        proxy_hide_header X-Hide;
+        location /inherit/ {{ proxy_pass http://127.0.0.1:{p}; }}
+        location /pass/ {{
+            proxy_pass http://127.0.0.1:{p};
+            proxy_pass_header Server;
+            proxy_pass_header X-Accel-Expires;
+        }}
+        location /own/ {{
+            proxy_pass http://127.0.0.1:{p};
+            proxy_hide_header X-Keep;
+        }}
+    }}
+}}
+"#,
+        p = backend.addr.port()
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let head = |path: &str| {
+        let resp = String::from_utf8_lossy(&http_get_close(port, path)).into_owned();
+        resp.split("\r\n\r\n").next().unwrap().to_string()
+    };
+    let ours = format!("Server: ruxen/{}", env!("CARGO_PKG_VERSION"));
+
+    let h = head("/inherit/");
+    assert!(!h.contains("X-Hide"), "{h}");
+    assert!(h.contains("\r\nX-Keep: yes"), "{h}");
+    assert!(h.contains(&ours) && !h.contains("backend/9.9"), "{h}");
+
+    // Passed headers come through, and ruxen doesn't add its own Server.
+    let h = head("/pass/");
+    let servers: Vec<&str> = h.lines().filter(|l| l.starts_with("Server:")).collect();
+    assert_eq!(servers, ["Server: backend/9.9"], "{h}");
+    assert!(h.contains("\r\nX-Accel-Expires: 10"), "{h}");
+    // The location's hide list is unset, so the server's still applies.
+    assert!(!h.contains("X-Hide"), "{h}");
+
+    // A location's own hide list replaces the server's.
+    let h = head("/own/");
+    assert!(!h.contains("X-Keep"), "{h}");
+    assert!(h.contains("\r\nX-Hide: secret"), "{h}");
+}

@@ -512,6 +512,10 @@ pub struct Server {
     /// Server-scope `proxy_redirect` directives. `None` inherits (nginx's
     /// implicit `default`).
     pub proxy_redirect: Option<ProxyRedirect>,
+    /// Server-scope `proxy_hide_header` / `proxy_pass_header` names.
+    /// `None` inherits.
+    pub proxy_hide_headers: Option<Vec<String>>,
+    pub proxy_pass_headers: Option<Vec<String>>,
     /// Server-scope `chunked_transfer_encoding on|off;`. `None` inherits the
     /// nginx default (`on`). When `false`, response bodies stay framed by
     /// `Content-Length` and `add_trailer` directives are silently dropped
@@ -656,6 +660,10 @@ pub struct Location {
     pub proxy_intercept_errors: Option<bool>,
     /// Location-scope `proxy_redirect` directives. `None` inherits.
     pub proxy_redirect: Option<ProxyRedirect>,
+    /// Location-scope `proxy_hide_header` / `proxy_pass_header` names.
+    /// `None` inherits.
+    pub proxy_hide_headers: Option<Vec<String>>,
+    pub proxy_pass_headers: Option<Vec<String>>,
     /// Location-scope `chunked_transfer_encoding on|off;`. `None` inherits
     /// from server scope, which itself defaults to nginx's `on`. When
     /// `false`, the response body uses `Content-Length` framing and any
