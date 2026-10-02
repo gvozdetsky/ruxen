@@ -265,6 +265,7 @@ pub(crate) fn parse_server_block(
                 }
                 let v = args.get(1).ok_or(Error::MissingArg("ssl_ciphers"))?;
                 ssl_ciphers = Some(v.clone());
+                warn_ignored_tls_policy(&args, warnings);
             }
             ("ssl_prefer_server_ciphers", Terminator::Semi) => {
                 saw_any_ssl_directive = true;
@@ -313,6 +314,7 @@ pub(crate) fn parse_server_block(
                 Terminator::Semi,
             ) => {
                 saw_any_ssl_directive = true;
+                warn_ignored_tls_policy(&args, warnings);
             }
             ("server_name", Terminator::Semi) => {
                 if args.len() < 2 {

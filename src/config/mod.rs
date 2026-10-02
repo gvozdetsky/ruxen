@@ -144,6 +144,21 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
+            // `user name [group];` — recorded so `main` can refuse a switch
+            // it can't make (see `check_privileges`).
+            ("user", Terminator::Semi) => {
+                if runtime.user.is_some() {
+                    return Err(Error::Duplicate("user"));
+                }
+                let user = args.get(1).ok_or(Error::MissingArg("user"))?;
+                runtime.user = Some(user.clone());
+            }
+            ("user", _) => {
+                return Err(Error::WrongTerminator {
+                    name: name.into(),
+                    ctx: "top-level",
+                });
+            }
             (n, Terminator::Semi) if is_ignored_stmt(n) => {}
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(&mut lx)?,
             _ => {
@@ -383,6 +398,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 let v = args.get(1).ok_or(Error::MissingArg("ssl_ciphers"))?;
                 ssl_ciphers = Some(v.clone());
+                warn_ignored_tls_policy(&args, &mut warnings);
             }
             ("ssl_prefer_server_ciphers", Terminator::Semi) => {
                 if ssl_prefer_server_ciphers.is_some() {
@@ -421,7 +437,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_reject_handshake"
                 | "ssl_conf_command",
                 Terminator::Semi,
-            ) => {}
+            ) => warn_ignored_tls_policy(&args, &mut warnings),
             (
                 "log_format"
                 | "access_log"
@@ -612,7 +628,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "worker_rlimit_nofile",
     "worker_rlimit_core",
     "worker_shutdown_timeout",
-    "user",
     "load_module",
     "error_log",
     "timer_resolution",
@@ -675,8 +690,9 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "msie_padding",
     "msie_refresh",
     "disable_symlinks",
+    // Without allow/deny (not implemented, so an error), `satisfy any`
+    // and `all` both reduce to auth_basic alone.
     "satisfy",
-    "internal",
     // DNS resolver (we don't proxy, these are swallowed preamble)
     "resolver",
     "resolver_timeout",
@@ -750,7 +766,60 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
 ];
 
 /// Block directives whose body we swallow wholesale (no inner parsing).
-pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "types", "limit_except", "charset_map"];
+pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "types", "charset_map"];
+
+/// Fail closed on directives that restrict access, when ruxen can't
+/// enforce them yet. The allowlist above is for tuning knobs; silently
+/// dropping one of these would serve what the config says to protect.
+/// Forms nginx itself doesn't enforce still load: `ssl_verify_client off`,
+/// and `optional` / `optional_no_ca`, where nginx admits clients without a
+/// certificate and the config decides via `$ssl_client_verify` — which
+/// ruxen renders as `NONE`, so a `= SUCCESS` check denies (see
+/// `warn_ignored_tls_policy`).
+/// Called by the lexer for every directive, so no scope can miss it.
+pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
+    let value = args.get(1).map(String::as_str);
+    let consequence = match args.first().map(String::as_str) {
+        Some("internal") => "the location would be reachable by external requests",
+        Some("limit_except") => "the method restrictions inside it would not apply",
+        Some("ssl_verify_client") if value == Some("on") => {
+            "clients would be accepted without a certificate"
+        }
+        Some("ssl_reject_handshake") if value == Some("on") => {
+            "handshakes for unknown names would complete with the default certificate"
+        }
+        _ => return Ok(()),
+    };
+    Err(Error::Unenforced {
+        name: args[0].clone(),
+        consequence,
+    })
+}
+
+/// Accepted with a warning: `ssl_ciphers` / `ssl_ecdh_curve`, because
+/// rustls offers only AEAD suites and modern groups, so ignoring a
+/// restriction can't enable a weak cipher, and nearly every real TLS
+/// config sets them; `ssl_verify_client optional*` (see above).
+pub(crate) fn warn_ignored_tls_policy(args: &[String], warnings: &mut Vec<String>) {
+    let name = args[0].as_str();
+    let w = match (name, args.get(1).map(String::as_str)) {
+        ("ssl_ciphers", _) => format!(
+            "\"{name}\" is not supported yet and is ignored: rustls's default cipher suites are used"
+        ),
+        ("ssl_ecdh_curve", _) => format!(
+            "\"{name}\" is not supported yet and is ignored: rustls's default key exchange groups \
+             are used"
+        ),
+        ("ssl_verify_client", Some(mode @ ("optional" | "optional_no_ca"))) => format!(
+            "\"ssl_verify_client {mode}\" is not supported yet: client certificates are not \
+             requested, and $ssl_client_verify is always \"NONE\""
+        ),
+        _ => return,
+    };
+    if !warnings.contains(&w) {
+        warnings.push(w);
+    }
+}
 
 #[inline]
 pub(crate) fn is_ignored_stmt(name: &str) -> bool {
@@ -1278,6 +1347,80 @@ mod tests {
             cfg.servers[0].ssl.ciphers.as_deref(),
             Some("HIGH:!aNULL:!MD5")
         );
+    }
+
+    fn unenforced_err(src: &str) -> String {
+        match parse(src) {
+            Err(e @ Error::Unenforced { .. }) => e.to_string(),
+            other => panic!("expected Unenforced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn access_restrictions_ruxen_cant_enforce_are_rejected() {
+        let err =
+            unenforced_err("http { server { listen 80; location /a/ { internal; return 200; } } }");
+        assert_eq!(
+            err,
+            "\"internal\" is not supported yet, and ignoring it is unsafe: \
+             the location would be reachable by external requests"
+        );
+        unenforced_err(
+            "http { server { listen 80; location / { limit_except GET { deny all; } } } }",
+        );
+        let tls = |directive: &str| {
+            format!(
+                "http {{ {directive} server {{ listen 443 ssl; ssl_certificate c.pem; \
+                 ssl_certificate_key k.pem; {directive} }} }}"
+            )
+        };
+        unenforced_err(&tls("ssl_verify_client on;"));
+        unenforced_err(&tls("ssl_reject_handshake on;"));
+        // The forms nginx doesn't enforce either still load; `optional*`
+        // warns (nginx admits certless clients there too, and ruxen's
+        // `$ssl_client_verify` is always NONE, never SUCCESS).
+        parse(&tls("ssl_verify_client off;")).unwrap();
+        for mode in ["optional", "optional_no_ca"] {
+            let cfg = parse(&tls(&format!("ssl_verify_client {mode};"))).unwrap();
+            let expected = format!("\"ssl_verify_client {mode}\" is not supported yet");
+            assert!(
+                cfg.warnings.iter().any(|w| w.starts_with(&expected)),
+                "{:?}",
+                cfg.warnings
+            );
+        }
+        parse(&tls("ssl_reject_handshake off;")).unwrap();
+        parse(&tls("ssl_client_certificate ca.pem;")).unwrap();
+    }
+
+    #[test]
+    fn ignored_tls_policy_warns_once() {
+        let cfg = parse(
+            r#"
+            http {
+                ssl_ciphers HIGH;
+                server { listen 443 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem;
+                         ssl_ciphers HIGH; ssl_ecdh_curve X25519; }
+                server { listen 444 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem;
+                         ssl_ecdh_curve X25519; }
+            }
+        "#,
+        )
+        .unwrap();
+        let tls_warnings: Vec<&String> = cfg
+            .warnings
+            .iter()
+            .filter(|w| w.contains("rustls's default"))
+            .collect();
+        assert_eq!(tls_warnings.len(), 2, "{:?}", cfg.warnings);
+        assert!(tls_warnings[0].starts_with("\"ssl_ciphers\" is not supported yet"));
+        assert!(tls_warnings[1].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
+    }
+
+    #[test]
+    fn user_directive_is_recorded() {
+        let cfg = parse("user www-data www-data;\nhttp { }").unwrap();
+        assert_eq!(cfg.runtime.user.as_deref(), Some("www-data"));
     }
 
     #[test]
@@ -2212,7 +2355,6 @@ mod tests {
                 charset utf-8;
                 types_hash_bucket_size 64;
                 map_hash_bucket_size 128;
-                limit_except GET { }
 
                 server {
                     listen 80;
@@ -2220,10 +2362,8 @@ mod tests {
                     keepalive_timeout 30s;
                     error_page 404 /404.html;
                     expires 1h;
-                    limit_except GET POST { }
 
                     location / {
-                        internal;
                         expires epoch;
                         error_page 500 /fail.html;
                         return 200 "ok";

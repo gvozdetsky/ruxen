@@ -431,3 +431,52 @@ http {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hostile or broken upstream response must cost one 502, not the
+/// server: a chunk size near `u64::MAX` used to overflow and panic the
+/// worker (taking the process down), and a huge `Content-Length` was
+/// reserved up front and aborted the process on allocation.
+#[test]
+fn m40_malformed_upstream_framing_is_502_and_server_survives() {
+    let responses: [&[u8]; 2] = [
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1000000000000\r\n\r\nabc",
+    ];
+    for response in responses {
+        let backend = Backend::spawn(response.to_vec());
+        let conf = format!(
+            r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location /up/ {{
+            proxy_pass http://127.0.0.1:{};
+        }}
+        location /alive {{
+            return 200 "alive";
+        }}
+    }}
+}}
+"#,
+            backend.addr.port()
+        );
+        let (mut guard, port, _dir) = spawn_ruxen(&conf);
+
+        let resp = http_get_close(port, "/up/");
+        assert_eq!(
+            status_code(&resp),
+            502,
+            "upstream {:?}: {}",
+            String::from_utf8_lossy(response),
+            String::from_utf8_lossy(&resp)
+        );
+        assert!(
+            guard.child.try_wait().unwrap().is_none(),
+            "ruxen exited after upstream {:?}",
+            String::from_utf8_lossy(response)
+        );
+        let resp = http_get_close(port, "/alive");
+        assert_eq!(status_code(&resp), 200);
+        assert_eq!(body(&resp), b"alive");
+    }
+}

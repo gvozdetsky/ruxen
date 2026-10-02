@@ -35,6 +35,12 @@ pub enum Error {
         path: String,
         reason: String,
     },
+    /// A security-relevant directive ruxen can't enforce yet. Ignoring it
+    /// would leave a config that looks protected and isn't.
+    Unenforced {
+        name: String,
+        consequence: &'static str,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -62,6 +68,10 @@ impl std::fmt::Display for Error {
             Error::IncludeOpen { path, reason } => {
                 write!(f, "open() \"{path}\" failed ({reason})")
             }
+            Error::Unenforced { name, consequence } => write!(
+                f,
+                "\"{name}\" is not supported yet, and ignoring it is unsafe: {consequence}"
+            ),
         }
     }
 }

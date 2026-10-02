@@ -148,6 +148,7 @@ impl Lexer {
                 self.push_include(&args[1])?;
                 continue;
             }
+            super::reject_unenforced(&args)?;
             return Ok((args, term));
         }
     }
