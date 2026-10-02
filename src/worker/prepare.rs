@@ -251,33 +251,38 @@ pub(crate) fn build_listen_tls(
 ) -> Result<Option<Arc<crate::tls::TlsAcceptor>>, String> {
     use crate::config::ServerNameSpec;
 
+    // As in nginx, `ssl` belongs to the listening socket: one `listen …
+    // ssl` makes every server on the address TLS (ngx_http.c:
+    // `ssl = lsopt->ssl || addr[i].opt.ssl`).
     if !inputs.iter().any(|i| i.ssl_listen) {
         return Ok(None);
     }
+    // The address's default server — `default_server`, else the first —
+    // must have a certificate (ngx_http_ssl_init); the others join SNI
+    // when they have one and otherwise get the default's.
+    let default_idx = inputs.iter().position(|i| i.default_server).unwrap_or(0);
+    let default = &inputs[default_idx];
+    if default.ssl.certs.is_empty() {
+        return Err(format!(
+            "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive \
+             (listen {addr})"
+        ));
+    }
+    // One rustls config per address: protocols and the session timeout
+    // follow the default server.
+    let protocols = default.ssl.protocols;
+    let session_timeout_secs = default
+        .ssl
+        .session_timeout_ms
+        .map(|ms| (ms / 1000).clamp(1, u32::MAX as u64) as u32);
 
     let mut resolver = crate::tls_certs::ServerNameResolver::new();
     let mut default_keys: Vec<Arc<rustls::sign::CertifiedKey>> = Vec::new();
-    let mut default_idx: Option<usize> = None;
-    let mut protocols = crate::config::TlsVersionSet::default();
-    let mut saw_protocols = false;
-    let mut session_timeout_secs: Option<u32> = None;
 
     for (idx, input) in inputs.iter().enumerate() {
-        if !input.ssl_listen {
+        if input.ssl.certs.is_empty() {
             continue;
         }
-        if input.ssl.certs.is_empty() {
-            panic!(
-                "ruxen: listen {addr}: server with `listen ssl;` has no ssl_certificate \
-                 (parser should have caught this; reaching prepare with an empty cert list \
-                 is a bug)"
-            );
-        }
-        if !saw_protocols {
-            protocols = input.ssl.protocols;
-            saw_protocols = true;
-        }
-
         let mut keys: Vec<Arc<rustls::sign::CertifiedKey>> =
             Vec::with_capacity(input.ssl.certs.len());
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
@@ -311,22 +316,8 @@ pub(crate) fn build_listen_tls(
                 }
             }
         }
-
-        // Default cert ladder: explicit `default_server` flag wins; otherwise
-        // the first ssl server on this listen.
-        if default_idx.is_none() || (input.default_server && default_idx != Some(idx)) {
-            if input.default_server || default_idx.is_none() {
-                default_keys = keys;
-                default_idx = Some(idx);
-                // Per-listener session timeout follows the default server.
-                // Multiple ssl servers on one listen share one rustls
-                // ServerConfig; nginx behaves the same way (the directive
-                // is effectively a per-listen knob).
-                session_timeout_secs = input
-                    .ssl
-                    .session_timeout_ms
-                    .map(|ms| (ms / 1000).clamp(1, u32::MAX as u64) as u32);
-            }
+        if idx == default_idx {
+            default_keys = keys;
         }
     }
 

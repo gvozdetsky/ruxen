@@ -356,6 +356,9 @@ pub struct Server {
     /// `client_header_timeout` / `client_body_timeout` / `send_timeout`,
     /// merged with the http-scope values.
     pub client_timeouts: ClientTimeouts,
+    /// The block has its own ssl_* lines (for the "TLS settings ignored"
+    /// warning when no server on its address listens with `ssl`).
+    pub ssl_directives: bool,
     /// `merge_slashes off` disables the `//` → `/` collapse in URI
     /// normalization. Default (`true`) matches nginx's default `on`.
     pub merge_slashes: bool,

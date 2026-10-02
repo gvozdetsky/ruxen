@@ -348,6 +348,46 @@ fn sni_dispatch() {
     );
 }
 
+/// `ssl` belongs to the listening socket (#41): server B's own `listen`
+/// has no `ssl`, but A's does, so B is TLS too and its certificate is
+/// served for SNI `b.test` (nginx: `ssl = lsopt->ssl || addr[i].opt.ssl`).
+const SSL_PER_LISTEN_CONF: &str = r#"
+daemon off;
+events { }
+
+http {
+    server {
+        listen 127.0.0.1:%%PORT%% ssl;
+        server_name a.test;
+        ssl_certificate     %%CERT_0%%;
+        ssl_certificate_key %%KEY_0%%;
+        location / { return 200 "server-A\n"; }
+    }
+
+    server {
+        listen 127.0.0.1:%%PORT%%;
+        server_name b.test;
+        ssl_certificate     %%CERT_1%%;
+        ssl_certificate_key %%KEY_1%%;
+        location / { return 200 "server-B\n"; }
+    }
+}
+"#;
+
+#[test]
+fn ssl_is_a_property_of_the_listen_address() {
+    let cert_a = make_ca_and_leaf("a.test");
+    let cert_b = make_ca_and_leaf("b.test");
+    let ca_b = cert_b.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server_multi(SSL_PER_LISTEN_CONF, vec![cert_a, cert_b]);
+
+    // Verifying against B's CA only succeeds if B's certificate is served.
+    let resp = curl_get(server.port, "b.test", "/", Some(&ca_b), false);
+    assert!(resp.ok, "b.test curl failed: stderr={}", resp.stderr);
+    assert_eq!(resp.status(), Some(200), "stdout={}", resp.stdout);
+    assert!(resp.stdout.contains("server-B"), "{}", resp.stdout);
+}
+
 const WILDCARD_SNI_CONF: &str = r#"
 daemon off;
 events { }
