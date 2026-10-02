@@ -49,12 +49,12 @@ See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status.
 ### Requirements
 
 - Linux on x86_64 with `io_uring` available. ruxen is developed and tested on kernels 6.x–7.0. `io_uring` must not be turned off with the `kernel.io_uring_disabled` sysctl.
-- To build from source (including `cargo install`): Rust 1.88 or newer, plus `cmake` and a C compiler for the `aws-lc-rs` crypto backend that rustls uses.
+- To build from source (including `cargo install`): Rust 1.88 or newer, plus `cmake` and a C compiler for the `aws-lc-rs` crypto backend that rustls uses. aws-lc refuses GCC 9 (`Your compiler (cc) is not supported due to a memcmp related bug`); on Ubuntu 20.04, install `gcc-10 g++-10` and build with `CC=gcc-10 CXX=g++-10`.
 - `curl` to try the server.
 
 ### Install
 
-**Prebuilt binary** (x86_64 Linux, glibc 2.35 or newer) from [GitHub Releases](https://github.com/gvozdetsky/ruxen/releases):
+**Prebuilt binary** (x86_64 Linux, glibc 2.35 or newer — Ubuntu 22.04, Debian 12 and later; on older systems it fails with ``version `GLIBC_2.34' not found``, so build from source) from [GitHub Releases](https://github.com/gvozdetsky/ruxen/releases):
 
 ```bash
 curl -LO https://github.com/gvozdetsky/ruxen/releases/download/v0.1.0/ruxen-v0.1.0-x86_64-linux-gnu.tar.gz
@@ -105,12 +105,14 @@ http {
 }
 ```
 
-Check the configuration (a valid one exits with status 0 and prints nothing), then start the server in the foreground:
+Check the configuration, then start the server in the foreground:
 
 ```bash
 ruxen -t -c examples/minimal.conf
 ruxen -c examples/minimal.conf
 ```
+
+As with nginx, a valid configuration prints `… syntax is ok` and `… test is successful` (on stderr; `-q` silences them) and exits with status 0.
 
 Then, from another terminal:
 
@@ -229,6 +231,7 @@ The currently implemented nginx-style command-line surface includes:
 -g
 -t
 -T
+-q
 -V
 ```
 

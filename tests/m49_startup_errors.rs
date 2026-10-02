@@ -225,3 +225,32 @@ fn http_without_servers_starts() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn test_mode_reports_success_like_nginx() {
+    let dir = TempDir::new("ok");
+    let conf = dir.write_conf("server { listen 127.0.0.1:1; location / { return 200 ok; } }");
+
+    let out = run_expecting_exit(ruxen(&dir, &conf, &["-t"]));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let conf = conf.canonicalize().unwrap();
+    assert_eq!(
+        stderr,
+        format!(
+            "ruxen: the configuration file {0} syntax is ok\n\
+             ruxen: configuration file {0} test is successful\n",
+            conf.display()
+        )
+    );
+    assert!(out.stdout.is_empty());
+
+    // `-q` keeps only errors.
+    let out = run_expecting_exit(ruxen(&dir, &conf, &["-t", "-q"]));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
