@@ -29,7 +29,7 @@ use crate::config::{
 };
 use crate::http::{self, Method, Parse, ParseState, READ_BUF};
 use crate::phase::{self, Response};
-use crate::{autoindex, file, fs_resolve, uri};
+use crate::{autoindex, file, fs_resolve, http_date, uri};
 
 use super::*;
 
@@ -1149,6 +1149,9 @@ pub(crate) struct ResponseHeaderScan {
     pub(crate) has_connection: bool,
     pub(crate) connection_is_close: bool,
     pub(crate) has_keep_alive: bool,
+    /// Offset of the `Date` value when the head has a `Date: ` line with an
+    /// IMF-fixdate (`http_date::LEN` bytes) — what `stamp_date` overwrites.
+    pub(crate) date_at: Option<usize>,
 }
 
 pub(crate) fn scan_response_headers(bytes: &[u8]) -> Option<ResponseHeaderScan> {
@@ -1178,9 +1181,40 @@ pub(crate) fn scan_response_headers(bytes: &[u8]) -> Option<ResponseHeaderScan> 
             }
         } else if name.eq_ignore_ascii_case(b"Keep-Alive") {
             scan.has_keep_alive = true;
+        } else if name.eq_ignore_ascii_case(b"Date")
+            && line.len() == colon + 2 + http_date::LEN
+            && line[colon + 1] == b' '
+        {
+            scan.date_at = Some(line.as_ptr() as usize - bytes.as_ptr() as usize + colon + 2);
         }
     }
     Some(scan)
+}
+
+/// Put the current time into a finished response head: overwrite the `Date`
+/// value the builder wrote (prebuilt heads carry the time they were built),
+/// or add the header at the end of the head if it has none. nginx's header
+/// filter writes `Date` into every response the same way.
+pub(crate) fn stamp_date(response: &mut Vec<u8>, scan: &mut ResponseHeaderScan) {
+    let now = http_date::now();
+    if let Some(at) = scan.date_at {
+        response[at..at + http_date::LEN].copy_from_slice(&now);
+        return;
+    }
+    let mut line = [0u8; 6 + http_date::LEN + 2];
+    line[..6].copy_from_slice(b"Date: ");
+    line[6..6 + http_date::LEN].copy_from_slice(&now);
+    line[6 + http_date::LEN..].copy_from_slice(b"\r\n");
+    let at = scan.head_end + 2 + 6;
+    insert_header_at(response, &mut scan.head_end, &line);
+    scan.date_at = Some(at);
+}
+
+/// `stamp_date` for the early-error paths, which don't keep a scan.
+pub(crate) fn refresh_date_header(response: &mut Vec<u8>) {
+    if let Some(mut scan) = scan_response_headers(response) {
+        stamp_date(response, &mut scan);
+    }
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]

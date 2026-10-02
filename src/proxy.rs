@@ -862,6 +862,10 @@ async fn attempt(
     let mut out = Vec::with_capacity(head_end + 64 + body_len);
     out.extend_from_slice(b"HTTP/1.1");
     out.extend_from_slice(&accum[8..first_line_end]);
+    // nginx hides the upstream's `Date` (`ngx_http_proxy_hide_headers`) and
+    // its header filter writes its own; the worker write path stamps it.
+    out.extend_from_slice(b"\r\nDate: ");
+    out.extend_from_slice(&crate::http_date::now());
     out.extend_from_slice(b"\r\n");
     let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
     let mut have_content_length = false;
@@ -880,7 +884,7 @@ async fn attempt(
             None => continue,
         };
         let name = trim_ascii(&line[..colon]);
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || name.eq_ignore_ascii_case(b"date") {
             continue;
         }
         // We re-framed chunked → identity, so drop the original

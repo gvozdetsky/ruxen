@@ -356,8 +356,7 @@ fn build_content_headers(
         .unwrap_or(meta.size);
     let mut out = Vec::with_capacity(256);
     write_status_line(&mut out, status);
-    out.extend_from_slice(b"\r\nServer: ");
-    out.extend_from_slice(server);
+    crate::http::write_server_and_date(&mut out, server);
     out.extend_from_slice(b"\r\nAccept-Ranges: bytes");
     out.extend_from_slice(b"\r\nContent-Type: ");
     out.extend_from_slice(meta.mime);
@@ -382,9 +381,7 @@ fn build_content_headers(
 fn build_not_modified_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     write_status_line(&mut out, 304);
-    out.extend_from_slice(b"\r\nServer: ");
-    out.extend_from_slice(server);
-    out.extend_from_slice(b"\r\nAccept-Ranges: bytes");
+    crate::http::write_server_and_date(&mut out, server);
     out.extend_from_slice(b"\r\nLast-Modified: ");
     out.extend_from_slice(&meta.last_modified);
     out.extend_from_slice(b"\r\nETag: ");
@@ -396,8 +393,7 @@ fn build_not_modified_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
 fn build_range_not_satisfiable_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     write_status_line(&mut out, 416);
-    out.extend_from_slice(b"\r\nServer: ");
-    out.extend_from_slice(server);
+    crate::http::write_server_and_date(&mut out, server);
     out.extend_from_slice(b"\r\nAccept-Ranges: bytes");
     out.extend_from_slice(b"\r\nContent-Range: bytes */");
     write_u64(&mut out, meta.size);
@@ -1775,7 +1771,9 @@ mod tests {
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 304 Not Modified\r\n"));
         assert!(!s.contains("Content-Length:"));
-        assert!(s.contains("Accept-Ranges: bytes\r\n"));
+        // nginx's not_modified filter clears Accept-Ranges on a 304.
+        assert!(!s.contains("Accept-Ranges"));
+        assert!(s.contains("\r\nServer: nginx/1.29.2\r\nDate: "));
         assert!(s.ends_with("\r\n\r\n"));
     }
 

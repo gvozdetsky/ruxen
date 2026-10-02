@@ -725,6 +725,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             scratch.clear();
                             scratch.extend_from_slice(http.bad_request.pick(Method::Other));
                             inject_connection_header(&mut *scratch, true);
+                            refresh_date_header(&mut *scratch);
                             let taken = std::mem::take(&mut *scratch);
                             let _ = stream.write_all(taken).await;
                             return;
@@ -746,6 +747,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 scratch.clear();
                                 scratch.extend_from_slice(http.bad_request.pick(method));
                                 inject_connection_header(&mut *scratch, true);
+                                refresh_date_header(&mut *scratch);
                                 let taken = std::mem::take(&mut *scratch);
                                 let _ = stream.write_all(taken).await;
                                 return;
@@ -756,6 +758,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch.clear();
                                     scratch.extend_from_slice(http.not_implemented.pick(method));
                                     inject_connection_header(&mut *scratch, true);
+                                    refresh_date_header(&mut *scratch);
                                     let taken = std::mem::take(&mut *scratch);
                                     let _ = stream.write_all(taken).await;
                                     return;
@@ -764,6 +767,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch.clear();
                                     scratch.extend_from_slice(http.bad_request.pick(method));
                                     inject_connection_header(&mut *scratch, true);
+                                    refresh_date_header(&mut *scratch);
                                     let taken = std::mem::take(&mut *scratch);
                                     let _ = stream.write_all(taken).await;
                                     return;
@@ -780,6 +784,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch.clear();
                                     scratch.extend_from_slice(http.bad_request.pick(method));
                                     inject_connection_header(&mut *scratch, true);
+                                    refresh_date_header(&mut *scratch);
                                     let taken = std::mem::take(&mut *scratch);
                                     let _ = stream.write_all(taken).await;
                                     return;
@@ -794,6 +799,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch.clear();
                                     scratch.extend_from_slice(http.bad_request.pick(method));
                                     inject_connection_header(&mut *scratch, true);
+                                    refresh_date_header(&mut *scratch);
                                     let taken = std::mem::take(&mut *scratch);
                                     let _ = stream.write_all(taken).await;
                                     return;
@@ -891,6 +897,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch.clear();
                                     scratch.extend_from_slice(http.bad_request.pick(method));
                                     inject_connection_header(&mut *scratch, true);
+                                    refresh_date_header(&mut *scratch);
                                     let taken = std::mem::take(&mut *scratch);
                                     let _ = stream.write_all(taken).await;
                                     return;
@@ -933,6 +940,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         scratch.clear();
                                         scratch.extend_from_slice(http.bad_request.pick(method));
                                         inject_connection_header(&mut *scratch, true);
+                                        refresh_date_header(&mut *scratch);
                                         let taken = std::mem::take(&mut *scratch);
                                         let _ = stream.write_all(taken).await;
                                         return;
@@ -1065,7 +1073,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // requests stay allocation-free.
                         let mut scan = match prebuilt_base {
                             Some(bytes) => cached_scan_response_headers(bytes),
-                            None => scan_response_headers(&scratch).unwrap_or_default(),
+                            None => {
+                                let mut scan = scan_response_headers(&scratch).unwrap_or_default();
+                                stamp_date(&mut *scratch, &mut scan);
+                                scan
+                            }
                         };
                         let mut close_after = !keep_alive
                             || !process_meta.keepalive.allow
@@ -1108,12 +1120,18 @@ pub(crate) async fn handle<S: ConnIo>(
                                     process_meta.keepalive.header_timeout_secs
                                 },
                             );
-                            let (res, _) = stream.write_all(variant.bytes).await;
+                            // The cached variant is shared and its `Date` is
+                            // from when it was built: send a stamped copy.
+                            scratch.extend_from_slice(variant.bytes);
+                            scan = variant.scan;
+                            stamp_date(&mut *scratch, &mut scan);
+                            let taken = std::mem::take(&mut *scratch);
+                            let (res, returned) = stream.write_all(taken).await;
+                            *scratch = returned;
                             if res.is_err() {
                                 return;
                             }
-                            scan = variant.scan;
-                            response_for_logs = variant.bytes;
+                            response_for_logs = &*scratch;
                         } else {
                             if !close_after && !scan.has_keep_alive {
                                 if let Some(timeout_secs) =
@@ -1259,6 +1277,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         scratch.clear();
                         scratch.extend_from_slice(http.bad_request.pick(method));
                         inject_connection_header(&mut *scratch, true);
+                        refresh_date_header(&mut *scratch);
                         let taken = std::mem::take(&mut *scratch);
                         let _ = stream.write_all(taken).await;
                         return;

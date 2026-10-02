@@ -1286,6 +1286,18 @@ pub fn server_header_value(t: crate::config::ServerTokens) -> &'static [u8] {
     }
 }
 
+/// Write the `Server` and `Date` lines that open every response head, in
+/// nginx's order (`ngx_http_header_filter`). Called right after the status
+/// line; the caller continues with the next `\r\n`. The worker write path
+/// re-stamps `Date` before sending, so prebuilt heads built at config time
+/// carry a current value too.
+pub fn write_server_and_date(out: &mut Vec<u8>, server: &[u8]) {
+    out.extend_from_slice(b"\r\nServer: ");
+    out.extend_from_slice(server);
+    out.extend_from_slice(b"\r\nDate: ");
+    out.extend_from_slice(&crate::http_date::now());
+}
+
 /// Default error-page body (`<html>...<center>nginx/X.Y.Z</center>...`)
 /// for the given status. `None` if the status doesn't have a canned
 /// nginx page (matches `ngx_http_error_pages` in
@@ -1406,8 +1418,7 @@ pub fn write_redirect_response(
     write_u16(out, status);
     out.push(b' ');
     out.extend_from_slice(reason.as_bytes());
-    out.extend_from_slice(b"\r\nServer: ");
-    out.extend_from_slice(server);
+    write_server_and_date(out, server);
     out.extend_from_slice(b"\r\nLocation: ");
     out.extend_from_slice(location);
     out.extend_from_slice(b"\r\nContent-Type: text/html\r\nContent-Length: ");
@@ -1502,8 +1513,7 @@ fn write_head_with_content_type(
     write_u16(out, status);
     out.push(b' ');
     out.extend_from_slice(reason.as_bytes());
-    out.extend_from_slice(b"\r\nServer: ");
-    out.extend_from_slice(server);
+    write_server_and_date(out, server);
     out.extend_from_slice(b"\r\nContent-Type: ");
     out.extend_from_slice(content_type);
     out.extend_from_slice(b"\r\nContent-Length: ");

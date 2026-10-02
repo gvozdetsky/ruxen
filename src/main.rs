@@ -22,6 +22,7 @@ mod config;
 mod file;
 mod fs_resolve;
 mod http;
+mod http_date;
 mod phase;
 mod proxy;
 mod tls;
