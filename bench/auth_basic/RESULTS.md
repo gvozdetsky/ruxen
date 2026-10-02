@@ -20,6 +20,7 @@ Captured 2026-10-01T19:37:18Z over 5 iterations. nginx 1.24.0, kernel 7.0.0-38-g
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 2026-10-01T18:32:33Z | 92148f1* | 701043 | -3.7% | 0.447 | +11.2% | 4.370 | -7.0% | 0 | auth runs before static content |
 | 2026-10-01T19:39:51Z | 886b2f2* | 785402 | +7.9% | 0.384 | -4.5% | 4.150 | -11.7% | 0 | after baseline re-capture with error guard |
+| 2026-10-01T21:31:19Z | 17ddc3b* | 849942 | +16.8% | 0.348 | -13.4% | 4.280 | -8.9% | 0 | full refresh 2026-10-01 |
 
 _`*` after a commit hash means working tree was dirty when measured. Δ is vs the nginx baseline median._
 
