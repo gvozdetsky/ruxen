@@ -235,6 +235,9 @@ pub struct ProcessMeta {
     /// proxied responses after the upstream future resolves (so the
     /// upstream's `Last-Modified` is visible for `expires modified ...`).
     pub proxy_expires: crate::worker::PreparedExpires,
+    /// The URI was refused before routing (`/../x`): logged with
+    /// the server's access_log and an empty `$uri`, as nginx.
+    pub invalid_uri: bool,
 }
 
 impl Default for ProcessMeta {
@@ -257,7 +260,24 @@ impl Default for ProcessMeta {
             post_action: None,
             upstream_response_time_ms: None,
             proxy_expires: crate::worker::PreparedExpires::Off,
+            invalid_uri: false,
         }
+    }
+}
+
+/// Logging context for a request refused at the server level, before any
+/// location: the server's access_log and error_log.
+fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMeta {
+    ProcessMeta {
+        log: LogMeta {
+            error_logs: server.error_logs,
+            log_not_found: server.log_not_found,
+        },
+        server_port: server.listen_port,
+        server_name: server.primary_server_name,
+        access_logs: server.access_logs,
+        invalid_uri,
+        ..ProcessMeta::default()
     }
 }
 
@@ -379,16 +399,6 @@ fn process_with_meta_inner(
     url_scratch: &mut Vec<u8>,
     initial_reroute: Option<Reroute>,
 ) -> (Response, ProcessMeta) {
-    // RFC 7230 §5.4: a missing Host header on HTTP/1.1 is a client error.
-    // Nginx enforces this in ngx_http_process_request_header
-    // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
-    // — empty Host is treated as "default server".
-    if req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
-        return (
-            Response::Prebuilt(http.bad_request.pick(req.method)),
-            ProcessMeta::default(),
-        );
-    }
     let Some(listen) = select_listen(http, req.listen_index) else {
         let server_bytes = default_server_header(http);
         return (
@@ -402,18 +412,31 @@ fn process_with_meta_inner(
         );
     };
 
-    if matches!(req.method, Method::Trace | Method::Connect) {
-        // No server selected yet — use this listen's default server header
-        // bytes. nginx returns 405 here from the request-line parser
-        // before any per-server `server_tokens` could differ anyway.
-        let server_bytes = listen.servers[listen.default_server].server_header;
+    // RFC 7230 §5.4: a missing Host header on HTTP/1.1 is a client error.
+    // Nginx enforces this in ngx_http_process_request_header
+    // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
+    // — empty Host is treated as "default server".
+    if req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
+        let server = &listen.servers[listen.default_server];
         return (
-            Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
-            ProcessMeta::default(),
+            Response::Prebuilt(http.bad_request.pick(req.method)),
+            refused_meta(server, false),
         );
     }
 
     let (server, regex_captures) = find_config(listen, req.host, req.sni);
+
+    if matches!(req.method, Method::Trace | Method::Connect) {
+        // nginx refuses these in ngx_http_process_request_header, once the
+        // server is chosen by Host and before any location.
+        return (
+            Response::Owned(crate::file::method_not_allowed(
+                req.method,
+                server.server_header,
+            )),
+            refused_meta(server, false),
+        );
+    }
     let mut named_target: Option<Vec<u8>> = None;
     let mut current_args: Option<Vec<u8>> = None;
     let mut error_page_status: Option<ErrorPageStatus> = None;
@@ -433,7 +456,7 @@ fn process_with_meta_inner(
             if let Err(resp) =
                 normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
             {
-                return (resp, ProcessMeta::default());
+                return (resp, refused_meta(server, true));
             }
         }
         Some(reroute) => {
@@ -478,7 +501,7 @@ fn process_with_meta_inner(
                     if let Err(resp) =
                         normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
                     {
-                        return (resp, ProcessMeta::default());
+                        return (resp, refused_meta(server, true));
                     }
                     named_target = Some(name);
                 }

@@ -58,6 +58,7 @@ pub(crate) async fn write_access_logs(
     epoch_ms: u16,
     tls: Option<&crate::tls::HandshakeInfo>,
     upstream_response_time_ms: Option<u64>,
+    valid_uri: bool,
 ) {
     if logs.is_empty() {
         return;
@@ -72,11 +73,16 @@ pub(crate) async fn write_access_logs(
 
     let status = response_status(response);
     let args = request_args(request_uri);
-    let uri = request_uri
-        .iter()
-        .position(|&b| b == b'?')
-        .map(|i| &request_uri[..i])
-        .unwrap_or(request_uri);
+    // nginx leaves `$uri` empty when the URI itself was refused.
+    let uri: &[u8] = if valid_uri {
+        request_uri
+            .iter()
+            .position(|&b| b == b'?')
+            .map(|i| &request_uri[..i])
+            .unwrap_or(request_uri)
+    } else {
+        b""
+    };
     let ctx = RenderCtx {
         uri,
         request_uri,
@@ -164,6 +170,88 @@ pub(crate) async fn write_access_logs(
             );
         }
     }
+}
+
+/// What an early rejection needs for its access-log line.
+pub(crate) struct ConnLogCtx<'a> {
+    pub listen_index: usize,
+    pub remote_addr: &'a [u8],
+    pub remote_port: u16,
+    pub connection_id: u64,
+    pub connection_requests: u64,
+    pub connection_start: Instant,
+    pub tls: Option<&'a crate::tls::HandshakeInfo>,
+}
+
+/// Send a canned error for a request refused before a server is chosen (a
+/// bad request line or header, an unsupported transfer coding, a body
+/// over the limit), and log it as nginx does: to the access_log of the
+/// address's default server. The connection is closed by the caller.
+async fn reject_request<S: ConnIo>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    http: &'static PreparedHttp,
+    response: &[u8],
+    request_head: &[u8],
+    conn: &ConnLogCtx<'_>,
+) {
+    scratch.clear();
+    scratch.extend_from_slice(response);
+    inject_connection_header(scratch, true);
+    refresh_date_header(scratch);
+    let sent = scratch.len() as u64;
+    let taken = std::mem::take(scratch);
+    let _ = stream.write_all(taken).await;
+
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
+    if server.access_logs.is_empty() {
+        return;
+    }
+    // Whatever of the request line arrived: method, then URI.
+    let line_end = request_head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(request_head.len());
+    let mut words = request_head[..line_end]
+        .split(|&b| b == b' ')
+        .filter(|w| !w.is_empty());
+    let method = words.next().unwrap_or(b"");
+    let uri = words.next().unwrap_or(b"");
+    let header_len = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(response.len(), |p| p + 4) as u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    write_access_logs(
+        server.access_logs,
+        uri,
+        method,
+        None,
+        conn.remote_addr,
+        conn.remote_port,
+        None,
+        b"",
+        response,
+        conn.connection_id,
+        conn.connection_requests,
+        conn.connection_start.elapsed().as_micros() as u64,
+        0,
+        server.listen_port,
+        b"",
+        b'.',
+        request_head.len() as u64,
+        sent,
+        (response.len() as u64).saturating_sub(header_len),
+        now.as_secs(),
+        now.subsec_millis() as u16,
+        conn.tls,
+        None,
+        true,
+    )
+    .await;
 }
 
 async fn settle_proxy_response(
@@ -315,6 +403,7 @@ async fn run_post_action(
             base_ctx.epoch_ms,
             base_ctx.tls,
             post_meta.upstream_response_time_ms,
+            !post_meta.invalid_uri,
         )
         .await;
     }
@@ -894,6 +983,21 @@ pub(crate) async fn handle<S: ConnIo>(
     let url_scratch = &mut url_scratch_owned;
     let buf = &mut buf_owned;
 
+    // Context for `reject_request`'s access-log line.
+    macro_rules! conn_log {
+        () => {
+            &ConnLogCtx {
+                listen_index,
+                remote_addr: &remote_addr,
+                remote_port,
+                connection_id,
+                connection_requests: request_count,
+                connection_start,
+                tls,
+            }
+        };
+    }
+
     'idle: loop {
         if !stream
             .idle_wait(
@@ -934,6 +1038,9 @@ pub(crate) async fn handle<S: ConnIo>(
                 match http::parse_request(view, &mut parse_state) {
                     Parse::Complete(req) => {
                         let request_start = Instant::now();
+                        // Counted up front so a request refused below logs
+                        // `$connection_requests` as nginx does.
+                        request_count = request_count.saturating_add(1);
                         // All offsets in `req` are relative to `view`; shift
                         // to absolute buffer offsets before indexing.
                         let base = read_start;
@@ -951,12 +1058,15 @@ pub(crate) async fn handle<S: ConnIo>(
                         // rather reject. Bound it.
                         let method_len = req.method_end - req.method_start;
                         if method_len > 16 {
-                            scratch.clear();
-                            scratch.extend_from_slice(http.bad_request.pick(Method::Other));
-                            inject_connection_header(&mut *scratch, true);
-                            refresh_date_header(&mut *scratch);
-                            let taken = std::mem::take(&mut *scratch);
-                            let _ = stream.write_all(taken).await;
+                            reject_request(
+                                stream,
+                                &mut *scratch,
+                                http,
+                                http.bad_request.pick(Method::Other),
+                                &buf[read_start..filled],
+                                conn_log!(),
+                            )
+                            .await;
                             return;
                         }
                         let mut method_buf: [u8; 16] = [0; 16];
@@ -973,32 +1083,41 @@ pub(crate) async fn handle<S: ConnIo>(
                             // - Transfer-Encoding is HTTP/1.1-only.
                             // - Transfer-Encoding + Content-Length is rejected.
                             if !req.http_11 || req.content_length.is_some() {
-                                scratch.clear();
-                                scratch.extend_from_slice(http.bad_request.pick(method));
-                                inject_connection_header(&mut *scratch, true);
-                                refresh_date_header(&mut *scratch);
-                                let taken = std::mem::take(&mut *scratch);
-                                let _ = stream.write_all(taken).await;
+                                reject_request(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    http.bad_request.pick(method),
+                                    &buf[read_start..filled],
+                                    conn_log!(),
+                                )
+                                .await;
                                 return;
                             }
                             match classify_request_transfer_encoding(te) {
                                 RequestTransferEncoding::ChunkedOnly => {}
                                 RequestTransferEncoding::Unsupported => {
-                                    scratch.clear();
-                                    scratch.extend_from_slice(http.not_implemented.pick(method));
-                                    inject_connection_header(&mut *scratch, true);
-                                    refresh_date_header(&mut *scratch);
-                                    let taken = std::mem::take(&mut *scratch);
-                                    let _ = stream.write_all(taken).await;
+                                    reject_request(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        http.not_implemented.pick(method),
+                                        &buf[read_start..filled],
+                                        conn_log!(),
+                                    )
+                                    .await;
                                     return;
                                 }
                                 RequestTransferEncoding::Invalid => {
-                                    scratch.clear();
-                                    scratch.extend_from_slice(http.bad_request.pick(method));
-                                    inject_connection_header(&mut *scratch, true);
-                                    refresh_date_header(&mut *scratch);
-                                    let taken = std::mem::take(&mut *scratch);
-                                    let _ = stream.write_all(taken).await;
+                                    reject_request(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        http.bad_request.pick(method),
+                                        &buf[read_start..filled],
+                                        conn_log!(),
+                                    )
+                                    .await;
                                     return;
                                 }
                             }
@@ -1010,12 +1129,15 @@ pub(crate) async fn handle<S: ConnIo>(
                             Some((s, e)) => match http::normalize_host_in_place(&mut *buf, s, e) {
                                 Some(nh) => Some(nh),
                                 None => {
-                                    scratch.clear();
-                                    scratch.extend_from_slice(http.bad_request.pick(method));
-                                    inject_connection_header(&mut *scratch, true);
-                                    refresh_date_header(&mut *scratch);
-                                    let taken = std::mem::take(&mut *scratch);
-                                    let _ = stream.write_all(taken).await;
+                                    reject_request(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        http.bad_request.pick(method),
+                                        &buf[read_start..filled],
+                                        conn_log!(),
+                                    )
+                                    .await;
                                     return;
                                 }
                             },
@@ -1025,12 +1147,15 @@ pub(crate) async fn handle<S: ConnIo>(
                             Some((s, e)) => match http::normalize_host_in_place(&mut *buf, s, e) {
                                 Some(nh) => Some(nh),
                                 None => {
-                                    scratch.clear();
-                                    scratch.extend_from_slice(http.bad_request.pick(method));
-                                    inject_connection_header(&mut *scratch, true);
-                                    refresh_date_header(&mut *scratch);
-                                    let taken = std::mem::take(&mut *scratch);
-                                    let _ = stream.write_all(taken).await;
+                                    reject_request(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        http.bad_request.pick(method),
+                                        &buf[read_start..filled],
+                                        conn_log!(),
+                                    )
+                                    .await;
                                     return;
                                 }
                             },
@@ -1080,7 +1205,6 @@ pub(crate) async fn handle<S: ConnIo>(
                         // the explicit clamp would be unreachable.
                         let connection_time_us = connection_start.elapsed().as_micros() as u64;
                         let request_time_us = request_start.elapsed().as_micros() as u64;
-                        request_count = request_count.saturating_add(1);
                         // `read_start > 0` ⇒ a previous request on this
                         // connection already consumed bytes from this read
                         // buffer ⇒ pipelined. Matches nginx's `r->pipeline`
@@ -1127,12 +1251,15 @@ pub(crate) async fn handle<S: ConnIo>(
                             if cl > max_body {
                                 // nginx answers 413 from the Content-Length
                                 // alone, without reading the body.
-                                scratch.clear();
-                                scratch.extend_from_slice(http.entity_too_large.pick(method));
-                                inject_connection_header(&mut *scratch, true);
-                                refresh_date_header(&mut *scratch);
-                                let taken = std::mem::take(&mut *scratch);
-                                let _ = stream.write_all(taken).await;
+                                reject_request(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    http.entity_too_large.pick(method),
+                                    &buf[read_start..filled],
+                                    conn_log!(),
+                                )
+                                .await;
                                 return;
                             }
                             let body_start = base + req.consumed;
@@ -1192,12 +1319,15 @@ pub(crate) async fn handle<S: ConnIo>(
                                         ChunkedBodyError::TooLarge => &http.entity_too_large,
                                         ChunkedBodyError::Invalid => &http.bad_request,
                                     };
-                                    scratch.clear();
-                                    scratch.extend_from_slice(response.pick(method));
-                                    inject_connection_header(&mut *scratch, true);
-                                    refresh_date_header(&mut *scratch);
-                                    let taken = std::mem::take(&mut *scratch);
-                                    let _ = stream.write_all(taken).await;
+                                    reject_request(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        response.pick(method),
+                                        &buf[read_start..filled],
+                                        conn_log!(),
+                                    )
+                                    .await;
                                     return;
                                 }
                             }
@@ -1503,6 +1633,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 epoch_ms,
                                 tls,
                                 process_meta.upstream_response_time_ms,
+                                !process_meta.invalid_uri,
                             )
                             .await;
                         }
@@ -1543,6 +1674,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     }
                     Parse::Incomplete => break,
                     Parse::Invalid => {
+                        request_count = request_count.saturating_add(1);
                         // Honor HEAD if the request line parsed before the
                         // header block went sideways; otherwise default to
                         // full — we don't know the method and a body on a
@@ -1555,12 +1687,15 @@ pub(crate) async fn handle<S: ConnIo>(
                         } else {
                             Method::Other
                         };
-                        scratch.clear();
-                        scratch.extend_from_slice(http.bad_request.pick(method));
-                        inject_connection_header(&mut *scratch, true);
-                        refresh_date_header(&mut *scratch);
-                        let taken = std::mem::take(&mut *scratch);
-                        let _ = stream.write_all(taken).await;
+                        reject_request(
+                            stream,
+                            &mut *scratch,
+                            http,
+                            http.bad_request.pick(method),
+                            &buf[read_start..filled],
+                            conn_log!(),
+                        )
+                        .await;
                         return;
                     }
                 }

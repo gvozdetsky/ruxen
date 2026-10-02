@@ -186,3 +186,57 @@ http {
     let access = std::fs::read_to_string(dir.join("access.log")).unwrap();
     assert!(access.contains("\"GET /\" 200 0"));
 }
+
+/// Requests refused with 400/405/501 are logged like nginx: before a server is
+/// chosen to the default server's access_log, and with a refused URI
+/// (`/../x`) with an empty `$uri`. They used to leave no log line.
+#[test]
+fn rejected_requests_are_logged() {
+    let conf = r#"
+events {}
+http {
+  log_format t "$connection_requests $status $request_method [$request_uri] [$uri]";
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    access_log %%DIR%%/t.log t;
+    location / { return 200 ""; }
+  }
+}
+"#;
+    let (_guard, port, dir) = spawn_server(conf);
+    let send = |raw: &[u8]| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(raw).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    assert!(send(b"GET\r\n\r\n").starts_with("HTTP/1.1 400"));
+    assert!(
+        send(b"POST /te HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n")
+            .starts_with("HTTP/1.1 501")
+    );
+    assert!(send(b"GET /nohost HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 400"));
+    assert!(
+        send(b"TRACE /t HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .starts_with("HTTP/1.1 405")
+    );
+    // Refused after the server is chosen (403 today; nginx says 400).
+    let resp = send(b"GET /../x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 4"), "{resp}");
+    sleep(Duration::from_millis(50));
+
+    let log = std::fs::read_to_string(dir.join("t.log")).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines.contains(&"1 400 GET [] []"), "{log}");
+    assert!(lines.contains(&"1 501 POST [/te] [/te]"), "{log}");
+    assert!(lines.contains(&"1 400 GET [/nohost] [/nohost]"), "{log}");
+    assert!(lines.contains(&"1 405 TRACE [/t] [/t]"), "{log}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("1 4") && l.ends_with(" GET [/../x] []")),
+        "{log}"
+    );
+}
