@@ -68,7 +68,9 @@ start_ruxen() {
         read -r -a env_parts <<<"$env_line"
     fi
 
-    env "${env_parts[@]}" "${REPO_ROOT}/target/release/ruxen" -p "$(conf_prefix "$conf")" -c "$conf" >"$server_log" 2>&1 &
+    # RUXEN_BIN overrides the binary (pair.sh uses it to compare builds).
+    env "${env_parts[@]}" "${RUXEN_BIN:-${REPO_ROOT}/target/release/ruxen}" \
+        -p "$(conf_prefix "$conf")" -c "$conf" >"$server_log" 2>&1 &
     echo $!
 }
 
