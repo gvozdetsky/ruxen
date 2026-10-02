@@ -408,9 +408,7 @@ pub fn run(
                         );
                     }
                     Ok(None) => {}
-                    Err(_) => {
-                        // Transient accept errors — keep looping.
-                    }
+                    Err(e) => accept_failed(&e).await,
                 }
             }
         } else {
@@ -455,9 +453,7 @@ pub(crate) async fn run_listener(
                 );
             }
             Ok(None) => {}
-            Err(_) => {
-                // Transient accept errors — keep looping.
-            }
+            Err(e) => accept_failed(&e).await,
         }
     }
 }
@@ -499,6 +495,21 @@ pub(crate) fn spawn_connection(
                 connection_id,
             ));
         }
+    }
+}
+
+/// Out of file descriptors, `accept` fails at once while the connection
+/// stays queued, so retrying immediately spins a core until fds free up.
+/// nginx logs it and stops accepting for `accept_mutex_delay` (500 ms,
+/// `ngx_event_accept.c`); do the same. Other errors (a client that reset
+/// before we accepted) are per-connection: just carry on.
+pub(crate) async fn accept_failed(err: &std::io::Error) {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    ) {
+        eprintln!("ruxen: [crit] accept() failed ({})", errno_text(err));
+        monoio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

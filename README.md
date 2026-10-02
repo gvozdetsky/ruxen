@@ -80,6 +80,8 @@ cargo build --release
 
 **In Docker**, the default seccomp profile blocks `io_uring`, so ruxen cannot create its `io_uring` runtime. Run the container with `--security-opt seccomp=unconfined` (or a profile that allows the `io_uring_*` syscalls).
 
+ruxen does not switch to an unprivileged user the way nginx's `user` directive does, so it refuses to start as root unless the configuration says `user root;`. Containers usually run as root: either add `user root;` or run the container with `--user`.
+
 ### Run
 
 [`examples/minimal.conf`](examples/minimal.conf) is the smallest useful configuration:
@@ -319,6 +321,9 @@ The following are intentionally outside the current v0.1 scope:
 - hot certificate reload
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
+- switching workers to an unprivileged `user`
+
+Access restrictions that ruxen can't enforce yet — `internal`, `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
 Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
 

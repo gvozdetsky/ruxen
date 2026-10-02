@@ -146,6 +146,36 @@ fn report_emerg(msg: &str, cli: &Cli, main_path: &Path) -> Failure {
     Failure::Reported
 }
 
+/// nginx started as root switches its workers to `user` (default
+/// `nobody`). ruxen can't switch users yet, so running as root is allowed
+/// only when the config says so with `user root;`; anything else would
+/// quietly serve every request with root's file access.
+fn check_privileges(euid: u32, user: Option<&str>) -> Result<(), String> {
+    const UNPRIVILEGED: &str = "start ruxen as an unprivileged user instead \
+        (setcap cap_net_bind_service=+ep allows ports below 1024)";
+    match (euid, user) {
+        (0, Some("root")) => Ok(()),
+        (0, Some(user)) => Err(format!(
+            "\"user {user}\" is not supported yet, and ignoring it is unsafe: requests \
+             would be served as root; {UNPRIVILEGED}"
+        )),
+        (0, None) => Err(format!(
+            "running as root without \"user root;\": nginx would switch workers to \
+             \"nobody\", but ruxen doesn't switch users yet; add \"user root;\" to run as \
+             root on purpose, or {UNPRIVILEGED}"
+        )),
+        (_, Some(_)) => {
+            // nginx's wording (ngx_set_user) for the same situation.
+            eprintln!(
+                "ruxen: [warn] the \"user\" directive makes sense only if the master \
+                 process runs with super-user privileges, ignored"
+            );
+            Ok(())
+        }
+        (_, None) => Ok(()),
+    }
+}
+
 fn real_main() -> Result<(), Failure> {
     let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
 
@@ -187,6 +217,10 @@ fn real_main() -> Result<(), Failure> {
     for w in &cfg.warnings {
         eprintln!("ruxen: [warn] {w}");
     }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_privileges(euid, cfg.runtime.user.as_deref())
+        .map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
     if cli.dump {
         for entry in &cfg.dump_files {
@@ -491,6 +525,23 @@ fn install_signal_handlers() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_needs_explicit_user_root() {
+        assert!(check_privileges(0, Some("root")).is_ok());
+        let err = check_privileges(0, None).unwrap_err();
+        assert!(
+            err.starts_with("running as root without \"user root;\""),
+            "{err}"
+        );
+        let err = check_privileges(0, Some("www-data")).unwrap_err();
+        assert!(
+            err.starts_with("\"user www-data\" is not supported yet"),
+            "{err}"
+        );
+        assert!(check_privileges(1000, None).is_ok());
+        assert!(check_privileges(1000, Some("www-data")).is_ok());
+    }
 
     #[test]
     fn version_output_is_pinned() {

@@ -770,8 +770,10 @@ async fn attempt(
             accum.truncate(body_start + cl_usize);
             body_len_in_accum = cl_usize;
         }
-        // Reserve the rest up front so the read loop never reallocates.
-        accum.reserve(cl_usize - body_len_in_accum);
+        // Reserve for what is likely to arrive, not for what the upstream
+        // claims: a bogus `Content-Length: 1000000000000` must not abort
+        // the process on allocation. Bigger bodies grow as bytes come in.
+        accum.reserve((cl_usize - body_len_in_accum).min(MAX_UPFRONT_RESERVE));
         while body_len_in_accum < cl_usize {
             let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
                 Ok(pair) => pair,
@@ -835,7 +837,7 @@ async fn attempt(
                     );
                 }
             }
-            if body_len_in_accum > 64 * 1024 * 1024 {
+            if body_len_in_accum > MAX_UNFRAMED_BODY {
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
@@ -1029,6 +1031,11 @@ async fn read_chunked_body_with_buf(
             Err(_) => return Err(false),
         };
         pos = line_end + 1;
+        // Bound the size before any arithmetic on it: `FFFFFFFFFFFFFFFF`
+        // would overflow `chunk_size + 2` below and panic the worker.
+        if chunk_size > (MAX_UNFRAMED_BODY - decoded.len()) as u64 {
+            return Err(false);
+        }
         if chunk_size == 0 {
             // Read the trailing CRLF (or any trailers, but we don't
             // forward them — drain until the empty line).
@@ -1082,11 +1089,15 @@ async fn read_chunked_body_with_buf(
         }
         decoded.extend_from_slice(&buf[pos..pos + chunk_size as usize]);
         pos += chunk_size as usize + 2;
-        if decoded.len() > 64 * 1024 * 1024 {
-            return Err(false);
-        }
     }
 }
+
+/// Largest chunked or close-delimited upstream body we buffer before
+/// answering 502. Responses are buffered whole until they stream.
+const MAX_UNFRAMED_BODY: usize = 64 * 1024 * 1024;
+
+/// Upper bound on the up-front reservation for a `Content-Length` body.
+const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 
 fn trim_crlf(s: &[u8]) -> &[u8] {
     let mut end = s.len();

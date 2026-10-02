@@ -13,6 +13,10 @@ pub struct RuntimeOpts {
     /// matching nginx). `Some(0)` represents `auto` — resolved at runtime
     /// via `available_parallelism()`.
     pub worker_processes: Option<WorkerProcesses>,
+    /// `user name [group];` — the user name only. ruxen doesn't switch
+    /// users; `main` uses this to decide whether running as root is
+    /// what the config asked for.
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -245,8 +249,8 @@ pub struct ServerSsl {
     pub certs: Vec<PathBuf>,
     pub keys: Vec<PathBuf>,
     pub protocols: TlsVersionSet,
-    /// `ssl_ciphers` — verbatim. v0.1 honors it for TLS 1.2 only; rustls
-    /// 0.23 does not expose per-suite enablement for TLS 1.3.
+    /// `ssl_ciphers` — verbatim, not applied: rustls's default suites are
+    /// used and the parser warns (`warn_ignored_tls_policy`).
     pub ciphers: Option<String>,
     /// `ssl_prefer_server_ciphers on|off;`. rustls always uses server
     /// preference for TLS 1.2, so explicit `off` is treated as a parse
