@@ -110,6 +110,7 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         state: &RuntimeState,
         idle: Option<Duration>,
         start_reload_gen: u64,
+        timers: &mut ConnTimers<'_>,
     ) -> bool;
 
     /// Raw socket fd for the zero-copy `sendfile` path, or `None` when the
@@ -127,8 +128,9 @@ impl ConnIo for TcpStream {
         state: &RuntimeState,
         idle: Option<Duration>,
         start_reload_gen: u64,
+        timers: &mut ConnTimers<'_>,
     ) -> bool {
-        wait_readable_or_shutdown(self, state, idle, start_reload_gen).await
+        wait_readable_or_shutdown(self, state, idle, start_reload_gen, timers).await
     }
 
     fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -147,11 +149,12 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
         state: &RuntimeState,
         idle: Option<Duration>,
         start_reload_gen: u64,
+        timers: &mut ConnTimers<'_>,
     ) -> bool {
         if self.has_buffered_input() {
             return !state.is_shutting_down() && state.reload_gen() == start_reload_gen;
         }
-        wait_readable_or_shutdown(self.io(), state, idle, start_reload_gen).await
+        wait_readable_or_shutdown(self.io(), state, idle, start_reload_gen, timers).await
     }
 
     fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -184,6 +187,8 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
     nonblocking: &mut bool,
     head: &[u8],
     body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
 ) -> bool {
     use std::os::unix::io::AsRawFd;
     let Some(sock) = stream.sendfile_fd() else {
@@ -218,7 +223,10 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
         }
         match std::io::Error::last_os_error().kind() {
             std::io::ErrorKind::WouldBlock => {
-                if stream.wait_writable().await.is_err() {
+                // `send_timeout` bounds each wait for the socket to drain,
+                // like nginx's timer between two successive sends.
+                let ready = with_timeout(timer.as_mut(), send_timeout, stream.wait_writable());
+                if !matches!(ready.await, Some(Ok(_))) {
                     return false;
                 }
             }
@@ -243,7 +251,10 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
         }
         match std::io::Error::last_os_error().kind() {
             std::io::ErrorKind::WouldBlock => {
-                if stream.wait_writable().await.is_err() {
+                // `send_timeout` bounds each wait for the socket to drain,
+                // like nginx's timer between two successive sends.
+                let ready = with_timeout(timer.as_mut(), send_timeout, stream.wait_writable());
+                if !matches!(ready.await, Some(Ok(_))) {
                     return false;
                 }
             }
@@ -254,9 +265,87 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
     true
 }
 
+/// A connection's long-lived timers. monoio extends a registered timer
+/// lazily when it is moved to a later deadline, so re-arming one of these
+/// costs a clock read, where a fresh `sleep`/`timeout` per operation costs
+/// a timer-wheel insert and remove. Each is only ever moved forward on the
+/// hot path: `io` by the same client timeouts, `idle` by keepalive_timeout,
+/// `tick` by 50 ms.
+pub(crate) struct ConnTimers<'a> {
+    /// client_header_timeout / client_body_timeout / send_timeout.
+    pub io: std::pin::Pin<&'a mut monoio::time::Sleep>,
+    /// The keep-alive (or first-request) deadline while idle.
+    pub idle: std::pin::Pin<&'a mut monoio::time::Sleep>,
+    /// The 50 ms poll for shutdown / reload while idle.
+    pub tick: std::pin::Pin<&'a mut monoio::time::Sleep>,
+}
+
+/// Run `fut` unless `deadline` passes first, using `timer` (see
+/// `ConnTimers`). The operation is polled first, so one that is ready
+/// never waits on the timer.
+pub(crate) async fn with_deadline<F: std::future::Future>(
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    deadline: monoio::time::Instant,
+    fut: F,
+) -> Option<F::Output> {
+    use std::task::Poll;
+    timer.as_mut().reset(deadline);
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// `with_deadline` for a timeout that starts now.
+pub(crate) async fn with_timeout<F: std::future::Future>(
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    timeout: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    with_deadline(timer, monoio::time::Instant::now() + timeout, fut).await
+}
+
+/// `write_all` with nginx's `send_timeout`: the connection is given up
+/// when one write makes no progress for `timeout`. nginx re-arms the timer
+/// after every partial send, so a slow but steady client may take longer
+/// than `timeout` in total. Writes `buf[..len]`; on a timeout the buffer
+/// is dropped with the write and an empty one comes back.
+pub(crate) async fn write_all_timed<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
+    mut buf: Vec<u8>,
+    len: usize,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    timeout: Duration,
+) -> (std::io::Result<()>, Vec<u8>) {
+    let mut written = 0;
+    while written < len {
+        let slice = buf.slice(written..len);
+        let Some((res, slice)) = with_timeout(timer.as_mut(), timeout, stream.write(slice)).await
+        else {
+            return (Err(std::io::ErrorKind::TimedOut.into()), Vec::new());
+        };
+        buf = slice.into_inner();
+        match res {
+            Ok(0) => return (Err(std::io::ErrorKind::WriteZero.into()), buf),
+            Ok(n) => written += n,
+            Err(e) => return (Err(e), buf),
+        }
+    }
+    (Ok(()), buf)
+}
+
 pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
     stream: &mut S,
     body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
 ) -> bool {
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
@@ -276,9 +365,15 @@ pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
             Ok(n) => n,
             Err(_) => return false,
         };
-        let slice = std::mem::take(&mut buf).slice(..n);
-        let (res, returned) = stream.write_all(slice).await;
-        buf = returned.into_inner();
+        let (res, returned) = write_all_timed(
+            stream,
+            std::mem::take(&mut buf),
+            n,
+            timer.as_mut(),
+            send_timeout,
+        )
+        .await;
+        buf = returned;
         if res.is_err() {
             return false;
         }
@@ -322,6 +417,8 @@ pub(crate) async fn read_chunked_request_body<S: ConnIo>(
     stream: &mut S,
     initial: &[u8],
     max_body: usize,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    read_timeout: Duration,
 ) -> Option<ChunkedBody> {
     let mut raw = Vec::with_capacity(initial.len().saturating_add(128));
     raw.extend_from_slice(initial);
@@ -339,7 +436,8 @@ pub(crate) async fn read_chunked_request_body<S: ConnIo>(
                 return None;
             }
             let chunk: Vec<u8> = vec![0u8; 4096];
-            let (res, returned) = stream.read(chunk).await;
+            let (res, returned) =
+                with_timeout(timer.as_mut(), read_timeout, stream.read(chunk)).await?;
             match res {
                 Ok(0) | Err(_) => return None,
                 Ok(n) => raw.extend_from_slice(&returned[..n]),
@@ -373,7 +471,8 @@ pub(crate) async fn read_chunked_request_body<S: ConnIo>(
                         return None;
                     }
                     let chunk: Vec<u8> = vec![0u8; 1024];
-                    let (res, returned) = stream.read(chunk).await;
+                    let (res, returned) =
+                        with_timeout(timer.as_mut(), read_timeout, stream.read(chunk)).await?;
                     match res {
                         Ok(0) | Err(_) => return None,
                         Ok(n) => raw.extend_from_slice(&returned[..n]),
@@ -419,7 +518,8 @@ pub(crate) async fn read_chunked_request_body<S: ConnIo>(
             let need = (cursor + chunk_len + 2) - raw.len();
             let cap = need.min(8192);
             let chunk: Vec<u8> = vec![0u8; cap];
-            let (res, returned) = stream.read(chunk).await;
+            let (res, returned) =
+                with_timeout(timer.as_mut(), read_timeout, stream.read(chunk)).await?;
             match res {
                 Ok(0) | Err(_) => return None,
                 Ok(n) => raw.extend_from_slice(&returned[..n]),

@@ -1022,6 +1022,7 @@ pub(crate) fn prepare_server(
     };
 
     Ok(PreparedServer {
+        timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
         exact_names,
         wildcard_leading,
         wildcard_trailing,

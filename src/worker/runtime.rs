@@ -552,10 +552,16 @@ pub(crate) async fn wait_readable_or_shutdown(
     state: &RuntimeState,
     idle_timeout: Option<Duration>,
     start_reload_gen: u64,
+    timers: &mut ConnTimers<'_>,
 ) -> bool {
-    use std::pin::pin;
+    use std::task::Poll;
 
-    let deadline = idle_timeout.map(|timeout| Instant::now() + timeout);
+    if let Some(timeout) = idle_timeout {
+        timers
+            .idle
+            .as_mut()
+            .reset(monoio::time::Instant::now() + timeout);
+    }
 
     loop {
         if state.is_shutting_down() {
@@ -568,27 +574,28 @@ pub(crate) async fn wait_readable_or_shutdown(
             return false;
         }
 
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                return false;
+        // Wake every 50 ms to re-check shutdown / reload; the idle deadline
+        // ends the wait. Both are the connection's long-lived timers.
+        timers
+            .tick
+            .as_mut()
+            .reset(monoio::time::Instant::now() + Duration::from_millis(50));
+        let mut readable = std::pin::pin!(stream.readable(false));
+        let woke = std::future::poll_fn(|cx| {
+            if let Poll::Ready(res) = readable.as_mut().poll(cx) {
+                return Poll::Ready(Some(res.is_ok()));
             }
-        }
-
-        let mut readable = pin!(stream.readable(false));
-        let mut tick = pin!(monoio::time::sleep(Duration::from_millis(50)));
-        if let Some(deadline) = deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let mut timeout = pin!(monoio::time::sleep(remaining));
-            monoio::select! {
-                res = &mut readable => return res.is_ok(),
-                _ = &mut timeout => return false,
-                _ = &mut tick => {}
+            if idle_timeout.is_some() && timers.idle.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Some(false));
             }
-        } else {
-            monoio::select! {
-                res = &mut readable => return res.is_ok(),
-                _ = &mut tick => {}
+            if timers.tick.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(None);
             }
+            Poll::Pending
+        })
+        .await;
+        if let Some(proceed) = woke {
+            return proceed;
         }
     }
 }
@@ -706,7 +713,27 @@ pub(crate) async fn handle<S: ConnIo>(
     let remote_addr = peer_addr.ip().to_string().into_bytes();
     let remote_port = peer_addr.port();
     let mut request_count: u64 = 0;
-    let mut keepalive_idle_timeout: Option<Duration> = None;
+    // Client timeouts come from the address's default server for the whole
+    // connection: the header is read before a virtual server is chosen (as
+    // in nginx), and the body here too. nginx switches client_body_timeout
+    // and send_timeout to the chosen server / location afterwards.
+    let timeouts = {
+        let listen = &http.listens[listen_index];
+        listen.servers[listen.default_server].timeouts
+    };
+    // A new connection gets client_header_timeout to send its first request
+    // (nginx's post-accept timeout); later waits use keepalive_timeout.
+    let mut keepalive_idle_timeout: Option<Duration> = Some(timeouts.header);
+    // When the current request's header must be complete; set on the first
+    // read for it, cleared once the request is handled.
+    let mut header_deadline: Option<monoio::time::Instant>;
+    // Long-lived timers for this connection (see `ConnTimers`).
+    let far = Duration::from_secs(3600);
+    let mut timers = ConnTimers {
+        io: std::pin::pin!(monoio::time::sleep(far)),
+        idle: std::pin::pin!(monoio::time::sleep(far)),
+        tick: std::pin::pin!(monoio::time::sleep(far)),
+    };
     // Snapshot the reload generation at accept time. SIGHUP bumps the
     // counter; idle keepalive waits and post-request keepalive checks both
     // bail when the live value drifts above this snapshot, which makes
@@ -733,12 +760,18 @@ pub(crate) async fn handle<S: ConnIo>(
 
     'idle: loop {
         if !stream
-            .idle_wait(&state, keepalive_idle_timeout, start_reload_gen)
+            .idle_wait(
+                &state,
+                keepalive_idle_timeout,
+                start_reload_gen,
+                &mut timers,
+            )
             .await
         {
             return;
         }
         keepalive_idle_timeout = None;
+        header_deadline = None;
 
         let mut read_start: usize = 0; // first unread byte of the current request
         let mut filled: usize = 0; // one past the last received byte
@@ -746,7 +779,13 @@ pub(crate) async fn handle<S: ConnIo>(
         loop {
             let taken = std::mem::take(&mut *buf);
             let slice = taken.slice_mut(filled..READ_BUF);
-            let (res, returned) = stream.read(slice).await;
+            let deadline = *header_deadline
+                .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
+            let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
+            // client_header_timeout: nginx closes without a response.
+            let Some((res, returned)) = read.await else {
+                return;
+            };
             *buf = returned.into_inner();
             match res {
                 Ok(0) => return,
@@ -966,8 +1005,16 @@ pub(crate) async fn handle<S: ConnIo>(
                                         let need = cl_usize - body.len();
                                         let chunk_cap = need.min(8192);
                                         let chunk: Vec<u8> = vec![0u8; chunk_cap];
-                                        let (res, returned) = stream.read(chunk).await;
-                                        let returned = returned;
+                                        // client_body_timeout between reads.
+                                        let Some((res, returned)) = with_timeout(
+                                            timers.io.as_mut(),
+                                            timeouts.body,
+                                            stream.read(chunk),
+                                        )
+                                        .await
+                                        else {
+                                            return;
+                                        };
                                         match res {
                                             Ok(0) => return,
                                             Ok(n) => body.extend_from_slice(&returned[..n]),
@@ -979,8 +1026,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             } else if req.transfer_encoding_chunked {
                                 let body_start = base + req.consumed;
                                 let initial = &buf[body_start..filled];
-                                match read_chunked_request_body(stream, initial, MAX_REQUEST_BODY)
-                                    .await
+                                match read_chunked_request_body(
+                                    stream,
+                                    initial,
+                                    MAX_REQUEST_BODY,
+                                    timers.io.as_mut(),
+                                    timeouts.body,
+                                )
+                                .await
                                 {
                                     Some(decoded) => {
                                         pipelined_tail = decoded.pipelined_tail;
@@ -1180,7 +1233,15 @@ pub(crate) async fn handle<S: ConnIo>(
                             scan = variant.scan;
                             stamp_date(&mut *scratch, &mut scan);
                             let taken = std::mem::take(&mut *scratch);
-                            let (res, returned) = stream.write_all(taken).await;
+                            let len = taken.len();
+                            let (res, returned) = write_all_timed(
+                                stream,
+                                taken,
+                                len,
+                                timers.io.as_mut(),
+                                timeouts.send,
+                            )
+                            .await;
                             *scratch = returned;
                             if res.is_err() {
                                 return;
@@ -1214,6 +1275,8 @@ pub(crate) async fn handle<S: ConnIo>(
                                     &mut sock_nonblocking,
                                     scratch,
                                     body,
+                                    timers.io.as_mut(),
+                                    timeouts.send,
                                 )
                                 .await
                                 {
@@ -1225,7 +1288,15 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // completes so we reuse the same allocation
                                 // next request.
                                 let taken = std::mem::take(&mut *scratch);
-                                let (res, returned) = stream.write_all(taken).await;
+                                let len = taken.len();
+                                let (res, returned) = write_all_timed(
+                                    stream,
+                                    taken,
+                                    len,
+                                    timers.io.as_mut(),
+                                    timeouts.send,
+                                )
+                                .await;
                                 *scratch = returned;
                                 if res.is_err() {
                                     return;
@@ -1234,7 +1305,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             response_for_logs = &*scratch;
                         }
                         if let Some(body) = file_body {
-                            if !stream_file(stream, body).await {
+                            if !stream_file(stream, body, timers.io.as_mut(), timeouts.send).await {
                                 return;
                             }
                         }
@@ -1289,6 +1360,7 @@ pub(crate) async fn handle<S: ConnIo>(
 
                         read_start += request_total_consumed;
                         parse_state.reset();
+                        header_deadline = None;
 
                         // Chunked decode may have read post-terminator
                         // bytes from the socket — those belong to the next
