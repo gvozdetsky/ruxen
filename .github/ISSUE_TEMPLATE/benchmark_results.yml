@@ -1,0 +1,60 @@
+name: Benchmark results
+description: Share ruxen vs nginx numbers from your hardware.
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Numbers from hardware other than the maintainer's laptop are the
+        point. Please use `bench/scripts/pair.sh` (interleaved runs) rather than
+        single `measure.sh` rows — see bench/README.md. An A/A run first
+        (`pair.sh m1_hello --a-bin <copy of target/release/ruxen>`) tells us
+        your noise floor.
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: Model, cores/threads (lscpu | head -20 is fine).
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel and distro
+      placeholder: "6.8.0-45-generic, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: nginx, Rust, ruxen versions
+      placeholder: "nginx 1.24.0, rustc 1.95.0, ruxen a1b2c3d"
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: Where did wrk run?
+      options:
+        - Same machine (loopback)
+        - Separate machine
+    validations:
+      required: true
+  - type: textarea
+    id: aa
+    attributes:
+      label: A/A calibration output
+      render: text
+  - type: textarea
+    id: results
+    attributes:
+      label: pair.sh output
+      description: One block per scenario (or `bench/scripts/pair.sh <id>` for each manifest id).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: CPU governor, pinning, anything unusual.
