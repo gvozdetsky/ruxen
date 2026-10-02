@@ -31,5 +31,6 @@ Sibling checkouts are expected one directory up:
 - Unknown directives are an explicit allowlist, and `-V` feature claims are
   minimal on purpose. Widening either unlocks nginx-tests files, so do it only
   together with the implementation.
-- The code is not rustfmt-clean and has clippy warnings. Don't mass-reformat
-  unrelated code inside a feature change.
+- Code is rustfmt-clean and CI enforces `cargo fmt --check`; run `cargo fmt`
+  before committing. Clippy still has ~100 warnings and is not gated — don't
+  mix clippy cleanups into feature changes.

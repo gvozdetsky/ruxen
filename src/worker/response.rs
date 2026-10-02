@@ -473,11 +473,16 @@ pub(crate) fn apply_expires(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let (expires_value, cache_control) =
-        compute_expires_headers(&directive, now, last_modified);
+    let (expires_value, cache_control) = compute_expires_headers(&directive, now, last_modified);
     let stripped = strip_header_lines(response, b"Expires");
     let stripped = strip_header_lines(stripped, b"Cache-Control");
-    insert_headers(stripped, &[(b"Expires", &expires_value), (b"Cache-Control", &cache_control)])
+    insert_headers(
+        stripped,
+        &[
+            (b"Expires", &expires_value),
+            (b"Cache-Control", &cache_control),
+        ],
+    )
 }
 
 /// Computes the `Expires` value and `Cache-Control` value for an
@@ -606,7 +611,10 @@ pub(crate) fn should_apply_error_page_status(base_status: u16) -> bool {
     (200..300).contains(&base_status) || base_status == 304
 }
 
-pub(crate) fn effective_error_page_status(base_status: u16, forced: Option<phase::ErrorPageStatus>) -> u16 {
+pub(crate) fn effective_error_page_status(
+    base_status: u16,
+    forced: Option<phase::ErrorPageStatus>,
+) -> u16 {
     if !should_apply_error_page_status(base_status) {
         return base_status;
     }
@@ -669,10 +677,7 @@ pub(crate) fn apply_proxy_add_headers(
     meta: &phase::ProcessMeta,
 ) -> Response {
     let needs_expires = !matches!(meta.proxy_expires, PreparedExpires::Off);
-    if meta.proxy_add_headers.is_empty()
-        && meta.proxy_add_trailers.is_empty()
-        && !needs_expires
-    {
+    if meta.proxy_add_headers.is_empty() && meta.proxy_add_trailers.is_empty() && !needs_expires {
         return response;
     }
     let Response::Owned(bytes) = response else {
@@ -951,7 +956,10 @@ pub(crate) fn inject_www_authenticate_headers(response: Vec<u8>, values: &[Vec<u
     out
 }
 
-pub(crate) fn render_error_page_target(parts: &[PreparedValuePart], ctx: &RenderCtx<'_>) -> Vec<u8> {
+pub(crate) fn render_error_page_target(
+    parts: &[PreparedValuePart],
+    ctx: &RenderCtx<'_>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     render_parts(parts, ctx, &mut out);
     out

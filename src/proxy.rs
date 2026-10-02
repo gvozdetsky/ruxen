@@ -314,12 +314,14 @@ pub async fn run_proxy(mut plan: ProxyPlan) -> Response {
                         || !body_safe_to_retry
                         || deadline_exceeded(overall_deadline)
                     {
-                        return last_failure
-                            .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                        return last_failure.unwrap_or_else(|| {
+                            Response::Prebuilt(plan.bad_gateway.pick(plan.method))
+                        });
                     }
                     let Some(next) = upstream::pick_peer(upstream, tried_mask) else {
-                        return last_failure
-                            .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                        return last_failure.unwrap_or_else(|| {
+                            Response::Prebuilt(plan.bad_gateway.pick(plan.method))
+                        });
                     };
                     tried_mask |= 1u64 << next.peer_idx.min(63);
                     drop(current);
@@ -414,7 +416,9 @@ fn build_intercept_reroute(
         return Response::Owned(Vec::new());
     }
     let error_page_status = match rule.action {
-        PreparedErrorPageAction::PreserveOriginal => Some(ErrorPageStatus::Preserve(upstream_status)),
+        PreparedErrorPageAction::PreserveOriginal => {
+            Some(ErrorPageStatus::Preserve(upstream_status))
+        }
         PreparedErrorPageAction::UseTargetStatus => None,
         PreparedErrorPageAction::Override(code) => Some(ErrorPageStatus::Override(code)),
     };
@@ -434,7 +438,10 @@ fn build_intercept_reroute(
     };
     if rule.target[0] == b'/' {
         let (uri, args) = match rule.target.iter().position(|&b| b == b'?') {
-            Some(i) => (rule.target[..i].to_vec(), Some(rule.target[i + 1..].to_vec())),
+            Some(i) => (
+                rule.target[..i].to_vec(),
+                Some(rule.target[i + 1..].to_vec()),
+            ),
             None => (rule.target.clone(), None),
         };
         return Response::Reroute(Reroute {
@@ -491,7 +498,6 @@ enum AttemptOutcome {
     /// fires, plus a classification for the next_upstream check.
     Failed(Response, FailKind),
 }
-
 
 async fn attempt(
     plan: &ProxyPlan,
@@ -656,8 +662,8 @@ async fn attempt(
     }
 
     // 5. Parse framing-relevant headers.
-    let head_after_status = &accum
-        [first_line_end + first_line_terminator_len(&accum, first_line_end)..head_end];
+    let head_after_status =
+        &accum[first_line_end + first_line_terminator_len(&accum, first_line_end)..head_end];
     let mut content_length: Option<u64> = None;
     let mut chunked = false;
     let mut upstream_close = !upstream_is_11; // HTTP/1.0 closes by default
@@ -736,7 +742,9 @@ async fn attempt(
         // bytes after `body_start` are not what we'll forward.
         accum.truncate(body_start);
         body_len_in_accum = 0;
-        match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout).await {
+        match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout)
+            .await
+        {
             Ok(()) => {}
             Err(stale) => {
                 if stale && from_pool && body.is_empty() {
@@ -1026,14 +1034,13 @@ async fn read_chunked_body_with_buf(
                         break pos + rel;
                     }
                     let scratch = std::mem::take(read_buf);
-                    let (res, returned) =
-                        match timeout(read_timeout, stream.read(scratch)).await {
-                            Ok(pair) => pair,
-                            Err(_) => {
-                                *read_buf = vec![0u8; 4096];
-                                return Err(false);
-                            }
-                        };
+                    let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
+                        Ok(pair) => pair,
+                        Err(_) => {
+                            *read_buf = vec![0u8; 4096];
+                            return Err(false);
+                        }
+                    };
                     *read_buf = returned;
                     match res {
                         Ok(0) => return Err(false),

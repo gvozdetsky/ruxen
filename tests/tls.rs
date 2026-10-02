@@ -15,7 +15,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use common::tls::{make_ca_and_leaf, make_self_signed, make_wildcard, CertSet};
+use common::tls::{CertSet, make_ca_and_leaf, make_self_signed, make_wildcard};
 
 // Same SETUP_LOCK rationale as `tests/file_serving.rs`: serialize port
 // picking against the spawn + readiness-check of the previous setup so
@@ -119,10 +119,7 @@ impl Drop for ServerHandleMulti {
 /// for each cert in `certs` (zero-indexed). Lets one config carry several
 /// `server` blocks with their own keypairs — the shape SNI-dispatch tests
 /// need. The handle owns child + tempdir + every cert in the vector.
-pub fn spawn_https_server_multi(
-    config_template: &str,
-    certs: Vec<CertSet>,
-) -> ServerHandleMulti {
+pub fn spawn_https_server_multi(config_template: &str, certs: Vec<CertSet>) -> ServerHandleMulti {
     let (port, _lock) = pick_port();
     let confdir = unique_dir();
     let conf_path = confdir.join("nginx.conf");
@@ -224,9 +221,9 @@ pub fn curl_get_full(
     }
     cmd.arg(format!("https://{host}:{port}{path}"));
 
-    let out = cmd.output().expect(
-        "failed to spawn `curl` — install it or skip with `cargo test -- --skip tls::`",
-    );
+    let out = cmd
+        .output()
+        .expect("failed to spawn `curl` — install it or skip with `cargo test -- --skip tls::`");
     CurlOut {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -584,7 +581,10 @@ fn ssl_variables_over_tls13() {
 
     let reused = header_value(&resp.stdout, "X-Reused")
         .unwrap_or_else(|| panic!("missing X-Reused; stdout={}", resp.stdout));
-    assert_eq!(reused, ".", "fresh handshake should render `.` for $ssl_session_reused");
+    assert_eq!(
+        reused, ".",
+        "fresh handshake should render `.` for $ssl_session_reused"
+    );
 }
 
 /// `$scheme` renders `http` on a plain listener, and `$ssl_protocol`

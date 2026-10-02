@@ -217,20 +217,40 @@ http {
     write_htpasswd(&dir.join("users.htpasswd"));
     write_ok_file(&dir);
 
-    let alice = http_get(port, "/ok.txt", &[("Authorization", "Basic YWxpY2U6c2VjcmV0")]);
+    let alice = http_get(
+        port,
+        "/ok.txt",
+        &[("Authorization", "Basic YWxpY2U6c2VjcmV0")],
+    );
     assert_eq!(status(&alice), 200);
     assert_eq!(body(&alice), b"ok");
 
-    let bob = http_get(port, "/ok.txt", &[("Authorization", "Basic Ym9iOnNlY3JldA==")]);
+    let bob = http_get(
+        port,
+        "/ok.txt",
+        &[("Authorization", "Basic Ym9iOnNlY3JldA==")],
+    );
     assert_eq!(status(&bob), 200);
 
-    let carol = http_get(port, "/ok.txt", &[("Authorization", "Basic Y2Fyb2w6c2VjcmV0")]);
+    let carol = http_get(
+        port,
+        "/ok.txt",
+        &[("Authorization", "Basic Y2Fyb2w6c2VjcmV0")],
+    );
     assert_eq!(status(&carol), 200);
 
-    let dave = http_get(port, "/ok.txt", &[("Authorization", "Basic ZGF2ZTpzZWNyZXQ=")]);
+    let dave = http_get(
+        port,
+        "/ok.txt",
+        &[("Authorization", "Basic ZGF2ZTpzZWNyZXQ=")],
+    );
     assert_eq!(status(&dave), 200);
 
-    let wrong = http_get(port, "/ok.txt", &[("Authorization", "Basic YWxpY2U6d3Jvbmc=")]);
+    let wrong = http_get(
+        port,
+        "/ok.txt",
+        &[("Authorization", "Basic YWxpY2U6d3Jvbmc=")],
+    );
     assert_eq!(status(&wrong), 401);
 }
 

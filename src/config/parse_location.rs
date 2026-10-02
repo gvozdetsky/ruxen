@@ -3,8 +3,8 @@
 //! `error_page`, `autoindex_*`, `return`, `on/off` parsing, and the
 //! `try_files` probe/fallback classifier.
 
-use std::path::PathBuf;
 use super::*;
+use std::path::PathBuf;
 
 /// Shared `return STATUS [body]` parser used at both server and location
 /// scope. The body (if any) is tokenized into the same `ValuePart` form
@@ -78,10 +78,7 @@ pub(crate) fn parse_expires_args(args: &[String]) -> Result<ExpiresDirective, Er
 /// Parse the static (non-variable) form of an `expires` value. Shared by
 /// the directive parser and the runtime evaluator that handles
 /// `expires $var` after rendering.
-pub(crate) fn parse_expires_static(
-    value: &str,
-    modified: bool,
-) -> Result<ExpiresDirective, Error> {
+pub(crate) fn parse_expires_static(value: &str, modified: bool) -> Result<ExpiresDirective, Error> {
     if !modified {
         match value {
             "epoch" => return Ok(ExpiresDirective::Epoch),
@@ -586,8 +583,10 @@ pub(crate) fn parse_location_block(
                 if auth_basic_user_file.is_some() {
                     return Err(Error::Duplicate("auth_basic_user_file"));
                 }
-                auth_basic_user_file =
-                    Some(parse_auth_basic_user_file_args(&args[1..], lx.conf_prefix())?);
+                auth_basic_user_file = Some(parse_auth_basic_user_file_args(
+                    &args[1..],
+                    lx.conf_prefix(),
+                )?);
             }
             ("auth_delay", Terminator::Semi) => {
                 if auth_delay_ms.is_some() {
@@ -728,13 +727,12 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("proxy_limit_rate"));
                 }
                 let v = args.get(1).ok_or(Error::MissingArg("proxy_limit_rate"))?;
-                proxy_limit_rate =
-                    Some(crate::config::parse_server::parse_size_bytes(v).ok_or(
-                        Error::BadValue {
-                            what: "proxy_limit_rate",
-                            got: v.clone(),
-                        },
-                    )?);
+                proxy_limit_rate = Some(crate::config::parse_server::parse_size_bytes(v).ok_or(
+                    Error::BadValue {
+                        what: "proxy_limit_rate",
+                        got: v.clone(),
+                    },
+                )?);
             }
             ("proxy_http_version", Terminator::Semi) => {
                 if proxy_http_version.is_some() {

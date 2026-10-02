@@ -1,0 +1,5 @@
+# Mechanical reformatting; skip in `git blame`.
+# Locally: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# style: run cargo fmt over the whole tree
+1b97d688491dd9a9e5582bbad1b9a8551447574d

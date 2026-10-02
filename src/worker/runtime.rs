@@ -166,7 +166,6 @@ pub(crate) async fn write_access_logs(
     }
 }
 
-
 async fn settle_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
@@ -870,8 +869,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 b"expect",
                             ) {
                                 if expect.eq_ignore_ascii_case(b"100-continue") {
-                                    let resp: Vec<u8> =
-                                        b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+                                    let resp: Vec<u8> = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
                                     let (res, _) = stream.write_all(resp).await;
                                     if res.is_err() {
                                         return;
@@ -1139,8 +1137,13 @@ pub(crate) async fn handle<S: ConnIo>(
                                 && stream.sendfile_fd().is_some()
                             {
                                 let body = file_body.take().expect("checked is_some");
-                                if !send_head_and_file(&*stream, &mut sock_nonblocking, scratch, body)
-                                    .await
+                                if !send_head_and_file(
+                                    &*stream,
+                                    &mut sock_nonblocking,
+                                    scratch,
+                                    body,
+                                )
+                                .await
                                 {
                                     return;
                                 }
@@ -1207,14 +1210,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         }
 
                         if let Some(target) = process_meta.post_action {
-                            run_post_action(
-                                http,
-                                &ctx,
-                                target,
-                                request_start,
-                                &mut *url_scratch,
-                            )
-                            .await;
+                            run_post_action(http, &ctx, target, request_start, &mut *url_scratch)
+                                .await;
                         }
 
                         read_start += request_total_consumed;

@@ -521,7 +521,9 @@ impl ServerProxyDefaults {
     }
 }
 
-pub(crate) fn prepare_proxy_set_headers(list: Vec<ProxySetHeader>) -> &'static [PreparedProxySetHeader] {
+pub(crate) fn prepare_proxy_set_headers(
+    list: Vec<ProxySetHeader>,
+) -> &'static [PreparedProxySetHeader] {
     let mut out: Vec<PreparedProxySetHeader> = Vec::with_capacity(list.len());
     for h in list {
         let name: &'static [u8] = Box::leak(h.name.into_bytes().into_boxed_slice());
@@ -1209,7 +1211,9 @@ pub(crate) fn prepare_split_clients(
 /// string value (unless the regex modifier is used), so we do the same.
 /// Regex entries compile into `regex::bytes::Regex` so they match against
 /// the same byte slice as the source render.
-pub(crate) fn prepare_maps(blocks: Vec<MapBlock>) -> std::collections::HashMap<&'static str, PreparedMap> {
+pub(crate) fn prepare_maps(
+    blocks: Vec<MapBlock>,
+) -> std::collections::HashMap<&'static str, PreparedMap> {
     let mut out = std::collections::HashMap::new();
     for block in blocks {
         let MapBlock {

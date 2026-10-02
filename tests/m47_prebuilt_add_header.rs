@@ -107,7 +107,8 @@ fn exchange(stream: &mut TcpStream, path: &str) -> (String, String) {
                 .lines()
                 .find_map(|l| {
                     let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().unwrap())
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().unwrap())
                 })
                 .unwrap_or(0);
             while got.len() < i + 4 + len {

@@ -77,9 +77,7 @@ fn load_htpasswd_cached(user_file: &Path) -> io::Result<std::sync::Arc<Vec<(Vec<
     let len = meta.len();
 
     {
-        let guard = htpasswd_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = htpasswd_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = guard.get(user_file) {
             if hit.mtime == mtime && hit.len == len {
                 return Ok(hit.entries.clone());
@@ -90,9 +88,7 @@ fn load_htpasswd_cached(user_file: &Path) -> io::Result<std::sync::Arc<Vec<(Vec<
     let raw = std::fs::read(user_file)?;
     let entries = std::sync::Arc::new(parse_htpasswd(&raw));
 
-    let mut guard = htpasswd_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = htpasswd_cache().lock().unwrap_or_else(|e| e.into_inner());
     guard.insert(
         user_file.to_path_buf(),
         CachedHtpasswd {

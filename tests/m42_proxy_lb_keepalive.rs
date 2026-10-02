@@ -69,11 +69,7 @@ fn spawn_ruxen(conf_body: &str) -> (ServerGuard, u16) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
     let conf_path = dir.join("ruxen.conf");
-    std::fs::write(
-        &conf_path,
-        conf_body.replace("%%PORT%%", &port.to_string()),
-    )
-    .unwrap();
+    std::fs::write(&conf_path, conf_body.replace("%%PORT%%", &port.to_string())).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
@@ -118,24 +114,26 @@ impl Backend {
         let stop_c = stop.clone();
         let accepts_c = accepts.clone();
         let requests_c = requests.clone();
-        thread::spawn(move || loop {
-            if stop_c.load(Ordering::SeqCst) {
-                return;
-            }
-            let (s, _) = match listener.accept() {
-                Ok(v) => v,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    sleep(Duration::from_millis(2));
-                    continue;
+        thread::spawn(move || {
+            loop {
+                if stop_c.load(Ordering::SeqCst) {
+                    return;
                 }
-                Err(_) => return,
-            };
-            accepts_c.fetch_add(1, Ordering::SeqCst);
-            let requests_inner = requests_c.clone();
-            let stop_inner = stop_c.clone();
-            thread::spawn(move || {
-                handle_conn(s, response, &requests_inner, &stop_inner);
-            });
+                let (s, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                accepts_c.fetch_add(1, Ordering::SeqCst);
+                let requests_inner = requests_c.clone();
+                let stop_inner = stop_c.clone();
+                thread::spawn(move || {
+                    handle_conn(s, response, &requests_inner, &stop_inner);
+                });
+            }
         });
         Backend {
             addr,
@@ -146,12 +144,7 @@ impl Backend {
     }
 }
 
-fn handle_conn(
-    mut s: TcpStream,
-    response: &[u8],
-    requests: &AtomicUsize,
-    stop: &AtomicBool,
-) {
+fn handle_conn(mut s: TcpStream, response: &[u8], requests: &AtomicUsize, stop: &AtomicBool) {
     s.set_read_timeout(Some(Duration::from_secs(2))).ok();
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -203,7 +196,9 @@ impl Drop for Backend {
 
 fn http_send(port: u16, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     stream.write_all(request).unwrap();
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];

@@ -120,7 +120,12 @@ pub(crate) fn rewrite_target_is_external(rendered: &[u8]) -> bool {
 /// `absolute_redirect on`: scheme + Host header (or primary server_name as
 /// fallback) + listen port (omitted when it matches the scheme default) +
 /// the path. The path is expected to be already in URL form.
-pub(crate) fn build_absolute_redirect_location(path: &[u8], host: &[u8], port: u16, tls: bool) -> Vec<u8> {
+pub(crate) fn build_absolute_redirect_location(
+    path: &[u8],
+    host: &[u8],
+    port: u16,
+    tls: bool,
+) -> Vec<u8> {
     let scheme: &[u8] = if tls { b"https" } else { b"http" };
     let default_port = if tls { 443 } else { 80 };
     let mut out = Vec::with_capacity(scheme.len() + 3 + host.len() + 6 + path.len());
@@ -426,4 +431,3 @@ pub(crate) fn run_rewrite_program(
         RewriteControl::Respond(resp) => RewriteOutcome::Respond(resp),
     }
 }
-

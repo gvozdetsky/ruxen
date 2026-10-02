@@ -176,7 +176,9 @@ mod tests {
             "TLS_AES_256_GCM_SHA384",
         );
         assert_eq!(
-            cipher_suite_iana_name(find_suite(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)),
+            cipher_suite_iana_name(find_suite(
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            )),
             "TLS_CHACHA20_POLY1305_SHA256",
         );
     }
@@ -199,7 +201,13 @@ mod tests {
 
     #[test]
     fn protocol_version_str_known_versions() {
-        assert_eq!(protocol_version_str(rustls::ProtocolVersion::TLSv1_3), "TLSv1.3");
-        assert_eq!(protocol_version_str(rustls::ProtocolVersion::TLSv1_2), "TLSv1.2");
+        assert_eq!(
+            protocol_version_str(rustls::ProtocolVersion::TLSv1_3),
+            "TLSv1.3"
+        );
+        assert_eq!(
+            protocol_version_str(rustls::ProtocolVersion::TLSv1_2),
+            "TLSv1.2"
+        );
     }
 }

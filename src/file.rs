@@ -940,14 +940,11 @@ fn epoch_from_ymdhms(
     // standard prefix formula shifted to 1970 (1969 has 477 leap years
     // since year 1).
     let prev = year - 1;
-    let leap_days_since_1970 =
-        (prev / 4 - prev / 100 + prev / 400) as u64 - 477;
+    let leap_days_since_1970 = (prev / 4 - prev / 100 + prev / 400) as u64 - 477;
     let mut days = 365u64 * (year - 1970) as u64 + leap_days_since_1970;
 
     // Cumulative non-leap-year days at the start of each month (index 1..=12).
-    const MONTH_OFFSETS: [u16; 13] = [
-        0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334,
-    ];
+    const MONTH_OFFSETS: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     days += MONTH_OFFSETS[month as usize] as u64;
     if month > 2 && is_leap(year) {
         days += 1;
@@ -1112,7 +1109,10 @@ mod tests {
                 assert_eq!(body.offset, 0);
                 assert_eq!(body.len, (INLINE_BODY_LIMIT as usize + 16) as u64);
             }
-            Response::Owned(_) | Response::Prebuilt(_) | Response::Reroute(_) | Response::Proxy(_) => {
+            Response::Owned(_)
+            | Response::Prebuilt(_)
+            | Response::Reroute(_)
+            | Response::Proxy(_) => {
                 panic!("expected streamed file response")
             }
         }
@@ -1140,7 +1140,10 @@ mod tests {
                 assert!(s.contains("Content-Length: 6\r\n"));
                 assert!(s.ends_with("\r\n\r\n"));
             }
-            Response::File { .. } | Response::Prebuilt(_) | Response::Reroute(_) | Response::Proxy(_) => {
+            Response::File { .. }
+            | Response::Prebuilt(_)
+            | Response::Reroute(_)
+            | Response::Proxy(_) => {
                 panic!("expected buffered headers-only response")
             }
         }
@@ -1168,7 +1171,10 @@ mod tests {
                 assert!(s.contains("Content-Length: 6\r\n"));
                 assert!(s.ends_with("abcdef"));
             }
-            Response::File { .. } | Response::Prebuilt(_) | Response::Reroute(_) | Response::Proxy(_) => {
+            Response::File { .. }
+            | Response::Prebuilt(_)
+            | Response::Reroute(_)
+            | Response::Proxy(_) => {
                 panic!("expected inlined small response")
             }
         }
@@ -1196,7 +1202,10 @@ mod tests {
                 assert!(s.contains("Content-Length: 0\r\n"));
                 assert!(s.ends_with("\r\n\r\n"));
             }
-            Response::File { .. } | Response::Prebuilt(_) | Response::Reroute(_) | Response::Proxy(_) => {
+            Response::File { .. }
+            | Response::Prebuilt(_)
+            | Response::Reroute(_)
+            | Response::Proxy(_) => {
                 panic!("expected buffered headers-only response for zero-length file")
             }
         }
@@ -1814,7 +1823,13 @@ mod tests {
         std::fs::write(&large, vec![b'l'; SENDFILE_MIN_BODY as usize]).unwrap();
 
         let serve = |path: &std::path::Path, sendfile: bool| {
-            serve_path(open_for_test(path), Method::Get, no_cond(), b"nginx/1.29.2", sendfile)
+            serve_path(
+                open_for_test(path),
+                Method::Get,
+                no_cond(),
+                b"nginx/1.29.2",
+                sendfile,
+            )
         };
         assert!(matches!(serve(&small, true), Response::Owned(_)));
         assert!(matches!(serve(&large, true), Response::File { .. }));
@@ -1837,7 +1852,11 @@ mod tests {
         }
         let mut mon = 0usize;
         loop {
-            let md = if mon == 1 && is_leap(year) { 29 } else { DAYS_PER_MONTH[mon] };
+            let md = if mon == 1 && is_leap(year) {
+                29
+            } else {
+                DAYS_PER_MONTH[mon]
+            };
             if d < md {
                 break;
             }
@@ -1854,10 +1873,15 @@ mod tests {
         // a coprime stride plus the last day reaches the 9999 cap.
         let full_until = 157_000; // ~2399-11
         let last_day = MAX_HTTP_DATE_SECS / 86_400;
-        let sampled = (full_until..=last_day).step_by(97).chain(std::iter::once(last_day));
+        let sampled = (full_until..=last_day)
+            .step_by(97)
+            .chain(std::iter::once(last_day));
         for days in (0..full_until).chain(sampled) {
-            assert_eq!(civil_from_days(days), civil_from_days_walk(days), "day {days}");
+            assert_eq!(
+                civil_from_days(days),
+                civil_from_days_walk(days),
+                "day {days}"
+            );
         }
     }
-
 }
