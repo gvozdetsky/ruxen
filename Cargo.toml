@@ -11,16 +11,9 @@ authors = ["Eugene Gvozdetsky <gvozdet@gmail.com>"]
 bytes = "1"
 libc = "0.2"
 monoio = "0.2.4"
-monoio-rustls = "0.4"
 regex = "1"
 rustls = "0.23"
 rustls-pemfile = "2"
 
 [dev-dependencies]
 rcgen = "0.14"
-
-# Pin to the fork branch carrying `Stream::get_ref` / `get_mut` while the
-# upstream PR (https://github.com/monoio-rs/monoio-tls) is in flight. Drop the
-# `[patch]` block once a release containing the accessors is published.
-[patch.crates-io]
-monoio-rustls = { git = "https://github.com/gvozdetsky/monoio-tls", rev = "3329f840e1a238d028013b6d4f2b2dded7ee2744" }
