@@ -178,8 +178,16 @@ async fn settle_proxy_response(
     };
 
     let upstream_started = Instant::now();
-    let upstream_resp = crate::proxy::run_proxy(plan).await;
+    let mut failures = Vec::new();
+    let upstream_resp = crate::proxy::run_proxy(plan, &mut failures).await;
     let upstream_elapsed_ms = upstream_started.elapsed().as_millis() as u64;
+    if !failures.is_empty() {
+        write_upstream_error_log(
+            &process_meta.log,
+            &ErrorLogRequest::new(ctx, process_meta.server_name),
+            &failures,
+        );
+    }
     if let Response::Reroute(rr) = upstream_resp {
         let (resp2, meta2) = phase::process_with_meta_from_reroute(http, ctx, url_scratch, rr);
         return (resp2, meta2);
@@ -252,7 +260,8 @@ async fn run_post_action(
     let response_for_logs = static_response.unwrap_or(owned_response.as_slice());
     let log_request_uri = post_path;
 
-    write_not_found_error_log(post_meta.log, log_request_uri, response_for_logs);
+    let log_req = ErrorLogRequest::new(&post_ctx, post_meta.server_name);
+    write_not_found_error_log(post_meta.log, &log_req, response_for_logs);
 
     if !post_meta.access_logs.is_empty() {
         write_access_logs(
@@ -1230,7 +1239,8 @@ pub(crate) async fn handle<S: ConnIo>(
                             }
                         }
 
-                        write_not_found_error_log(process_meta.log, path, response_for_logs);
+                        let log_req = ErrorLogRequest::new(&ctx, process_meta.server_name);
+                        write_not_found_error_log(process_meta.log, &log_req, response_for_logs);
 
                         if !process_meta.access_logs.is_empty() {
                             let request_time_us = request_start.elapsed().as_micros() as u64;

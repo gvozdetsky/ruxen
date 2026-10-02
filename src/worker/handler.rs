@@ -470,11 +470,9 @@ pub(crate) fn run_location_handler(
             rewritten_uri.as_slice()
         };
         // Pick the first peer via the per-worker LB. None means every
-        // peer is `down` or in a `max_fails` cooldown — surface as 502.
-        let initial_peer = match crate::upstream::pick_peer(proxy.upstream, 0) {
-            Some(p) => p,
-            None => return Response::Prebuilt(http.bad_gateway.pick(req.method)),
-        };
+        // peer is `down` or in a `max_fails` cooldown: `run_proxy` answers
+        // 502 and reports `no live upstreams` for the error log.
+        let initial_peer = crate::upstream::pick_peer(proxy.upstream, 0);
         // Render proxy_set_header values with $proxy_host populated for
         // this location's upstream URL authority. The other RenderCtx
         // fields are inherited from the base built above.
@@ -608,7 +606,7 @@ pub(crate) fn run_location_handler(
         };
         return Response::Proxy(crate::proxy::ProxyPlan {
             upstream: proxy.upstream,
-            initial_peer: Some(initial_peer),
+            initial_peer,
             request: bytes::Bytes::from(request),
             method: req.method,
             server_bytes,

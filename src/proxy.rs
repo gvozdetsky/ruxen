@@ -242,7 +242,39 @@ pub fn is_hop_by_hop_name(name: &[u8]) -> bool {
 ///     and retry.
 ///   - Pool the upstream socket on success when the upstream and request
 ///     framing both permit it.
-pub async fn run_proxy(mut plan: ProxyPlan) -> Response {
+/// Record a failed attempt for the error log. Out of line and cold so the
+/// formatting stays out of the retry loop's code.
+#[cold]
+#[inline(never)]
+fn record_failure(
+    failures: &mut Vec<AttemptFailure>,
+    plan: &ProxyPlan,
+    peer_idx: usize,
+    error: Box<UpstreamError>,
+) {
+    failures.push(AttemptFailure {
+        error: *error,
+        upstream: upstream_url(plan, peer_idx),
+    });
+}
+
+/// `http://<peer><URI>` for `upstream: "…"` in error-log lines; the URI is
+/// taken from the request line already built for the upstream.
+fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
+    let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let uri = request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/");
+    format!(
+        "http://{}{}",
+        plan.upstream.peers[peer_idx].addr,
+        String::from_utf8_lossy(uri)
+    )
+}
+
+/// Run the upstream exchange, with `proxy_next_upstream` failover. Each
+/// failed attempt is appended to `failures` so the worker can log it with
+/// the request's context; on the happy path nothing is pushed and the
+/// caller's empty `Vec` never allocates.
+pub async fn run_proxy(mut plan: ProxyPlan, failures: &mut Vec<AttemptFailure>) -> Response {
     let upstream = plan.upstream;
     let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
     let overall_deadline = if plan.next_upstream_timeout.is_zero() {
@@ -253,10 +285,15 @@ pub async fn run_proxy(mut plan: ProxyPlan) -> Response {
     // Take ownership of the initial leased peer. `current` always names
     // the peer we're about to try; tried_mask records peers already
     // attempted (and reported FAILED) so the next pick skips them.
-    let mut current = plan
-        .initial_peer
-        .take()
-        .expect("ruxen: run_proxy entered without an initial leased peer");
+    // No initial peer: every peer is `down` or cooling off after
+    // `max_fails`.
+    let Some(mut current) = plan.initial_peer.take() else {
+        failures.push(AttemptFailure {
+            error: UpstreamError::NoLiveUpstreams,
+            upstream: String::new(),
+        });
+        return Response::Prebuilt(plan.bad_gateway.pick(plan.method));
+    };
     let mut tried_mask: u64 = 1u64 << current.peer_idx.min(63);
     let mut attempts: u32 = 0;
     // Idempotent methods may always be retried. POST/PATCH/etc. only when
@@ -290,6 +327,7 @@ pub async fn run_proxy(mut plan: ProxyPlan) -> Response {
                         AttemptOutcome::Failed(
                             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                             FailKind::Error,
+                            Box::new(UpstreamError::PrematurelyClosed(Stage::ReadingHeader)),
                         )
                     }
                 }
@@ -345,8 +383,9 @@ pub async fn run_proxy(mut plan: ProxyPlan) -> Response {
                 // retry or a Failed; reaching here is a logic bug.
                 unreachable!("ruxen: pooled-stale outcome leaked past stale-retry collapse");
             }
-            AttemptOutcome::Failed(resp, kind) => {
+            AttemptOutcome::Failed(resp, kind, error) => {
                 upstream::report_failure(upstream, current.peer_idx);
+                record_failure(failures, &plan, current.peer_idx, error);
                 let triggers = match kind {
                     FailKind::Error => plan.next_upstream.error,
                     FailKind::Timeout => plan.next_upstream.timeout,
@@ -488,6 +527,129 @@ enum FailKind {
     InvalidHeader,
 }
 
+/// What the proxy was doing when an attempt failed — the `while …` part
+/// of nginx's upstream error lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Connecting,
+    SendingRequest,
+    ReadingHeader,
+    ReadingBody,
+}
+
+impl Stage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Stage::Connecting => "connecting to upstream",
+            Stage::SendingRequest => "sending request to upstream",
+            Stage::ReadingHeader => "reading response header from upstream",
+            Stage::ReadingBody => "reading upstream",
+        }
+    }
+}
+
+/// Why one upstream attempt failed. `Display` is nginx's wording
+/// (ngx_http_upstream.c, ngx_event_connect.c), so error-log lines read the
+/// same as nginx's.
+#[derive(Debug)]
+pub enum UpstreamError {
+    ConnectFailed(std::io::Error),
+    SendFailed(std::io::Error),
+    RecvFailed(std::io::Error, Stage),
+    TimedOut(Stage),
+    PrematurelyClosed(Stage),
+    TooBigHeader,
+    InvalidStatusLine,
+    Status444,
+    NoBodyFraming,
+    InvalidChunked,
+    TooBigBody,
+    NoLiveUpstreams,
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::worker::errno_text;
+        use UpstreamError::*;
+        match self {
+            ConnectFailed(e) => write!(
+                f,
+                "connect() failed ({}) while {}",
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            SendFailed(e) => write!(
+                f,
+                "send() failed ({}) while {}",
+                errno_text(e),
+                Stage::SendingRequest.as_str()
+            ),
+            RecvFailed(e, stage) => {
+                write!(
+                    f,
+                    "recv() failed ({}) while {}",
+                    errno_text(e),
+                    stage.as_str()
+                )
+            }
+            TimedOut(stage) => write!(
+                f,
+                "upstream timed out (110: Connection timed out) while {}",
+                stage.as_str()
+            ),
+            PrematurelyClosed(stage) => {
+                write!(
+                    f,
+                    "upstream prematurely closed connection while {}",
+                    stage.as_str()
+                )
+            }
+            TooBigHeader => write!(
+                f,
+                "upstream sent too big header while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            InvalidStatusLine => write!(
+                f,
+                "upstream sent no valid HTTP/1.0 header while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            Status444 => write!(
+                f,
+                "upstream sent status 444 while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            NoBodyFraming => write!(
+                f,
+                "upstream sent neither Content-Length nor chunked encoding with HTTP/1.1 \
+                 keep-alive while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            InvalidChunked => write!(
+                f,
+                "upstream sent invalid chunked response while {}",
+                Stage::ReadingBody.as_str()
+            ),
+            TooBigBody => write!(
+                f,
+                "upstream response is too big to buffer while {}",
+                Stage::ReadingBody.as_str()
+            ),
+            NoLiveUpstreams => write!(f, "no live upstreams while {}", Stage::Connecting.as_str()),
+        }
+    }
+}
+
+/// One failed attempt, for the error log: what went wrong and where. The
+/// worker adds the request context (client, server, request, host).
+#[derive(Debug)]
+pub struct AttemptFailure {
+    pub error: UpstreamError,
+    /// `http://<peer><upstream URI>`, as nginx prints `upstream: "…"`.
+    /// Empty when no peer was tried (`no live upstreams`).
+    pub upstream: String,
+}
+
 enum AttemptOutcome {
     Ok(Response),
     /// The pooled connection failed before we received any response data
@@ -495,8 +657,11 @@ enum AttemptOutcome {
     /// idempotency in the outer loop).
     PooledStale,
     /// Hard failure. Carries the response we'd return if no failover
-    /// fires, plus a classification for the next_upstream check.
-    Failed(Response, FailKind),
+    /// fires, a classification for the next_upstream check, and the
+    /// reason for the error log (boxed: allocated only on failure, and it
+    /// keeps this enum the size of a `Response`, which every attempt
+    /// returns).
+    Failed(Response, FailKind, Box<UpstreamError>),
 }
 
 async fn attempt(
@@ -512,16 +677,18 @@ async fn attempt(
         let connect_fut = TcpStream::connect(peer_addr);
         let stream = match timeout(plan.connect_timeout, connect_fut).await {
             Ok(Ok(s)) => s,
-            Ok(Err(_)) => {
+            Ok(Err(e)) => {
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
+                    Box::new(UpstreamError::ConnectFailed(e)),
                 );
             }
             Err(_) => {
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
                     FailKind::Timeout,
+                    Box::new(UpstreamError::TimedOut(Stage::Connecting)),
                 );
             }
         };
@@ -544,16 +711,18 @@ async fn attempt(
             return AttemptOutcome::Failed(
                 Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
                 FailKind::Timeout,
+                Box::new(UpstreamError::TimedOut(Stage::SendingRequest)),
             );
         }
     };
-    if res.is_err() {
+    if let Err(e) = res {
         if from_pool {
             return AttemptOutcome::PooledStale;
         }
         return AttemptOutcome::Failed(
             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
             FailKind::Error,
+            Box::new(UpstreamError::SendFailed(e)),
         );
     }
 
@@ -580,6 +749,7 @@ async fn attempt(
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
                     FailKind::Timeout,
+                    Box::new(UpstreamError::TimedOut(Stage::ReadingHeader)),
                 );
             }
         };
@@ -592,16 +762,18 @@ async fn attempt(
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
+                    Box::new(UpstreamError::PrematurelyClosed(Stage::ReadingHeader)),
                 );
             }
             Ok(n) => accum.extend_from_slice(&read_buf[..n]),
-            Err(_) => {
+            Err(e) => {
                 if accum.is_empty() && from_pool {
                     return AttemptOutcome::PooledStale;
                 }
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
+                    Box::new(UpstreamError::RecvFailed(e, Stage::ReadingHeader)),
                 );
             }
         }
@@ -614,6 +786,7 @@ async fn attempt(
             return AttemptOutcome::Failed(
                 Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                 FailKind::InvalidHeader,
+                Box::new(UpstreamError::TooBigHeader),
             );
         }
     }
@@ -629,6 +802,7 @@ async fn attempt(
             return AttemptOutcome::Failed(
                 Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                 FailKind::InvalidHeader,
+                Box::new(UpstreamError::InvalidStatusLine),
             );
         }
     };
@@ -643,6 +817,7 @@ async fn attempt(
         return AttemptOutcome::Failed(
             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
             FailKind::InvalidHeader,
+            Box::new(UpstreamError::InvalidStatusLine),
         );
     };
     let status_code = parse_status_code(&accum[..first_line_end]);
@@ -658,6 +833,7 @@ async fn attempt(
         return AttemptOutcome::Failed(
             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
             FailKind::Error,
+            Box::new(UpstreamError::Status444),
         );
     }
 
@@ -746,13 +922,14 @@ async fn attempt(
             .await
         {
             Ok(()) => {}
-            Err(stale) => {
+            Err((stale, error)) => {
                 if stale && from_pool && body.is_empty() {
                     return AttemptOutcome::PooledStale;
                 }
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
+                    Box::new(error),
                 );
             }
         }
@@ -781,6 +958,7 @@ async fn attempt(
                     return AttemptOutcome::Failed(
                         Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
                         FailKind::Timeout,
+                        Box::new(UpstreamError::TimedOut(Stage::ReadingBody)),
                     );
                 }
             };
@@ -790,6 +968,7 @@ async fn attempt(
                     return AttemptOutcome::Failed(
                         Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                         FailKind::Error,
+                        Box::new(UpstreamError::PrematurelyClosed(Stage::ReadingBody)),
                     );
                 }
                 Ok(n) => {
@@ -800,10 +979,11 @@ async fn attempt(
                     paced_body_bytes += take as u64;
                     pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
                 }
-                Err(_) => {
+                Err(e) => {
                     return AttemptOutcome::Failed(
                         Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                         FailKind::Error,
+                        Box::new(UpstreamError::RecvFailed(e, Stage::ReadingBody)),
                     );
                 }
             }
@@ -818,6 +998,7 @@ async fn attempt(
                     return AttemptOutcome::Failed(
                         Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
                         FailKind::Timeout,
+                        Box::new(UpstreamError::TimedOut(Stage::ReadingBody)),
                     );
                 }
             };
@@ -830,10 +1011,11 @@ async fn attempt(
                     paced_body_bytes += n as u64;
                     pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
                 }
-                Err(_) => {
+                Err(e) => {
                     return AttemptOutcome::Failed(
                         Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                         FailKind::Error,
+                        Box::new(UpstreamError::RecvFailed(e, Stage::ReadingBody)),
                     );
                 }
             }
@@ -841,6 +1023,7 @@ async fn attempt(
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
+                    Box::new(UpstreamError::TooBigBody),
                 );
             }
         }
@@ -850,6 +1033,7 @@ async fn attempt(
         return AttemptOutcome::Failed(
             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
             FailKind::InvalidHeader,
+            Box::new(UpstreamError::NoBodyFraming),
         );
     }
 
@@ -975,14 +1159,14 @@ async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: Instant) {
 /// header-pull loop and reused for every read here too — `attempt` does
 /// one allocation for it per request and threads it through both phases.
 ///
-/// Returns `Err(true)` if no bytes were read at all (indicates a stale
-/// pooled connection); `Err(false)` for any other failure.
+/// On failure returns the reason, paired with `true` if no bytes were read
+/// at all (a stale pooled connection) and `false` otherwise.
 async fn read_chunked_body_with_buf(
     stream: &mut TcpStream,
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
-) -> Result<(), bool> {
+) -> Result<(), (bool, UpstreamError)> {
     // Buffered reader over the stream — chunked decoding is line-oriented
     // and we already may have leftover bytes from the header read in
     // `body`.
@@ -1003,17 +1187,27 @@ async fn read_chunked_body_with_buf(
                 Ok(pair) => pair,
                 Err(_) => {
                     *read_buf = vec![0u8; 4096];
-                    return Err(false);
+                    return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
                 }
             };
             *read_buf = returned;
             match res {
-                Ok(0) => return Err(nothing_read),
+                Ok(0) => {
+                    return Err((
+                        nothing_read,
+                        UpstreamError::PrematurelyClosed(Stage::ReadingBody),
+                    ));
+                }
                 Ok(n) => {
                     buf.extend_from_slice(&read_buf[..n]);
                     nothing_read = false;
                 }
-                Err(_) => return Err(nothing_read),
+                Err(e) => {
+                    return Err((
+                        nothing_read,
+                        UpstreamError::RecvFailed(e, Stage::ReadingBody),
+                    ));
+                }
             }
         };
         let line = trim_crlf(&buf[pos..line_end]);
@@ -1024,17 +1218,17 @@ async fn read_chunked_body_with_buf(
         };
         let size_str = match std::str::from_utf8(size_part) {
             Ok(s) => s.trim(),
-            Err(_) => return Err(false),
+            Err(_) => return Err((false, UpstreamError::InvalidChunked)),
         };
         let chunk_size = match u64::from_str_radix(size_str, 16) {
             Ok(n) => n,
-            Err(_) => return Err(false),
+            Err(_) => return Err((false, UpstreamError::InvalidChunked)),
         };
         pos = line_end + 1;
         // Bound the size before any arithmetic on it: `FFFFFFFFFFFFFFFF`
         // would overflow `chunk_size + 2` below and panic the worker.
         if chunk_size > (MAX_UNFRAMED_BODY - decoded.len()) as u64 {
-            return Err(false);
+            return Err((false, UpstreamError::TooBigBody));
         }
         if chunk_size == 0 {
             // Read the trailing CRLF (or any trailers, but we don't
@@ -1049,14 +1243,21 @@ async fn read_chunked_body_with_buf(
                         Ok(pair) => pair,
                         Err(_) => {
                             *read_buf = vec![0u8; 4096];
-                            return Err(false);
+                            return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
                         }
                     };
                     *read_buf = returned;
                     match res {
-                        Ok(0) => return Err(false),
+                        Ok(0) => {
+                            return Err((
+                                false,
+                                UpstreamError::PrematurelyClosed(Stage::ReadingBody),
+                            ));
+                        }
                         Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                        Err(_) => return Err(false),
+                        Err(e) => {
+                            return Err((false, UpstreamError::RecvFailed(e, Stage::ReadingBody)));
+                        }
                     }
                 };
                 let line = trim_crlf(&buf[pos..line_end]);
@@ -1077,14 +1278,14 @@ async fn read_chunked_body_with_buf(
                 Ok(pair) => pair,
                 Err(_) => {
                     *read_buf = vec![0u8; 4096];
-                    return Err(false);
+                    return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
                 }
             };
             *read_buf = returned;
             match res {
-                Ok(0) => return Err(false),
+                Ok(0) => return Err((false, UpstreamError::PrematurelyClosed(Stage::ReadingBody))),
                 Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                Err(_) => return Err(false),
+                Err(e) => return Err((false, UpstreamError::RecvFailed(e, Stage::ReadingBody))),
             }
         }
         decoded.extend_from_slice(&buf[pos..pos + chunk_size as usize]);
