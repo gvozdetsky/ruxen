@@ -453,7 +453,12 @@ pub(crate) fn build_proxy(
             location_pattern,
         )?
     };
-    let response = prepare_response_rules(redirects, eff.hide_headers, eff.pass_headers);
+    let response = prepare_response_rules(
+        redirects,
+        eff.hide_headers,
+        eff.pass_headers,
+        eff.error_pages,
+    );
     Ok(match pp {
         ProxyPass::Direct {
             addr, host_header, ..
@@ -545,6 +550,7 @@ fn prepare_response_rules(
     redirects: &'static [PreparedRedirect],
     hide: Option<&'static [String]>,
     pass: Option<&'static [String]>,
+    error_pages: &'static [PreparedErrorPage],
 ) -> &'static ProxyResponseRules {
     let pass = pass.unwrap_or(&[]);
     let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
@@ -560,6 +566,7 @@ fn prepare_response_rules(
         .collect();
     Box::leak(Box::new(ProxyResponseRules {
         redirects,
+        error_pages,
         hide: Box::leak(hide.into_boxed_slice()),
         pass_mask,
     }))
@@ -761,6 +768,8 @@ pub(crate) fn resolve_proxy_effective(
         },
         hide_headers: leak_list(location_hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location_pass_headers).or(server_defaults.pass_headers),
+        // Filled in by the location once its error_page list is resolved.
+        error_pages: &[],
     }
 }
 
@@ -1985,6 +1994,11 @@ pub(crate) fn build_prefix_or_exact(
     );
     let tokens = location_server_tokens.unwrap_or(server_tokens_value);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
+    let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
+    let proxy_effective = ProxyEffective {
+        error_pages,
+        ..proxy_effective
+    };
     let handler = build_handler(
         handler,
         pattern,
@@ -2008,7 +2022,6 @@ pub(crate) fn build_prefix_or_exact(
     let auto_redirect = matches!(&handler, PreparedHandler::Proxy(_)) && pattern.ends_with(b"/");
     let add_headers = resolve_add_headers(location_add_headers, server_add_headers);
     let add_trailers = resolve_add_headers(location_add_trailers, server_add_trailers);
-    let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
     let error_logs = resolve_error_logs(location_error_logs, server_error_logs)?;
     let log_not_found = location_log_not_found.unwrap_or(server_log_not_found);
     let access_logs = match location_access_logs {
@@ -2178,6 +2191,11 @@ pub(crate) fn build_regex_location(
     );
     let tokens = location_server_tokens.unwrap_or(server_tokens_value);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
+    let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
+    let proxy_effective = ProxyEffective {
+        error_pages,
+        ..proxy_effective
+    };
     let handler = build_handler(
         handler,
         location_pattern,
@@ -2200,7 +2218,6 @@ pub(crate) fn build_regex_location(
     )?;
     let add_headers = resolve_add_headers(location_add_headers, server_add_headers);
     let add_trailers = resolve_add_headers(location_add_trailers, server_add_trailers);
-    let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
     let error_logs = resolve_error_logs(location_error_logs, server_error_logs)?;
     let log_not_found = location_log_not_found.unwrap_or(server_log_not_found);
     let access_logs = match location_access_logs {
