@@ -109,7 +109,8 @@ fn fd_exhaustion_backs_off_instead_of_spinning() {
     // costs next to nothing.
     assert!(used < 30, "accept loop used {used} CPU ticks in 1 s");
     assert!(
-        log.contains("[crit] accept() failed (24: Too many open files)"),
+        log.lines().any(|l| l.contains(" [crit] ")
+            && l.ends_with(": accept() failed (24: Too many open files)")),
         "error log: {log}"
     );
     assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");

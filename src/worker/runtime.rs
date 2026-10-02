@@ -403,6 +403,9 @@ pub fn run(
                 }
                 match accept_or_tick(&listener).await {
                     Ok(Some((stream, addr))) => {
+                        if !admit_connection(http) {
+                            continue;
+                        }
                         let _ = stream.set_nodelay(true);
                         state.connection_started();
                         let connection_id = state.next_connection_id();
@@ -448,6 +451,9 @@ pub(crate) async fn run_listener(
         }
         match accept_or_tick(&listener).await {
             Ok(Some((stream, addr))) => {
+                if !admit_connection(http) {
+                    continue;
+                }
                 let _ = stream.set_nodelay(true);
                 state.connection_started();
                 let connection_id = state.next_connection_id();
@@ -517,7 +523,10 @@ pub(crate) async fn accept_failed(err: &std::io::Error) {
         err.raw_os_error(),
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
     ) {
-        eprintln!("ruxen: [crit] accept() failed ({})", errno_text(err));
+        write_worker_log(
+            ErrorLogLevel::Crit,
+            &format!("accept() failed ({})", errno_text(err)),
+        );
         monoio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -563,8 +572,9 @@ pub(crate) async fn wait_readable_or_shutdown(
             .reset(monoio::time::Instant::now() + timeout);
     }
 
+    let idle = IdleMark::new();
     loop {
-        if state.is_shutting_down() {
+        if state.is_shutting_down() || idle.asked_to_close() {
             return false;
         }
         // SIGHUP-driven reload while this connection was idle: bail out so
@@ -574,7 +584,8 @@ pub(crate) async fn wait_readable_or_shutdown(
             return false;
         }
 
-        // Wake every 50 ms to re-check shutdown / reload; the idle deadline
+        // Wake every 50 ms to re-check shutdown / reload / room-making; the
+        // idle deadline
         // ends the wait. Both are the connection's long-lived timers.
         timers
             .tick
@@ -605,6 +616,107 @@ pub(crate) struct ConnectionGuard(Arc<RuntimeState>);
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.connection_finished();
+        WORKER_CONNS.with(|w| w.active.set(w.active.get().saturating_sub(1)));
+    }
+}
+
+/// This worker's share of `worker_connections`, and nginx's reuse of idle
+/// connections when it runs low (`ngx_drain_connections`). A worker is a
+/// thread that owns its connections, so thread-local cells are enough.
+struct WorkerConns {
+    /// Accepted connections that haven't finished.
+    active: Cell<usize>,
+    /// Connections waiting for a request — nginx's "reusable" ones.
+    idle: Cell<usize>,
+    /// How many idle connections are asked to close to make room.
+    drain: Cell<usize>,
+    /// UNIX second of the last "not enough" line: log once a second.
+    logged_at: Cell<u64>,
+}
+
+thread_local! {
+    static WORKER_CONNS: WorkerConns = const {
+        WorkerConns {
+            active: Cell::new(0),
+            idle: Cell::new(0),
+            drain: Cell::new(0),
+            logged_at: Cell::new(0),
+        }
+    };
+}
+
+/// Count a newly accepted connection against the worker's slots. When few
+/// are left, ask up to 32 idle connections (an eighth of them) to close,
+/// as nginx does below a sixteenth free; with none left, `false`: the new
+/// connection is closed, as when nginx's ngx_get_connection fails.
+pub(crate) fn admit_connection(http: &PreparedHttp) -> bool {
+    let slots = http.client_slots();
+    WORKER_CONNS.with(|w| {
+        let active = w.active.get();
+        let idle = w.idle.get();
+        let full = active >= slots;
+        if slots - active.min(slots) <= slots / 16 && idle > 0 {
+            w.drain.set(w.drain.get().max((idle / 8).clamp(1, 32)));
+            if !full {
+                log_connections_not_enough(w, http, ErrorLogLevel::Warn, ", reusing connections");
+            }
+        }
+        if full {
+            log_connections_not_enough(w, http, ErrorLogLevel::Alert, "");
+            return false;
+        }
+        w.active.set(active + 1);
+        true
+    })
+}
+
+fn log_connections_not_enough(
+    w: &WorkerConns,
+    http: &PreparedHttp,
+    level: ErrorLogLevel,
+    tail: &str,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if w.logged_at.replace(now) != now {
+        write_worker_log(
+            level,
+            &format!(
+                "{} worker_connections are not enough{tail}",
+                http.worker_connections
+            ),
+        );
+    }
+}
+
+/// Marks a connection idle (waiting for a request) while alive, so
+/// `admit_connection` can ask it to make room.
+struct IdleMark;
+
+impl IdleMark {
+    fn new() -> Self {
+        WORKER_CONNS.with(|w| w.idle.set(w.idle.get() + 1));
+        IdleMark
+    }
+
+    /// Whether this idle connection should close to free a slot.
+    fn asked_to_close(&self) -> bool {
+        WORKER_CONNS.with(|w| {
+            let drain = w.drain.get();
+            if drain == 0 {
+                return false;
+            }
+            w.drain.set(drain - 1);
+            true
+        })
+    }
+}
+
+impl Drop for IdleMark {
+    fn drop(&mut self) {
+        WORKER_CONNS.with(|w| w.idle.set(w.idle.get().saturating_sub(1)));
     }
 }
 

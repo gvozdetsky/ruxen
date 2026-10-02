@@ -97,7 +97,7 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
-            ("events", Terminator::BlockOpen) => skip_block(&mut lx)?,
+            ("events", Terminator::BlockOpen) => parse_events_block(&mut lx, &mut runtime)?,
             ("events", _) => {
                 return Err(Error::WrongTerminator {
                     name: name.into(),
@@ -829,6 +829,37 @@ pub(crate) fn warn_ignored_tls_policy(args: &[String], warnings: &mut Vec<String
     }
 }
 
+/// `events { … }`: `worker_connections` is used; the other event-module
+/// knobs (`use`, `multi_accept`, `accept_mutex`, …) don't apply to
+/// io_uring and are ignored, as the whole block used to be.
+fn parse_events_block(lx: &mut Lexer, runtime: &mut RuntimeOpts) -> Result<(), Error> {
+    loop {
+        let (args, term) = lx.read_directive()?;
+        match (args.first().map(String::as_str), term) {
+            (None, Terminator::BlockClose) => return Ok(()),
+            (None, Terminator::Eof) => return Err(Error::UnclosedBlock),
+            (None, _) => continue,
+            (Some("worker_connections"), Terminator::Semi) => {
+                if runtime.worker_connections.is_some() {
+                    return Err(Error::Duplicate("worker_connections"));
+                }
+                let raw = args.get(1).ok_or(Error::MissingArg("worker_connections"))?;
+                let n: usize =
+                    raw.parse()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or_else(|| Error::BadValue {
+                            what: "worker_connections",
+                            got: raw.clone(),
+                        })?;
+                runtime.worker_connections = Some(n);
+            }
+            (Some(_), Terminator::BlockOpen) => skip_block(lx)?,
+            (Some(_), _) => {}
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn is_ignored_stmt(name: &str) -> bool {
     IGNORED_STMT.iter().any(|&d| d == name)
@@ -1459,6 +1490,27 @@ mod tests {
             Err(Error::Duplicate("send_timeout"))
         ));
         assert!(parse("http { client_body_timeout soon; }").is_err());
+    }
+
+    #[test]
+    fn events_block_reads_worker_connections() {
+        let cfg =
+            parse("events { worker_connections 2048; use epoll; multi_accept on; }\nhttp { }")
+                .unwrap();
+        assert_eq!(cfg.runtime.worker_connections, Some(2048));
+        assert_eq!(
+            parse("events { }\nhttp { }")
+                .unwrap()
+                .runtime
+                .worker_connections,
+            None
+        );
+        assert!(parse("events { worker_connections 0; }\nhttp { }").is_err());
+        assert!(parse("events { worker_connections many; }\nhttp { }").is_err());
+        assert!(matches!(
+            parse("events { worker_connections 1; worker_connections 2; }\nhttp { }"),
+            Err(Error::Duplicate("worker_connections"))
+        ));
     }
 
     #[test]

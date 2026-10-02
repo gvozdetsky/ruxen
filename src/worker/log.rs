@@ -93,6 +93,41 @@ impl<'a> ErrorLogRequest<'a> {
     }
 }
 
+/// `2026/10/02 14:00:00 [error] 1234#1235: ` — nginx's error-log line
+/// prefix (UTC here, like `$time_local`).
+fn log_line_prefix(level: ErrorLogLevel) -> Vec<u8> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, mon, day, hour, minute, second) = civil_from_secs(secs);
+    let mut stamp = *b"0000/00/00 00:00:00";
+    write_u4(&mut stamp[0..4], year);
+    write_u2(&mut stamp[5..7], mon + 1);
+    write_u2(&mut stamp[8..10], day + 1);
+    write_u2(&mut stamp[11..13], hour);
+    write_u2(&mut stamp[14..16], minute);
+    write_u2(&mut stamp[17..19], second);
+    let mut line = Vec::with_capacity(128);
+    line.extend_from_slice(&stamp);
+    line.extend_from_slice(b" [");
+    line.extend_from_slice(level_name(level));
+    // SAFETY: gettid has no preconditions and cannot fail.
+    let tid = unsafe { libc::gettid() };
+    line.extend_from_slice(format!("] {}#{}: ", std::process::id(), tid).as_bytes());
+    line
+}
+
+/// A worker-level line not about any request (`accept() failed`,
+/// `worker_connections are not enough`), to stderr like nginx's main
+/// error log; `-e` redirects it.
+pub(crate) fn write_worker_log(level: ErrorLogLevel, message: &str) {
+    let mut line = log_line_prefix(level);
+    line.extend_from_slice(message.as_bytes());
+    line.push(b'\n');
+    let _ = std::io::stderr().write_all(&line);
+}
+
 fn level_name(level: ErrorLogLevel) -> &'static [u8] {
     match level {
         ErrorLogLevel::Emerg => b"emerg",
@@ -135,27 +170,8 @@ pub(crate) fn write_error_log(
     text.extend_from_slice(message);
     req.append_context(&mut text, upstream);
 
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (year, mon, day, hour, minute, second) = civil_from_secs(secs);
-    let mut stamp = *b"0000/00/00 00:00:00";
-    write_u4(&mut stamp[0..4], year);
-    write_u2(&mut stamp[5..7], mon + 1);
-    write_u2(&mut stamp[8..10], day + 1);
-    write_u2(&mut stamp[11..13], hour);
-    write_u2(&mut stamp[14..16], minute);
-    write_u2(&mut stamp[17..19], second);
-    let mut line = Vec::with_capacity(text.len() + 64);
-    line.extend_from_slice(&stamp);
-    line.extend_from_slice(b" [");
-    line.extend_from_slice(level_name(level));
-    // SAFETY: gettid has no preconditions and cannot fail.
-    let tid = unsafe { libc::gettid() };
-    line.extend_from_slice(
-        format!("] {}#{}: *{} ", std::process::id(), tid, req.connection_id).as_bytes(),
-    );
+    let mut line = log_line_prefix(level);
+    line.extend_from_slice(format!("*{} ", req.connection_id).as_bytes());
     line.extend_from_slice(&text);
     line.push(b'\n');
 

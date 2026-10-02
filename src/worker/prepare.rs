@@ -56,7 +56,7 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
-        runtime: _,
+        runtime,
         log_formats,
         access_logs,
         server_tokens,
@@ -185,6 +185,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let canonical_access_logs = alp.finish();
 
     Ok(Box::leak(Box::new(PreparedHttp {
+        worker_connections: runtime.worker_connections.unwrap_or(512),
         listens,
         access_logs: canonical_access_logs,
         split_clients: prepared_split_clients,
