@@ -105,12 +105,14 @@ http {
 }
 ```
 
-Check the configuration (a valid one exits with status 0 and prints nothing), then start the server in the foreground:
+Check the configuration, then start the server in the foreground:
 
 ```bash
 ruxen -t -c examples/minimal.conf
 ruxen -c examples/minimal.conf
 ```
+
+As with nginx, a valid configuration prints `… syntax is ok` and `… test is successful` (on stderr; `-q` silences them) and exits with status 0.
 
 Then, from another terminal:
 
@@ -229,6 +231,7 @@ The currently implemented nginx-style command-line surface includes:
 -g
 -t
 -T
+-q
 -V
 ```
 

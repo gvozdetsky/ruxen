@@ -1,7 +1,7 @@
 // ruxen — nginx-tests interop bootstrap.
 //
 // Startup-only surface:
-// - nginx-style CLI flags (`-c`, `-p`, `-e`, `-g`, `-t`, `-T`, `-V`)
+// - nginx-style CLI flags (`-c`, `-p`, `-e`, `-g`, `-t`, `-T`, `-q`, `-V`)
 // - config validation mode
 // - pid file creation
 // - SIGQUIT-driven graceful shutdown
@@ -77,6 +77,7 @@ struct Cli {
     errlog: Option<PathBuf>,
     globals: Vec<String>,
     test_only: bool,
+    quiet: bool,
     dump: bool,
     show_version: bool,
     signal: Option<String>,
@@ -90,6 +91,7 @@ impl Default for Cli {
             errlog: None,
             globals: Vec::new(),
             test_only: false,
+            quiet: false,
             dump: false,
             show_version: false,
             signal: None,
@@ -217,6 +219,15 @@ fn real_main() -> Result<(), Failure> {
     for w in &cfg.warnings {
         eprintln!("ruxen: [warn] {w}");
     }
+    // nginx's two `-t` lines (ngx_init_cycle, then main once modules are
+    // initialised); `-q` silences them.
+    let report_test = cli.test_only && !cli.quiet;
+    if report_test {
+        eprintln!(
+            "ruxen: the configuration file {} syntax is ok",
+            main_path.display()
+        );
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     check_privileges(euid, cfg.runtime.user.as_deref())
@@ -249,6 +260,12 @@ fn real_main() -> Result<(), Failure> {
     let http: &'static worker::PreparedHttp =
         worker::prepare(cfg).map_err(|e| report_emerg(&e, &cli, &main_path))?;
     if cli.test_only {
+        if report_test {
+            eprintln!(
+                "ruxen: configuration file {} test is successful",
+                main_path.display()
+            );
+        }
         return Ok(());
     }
 
@@ -380,6 +397,8 @@ where
                 cli.globals.push(value);
             }
             "-t" => cli.test_only = true,
+            // nginx: suppress non-error messages during configuration testing.
+            "-q" => cli.quiet = true,
             "-T" => {
                 cli.test_only = true;
                 cli.dump = true;
