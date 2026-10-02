@@ -1267,7 +1267,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn build(src: &str) -> &'static PreparedHttp {
-        prepare(config::parse(src).unwrap())
+        prepare(config::parse(src).unwrap()).expect("prepare")
     }
 
     fn unique_dir() -> PathBuf {

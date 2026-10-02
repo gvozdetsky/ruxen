@@ -33,7 +33,28 @@ use crate::{autoindex, file, fs_resolve, uri};
 
 use super::*;
 
-pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
+/// nginx's `(<errno>: <strerror>)` rendering of a failed syscall, e.g.
+/// `2: No such file or directory`, for `[emerg] open() "…" failed (…)`.
+pub(crate) fn errno_text(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => {
+            let reason = text
+                .strip_suffix(&format!(" (os error {code})"))
+                .unwrap_or(&text);
+            format!("{code}: {reason}")
+        }
+        None => text,
+    }
+}
+
+/// Lower the parsed config into the leaked `PreparedHttp` the workers share.
+///
+/// This is also where config meets the filesystem — root directories,
+/// certificates, log files — so it fails on things the parser can't see.
+/// `-t` runs it too, like `nginx -t` runs module init. The error is the
+/// message `main` prints after `[emerg]`.
+pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         runtime: _,
         log_formats,
@@ -61,9 +82,8 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
         conf_prefix,
     } = cfg;
 
-    if servers.is_empty() {
-        panic!("ruxen: no server blocks in config");
-    }
+    // No `server` blocks is valid, as in nginx: workers start with nothing
+    // to listen on and idle until shutdown.
     // Group server blocks by listen address while preserving declaration
     // order both across listen buckets and within each bucket.
     let mut grouped: Vec<(SocketAddr, Vec<Server>)> = Vec::new();
@@ -108,7 +128,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
     // prepared) becomes `PreparedHttp::access_logs` for the per-worker fd
     // table.
     let mut alp = AccessLogPrep::new(&log_formats);
-    let http_access_logs: &'static [PreparedAccessLog] = alp.prepare_list(&access_logs);
+    let http_access_logs: &'static [PreparedAccessLog] = alp.prepare_list(&access_logs)?;
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
@@ -152,8 +172,8 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
                     &mut alp,
                 )
             })
-            .collect();
-        let tls = build_listen_tls(addr, &tls_inputs);
+            .collect::<Result<_, _>>()?;
+        let tls = build_listen_tls(addr, &tls_inputs)?;
         listens.push(PreparedListen {
             addr,
             servers,
@@ -164,7 +184,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
 
     let canonical_access_logs = alp.finish();
 
-    Box::leak(Box::new(PreparedHttp {
+    Ok(Box::leak(Box::new(PreparedHttp {
         listens,
         access_logs: canonical_access_logs,
         split_clients: prepared_split_clients,
@@ -177,7 +197,7 @@ pub fn prepare(cfg: HttpConfig) -> &'static PreparedHttp {
         gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
         upstreams: prepared_upstreams,
         conf_prefix: conf_prefix.map(leak_path_buf),
-    }))
+    })))
 }
 
 /// TLS-relevant snapshot for one `server {}` block, captured before
@@ -190,19 +210,18 @@ pub(crate) struct TlsServerInput {
 }
 
 /// Build the per-listen `TlsAcceptor`, or `None` when no server on this
-/// address declared `listen … ssl;`. Cert load failures or empty cert sets
-/// abort startup — the parser already validated that ssl listens carry
-/// matching `ssl_certificate`/`ssl_certificate_key` pairs, so anything
-/// failing here is an unreadable file or a malformed PEM, neither of which
-/// we can recover from.
+/// address declared `listen … ssl;`. The parser already validated that
+/// ssl listens carry `ssl_certificate`/`ssl_certificate_key` pairs, so a
+/// load failure here is an unreadable file, a malformed PEM or a key that
+/// doesn't match its certificate — a startup error, as in nginx.
 pub(crate) fn build_listen_tls(
     addr: SocketAddr,
     inputs: &[TlsServerInput],
-) -> Option<Arc<crate::tls::TlsAcceptor>> {
+) -> Result<Option<Arc<crate::tls::TlsAcceptor>>, String> {
     use crate::config::ServerNameSpec;
 
     if !inputs.iter().any(|i| i.ssl_listen) {
-        return None;
+        return Ok(None);
     }
 
     let mut resolver = crate::tls_certs::ServerNameResolver::new();
@@ -231,8 +250,13 @@ pub(crate) fn build_listen_tls(
         let mut keys: Vec<Arc<rustls::sign::CertifiedKey>> =
             Vec::with_capacity(input.ssl.certs.len());
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
-            let ck = crate::tls_certs::load_certified_key(cert, key)
-                .unwrap_or_else(|e| panic!("ruxen: listen {addr}: {e}"));
+            let ck = crate::tls_certs::load_certified_key(cert, key).map_err(|e| {
+                format!(
+                    "cannot load certificate \"{}\" with key \"{}\": {e}",
+                    cert.display(),
+                    key.display()
+                )
+            })?;
             keys.push(Arc::new(ck));
         }
 
@@ -277,8 +301,8 @@ pub(crate) fn build_listen_tls(
 
     resolver.set_default(default_keys);
     let cfg = crate::tls_certs::build_server_config(resolver, protocols, session_timeout_secs)
-        .unwrap_or_else(|e| panic!("ruxen: listen {addr}: build TLS config: {e}"));
-    Some(Arc::new(crate::tls::acceptor_from_config(cfg)))
+        .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
+    Ok(Some(Arc::new(crate::tls::acceptor_from_config(cfg))))
 }
 
 pub(crate) fn prepare_upstreams(
@@ -326,7 +350,12 @@ pub(crate) fn build_proxy(
     eff: ProxyEffective,
     location_pattern: &'static [u8],
     is_regex_location: bool,
-) -> PreparedProxy {
+) -> Result<PreparedProxy, String> {
+    // nginx rejects a URI part wherever there is no location prefix to
+    // replace (ngx_http_proxy_pass), with this one message for all cases.
+    const URI_PART_NOT_ALLOWED: &str = "\"proxy_pass\" cannot have URI part in location given by \
+         regular expression, or inside named location, or inside \"if\" statement, or inside \
+         \"limit_except\" block";
     let (request_path, location_prefix) = match (&pp, is_regex_location) {
         (
             ProxyPass::Direct {
@@ -346,10 +375,7 @@ pub(crate) fn build_proxy(
             // locations have nothing to strip from a client URI — nginx
             // rejects `proxy_pass http://up/path;` in those modes.
             if location_pattern.first() == Some(&b'@') {
-                panic!(
-                    "ruxen: proxy_pass URL path is not allowed inside named location {} (prefix-mode locations only)",
-                    String::from_utf8_lossy(location_pattern)
-                );
+                return Err(URI_PART_NOT_ALLOWED.to_string());
             }
             let path: &'static [u8] = Box::leak(p.clone().into_bytes().into_boxed_slice());
             (path, location_pattern)
@@ -368,13 +394,11 @@ pub(crate) fn build_proxy(
             },
             true,
         ) => {
-            panic!(
-                "ruxen: proxy_pass URL path is not allowed in a regex location (matches nginx ngx_http_proxy_module.c)"
-            );
+            return Err(URI_PART_NOT_ALLOWED.to_string());
         }
         _ => (b"".as_slice(), b"".as_slice()),
     };
-    match pp {
+    Ok(match pp {
         ProxyPass::Direct {
             addr, host_header, ..
         } => {
@@ -454,7 +478,7 @@ pub(crate) fn build_proxy(
                 request_path,
             }
         }
-    }
+    })
 }
 
 /// Server-scope proxy defaults — used as the parent in location-scope
@@ -594,7 +618,7 @@ pub(crate) fn prepare_server(
     http_underscores_in_headers: bool,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
-) -> PreparedServer {
+) -> Result<PreparedServer, String> {
     let listen_port = server.listen.addr.port();
     let merge_slashes = server.merge_slashes;
     let server_ignore_invalid_headers = server
@@ -717,7 +741,7 @@ pub(crate) fn prepare_server(
         server.keepalive_disable,
     );
     let server_error_logs: &'static [PreparedErrorLog] = match server.error_logs {
-        Some(list) => prepare_error_logs(list),
+        Some(list) => prepare_error_logs(list)?,
         None => &[],
     };
     let server_log_not_found = server.log_not_found.unwrap_or(true);
@@ -762,7 +786,7 @@ pub(crate) fn prepare_server(
     // None inherits the http-scope list. Empty `Some(vec![])` means the
     // user wrote `access_log off;` at server scope — explicit silence.
     let server_access_logs: &'static [PreparedAccessLog] = match server.access_logs {
-        Some(ref list) => alp.prepare_list(list),
+        Some(ref list) => alp.prepare_list(list)?,
         None => http_access_logs,
     };
     // Done last because Server can't be partially moved further down.
@@ -799,7 +823,7 @@ pub(crate) fn prepare_server(
                 server_proxy_defaults,
                 upstreams,
                 alp,
-            )),
+            )?),
             MatchMode::Prefix => prefix.push(build_prefix_or_exact(
                 l,
                 server_index,
@@ -826,7 +850,7 @@ pub(crate) fn prepare_server(
                 server_proxy_defaults,
                 upstreams,
                 alp,
-            )),
+            )?),
             MatchMode::Named => named.push(build_prefix_or_exact(
                 l,
                 server_index,
@@ -853,7 +877,7 @@ pub(crate) fn prepare_server(
                 server_proxy_defaults,
                 upstreams,
                 alp,
-            )),
+            )?),
             MatchMode::Regex { case_insensitive } => regex.push(build_regex_location(
                 l,
                 case_insensitive,
@@ -881,7 +905,7 @@ pub(crate) fn prepare_server(
                 server_proxy_defaults,
                 upstreams,
                 alp,
-            )),
+            )?),
         }
     }
     exact.sort_by(|a, b| a.pattern.cmp(b.pattern));
@@ -919,7 +943,7 @@ pub(crate) fn prepare_server(
             server_tokens_value,
             upstreams,
             ProxyEffective::defaults(),
-        );
+        )?;
         Some(PreparedLocation {
             pattern,
             handler,
@@ -968,7 +992,7 @@ pub(crate) fn prepare_server(
             server_tokens_value,
             upstreams,
             ProxyEffective::defaults(),
-        );
+        )?;
         Some(PreparedLocation {
             pattern,
             handler,
@@ -997,7 +1021,7 @@ pub(crate) fn prepare_server(
         None
     };
 
-    PreparedServer {
+    Ok(PreparedServer {
         exact_names,
         wildcard_leading,
         wildcard_trailing,
@@ -1020,7 +1044,7 @@ pub(crate) fn prepare_server(
         auth_delay_ms: server_auth_delay_ms,
         underscores_in_headers: server_underscores_in_headers,
         post_action: server_post_action,
-    }
+    })
 }
 
 pub(crate) fn prepare_add_headers(list: Vec<AddHeader>) -> &'static [PreparedAddHeader] {
@@ -1281,7 +1305,7 @@ impl<'a> AccessLogPrep<'a> {
         }
     }
 
-    pub(crate) fn prepare_one(&mut self, log: &AccessLog) -> PreparedAccessLog {
+    pub(crate) fn prepare_one(&mut self, log: &AccessLog) -> Result<PreparedAccessLog, String> {
         // nginx default format name.
         const DEFAULT_FORMAT_NAME: &str = "combined";
         let chosen_format = log.format.as_deref().unwrap_or(DEFAULT_FORMAT_NAME);
@@ -1309,17 +1333,12 @@ impl<'a> AccessLogPrep<'a> {
                 ValuePart::Var(Variable::BodyBytesSent),
             ])
         } else {
-            panic!(
-                "ruxen: access_log references unknown log_format `{}`",
-                chosen_format
-            );
+            return Err(format!("unknown log format \"{chosen_format}\""));
         };
-        // Ensure the file exists so tests that read it don't fail with
-        // ENOENT even when no request matches `if=...`.
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log.path);
+        // Create the file up front, as nginx does at startup: an unwritable
+        // path fails here rather than in every worker, and tests that read
+        // the log don't hit ENOENT when no request matches `if=...`.
+        open_log_file(&log.path)?;
 
         let file_index = self.canonical.len();
         let prepared = PreparedAccessLog {
@@ -1329,15 +1348,21 @@ impl<'a> AccessLogPrep<'a> {
             file_index,
         };
         self.canonical.push(prepared);
-        prepared
+        Ok(prepared)
     }
 
-    pub(crate) fn prepare_list(&mut self, list: &[AccessLog]) -> &'static [PreparedAccessLog] {
+    pub(crate) fn prepare_list(
+        &mut self,
+        list: &[AccessLog],
+    ) -> Result<&'static [PreparedAccessLog], String> {
         if list.is_empty() {
-            return &[];
+            return Ok(&[]);
         }
-        let prepared: Vec<PreparedAccessLog> = list.iter().map(|l| self.prepare_one(l)).collect();
-        Box::leak(prepared.into_boxed_slice())
+        let prepared: Vec<PreparedAccessLog> = list
+            .iter()
+            .map(|l| self.prepare_one(l))
+            .collect::<Result<_, _>>()?;
+        Ok(Box::leak(prepared.into_boxed_slice()))
     }
 
     pub(crate) fn finish(self) -> &'static [PreparedAccessLog] {
@@ -1495,8 +1520,8 @@ pub(crate) fn build_handler(
     tokens: crate::config::ServerTokens,
     upstreams: &UpstreamMap,
     proxy_effective: ProxyEffective,
-) -> PreparedHandler {
-    match handler {
+) -> Result<PreparedHandler, String> {
+    Ok(match handler {
         Handler::Return { status, body } => {
             PreparedHandler::Return(prepare_return(status, body, tokens))
         }
@@ -1506,18 +1531,25 @@ pub(crate) fn build_handler(
             proxy_effective,
             location_pattern,
             is_regex_location,
-        )),
+        )?),
         Handler::Root { path, mapping } => {
             // Canonicalize once to fail fast on a bad root path; the
             // resolved inode will also be the one `openat2(RESOLVE_BENEATH)`
             // is anchored to, so symlinks in the configured root path can't
-            // retarget the "beneath" set at runtime.
-            let canonical = path.canonicalize().unwrap_or_else(|e| {
-                panic!(
-                    "ruxen: cannot canonicalize root {}: {e} (directory must exist at startup)",
-                    path.display()
+            // retarget the "beneath" set at runtime. nginx resolves root per
+            // request and starts with a missing one; ruxen can't, so say so.
+            let directive = match mapping {
+                PathMapping::Root => "root",
+                PathMapping::Alias => "alias",
+            };
+            let canonical = path.canonicalize().map_err(|e| {
+                format!(
+                    "{directive} \"{}\" is not accessible: realpath() failed ({}); \
+                     ruxen needs {directive} paths to exist at startup",
+                    path.display(),
+                    errno_text(&e)
                 )
-            });
+            })?;
             let root: &'static Path = Box::leak(path.into_boxed_path());
             let root_fd = {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -1532,9 +1564,13 @@ pub(crate) fn build_handler(
                     .read(true)
                     .custom_flags(flags)
                     .open(&canonical)
-                    .unwrap_or_else(|e| {
-                        panic!("ruxen: cannot open root {}: {e}", canonical.display())
-                    });
+                    .map_err(|e| {
+                        format!(
+                            "{directive} \"{}\" is not accessible: open() failed ({})",
+                            canonical.display(),
+                            errno_text(&e)
+                        )
+                    })?;
                 // `into_raw_fd` suppresses the `File::drop`, so the fd
                 // lives for process lifetime — paired with `PreparedHttp`
                 // being leaked.
@@ -1592,7 +1628,7 @@ pub(crate) fn build_handler(
                 try_files,
             })
         }
-    }
+    })
 }
 
 pub(crate) fn resolve_add_headers(
@@ -1615,15 +1651,25 @@ pub(crate) fn resolve_error_pages(
     }
 }
 
-pub(crate) fn prepare_error_log_target(target: ErrorLogTarget) -> PreparedErrorLogTarget {
-    match target {
+/// Create (or append-open) a log file the way nginx does at startup, so a
+/// bad path is an `[emerg]` instead of a silent loss of log lines.
+fn open_log_file(path: &Path) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(drop)
+        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))
+}
+
+pub(crate) fn prepare_error_log_target(
+    target: ErrorLogTarget,
+) -> Result<PreparedErrorLogTarget, String> {
+    Ok(match target {
         ErrorLogTarget::File(path) => {
             // Match access_log behavior: create eagerly so "no writes happened"
             // still leaves a readable file for assertions.
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path);
+            open_log_file(&path)?;
             PreparedErrorLogTarget::File(Box::leak(path.into_boxed_path()))
         }
         ErrorLogTarget::Stderr => PreparedErrorLogTarget::Stderr,
@@ -1642,27 +1688,29 @@ pub(crate) fn prepare_error_log_target(target: ErrorLogTarget) -> PreparedErrorL
             };
             PreparedErrorLogTarget::Syslog(PreparedErrorLogSyslogTarget { server, tag })
         }
-    }
+    })
 }
 
-pub(crate) fn prepare_error_logs(list: Vec<ErrorLog>) -> &'static [PreparedErrorLog] {
+pub(crate) fn prepare_error_logs(
+    list: Vec<ErrorLog>,
+) -> Result<&'static [PreparedErrorLog], String> {
     let mut out: Vec<PreparedErrorLog> = Vec::with_capacity(list.len());
     for log in list {
         out.push(PreparedErrorLog {
-            target: prepare_error_log_target(log.target),
+            target: prepare_error_log_target(log.target)?,
             level: log.level,
         });
     }
-    Box::leak(out.into_boxed_slice())
+    Ok(Box::leak(out.into_boxed_slice()))
 }
 
 pub(crate) fn resolve_error_logs(
     location_error_logs: Option<Vec<ErrorLog>>,
     server_error_logs: &'static [PreparedErrorLog],
-) -> &'static [PreparedErrorLog] {
+) -> Result<&'static [PreparedErrorLog], String> {
     match location_error_logs {
         Some(list) => prepare_error_logs(list),
-        None => server_error_logs,
+        None => Ok(server_error_logs),
     }
 }
 
@@ -1692,7 +1740,7 @@ pub(crate) fn build_prefix_or_exact(
     server_proxy_defaults: ServerProxyDefaults,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
-) -> PreparedLocation {
+) -> Result<PreparedLocation, String> {
     let Location {
         mode: _,
         pattern,
@@ -1785,15 +1833,15 @@ pub(crate) fn build_prefix_or_exact(
         tokens,
         upstreams,
         proxy_effective,
-    );
+    )?;
     let auto_redirect = matches!(&handler, PreparedHandler::Proxy(_)) && pattern.ends_with(b"/");
     let add_headers = resolve_add_headers(location_add_headers, server_add_headers);
     let add_trailers = resolve_add_headers(location_add_trailers, server_add_trailers);
     let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
-    let error_logs = resolve_error_logs(location_error_logs, server_error_logs);
+    let error_logs = resolve_error_logs(location_error_logs, server_error_logs)?;
     let log_not_found = location_log_not_found.unwrap_or(server_log_not_found);
     let access_logs = match location_access_logs {
-        Some(ref list) => alp.prepare_list(list),
+        Some(ref list) => alp.prepare_list(list)?,
         None => server_access_logs,
     };
     let auth_basic = location_auth_basic
@@ -1813,7 +1861,7 @@ pub(crate) fn build_prefix_or_exact(
         .unwrap_or(server_expires);
     let chunked_transfer_encoding =
         location_chunked_transfer_encoding.unwrap_or(server_chunked_transfer_encoding);
-    PreparedLocation {
+    Ok(PreparedLocation {
         pattern,
         handler,
         auto_redirect,
@@ -1837,7 +1885,7 @@ pub(crate) fn build_prefix_or_exact(
         post_action,
         expires,
         chunked_transfer_encoding,
-    }
+    })
 }
 
 pub(crate) fn build_regex_location(
@@ -1867,7 +1915,7 @@ pub(crate) fn build_regex_location(
     server_proxy_defaults: ServerProxyDefaults,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
-) -> PreparedRegexLocation {
+) -> Result<PreparedRegexLocation, String> {
     let Location {
         mode: _,
         pattern,
@@ -1972,14 +2020,14 @@ pub(crate) fn build_regex_location(
         tokens,
         upstreams,
         proxy_effective,
-    );
+    )?;
     let add_headers = resolve_add_headers(location_add_headers, server_add_headers);
     let add_trailers = resolve_add_headers(location_add_trailers, server_add_trailers);
     let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
-    let error_logs = resolve_error_logs(location_error_logs, server_error_logs);
+    let error_logs = resolve_error_logs(location_error_logs, server_error_logs)?;
     let log_not_found = location_log_not_found.unwrap_or(server_log_not_found);
     let access_logs = match location_access_logs {
-        Some(ref list) => alp.prepare_list(list),
+        Some(ref list) => alp.prepare_list(list)?,
         None => server_access_logs,
     };
     let auth_basic = location_auth_basic
@@ -1999,7 +2047,7 @@ pub(crate) fn build_regex_location(
         .unwrap_or(server_expires);
     let chunked_transfer_encoding =
         location_chunked_transfer_encoding.unwrap_or(server_chunked_transfer_encoding);
-    PreparedRegexLocation {
+    Ok(PreparedRegexLocation {
         regex,
         handler,
         rewrite_program,
@@ -2021,7 +2069,7 @@ pub(crate) fn build_regex_location(
         post_action,
         expires,
         chunked_transfer_encoding,
-    }
+    })
 }
 
 pub(crate) fn prepare_try_files(
