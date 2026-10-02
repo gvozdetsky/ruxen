@@ -309,15 +309,18 @@ fn normalize_host(host: &str) -> String {
 }
 
 /// Build a rustls `ServerConfig` from a populated resolver and the parsed
-/// `ssl_protocols` set. Session storage uses an in-memory cache (no
-/// persistence; see README's v0.1 TLS limitations). When
-/// `session_timeout_secs` is set, both the TLS 1.2 SessionID cache and
-/// the TLS 1.3 ticketer are wrapped to reject resumption attempts older
-/// than the configured `ssl_session_timeout`.
+/// `ssl_protocols` set.
+///
+/// Session resumption follows nginx: `ssl_session_cache` (default `none`)
+/// turns on an in-memory session-ID cache shared by the workers, and
+/// `ssl_session_tickets` (default `on`) stateless tickets. With neither,
+/// every handshake is a full one: no cache, no ticketer, and no TLS 1.3
+/// tickets sent. Both are bounded by `ssl_session_timeout` (default 5m).
 pub fn build_server_config(
     resolver: ServerNameResolver,
     protocols: TlsVersionSet,
     session_timeout_secs: Option<u32>,
+    resumption: crate::config::SessionResumption,
 ) -> Result<Arc<ServerConfig>, rustls::Error> {
     let versions: Vec<&'static SupportedProtocolVersion> =
         match (protocols.tlsv1_2, protocols.tlsv1_3) {
@@ -333,21 +336,27 @@ pub fn build_server_config(
     let mut cfg = ServerConfig::builder_with_protocol_versions(&versions)
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
-    let inner_storage: Arc<dyn rustls::server::StoresServerSessions> =
-        rustls::server::ServerSessionMemoryCache::new(256);
-    cfg.session_storage = match session_timeout_secs {
-        Some(secs) => Arc::new(crate::tls_session::ExpiringSessionStorage::new(
-            inner_storage,
-            std::time::Duration::from_secs(secs as u64),
-        )),
-        None => inner_storage,
+    // nginx's default ssl_session_timeout.
+    let timeout_secs = session_timeout_secs.unwrap_or(300);
+    let cache = resumption.cache.unwrap_or(false);
+    let tickets = resumption.tickets.unwrap_or(true);
+    cfg.session_storage = if cache {
+        Arc::new(crate::tls_session::ExpiringSessionStorage::new(
+            rustls::server::ServerSessionMemoryCache::new(4096),
+            std::time::Duration::from_secs(timeout_secs as u64),
+        ))
+    } else {
+        Arc::new(rustls::server::NoServerSessionStorage {})
     };
-    if let Some(secs) = session_timeout_secs {
+    if tickets {
         let inner_ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()?;
         cfg.ticketer = Arc::new(crate::tls_session::ExpiringTicketer::new(
             inner_ticketer,
-            secs,
+            timeout_secs,
         ));
+    } else if !cache {
+        // Nothing to resume from: don't send TLS 1.3 tickets at all.
+        cfg.send_tls13_tickets = 0;
     }
     // Extend this list when HTTP/2 lands.
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -584,9 +593,39 @@ mod tests {
         let key = ck(RSA_CRT, RSA_KEY_PKCS8);
         let mut r = ServerNameResolver::new();
         r.add_exact("test.ruxen.local", key);
-        let cfg = build_server_config(r, TlsVersionSet::default(), None)
+        let cfg = build_server_config(r, TlsVersionSet::default(), None, Default::default())
             .expect("default protocols build");
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn session_resumption_follows_nginx() {
+        use crate::config::SessionResumption;
+        let build = |cache, tickets| {
+            let mut r = ServerNameResolver::new();
+            r.set_default(vec![ck(RSA_CRT, RSA_KEY_PKCS8)]);
+            build_server_config(
+                r,
+                TlsVersionSet::default(),
+                None,
+                SessionResumption { cache, tickets },
+            )
+            .unwrap()
+        };
+        // nginx's defaults: no session-ID cache, tickets on.
+        let cfg = build(None, None);
+        assert!(!cfg.session_storage.can_cache());
+        assert!(cfg.ticketer.enabled());
+        // ssl_session_cache shared:…, tickets off: resumption by session ID.
+        let cfg = build(Some(true), Some(false));
+        assert!(cfg.session_storage.can_cache());
+        assert!(!cfg.ticketer.enabled());
+        assert_ne!(cfg.send_tls13_tickets, 0);
+        // off/none + tickets off: nothing to resume, no tickets sent.
+        let cfg = build(Some(false), Some(false));
+        assert!(!cfg.session_storage.can_cache());
+        assert!(!cfg.ticketer.enabled());
+        assert_eq!(cfg.send_tls13_tickets, 0);
     }
 
     #[test]
@@ -596,7 +635,8 @@ mod tests {
             tlsv1_2: false,
             tlsv1_3: false,
         };
-        let err = build_server_config(r, empty, None).expect_err("empty set rejected");
+        let err = build_server_config(r, empty, None, Default::default())
+            .expect_err("empty set rejected");
         assert!(matches!(err, rustls::Error::General(_)));
     }
 }

@@ -332,8 +332,13 @@ pub(crate) fn build_listen_tls(
     }
 
     resolver.set_default(default_keys);
-    let cfg = crate::tls_certs::build_server_config(resolver, protocols, session_timeout_secs)
-        .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
+    let cfg = crate::tls_certs::build_server_config(
+        resolver,
+        protocols,
+        session_timeout_secs,
+        default.ssl.resumption,
+    )
+    .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
     Ok(Some(Arc::new(crate::tls::acceptor_from_config(cfg))))
 }
 
