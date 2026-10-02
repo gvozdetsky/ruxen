@@ -100,14 +100,53 @@ impl Default for Cli {
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
+        Err(Failure::Reported) => ExitCode::FAILURE,
+        Err(Failure::Io(err)) => {
             eprintln!("ruxen: {err}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn real_main() -> io::Result<()> {
+/// Why startup failed. `Reported` errors were already printed as
+/// `ruxen: [emerg] …` (plus the `-t` failure tail), so `main` only sets
+/// the exit status; anything else is printed by `main`.
+enum Failure {
+    Reported,
+    Io(io::Error),
+}
+
+impl From<io::Error> for Failure {
+    fn from(err: io::Error) -> Self {
+        Failure::Io(err)
+    }
+}
+
+/// Print a config-time error the way nginx does, with `-t`'s closing line
+/// (upstream tests match `qr/file <main> test failed/`). nginx opens the
+/// `-e` log before reading the config and writes `[emerg]` to it as well
+/// as to stderr; Test::Nginx's end-of-test checks read that file.
+fn report_emerg(msg: &str, cli: &Cli, main_path: &Path) -> Failure {
+    let line = format!("ruxen: [emerg] {msg}\n");
+    eprint!("{line}");
+    if let Some(errlog) = &cli.errlog {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(errlog)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+    }
+    if cli.test_only {
+        eprintln!(
+            "ruxen: configuration file {} test failed",
+            main_path.display()
+        );
+    }
+    Failure::Reported
+}
+
+fn real_main() -> Result<(), Failure> {
     let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
 
     if cli.show_version {
@@ -115,7 +154,7 @@ fn real_main() -> io::Result<()> {
         return Ok(());
     }
     if let Some(sig) = cli.signal {
-        return Err(io::Error::other(format!("`-s {sig}` is not supported yet")));
+        return Err(io::Error::other(format!("`-s {sig}` is not supported yet")).into());
     }
 
     if let Some(prefix) = &cli.prefix {
@@ -142,21 +181,8 @@ fn real_main() -> io::Result<()> {
         Some(merged)
     };
 
-    let cfg = match config::parse_with_main(main_path.clone(), file_src, globals_src) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("ruxen: [emerg] {e}");
-            if cli.test_only {
-                // Match nginx's `-T` failure tail so upstream tests' regexes
-                // (e.g. `qr/file <main> test failed/`) match our output.
-                eprintln!(
-                    "ruxen: configuration file {} test failed",
-                    main_path.display()
-                );
-            }
-            return Err(io::Error::new(std::io::ErrorKind::InvalidData, "config"));
-        }
-    };
+    let cfg = config::parse_with_main(main_path.clone(), file_src, globals_src)
+        .map_err(|e| report_emerg(&e.to_string(), &cli, &main_path))?;
 
     for w in &cfg.warnings {
         eprintln!("ruxen: [warn] {w}");
@@ -172,6 +198,22 @@ fn real_main() -> io::Result<()> {
             println!();
         }
     }
+
+    let pid_path = cfg.runtime.pid.clone();
+    // Resolve `worker_processes` (or `auto`) from the config; nginx
+    // defaults to 1 when unset. RUXEN_WORKERS still overrides for
+    // benchmarking convenience.
+    let config_workers = match cfg.runtime.worker_processes {
+        Some(config::WorkerProcesses::Count(n)) => n,
+        Some(config::WorkerProcesses::Auto) => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        None => 1,
+    };
+    // Load certificates, open roots and log files. `-t` does this too, so
+    // it catches everything short of a busy port, like `nginx -t`.
+    let http: &'static worker::PreparedHttp =
+        worker::prepare(cfg).map_err(|e| report_emerg(&e, &cli, &main_path))?;
     if cli.test_only {
         return Ok(());
     }
@@ -188,26 +230,11 @@ fn real_main() -> io::Result<()> {
              (in Docker, run with --security-opt seccomp=unconfined), disabled \
              via the kernel.io_uring_disabled sysctl, or the kernel is too old"
         );
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "io_uring unavailable",
-        ));
+        return Err(Failure::Reported);
     }
 
     install_signal_handlers()?;
 
-    let pid_path = cfg.runtime.pid.clone();
-    // Resolve `worker_processes` (or `auto`) from the config; nginx
-    // defaults to 1 when unset. RUXEN_WORKERS still overrides for
-    // benchmarking convenience.
-    let config_workers = match cfg.runtime.worker_processes {
-        Some(config::WorkerProcesses::Count(n)) => n,
-        Some(config::WorkerProcesses::Auto) => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-        None => 1,
-    };
-    let http: &'static worker::PreparedHttp = worker::prepare(cfg);
     let runtime = Arc::new(worker::RuntimeState::default());
 
     let n_workers: usize = std::env::var("RUXEN_WORKERS")
@@ -216,14 +243,41 @@ fn real_main() -> io::Result<()> {
         .unwrap_or(config_workers);
     let pin = matches!(std::env::var("RUXEN_PIN").as_deref(), Ok("1"));
 
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let mut handles = Vec::with_capacity(n_workers);
     for i in 0..n_workers {
         let cpu = if pin { Some(i) } else { None };
         let runtime = runtime.clone();
+        let ready = ready_tx.clone();
         let handle = thread::Builder::new()
             .name(format!("ruxen-worker-{i}"))
-            .spawn(move || worker::run(http, cpu, runtime))?;
+            .spawn(move || worker::run(http, cpu, runtime, ready))?;
         handles.push(handle);
+    }
+    drop(ready_tx);
+
+    // Each worker reports once its listeners are bound. Wait for all of
+    // them: a busy port becomes one `[emerg]` and exit 1 instead of a
+    // panic per worker, and the pid file (which Test::Nginx polls for)
+    // appears only once the server accepts connections.
+    let mut startup_error = None;
+    for _ in 0..n_workers {
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                startup_error.get_or_insert(e);
+            }
+            // A worker died before reporting; the join below says so.
+            Err(_) => break,
+        }
+    }
+    if let Some(e) = startup_error {
+        eprintln!("ruxen: [emerg] {e}");
+        runtime.begin_shutdown();
+        for handle in handles {
+            let _ = handle.join();
+        }
+        return Err(Failure::Reported);
     }
 
     if let Some(path) = &pid_path {
@@ -252,7 +306,7 @@ fn real_main() -> io::Result<()> {
     for handle in handles {
         if handle.join().is_err() {
             runtime.begin_shutdown();
-            return Err(io::Error::other("worker thread panicked"));
+            return Err(io::Error::other("worker thread panicked").into());
         }
     }
 

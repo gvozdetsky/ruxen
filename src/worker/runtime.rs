@@ -316,7 +316,16 @@ fn unshare_fd_table() {
     }
 }
 
-pub fn run(http: &'static PreparedHttp, cpu: Option<usize>, state: Arc<RuntimeState>) {
+/// Worker thread body. `ready` gets exactly one message once startup is
+/// done — `Ok` when every listener is bound, or the `[emerg]` text of the
+/// first failure, after which the worker exits. `main` waits for all of
+/// them before writing the pid file.
+pub fn run(
+    http: &'static PreparedHttp,
+    cpu: Option<usize>,
+    state: Arc<RuntimeState>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) {
     unshare_fd_table();
     if let Some(c) = cpu {
         // Pin before building the runtime so io_uring setup + the submission
@@ -326,29 +335,56 @@ pub fn run(http: &'static PreparedHttp, cpu: Option<usize>, state: Arc<RuntimeSt
         }
     }
 
-    let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
+    let mut rt = match RuntimeBuilder::<monoio::IoUringDriver>::new()
         .enable_timer()
         .with_entries(4096)
         .build()
-        .expect("failed to build io_uring runtime");
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ready.send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
+            return;
+        }
+    };
 
     rt.block_on(async move {
         // Open one fd per configured access_log for this worker. Kept in a
         // thread-local so `write_access_logs` can do io_uring writes without
         // re-opening the file per request.
-        init_access_logs_for_worker(http.access_logs);
+        if let Err(e) = init_access_logs_for_worker(http.access_logs) {
+            let _ = ready.send(Err(e));
+            return;
+        }
 
         let opts = ListenerOpts::new()
             .reuse_port(true)
             .reuse_addr(true)
             .backlog(4096);
-        if http.listens.len() == 1 {
+        let mut listeners = Vec::with_capacity(http.listens.len());
+        for prepared in &http.listens {
+            match TcpListener::bind_with_config(prepared.addr, &opts) {
+                Ok(listener) => listeners.push(listener),
+                Err(e) => {
+                    let _ = ready.send(Err(format!(
+                        "bind() to {} failed ({})",
+                        prepared.addr,
+                        errno_text(&e)
+                    )));
+                    return;
+                }
+            }
+        }
+        let _ = ready.send(Ok(()));
+        // Drop the sender so `main` sees a closed channel, not a hang, if
+        // another worker dies before reporting.
+        drop(ready);
+
+        if listeners.len() == 1 {
             // Single-listen fast path: keep the accept loop in this top-level
             // task (the pre-m36 shape) to avoid an extra scheduler hop on
             // every accepted connection.
             let prepared = &http.listens[0];
-            let listener = TcpListener::bind_with_config(prepared.addr, &opts)
-                .unwrap_or_else(|e| panic!("bind listen socket {}: {e}", prepared.addr));
+            let listener = listeners.pop().expect("one listener");
             loop {
                 if state.is_shutting_down() {
                     while state.active_connections() != 0 {
@@ -378,9 +414,7 @@ pub fn run(http: &'static PreparedHttp, cpu: Option<usize>, state: Arc<RuntimeSt
                 }
             }
         } else {
-            for (listen_index, prepared) in http.listens.iter().enumerate() {
-                let listener = TcpListener::bind_with_config(prepared.addr, &opts)
-                    .unwrap_or_else(|e| panic!("bind listen socket {}: {e}", prepared.addr));
+            for (listen_index, listener) in listeners.into_iter().enumerate() {
                 monoio::spawn(run_listener(listener, listen_index, http, state.clone()));
             }
 

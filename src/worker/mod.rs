@@ -72,37 +72,38 @@ thread_local! {
     static ACCESS_LOG_FILES: Cell<Option<&'static [AsyncFile]>> = const { Cell::new(None) };
 }
 
-pub(crate) fn init_access_logs_for_worker(logs: &[PreparedAccessLog]) {
+/// `prepare` already opened every access_log once, so a failure here
+/// means the file changed underneath us during startup; it is reported
+/// like any other startup error.
+pub(crate) fn init_access_logs_for_worker(logs: &[PreparedAccessLog]) -> Result<(), String> {
     ACCESS_LOG_FILES.with(|cell| {
         if cell.get().is_some() {
-            return;
+            return Ok(());
         }
         if logs.is_empty() {
             cell.set(Some(&[]));
-            return;
+            return Ok(());
         }
         let mut opened: Vec<AsyncFile> = Vec::with_capacity(logs.len());
         for log in logs {
+            let open_failed = |e: std::io::Error| {
+                format!(
+                    "open() \"{}\" failed ({})",
+                    log.path.display(),
+                    errno_text(&e)
+                )
+            };
             let std_file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(log.path)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "ruxen: worker failed to open access_log {}: {e}",
-                        log.path.display()
-                    )
-                });
-            let f = AsyncFile::from_std(std_file).unwrap_or_else(|e| {
-                panic!(
-                    "ruxen: worker failed to wrap access_log {}: {e}",
-                    log.path.display()
-                )
-            });
+                .map_err(open_failed)?;
+            let f = AsyncFile::from_std(std_file).map_err(open_failed)?;
             opened.push(f);
         }
         cell.set(Some(Box::leak(opened.into_boxed_slice())));
-    });
+        Ok(())
+    })
 }
 
 /// Machine hostname, resolved once at startup for `$hostname` expansion.
@@ -291,7 +292,7 @@ mod tests {
                 }
             "#,
         );
-        let http = prepare(cfg);
+        let http = prepare(cfg).expect("prepare");
         assert_eq!(http.listens.len(), 1);
         assert_eq!(http.listens[0].servers.len(), 2);
         assert_eq!(http.listens[0].default_server, 0);
@@ -316,7 +317,7 @@ mod tests {
                 }
             "#,
         );
-        let http = prepare(cfg);
+        let http = prepare(cfg).expect("prepare");
         assert_eq!(http.listens.len(), 2);
         assert_eq!(http.listens[0].addr.port(), 8080);
         assert_eq!(http.listens[0].servers.len(), 2);
@@ -325,10 +326,74 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn prepare_rejects_zero_servers() {
-        let cfg = parse_cfg("http {}");
-        let res = std::panic::catch_unwind(|| prepare(cfg));
-        assert!(res.is_err());
+    pub(crate) fn prepare_accepts_zero_servers() {
+        // nginx starts with an empty `http {}`; so do we, listening nowhere.
+        let http = prepare(parse_cfg("http {}")).expect("prepare");
+        assert!(http.listens.is_empty());
+    }
+
+    fn prepare_err(src: &str) -> String {
+        prepare(parse_cfg(src)).err().expect("prepare must fail")
+    }
+
+    #[test]
+    pub(crate) fn prepare_reports_missing_root() {
+        let err =
+            prepare_err("http { server { listen 127.0.0.1:8080; root /nonexistent-ruxen-root; } }");
+        assert!(
+            err.starts_with(
+                "root \"/nonexistent-ruxen-root\" is not accessible: realpath() failed (2: "
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    pub(crate) fn prepare_reports_missing_alias() {
+        let err = prepare_err(
+            "http { server { listen 127.0.0.1:8080; location /a/ { alias /nonexistent-ruxen-alias/; } } }",
+        );
+        assert!(
+            err.starts_with("alias \"/nonexistent-ruxen-alias/\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    pub(crate) fn prepare_reports_unknown_log_format() {
+        let err = prepare_err(
+            "http { server { listen 127.0.0.1:8080; access_log /dev/null nosuchfmt; } }",
+        );
+        assert_eq!(err, "unknown log format \"nosuchfmt\"");
+    }
+
+    #[test]
+    pub(crate) fn prepare_reports_unopenable_logs() {
+        let err = prepare_err(
+            "http { server { listen 127.0.0.1:8080; access_log /nonexistent-ruxen-dir/a.log; } }",
+        );
+        assert_eq!(
+            err,
+            "open() \"/nonexistent-ruxen-dir/a.log\" failed (2: No such file or directory)"
+        );
+        let err = prepare_err(
+            "http { server { listen 127.0.0.1:8080; error_log /nonexistent-ruxen-dir/e.log; } }",
+        );
+        assert_eq!(
+            err,
+            "open() \"/nonexistent-ruxen-dir/e.log\" failed (2: No such file or directory)"
+        );
+    }
+
+    #[test]
+    pub(crate) fn prepare_rejects_proxy_uri_in_regex_location() {
+        let err = prepare_err(
+            "http { server { listen 127.0.0.1:8080; location ~ ^/a { proxy_pass http://127.0.0.1:1/x; } } }",
+        );
+        assert!(
+            err.starts_with("\"proxy_pass\" cannot have URI part"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -344,7 +409,7 @@ mod tests {
                 }
             "#,
         );
-        let http = prepare(cfg);
+        let http = prepare(cfg).expect("prepare");
         assert_eq!(
             http.listens[0].servers[0].exact_names,
             vec![&b"example.com"[..]]
@@ -366,7 +431,7 @@ mod tests {
                 }
             "#,
         );
-        let http = prepare(cfg);
+        let http = prepare(cfg).expect("prepare");
         let s = &http.listens[0].servers[0];
         assert_eq!(s.exact_locations.len(), 1);
         assert_eq!(s.exact_locations[0].pattern, b"/exact");
@@ -390,7 +455,7 @@ mod tests {
                 }
             "#,
         );
-        let http = prepare(cfg);
+        let http = prepare(cfg).expect("prepare");
         let s = &http.listens[0].servers[0];
         assert_eq!(s.prefix_locations.len(), 1);
         assert_eq!(s.named_locations.len(), 1);
@@ -424,7 +489,7 @@ mod tests {
                 }
             "#,
         );
-        let http = prepare(cfg);
+        let http = prepare(cfg).expect("prepare");
         let find = |listen: usize, pat: &[u8]| {
             http.listens[listen].servers[0]
                 .prefix_locations
@@ -440,7 +505,8 @@ mod tests {
 
         let default_off = prepare(parse_cfg(
             "http { server { listen 8082; location / { return 200; } } }",
-        ));
+        ))
+        .expect("prepare");
         assert!(!default_off.listens[0].servers[0].prefix_locations[0].sendfile);
     }
 
@@ -461,7 +527,7 @@ mod tests {
                 }
             "#,
         );
-        let http = prepare(cfg);
+        let http = prepare(cfg).expect("prepare");
         let server = &http.listens[0].servers[0];
         assert_eq!(server.prefix_locations.len(), 2);
         let replace = server
@@ -536,7 +602,8 @@ mod tests {
         let http = prepare(parse_cfg(&format!(
             "http {{ server {{ listen 80; location / {{ root {}; }} }} }}",
             root.display()
-        )));
+        )))
+        .expect("prepare");
         let server = &http.listens[0].servers[0];
         let loc = MatchedLocation::from_prefix(&server.prefix_locations[0]);
         let req = phase::RequestCtx {
