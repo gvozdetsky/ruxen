@@ -34,3 +34,24 @@ Sibling checkouts are expected one directory up:
 - Code is rustfmt-clean and CI enforces `cargo fmt --check`; run `cargo fmt`
   before committing. Clippy still has ~100 warnings and is not gated — don't
   mix clippy cleanups into feature changes.
+- Access restrictions ruxen can't enforce yet fail closed (`[emerg]`), never
+  go on the allowlist (`config::reject_unenforced`).
+
+## Backlog
+
+The backlog is GitHub issues, nothing else; there is no backlog file.
+
+- Query it: `gh issue list --state open --json number,title,labels,milestone`,
+  narrowed with `--label area:proxy`, `--milestone v0.1.1`, etc. Labels:
+  `area:{proxy,http,tls,config,static,cli,core,logging}`, `size:{S,M,L}`,
+  `nginx-compatibility`, `performance`, `bug`, `documentation`,
+  `good first issue`, `help wanted`. Milestones: `v0.1.1`, `v0.2.0`.
+- One issue = one root cause. Sections: Summary, Repro (minimal config +
+  command, nginx vs ruxen), nginx reference (`file.c:line` at 1.24.0),
+  Unlocks (nginx-tests files), Notes, Where in ruxen (files, no line
+  numbers), and "Reproduced on `<sha>`". Re-check the repro on main before
+  working on an older issue.
+- Before filing, search for a duplicate. `good first issue` / `help wanted`
+  issues are left for contributors.
+- Possible vulnerabilities are never filed as issues: see `SECURITY.md`.
+- Every PR ends with a "Follow-ups" section: new issue numbers, or "none".
