@@ -95,6 +95,77 @@ investigating.
 
 ---
 
+## Deciding whether a change helps: `pair.sh`
+
+`RESULTS.md` rows are single runs against a baseline captured at another
+time. On a machine that also runs the client (and anything else), those
+drift by up to ±10%: on the reference laptop the same scenario has read
+94.8% and 104.7% of nginx on two evenings, and the CPU boosts for tens of
+seconds after idle, so the first run after a pause can read 30–100% high.
+They are a log, not a verdict.
+
+To compare two servers or two builds, interleave them:
+
+```bash
+bench/scripts/pair.sh static_8k                            # ruxen vs nginx
+bench/scripts/pair.sh static_8k --a-bin /tmp/ruxen-main    # this build vs a saved build
+bench/scripts/pair.sh m5_conditional_304 --a ruxen \
+    --a-env RUXEN_UNSHARE_FILES=0                           # one binary, env toggle
+```
+
+It runs a 20 s throwaway warm-up of A, then 6 pairs in alternating order
+(A B, B A, …), each with the scenario's warmup before a 10 s measurement.
+It prints every pair and the **geometric mean of B/A**. Runs that saw any
+error response or wrk timeout make it exit 1, because their ratio means
+nothing.
+
+Practical rules:
+
+- **Calibrate first.** Run A/A on an identical binary
+  (`pair.sh m1_hello --a-bin <copy of target/release/ruxen>`). The spread
+  you see is your noise floor. On the idle reference laptop it was about ±1%
+  per pair; with a browser and an editor busy, ±5–10%.
+- **Keep the number of pairs even.** The second run of a pair reads a few
+  percent differently, and equal counts of "A first" and "B first" cancel
+  that in the mean.
+- **Idle machine, no compiles.** Don't run `cargo build` or the
+  nginx-tests sweep at the same time; nginx-tests also uses ports 808x.
+- Save the old build before you rebuild:
+  `cp target/release/ruxen /tmp/ruxen-main`.
+
+### When the server isn't the bottleneck: `cpu_per_request.sh`
+
+On the no-keepalive scenarios neither server saturates the CPU (wrk and the
+kernel's TCP setup are the limit), so req/s barely moves when ruxen gets
+cheaper or more expensive. Compare server CPU per request instead:
+
+```bash
+bench/scripts/cpu_per_request.sh m1_no_keepalive --server nginx
+bench/scripts/cpu_per_request.sh m1_no_keepalive --server ruxen
+bench/scripts/cpu_per_request.sh m1_no_keepalive --bin /tmp/ruxen-main
+```
+
+It reads the server's utime/stime from `/proc` around one measured run and
+prints user/system µs per request. Alternate the runs and repeat a few
+times; the first run after idle is unreliable here too.
+
+### Profiling
+
+`perf record -g -p <pid>` works once
+`sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0` is set
+(it resets on reboot). System-wide `-a` stays blocked at that level, so
+profile nginx by its worker pids. Distribution nginx packages usually ship
+without symbols, so compare nginx at the kernel-symbol level. For ruxen
+user-space call stacks, build with frame pointers into a separate target
+dir:
+
+```bash
+CARGO_TARGET_DIR=/tmp/ruxen-prof CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
+```
+
+---
+
 ## Adding a new scenario
 
 Append a line to `bench/scenarios/manifest.tsv`:
