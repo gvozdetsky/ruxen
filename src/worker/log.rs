@@ -119,13 +119,21 @@ fn log_line_prefix(level: ErrorLogLevel) -> Vec<u8> {
 }
 
 /// A worker-level line not about any request (`accept() failed`,
-/// `worker_connections are not enough`), to stderr like nginx's main
-/// error log; `-e` redirects it.
-pub(crate) fn write_worker_log(level: ErrorLogLevel, message: &str) {
+/// `worker_connections are not enough`): to the top-level `error_log`, or
+/// stderr (which `-e` redirects) when there is none, like nginx's main log.
+pub(crate) fn write_worker_log(sinks: &[PreparedErrorLog], level: ErrorLogLevel, message: &str) {
+    let sinks = if sinks.is_empty() {
+        DEFAULT_ERROR_LOGS
+    } else {
+        sinks
+    };
+    if !sinks.iter().any(|s| s.level.allows(level)) {
+        return;
+    }
     let mut line = log_line_prefix(level);
     line.extend_from_slice(message.as_bytes());
     line.push(b'\n');
-    let _ = std::io::stderr().write_all(&line);
+    emit(sinks, level, &line, message.as_bytes());
 }
 
 fn level_name(level: ErrorLogLevel) -> &'static [u8] {
@@ -175,13 +183,19 @@ pub(crate) fn write_error_log(
     line.extend_from_slice(&text);
     line.push(b'\n');
 
+    emit(sinks, level, &line, &text);
+}
+
+/// Write a finished line to every sink that takes `level`; syslog gets
+/// `text`, the line without nginx's date/level/pid prefix.
+fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8], text: &[u8]) {
     for sink in sinks {
         if !sink.level.allows(level) {
             continue;
         }
         match sink.target {
             PreparedErrorLogTarget::Stderr => {
-                let _ = std::io::stderr().write_all(&line);
+                let _ = std::io::stderr().write_all(line);
             }
             PreparedErrorLogTarget::File(path) => {
                 match std::fs::OpenOptions::new()
@@ -190,7 +204,7 @@ pub(crate) fn write_error_log(
                     .open(path)
                 {
                     Ok(mut file) => {
-                        if let Err(e) = file.write_all(&line) {
+                        if let Err(e) = file.write_all(line) {
                             eprintln!("ruxen: error_log write to {} failed: {e}", path.display());
                         }
                     }
@@ -198,7 +212,7 @@ pub(crate) fn write_error_log(
                 }
             }
             PreparedErrorLogTarget::Syslog(target) => {
-                if let Err(e) = send_syslog_error(target, syslog_severity(level), &text) {
+                if let Err(e) = send_syslog_error(target, syslog_severity(level), text) {
                     eprintln!("ruxen: error_log syslog send failed: {e}");
                 }
             }
