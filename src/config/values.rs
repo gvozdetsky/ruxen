@@ -145,6 +145,135 @@ pub(crate) fn reject_sent_http_parts(parts: &[ValuePart], what: &'static str) ->
     Ok(())
 }
 
+// Variables ruxen resolves only at run time (`Variable::Unknown`): the
+// names referenced, and the ones the config defines. nginx rejects a
+// reference to a name nothing defines (`unknown "x" variable`); the check
+// runs once the whole config is read, since `set` / `map` may come later.
+thread_local! {
+    static VARIABLES: std::cell::RefCell<VariableRegistry> =
+        std::cell::RefCell::new(VariableRegistry::default());
+}
+
+#[derive(Default)]
+struct VariableRegistry {
+    referenced: Vec<String>,
+    defined: std::collections::HashSet<String>,
+}
+
+pub(crate) fn reset_variable_registry() {
+    VARIABLES.with(|v| *v.borrow_mut() = VariableRegistry::default());
+}
+
+/// Note the names a directive defines: `set $x`, `map … $x`,
+/// `split_clients … $x`, and named captures in any regex argument
+/// (`(?<x>…)`, `(?P<x>…)`, `(?'x'…)`).
+pub(crate) fn note_defined_variables(args: &[String]) {
+    let target = match args.first().map(String::as_str) {
+        Some("set") => args.get(1),
+        Some("map" | "split_clients") => args.get(2),
+        _ => None,
+    };
+    VARIABLES.with(|v| {
+        let mut v = v.borrow_mut();
+        if let Some(name) = target.and_then(|t| t.strip_prefix('$')) {
+            v.defined.insert(name.to_string());
+        }
+        for arg in args {
+            for (open, close) in [("(?<", '>'), ("(?P<", '>'), ("(?'", '\'')] {
+                let mut rest = arg.as_str();
+                while let Some(i) = rest.find(open) {
+                    rest = &rest[i + open.len()..];
+                    if let Some(end) = rest.find(close) {
+                        v.defined.insert(rest[..end].to_string());
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// After the whole config is read: an error for the first reference
+/// nothing defines, and a warning per variable nginx has but ruxen
+/// doesn't implement yet (those render empty).
+pub(crate) fn check_variable_references() -> Result<Vec<String>, Error> {
+    VARIABLES.with(|v| {
+        let v = v.borrow();
+        let mut warnings = Vec::new();
+        for name in &v.referenced {
+            if v.defined.contains(name) {
+                continue;
+            }
+            if !is_nginx_variable(name) {
+                return Err(Error::UnknownVariable(name.clone()));
+            }
+            let w = format!("variable \"${name}\" is not supported yet and is always empty");
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
+        Ok(warnings)
+    })
+}
+
+/// Variables of nginx 1.24 (core and the modules of a default build) that
+/// ruxen doesn't implement as such.
+fn is_nginx_variable(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "binary_remote_addr",
+        "bytes_received",
+        "date_gmt",
+        "date_local",
+        "document_root",
+        "document_uri",
+        "fastcgi_path_info",
+        "fastcgi_script_name",
+        "gzip_ratio",
+        "http2",
+        "http3",
+        "https",
+        "invalid_referer",
+        "limit_conn_status",
+        "limit_req_status",
+        "memcached_key",
+        "msie",
+        "nginx_version",
+        "pid",
+        "proxy_internal_body_length",
+        "proxy_internal_chunked",
+        "proxy_port",
+        "proxy_protocol_addr",
+        "proxy_protocol_port",
+        "proxy_protocol_server_addr",
+        "proxy_protocol_server_port",
+        "quic",
+        "realip_remote_addr",
+        "realip_remote_port",
+        "realpath_root",
+        "request_completion",
+        "request_filename",
+        "request_id",
+        "secure_link",
+        "secure_link_expires",
+        "server_addr",
+        "slice_range",
+        "tcpinfo_rcv_space",
+        "tcpinfo_rtt",
+        "tcpinfo_rttvar",
+        "tcpinfo_snd_cwnd",
+        "uid_got",
+        "uid_reset",
+        "uid_set",
+        "upstream_cache_status",
+        "upstream_cache_last_modified",
+    ];
+    const PREFIXES: &[&str] = &["ssl_", "upstream_trailer_", "geoip_"];
+    NAMES.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+fn note_unknown_variable(name: &str) {
+    VARIABLES.with(|v| v.borrow_mut().referenced.push(name.to_string()));
+}
+
 pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
     Ok(match name {
         b"uri" => Variable::Uri,
@@ -234,7 +363,11 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
             Variable::Cookie(s)
         }
         _ if name.starts_with(b"http_") => Variable::Http(header_var_name(&name[b"http_".len()..])),
-        _ => Variable::Unknown(String::from_utf8_lossy(name).into_owned()),
+        _ => {
+            let name = String::from_utf8_lossy(name).into_owned();
+            note_unknown_variable(&name);
+            Variable::Unknown(name)
+        }
     })
 }
 

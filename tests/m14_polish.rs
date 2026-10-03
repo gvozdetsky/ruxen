@@ -134,10 +134,10 @@ fn body(resp: &[u8]) -> &[u8] {
 }
 
 #[test]
-fn unknown_variable_renders_empty_not_a_parse_error() {
-    // Pre-M14 this config would fail `-t` because `$undefined_var` wasn't
-    // in our allowlist. Now it parses and renders empty at request time,
-    // matching nginx's lenient variable resolution.
+fn unsupported_nginx_variable_renders_empty() {
+    // A variable nginx has but ruxen doesn't implement yet loads with a
+    // warning and renders empty. (A name nginx doesn't know is an
+    // `unknown "x" variable` error, as in nginx.)
     let conf = r#"
 events { }
 http {
@@ -145,8 +145,8 @@ http {
     listen 127.0.0.1:%%PORT%%;
     location / {
       add_header X-Known $uri;
-      add_header X-Undef $nonexistent_var;
-      return 200 "before|$nonexistent_var|after";
+      add_header X-Undef $tcpinfo_rtt;
+      return 200 "before|$tcpinfo_rtt|after";
     }
   }
 }

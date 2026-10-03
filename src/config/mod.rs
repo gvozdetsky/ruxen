@@ -69,6 +69,7 @@ pub fn parse_with_main(
 }
 
 pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
+    reset_variable_registry();
     let mut runtime = RuntimeOpts::default();
     let mut http: Option<HttpConfig> = None;
 
@@ -174,6 +175,7 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
     }
 
     let mut http = http.ok_or(Error::UnexpectedEof)?;
+    http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
     http.conf_prefix = lx.conf_prefix().map(Path::to_path_buf);
@@ -2664,22 +2666,32 @@ mod tests {
     }
 
     #[test]
-    fn add_header_accepts_unknown_variable_as_lenient_empty() {
-        // nginx resolves unknown `$name` references to empty at runtime
-        // rather than failing the config. We match that so test suites
-        // referencing variables we haven't implemented (e.g. `$name` regex
-        // captures) still load cleanly.
-        let src = r#"
-            http { server { listen 80; location / {
-                add_header X-Remote $nonexistent_var;
-                return 200 "";
-            } } }
-        "#;
-        let cfg = parse(src).unwrap();
-        let hdr = &cfg.servers[0].locations[0].add_headers.as_ref().unwrap()[0];
+    fn unknown_variables_fail_like_nginx() {
+        // A name nothing defines is an error, as in nginx.
+        let err =
+            parse("http { server { listen 80; location / { add_header X $nonexistent_var; return 204; } } }")
+                .unwrap_err();
+        assert_eq!(err.to_string(), "unknown \"nonexistent_var\" variable");
+        // Defined later in the file by `set`, `map` or a named capture: fine.
+        let cfg = parse(
+            "http { server { listen 80; server_name ~^(?<sub>.+)\\.x$; \
+               location / { add_header X \"$a $m $sub $cap\"; set $a 1; return 204; } \
+               location ~ ^/(?P<cap>.+)$ { return 204; } } \
+             map $uri $m { default 1; } }",
+        )
+        .unwrap();
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        // A variable nginx has and ruxen doesn't: loads, with a warning.
+        let cfg = parse(
+            "http { server { listen 80; location / { add_header X $server_addr$ssl_early_data; return 204; } } }",
+        )
+        .unwrap();
         assert_eq!(
-            hdr.value,
-            vec![ValuePart::Var(Variable::Unknown("nonexistent_var".into()))]
+            cfg.warnings,
+            [
+                "variable \"$server_addr\" is not supported yet and is always empty",
+                "variable \"$ssl_early_data\" is not supported yet and is always empty",
+            ]
         );
     }
 
