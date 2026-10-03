@@ -453,6 +453,11 @@ fn process_with_meta_inner(
     // The checks of nginx's ngx_http_process_request_header, in its order.
     // An error page reached from one of them doesn't run them again.
     let refusing = initial_reroute.is_none();
+    if refusing {
+        // Refused below before normalising: don't leave the previous
+        // request's URI behind for the access log's `$uri`.
+        url_scratch.clear();
+    }
 
     // RFC 7230 §5.4: a missing Host header on HTTP/1.1 is a client error.
     // Nginx enforces this in ngx_http_process_request_header

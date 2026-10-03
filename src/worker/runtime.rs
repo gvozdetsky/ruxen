@@ -62,7 +62,10 @@ pub(crate) async fn write_access_logs(
     // The request's processing result, for `$proxy_host` and the
     // upstream variables; `None` for a request refused before routing.
     meta: Option<&phase::ProcessMeta>,
-    valid_uri: bool,
+    // `$uri`: the URI the request ended up with (after normalisation,
+    // rewrites and internal redirects), or `None` to take the path of
+    // `request_uri`.
+    uri: Option<&[u8]>,
 ) {
     if logs.is_empty() {
         return;
@@ -77,16 +80,13 @@ pub(crate) async fn write_access_logs(
 
     let status = response_status(response);
     let args = request_args(request_uri);
-    // nginx leaves `$uri` empty when the URI itself was refused.
-    let uri: &[u8] = if valid_uri {
+    let uri: &[u8] = uri.unwrap_or_else(|| {
         request_uri
             .iter()
             .position(|&b| b == b'?')
             .map(|i| &request_uri[..i])
             .unwrap_or(request_uri)
-    } else {
-        b""
-    };
+    });
     let ctx = RenderCtx {
         uri,
         request_uri,
@@ -169,6 +169,20 @@ pub(crate) async fn write_access_logs(
                 log.path.display()
             );
         }
+    }
+}
+
+/// `$uri` for the access log: nginx's `r->uri` at the end of the request,
+/// which `phase::process` leaves in `url_scratch` (normalised, rewritten,
+/// after internal redirects). Empty for a refused URI, as in nginx;
+/// `None` (the request's own path) when processing never got that far.
+fn final_uri<'a>(meta: &phase::ProcessMeta, url_scratch: &'a [u8]) -> Option<&'a [u8]> {
+    if meta.invalid_uri {
+        Some(b"")
+    } else if url_scratch.is_empty() {
+        None
+    } else {
+        Some(url_scratch)
     }
 }
 
@@ -257,7 +271,7 @@ async fn reject_request<S: ConnIo>(
         conn.tls,
         http,
         None,
-        true,
+        None,
     )
     .await;
 }
@@ -441,7 +455,7 @@ async fn run_post_action(
             base_ctx.tls,
             http,
             Some(&post_meta),
-            !post_meta.invalid_uri,
+            final_uri(&post_meta, url_scratch),
         )
         .await;
     }
@@ -1651,7 +1665,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 tls,
                                 http,
                                 Some(&process_meta),
-                                !process_meta.invalid_uri,
+                                final_uri(&process_meta, url_scratch),
                             )
                             .await;
                         }
