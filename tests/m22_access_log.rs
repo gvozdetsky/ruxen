@@ -287,3 +287,37 @@ http {
         "{log}"
     );
 }
+
+/// `$uri` in the log is the URI the request ended up with, as nginx's
+/// `r->uri`: decoded and normalised, after `rewrite` and internal
+/// redirects. It used to be the raw request path.
+#[test]
+fn logged_uri_is_the_final_one() {
+    let conf = r#"
+events {}
+http {
+  log_format t "$request_uri $uri";
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    access_log %%DIR%%/t.log t;
+    location /rw { rewrite ^ /target last; }
+    location /target { return 200 "t"; }
+    location / { return 200 "x"; }
+  }
+}
+"#;
+    let (_guard, port, dir) = spawn_server(conf);
+    for path in ["/%61bc", "/a/../b//c", "/rw?q=1"] {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let _ = read_one_response(&mut s);
+    }
+    sleep(Duration::from_millis(50));
+    let log = std::fs::read_to_string(dir.join("t.log")).unwrap();
+    assert_eq!(log, "/%61bc /abc\n/a/../b//c /b/c\n/rw?q=1 /target\n");
+}
