@@ -588,12 +588,14 @@ pub struct PreparedPeer {
 /// ngx_http_try_files_loc_conf_t::try_files) split.
 pub struct PreparedRoot {
     pub root: &'static Path,
-    /// Open dirfd for the canonicalized root. Used as the `dirfd` argument
-    /// of `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` so the kernel
+    /// Open dirfd for the canonicalized root, or -1 while it doesn't exist
+    /// (read it through `fd()`). Used as the `dirfd` argument of
+    /// `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` so the kernel
     /// enforces symlink-escape containment in a single syscall — replaces
-    /// the old stat + canonicalize + `starts_with` guard. Opened once at
-    /// prepare time, leaked for process lifetime (closed at exit only).
-    pub root_fd: std::os::unix::io::RawFd,
+    /// the old stat + canonicalize + `starts_with` guard. Opened at prepare
+    /// time if possible, else on first use; leaked for process lifetime
+    /// (closed at exit only).
+    pub root_fd: std::sync::atomic::AtomicI32,
     /// `root` appends the whole URI.
     /// Prefix/exact `alias` strips the matched location prefix before
     /// joining. Regex-location `alias` uses nginx's `add_uri_to_alias`
@@ -611,6 +613,49 @@ pub struct PreparedRoot {
     /// Effective `autoindex_format ...;` for this location.
     pub autoindex_format: AutoindexFormat,
     pub try_files: Option<&'static PreparedTryFiles>,
+}
+
+impl PreparedRoot {
+    /// The root's dirfd. A root that didn't exist at startup is opened on
+    /// first use, so it works once it appears, as with nginx; until then
+    /// this is the open error (a 404 for ENOENT).
+    pub fn fd(&self) -> std::io::Result<std::os::unix::io::RawFd> {
+        use std::sync::atomic::Ordering;
+        let fd = self.root_fd.load(Ordering::Acquire);
+        if fd != -1 {
+            return Ok(fd);
+        }
+        let opened = open_root(self.root)?;
+        match self
+            .root_fd
+            .compare_exchange(-1, opened, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(opened),
+            Err(other) => {
+                // Another worker opened it first.
+                // SAFETY: `opened` is our own fd, not shared with anyone.
+                unsafe { libc::close(opened) };
+                Ok(other)
+            }
+        }
+    }
+}
+
+/// Open a `root` / `alias` path as the `openat2` anchor. Canonicalized
+/// first so the anchor is the resolved inode: symlinks in the configured
+/// path can't retarget the "beneath" set later. No `O_DIRECTORY` — nginx
+/// allows `alias /some/file;` at exact locations, so the anchor can be a
+/// regular file (the resolver `dup`s it back out when the URL-mapped rel
+/// is empty).
+pub(crate) fn open_root(path: &Path) -> std::io::Result<std::os::unix::io::RawFd> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::IntoRawFd;
+    let canonical = path.canonicalize()?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(canonical)?;
+    Ok(f.into_raw_fd())
 }
 
 #[derive(Debug, Copy, Clone)]

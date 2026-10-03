@@ -418,26 +418,20 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn prepare_reports_missing_root() {
-        let err =
-            prepare_err("http { server { listen 127.0.0.1:8080; root /nonexistent-ruxen-root; } }");
-        assert!(
-            err.starts_with(
-                "root \"/nonexistent-ruxen-root\" is not accessible: realpath() failed (2: "
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
-    pub(crate) fn prepare_reports_missing_alias() {
-        let err = prepare_err(
-            "http { server { listen 127.0.0.1:8080; location /a/ { alias /nonexistent-ruxen-alias/; } } }",
-        );
-        assert!(
-            err.starts_with("alias \"/nonexistent-ruxen-alias/\""),
-            "{err}"
-        );
+    pub(crate) fn prepare_accepts_missing_root_and_alias() {
+        // nginx resolves them per request (404 while missing); the anchor
+        // is opened on first use.
+        let http = prepare(parse_cfg(
+            "http { server { listen 127.0.0.1:8080; root /nonexistent-ruxen-root; \
+             location /a/ { alias /nonexistent-ruxen-alias/; } } }",
+        ))
+        .expect("prepare");
+        let server = &http.listens[0].servers[0];
+        let PreparedHandler::Root(root) = &server.prefix_locations[0].handler else {
+            panic!("alias location is a root handler");
+        };
+        assert_eq!(root.root_fd.load(std::sync::atomic::Ordering::Relaxed), -1);
+        assert_eq!(root.fd().unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

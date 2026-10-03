@@ -1150,11 +1150,16 @@ mod tests {
     }
 
     #[test]
-    fn location_requires_handler() {
+    fn location_without_handler_defaults_to_root_html() {
+        // nginx's default `root` is `html` under the prefix.
         let src = r#"
             http { server { listen 8080; location / {} } }
         "#;
-        assert!(parse(src).is_err());
+        let cfg = parse(src).unwrap();
+        assert!(matches!(
+            &cfg.servers[0].locations[0].handler,
+            Handler::Root { path, mapping: PathMapping::Root } if path == Path::new("html")
+        ));
     }
 
     #[test]
