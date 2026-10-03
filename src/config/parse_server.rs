@@ -217,7 +217,7 @@ pub(crate) fn parse_server_block(
         }
         match (args[0].as_str(), &term) {
             ("listen", Terminator::Semi) => {
-                listens.push(parse_listen_args(&args[1..])?);
+                listens.extend(parse_listen_range_args(&args[1..])?);
             }
             ("ssl_certificate", Terminator::Semi) => {
                 saw_any_ssl_directive = true;
@@ -978,6 +978,39 @@ pub(crate) fn parse_listen(s: &str) -> Result<SocketAddr, Error> {
         what: "listen address",
         got: s.to_string(),
     })
+}
+
+/// `listen` with a port range (`127.0.0.1:8000-8003`, `8000-8003`,
+/// `[::1]:8000-8003`): one listen per port, the flags on each, as nginx's
+/// `ngx_parse_inet_url`. A single port is one listen.
+pub(crate) fn parse_listen_range_args(args: &[String]) -> Result<Vec<Listen>, Error> {
+    let addr_s = args.first().ok_or(Error::MissingArg("listen"))?;
+    let bad = || Error::BadValue {
+        what: "listen address",
+        got: addr_s.to_string(),
+    };
+    let (host, ports) = match addr_s.rfind(':') {
+        Some(i) if !addr_s.ends_with(']') => (Some(&addr_s[..i]), &addr_s[i + 1..]),
+        _ => (None, addr_s.as_str()),
+    };
+    let Some((first, last)) = ports.split_once('-') else {
+        return Ok(vec![parse_listen_args(args)?]);
+    };
+    let first: u16 = first.parse().map_err(|_| bad())?;
+    let last: u16 = last.parse().map_err(|_| bad())?;
+    if first == 0 || last < first {
+        return Err(bad());
+    }
+    let mut listens = Vec::with_capacity(usize::from(last - first) + 1);
+    for port in first..=last {
+        let mut one = args.to_vec();
+        one[0] = match host {
+            Some(host) => format!("{host}:{port}"),
+            None => port.to_string(),
+        };
+        listens.push(parse_listen_args(&one)?);
+    }
+    Ok(listens)
 }
 
 /// Parse a `listen` directive's argument list (address + zero or more flags).

@@ -1859,6 +1859,41 @@ mod tests {
     }
 
     #[test]
+    fn listen_port_ranges_expand() {
+        let cfg = parse(
+            "http { server { listen 127.0.0.1:8000-8002 default_server; \
+             listen [::1]:9000-9001; listen 7000-7000; location / { return 204; } } }",
+        )
+        .unwrap();
+        let ports: Vec<String> = cfg
+            .servers
+            .iter()
+            .map(|s| s.listen.addr.to_string())
+            .collect();
+        assert_eq!(
+            ports,
+            [
+                "127.0.0.1:8000",
+                "127.0.0.1:8001",
+                "127.0.0.1:8002",
+                "[::1]:9000",
+                "[::1]:9001",
+                "0.0.0.0:7000"
+            ]
+        );
+        assert!(cfg.servers[..3].iter().all(|s| s.listen.default_server));
+        for bad in ["127.0.0.1:8002-8000", "127.0.0.1:0-1", "127.0.0.1:1-x"] {
+            assert!(
+                parse(&format!(
+                    "http {{ server {{ listen {bad}; location / {{ return 204; }} }} }}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn log_format_and_access_log_parse_at_http_scope() {
         let src = r#"
             http {
