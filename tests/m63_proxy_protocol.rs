@@ -33,6 +33,10 @@ const BODY: &str = "\"$proxy_protocol_addr:$proxy_protocol_port \
                     $proxy_protocol_server_addr:$proxy_protocol_server_port $remote_addr\"";
 
 fn start(tag: &str, listen_extra: &str, server_extra: &str) -> Server {
+    start_with(tag, "", listen_extra, server_extra)
+}
+
+fn start_with(tag: &str, events: &str, listen_extra: &str, server_extra: &str) -> Server {
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -43,7 +47,7 @@ fn start(tag: &str, listen_extra: &str, server_extra: &str) -> Server {
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
-            "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{ server {{ \
+            "pid {d}/ruxen.pid;\nevents {{ {events} }}\nhttp {{ server {{ \
              listen 127.0.0.1:{port} proxy_protocol {listen_extra}; {server_extra}\n\
              location / {{ return 200 {BODY}; }} }} }}\n",
             d = dir.display()
@@ -55,6 +59,7 @@ fn start(tag: &str, listen_extra: &str, server_extra: &str) -> Server {
         .arg(dir.join("nginx.conf"))
         .arg("-e")
         .arg(dir.join("error.log"))
+        .env("RUXEN_WORKERS", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -154,6 +159,34 @@ fn a_header_cut_short_is_refused_at_once() {
         sleep(Duration::from_millis(50));
         let log = std::fs::read_to_string(server.dir.join("error.log")).unwrap_or_default();
         assert!(log.contains(logged), "{log}");
+    }
+}
+
+/// A connection that never sends a valid header still gives back its
+/// `worker_connections` slot. It used to keep it: with one worker and
+/// three slots, three broken connections locked every later client out,
+/// and SIGQUIT waited for them forever.
+#[test]
+fn broken_headers_give_back_their_slot() {
+    let mut server = start_with("slots", "worker_connections 4;", "", "");
+    for _ in 0..8 {
+        assert_eq!(exchange(server.port, &[GET]), "");
+        // Closed before sending anything.
+        drop(TcpStream::connect(("127.0.0.1", server.port)).unwrap());
+    }
+    sleep(Duration::from_millis(50));
+    let want = "192.0.2.1:51000 192.0.2.2:80 127.0.0.1";
+    assert_eq!(body(&exchange(server.port, &[V1, GET])), want);
+
+    let rc = unsafe { libc::kill(server.child.id() as i32, libc::SIGQUIT) };
+    assert_eq!(rc, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while server.child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "ruxen did not exit after SIGQUIT"
+        );
+        sleep(Duration::from_millis(20));
     }
 }
 
