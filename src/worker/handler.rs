@@ -207,17 +207,6 @@ pub(crate) fn finalize_location_response(
     }
 }
 
-/// RFC 9110 §9.2.2 idempotent methods. POST and PATCH are not. The
-/// classifier in `http.rs::Method` collapses everything off the
-/// GET/HEAD/TRACE/CONNECT path to `Method::Other`, so the proxy
-/// idempotency gate has to fall back to the raw method bytes.
-pub(crate) fn is_idempotent_method_bytes(bytes: &[u8]) -> bool {
-    matches!(
-        bytes,
-        b"GET" | b"HEAD" | b"PUT" | b"DELETE" | b"OPTIONS" | b"TRACE"
-    )
-}
-
 /// Walk the raw client header block and append each non-hop-by-hop header
 /// that isn't already in `overrides` (matched case-insensitively by name)
 /// to `out`. Names already lowercased by the parser, but we still
@@ -634,13 +623,12 @@ pub(crate) fn run_location_handler(
             next_upstream: proxy.next_upstream,
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
-            has_request_body: forward_len > 0,
             body_file,
             keep_upstream_headers: !loc.add_headers.is_empty()
                 || !loc.add_trailers.is_empty()
                 || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
             response: proxy.response,
-            method_idempotent: is_idempotent_method_bytes(req.method_bytes),
+            method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
             intercept,
         });

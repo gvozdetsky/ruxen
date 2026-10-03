@@ -635,3 +635,68 @@ http {{
     // Exactly one upstream request — no retry shadow.
     assert_eq!(live.requests.load(Ordering::SeqCst), 1);
 }
+
+/// nginx's non-idempotent rule: once the request went out, POST, LOCK and
+/// PATCH move to the next peer only with `proxy_next_upstream
+/// non_idempotent`, with or without a body; other methods (PUT, DELETE,
+/// unknown ones) count as idempotent. A connect failure is retried for
+/// any method, since nothing was sent. ruxen used to retry a bodiless POST
+/// and refuse to retry PUT or a POST whose peer refused the connection.
+#[test]
+fn m43_non_idempotent_methods_follow_nginx() {
+    let bad = Backend::spawn(Mode::Status5xx(500));
+    let live = Backend::spawn(Mode::Ok);
+    let dead_port = common::ports::DeadPort::new();
+    let conf = format!(
+        r#"
+http {{
+    upstream bad_first {{
+        server 127.0.0.1:{bad} max_fails=0;
+        server 127.0.0.1:{live} max_fails=0;
+    }}
+    upstream dead_first {{
+        server 127.0.0.1:{dead} max_fails=0;
+        server 127.0.0.1:{live} max_fails=0;
+    }}
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://bad_first;
+            proxy_next_upstream error timeout http_500;
+        }}
+        location /opt/ {{
+            proxy_pass http://bad_first;
+            proxy_next_upstream error timeout http_500 non_idempotent;
+        }}
+        location /dead/ {{
+            proxy_pass http://dead_first;
+        }}
+    }}
+}}
+"#,
+        bad = bad.addr.port(),
+        live = live.addr.port(),
+        dead = dead_port.port(),
+    );
+    let (_g, port) = spawn_ruxen(&conf);
+    let send = |method: &str, path: &str| {
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: c\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        status_of(&http_send(port, req.as_bytes()))
+    };
+    // Each round-robin cycle starts on the first peer again only every
+    // other request, so send each case twice and look at both answers.
+    let both = |method: &str, path: &str| [send(method, path), send(method, path)];
+
+    assert!(both("POST", "/").contains(&500), "POST was retried");
+    assert!(both("PATCH", "/").contains(&500), "PATCH was retried");
+    assert_eq!(both("PUT", "/"), [200, 200], "PUT not retried");
+    assert_eq!(both("PROPFIND", "/"), [200, 200], "PROPFIND not retried");
+    assert_eq!(both("POST", "/opt/"), [200, 200], "non_idempotent ignored");
+    assert_eq!(
+        both("POST", "/dead/"),
+        [200, 200],
+        "connect failure not retried"
+    );
+}

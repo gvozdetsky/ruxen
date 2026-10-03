@@ -118,15 +118,10 @@ pub struct ProxyPlan {
     /// `proxy_next_upstream_timeout` overall budget. `Duration::ZERO`
     /// means no overall cap (per-attempt timeouts still apply).
     pub next_upstream_timeout: Duration,
-    /// True if `proxy_pass_request_body` would have shipped a non-empty
-    /// body on the wire. Drives idempotent-retry gating: nginx will not
-    /// retry a non-idempotent request once its body has started flowing,
-    /// unless `proxy_next_upstream non_idempotent` was set.
-    pub has_request_body: bool,
-    /// Whether the request method is idempotent per RFC 9110 §9.2.2.
-    /// `Method::Other` covers POST/PUT/PATCH/DELETE/OPTIONS at our
-    /// classification granularity, so we precompute this against the
-    /// raw method bytes in the worker before building the plan.
+    /// False for POST, LOCK and PATCH, the methods nginx won't send to
+    /// another peer once the request went out, unless
+    /// `proxy_next_upstream non_idempotent` is set (with or without a
+    /// body). Every other method counts as idempotent there.
     pub method_idempotent: bool,
     /// The proxied location was reached as an error page, so its own
     /// `error_page` doesn't apply again (no `recursive_error_pages`).
@@ -324,11 +319,11 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     };
     let mut tried_mask: u64 = 1u64 << current.peer_idx.min(63);
     let mut attempts: u32 = 0;
-    // Idempotent methods may always be retried. POST/PATCH/etc. only when
-    // either the request body is empty (no risk of replay) or the user
-    // opted in via `proxy_next_upstream non_idempotent`.
-    let body_safe_to_retry =
-        plan.method_idempotent || !plan.has_request_body || plan.next_upstream.non_idempotent;
+    // nginx's NGX_HTTP_UPSTREAM_FT_NON_IDEMPOTENT: once the request went
+    // out, POST/LOCK/PATCH move to the next peer only with
+    // `proxy_next_upstream non_idempotent`. Before that (connect failed)
+    // any request may.
+    let sent_may_retry = plan.method_idempotent || plan.next_upstream.non_idempotent;
     // Tracks the last response we'd return if the next failover branch
     // doesn't fire. The first iteration always overwrites it before any
     // read — `unused_assignments` complains about the initializer, but
@@ -365,7 +360,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     // if the body can be safely re-sent. The stale socket
                     // isn't an attempt of its own in nginx's terms.
                     state = UpstreamState::new(state.peer);
-                    if body_safe_to_retry {
+                    if sent_may_retry {
                         attempt(
                             &plan,
                             current.peer_idx,
@@ -420,7 +415,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     last_failure = Some(resp);
                     // Failover budget check.
                     if attempts >= max_tries
-                        || !body_safe_to_retry
+                        || !sent_may_retry
                         || deadline_exceeded(overall_deadline)
                     {
                         return last_failure.unwrap_or_else(|| {
@@ -456,6 +451,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
             }
             AttemptOutcome::Failed(resp, kind, error) => {
                 upstream::report_failure(upstream, current.peer_idx);
+                let sent = !matches!(
+                    *error,
+                    UpstreamError::ConnectFailed(_) | UpstreamError::TimedOut(Stage::Connecting)
+                );
                 record_failure(failures, &plan, current.peer_idx, error);
                 let triggers = match kind {
                     FailKind::Error => plan.next_upstream.error,
@@ -465,7 +464,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 last_failure = Some(resp);
                 if !triggers
                     || attempts >= max_tries
-                    || !body_safe_to_retry
+                    || (sent && !sent_may_retry)
                     || deadline_exceeded(overall_deadline)
                 {
                     return last_failure
