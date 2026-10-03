@@ -42,17 +42,47 @@ fn unique_dir() -> PathBuf {
     d
 }
 
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
+/// Start ruxen on a free port; `render(port)` gives the config. Picking a
+/// port and binding it isn't atomic: another socket — often an outgoing
+/// connection of a parallel test — can take the port in between, and with
+/// one listener per worker a later worker's bind then fails after the
+/// first already accepts, so a connect-based readiness check passes and
+/// the server exits right after. Wait for the pid file instead (ruxen
+/// writes it once every worker is bound) and start over on a new port if
+/// the process exited.
+fn start_ruxen(render: impl Fn(u16) -> String) -> (Child, u16, PathBuf) {
+    for _ in 0..5 {
+        let (port, _lock) = pick_port();
+        let confdir = unique_dir();
+        let conf_path = confdir.join("nginx.conf");
+        std::fs::write(&conf_path, render(port)).unwrap();
+        let pid = confdir.join("ruxen.pid");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(&conf_path)
+            .arg("-g")
+            .arg(format!("pid {};", pid.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ruxen");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if pid.exists() {
+                return (child, port, confdir);
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ruxen did not start on port {port}"
+            );
+            sleep(Duration::from_millis(10));
         }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
+        let _ = std::fs::remove_dir_all(&confdir);
     }
+    panic!("ruxen exited at startup five times");
 }
 
 pub struct ServerHandle {
@@ -74,24 +104,12 @@ impl Drop for ServerHandle {
 /// substitutions) into a tempdir and run the release binary against it.
 /// The handle owns the child + tempdir + certs and cleans them on drop.
 pub fn spawn_https_server(config_template: &str, certs: CertSet) -> ServerHandle {
-    let (port, _lock) = pick_port();
-    let confdir = unique_dir();
-    let conf_path = confdir.join("nginx.conf");
-
-    let conf = config_template
-        .replace("%%PORT%%", &port.to_string())
-        .replace("%%CERT%%", certs.cert_path().to_str().unwrap())
-        .replace("%%KEY%%", certs.key_path().to_str().unwrap());
-    std::fs::write(&conf_path, conf).unwrap();
-
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .args(["-c", conf_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn ruxen");
-
-    wait_for_listen(port);
+    let (child, port, confdir) = start_ruxen(|port| {
+        config_template
+            .replace("%%PORT%%", &port.to_string())
+            .replace("%%CERT%%", certs.cert_path().to_str().unwrap())
+            .replace("%%KEY%%", certs.key_path().to_str().unwrap())
+    });
     ServerHandle {
         child,
         port,
@@ -120,26 +138,15 @@ impl Drop for ServerHandleMulti {
 /// `server` blocks with their own keypairs — the shape SNI-dispatch tests
 /// need. The handle owns child + tempdir + every cert in the vector.
 pub fn spawn_https_server_multi(config_template: &str, certs: Vec<CertSet>) -> ServerHandleMulti {
-    let (port, _lock) = pick_port();
-    let confdir = unique_dir();
-    let conf_path = confdir.join("nginx.conf");
-
-    let mut conf = config_template.replace("%%PORT%%", &port.to_string());
-    for (i, c) in certs.iter().enumerate() {
-        conf = conf
-            .replace(&format!("%%CERT_{i}%%"), c.cert_path().to_str().unwrap())
-            .replace(&format!("%%KEY_{i}%%"), c.key_path().to_str().unwrap());
-    }
-    std::fs::write(&conf_path, conf).unwrap();
-
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .args(["-c", conf_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn ruxen");
-
-    wait_for_listen(port);
+    let (child, port, confdir) = start_ruxen(|port| {
+        let mut conf = config_template.replace("%%PORT%%", &port.to_string());
+        for (i, c) in certs.iter().enumerate() {
+            conf = conf
+                .replace(&format!("%%CERT_{i}%%"), c.cert_path().to_str().unwrap())
+                .replace(&format!("%%KEY_{i}%%"), c.key_path().to_str().unwrap());
+        }
+        conf
+    });
     ServerHandleMulti {
         child,
         port,
@@ -650,19 +657,8 @@ fn ssl_variables_over_tls13() {
 /// expands to empty when the connection isn't over TLS.
 #[test]
 fn ssl_variables_on_plain_listener() {
-    let (port, _lock) = pick_port();
-    let confdir = unique_dir();
-    let conf_path = confdir.join("nginx.conf");
-    let conf = PLAIN_SCHEME_CONF.replace("%%PORT%%", &port.to_string());
-    std::fs::write(&conf_path, conf).unwrap();
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .args(["-c", conf_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn ruxen");
-    wait_for_listen(port);
+    let (mut child, port, confdir) =
+        start_ruxen(|port| PLAIN_SCHEME_CONF.replace("%%PORT%%", &port.to_string()));
 
     let resp = curl_get_include(port, "localhost", "/", None, false, false);
     let _ = child.kill();
