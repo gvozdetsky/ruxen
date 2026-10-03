@@ -916,6 +916,9 @@ pub(crate) fn spawn_connection(
     state: Arc<RuntimeState>,
     connection_id: u64,
 ) {
+    // The connection was counted on accept; whatever path it takes from
+    // here, dropping the guard un-counts it.
+    let guard = ConnectionGuard(state.clone());
     if prepared.proxy_protocol {
         // Cold: `listen … proxy_protocol`.
         monoio::spawn(handle_proxy_protocol(
@@ -926,6 +929,7 @@ pub(crate) fn spawn_connection(
             http,
             state,
             connection_id,
+            guard,
         ));
         return;
     }
@@ -939,6 +943,7 @@ pub(crate) fn spawn_connection(
                 state,
                 connection_id,
                 None,
+                guard,
             ));
         }
         Some(acceptor) => {
@@ -952,6 +957,7 @@ pub(crate) fn spawn_connection(
                 state,
                 connection_id,
                 None,
+                guard,
             ));
         }
     }
@@ -969,6 +975,7 @@ async fn handle_proxy_protocol(
     http: &'static PreparedHttp,
     state: Arc<RuntimeState>,
     connection_id: u64,
+    guard: ConnectionGuard,
 ) {
     let server = &prepared.servers[prepared.default_server];
     let header = match crate::proxy_protocol::read(&stream, server.timeouts.header).await {
@@ -995,6 +1002,7 @@ async fn handle_proxy_protocol(
                 state,
                 connection_id,
                 Some(header),
+                guard,
             )
             .await
         }
@@ -1008,6 +1016,7 @@ async fn handle_proxy_protocol(
                 state,
                 connection_id,
                 Some(header),
+                guard,
             )
             .await
         }
@@ -1231,8 +1240,8 @@ pub(crate) async fn handle_plain(
     state: Arc<RuntimeState>,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
+    _guard: ConnectionGuard,
 ) {
-    let _guard = ConnectionGuard(state.clone());
     handle(
         &mut stream,
         peer_addr,
@@ -1256,8 +1265,8 @@ pub(crate) async fn handle_tls(
     state: Arc<RuntimeState>,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
+    _guard: ConnectionGuard,
 ) {
-    let _guard = ConnectionGuard(state.clone());
     let (mut tls_stream, info) = match crate::tls::accept_with_timeout(
         &acceptor,
         stream,
