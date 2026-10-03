@@ -317,3 +317,30 @@ http {
     assert_eq!(status_line(&r), "HTTP/1.1 405 Not Allowed");
     assert_eq!(body(&r), b"other method");
 }
+
+/// `recursive_error_pages on` in the location that takes an error page
+/// lets the error page take another one; off (the default) stops at the
+/// first, as in nginx. It used to be accepted and ignored.
+#[test]
+fn m12_recursive_error_pages() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location /rec/ { recursive_error_pages on; error_page 404 /missing2; return 404; }
+    location /norec/ { error_page 404 /missing2; return 404; }
+    location = /missing2 { error_page 404 /err.html; return 404; }
+    location = /err.html { return 200 "err page"; }
+  }
+}
+"#;
+    let (_guard, port) = spawn_server(conf);
+    let resp = http_get(port, "/rec/zzz");
+    assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
+    assert_eq!(body(&resp), b"err page");
+
+    let resp = http_get(port, "/norec/zzz");
+    assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
+    assert_ne!(body(&resp), b"err page");
+}

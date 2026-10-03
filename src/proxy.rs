@@ -440,7 +440,12 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 if let Some(rules) = plan.intercept.as_ref()
                     && let Some(rule) = rules.iter().find(|r| r.status == status)
                 {
-                    return build_intercept_reroute(rule, status, &resp);
+                    return build_intercept_reroute(
+                        rule,
+                        status,
+                        &resp,
+                        plan.response.recursive_error_pages,
+                    );
                 }
                 return resp;
             }
@@ -518,6 +523,7 @@ fn build_intercept_reroute(
     rule: &InterceptRule,
     upstream_status: u16,
     upstream_resp: &Response,
+    recursive: bool,
 ) -> Response {
     use crate::phase::{ErrorPageStatus, Reroute, RerouteTarget};
     use crate::worker::PreparedErrorPageAction;
@@ -557,7 +563,7 @@ fn build_intercept_reroute(
             target: RerouteTarget::Uri(uri),
             args,
             error_page_status,
-            enters_error_page: true,
+            enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
         });
@@ -567,7 +573,7 @@ fn build_intercept_reroute(
             target: RerouteTarget::Named(rule.target.clone()),
             args: None,
             error_page_status,
-            enters_error_page: true,
+            enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
         });

@@ -288,6 +288,7 @@ async fn settle_proxy_response(
 
     let redirects = plan.response.redirects;
     let server_bytes = plan.server_bytes;
+    let recursive_error_pages = plan.response.recursive_error_pages;
     let error_pages: &'static [PreparedErrorPage] = if plan.in_error_page {
         &[]
     } else {
@@ -310,6 +311,7 @@ async fn settle_proxy_response(
         intercept_proxy_error(
             upstream_resp,
             error_pages,
+            recursive_error_pages,
             http,
             &ctx,
             &process_meta,

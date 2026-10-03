@@ -834,6 +834,7 @@ pub(crate) fn run_location_handler(
         req,
         &render_ctx_base,
         in_error_page,
+        loc.recursive_error_pages,
         server_bytes,
     );
     let trailers_allowed =
