@@ -205,3 +205,30 @@ fn m10_alias_and_index_parity_matches_core_index_t_cases() {
     let looped = http_get(port, "/loop/");
     assert_eq!(status_line(&looped), "HTTP/1.1 500 Internal Server Error");
 }
+
+/// An `alias` that names a file serves it on every request. The served fd
+/// is a `dup` of the alias's anchor, and dups share the file offset: the
+/// read+write path (sendfile off, the default) used plain `read`, so every
+/// request after the first got an empty body.
+#[test]
+fn m10_alias_file_serves_every_request() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location = /exact { alias %%TESTDIR%%/exact.txt; }
+  }
+}
+"#;
+    let (guard, port) = spawn_server(conf);
+    // Big enough to be streamed from the file, not sent in one piece.
+    let big: Vec<u8> = (0..64 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+    std::fs::write(guard.tempdir.join("exact.txt"), &big).unwrap();
+    for _ in 0..3 {
+        let resp = http_get(port, "/exact");
+        assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
+        assert_eq!(body(&resp).len(), big.len());
+        assert_eq!(body(&resp), &big[..]);
+    }
+}
