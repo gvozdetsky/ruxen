@@ -68,41 +68,104 @@ pub(crate) use response::*;
 pub(crate) use rewrite::*;
 pub(crate) use runtime::*;
 
+/// Bumped on SIGUSR1; each worker reopens its access_log files before the
+/// next write once it sees a new value (logrotate's `kill -USR1`).
+pub(crate) static LOG_REOPEN_GEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The `-e` file stderr goes to. Each worker has its own fd table
+/// (`unshare(CLONE_FILES)`), so each one re-points its fd 2 on reopen.
+pub(crate) static STDERR_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Point fd 2 at `path` (append, created if missing).
+pub(crate) fn redirect_stderr_to(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    // SAFETY: plain dup2 onto stderr; `file` stays open for the call.
+    if unsafe { libc::dup2(file.as_raw_fd(), 2) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Before writing an error line: if SIGUSR1 came since this worker last
+/// looked, re-point its stderr at the `-e` file.
+pub(crate) fn reopen_stderr_if_needed() {
+    let generation = LOG_REOPEN_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    STDERR_GEN.with(|seen| {
+        if seen.get() == generation {
+            return;
+        }
+        seen.set(generation);
+        if let Some(path) = STDERR_LOG_PATH.get()
+            && let Err(e) = redirect_stderr_to(path)
+        {
+            eprintln!("ruxen: [alert] reopening {}: {e}", path.display());
+        }
+    });
+}
+
 thread_local! {
-    static ACCESS_LOG_FILES: Cell<Option<&'static [AsyncFile]>> = const { Cell::new(None) };
+    static STDERR_GEN: Cell<u64> = const { Cell::new(0) };
+    /// This worker's access_log files (indexed by `file_index`) and the
+    /// reopen generation they were opened at. An `Rc` so a write still in
+    /// flight keeps the old files open across a reopen.
+    static ACCESS_LOG_FILES: std::cell::RefCell<(u64, Option<std::rc::Rc<[AsyncFile]>>)> =
+        const { std::cell::RefCell::new((0, None)) };
+}
+
+fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AsyncFile]>, String> {
+    let mut opened: Vec<AsyncFile> = Vec::with_capacity(logs.len());
+    for log in logs {
+        let open_failed = |e: std::io::Error| {
+            format!(
+                "open() \"{}\" failed ({})",
+                log.path.display(),
+                errno_text(&e)
+            )
+        };
+        let std_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log.path)
+            .map_err(open_failed)?;
+        opened.push(AsyncFile::from_std(std_file).map_err(open_failed)?);
+    }
+    Ok(opened.into())
 }
 
 /// `prepare` already opened every access_log once, so a failure here
 /// means the file changed underneath us during startup; it is reported
 /// like any other startup error.
 pub(crate) fn init_access_logs_for_worker(logs: &[PreparedAccessLog]) -> Result<(), String> {
+    if ACCESS_LOG_FILES.with(|cell| cell.borrow().1.is_some()) {
+        return Ok(());
+    }
+    let files = open_access_logs(logs)?;
+    let generation = LOG_REOPEN_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    ACCESS_LOG_FILES.with(|cell| *cell.borrow_mut() = (generation, Some(files)));
+    Ok(())
+}
+
+/// This worker's access_log files, reopened first if SIGUSR1 arrived
+/// since they were opened. `None` before `init_access_logs_for_worker`.
+pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc<[AsyncFile]>> {
+    let generation = LOG_REOPEN_GEN.load(std::sync::atomic::Ordering::Relaxed);
     ACCESS_LOG_FILES.with(|cell| {
-        if cell.get().is_some() {
-            return Ok(());
+        let mut cell = cell.borrow_mut();
+        if cell.1.is_some() && cell.0 != generation {
+            cell.0 = generation;
+            match open_access_logs(logs) {
+                Ok(files) => cell.1 = Some(files),
+                // nginx keeps writing to the old file when a reopen fails.
+                Err(e) => eprintln!("ruxen: [alert] reopening access_log: {e}"),
+            }
         }
-        if logs.is_empty() {
-            cell.set(Some(&[]));
-            return Ok(());
-        }
-        let mut opened: Vec<AsyncFile> = Vec::with_capacity(logs.len());
-        for log in logs {
-            let open_failed = |e: std::io::Error| {
-                format!(
-                    "open() \"{}\" failed ({})",
-                    log.path.display(),
-                    errno_text(&e)
-                )
-            };
-            let std_file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log.path)
-                .map_err(open_failed)?;
-            let f = AsyncFile::from_std(std_file).map_err(open_failed)?;
-            opened.push(f);
-        }
-        cell.set(Some(Box::leak(opened.into_boxed_slice())));
-        Ok(())
+        cell.1.clone()
     })
 }
 

@@ -189,6 +189,7 @@ pub(crate) fn write_error_log(
 /// Write a finished line to every sink that takes `level`; syslog gets
 /// `text`, the line without nginx's date/level/pid prefix.
 fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8], text: &[u8]) {
+    reopen_stderr_if_needed();
     for sink in sinks {
         if !sink.level.allows(level) {
             continue;
