@@ -199,6 +199,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_delay_ms: Option<u64> = None;
     let mut client_max_body_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
+    let mut limit_rate: Option<Vec<ValuePart>> = None;
+    let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
@@ -241,6 +243,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     auth_delay_ms,
                     client_max_body_size,
                     sendfile,
+                    limit_rate,
+                    limit_rate_after,
                     post_action,
                     expires,
                     ignore_invalid_headers,
@@ -519,6 +523,18 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 client_max_body_size = Some(parse_client_max_body_size_args(&args[1..])?);
             }
+            ("limit_rate", Terminator::Semi) => {
+                if limit_rate.is_some() {
+                    return Err(Error::Duplicate("limit_rate"));
+                }
+                limit_rate = Some(parse_size_value(&args[1..], "limit_rate")?);
+            }
+            ("limit_rate_after", Terminator::Semi) => {
+                if limit_rate_after.is_some() {
+                    return Err(Error::Duplicate("limit_rate_after"));
+                }
+                limit_rate_after = Some(parse_size_value(&args[1..], "limit_rate_after")?);
+            }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
                     return Err(Error::Duplicate("sendfile"));
@@ -752,8 +768,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // limit_rate / limit_rate_after: no rate-limiting subsystem yet, accepted
     // as no-ops so configs (including upstream nginx-tests) load. `$limit_rate`
     // is also rendered as `0` for the same reason — see `worker::render`.
-    "limit_rate",
-    "limit_rate_after",
     "proxy_store",
     "proxy_store_access",
     // File I/O knobs (we use std::fs; these are nginx-only tuning)

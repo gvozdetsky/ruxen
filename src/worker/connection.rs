@@ -341,11 +341,82 @@ pub(crate) async fn write_all_timed<S: monoio::io::AsyncWriteRent>(
     (Ok(()), buf)
 }
 
+/// nginx's `limit_rate` pacing (`ngx_http_write_filter`): past
+/// `limit_rate_after` bytes the response may have sent at most
+/// `rate * (elapsed + 1 s)` more, so writes wait for that.
+pub(crate) struct Pacer {
+    rate: u64,
+    after: u64,
+    start: Instant,
+    sent: u64,
+}
+
+impl Pacer {
+    /// `None` for an unlimited response (rate 0), the common case.
+    pub(crate) fn new(rate: u64, after: u64, start: Instant) -> Option<Pacer> {
+        (rate > 0).then_some(Pacer {
+            rate,
+            after,
+            start,
+            sent: 0,
+        })
+    }
+
+    /// Wait until some of `want` bytes may go; returns how many.
+    async fn allowance(&mut self, want: usize) -> usize {
+        loop {
+            let elapsed_ms = self.start.elapsed().as_millis() as u64;
+            let allowed = self
+                .after
+                .saturating_add(self.rate.saturating_mul(elapsed_ms + 1000) / 1000);
+            if self.sent < allowed {
+                // Small writes keep the pace even, as nginx's `limit`.
+                let step = self.rate.clamp(1, 64 * 1024);
+                return ((allowed - self.sent).min(step) as usize).min(want);
+            }
+            let over = self.sent - allowed + 1;
+            let wait_ms = (over.saturating_mul(1000)).div_ceil(self.rate).max(1);
+            monoio::time::sleep(Duration::from_millis(wait_ms)).await;
+        }
+    }
+}
+
+/// `write_all_timed` under `limit_rate`.
+pub(crate) async fn write_all_paced<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
+    mut buf: Vec<u8>,
+    len: usize,
+    pacer: &mut Pacer,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    timeout: Duration,
+) -> (std::io::Result<()>, Vec<u8>) {
+    let mut written = 0;
+    while written < len {
+        let n = pacer.allowance(len - written).await;
+        let slice = buf.slice(written..written + n);
+        let Some((res, slice)) = with_timeout(timer.as_mut(), timeout, stream.write(slice)).await
+        else {
+            return (Err(std::io::ErrorKind::TimedOut.into()), Vec::new());
+        };
+        buf = slice.into_inner();
+        match res {
+            Ok(0) => return (Err(std::io::ErrorKind::WriteZero.into()), buf),
+            Ok(n) => {
+                written += n;
+                pacer.sent += n as u64;
+            }
+            Err(e) => return (Err(e), buf),
+        }
+    }
+    (Ok(()), buf)
+}
+
 pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
     stream: &mut S,
     body: phase::FileBody,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
+    mut pacer: Option<&mut Pacer>,
 ) -> bool {
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
@@ -366,14 +437,29 @@ pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
             Err(_) => return false,
         };
         offset += n as u64;
-        let (res, returned) = write_all_timed(
-            stream,
-            std::mem::take(&mut buf),
-            n,
-            timer.as_mut(),
-            send_timeout,
-        )
-        .await;
+        let (res, returned) = match pacer.as_deref_mut() {
+            Some(pacer) => {
+                write_all_paced(
+                    stream,
+                    std::mem::take(&mut buf),
+                    n,
+                    pacer,
+                    timer.as_mut(),
+                    send_timeout,
+                )
+                .await
+            }
+            None => {
+                write_all_timed(
+                    stream,
+                    std::mem::take(&mut buf),
+                    n,
+                    timer.as_mut(),
+                    send_timeout,
+                )
+                .await
+            }
+        };
         buf = returned;
         if res.is_err() {
             return false;

@@ -275,6 +275,36 @@ async fn reject_request<S: ConnIo>(
     .await;
 }
 
+/// A response under `limit_rate`: the head, then the file body if any,
+/// paced as nginx's write filter does. `false` if the connection failed.
+#[allow(clippy::too_many_arguments)]
+async fn write_response_paced<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    file_body: Option<phase::FileBody>,
+    rate: u64,
+    after: u64,
+    request_start: Instant,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> bool {
+    let Some(mut pacer) = Pacer::new(rate, after, request_start) else {
+        return false;
+    };
+    let taken = std::mem::take(scratch);
+    let len = taken.len();
+    let (res, returned) =
+        write_all_paced(stream, taken, len, &mut pacer, timer.as_mut(), send_timeout).await;
+    *scratch = returned;
+    if res.is_err() {
+        return false;
+    }
+    match file_body {
+        Some(body) => stream_file(stream, body, timer, send_timeout, Some(&mut pacer)).await,
+        None => true,
+    }
+}
+
 async fn settle_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
@@ -329,8 +359,14 @@ async fn settle_proxy_response(
         Response::Reroute(reroute) => (reroute, false),
         // nginx's ngx_http_upstream_process_headers: the response is dropped
         // and the request redirected internally, as a GET.
-        _ if report.accel_redirect.is_some() => (
-            accel_redirect_reroute(report.accel_redirect.take().unwrap_or_default()),
+        _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => (
+            accel_redirect_reroute(
+                report
+                    .accel
+                    .as_mut()
+                    .and_then(|a| a.redirect.take())
+                    .unwrap_or_default(),
+            ),
             !matches!(ctx.method, Method::Head),
         ),
         upstream_resp => {
@@ -352,6 +388,7 @@ async fn settle_proxy_response(
         reroute,
         report.states,
         as_get,
+        report.accel.as_ref().and_then(|a| a.limit_rate),
     ))
     .await
 }
@@ -368,6 +405,11 @@ fn finish_proxy_response(
     mut process_meta: phase::ProcessMeta,
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
+    // `X-Accel-Limit-Rate` is the response's `limit_rate`.
+    if let Some(rate) = report.accel.as_ref().and_then(|a| a.limit_rate) {
+        process_meta.limit_rate =
+            phase::ResponseLimit::with_rate(process_meta.limit_rate.take(), rate);
+    }
     // nginx rewrites Location / Refresh while processing the upstream
     // header, before the add_header filter sees the response.
     let upstream_resp = if report.redirect_header {
@@ -402,6 +444,9 @@ enum PassOutcome {
         reroute: phase::Reroute,
         states: Vec<crate::proxy::UpstreamState>,
         as_get: bool,
+        /// The upstream's `X-Accel-Limit-Rate`: it outlives the redirect
+        /// (nginx's `r->limit_rate_set`).
+        limit_rate: Option<u64>,
     },
 }
 
@@ -456,13 +501,21 @@ async fn run_proxy_pass(
             reroute,
             states: report.states,
             as_get,
+            limit_rate: report.accel.as_ref().and_then(|a| a.limit_rate),
         },
         // nginx's ngx_http_upstream_process_headers: the response is dropped
         // and the request redirected internally, as a GET.
-        _ if report.accel_redirect.is_some() => PassOutcome::Redirect {
-            reroute: accel_redirect_reroute(report.accel_redirect.take().unwrap_or_default()),
+        _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => PassOutcome::Redirect {
+            reroute: accel_redirect_reroute(
+                report
+                    .accel
+                    .as_mut()
+                    .and_then(|a| a.redirect.take())
+                    .unwrap_or_default(),
+            ),
             states: report.states,
             as_get: !matches!(ctx.method, Method::Head),
+            limit_rate: report.accel.as_ref().and_then(|a| a.limit_rate),
         },
         upstream_resp => {
             let (response, process_meta) =
@@ -483,6 +536,7 @@ async fn settle_redirected(
     mut reroute: phase::Reroute,
     mut states: Vec<crate::proxy::UpstreamState>,
     mut as_get: bool,
+    mut accel_limit_rate: Option<u64>,
 ) -> (Response, phase::ProcessMeta) {
     for _ in 0..phase::MAX_REROUTES {
         let pass_ctx = phase::RequestCtx {
@@ -491,6 +545,10 @@ async fn settle_redirected(
         };
         let (response, mut process_meta) =
             phase::process_with_meta_from_reroute(http, &pass_ctx, url_scratch, reroute);
+        if let Some(rate) = accel_limit_rate {
+            process_meta.limit_rate =
+                phase::ResponseLimit::with_rate(process_meta.limit_rate.take(), rate);
+        }
         let Response::Proxy(plan) = response else {
             process_meta.upstream_states = states;
             return (response, process_meta);
@@ -505,10 +563,12 @@ async fn settle_redirected(
                 reroute: next,
                 states: mut more,
                 as_get: next_as_get,
+                limit_rate,
             } => {
                 states.append(&mut more);
                 reroute = next;
                 as_get = next_as_get;
+                accel_limit_rate = limit_rate.or(accel_limit_rate);
             }
         }
     }
@@ -1780,7 +1840,27 @@ pub(crate) async fn handle<S: ConnIo>(
                                 };
                                 insert_header_at(&mut *scratch, &mut scan.head_end, header);
                             }
-                            if process_meta.sendfile
+                            if let Some(limit) = process_meta.limit_rate.as_deref()
+                                && limit.rate > 0
+                            {
+                                // Cold: `limit_rate`. Boxed so the pacer
+                                // doesn't grow every connection's future.
+                                let body = file_body.take();
+                                if !Box::pin(write_response_paced(
+                                    stream,
+                                    &mut *scratch,
+                                    body,
+                                    limit.rate,
+                                    limit.after,
+                                    request_start,
+                                    timers.io.as_mut(),
+                                    timeouts.send,
+                                ))
+                                .await
+                                {
+                                    return;
+                                }
+                            } else if process_meta.sendfile
                                 && file_body.is_some()
                                 && stream.sendfile_fd().is_some()
                             {
@@ -1818,9 +1898,16 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             }
                             response_for_logs = &*scratch;
-                        }
-                        if let Some(body) = file_body {
-                            if !stream_file(stream, body, timers.io.as_mut(), timeouts.send).await {
+                            if let Some(body) = file_body.take()
+                                && !stream_file(
+                                    stream,
+                                    body,
+                                    timers.io.as_mut(),
+                                    timeouts.send,
+                                    None,
+                                )
+                                .await
+                            {
                                 return;
                             }
                         }

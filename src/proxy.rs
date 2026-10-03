@@ -292,7 +292,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     let failures = &mut report.failures;
     let upstream_headers = &mut report.upstream_headers;
     let redirect_header = &mut report.redirect_header;
-    let accel_redirect = &mut report.accel_redirect;
+    let accel = &mut report.accel;
     let states = &mut report.states;
     let upstream = plan.upstream;
     let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
@@ -351,7 +351,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 Some(c),
                 upstream_headers,
                 redirect_header,
-                accel_redirect,
+                accel,
                 &mut state,
                 started,
             )
@@ -369,7 +369,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                             None,
                             upstream_headers,
                             redirect_header,
-                            accel_redirect,
+                            accel,
                             &mut state,
                             started,
                         )
@@ -391,7 +391,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 None,
                 upstream_headers,
                 redirect_header,
-                accel_redirect,
+                accel,
                 &mut state,
                 started,
             )
@@ -759,13 +759,46 @@ pub struct ProxyReport {
     /// The response has a `Location` or `Refresh` header and there are
     /// `proxy_redirect` rules to apply to it.
     pub redirect_header: bool,
-    /// The upstream's `X-Accel-Redirect` target, unless
-    /// `proxy_ignore_headers X-Accel-Redirect`: the worker redirects there
-    /// instead of sending the response.
-    pub accel_redirect: Option<Vec<u8>>,
+    /// The upstream's `X-Accel-Redirect` / `X-Accel-Limit-Rate`, unless
+    /// `proxy_ignore_headers` lists them.
+    pub accel: Option<Box<AccelHeaders>>,
     /// One entry per attempt, for `$upstream_addr`, `$upstream_status` and
     /// the other per-attempt variables.
     pub states: Vec<UpstreamState>,
+}
+
+/// Record an upstream `X-Accel-Redirect` / `X-Accel-Limit-Rate` unless
+/// `proxy_ignore_headers` lists it. Cold: kept out of the attempt's code.
+#[cold]
+#[inline(never)]
+fn note_accel_header(
+    accel: &mut Option<Box<AccelHeaders>>,
+    rules: &crate::worker::ProxyResponseRules,
+    name: &[u8],
+    value: &[u8],
+) {
+    if name.eq_ignore_ascii_case(b"x-accel-redirect") && !rules.ignore_accel_redirect {
+        accel.get_or_insert_default().redirect = Some(value.to_vec());
+    } else if name.eq_ignore_ascii_case(b"x-accel-limit-rate") && !rules.ignore_accel_limit_rate {
+        // ngx_http_upstream_process_limit_rate: a number, or `off`.
+        let rate = if value.eq_ignore_ascii_case(b"off") {
+            Some(0)
+        } else {
+            std::str::from_utf8(value).ok().and_then(|v| v.parse().ok())
+        };
+        if rate.is_some() {
+            accel.get_or_insert_default().limit_rate = rate;
+        }
+    }
+}
+
+/// The upstream's X-Accel headers that change what ruxen does next.
+#[derive(Default)]
+pub struct AccelHeaders {
+    /// `X-Accel-Redirect`: redirect there instead of sending the response.
+    pub redirect: Option<Vec<u8>>,
+    /// `X-Accel-Limit-Rate`: the response's `limit_rate` (0 for `off`).
+    pub limit_rate: Option<u64>,
 }
 
 /// One upstream attempt, as nginx's `ngx_http_upstream_state_t`: what the
@@ -841,11 +874,13 @@ async fn attempt(
     pooled: Option<upstream::PooledConn>,
     upstream_headers: &mut Vec<u8>,
     redirect_header: &mut bool,
-    accel_redirect: &mut Option<Vec<u8>>,
+    accel: &mut Option<Box<AccelHeaders>>,
     state: &mut UpstreamState,
     started: Instant,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
+    // Only the answering attempt's X-Accel headers count.
+    *accel = None;
     let peer_addr = plan.upstream.peers[peer_idx].addr;
     let (mut stream, opened_at, requests_served) = if let Some(c) = pooled {
         (c.stream, c.opened_at, c.requests_served)
@@ -1046,6 +1081,7 @@ async fn attempt(
     let mut content_length: Option<u64> = None;
     let mut chunked = false;
     let mut upstream_close = !upstream_is_11; // HTTP/1.0 closes by default
+
     // Framing is validated as strictly as nginx does
     // (ngx_http_upstream_process_content_length / _transfer_encoding): a
     // second Content-Length or Transfer-Encoding, both together, a
@@ -1107,6 +1143,8 @@ async fn attempt(
                     );
                 }
                 framing_line = Some((header_line, is_length));
+            } else if name.len() >= 16 && name[..8].eq_ignore_ascii_case(b"x-accel-") {
+                note_accel_header(accel, plan.response, name, value);
             } else if name.eq_ignore_ascii_case(b"connection") {
                 if value
                     .split(|&b| b == b',')
@@ -1134,7 +1172,15 @@ async fn attempt(
     // copying through an intermediate `body_owned`. For chunked, we still
     // need a separate decoded buffer because the wire bytes carry chunk
     // sizes that would otherwise leak into the forwarded body.
-    let body_has_content = !matches!(plan.method, Method::Head)
+    // `X-Accel-Redirect` (unless ignored): nginx redirects as soon as it
+    // has the header and closes the upstream connection; the body is never
+    // read, which makes the connection unusable for the pool.
+    let skip_body = accel.as_ref().is_some_and(|a| a.redirect.is_some());
+    if skip_body {
+        upstream_close = true;
+    }
+    let body_has_content = !skip_body
+        && !matches!(plan.method, Method::Head)
         && status_code != 204
         && status_code != 304
         && !(status_code >= 100 && status_code < 200);
@@ -1333,10 +1379,6 @@ async fn attempt(
             upstream_headers.extend_from_slice(b"\r\n");
         }
         let class = classify_upstream_header(name);
-        if class == UpstreamHeader::Hidden(HIDDEN_X_ACCEL_REDIRECT) && !rules.ignore_accel_redirect
-        {
-            *accel_redirect = Some(trim_ascii(&line[colon + 1..]).to_vec());
-        }
         match class {
             UpstreamHeader::HopByHop => continue,
             UpstreamHeader::Hidden(bit) if rules.pass_mask & bit == 0 => continue,
@@ -1646,6 +1688,7 @@ enum UpstreamHeader {
 const HIDDEN_DATE: u16 = 1 << 0;
 const HIDDEN_SERVER: u16 = 1 << 1;
 const HIDDEN_X_ACCEL_REDIRECT: u16 = 1 << 5;
+const HIDDEN_X_ACCEL_LIMIT_RATE: u16 = 1 << 7;
 
 /// One dispatch on the name's length, then at most a few compares: this
 /// runs for every upstream header line on the proxy hot path.
@@ -1672,7 +1715,7 @@ fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
         16 if is(b"x-accel-redirect") => Hidden(HIDDEN_X_ACCEL_REDIRECT),
         17 if is(b"transfer-encoding") => HopByHop,
         17 if is(b"x-accel-buffering") => Hidden(1 << 6),
-        18 if is(b"x-accel-limit-rate") => Hidden(1 << 7),
+        18 if is(b"x-accel-limit-rate") => Hidden(HIDDEN_X_ACCEL_LIMIT_RATE),
         18 if is(b"proxy-authenticate") => HopByHop,
         19 if is(b"proxy-authorization") => HopByHop,
         _ => Other,

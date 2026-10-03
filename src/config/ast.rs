@@ -115,6 +115,10 @@ pub struct HttpConfig {
     pub client_max_body_size: Option<u64>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
+    /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
+    /// `None` inherits.
+    pub limit_rate: Option<Vec<ValuePart>>,
+    pub limit_rate_after: Option<Vec<ValuePart>>,
     /// http-scope `post_action URI|@name;`. `None` means "not set";
     /// server/location scopes inherit it.
     pub post_action: Option<String>,
@@ -477,6 +481,10 @@ pub struct Server {
     pub client_max_body_size: Option<u64>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
     pub sendfile: Option<bool>,
+    /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
+    /// `None` inherits.
+    pub limit_rate: Option<Vec<ValuePart>>,
+    pub limit_rate_after: Option<Vec<ValuePart>>,
     /// Server-scope `post_action URI|@name;`. `None` inherits from http.
     pub post_action: Option<String>,
     /// Server-scope `expires` directive. `None` inherits from http.
@@ -631,6 +639,10 @@ pub struct Location {
     /// Location-scope `sendfile on|off`, inherited through nested locations
     /// at parse time. `None` inherits from server/http at prepare time.
     pub sendfile: Option<bool>,
+    /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
+    /// `None` inherits.
+    pub limit_rate: Option<Vec<ValuePart>>,
+    pub limit_rate_after: Option<Vec<ValuePart>>,
     /// Location-scope `client_body_in_file_only on|clean|off;`. `None`
     /// inherits from server (default `off`). When `on`, the spilled
     /// request body file is kept after the request completes; `clean`
