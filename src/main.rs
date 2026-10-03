@@ -35,6 +35,7 @@ mod worker;
 
 static SIGQUIT_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGHUP_SEEN: AtomicBool = AtomicBool::new(false);
+static SIGUSR1_SEEN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 const SIGHUP: i32 = 1;
@@ -69,6 +70,10 @@ extern "C" fn sigquit_handler(_sig: i32) {
 
 extern "C" fn sighup_handler(_sig: i32) {
     SIGHUP_SEEN.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn sigusr1_handler(_sig: i32) {
+    SIGUSR1_SEEN.store(true, Ordering::SeqCst);
 }
 
 struct Cli {
@@ -271,6 +276,7 @@ fn real_main() -> Result<(), Failure> {
 
     if let Some(errlog) = &cli.errlog {
         redirect_stderr(errlog)?;
+        let _ = worker::STDERR_LOG_PATH.set(errlog.clone());
     }
 
     // Workers can't run without io_uring; say why up front instead of
@@ -336,6 +342,7 @@ fn real_main() -> Result<(), Failure> {
     }
 
     let signal_runtime = runtime.clone();
+    let reopen_stderr = cli.errlog.clone();
     let signal_monitor = thread::spawn(move || {
         while !signal_runtime.is_shutting_down() {
             if SIGQUIT_SEEN.load(Ordering::SeqCst) {
@@ -349,6 +356,19 @@ fn real_main() -> Result<(), Failure> {
             // `gen != start_gen`.
             if SIGHUP_SEEN.swap(false, Ordering::SeqCst) {
                 signal_runtime.bump_reload_gen();
+            }
+            // SIGUSR1 reopens the log files, as nginx does after logrotate
+            // moved them: the `-e` file for this thread here, and in each
+            // worker (own fd table) before its next error line; the
+            // access_log files before a worker's next write. error_log
+            // files are opened per write already.
+            if SIGUSR1_SEEN.swap(false, Ordering::SeqCst) {
+                if let Some(path) = &reopen_stderr
+                    && let Err(e) = redirect_stderr(path)
+                {
+                    eprintln!("ruxen: reopening {} failed: {e}", path.display());
+                }
+                worker::LOG_REOPEN_GEN.fetch_add(1, Ordering::Relaxed);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -516,10 +536,13 @@ fn install_signal_handlers() -> io::Result<()> {
     if unsafe { signal(SIGHUP, sighup_handler as *const () as usize) } == usize::MAX {
         return Err(io::Error::last_os_error());
     }
-    // SIGUSR1 / SIGUSR2 (log reopen, binary upgrade) and SIGPIPE are not
-    // implemented yet, but their default disposition is "terminate" — the
-    // upstream test harness sends them and we don't want to die. Ignore.
-    for sig in [SIGUSR1, SIGUSR2, SIGPIPE] {
+    if unsafe { signal(SIGUSR1, sigusr1_handler as *const () as usize) } == usize::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    // SIGUSR2 (binary upgrade) is not implemented, but its default
+    // disposition is "terminate" — the upstream test harness sends it and
+    // we don't want to die. Ignore it and SIGPIPE.
+    for sig in [SIGUSR2, SIGPIPE] {
         if unsafe { signal(sig, SIG_IGN) } == usize::MAX {
             return Err(io::Error::last_os_error());
         }

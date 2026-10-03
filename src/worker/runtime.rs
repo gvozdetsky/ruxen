@@ -73,9 +73,8 @@ pub(crate) async fn write_access_logs(
     // The worker opens its access_log fds once at startup (see
     // `init_access_logs_for_worker`); if that hasn't run we have nothing to
     // write to, so bail quietly.
-    let files = match ACCESS_LOG_FILES.with(|c| c.get()) {
-        Some(f) => f,
-        None => return,
+    let Some(files) = access_log_files(http.access_logs) else {
+        return;
     };
 
     let status = response_status(response);
