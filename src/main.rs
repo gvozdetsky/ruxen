@@ -190,9 +190,10 @@ fn real_main() -> Result<(), Failure> {
         print!("{}", version_output());
         return Ok(());
     }
-    if let Some(sig) = cli.signal {
-        return Err(io::Error::other(format!("`-s {sig}` is not supported yet")).into());
-    }
+    let signal = match cli.signal.as_deref() {
+        None => None,
+        Some(name) => Some(signal_for(name).map_err(io::Error::other)?),
+    };
 
     if let Some(prefix) = &cli.prefix {
         std::env::set_current_dir(prefix)
@@ -223,6 +224,9 @@ fn real_main() -> Result<(), Failure> {
 
     for w in &cfg.warnings {
         eprintln!("ruxen: [warn] {w}");
+    }
+    if let Some(signal) = signal {
+        return signal_process(signal, cfg.runtime.pid.as_deref());
     }
     // nginx's two `-t` lines (ngx_init_cycle, then main once modules are
     // initialised); `-q` silences them.
@@ -493,6 +497,63 @@ fn version_output() -> &'static str {
         " --without-mail_smtp_module",
         "\n",
     )
+}
+
+/// `-s NAME`: the signal nginx sends for it. `reload` is refused: SIGHUP
+/// only closes idle keep-alive connections, ruxen can't re-read its config.
+fn signal_for(name: &str) -> Result<i32, String> {
+    match name {
+        "stop" => Ok(libc::SIGTERM),
+        "quit" => Ok(libc::SIGQUIT),
+        "reopen" => Ok(libc::SIGUSR1),
+        "reload" => Err(
+            "`-s reload` is not supported yet: ruxen can't re-read its configuration; \
+             restart it instead"
+                .into(),
+        ),
+        _ => Err(format!("invalid option: \"-s {name}\"")),
+    }
+}
+
+/// nginx's `ngx_signal_process`: read the running instance's PID from the
+/// config's `pid` file and signal it.
+fn signal_process(signal: i32, pid_path: Option<&Path>) -> Result<(), Failure> {
+    let Some(path) = pid_path else {
+        eprintln!("ruxen: [error] no \"pid\" file is configured, so there is no process to signal");
+        return Err(Failure::Reported);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!(
+                "ruxen: [error] open() \"{}\" failed ({})",
+                path.display(),
+                worker::errno_text(&e)
+            );
+            return Err(Failure::Reported);
+        }
+    };
+    let pid = match text.trim_end_matches('\n').parse::<i32>() {
+        Ok(pid) if pid > 0 => pid,
+        _ => {
+            eprintln!(
+                "ruxen: [error] invalid PID number \"{}\" in \"{}\"",
+                text.trim_end_matches('\n'),
+                path.display()
+            );
+            return Err(Failure::Reported);
+        }
+    };
+    // SAFETY: kill(2) with a parsed PID and a valid signal number.
+    if unsafe { libc::kill(pid, signal) } == -1 {
+        let e = io::Error::last_os_error();
+        eprintln!(
+            "ruxen: [alert] kill({pid}, {signal}) failed ({})",
+            worker::errno_text(&e)
+        );
+        return Err(Failure::Reported);
+    }
+    Ok(())
 }
 
 fn write_pid_file(path: &Path) -> io::Result<()> {
