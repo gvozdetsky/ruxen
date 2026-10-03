@@ -242,9 +242,10 @@ http {
 }
 
 #[test]
-fn server_scope_return_covers_unmatched_locations() {
-    // `return 204;` at server scope fires when no `location {}` matches,
-    // replacing the default 404.
+fn server_scope_return_answers_every_request() {
+    // `return 204;` at server scope runs in nginx's SERVER_REWRITE phase,
+    // before the location search, so it answers every request (checked
+    // against nginx 1.24). It used to fire only when no location matched.
     let conf = r#"
 events { }
 http {
@@ -256,8 +257,33 @@ http {
 }
 "#;
     let (_g, port) = spawn_server(conf);
-    assert!(status_line(&http_get(port, "/hit")).starts_with("HTTP/1.1 200"));
+    assert!(status_line(&http_get(port, "/hit")).starts_with("HTTP/1.1 204"));
     assert!(status_line(&http_get(port, "/miss")).starts_with("HTTP/1.1 204"));
+}
+
+#[test]
+fn server_scope_rewrite_set_and_if() {
+    // The server rewrite program runs before the location search: `if`,
+    // `set` and `rewrite` at server scope, as nginx. They used to fail the
+    // config (`unknown directive "if" in server`).
+    let conf = r#"
+events { }
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    set $who server;
+    if ($arg_deny) { return 403; }
+    rewrite ^/old/(.*)$ /new/$1;
+    location /new/ { return 200 "new $uri $who"; }
+    location / { return 200 "other $who"; }
+  }
+}
+"#;
+    let (_g, port) = spawn_server(conf);
+    let r = http_get(port, "/old/x");
+    assert_eq!(body(&r), b"new /new/x server");
+    assert_eq!(body(&http_get(port, "/y")), b"other server");
+    assert!(status_line(&http_get(port, "/y?deny=1")).starts_with("HTTP/1.1 403"));
 }
 
 #[test]
@@ -503,4 +529,29 @@ http {{
         b"GET /t HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"nope\"\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+}
+
+#[test]
+fn server_scope_return_takes_server_error_page_and_add_header_once() {
+    // nginx 1.24: the 404 goes to `error_page 404 /e`, whose internal
+    // redirect runs the server `return 404` again; the second 404 doesn't
+    // take the error page again, and the server's `add_header … always`
+    // is on the final response.
+    let conf = r#"
+events { }
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    add_header X-S s always;
+    error_page 404 /e;
+    return 404;
+    location = /e { return 200 "e"; }
+  }
+}
+"#;
+    let (_g, port) = spawn_server(conf);
+    let r = http_get(port, "/x");
+    assert!(status_line(&r).starts_with("HTTP/1.1 404"));
+    assert_eq!(header_value(&r, "X-S"), Some("s"));
+    assert_ne!(body(&r), b"e");
 }

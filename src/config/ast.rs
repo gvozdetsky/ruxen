@@ -416,12 +416,10 @@ pub struct Server {
     /// declaration order; a location with its own list replaces the
     /// inherited server list entirely, mirroring nginx's merge behavior.
     pub error_pages: Option<Vec<ErrorPage>>,
-    /// Server-scope `return STATUS [body]`. In nginx this fires from the
-    /// rewrite phase before location is picked, so it effectively becomes
-    /// the handler for any request that doesn't match a more specific
-    /// location. We wire it up as a fallback invoked when `match_location`
-    /// returns None.
-    pub server_return: Option<(u16, Vec<ValuePart>)>,
+    /// Server-scope rewrite-module directives (`rewrite`, `set`, `if`,
+    /// `return`, `break`) in order: nginx's SERVER_REWRITE phase, run
+    /// before the location is searched.
+    pub rewrite_ops: Vec<RewriteOp>,
     /// Server-scope keepalive behavior. `None` keeps the runtime default:
     /// keepalive allowed, no `Keep-Alive` header hint.
     pub keepalive_timeout: Option<KeepaliveTimeout>,

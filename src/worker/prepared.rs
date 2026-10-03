@@ -1075,6 +1075,12 @@ pub struct PreparedServer {
     /// Effective server-scope `post_action`, used for server-default and
     /// no-location fallback paths.
     pub post_action: Option<&'static [u8]>,
+    /// Server-scope rewrite program (`rewrite`, `set`, `if`, `return`,
+    /// `break`), run before the location search. Empty: no cost.
+    pub rewrite_program: &'static [PreparedRewriteOp],
+    /// Server-scope `add_header` list, for responses made before any
+    /// location (the rewrite program's `return`, refused requests).
+    pub add_headers: &'static [PreparedAddHeader],
     /// Server-scope `error_page` list, for requests refused before any
     /// location (bad or missing Host, Transfer-Encoding, TRACE).
     pub error_pages: &'static [PreparedErrorPage],

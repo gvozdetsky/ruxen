@@ -814,17 +814,19 @@ fn proxy_render_ctx<'a>(
     }
 }
 
-/// Apply the server's own `error_page` list to a request refused before
-/// any location (nginx runs the special response handler with the
-/// server's configuration then). A match becomes a `Reroute`; anything
-/// else returns `response` unchanged.
-pub(crate) fn intercept_refusal(
+/// A response produced at the server level, before any location: a
+/// refused request (bad Host, Transfer-Encoding, TRACE) or the server
+/// rewrite program's `return`. nginx's special response handler and
+/// header filter run with the server's configuration then: its
+/// `error_page` (a match becomes a `Reroute`), else its `add_header`s.
+pub(crate) fn finish_server_response(
     http: &'static PreparedHttp,
     req: &phase::RequestCtx<'_>,
     server: &'static PreparedServer,
     response: Response,
+    in_error_page: bool,
 ) -> Response {
-    if server.error_pages.is_empty() {
+    if server.error_pages.is_empty() && server.add_headers.is_empty() {
         return response;
     }
     let request_uri = req.path;
@@ -876,15 +878,28 @@ pub(crate) fn intercept_refusal(
         sent_trailers: &[],
         tls: req.tls,
     };
-    maybe_intercept_error_page(
+    let response = maybe_intercept_error_page(
         response,
         server.error_pages,
         req,
         &ctx,
-        false,
+        in_error_page,
         false,
         server.server_header,
-    )
+    );
+    if server.add_headers.is_empty() {
+        return response;
+    }
+    let bytes = match response {
+        Response::Owned(bytes) => bytes,
+        Response::Prebuilt(bytes) => bytes.to_vec(),
+        other => return other,
+    };
+    let ctx = RenderCtx {
+        status: response_status(&bytes),
+        ..ctx
+    };
+    Response::Owned(inject_add_headers(bytes, server.add_headers, &ctx))
 }
 
 /// `proxy_redirect`: rewrite the proxied response's `Location` and

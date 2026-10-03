@@ -250,7 +250,9 @@ pub(crate) fn execute_rewrite_ops(
     ops: &'static [PreparedRewriteOp],
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
-    loc: MatchedLocation<'static>,
+    // `Server:` for a `return` response: the location's, or the server's
+    // for the server-level program.
+    server_header: &'static [u8],
     req: &phase::RequestCtx<'_>,
     uri_path: &mut Vec<u8>,
     current_args: &mut Option<Vec<u8>>,
@@ -300,7 +302,7 @@ pub(crate) fn execute_rewrite_ops(
                         body,
                         http,
                         server,
-                        loc,
+                        server_header,
                         req,
                         uri_path,
                         current_args,
@@ -370,12 +372,7 @@ pub(crate) fn execute_rewrite_ops(
                     }
                     let location = escape_redirect_location(&rendered);
                     return RewriteControl::Respond(Response::Owned(
-                        http::build_redirect_response(
-                            status,
-                            &location,
-                            req.method,
-                            loc.server_header,
-                        ),
+                        http::build_redirect_response(status, &location, req.method, server_header),
                     ));
                 }
 
@@ -428,7 +425,7 @@ pub(crate) fn execute_rewrite_ops(
                         Response::Prebuilt(prebuilt.pick(req.method))
                     }
                     PreparedReturn::Template { status, parts } => Response::Owned(
-                        build_templated_return(*status, parts, &ctx, req.method, loc.server_header),
+                        build_templated_return(*status, parts, &ctx, req.method, server_header),
                     ),
                 };
                 return RewriteControl::Respond(response);
@@ -439,6 +436,37 @@ pub(crate) fn execute_rewrite_ops(
     RewriteControl::Continue
 }
 
+/// The server-level rewrite program, nginx's SERVER_REWRITE phase: it
+/// runs before the location is searched, so a server-level `return`
+/// answers every request. `break` and `rewrite … last` end it; the
+/// location search follows either way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_server_rewrite(
+    http: &'static PreparedHttp,
+    server: &'static PreparedServer,
+    req: &phase::RequestCtx<'_>,
+    uri_path: &mut Vec<u8>,
+    current_args: &mut Option<Vec<u8>>,
+    rewrite_state: &mut RewriteState,
+    server_name_captures: Option<&phase::ServerNameCaptures>,
+) -> Option<Response> {
+    match execute_rewrite_ops(
+        server.rewrite_program,
+        http,
+        server,
+        server.server_header,
+        req,
+        uri_path,
+        current_args,
+        rewrite_state,
+        server_name_captures,
+    ) {
+        RewriteControl::Respond(response) => Some(response),
+        RewriteControl::Continue | RewriteControl::Stop | RewriteControl::Reroute => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_rewrite_program(
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
@@ -456,7 +484,7 @@ pub(crate) fn run_rewrite_program(
         loc.rewrite_program,
         http,
         server,
-        loc,
+        loc.server_header,
         req,
         uri_path,
         current_args,
