@@ -422,7 +422,7 @@ async fn run_post_action(
     let log_request_uri = post_path;
 
     let log_req = ErrorLogRequest::new(&post_ctx, post_meta.server_name);
-    write_not_found_error_log(post_meta.log, &log_req, response_for_logs);
+    write_lookup_error_log(post_meta.log, &log_req);
 
     if !post_meta.access_logs.is_empty() {
         write_access_logs(
@@ -1626,7 +1626,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         }
 
                         let log_req = ErrorLogRequest::new(&ctx, process_meta.server_name);
-                        write_not_found_error_log(process_meta.log, &log_req, response_for_logs);
+                        write_lookup_error_log(process_meta.log, &log_req);
 
                         if !process_meta.access_logs.is_empty() {
                             let request_time_us = request_start.elapsed().as_micros() as u64;

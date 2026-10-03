@@ -1,5 +1,5 @@
 //! Per-request error-log emission in nginx's line format:
-//! `write_not_found_error_log` for 404s, `write_upstream_error_log` for
+//! `write_lookup_error_log` for failed file lookups, `write_upstream_error_log` for
 //! failed proxy attempts, `send_syslog_error` for the syslog target.
 
 #![allow(unused_imports)]
@@ -221,24 +221,18 @@ fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8], text: &[u
     }
 }
 
-pub(crate) fn write_not_found_error_log(
-    meta: phase::LogMeta,
-    req: &ErrorLogRequest<'_>,
-    response: &[u8],
-) {
-    if !meta.log_not_found || response_status(response) != 404 {
+/// The error-log line for a failed static lookup (`open() "/srv/x"
+/// failed (2: …)`, `directory index of "…" is forbidden`, …), as noted by
+/// `fs_resolve`. "Not found" lines need `log_not_found`. A 404 that didn't
+/// come from a file lookup (`return 404`, no location) logs nothing, as in
+/// nginx.
+pub(crate) fn write_lookup_error_log(meta: phase::LogMeta, req: &ErrorLogRequest<'_>) {
+    let Some((message, not_found)) = crate::fs_resolve::take_failed_lookup() else {
+        return;
+    };
+    if not_found && !meta.log_not_found {
         return;
     }
-    let uri = req
-        .uri
-        .iter()
-        .position(|&b| b == b'?')
-        .map(|i| &req.uri[..i])
-        .unwrap_or(req.uri);
-    let mut message = Vec::with_capacity(uri.len() + 48);
-    message.extend_from_slice(b"open() \"");
-    message.extend_from_slice(uri);
-    message.extend_from_slice(b"\" failed (2: No such file or directory)");
     write_error_log(meta.error_logs, ErrorLogLevel::Error, req, &message, None);
 }
 

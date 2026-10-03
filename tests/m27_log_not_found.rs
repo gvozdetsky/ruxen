@@ -189,3 +189,54 @@ fn server_log_not_found_off_can_be_overridden_in_location() {
     assert!(!server_log.contains("/inherit/missing"));
     assert!(server_log.contains("/override/missing"));
 }
+
+/// The error-log lines name the file nginx tried, in its static and index
+/// modules' words; a 404 that isn't a file lookup (`return 404`) logs
+/// nothing. ruxen used to print `open() "<uri>" failed (2: …)` for every
+/// 404, whatever produced it.
+#[test]
+fn lookup_errors_name_the_path_like_nginx() {
+    let (guard, port) = spawn_server(|dir| {
+        std::fs::create_dir(dir.join("noindex")).unwrap();
+        format!(
+            r#"
+    error_log {root}/e.log;
+    location = /ret {{ return 404; }}
+"#,
+            root = dir.display()
+        )
+    });
+    let root = guard.tempdir.canonicalize().unwrap();
+    let get = |path: &str| {
+        let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        status_line(&request(port, raw.as_bytes())).to_string()
+    };
+    assert_eq!(get("/missing.txt"), "HTTP/1.1 404 Not Found");
+    assert_eq!(get("/nodir/"), "HTTP/1.1 404 Not Found");
+    assert_eq!(get("/noindex/"), "HTTP/1.1 403 Forbidden");
+    assert_eq!(get("/ret"), "HTTP/1.1 404 Not Found");
+    sleep(Duration::from_millis(30));
+
+    let log = std::fs::read_to_string(guard.tempdir.join("e.log")).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 3, "{log}");
+    let root = root.display();
+    assert!(
+        lines[0].contains(&format!(
+            "open() \"{root}/missing.txt\" failed (2: No such file or directory)"
+        )),
+        "{log}"
+    );
+    assert!(
+        lines[1].contains(&format!(
+            "\"{root}/nodir/\" is not found (2: No such file or directory)"
+        )),
+        "{log}"
+    );
+    assert!(
+        lines[2].contains(&format!(
+            "directory index of \"{root}/noindex/\" is forbidden"
+        )),
+        "{log}"
+    );
+}

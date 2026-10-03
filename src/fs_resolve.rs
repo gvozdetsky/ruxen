@@ -162,6 +162,55 @@ fn apply_fallback(fallback: &'static PreparedFallback) -> Outcome {
     }
 }
 
+thread_local! {
+    /// The error-log line for this request's failed file lookup, as nginx's
+    /// static and index modules word it, and whether it's a "not found"
+    /// (logged only with `log_not_found`). Set on the cold failure paths
+    /// here, taken by the worker when it logs the request.
+    static FAILED_LOOKUP: std::cell::RefCell<Option<(Vec<u8>, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The failed lookup noted for this request, if any.
+pub(crate) fn take_failed_lookup() -> Option<(Vec<u8>, bool)> {
+    FAILED_LOOKUP.with(|f| f.borrow_mut().take())
+}
+
+#[cold]
+fn note_failed_lookup(message: String, not_found: bool) {
+    FAILED_LOOKUP.with(|f| *f.borrow_mut() = Some((message.into_bytes(), not_found)));
+}
+
+fn is_not_found(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// `open() "<path>" failed (<errno>)`, nginx's static-module line.
+#[cold]
+fn open_failed(root: &PreparedRoot, rel: &[u8], e: std::io::Error) -> Outcome {
+    // A path outside the root (EXDEV from RESOLVE_BENEATH) is ruxen's own
+    // symlink policy, not an nginx open() failure.
+    if e.raw_os_error() != Some(libc::EXDEV) {
+        let path = if rel.is_empty() {
+            root.root.to_path_buf()
+        } else {
+            join(root.root, rel)
+        };
+        note_failed_lookup(
+            format!(
+                "open() \"{}\" failed ({})",
+                path.display(),
+                crate::worker::errno_text(&e)
+            ),
+            is_not_found(&e),
+        );
+    }
+    io_to_outcome(e)
+}
+
 /// The static+index half. Looks up `<root><url>`, deals with the four
 /// shapes a request can take: file, directory-with-slash, directory-no-
 /// slash, missing.
@@ -216,10 +265,25 @@ fn resolve_static(
                         format: root.autoindex_format,
                     };
                 }
+                note_failed_lookup(
+                    format!("directory index of \"{}\" is forbidden", fs_path.display()),
+                    false,
+                );
                 return Outcome::Forbidden;
             }
             Ok(_) => return Outcome::NotFound,
-            Err(e) => return io_to_outcome(e),
+            Err(e) => {
+                // nginx's index module, testing the directory.
+                note_failed_lookup(
+                    format!(
+                        "\"{}\" is not found ({})",
+                        fs_path.display(),
+                        crate::worker::errno_text(&e)
+                    ),
+                    is_not_found(&e),
+                );
+                return io_to_outcome(e);
+            }
         }
     }
 
@@ -251,17 +315,17 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
     // one syscall, no path walk, no race between stat and open.
     let root_fd = match root.fd() {
         Ok(fd) => fd,
-        Err(e) => return io_to_outcome(e),
+        Err(e) => return open_failed(root, rel, e),
     };
     let fd = if rel.is_empty() {
         match dup_fd(root_fd) {
             Ok(fd) => fd,
-            Err(e) => return io_to_outcome(e),
+            Err(e) => return open_failed(root, rel, e),
         }
     } else {
         match openat2_beneath(root_fd, rel) {
             Ok(fd) => fd,
-            Err(e) => return io_to_outcome(e),
+            Err(e) => return open_failed(root, rel, e),
         }
     };
 
