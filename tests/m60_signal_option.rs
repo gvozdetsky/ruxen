@@ -3,6 +3,7 @@
 //! refused (ruxen can't re-read its config); unknown names are nginx's
 //! `invalid option`. It used to be "not supported yet" for every name.
 
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -77,6 +78,83 @@ fn quit_signals_the_running_instance() {
         assert!(Instant::now() < deadline, "-s quit didn't stop it");
         sleep(Duration::from_millis(20));
     }
+}
+
+/// Waits for `child` to exit and returns its exit code; `None` if a signal
+/// killed it.
+fn exit_code(child: &mut Child, within: Duration, what: &str) -> Option<i32> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.code();
+        }
+        assert!(Instant::now() < deadline, "{what} didn't stop it");
+        sleep(Duration::from_millis(20));
+    }
+}
+
+/// A request that has started but will never finish: SIGQUIT would wait
+/// for it, SIGTERM / SIGINT must not.
+fn hold_a_request(port: u16) -> TcpStream {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").unwrap();
+    sleep(Duration::from_millis(50));
+    s
+}
+
+#[test]
+fn stop_is_a_fast_shutdown() {
+    let (dir, port) = setup("stop");
+    let mut child = start(&dir, port);
+    let _held = hold_a_request(port);
+
+    let out = run(&dir, &["-s", "stop"]);
+    assert!(out.status.success(), "{out:?}");
+    // nginx exits 0 and deletes its pid file; the default SIGTERM action
+    // killed ruxen and left the file behind.
+    assert_eq!(
+        exit_code(&mut child, Duration::from_secs(2), "-s stop"),
+        Some(0)
+    );
+    assert!(!dir.0.join("ruxen.pid").exists(), "pid file left behind");
+}
+
+#[test]
+fn sigint_is_a_fast_shutdown() {
+    let (dir, port) = setup("int");
+    let mut child = start(&dir, port);
+    let _held = hold_a_request(port);
+
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    assert_eq!(
+        exit_code(&mut child, Duration::from_secs(2), "SIGINT"),
+        Some(0)
+    );
+    assert!(!dir.0.join("ruxen.pid").exists(), "pid file left behind");
+}
+
+/// `-s stop` during a graceful shutdown that is waiting for a request
+/// turns it into a fast one, as in nginx.
+#[test]
+fn stop_cuts_a_graceful_shutdown_short() {
+    let (dir, port) = setup("quit-then-stop");
+    let mut child = start(&dir, port);
+    let _held = hold_a_request(port);
+
+    let out = run(&dir, &["-s", "quit"]);
+    assert!(out.status.success(), "{out:?}");
+    sleep(Duration::from_millis(200));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "quit didn't wait for the request"
+    );
+
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(
+        exit_code(&mut child, Duration::from_secs(2), "SIGTERM"),
+        Some(0)
+    );
+    assert!(!dir.0.join("ruxen.pid").exists(), "pid file left behind");
 }
 
 #[test]

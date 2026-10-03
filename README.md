@@ -240,7 +240,7 @@ The currently implemented nginx-style command-line surface includes:
 
 Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.29.2` instead, because the upstream tests assert nginx's header.
 
-ruxen also supports pid files, graceful shutdown via `SIGQUIT` and log reopening via `SIGUSR1`. `-s stop|quit|reopen` send `SIGTERM`/`SIGQUIT`/`SIGUSR1` to the PID in the config's `pid` file, as nginx does. `-s reload` is refused: ruxen can't re-read its configuration yet, so restart it instead.
+ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) and log reopening via `SIGUSR1`. `-s stop|quit|reopen` send `SIGTERM`/`SIGQUIT`/`SIGUSR1` to the PID in the config's `pid` file, as nginx does. `-s reload` is refused: ruxen can't re-read its configuration yet, so restart it instead.
 
 ## Compatibility philosophy
 
