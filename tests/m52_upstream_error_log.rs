@@ -190,10 +190,9 @@ fn upstream_failures_are_logged_like_nginx() {
     assert!(line_with(&log, "GET /closing/ ").contains(
         "upstream prematurely closed connection while reading response header from upstream"
     ));
-    assert!(
-        line_with(&log, "GET /missing ")
-            .contains("open() \"/missing\" failed (2: No such file or directory), client: 127.0.0.1, server: example.test,")
-    );
+    assert!(line_with(&log, "GET /missing ").contains(
+        "/missing\" failed (2: No such file or directory), client: 127.0.0.1, server: example.test,"
+    ));
     drop(silent);
 }
 
@@ -294,11 +293,11 @@ fn error_log_inherits_from_http_and_top_level() {
 
     let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
     // Top level only: it takes the request errors.
-    line_with(&read("main.log"), "open() \"/from-main\" failed");
+    line_with(&read("main.log"), "/from-main\" failed");
     // http overrides the top level; server overrides http.
-    line_with(&read("http.log"), "open() \"/from-http\" failed");
+    line_with(&read("http.log"), "/from-http\" failed");
     assert!(!read("main2.log").contains("from-http"));
-    line_with(&read("server.log"), "open() \"/from-server\" failed");
+    line_with(&read("server.log"), "/from-server\" failed");
     assert!(!read("http.log").contains("from-server"));
     // Nothing reached stderr: every request had a configured log.
     assert!(

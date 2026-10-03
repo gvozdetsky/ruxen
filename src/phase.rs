@@ -455,8 +455,10 @@ fn process_with_meta_inner(
     let refusing = initial_reroute.is_none();
     if refusing {
         // Refused below before normalising: don't leave the previous
-        // request's URI behind for the access log's `$uri`.
+        // request's URI behind for the access log's `$uri`, nor its
+        // failed file lookup for the error log.
         url_scratch.clear();
+        let _ = crate::fs_resolve::take_failed_lookup();
     }
 
     // RFC 7230 §5.4: a missing Host header on HTTP/1.1 is a client error.

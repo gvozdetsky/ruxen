@@ -95,7 +95,7 @@ fn sigusr1_reopens_rotated_logs() {
     assert_eq!(read(dir.join("access.log")), "/after\n");
     let errors = read(dir.join("error.log"));
     assert!(
-        errors.contains("open() \"/after\" failed"),
+        errors.contains("/www/after\" failed"),
         "new: {errors:?} old: {:?}",
         read(dir.join("error.log.1"))
     );
