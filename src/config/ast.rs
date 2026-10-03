@@ -450,6 +450,8 @@ pub struct Server {
     pub error_logs: Option<Vec<ErrorLog>>,
     /// Server-scope `log_not_found` policy. `None` means default (`on`).
     pub log_not_found: Option<bool>,
+    /// Server-scope `recursive_error_pages`. `None` means default (`off`).
+    pub recursive_error_pages: Option<bool>,
     /// Server-scope `server_tokens`. `None` inherits from http scope (which
     /// itself defaults to `On`).
     pub server_tokens: Option<ServerTokens>,
@@ -594,6 +596,8 @@ pub struct Location {
     pub error_logs: Option<Vec<ErrorLog>>,
     /// Location-scope `log_not_found` policy. `None` inherits from server.
     pub log_not_found: Option<bool>,
+    /// Location-scope `recursive_error_pages`. `None` inherits from server.
+    pub recursive_error_pages: Option<bool>,
     /// Location-scope `server_tokens`. `None` inherits from server.
     pub server_tokens: Option<ServerTokens>,
     /// Location-scope `autoindex on|off;`. `None` inherits from server.

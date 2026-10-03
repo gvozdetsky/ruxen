@@ -393,6 +393,9 @@ pub struct ProxyResponseRules {
     /// The location's `error_page` list, for a 502/504 the proxy itself
     /// produces (nginx applies it without `proxy_intercept_errors`).
     pub error_pages: &'static [PreparedErrorPage],
+    /// The location's `recursive_error_pages`, for those and for
+    /// `proxy_intercept_errors`.
+    pub recursive_error_pages: bool,
 }
 
 /// One prepared `proxy_redirect` rule.
@@ -515,6 +518,7 @@ pub(crate) struct ProxyEffective {
     pub pass_headers: Option<&'static [String]>,
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
+    pub recursive_error_pages: bool,
 }
 
 impl ProxyEffective {
@@ -541,6 +545,7 @@ impl ProxyEffective {
             hide_headers: None,
             pass_headers: None,
             error_pages: &[],
+            recursive_error_pages: false,
         }
     }
 }
@@ -735,6 +740,9 @@ pub struct PreparedLocation {
     pub error_logs: &'static [PreparedErrorLog],
     /// Inheritance-resolved `log_not_found` policy.
     pub log_not_found: bool,
+    /// Inheritance-resolved `recursive_error_pages`: an `error_page` taken
+    /// here leaves the request free to take another one.
+    pub recursive_error_pages: bool,
     /// Pre-resolved `Server:` header value bytes for this location, derived
     /// from the effective `server_tokens` (location → server → http →
     /// default `On`). Static `return` responses bake these in at prepare;
@@ -792,6 +800,7 @@ pub struct PreparedRegexLocation {
     pub keepalive: PreparedKeepalive,
     pub error_logs: &'static [PreparedErrorLog],
     pub log_not_found: bool,
+    pub recursive_error_pages: bool,
     pub server_header: &'static [u8],
     pub access_logs: &'static [PreparedAccessLog],
     pub auth_basic: PreparedAuthBasic,
@@ -822,6 +831,7 @@ pub struct MatchedLocation<'a> {
     pub keepalive: PreparedKeepalive,
     pub error_logs: &'static [PreparedErrorLog],
     pub log_not_found: bool,
+    pub recursive_error_pages: bool,
     pub server_header: &'static [u8],
     pub access_logs: &'static [PreparedAccessLog],
     pub auth_basic: PreparedAuthBasic,
@@ -849,6 +859,7 @@ impl<'a> MatchedLocation<'a> {
             keepalive: loc.keepalive,
             error_logs: loc.error_logs,
             log_not_found: loc.log_not_found,
+            recursive_error_pages: loc.recursive_error_pages,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
             auth_basic: loc.auth_basic,
@@ -880,6 +891,7 @@ impl<'a> MatchedLocation<'a> {
             keepalive: loc.keepalive,
             error_logs: loc.error_logs,
             log_not_found: loc.log_not_found,
+            recursive_error_pages: loc.recursive_error_pages,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
             auth_basic: loc.auth_basic,

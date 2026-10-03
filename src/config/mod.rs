@@ -707,7 +707,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Misc request handling we treat as no-op for now
     "ignore_invalid_headers",
     "underscores_in_headers",
-    "recursive_error_pages",
     "if_modified_since",
     "etag",
     "msie_padding",

@@ -727,6 +727,7 @@ pub(crate) fn apply_proxy_add_headers(
 pub(crate) fn intercept_proxy_error(
     response: Response,
     error_pages: &[PreparedErrorPage],
+    recursive: bool,
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
@@ -745,6 +746,7 @@ pub(crate) fn intercept_proxy_error(
         ctx,
         &render_ctx,
         false,
+        recursive,
         server,
     )
 }
@@ -879,6 +881,7 @@ pub(crate) fn intercept_refusal(
         server.error_pages,
         req,
         &ctx,
+        false,
         false,
         server.server_header,
     )
@@ -1202,6 +1205,9 @@ pub(crate) fn maybe_intercept_error_page(
     req: &phase::RequestCtx<'_>,
     render_ctx_base: &RenderCtx<'_>,
     in_error_page: bool,
+    // The location's `recursive_error_pages`: taking this error page
+    // doesn't stop a later one (nginx leaves `r->error_page` unset).
+    recursive: bool,
     server: &[u8],
 ) -> Response {
     if in_error_page || error_pages.is_empty() {
@@ -1271,7 +1277,7 @@ pub(crate) fn maybe_intercept_error_page(
             target: phase::RerouteTarget::Uri(uri),
             args,
             error_page_status,
-            enters_error_page: true,
+            enters_error_page: !recursive,
             preserved_location,
             preserved_www_authenticate,
         });
@@ -1288,7 +1294,7 @@ pub(crate) fn maybe_intercept_error_page(
             target: phase::RerouteTarget::Named(target),
             args: None,
             error_page_status,
-            enters_error_page: true,
+            enters_error_page: !recursive,
             preserved_location,
             preserved_www_authenticate,
         });

@@ -54,6 +54,7 @@ pub(crate) fn parse_server_block(
     let mut underscores_in_headers: Option<bool> = None;
     let mut error_logs: Option<Vec<ErrorLog>> = None;
     let mut log_not_found: Option<bool> = None;
+    let mut recursive_error_pages: Option<bool> = None;
     let mut server_tokens: Option<ServerTokens> = None;
     let mut autoindex: Option<bool> = None;
     let mut autoindex_exact_size: Option<bool> = None;
@@ -155,6 +156,7 @@ pub(crate) fn parse_server_block(
                         underscores_in_headers,
                         error_logs,
                         log_not_found,
+                        recursive_error_pages,
                         server_tokens,
                         autoindex,
                         autoindex_exact_size,
@@ -419,6 +421,13 @@ pub(crate) fn parse_server_block(
                 error_logs
                     .get_or_insert_with(Vec::new)
                     .push(parse_error_log_args(&args[1..])?);
+            }
+            ("recursive_error_pages", Terminator::Semi) => {
+                if recursive_error_pages.is_some() {
+                    return Err(Error::Duplicate("recursive_error_pages"));
+                }
+                recursive_error_pages =
+                    Some(parse_on_off_args(&args[1..], "recursive_error_pages")?);
             }
             ("log_not_found", Terminator::Semi) => {
                 if log_not_found.is_some() {
@@ -691,6 +700,7 @@ pub(crate) fn parse_server_block(
                 | "underscores_in_headers"
                 | "error_log"
                 | "log_not_found"
+                | "recursive_error_pages"
                 | "server_tokens"
                 | "autoindex"
                 | "autoindex_exact_size"

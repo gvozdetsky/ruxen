@@ -458,6 +458,7 @@ pub(crate) fn build_proxy(
         eff.hide_headers,
         eff.pass_headers,
         eff.error_pages,
+        eff.recursive_error_pages,
     );
     Ok(match pp {
         ProxyPass::Direct {
@@ -553,6 +554,7 @@ fn prepare_response_rules(
     hide: Option<&'static [String]>,
     pass: Option<&'static [String]>,
     error_pages: &'static [PreparedErrorPage],
+    recursive_error_pages: bool,
 ) -> &'static ProxyResponseRules {
     let pass = pass.unwrap_or(&[]);
     let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
@@ -569,6 +571,7 @@ fn prepare_response_rules(
     Box::leak(Box::new(ProxyResponseRules {
         redirects,
         error_pages,
+        recursive_error_pages,
         hide: Box::leak(hide.into_boxed_slice()),
         pass_mask,
     }))
@@ -779,6 +782,7 @@ pub(crate) fn resolve_proxy_effective(
         pass_headers: leak_list(location_pass_headers).or(server_defaults.pass_headers),
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
+        recursive_error_pages: false,
     }
 }
 
@@ -933,6 +937,7 @@ pub(crate) fn prepare_server(
         None => http_error_logs,
     };
     let server_log_not_found = server.log_not_found.unwrap_or(true);
+    let server_recursive_error_pages = server.recursive_error_pages.unwrap_or(false);
     let server_auth_basic = server
         .auth_basic
         .map(prepare_auth_basic)
@@ -994,6 +999,7 @@ pub(crate) fn prepare_server(
                 server_keepalive,
                 server_error_logs,
                 server_log_not_found,
+                server_recursive_error_pages,
                 server_tokens_value,
                 server_autoindex,
                 server_autoindex_exact_size,
@@ -1021,6 +1027,7 @@ pub(crate) fn prepare_server(
                 server_keepalive,
                 server_error_logs,
                 server_log_not_found,
+                server_recursive_error_pages,
                 server_tokens_value,
                 server_autoindex,
                 server_autoindex_exact_size,
@@ -1048,6 +1055,7 @@ pub(crate) fn prepare_server(
                 server_keepalive,
                 server_error_logs,
                 server_log_not_found,
+                server_recursive_error_pages,
                 server_tokens_value,
                 server_autoindex,
                 server_autoindex_exact_size,
@@ -1076,6 +1084,7 @@ pub(crate) fn prepare_server(
                 server_keepalive,
                 server_error_logs,
                 server_log_not_found,
+                server_recursive_error_pages,
                 server_tokens_value,
                 server_autoindex,
                 server_autoindex_exact_size,
@@ -1144,6 +1153,7 @@ pub(crate) fn prepare_server(
             keepalive: server_keepalive,
             error_logs: server_error_logs,
             log_not_found: server_log_not_found,
+            recursive_error_pages: server_recursive_error_pages,
             server_header: server_header_bytes,
             access_logs: server_access_logs,
             auth_basic: server_auth_basic,
@@ -1193,6 +1203,7 @@ pub(crate) fn prepare_server(
             keepalive: server_keepalive,
             error_logs: server_error_logs,
             log_not_found: server_log_not_found,
+            recursive_error_pages: server_recursive_error_pages,
             server_header: server_header_bytes,
             access_logs: server_access_logs,
             auth_basic: server_auth_basic,
@@ -1870,6 +1881,7 @@ pub(crate) fn build_prefix_or_exact(
     server_keepalive: PreparedKeepalive,
     server_error_logs: &'static [PreparedErrorLog],
     server_log_not_found: bool,
+    server_recursive_error_pages: bool,
     server_tokens_value: crate::config::ServerTokens,
     server_autoindex: bool,
     server_autoindex_exact_size: bool,
@@ -1905,6 +1917,7 @@ pub(crate) fn build_prefix_or_exact(
         keepalive_disable,
         error_logs: location_error_logs,
         log_not_found: location_log_not_found,
+        recursive_error_pages: location_recursive_error_pages,
         server_tokens: location_server_tokens,
         autoindex: location_autoindex,
         autoindex_exact_size: location_autoindex_exact_size,
@@ -1970,8 +1983,11 @@ pub(crate) fn build_prefix_or_exact(
     let tokens = location_server_tokens.unwrap_or(server_tokens_value);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
     let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
+    let recursive_error_pages =
+        location_recursive_error_pages.unwrap_or(server_recursive_error_pages);
     let proxy_effective = ProxyEffective {
         error_pages,
+        recursive_error_pages,
         ..proxy_effective
     };
     let handler = build_handler(
@@ -2032,6 +2048,7 @@ pub(crate) fn build_prefix_or_exact(
         keepalive,
         error_logs,
         log_not_found,
+        recursive_error_pages,
         server_header: http::server_header_value(tokens),
         access_logs,
         auth_basic,
@@ -2057,6 +2074,7 @@ pub(crate) fn build_regex_location(
     server_keepalive: PreparedKeepalive,
     server_error_logs: &'static [PreparedErrorLog],
     server_log_not_found: bool,
+    server_recursive_error_pages: bool,
     server_tokens_value: crate::config::ServerTokens,
     server_autoindex: bool,
     server_autoindex_exact_size: bool,
@@ -2092,6 +2110,7 @@ pub(crate) fn build_regex_location(
         keepalive_disable,
         error_logs: location_error_logs,
         log_not_found: location_log_not_found,
+        recursive_error_pages: location_recursive_error_pages,
         server_tokens: location_server_tokens,
         autoindex: location_autoindex,
         autoindex_exact_size: location_autoindex_exact_size,
@@ -2169,8 +2188,11 @@ pub(crate) fn build_regex_location(
     let tokens = location_server_tokens.unwrap_or(server_tokens_value);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
     let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
+    let recursive_error_pages =
+        location_recursive_error_pages.unwrap_or(server_recursive_error_pages);
     let proxy_effective = ProxyEffective {
         error_pages,
+        recursive_error_pages,
         ..proxy_effective
     };
     let handler = build_handler(
@@ -2228,6 +2250,7 @@ pub(crate) fn build_regex_location(
         keepalive,
         error_logs,
         log_not_found,
+        recursive_error_pages,
         server_header: http::server_header_value(tokens),
         access_logs,
         auth_basic,
