@@ -365,6 +365,8 @@ pub(crate) fn parse_location_block(
     let mut proxy_pass_headers: Option<Vec<String>> = None;
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
+    let mut limit_rate: Option<Vec<ValuePart>> = None;
+    let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     // Children parsed inside this block — appended to `sink` after the
     // parent so the parent's entry appears first in declaration order.
     let mut children: Vec<Location> = Vec::new();
@@ -453,6 +455,8 @@ pub(crate) fn parse_location_block(
                         auth_delay_ms: effective_auth_delay_ms,
                         client_max_body_size: effective_client_max_body_size,
                         sendfile: effective_sendfile,
+                        limit_rate: limit_rate.clone(),
+                        limit_rate_after: limit_rate_after.clone(),
                         client_body_in_file_only,
                         post_action: effective_post_action,
                         expires: effective_expires,
@@ -843,6 +847,18 @@ pub(crate) fn parse_location_block(
                 }
                 proxy_intercept_errors =
                     Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
+            }
+            ("limit_rate", Terminator::Semi) => {
+                if limit_rate.is_some() {
+                    return Err(Error::Duplicate("limit_rate"));
+                }
+                limit_rate = Some(parse_size_value(&args[1..], "limit_rate")?);
+            }
+            ("limit_rate_after", Terminator::Semi) => {
+                if limit_rate_after.is_some() {
+                    return Err(Error::Duplicate("limit_rate_after"));
+                }
+                limit_rate_after = Some(parse_size_value(&args[1..], "limit_rate_after")?);
             }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
@@ -1298,4 +1314,47 @@ pub(crate) fn parse_proxy_ignore_headers(args: &[String]) -> Result<Vec<String>,
             }
         })
         .collect()
+}
+
+/// A size directive whose value may hold variables (`limit_rate 12k;`,
+/// `limit_rate $arg_l;`): checked as a size here when it's literal,
+/// rendered and parsed per request otherwise.
+pub(crate) fn parse_size_value(
+    args: &[String],
+    what: &'static str,
+) -> Result<Vec<ValuePart>, Error> {
+    let [value] = args else {
+        return Err(Error::BadValue {
+            what,
+            got: args.join(" "),
+        });
+    };
+    let parts = parse_value_with_vars(value)?;
+    if parts.iter().all(|p| matches!(p, ValuePart::Literal(_)))
+        && parse_size(value.as_bytes()).is_none()
+    {
+        return Err(Error::BadValue {
+            what,
+            got: value.clone(),
+        });
+    }
+    Ok(parts)
+}
+
+/// nginx's `ngx_parse_size`: a decimal number with an optional `k`/`K` or
+/// `m`/`M` suffix.
+pub(crate) fn parse_size(value: &[u8]) -> Option<u64> {
+    let (digits, scale) = match value.last()? {
+        b'k' | b'K' => (&value[..value.len() - 1], 1024),
+        b'm' | b'M' => (&value[..value.len() - 1], 1024 * 1024),
+        _ => (value, 1),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits)
+        .ok()?
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(scale)
 }

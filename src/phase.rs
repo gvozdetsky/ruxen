@@ -234,6 +234,9 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// `limit_rate` / `limit_rate_after` for this response. Boxed: `None`
+    /// (one word) in the common case.
+    pub limit_rate: Option<Box<ResponseLimit>>,
     /// Effective `post_action` target for the matched location/server.
     /// The worker runs this after the client response is written and
     /// suppresses its output.
@@ -270,6 +273,7 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            limit_rate: None,
             post_action: None,
             upstream_states: Vec::new(),
             upstream_headers: Vec::new(),
@@ -317,6 +321,26 @@ fn refuse(
         meta.keepalive.allow = false;
     }
     (response, meta)
+}
+
+/// A response's `limit_rate` (bytes per second, 0 = unlimited) and
+/// `limit_rate_after` (bytes sent before pacing starts).
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseLimit {
+    pub rate: u64,
+    pub after: u64,
+}
+
+impl ResponseLimit {
+    /// `None` unless something is set.
+    pub fn new(rate: u64, after: u64) -> Option<Box<ResponseLimit>> {
+        (rate > 0 || after > 0).then(|| Box::new(ResponseLimit { rate, after }))
+    }
+
+    /// The rate from X-Accel-Limit-Rate, keeping the location's `after`.
+    pub fn with_rate(current: Option<Box<ResponseLimit>>, rate: u64) -> Option<Box<ResponseLimit>> {
+        ResponseLimit::new(rate, current.map_or(0, |l| l.after))
+    }
 }
 
 /// What to write back on the socket. `Prebuilt` is a `&'static` slice baked
@@ -714,6 +738,23 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
+        // `set $limit_rate` wins over the directive, as nginx's
+        // r->limit_rate_set. Rendered only when something is set.
+        meta.limit_rate = if loc.limit_rate.is_none() && !rewrite_state.has_user_vars() {
+            None
+        } else {
+            let (rate, after) = crate::worker::evaluate_limit_rate(
+                http,
+                server,
+                req,
+                url_scratch,
+                current_args.as_deref(),
+                &rewrite_state,
+                regex_captures.as_ref(),
+                loc.limit_rate.copied().unwrap_or_default(),
+            );
+            ResponseLimit::new(rate, after)
+        };
         if let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler {
             meta.proxy_host = proxy.host_header;
         }

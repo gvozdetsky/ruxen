@@ -323,9 +323,17 @@ impl RenderCtx<'_> {
             Variable::ConnectionRequests => write_u64_decimal(out, self.connection_requests),
             Variable::ConnectionTime => write_connection_time(out, self.connection_time_us),
             Variable::RequestTime => write_connection_time(out, self.request_time_us),
-            // No rate-limit subsystem yet — `$limit_rate` is always 0,
-            // which is also the nginx default when nothing has set it.
-            Variable::LimitRate => out.push(b'0'),
+            // nginx's `r->limit_rate`: what `set $limit_rate` stored, as a
+            // size in bytes (0 if it isn't one); 0 until something sets it
+            // (`limit_rate` itself applies when the response is written).
+            Variable::LimitRate => {
+                let rate = self
+                    .rewrite_state
+                    .and_then(|state| state.user_var("limit_rate"))
+                    .and_then(crate::config::parse_size)
+                    .unwrap_or(0);
+                write_u64_decimal(out, rate);
+            }
             Variable::ServerPort => write_u16_decimal(out, self.server_port),
             Variable::RequestPort => out.extend_from_slice(self.request_port),
             Variable::IsRequestPort => {

@@ -66,6 +66,8 @@ pub(crate) fn parse_server_block(
     let mut auth_delay_ms: Option<u64> = None;
     let mut client_max_body_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
+    let mut limit_rate: Option<Vec<ValuePart>> = None;
+    let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_set_headers: Option<Vec<ProxySetHeader>> = None;
@@ -169,6 +171,8 @@ pub(crate) fn parse_server_block(
                         auth_delay_ms,
                         client_max_body_size,
                         sendfile,
+                        limit_rate,
+                        limit_rate_after,
                         post_action,
                         expires,
                         proxy_set_headers,
@@ -501,6 +505,18 @@ pub(crate) fn parse_server_block(
                     return Err(Error::Duplicate("client_max_body_size"));
                 }
                 client_max_body_size = Some(parse_client_max_body_size_args(&args[1..])?);
+            }
+            ("limit_rate", Terminator::Semi) => {
+                if limit_rate.is_some() {
+                    return Err(Error::Duplicate("limit_rate"));
+                }
+                limit_rate = Some(parse_size_value(&args[1..], "limit_rate")?);
+            }
+            ("limit_rate_after", Terminator::Semi) => {
+                if limit_rate_after.is_some() {
+                    return Err(Error::Duplicate("limit_rate_after"));
+                }
+                limit_rate_after = Some(parse_size_value(&args[1..], "limit_rate_after")?);
             }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {

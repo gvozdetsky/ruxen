@@ -72,6 +72,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         auth_delay_ms,
         client_max_body_size,
         sendfile,
+        limit_rate,
+        limit_rate_after,
         post_action,
         expires: http_expires,
         ignore_invalid_headers,
@@ -112,6 +114,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_auth_delay_ms = auth_delay_ms.unwrap_or(0);
     let http_client_max_body_size = client_max_body_size;
     let http_sendfile = sendfile;
+    let http_limit_rate =
+        PreparedLimitRate::inherit(limit_rate, limit_rate_after, PreparedLimitRate::default());
     let http_post_action = post_action.map(|target| leak_bytes(target.as_bytes()));
     let http_expires = http_expires
         .map(prepare_expires)
@@ -173,6 +177,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                     http_auth_delay_ms,
                     http_client_max_body_size,
                     http_sendfile,
+                    http_limit_rate,
                     http_post_action,
                     http_expires,
                     http_ignore_invalid_headers,
@@ -460,6 +465,7 @@ pub(crate) fn build_proxy(
         eff.error_pages,
         eff.recursive_error_pages,
         eff.ignore_accel_redirect,
+        eff.ignore_accel_limit_rate,
     );
     Ok(match pp {
         ProxyPass::Direct {
@@ -557,6 +563,7 @@ fn prepare_response_rules(
     error_pages: &'static [PreparedErrorPage],
     recursive_error_pages: bool,
     ignore_accel_redirect: bool,
+    ignore_accel_limit_rate: bool,
 ) -> &'static ProxyResponseRules {
     let pass = pass.unwrap_or(&[]);
     let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
@@ -575,6 +582,7 @@ fn prepare_response_rules(
         error_pages,
         recursive_error_pages,
         ignore_accel_redirect,
+        ignore_accel_limit_rate,
         hide: Box::leak(hide.into_boxed_slice()),
         pass_mask,
     }))
@@ -647,6 +655,7 @@ pub(crate) struct ServerProxyDefaults {
     pub pass_request_body: bool,
     pub set_body: Option<&'static [PreparedValuePart]>,
     pub ignore_accel_redirect: bool,
+    pub ignore_accel_limit_rate: bool,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
@@ -663,10 +672,10 @@ pub(crate) struct ServerProxyDefaults {
     pub pass_headers: Option<&'static [String]>,
 }
 
-/// `proxy_ignore_headers` as set at one scope: whether it lists
-/// X-Accel-Redirect, or `None` when the scope didn't set it.
-fn ignores_accel_redirect(list: Option<&[String]>) -> Option<bool> {
-    list.map(|l| l.iter().any(|h| h == "x-accel-redirect"))
+/// `proxy_ignore_headers` as set at one scope: whether it lists `field`
+/// (lowercase), or `None` when the scope didn't set it.
+fn ignores(list: Option<&[String]>, field: &str) -> Option<bool> {
+    list.map(|l| l.iter().any(|h| h == field))
 }
 
 /// Leak a directive's list for the lifetime of the config.
@@ -708,7 +717,9 @@ impl ServerProxyDefaults {
                 .unwrap_or(defaults.pass_request_headers),
             pass_request_body: proxy_pass_request_body.unwrap_or(defaults.pass_request_body),
             set_body: proxy_set_body.map(prepare_value_parts),
-            ignore_accel_redirect: ignores_accel_redirect(proxy_ignore_headers.as_deref())
+            ignore_accel_redirect: ignores(proxy_ignore_headers.as_deref(), "x-accel-redirect")
+                .unwrap_or(false),
+            ignore_accel_limit_rate: ignores(proxy_ignore_headers.as_deref(), "x-accel-limit-rate")
                 .unwrap_or(false),
             connect_timeout_ms: proxy_connect_timeout_ms.unwrap_or(defaults.connect_timeout_ms),
             read_timeout_ms: proxy_read_timeout_ms.unwrap_or(defaults.read_timeout_ms),
@@ -772,8 +783,10 @@ pub(crate) fn resolve_proxy_effective(
         pass_request_headers: location_pass_request_headers
             .unwrap_or(server_defaults.pass_request_headers),
         pass_request_body: location_pass_request_body.unwrap_or(server_defaults.pass_request_body),
-        ignore_accel_redirect: ignores_accel_redirect(location_ignore_headers.as_deref())
+        ignore_accel_redirect: ignores(location_ignore_headers.as_deref(), "x-accel-redirect")
             .unwrap_or(server_defaults.ignore_accel_redirect),
+        ignore_accel_limit_rate: ignores(location_ignore_headers.as_deref(), "x-accel-limit-rate")
+            .unwrap_or(server_defaults.ignore_accel_limit_rate),
         set_body: location_set_body
             .map(prepare_value_parts)
             .or(server_defaults.set_body),
@@ -816,6 +829,7 @@ pub(crate) fn prepare_server(
     http_auth_delay_ms: u64,
     http_client_max_body_size: Option<u64>,
     http_sendfile: Option<bool>,
+    http_limit_rate: PreparedLimitRate,
     http_post_action: Option<&'static [u8]>,
     http_expires: PreparedExpires,
     http_ignore_invalid_headers: bool,
@@ -966,6 +980,11 @@ pub(crate) fn prepare_server(
     let server_auth_delay_ms = server.auth_delay_ms.unwrap_or(http_auth_delay_ms);
     let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
     let server_sendfile = server.sendfile.or(http_sendfile).unwrap_or(false);
+    let server_limit_rate = PreparedLimitRate::inherit(
+        server.limit_rate.take(),
+        server.limit_rate_after.take(),
+        http_limit_rate,
+    );
     let server_post_action = server
         .post_action
         .as_ref()
@@ -1028,6 +1047,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_limit_rate,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -1056,6 +1076,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_limit_rate,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -1084,6 +1105,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_limit_rate,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -1113,6 +1135,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_limit_rate,
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
@@ -1179,6 +1202,7 @@ pub(crate) fn prepare_server(
             auth_delay_ms: server_auth_delay_ms,
             client_max_body_size: server_client_max_body_size,
             sendfile: server_sendfile,
+            limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             post_action: server_post_action,
             expires: server_expires,
@@ -1230,6 +1254,7 @@ pub(crate) fn prepare_server(
             auth_delay_ms: server_auth_delay_ms,
             client_max_body_size: server_client_max_body_size,
             sendfile: server_sendfile,
+            limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             post_action: server_post_action,
             expires: server_expires,
@@ -1912,6 +1937,7 @@ pub(crate) fn build_prefix_or_exact(
     server_auth_delay_ms: u64,
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
+    server_limit_rate: PreparedLimitRate,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
@@ -1949,6 +1975,8 @@ pub(crate) fn build_prefix_or_exact(
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
+        limit_rate: location_limit_rate,
+        limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
@@ -2050,6 +2078,11 @@ pub(crate) fn build_prefix_or_exact(
     let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
+    let limit_rate = PreparedLimitRate::inherit(
+        location_limit_rate,
+        location_limit_rate_after,
+        server_limit_rate,
+    );
     let post_action = location_post_action
         .map(|target| leak_bytes(target.as_bytes()))
         .or(server_post_action);
@@ -2079,6 +2112,7 @@ pub(crate) fn build_prefix_or_exact(
         auth_delay_ms,
         client_max_body_size,
         sendfile,
+        limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
         post_action,
@@ -2109,6 +2143,7 @@ pub(crate) fn build_regex_location(
     server_auth_delay_ms: u64,
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
+    server_limit_rate: PreparedLimitRate,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
@@ -2146,6 +2181,8 @@ pub(crate) fn build_regex_location(
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
+        limit_rate: location_limit_rate,
+        limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
@@ -2258,6 +2295,11 @@ pub(crate) fn build_regex_location(
     let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
+    let limit_rate = PreparedLimitRate::inherit(
+        location_limit_rate,
+        location_limit_rate_after,
+        server_limit_rate,
+    );
     let post_action = location_post_action
         .map(|target| leak_bytes(target.as_bytes()))
         .or(server_post_action);
@@ -2285,6 +2327,7 @@ pub(crate) fn build_regex_location(
         auth_delay_ms,
         client_max_body_size,
         sendfile,
+        limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
         post_action,

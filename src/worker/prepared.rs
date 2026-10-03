@@ -271,6 +271,11 @@ impl RewriteState {
         self.user_vars.push((name, value));
     }
 
+    /// No `set` ran (the common case; a field check, no name compare).
+    pub(crate) fn has_user_vars(&self) -> bool {
+        !self.user_vars.is_empty()
+    }
+
     pub(crate) fn user_var(&self, name: &str) -> Option<&[u8]> {
         let name = name.as_bytes();
         self.user_vars
@@ -399,6 +404,8 @@ pub struct ProxyResponseRules {
     /// `proxy_ignore_headers X-Accel-Redirect`: forward the response
     /// instead of following the header.
     pub ignore_accel_redirect: bool,
+    /// `proxy_ignore_headers X-Accel-Limit-Rate`.
+    pub ignore_accel_limit_rate: bool,
 }
 
 /// One prepared `proxy_redirect` rule.
@@ -500,6 +507,7 @@ pub(crate) struct ProxyEffective {
     pub pass_request_body: bool,
     pub set_body: Option<&'static [PreparedValuePart]>,
     pub ignore_accel_redirect: bool,
+    pub ignore_accel_limit_rate: bool,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
@@ -535,6 +543,7 @@ impl ProxyEffective {
             pass_request_body: true,
             set_body: None,
             ignore_accel_redirect: false,
+            ignore_accel_limit_rate: false,
             connect_timeout_ms: 60_000,
             read_timeout_ms: 60_000,
             send_timeout_ms: 60_000,
@@ -596,6 +605,34 @@ pub struct PreparedPeer {
 /// resolved `index` list and the optional `try_files` program. Matches
 /// nginx's post-merge (clcf->root + ngx_http_index_loc_conf_t::indices +
 /// ngx_http_try_files_loc_conf_t::try_files) split.
+/// Inheritance-resolved `limit_rate` / `limit_rate_after`, rendered and
+/// parsed per request (they may hold variables). `None`: not set.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreparedLimitRate {
+    pub rate: Option<&'static [PreparedValuePart]>,
+    pub after: Option<&'static [PreparedValuePart]>,
+}
+
+impl PreparedLimitRate {
+    /// For a location: `None` (the common case, one word to copy per
+    /// request) unless something is set.
+    pub(crate) fn for_location(self) -> Option<&'static PreparedLimitRate> {
+        (self.rate.is_some() || self.after.is_some()).then(|| &*Box::leak(Box::new(self)))
+    }
+
+    /// This scope's own directives over the parent's.
+    pub(crate) fn inherit(
+        rate: Option<Vec<ValuePart>>,
+        after: Option<Vec<ValuePart>>,
+        parent: PreparedLimitRate,
+    ) -> PreparedLimitRate {
+        PreparedLimitRate {
+            rate: rate.map(prepare_value_parts).or(parent.rate),
+            after: after.map(prepare_value_parts).or(parent.after),
+        }
+    }
+}
+
 pub struct PreparedRoot {
     pub root: &'static Path,
     /// Open dirfd for the canonicalized root, or -1 while it doesn't exist
@@ -776,6 +813,7 @@ pub struct PreparedLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    pub limit_rate: Option<&'static PreparedLimitRate>,
     /// Effective `post_action` target, if any. A leading `/` is an
     /// internal URI redirect; a leading `@` is a named-location jump.
     pub post_action: Option<&'static [u8]>,
@@ -819,6 +857,7 @@ pub struct PreparedRegexLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
@@ -851,6 +890,7 @@ pub struct MatchedLocation<'a> {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
@@ -878,6 +918,7 @@ impl<'a> MatchedLocation<'a> {
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             sendfile: loc.sendfile,
+            limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
@@ -911,6 +952,7 @@ impl<'a> MatchedLocation<'a> {
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             sendfile: loc.sendfile,
+            limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,

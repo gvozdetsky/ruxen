@@ -155,6 +155,44 @@ pub(crate) fn escape_redirect_location(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The request's `limit_rate` and `limit_rate_after` in bytes: `set
+/// $limit_rate` if the rewrite program ran it, else the location's
+/// directives, rendered (they may hold variables) and parsed as nginx
+/// sizes; an invalid size is 0 (unlimited), as `ngx_http_complex_value_size`
+/// falls back to its default.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+pub(crate) fn evaluate_limit_rate(
+    http: &'static PreparedHttp,
+    server: &'static PreparedServer,
+    req: &phase::RequestCtx<'_>,
+    uri: &[u8],
+    current_args: Option<&[u8]>,
+    rewrite_state: &RewriteState,
+    server_name_captures: Option<&phase::ServerNameCaptures>,
+    limits: PreparedLimitRate,
+) -> (u64, u64) {
+    let args = current_args.unwrap_or_else(|| request_args(req.path));
+    let captures_slice: &[(&'static str, Vec<u8>)] = match server_name_captures {
+        Some(caps) => caps.names.as_slice(),
+        None => &[],
+    };
+    let ctx = build_rewrite_ctx(http, server, req, uri, args, captures_slice, rewrite_state);
+    let size = |parts: Option<&'static [PreparedValuePart]>| {
+        parts.map_or(0, |parts| {
+            let mut value = Vec::with_capacity(16);
+            render_parts(parts, &ctx, &mut value);
+            crate::config::parse_size(&value).unwrap_or(0)
+        })
+    };
+    let rate = match rewrite_state.user_var("limit_rate") {
+        Some(value) => crate::config::parse_size(value).unwrap_or(0),
+        None => size(limits.rate),
+    };
+    (rate, size(limits.after))
+}
+
 pub(crate) fn build_rewrite_ctx<'a>(
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
