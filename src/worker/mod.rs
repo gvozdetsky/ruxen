@@ -493,7 +493,7 @@ mod tests {
         let PreparedHandler::Root(root) = &server.prefix_locations[0].handler else {
             panic!("alias location is a root handler");
         };
-        assert_eq!(root.root_fd.load(std::sync::atomic::Ordering::Relaxed), -1);
+        assert_eq!(root.root_fd, -1);
         assert_eq!(root.fd().unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 

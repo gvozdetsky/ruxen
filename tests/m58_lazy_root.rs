@@ -26,6 +26,10 @@ impl Drop for Server {
 }
 
 fn start(tag: &str, http_body: &str) -> Server {
+    start_with_workers(tag, http_body, 1)
+}
+
+fn start_with_workers(tag: &str, http_body: &str, workers: usize) -> Server {
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -50,6 +54,7 @@ fn start(tag: &str, http_body: &str) -> Server {
         .arg(dir.join("nginx.conf"))
         .arg("-e")
         .arg(dir.join("error.log"))
+        .env("RUXEN_WORKERS", workers.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -108,4 +113,29 @@ fn location_without_handler_serves_default_html_root() {
     let resp = get(server.port, "/");
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     assert!(resp.ends_with("default root"), "{resp}");
+}
+
+/// Each worker has its own fd table, so a root opened after startup must
+/// be opened by every worker that serves from it. It used to be opened
+/// once and its fd number shared, which other workers resolved in their
+/// own tables (an unrelated fd: 403s, or files from another directory).
+#[test]
+fn late_root_is_served_by_every_worker() {
+    let server = start_with_workers(
+        "workers",
+        "server { listen 127.0.0.1:%%PORT%%; location / { root %%DIR%%/later; } }",
+        4,
+    );
+    // Open some fds in every worker first so fd numbers differ.
+    for _ in 0..16 {
+        assert!(get(server.port, "/a.txt").starts_with("HTTP/1.1 404"));
+    }
+    put_file(&server.dir.join("later/a.txt"), "here");
+    for i in 0..64 {
+        let resp = get(server.port, "/a.txt");
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.ends_with("here"),
+            "request {i}: {resp}"
+        );
+    }
 }

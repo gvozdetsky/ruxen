@@ -1734,7 +1734,7 @@ pub(crate) fn build_handler(
             // as an `openat2(RESOLVE_BENEATH)` anchor, at startup when it
             // exists, else on first use (`PreparedRoot::fd`).
             let root: &'static Path = Box::leak(path.into_boxed_path());
-            let root_fd = std::sync::atomic::AtomicI32::new(open_root(root).unwrap_or(-1));
+            let root_fd = open_root(root).unwrap_or(-1);
             let path_mapping = match mapping {
                 PathMapping::Root => PreparedPathMapping::Root,
                 PathMapping::Alias => {
