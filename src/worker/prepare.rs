@@ -1010,6 +1010,8 @@ pub(crate) fn prepare_server(
     // default to `On`. Resolved once here; prepare_handler downstream
     // bakes the right `Server:` bytes into static prebuilts.
     let server_tokens_value = server.server_tokens.unwrap_or(http_tokens);
+    let server_rewrite_program =
+        prepare_rewrite_ops(std::mem::take(&mut server.rewrite_ops), server_tokens_value);
     let server_header_bytes = http::server_header_value(server_tokens_value);
     // access_log inheritance: server-scope list (if set) replaces http;
     // None inherits the http-scope list. Empty `Some(vec![])` means the
@@ -1150,119 +1152,72 @@ pub(crate) fn prepare_server(
     // regex_locations stay in declaration order — first match wins.
 
     // Synthesize a nameless catch-all PreparedLocation that fires when the
-    // normal ladder finds no match. Three sources, in priority:
-    //   1. Server-scope `return STATUS [body]` (nginx rewrite-phase action).
-    //   2. Server-scope `root` without an explicit `/` prefix location —
+    // normal ladder finds no match:
+    //   1. Server-scope `root` without an explicit `/` prefix location —
     //      nginx always has an implicit `/` that serves from root.
-    //   3. None → real 404 fallback in phase::process.
+    //   2. None → real 404 fallback in phase::process.
+    // (A server-scope `return` is part of the server rewrite program, which
+    // runs before the location search, as in nginx.)
     // The prepared location inherits the server's add_header / error_page
     // lists via the same path explicit locations use.
     let have_root_catchall =
         exact.iter().any(|l| l.pattern == b"/") || prefix.iter().any(|l| l.pattern == b"/");
-    let server_default = if let Some((status, body)) = server.server_return {
-        let pattern: &'static [u8] = b"";
-        let handler = build_handler(
-            Handler::Return { status, body },
-            pattern,
-            false,
-            None,
-            None,
-            None,
-            server_index,
-            None,
-            None,
-            None,
-            None,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            server_tokens_value,
-            upstreams,
-            ProxyEffective::defaults(),
-        )?;
-        Some(PreparedLocation {
-            pattern,
-            handler,
-            auto_redirect: false,
-            noregex: false,
-            rewrite_program: &[],
-            add_headers: server_add_headers,
-            add_trailers: server_add_trailers,
-            error_pages: server_error_pages,
-            keepalive: server_keepalive,
-            error_logs: server_error_logs,
-            log_not_found: server_log_not_found,
-            recursive_error_pages: server_recursive_error_pages,
-            internal: false,
-            server_header: server_header_bytes,
-            access_logs: server_access_logs,
-            auth_basic: server_auth_basic,
-            auth_basic_user_file: server_auth_basic_user_file,
-            auth_delay_ms: server_auth_delay_ms,
-            client_max_body_size: server_client_max_body_size,
-            sendfile: server_sendfile,
-            limit_rate: server_limit_rate.for_location(),
-            client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
-            post_action: server_post_action,
-            expires: server_expires,
-            chunked_transfer_encoding: server_chunked_transfer_encoding,
-        })
-    } else if let Some(root_path) = server.root.clone().filter(|_| !have_root_catchall) {
-        let pattern: &'static [u8] = b"/";
-        let handler = build_handler(
-            Handler::Root {
-                path: root_path,
-                mapping: PathMapping::Root,
-            },
-            pattern,
-            false,
-            None,
-            None,
-            None,
-            server_index,
-            None,
-            None,
-            None,
-            None,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            server_tokens_value,
-            upstreams,
-            ProxyEffective::defaults(),
-        )?;
-        Some(PreparedLocation {
-            pattern,
-            handler,
-            auto_redirect: false,
-            noregex: false,
-            rewrite_program: &[],
-            add_headers: server_add_headers,
-            add_trailers: server_add_trailers,
-            error_pages: server_error_pages,
-            keepalive: server_keepalive,
-            error_logs: server_error_logs,
-            log_not_found: server_log_not_found,
-            recursive_error_pages: server_recursive_error_pages,
-            internal: false,
-            server_header: server_header_bytes,
-            access_logs: server_access_logs,
-            auth_basic: server_auth_basic,
-            auth_basic_user_file: server_auth_basic_user_file,
-            auth_delay_ms: server_auth_delay_ms,
-            client_max_body_size: server_client_max_body_size,
-            sendfile: server_sendfile,
-            limit_rate: server_limit_rate.for_location(),
-            client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
-            post_action: server_post_action,
-            expires: server_expires,
-            chunked_transfer_encoding: server_chunked_transfer_encoding,
-        })
-    } else {
-        None
-    };
+    let server_default =
+        if let Some(root_path) = server.root.clone().filter(|_| !have_root_catchall) {
+            let pattern: &'static [u8] = b"/";
+            let handler = build_handler(
+                Handler::Root {
+                    path: root_path,
+                    mapping: PathMapping::Root,
+                },
+                pattern,
+                false,
+                None,
+                None,
+                None,
+                server_index,
+                None,
+                None,
+                None,
+                None,
+                server_autoindex,
+                server_autoindex_exact_size,
+                server_autoindex_localtime,
+                server_autoindex_format,
+                server_tokens_value,
+                upstreams,
+                ProxyEffective::defaults(),
+            )?;
+            Some(PreparedLocation {
+                pattern,
+                handler,
+                auto_redirect: false,
+                noregex: false,
+                rewrite_program: &[],
+                add_headers: server_add_headers,
+                add_trailers: server_add_trailers,
+                error_pages: server_error_pages,
+                keepalive: server_keepalive,
+                error_logs: server_error_logs,
+                log_not_found: server_log_not_found,
+                recursive_error_pages: server_recursive_error_pages,
+                internal: false,
+                server_header: server_header_bytes,
+                access_logs: server_access_logs,
+                auth_basic: server_auth_basic,
+                auth_basic_user_file: server_auth_basic_user_file,
+                auth_delay_ms: server_auth_delay_ms,
+                client_max_body_size: server_client_max_body_size,
+                sendfile: server_sendfile,
+                limit_rate: server_limit_rate.for_location(),
+                client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
+                post_action: server_post_action,
+                expires: server_expires,
+                chunked_transfer_encoding: server_chunked_transfer_encoding,
+            })
+        } else {
+            None
+        };
 
     Ok(PreparedServer {
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
@@ -1288,6 +1243,8 @@ pub(crate) fn prepare_server(
         auth_delay_ms: server_auth_delay_ms,
         underscores_in_headers: server_underscores_in_headers,
         post_action: server_post_action,
+        rewrite_program: server_rewrite_program,
+        add_headers: server_add_headers,
         error_pages: server_error_pages,
     })
 }

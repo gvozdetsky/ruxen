@@ -310,13 +310,15 @@ fn refuse(
     server: &'static PreparedServer,
     response: Response,
     close: bool,
+    in_error_page: bool,
 ) -> (Response, ProcessMeta) {
-    let (response, mut meta) = match crate::worker::intercept_refusal(http, req, server, response) {
-        Response::Reroute(reroute) => {
-            process_with_meta_inner(http, req, url_scratch, Some(reroute))
-        }
-        response => (response, refused_meta(server, false)),
-    };
+    let (response, mut meta) =
+        match crate::worker::finish_server_response(http, req, server, response, in_error_page) {
+            Response::Reroute(reroute) => {
+                process_with_meta_inner(http, req, url_scratch, Some(reroute))
+            }
+            response => (response, refused_meta(server, false)),
+        };
     if close {
         meta.keepalive.allow = false;
     }
@@ -492,7 +494,7 @@ fn process_with_meta_inner(
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
         let server = &listen.servers[listen.default_server];
         let response = Response::Prebuilt(http.bad_request.pick(req.method));
-        return refuse(http, req, url_scratch, server, response, true);
+        return refuse(http, req, url_scratch, server, response, true, false);
     }
 
     let (server, regex_captures) = find_config(listen, req.host, req.sni);
@@ -505,14 +507,14 @@ fn process_with_meta_inner(
                 &http.bad_request
             };
             let response = Response::Prebuilt(canned.pick(req.method));
-            return refuse(http, req, url_scratch, server, response, true);
+            return refuse(http, req, url_scratch, server, response, true, false);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
             let response = Response::Owned(crate::file::method_not_allowed(
                 req.method,
                 server.server_header,
             ));
-            return refuse(http, req, url_scratch, server, response, false);
+            return refuse(http, req, url_scratch, server, response, false, false);
         }
     }
     let mut named_target: Option<Vec<u8>> = None;
@@ -595,6 +597,9 @@ fn process_with_meta_inner(
     // `ngx_http_internal_redirect`; the counter is `r->uri_changes`. We
     // bound at MAX_REROUTES to guarantee termination on cyclic configs
     // (`try_files / =404` pointing at a URI that re-triggers try_files).
+    // nginx runs the server rewrite phase first, and again after an
+    // internal redirect, but not after a location's `rewrite … last`.
+    let mut run_server_rewrite = true;
     for hop in 0..MAX_REROUTES {
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
@@ -615,12 +620,35 @@ fn process_with_meta_inner(
                 }
             }
         } else {
+            if std::mem::take(&mut run_server_rewrite)
+                && !server.rewrite_program.is_empty()
+                && let Some(response) = crate::worker::run_server_rewrite(
+                    http,
+                    server,
+                    req,
+                    url_scratch,
+                    &mut current_args,
+                    &mut rewrite_state,
+                    regex_captures.as_ref(),
+                )
+            {
+                // Answered before any location: the server's error_page,
+                // add_header and logs.
+                return refuse(
+                    http,
+                    req,
+                    url_scratch,
+                    server,
+                    response,
+                    false,
+                    in_error_page,
+                );
+            }
             match match_location(server, url_scratch, &mut rewrite_state) {
                 Some(loc) => loc,
                 None => match server.server_default.as_ref() {
-                    // Server-scope `return` fires for any request that
-                    // didn't land on an explicit location, matching nginx's
-                    // rewrite-phase behavior.
+                    // Server-scope `root` with no `/` location: nginx's
+                    // implicit catch-all.
                     Some(default) => MatchedLocation::from_prefix(default),
                     None => {
                         meta.server_port = server.listen_port;
@@ -774,6 +802,7 @@ fn process_with_meta_inner(
             regex_captures.as_ref(),
         ) {
             Response::Reroute(next) => {
+                run_server_rewrite = true;
                 if let Some(args) = next.args {
                     current_args = Some(args);
                 }

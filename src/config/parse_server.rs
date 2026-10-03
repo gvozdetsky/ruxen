@@ -44,7 +44,7 @@ pub(crate) fn parse_server_block(
     let mut add_headers: Option<Vec<AddHeader>> = None;
     let mut add_trailers: Option<Vec<AddHeader>> = None;
     let mut error_pages: Option<Vec<ErrorPage>> = None;
-    let mut server_return: Option<(u16, Vec<ValuePart>)> = None;
+    let mut rewrite_ops: Vec<RewriteOp> = Vec::new();
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
@@ -147,7 +147,7 @@ pub(crate) fn parse_server_block(
                         add_headers,
                         add_trailers,
                         error_pages,
-                        server_return,
+                        rewrite_ops,
                         keepalive_timeout: kat,
                         keepalive_requests: kar,
                         keepalive_time_ms: katm,
@@ -361,11 +361,21 @@ pub(crate) fn parse_server_block(
                 root = Some(PathBuf::from(path));
             }
             ("return", Terminator::Semi) => {
-                if server_return.is_some() {
-                    return Err(Error::Duplicate("return"));
-                }
-                server_return = Some(parse_return_args(&args[1..])?);
+                let (status, body) = parse_return_args(&args[1..])?;
+                rewrite_ops.push(RewriteOp::Return { status, body });
             }
+            ("set", Terminator::Semi) => rewrite_ops.push(parse_set_op(&args[1..])?),
+            ("rewrite", Terminator::Semi) => rewrite_ops.push(parse_rewrite_op(&args[1..])?),
+            ("break", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::BadValue {
+                        what: "break",
+                        got: args[1..].join(" "),
+                    });
+                }
+                rewrite_ops.push(RewriteOp::Break);
+            }
+            ("if", Terminator::BlockOpen) => rewrite_ops.push(parse_if_op(&args[1..], lx)?),
             ("keepalive_timeout", Terminator::Semi) => {
                 if keepalive_timeout.is_some() {
                     return Err(Error::Duplicate("keepalive_timeout"));
@@ -716,6 +726,10 @@ pub(crate) fn parse_server_block(
                 | "add_header"
                 | "error_page"
                 | "return"
+                | "set"
+                | "rewrite"
+                | "break"
+                | "if"
                 | "keepalive_timeout"
                 | "keepalive_requests"
                 | "keepalive_time"
