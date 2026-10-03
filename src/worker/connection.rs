@@ -341,6 +341,45 @@ pub(crate) async fn write_all_timed<S: monoio::io::AsyncWriteRent>(
     (Ok(()), buf)
 }
 
+/// nginx's lingering close (`ngx_http_set_lingering_close`): after an
+/// early answer the client may still be sending the request body, and
+/// closing a socket with unread input makes the kernel reset the
+/// connection — the client can then lose the response. Stop writing, read
+/// and discard until the client is done (EOF), at most `lingering_timeout`
+/// (5 s) per read and `lingering_time` (30 s) in total, then close.
+pub(crate) async fn lingering_close<S: ConnIo>(stream: &mut S, buf: &mut Vec<u8>) {
+    const LINGERING_TIME: Duration = Duration::from_secs(30);
+    const LINGERING_TIMEOUT: Duration = Duration::from_secs(5);
+    let _ = monoio::io::AsyncWriteRent::shutdown(stream).await;
+    let deadline = Instant::now() + LINGERING_TIME;
+    let mut scratch = std::mem::take(buf);
+    scratch.clear();
+    scratch.reserve(16 * 1024);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match monoio::time::timeout(left.min(LINGERING_TIMEOUT), stream.read(scratch)).await {
+            Ok((Ok(n), returned)) if n > 0 => {
+                scratch = returned;
+                scratch.clear();
+            }
+            Ok((_, returned)) => {
+                scratch = returned;
+                break;
+            }
+            // Timed out: the buffer went with the read.
+            Err(_) => {
+                scratch = Vec::new();
+                break;
+            }
+        }
+    }
+    scratch.clear();
+    *buf = scratch;
+}
+
 /// nginx's `limit_rate` pacing (`ngx_http_write_filter`): past
 /// `limit_rate_after` bytes the response may have sent at most
 /// `rate * (elapsed + 1 s)` more, so writes wait for that.
