@@ -193,7 +193,16 @@ pub struct PreparedMapRegex {
 /// entry matches, mirroring `ngx_http_map_module.c`.
 pub struct PreparedMap {
     pub key: &'static [PreparedValuePart],
+    /// Exact keys, lowercased: nginx's map hash is case-insensitive.
     pub exact: std::collections::HashMap<Vec<u8>, &'static [PreparedValuePart]>,
+    /// `hostnames`: a trailing dot of the value is ignored, and the
+    /// wildcards below apply.
+    pub hostnames: bool,
+    /// `*.example.com` / `.example.com` as (lowercased suffix, whether the
+    /// bare `example.com` matches too, value); the longest match wins.
+    pub wildcard_head: &'static [(Vec<u8>, bool, &'static [PreparedValuePart])],
+    /// `mail.*` as (lowercased head, value); the longest match wins.
+    pub wildcard_tail: &'static [(Vec<u8>, &'static [PreparedValuePart])],
     pub regex: &'static [PreparedMapRegex],
     pub default: Option<&'static [PreparedValuePart]>,
 }

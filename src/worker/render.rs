@@ -421,11 +421,21 @@ impl RenderCtx<'_> {
                 if let Some(maps) = self.maps
                     && let Some(program) = maps.get(name.as_str())
                 {
-                    // Render the source key, try exact → regex → default
-                    // (mirrors nginx's `ngx_http_map_module.c` lookup order).
+                    // Render the source key, try exact → wildcards → regex →
+                    // default (nginx's `ngx_http_map_module.c` lookup order).
                     let mut key = Vec::with_capacity(32);
                     render_parts(program.key, self, &mut key);
-                    if let Some(value) = program.exact.get(key.as_slice()) {
+                    if program.hostnames && key.last() == Some(&b'.') {
+                        key.pop();
+                    }
+                    // The hash lookup is case-insensitive; regexes see the
+                    // value as it is.
+                    let lower = key.to_ascii_lowercase();
+                    if let Some(value) = program.exact.get(lower.as_slice()) {
+                        render_parts(value, self, out);
+                        return;
+                    }
+                    if let Some(value) = map_wildcard(program, &lower) {
                         render_parts(value, self, out);
                         return;
                     }
@@ -804,6 +814,31 @@ fn write_upstream_ms(out: &mut Vec<u8>, ms: Option<u64>) {
         b'0' + (frac / 10 % 10) as u8,
         b'0' + (frac % 10) as u8,
     ]);
+}
+
+/// A `hostnames` map's wildcard match for a lowercased host: the longest
+/// `*.suffix` / `.suffix`, then the longest `head.*`.
+fn map_wildcard(map: &PreparedMap, host: &[u8]) -> Option<&'static [PreparedValuePart]> {
+    let head = map
+        .wildcard_head
+        .iter()
+        .filter(|(suffix, bare, _)| {
+            (*bare && host == suffix.as_slice())
+                || (host.len() > suffix.len()
+                    && host.ends_with(suffix)
+                    && host[host.len() - suffix.len() - 1] == b'.')
+        })
+        .max_by_key(|(suffix, _, _)| suffix.len());
+    if let Some((_, _, value)) = head {
+        return Some(value);
+    }
+    map.wildcard_tail
+        .iter()
+        .filter(|(head, _)| {
+            host.len() > head.len() && host.starts_with(head) && host[head.len()] == b'.'
+        })
+        .max_by_key(|(head, _)| head.len())
+        .map(|(_, value)| *value)
 }
 
 /// `HTTP/1.x` at the end of a request line; empty if there is none.

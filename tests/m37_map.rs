@@ -149,7 +149,8 @@ http {
     let (_g, port) = spawn_server(conf);
 
     assert_eq!(body(&http_get(port, "/?fruit=apple")), b"flavor=crisp");
-    assert_eq!(body(&http_get(port, "/?fruit=Apple")), b"flavor=unknown"); // exact is case-sensitive
+    // nginx's map hash is case-insensitive (checked against nginx 1.24).
+    assert_eq!(body(&http_get(port, "/?fruit=Apple")), b"flavor=crisp");
     assert_eq!(body(&http_get(port, "/?fruit=banana")), b"flavor=sweet");
     assert_eq!(body(&http_get(port, "/?fruit=BANANA")), b"flavor=sweet");
     assert_eq!(body(&http_get(port, "/?fruit=pear-pie")), b"flavor=grainy");
@@ -297,4 +298,47 @@ http {
 "#,
         "bad map regex",
     );
+}
+
+#[test]
+fn map_hostnames_wildcards_and_escaped_keys() {
+    // `hostnames`: a trailing dot is ignored, `*.x` / `.x` / `x.*`
+    // wildcards (the longest wins), regexes see the value as sent; `\key`
+    // is a literal key even when it spells a keyword. As nginx's map.t.
+    let conf = r#"
+events {}
+http {
+  map $args $y {
+    hostnames;
+    default            0;
+    example.com        foo;
+    example.*          right;
+    *.example.com      left;
+    .dot.example.com   special;
+    ~^REGEX\.ORG$      regex;
+    \include           include;
+  }
+
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location / {
+      return 200 "y=$y";
+    }
+  }
+}
+"#;
+    let (_g, port) = spawn_server(conf);
+    for (args, want) in [
+        ("EXAMPLE.COM.", "foo"),
+        ("example.org", "right"),
+        ("a.example.com", "left"),
+        ("dot.example.com", "special"),
+        ("www.dot.example.com", "special"),
+        ("REGEX.ORG", "regex"),
+        ("regex.org", "0"),
+        ("include", "include"),
+    ] {
+        let got = body(&http_get(port, &format!("/?{args}"))).to_vec();
+        assert_eq!(String::from_utf8_lossy(&got), format!("y={want}"), "{args}");
+    }
 }

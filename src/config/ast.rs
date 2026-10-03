@@ -1048,6 +1048,12 @@ pub struct MapBlock {
     /// Fallback value when nothing matches. `None` renders empty, matching
     /// nginx when no `default` is declared.
     pub default: Option<Vec<ValuePart>>,
+    /// `hostnames;`: the source value is a host name (a trailing dot is
+    /// ignored) and keys may be wildcards (`*.example.com`,
+    /// `.example.com`, `mail.*`).
+    pub hostnames: bool,
+    /// The wildcard keys of a `hostnames` map, as written.
+    pub wildcards: Vec<MapExactEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

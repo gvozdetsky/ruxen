@@ -1450,11 +1450,29 @@ pub(crate) fn prepare_maps(
             exact,
             regex,
             default,
+            hostnames,
+            wildcards,
         } = block;
         let mut exact_map: std::collections::HashMap<Vec<u8>, &'static [PreparedValuePart]> =
             std::collections::HashMap::with_capacity(exact.len());
         for MapExactEntry { key: k, value } in exact {
-            exact_map.insert(k.into_bytes(), prepare_value_parts(value));
+            exact_map.insert(
+                k.to_ascii_lowercase().into_bytes(),
+                prepare_value_parts(value),
+            );
+        }
+        let mut wildcard_head = Vec::new();
+        let mut wildcard_tail = Vec::new();
+        for MapExactEntry { key: k, value } in wildcards {
+            let k = k.to_ascii_lowercase();
+            let value = prepare_value_parts(value);
+            if let Some(suffix) = k.strip_prefix("*.") {
+                wildcard_head.push((suffix.as_bytes().to_vec(), false, value));
+            } else if let Some(suffix) = k.strip_prefix('.') {
+                wildcard_head.push((suffix.as_bytes().to_vec(), true, value));
+            } else if let Some(head) = k.strip_suffix(".*") {
+                wildcard_tail.push((head.as_bytes().to_vec(), value));
+            }
         }
         let mut regex_entries: Vec<PreparedMapRegex> = Vec::with_capacity(regex.len());
         for MapRegexEntry {
@@ -1476,6 +1494,9 @@ pub(crate) fn prepare_maps(
         let prepared = PreparedMap {
             key: prepare_value_parts(key),
             exact: exact_map,
+            hostnames,
+            wildcard_head: Box::leak(wildcard_head.into_boxed_slice()),
+            wildcard_tail: Box::leak(wildcard_tail.into_boxed_slice()),
             regex: Box::leak(regex_entries.into_boxed_slice()),
             default: default.map(prepare_value_parts),
         };

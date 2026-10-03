@@ -165,9 +165,10 @@ pub(crate) fn parse_split_percent_hundredths(raw: &str) -> Result<u32, Error> {
 ///
 /// Verified against `ngx_http_map_module.c::ngx_http_map_block`: exact
 /// strings go into a hash, regexes stay in declaration order and are
-/// tried linearly, `default` is optional. Modifiers `hostnames` and
-/// `volatile` are not yet supported. `include` is handled transparently
-/// by the lexer.
+/// tried linearly, `default` is optional. `hostnames` adds wildcard keys;
+/// `volatile` is not yet supported. A key starting with `\` is taken
+/// literally without it (`\default`, `\include`, `\~x`). `include`
+/// is handled transparently by the lexer.
 pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBlock, Error> {
     if args.len() != 2 {
         return Err(Error::BadValue {
@@ -182,6 +183,8 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
     let mut exact: Vec<MapExactEntry> = Vec::new();
     let mut regex: Vec<MapRegexEntry> = Vec::new();
     let mut default: Option<Vec<ValuePart>> = None;
+    let mut hostnames = false;
+    let mut wildcards: Vec<MapExactEntry> = Vec::new();
 
     loop {
         let (line_args, term) = lx.read_directive()?;
@@ -201,7 +204,11 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
         // Reject modifiers we don't yet support rather than letting them
         // masquerade as an exact-match pattern. (`include` is handled by
         // the lexer before we ever see it here.)
-        if matches!(line_args[0].as_str(), "hostnames" | "volatile") && line_args.len() == 1 {
+        if line_args[0] == "hostnames" && line_args.len() == 1 {
+            hostnames = true;
+            continue;
+        }
+        if line_args[0] == "volatile" && line_args.len() == 1 {
             return Err(Error::UnknownDirective {
                 name: line_args[0].clone(),
                 ctx: "map",
@@ -222,6 +229,25 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
                 return Err(Error::Duplicate("map default"));
             }
             default = Some(value);
+            continue;
+        }
+
+        // `\key`: the key itself, not a keyword or a regex.
+        if let Some(literal) = lhs.strip_prefix('\\') {
+            if exact.iter().any(|e| e.key == literal) {
+                return Err(Error::Duplicate("map exact key"));
+            }
+            exact.push(MapExactEntry {
+                key: literal.to_string(),
+                value,
+            });
+            continue;
+        }
+        if hostnames && (lhs.starts_with('.') || lhs.starts_with("*.") || lhs.ends_with(".*")) {
+            wildcards.push(MapExactEntry {
+                key: lhs.clone(),
+                value,
+            });
             continue;
         }
 
@@ -269,6 +295,8 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
         exact,
         regex,
         default,
+        hostnames,
+        wildcards,
     })
 }
 
