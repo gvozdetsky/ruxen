@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-02 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-03 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 55
+- **Passing in ruxen:** 61
 - **Intentionally skipped (`-V` banner excludes the module):** 401
-- **Failing — work in progress:** 49
+- **Failing — work in progress:** 43
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (55)
+## Passing in ruxen (61)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -38,8 +38,11 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `http_server_name.t`
 - `http_try_files.t`
 - `http_uri.t`
+- `http_variables.t`
 - `ignore_invalid_headers.t`
 - `index.t`
+- `limit_rate.t`
+- `map.t`
 - `map_complex.t`
 - `merge_slashes.t`
 - `not_modified.t`
@@ -51,9 +54,12 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_limit_rate.t`
 - `proxy_max_temp_file_size.t`
 - `proxy_noclose.t`
+- `proxy_non_idempotent.t`
 - `proxy_pass_request.t`
 - `proxy_request_buffering_keepalive.t`
+- `proxy_set_body.t`
 - `proxy_upstream_cookie.t`
+- `proxy_variables.t`
 - `range_if_range.t`
 - `rewrite.t`
 - `rewrite_if.t`
@@ -73,7 +79,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (49)
+## Failing — actively being worked on (43)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -82,9 +88,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `http_resolver.t` — 0/0
 - `http_resolver_cleanup.t` — 1/3
 - `http_resolver_cname.t` — 11/13
-- `http_variables.t` — 3/9
-- `limit_rate.t` — 3/9
-- `map.t` — 19/21
 - `map_volatile.t` — 0/0
 - `proxy.t` — 28/30
 - `proxy_bind.t` — 3/7
@@ -94,13 +97,11 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_method.t` — 3/6
 - `proxy_next_upstream.t` — 2/10
 - `proxy_next_upstream_tries.t` — 8/10
-- `proxy_non_idempotent.t` — 7/10
 - `proxy_protocol2_tlv.t` — 14/16
 - `proxy_redirect.t` — 15/17
 - `proxy_request_buffering.t` — 2/20
 - `proxy_request_buffering_chunked.t` — 3/24
 - `proxy_request_buffering_ssl.t` — 18/20
-- `proxy_set_body.t` — 2/4
 - `proxy_ssl.t` — 8/10
 - `proxy_ssl_certificate.t` — 5/7
 - `proxy_ssl_certificate_empty.t` — 0/0
@@ -110,8 +111,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_ssl_verify.t` — 6/8
 - `proxy_ssl_verify_ip.t` — 8/10
 - `proxy_unix.t` — 5/7
-- `proxy_variables.t` — 2/6
-- `proxy_xar.t` — 16/18
+- `proxy_xar.t` — 11/18
 - `ssl.t` — 4/23
 - `ssl_cache.t` — 4/6
 - `ssl_certificate_aux.t` — 0/0
