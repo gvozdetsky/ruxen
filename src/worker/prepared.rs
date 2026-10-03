@@ -432,6 +432,9 @@ pub struct PreparedProxy {
     pub pass_request_headers: bool,
     /// Inheritance-resolved `proxy_pass_request_body` (default `true`).
     pub pass_request_body: bool,
+    /// Inheritance-resolved `proxy_set_body`: rendered per request and sent
+    /// instead of the client's body.
+    pub set_body: Option<&'static [PreparedValuePart]>,
     /// Inheritance-resolved `proxy_connect_timeout` (default 60s).
     pub connect_timeout_ms: u64,
     /// Inheritance-resolved `proxy_read_timeout` (default 60s).
@@ -489,6 +492,7 @@ pub(crate) struct ProxyEffective {
     pub set_headers: &'static [PreparedProxySetHeader],
     pub pass_request_headers: bool,
     pub pass_request_body: bool,
+    pub set_body: Option<&'static [PreparedValuePart]>,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
@@ -521,6 +525,7 @@ impl ProxyEffective {
             set_headers: &[],
             pass_request_headers: true,
             pass_request_body: true,
+            set_body: None,
             connect_timeout_ms: 60_000,
             read_timeout_ms: 60_000,
             send_timeout_ms: 60_000,

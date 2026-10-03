@@ -487,6 +487,8 @@ pub struct Server {
     pub proxy_pass_request_headers: Option<bool>,
     /// Server-scope `proxy_pass_request_body on|off;`. `None` inherits.
     pub proxy_pass_request_body: Option<bool>,
+    /// Server-scope `proxy_set_body VALUE;`. `None` inherits.
+    pub proxy_set_body: Option<Vec<ValuePart>>,
     /// Server-scope `proxy_connect_timeout` in milliseconds.
     pub proxy_connect_timeout_ms: Option<u64>,
     /// Server-scope `proxy_read_timeout` in milliseconds.
@@ -640,6 +642,9 @@ pub struct Location {
     pub proxy_pass_request_headers: Option<bool>,
     /// Location-scope `proxy_pass_request_body`. `None` inherits.
     pub proxy_pass_request_body: Option<bool>,
+    /// Location-scope `proxy_set_body`: the body sent upstream instead of
+    /// the client's. `None` inherits.
+    pub proxy_set_body: Option<Vec<ValuePart>>,
     /// Location-scope `proxy_connect_timeout`. `None` inherits.
     pub proxy_connect_timeout_ms: Option<u64>,
     /// Location-scope `proxy_read_timeout`. `None` inherits.

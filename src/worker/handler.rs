@@ -518,18 +518,23 @@ pub(crate) fn run_location_handler(
             overrides_buf.push((b"Connection", value.to_vec()));
         }
 
-        // Decide on the body to forward. proxy_pass_request_body off ⇒
-        // never forward; otherwise, pass the worker-buffered body
-        // (Content-Length or decoded chunked).
-        let forward_body: &[u8] = if proxy.pass_request_body {
-            req.body
-        } else {
-            &[]
+        // Decide on the body to forward. `proxy_set_body` replaces it;
+        // proxy_pass_request_body off ⇒ never forward; otherwise, pass the
+        // worker-buffered body (Content-Length or decoded chunked).
+        let set_body: Option<Vec<u8>> = proxy.set_body.map(|parts| {
+            let mut body = Vec::new();
+            render_parts(parts, &proxy_render_ctx, &mut body);
+            body
+        });
+        let forward_body: &[u8] = match &set_body {
+            Some(body) => body,
+            None if proxy.pass_request_body => req.body,
+            None => &[],
         };
-        let forward_len = if proxy.pass_request_body {
-            req.body_len
-        } else {
-            0
+        let forward_len = match &set_body {
+            Some(body) => body.len() as u64,
+            None if proxy.pass_request_body => req.body_len,
+            None => 0,
         };
         // A body too large to keep in memory is only in the temp file;
         // `run_proxy` streams it after the header block.
