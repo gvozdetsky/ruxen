@@ -125,9 +125,36 @@ fn a_connection_without_the_header_is_closed() {
     sleep(Duration::from_millis(50));
     let log = std::fs::read_to_string(server.dir.join("error.log")).unwrap_or_default();
     assert!(
-        log.contains("[error]") && log.contains("broken header: \"GET / HTTP/1.1"),
+        log.contains("[error]")
+            && log.contains("broken header: \"GET / HTTP/1.1\" while reading PROXY protocol"),
         "{log}"
     );
+}
+
+/// What arrives first is all nginx looks at (ngx_http_wait_request_handler
+/// reads once), so a header cut short is refused at once. ruxen used to
+/// poll the socket every 5 ms until client_header_timeout (60 s), even
+/// after the client had closed: the bytes it peeked never went away.
+#[test]
+fn a_header_cut_short_is_refused_at_once() {
+    let server = start("cut", "", "");
+    let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    v2.extend_from_slice(&[0x21, 0x11, 0, 12, 192, 0, 2, 1]);
+    for (part, logged) in [
+        (&b"PROXY TCP4 "[..], "broken header: \"PROXY TCP4 \""),
+        (&v2[..], "header is too large"),
+    ] {
+        let started = Instant::now();
+        assert_eq!(exchange(server.port, &[part]), "");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{logged}: closed after {:?}",
+            started.elapsed()
+        );
+        sleep(Duration::from_millis(50));
+        let log = std::fs::read_to_string(server.dir.join("error.log")).unwrap_or_default();
+        assert!(log.contains(logged), "{log}");
+    }
 }
 
 #[test]

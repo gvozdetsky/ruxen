@@ -34,7 +34,7 @@ const V2_MAX: usize = 16 + 4096;
 pub enum Parsed {
     /// A header of this many bytes.
     Header(ProxyHeader, usize),
-    /// Too short to tell yet.
+    /// Cut short. `read` refuses it, as nginx does.
     Incomplete,
     /// Not a PROXY header; the text is for the error log.
     Invalid(&'static str),
@@ -160,6 +160,15 @@ fn parse_v2(buf: &[u8]) -> Parsed {
     Parsed::Header(header, len)
 }
 
+/// `what: "<the bytes>"`, as nginx shows a header it refused: up to the
+/// first CR or LF (and, here, at most a v1 line's worth).
+fn broken(what: &str, got: &[u8]) -> String {
+    let line = got.iter().position(|&b| b == b'\r' || b == b'\n');
+    let end = line.unwrap_or(got.len()).min(V1_MAX);
+    let shown = String::from_utf8_lossy(&got[..end]).into_owned();
+    format!("{what}: \"{}\"", shown.escape_debug())
+}
+
 /// Read the PROXY header off `stream` within `timeout`, leaving the bytes
 /// after it in the socket. `Err` carries the reason for the error log;
 /// the caller closes the connection.
@@ -212,13 +221,27 @@ pub async fn read(
                 }
                 return Ok(header);
             }
-            Parsed::Invalid(what) => {
-                let shown = String::from_utf8_lossy(&buf[..(n as usize).min(V1_MAX)]).into_owned();
-                return Err(format!("{what}: \"{}\"", shown.escape_debug()));
+            refused => {
+                let got = &buf[..n as usize];
+                let reason = match refused {
+                    // What arrived first is all nginx looks at: its
+                    // ngx_http_wait_request_handler reads once and hands
+                    // that to ngx_proxy_protocol_read, so a header cut
+                    // short is refused, not waited for. A v2 header whose
+                    // addresses didn't all arrive gets nginx's "header is
+                    // too large" (sic); anything else is a broken header.
+                    Parsed::Incomplete if got.len() >= 16 && got.starts_with(V2_SIGNATURE) => {
+                        "header is too large".into()
+                    }
+                    Parsed::Invalid(what) => broken(what, got),
+                    _ => broken("broken header", got),
+                };
+                // nginx has read these bytes; take them off the socket
+                // too, so closing it is a FIN rather than a reset.
+                // SAFETY: as above.
+                unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), n as usize, libc::MSG_DONTWAIT) };
+                return Err(reason);
             }
-            // The rest hasn't arrived; readable() would fire at once on
-            // what's there, so wait a little instead.
-            Parsed::Incomplete => monoio::time::sleep(Duration::from_millis(5)).await,
         }
     }
 }
