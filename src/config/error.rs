@@ -41,6 +41,9 @@ pub enum Error {
         name: String,
         consequence: &'static str,
     },
+    /// `$name` that is neither a variable nginx knows nor one the config
+    /// defines (`set`, `map`, `split_clients`, a named regex capture).
+    UnknownVariable(String),
 }
 
 impl std::fmt::Display for Error {
@@ -72,6 +75,7 @@ impl std::fmt::Display for Error {
                 f,
                 "\"{name}\" is not supported yet, and ignoring it is unsafe: {consequence}"
             ),
+            Error::UnknownVariable(name) => write!(f, "unknown \"{name}\" variable"),
         }
     }
 }

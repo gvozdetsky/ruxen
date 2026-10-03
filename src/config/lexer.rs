@@ -130,6 +130,7 @@ impl Lexer {
     pub(crate) fn read_directive(&mut self) -> Result<(Vec<String>, Terminator), Error> {
         loop {
             let (args, term) = self.read_directive_one()?;
+            super::note_defined_variables(&args);
             // EOF on a non-root frame: pop and continue reading from the parent.
             if args.is_empty() && matches!(term, Terminator::Eof) && self.frames.len() > 1 {
                 self.frames.pop();
