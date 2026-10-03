@@ -3,7 +3,9 @@
 //! larger bodies. Bodies over 1 MiB are kept in a temp file instead of
 //! memory and proxied from there; both Content-Length and chunked bodies.
 //! Over the limit is 413 (it used to be 400 and a reset for anything over
-//! 1 MiB, whatever the configuration said).
+//! 1 MiB, whatever the configuration said). A Content-Length over the
+//! limit of the location the request is routed to is refused before the
+//! body is read, as nginx's find_config phase does.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -85,7 +87,9 @@ fn start(conf_http: &str) -> Server {
         dir.join("nginx.conf"),
         format!(
             "events {{}}\nhttp {{ {} }}\n",
-            conf_http.replace("%%PORT%%", &port.to_string())
+            conf_http
+                .replace("%%PORT%%", &port.to_string())
+                .replace("%%DIR%%", &dir.display().to_string())
         ),
     )
     .unwrap();
@@ -192,8 +196,7 @@ fn limits_follow_client_max_body_size() {
     let head = "POST /big/ HTTP/1.1\r\nHost: x\r\nContent-Length: 11534336\r\n\r\n";
     let resp = exchange(server.port, head, b"");
     assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
-    // nginx's default is 1m. Bodies are read before routing, so this one
-    // is read, then refused by the location (nginx refuses it up front).
+    // nginx's default is 1m.
     let resp = post_cl(server.port, "/default/", &payload(2 * 1024 * 1024));
     assert!(
         resp.starts_with("HTTP/1.1 413"),
@@ -266,4 +269,64 @@ fn refused_upload_is_drained_not_reset() {
     assert!(sent.is_ok(), "upload failed: {sent:?}");
     let resp = String::from_utf8_lossy(&resp);
     assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+}
+
+/// Sends only the request head and returns the first response head that
+/// comes back within 3 s (a `100 Continue` counts), or what arrived.
+fn head_only(port: u16, head: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(head.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    while !out.ends_with(b"\r\n\r\n") && s.read(&mut byte).unwrap_or(0) == 1 {
+        out.push(byte[0]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One location without a limit used to lift the read bound for every
+/// location in every server: a body over the location's own limit was read
+/// in full (to a temp file past 1 MiB) and only then refused. Now the
+/// limit of the location the request is routed to is checked against the
+/// Content-Length first, as nginx's find_config phase does: 413 at once,
+/// with nginx's error-log line, and no `100 Continue`.
+#[test]
+fn oversized_content_length_is_refused_unread() {
+    let server = start(
+        "error_log %%DIR%%/error.log;\n\
+         server { listen 127.0.0.1:%%PORT%%;\n\
+           location / { return 200 \"ok\"; }\n\
+           location /upload { client_max_body_size 0; return 200 \"upload\"; } }",
+    );
+    let big = 50_000_000;
+
+    let resp = head_only(
+        server.port,
+        &format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {big}\r\n\r\n"),
+    );
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp:?}");
+    let log = std::fs::read_to_string(server.dir.join("error.log")).unwrap_or_default();
+    let line = format!("client intended to send too large body: {big} bytes, client: 127.0.0.1");
+    assert!(log.contains("[error]") && log.contains(&line), "{log}");
+
+    // Expect: 100-continue gets the 413 straight away, without a 100.
+    let resp = head_only(
+        server.port,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\
+             Content-Length: {big}\r\n\r\n"
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp:?}");
+
+    // The unlimited location still asks for the body.
+    let resp = head_only(
+        server.port,
+        &format!(
+            "POST /upload HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\
+             Content-Length: {big}\r\n\r\n"
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 100 Continue"), "{resp:?}");
 }
