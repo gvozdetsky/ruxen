@@ -459,6 +459,7 @@ pub(crate) fn build_proxy(
         eff.pass_headers,
         eff.error_pages,
         eff.recursive_error_pages,
+        eff.ignore_accel_redirect,
     );
     Ok(match pp {
         ProxyPass::Direct {
@@ -555,6 +556,7 @@ fn prepare_response_rules(
     pass: Option<&'static [String]>,
     error_pages: &'static [PreparedErrorPage],
     recursive_error_pages: bool,
+    ignore_accel_redirect: bool,
 ) -> &'static ProxyResponseRules {
     let pass = pass.unwrap_or(&[]);
     let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
@@ -572,6 +574,7 @@ fn prepare_response_rules(
         redirects,
         error_pages,
         recursive_error_pages,
+        ignore_accel_redirect,
         hide: Box::leak(hide.into_boxed_slice()),
         pass_mask,
     }))
@@ -643,6 +646,7 @@ pub(crate) struct ServerProxyDefaults {
     pub pass_request_headers: bool,
     pub pass_request_body: bool,
     pub set_body: Option<&'static [PreparedValuePart]>,
+    pub ignore_accel_redirect: bool,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
@@ -659,6 +663,12 @@ pub(crate) struct ServerProxyDefaults {
     pub pass_headers: Option<&'static [String]>,
 }
 
+/// `proxy_ignore_headers` as set at one scope: whether it lists
+/// X-Accel-Redirect, or `None` when the scope didn't set it.
+fn ignores_accel_redirect(list: Option<&[String]>) -> Option<bool> {
+    list.map(|l| l.iter().any(|h| h == "x-accel-redirect"))
+}
+
 /// Leak a directive's list for the lifetime of the config.
 fn leak_list(list: Option<Vec<String>>) -> Option<&'static [String]> {
     list.map(|l| &*Box::leak(l.into_boxed_slice()))
@@ -671,6 +681,7 @@ impl ServerProxyDefaults {
         proxy_pass_request_headers: Option<bool>,
         proxy_pass_request_body: Option<bool>,
         proxy_set_body: Option<Vec<ValuePart>>,
+        proxy_ignore_headers: Option<Vec<String>>,
         proxy_connect_timeout_ms: Option<u64>,
         proxy_read_timeout_ms: Option<u64>,
         proxy_send_timeout_ms: Option<u64>,
@@ -697,6 +708,8 @@ impl ServerProxyDefaults {
                 .unwrap_or(defaults.pass_request_headers),
             pass_request_body: proxy_pass_request_body.unwrap_or(defaults.pass_request_body),
             set_body: proxy_set_body.map(prepare_value_parts),
+            ignore_accel_redirect: ignores_accel_redirect(proxy_ignore_headers.as_deref())
+                .unwrap_or(false),
             connect_timeout_ms: proxy_connect_timeout_ms.unwrap_or(defaults.connect_timeout_ms),
             read_timeout_ms: proxy_read_timeout_ms.unwrap_or(defaults.read_timeout_ms),
             send_timeout_ms: proxy_send_timeout_ms.unwrap_or(defaults.send_timeout_ms),
@@ -734,6 +747,7 @@ pub(crate) fn resolve_proxy_effective(
     location_pass_request_headers: Option<bool>,
     location_pass_request_body: Option<bool>,
     location_set_body: Option<Vec<ValuePart>>,
+    location_ignore_headers: Option<Vec<String>>,
     location_connect_timeout_ms: Option<u64>,
     location_read_timeout_ms: Option<u64>,
     location_send_timeout_ms: Option<u64>,
@@ -758,6 +772,8 @@ pub(crate) fn resolve_proxy_effective(
         pass_request_headers: location_pass_request_headers
             .unwrap_or(server_defaults.pass_request_headers),
         pass_request_body: location_pass_request_body.unwrap_or(server_defaults.pass_request_body),
+        ignore_accel_redirect: ignores_accel_redirect(location_ignore_headers.as_deref())
+            .unwrap_or(server_defaults.ignore_accel_redirect),
         set_body: location_set_body
             .map(prepare_value_parts)
             .or(server_defaults.set_body),
@@ -822,6 +838,7 @@ pub(crate) fn prepare_server(
         server.proxy_pass_request_headers,
         server.proxy_pass_request_body,
         server.proxy_set_body.take(),
+        server.proxy_ignore_headers.take(),
         server.proxy_connect_timeout_ms,
         server.proxy_read_timeout_ms,
         server.proxy_send_timeout_ms,
@@ -1939,6 +1956,7 @@ pub(crate) fn build_prefix_or_exact(
         proxy_pass_request_headers: location_proxy_pass_request_headers,
         proxy_pass_request_body: location_proxy_pass_request_body,
         proxy_set_body: location_proxy_set_body,
+        proxy_ignore_headers: location_proxy_ignore_headers,
         proxy_connect_timeout_ms: location_proxy_connect_timeout_ms,
         proxy_read_timeout_ms: location_proxy_read_timeout_ms,
         proxy_send_timeout_ms: location_proxy_send_timeout_ms,
@@ -1959,6 +1977,7 @@ pub(crate) fn build_prefix_or_exact(
         location_proxy_pass_request_headers,
         location_proxy_pass_request_body,
         location_proxy_set_body,
+        location_proxy_ignore_headers,
         location_proxy_connect_timeout_ms,
         location_proxy_read_timeout_ms,
         location_proxy_send_timeout_ms,
@@ -2134,6 +2153,7 @@ pub(crate) fn build_regex_location(
         proxy_pass_request_headers: location_proxy_pass_request_headers,
         proxy_pass_request_body: location_proxy_pass_request_body,
         proxy_set_body: location_proxy_set_body,
+        proxy_ignore_headers: location_proxy_ignore_headers,
         proxy_connect_timeout_ms: location_proxy_connect_timeout_ms,
         proxy_read_timeout_ms: location_proxy_read_timeout_ms,
         proxy_send_timeout_ms: location_proxy_send_timeout_ms,
@@ -2154,6 +2174,7 @@ pub(crate) fn build_regex_location(
         location_proxy_pass_request_headers,
         location_proxy_pass_request_body,
         location_proxy_set_body,
+        location_proxy_ignore_headers,
         location_proxy_connect_timeout_ms,
         location_proxy_read_timeout_ms,
         location_proxy_send_timeout_ms,
