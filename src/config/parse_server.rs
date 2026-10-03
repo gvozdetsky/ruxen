@@ -70,6 +70,7 @@ pub(crate) fn parse_server_block(
     let mut proxy_set_headers: Option<Vec<ProxySetHeader>> = None;
     let mut proxy_pass_request_headers: Option<bool> = None;
     let mut proxy_pass_request_body: Option<bool> = None;
+    let mut proxy_set_body: Option<Vec<ValuePart>> = None;
     let mut proxy_connect_timeout_ms: Option<u64> = None;
     let mut proxy_read_timeout_ms: Option<u64> = None;
     let mut proxy_send_timeout_ms: Option<u64> = None;
@@ -170,6 +171,7 @@ pub(crate) fn parse_server_block(
                         proxy_set_headers,
                         proxy_pass_request_headers,
                         proxy_pass_request_body,
+                        proxy_set_body,
                         proxy_connect_timeout_ms,
                         proxy_read_timeout_ms,
                         proxy_send_timeout_ms,
@@ -556,6 +558,18 @@ pub(crate) fn parse_server_block(
                 proxy_pass_request_headers =
                     Some(parse_on_off_args(&args[1..], "proxy_pass_request_headers")?);
             }
+            ("proxy_set_body", Terminator::Semi) => {
+                if proxy_set_body.is_some() {
+                    return Err(Error::Duplicate("proxy_set_body"));
+                }
+                if args.len() != 2 {
+                    return Err(Error::BadValue {
+                        what: "proxy_set_body",
+                        got: args[1..].join(" "),
+                    });
+                }
+                proxy_set_body = Some(parse_value_with_vars(&args[1])?);
+            }
             ("proxy_pass_request_body", Terminator::Semi) => {
                 if proxy_pass_request_body.is_some() {
                     return Err(Error::Duplicate("proxy_pass_request_body"));
@@ -692,6 +706,7 @@ pub(crate) fn parse_server_block(
                 | "proxy_set_header"
                 | "proxy_pass_request_headers"
                 | "proxy_pass_request_body"
+                | "proxy_set_body"
                 | "proxy_connect_timeout"
                 | "proxy_read_timeout"
                 | "proxy_send_timeout"

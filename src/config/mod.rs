@@ -740,7 +740,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_redirect",
     "proxy_method",
     "proxy_http_version",
-    "proxy_set_body",
     "proxy_force_ranges",
     "proxy_pass_header",
     "proxy_hide_header",
@@ -1809,6 +1808,34 @@ mod tests {
         let cfg = parse(src).unwrap();
         // Directives parsed without error and didn't disturb the populated SSL state.
         assert_eq!(cfg.servers[0].ssl.certs.len(), 1);
+    }
+
+    #[test]
+    fn proxy_set_body_parses_at_server_and_location_only() {
+        let cfg = parse(
+            "http { server { listen 80; proxy_set_body a; \
+             location / { proxy_set_body \"b-$arg_x\"; proxy_pass http://127.0.0.1:1; } } }",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.servers[0].proxy_set_body,
+            Some(vec![ValuePart::Literal("a".into())])
+        );
+        assert_eq!(
+            cfg.servers[0].locations[0].proxy_set_body,
+            Some(vec![
+                ValuePart::Literal("b-".into()),
+                ValuePart::Var(Variable::Arg("x".into())),
+            ])
+        );
+        // Not at http scope (like proxy_set_header), and once per block.
+        assert!(parse("http { proxy_set_body a; server { listen 80; } }").is_err());
+        assert!(
+            parse(
+                "http { server { listen 80; location / { proxy_set_body a; proxy_set_body b; } } }"
+            )
+            .is_err()
+        );
     }
 
     #[test]
