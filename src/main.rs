@@ -4,7 +4,7 @@
 // - nginx-style CLI flags (`-c`, `-p`, `-e`, `-g`, `-t`, `-T`, `-q`, `-V`)
 // - config validation mode
 // - pid file creation
-// - SIGQUIT-driven graceful shutdown
+// - SIGQUIT-driven graceful shutdown, SIGTERM / SIGINT fast shutdown
 
 use std::io;
 #[cfg(unix)]
@@ -35,11 +35,14 @@ mod uri;
 mod worker;
 
 static SIGQUIT_SEEN: AtomicBool = AtomicBool::new(false);
+static SIGTERM_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGHUP_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGUSR1_SEEN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 const SIGHUP: i32 = 1;
+#[cfg(unix)]
+const SIGINT: i32 = 2;
 #[cfg(unix)]
 const SIGQUIT: i32 = 3;
 #[cfg(unix)]
@@ -48,6 +51,8 @@ const SIGPIPE: i32 = 13;
 const SIGUSR1: i32 = 10;
 #[cfg(unix)]
 const SIGUSR2: i32 = 12;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
 #[cfg(unix)]
 const SIG_UNBLOCK: i32 = 1;
 #[cfg(unix)]
@@ -67,6 +72,11 @@ unsafe extern "C" {
 
 extern "C" fn sigquit_handler(_sig: i32) {
     SIGQUIT_SEEN.store(true, Ordering::SeqCst);
+}
+
+/// SIGTERM and SIGINT.
+extern "C" fn sigterm_handler(_sig: i32) {
+    SIGTERM_SEEN.store(true, Ordering::SeqCst);
 }
 
 extern "C" fn sighup_handler(_sig: i32) {
@@ -348,11 +358,26 @@ fn real_main() -> Result<(), Failure> {
 
     let signal_runtime = runtime.clone();
     let reopen_stderr = cli.errlog.clone();
+    let monitor_pid_path = pid_path.clone();
+    // Runs until the workers have finished (main drops `workers_done`),
+    // so SIGTERM still works during a graceful shutdown.
+    let (workers_done, monitor_rx) = std::sync::mpsc::channel::<()>();
     let signal_monitor = thread::spawn(move || {
-        while !signal_runtime.is_shutting_down() {
+        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            monitor_rx.recv_timeout(Duration::from_millis(10))
+        {
+            // SIGTERM / SIGINT: nginx's fast shutdown. Its workers exit
+            // without waiting for their requests, and the master deletes
+            // the pid file and exits 0. Leaving the process does both.
+            if SIGTERM_SEEN.load(Ordering::SeqCst) {
+                signal_runtime.begin_shutdown();
+                if let Some(path) = &monitor_pid_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                std::process::exit(0);
+            }
             if SIGQUIT_SEEN.load(Ordering::SeqCst) {
                 signal_runtime.begin_shutdown();
-                return;
             }
             // Drain any pending SIGHUP into a reload-gen bump. The signal
             // handler stores `true`; clearing it here means we coalesce
@@ -375,7 +400,6 @@ fn real_main() -> Result<(), Failure> {
                 }
                 worker::LOG_REOPEN_GEN.fetch_add(1, Ordering::Relaxed);
             }
-            thread::sleep(Duration::from_millis(10));
         }
     });
 
@@ -387,6 +411,7 @@ fn real_main() -> Result<(), Failure> {
     }
 
     runtime.begin_shutdown();
+    drop(workers_done);
     let _ = signal_monitor.join();
 
     if let Some(path) = &pid_path {
@@ -590,6 +615,11 @@ fn install_signal_handlers() -> io::Result<()> {
     if rc == usize::MAX {
         return Err(io::Error::last_os_error());
     }
+    for sig in [SIGTERM, SIGINT] {
+        if unsafe { signal(sig, sigterm_handler as *const () as usize) } == usize::MAX {
+            return Err(io::Error::last_os_error());
+        }
+    }
     // SIGHUP triggers a "reload" — we don't actually re-read config or
     // re-exec workers, but we do bump the reload generation so that
     // already-accepted connections close (idle keepalive bails out, the
@@ -609,12 +639,14 @@ fn install_signal_handlers() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    // A parent with SIGQUIT masked (some shells, many CI harnesses) would
+    // A parent with these masked (some shells, many CI harnesses) would
     // otherwise leave the signal pending forever — the handler is installed
     // but the kernel can't find a thread with it unblocked. Runs on the main
     // thread before workers spawn, so children inherit the unblocked mask.
     let mut set: SigSet = [0; 16];
-    set[0] = 1u64 << (SIGQUIT - 1);
+    set[0] = [SIGQUIT, SIGTERM, SIGINT]
+        .iter()
+        .fold(0, |bits, sig| bits | 1u64 << (sig - 1));
     if unsafe { sigprocmask(SIG_UNBLOCK, &set, std::ptr::null_mut()) } != 0 {
         return Err(io::Error::last_os_error());
     }
