@@ -552,7 +552,7 @@ mod tests {
             root: Path::new("/srv"),
             // `AT_FDCWD` is fine for tests that only exercise the path
             // utilities below — none of them hit `openat2`.
-            root_fd: std::sync::atomic::AtomicI32::new(libc::AT_FDCWD),
+            root_fd: libc::AT_FDCWD,
             path_mapping: mapping,
             index: &[],
             autoindex: false,
