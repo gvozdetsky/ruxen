@@ -160,6 +160,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 server_names: s.server_names.clone(),
             })
             .collect();
+        let proxy_protocol = servers_for_addr.iter().any(|s| s.listen.proxy_protocol);
         let servers: Vec<PreparedServer> = servers_for_addr
             .into_iter()
             .map(|s| {
@@ -193,6 +194,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             servers,
             default_server: 0,
             tls,
+            proxy_protocol,
         });
     }
 

@@ -237,7 +237,7 @@ pub struct Listen {
     pub http3: bool,
     /// `quic` — accepted, ignored.
     pub quic: bool,
-    /// `proxy_protocol` — accepted, ignored.
+    /// `proxy_protocol` — connections start with a PROXY protocol header.
     pub proxy_protocol: bool,
     /// `deferred` — Linux `TCP_DEFER_ACCEPT`; accepted, ignored.
     pub deferred: bool,
@@ -1329,6 +1329,12 @@ pub enum Variable {
     RequestMethod,
     /// `$request` — the request line as received, without the CRLF.
     Request,
+    /// `$proxy_protocol_addr` / `_port` / `_server_addr` / `_server_port`:
+    /// from the connection's PROXY protocol header.
+    ProxyProtocolAddr,
+    ProxyProtocolPort,
+    ProxyProtocolServerAddr,
+    ProxyProtocolServerPort,
     /// `$server_protocol` — `HTTP/1.0` or `HTTP/1.1` from the request line.
     ServerProtocol,
     /// Unrecognized `$name`. Renders empty at runtime, matching nginx's

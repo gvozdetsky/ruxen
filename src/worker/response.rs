@@ -811,6 +811,7 @@ fn proxy_render_ctx<'a>(
         upstream_states: &meta.upstream_states,
         sent_trailers: &[],
         tls: ctx.tls,
+        proxy_protocol: ctx.proxy_protocol,
     }
 }
 
@@ -877,6 +878,7 @@ pub(crate) fn finish_server_response(
         upstream_states: req.upstream_states,
         sent_trailers: &[],
         tls: req.tls,
+        proxy_protocol: req.proxy_protocol,
     };
     let response = maybe_intercept_error_page(
         response,

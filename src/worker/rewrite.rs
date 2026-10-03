@@ -243,6 +243,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
         upstream_states: req.upstream_states,
         sent_trailers: &[],
         tls: req.tls,
+        proxy_protocol: req.proxy_protocol,
     }
 }
 

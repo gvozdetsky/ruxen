@@ -1110,6 +1110,9 @@ pub struct PreparedListen {
     /// so a future SIGHUP reload can swap it without invalidating
     /// references handed to in-flight connections.
     pub tls: Option<Arc<crate::tls::TlsAcceptor>>,
+    /// `listen … proxy_protocol` on any server of this address: every
+    /// connection starts with a PROXY protocol header.
+    pub proxy_protocol: bool,
 }
 
 /// Top-level prepared state.

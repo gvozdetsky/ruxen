@@ -131,6 +131,9 @@ pub(crate) struct RenderCtx<'a> {
     /// handshake completion. `None` for plain-HTTP. Source for `$scheme`
     /// (renders `https` when present) and the `$ssl_*` family.
     pub tls: Option<&'a crate::tls::HandshakeInfo>,
+    /// The connection's PROXY protocol header (`listen … proxy_protocol`),
+    /// for `$proxy_protocol_*`.
+    pub proxy_protocol: Option<&'a crate::proxy_protocol::ProxyHeader>,
 }
 
 impl RenderCtx<'_> {
@@ -154,6 +157,27 @@ impl RenderCtx<'_> {
             Variable::RequestUri => out.extend_from_slice(self.request_uri),
             Variable::RequestMethod => out.extend_from_slice(self.request_method),
             Variable::Request => out.extend_from_slice(self.request_line),
+            Variable::ProxyProtocolAddr
+            | Variable::ProxyProtocolPort
+            | Variable::ProxyProtocolServerAddr
+            | Variable::ProxyProtocolServerPort => {
+                let header = self.proxy_protocol;
+                let addr = match var {
+                    Variable::ProxyProtocolAddr | Variable::ProxyProtocolPort => {
+                        header.and_then(|h| h.source)
+                    }
+                    _ => header.and_then(|h| h.destination),
+                };
+                if let Some(addr) = addr {
+                    use std::io::Write;
+                    let _ = match var {
+                        Variable::ProxyProtocolAddr | Variable::ProxyProtocolServerAddr => {
+                            write!(out, "{}", addr.ip())
+                        }
+                        _ => write!(out, "{}", addr.port()),
+                    };
+                }
+            }
             Variable::ServerProtocol => out.extend_from_slice(server_protocol(self.request_line)),
             Variable::Host => out.extend_from_slice(self.host),
             Variable::RemoteAddr => out.extend_from_slice(self.remote_addr),
@@ -863,6 +887,10 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::SslClientVStart
             | Variable::SslClientVEnd
             | Variable::SslClientVRemain
+            | Variable::ProxyProtocolAddr
+            | Variable::ProxyProtocolPort
+            | Variable::ProxyProtocolServerAddr
+            | Variable::ProxyProtocolServerPort
     )
 }
 
