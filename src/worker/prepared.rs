@@ -743,6 +743,8 @@ pub struct PreparedLocation {
     /// Inheritance-resolved `recursive_error_pages`: an `error_page` taken
     /// here leaves the request free to take another one.
     pub recursive_error_pages: bool,
+    /// `internal;`: an external request matching here gets 404.
+    pub internal: bool,
     /// Pre-resolved `Server:` header value bytes for this location, derived
     /// from the effective `server_tokens` (location → server → http →
     /// default `On`). Static `return` responses bake these in at prepare;
@@ -801,6 +803,7 @@ pub struct PreparedRegexLocation {
     pub error_logs: &'static [PreparedErrorLog],
     pub log_not_found: bool,
     pub recursive_error_pages: bool,
+    pub internal: bool,
     pub server_header: &'static [u8],
     pub access_logs: &'static [PreparedAccessLog],
     pub auth_basic: PreparedAuthBasic,
@@ -832,6 +835,7 @@ pub struct MatchedLocation<'a> {
     pub error_logs: &'static [PreparedErrorLog],
     pub log_not_found: bool,
     pub recursive_error_pages: bool,
+    pub internal: bool,
     pub server_header: &'static [u8],
     pub access_logs: &'static [PreparedAccessLog],
     pub auth_basic: PreparedAuthBasic,
@@ -860,6 +864,7 @@ impl<'a> MatchedLocation<'a> {
             error_logs: loc.error_logs,
             log_not_found: loc.log_not_found,
             recursive_error_pages: loc.recursive_error_pages,
+            internal: loc.internal,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
             auth_basic: loc.auth_basic,
@@ -892,6 +897,7 @@ impl<'a> MatchedLocation<'a> {
             error_logs: loc.error_logs,
             log_not_found: loc.log_not_found,
             recursive_error_pages: loc.recursive_error_pages,
+            internal: loc.internal,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
             auth_basic: loc.auth_basic,

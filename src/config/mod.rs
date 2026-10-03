@@ -801,7 +801,6 @@ pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "types", "charset_map"];
 pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
-        Some("internal") => "the location would be reachable by external requests",
         Some("limit_except") => "the method restrictions inside it would not apply",
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
@@ -1434,16 +1433,18 @@ mod tests {
 
     #[test]
     fn access_restrictions_ruxen_cant_enforce_are_rejected() {
-        let err =
-            unenforced_err("http { server { listen 80; location /a/ { internal; return 200; } } }");
-        assert_eq!(
-            err,
-            "\"internal\" is not supported yet, and ignoring it is unsafe: \
-             the location would be reachable by external requests"
-        );
-        unenforced_err(
+        let err = unenforced_err(
             "http { server { listen 80; location / { limit_except GET { deny all; } } } }",
         );
+        assert_eq!(
+            err,
+            "\"limit_except\" is not supported yet, and ignoring it is unsafe: \
+             the method restrictions inside it would not apply"
+        );
+        // `internal` is enforced now (phase::process).
+        let cfg =
+            parse("http { server { listen 80; location /a/ { internal; return 200; } } }").unwrap();
+        assert!(cfg.servers[0].locations[0].internal);
         let tls = |directive: &str| {
             format!(
                 "http {{ {directive} server {{ listen 443 ssl; ssl_certificate c.pem; \

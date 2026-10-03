@@ -331,6 +331,7 @@ pub(crate) fn parse_location_block(
     let mut error_logs: Option<Vec<ErrorLog>> = None;
     let mut log_not_found: Option<bool> = None;
     let mut recursive_error_pages: Option<bool> = None;
+    let mut internal = false;
     let mut server_tokens: Option<ServerTokens> = None;
     let mut autoindex: Option<bool> = None;
     let mut autoindex_exact_size: Option<bool> = None;
@@ -439,6 +440,7 @@ pub(crate) fn parse_location_block(
                         error_logs,
                         log_not_found,
                         recursive_error_pages,
+                        internal,
                         server_tokens: effective_server_tokens,
                         autoindex: effective_autoindex,
                         autoindex_exact_size: effective_autoindex_exact_size,
@@ -544,6 +546,15 @@ pub(crate) fn parse_location_block(
                 error_logs
                     .get_or_insert_with(Vec::new)
                     .push(parse_error_log_args(&args[1..])?);
+            }
+            ("internal", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::BadValue {
+                        what: "internal",
+                        got: args[1..].join(" "),
+                    });
+                }
+                internal = true;
             }
             ("recursive_error_pages", Terminator::Semi) => {
                 if recursive_error_pages.is_some() {
@@ -916,6 +927,7 @@ pub(crate) fn parse_location_block(
                 | "error_log"
                 | "log_not_found"
                 | "recursive_error_pages"
+                | "internal"
                 | "server_tokens"
                 | "autoindex"
                 | "autoindex_exact_size"
