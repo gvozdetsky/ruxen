@@ -571,7 +571,10 @@ fn process_with_meta_inner(
     // `ngx_http_internal_redirect`; the counter is `r->uri_changes`. We
     // bound at MAX_REROUTES to guarantee termination on cyclic configs
     // (`try_files / =404` pointing at a URI that re-triggers try_files).
-    for _ in 0..MAX_REROUTES {
+    for hop in 0..MAX_REROUTES {
+        // nginx's `r->internal`: set by any internal redirect (an entry
+        // reroute, or a later hop: rewrite, error_page, try_files, index).
+        let internal_request = !refusing || hop > 0;
         let loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
                 Some(loc) => loc,
@@ -642,6 +645,11 @@ fn process_with_meta_inner(
             error_logs: loc.error_logs,
             log_not_found: loc.log_not_found,
         };
+        if loc.internal && !internal_request {
+            // ngx_http_core_find_config_phase: an `internal` location is
+            // not found for an external request.
+            return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+        }
         if let Some(target) = loc.auto_redirect_to {
             let args = current_args
                 .as_deref()

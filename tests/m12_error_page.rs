@@ -344,3 +344,38 @@ http {
     assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
     assert_ne!(body(&resp), b"err page");
 }
+
+/// `internal;` locations answer 404 to external requests and serve
+/// internal redirects (rewrite, error_page, try_files), as in nginx. The
+/// directive used to fail the config (fail-closed until it was enforced).
+#[test]
+fn m12_internal_locations() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location /int/ { internal; return 200 "internal"; }
+    location /rw { rewrite ^ /int/rw last; }
+    location /ep { error_page 404 /int/ep; return 404; }
+    location /tf { try_files /no-such-file /int/tf; }
+  }
+}
+"#;
+    let (_guard, port) = spawn_server(conf);
+    let resp = http_get(port, "/int/x");
+    assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
+    assert_ne!(body(&resp), b"internal");
+
+    let resp = http_get(port, "/rw");
+    assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
+    assert_eq!(body(&resp), b"internal");
+
+    let resp = http_get(port, "/ep");
+    assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
+    assert_eq!(body(&resp), b"internal");
+
+    let resp = http_get(port, "/tf");
+    assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
+    assert_eq!(body(&resp), b"internal");
+}

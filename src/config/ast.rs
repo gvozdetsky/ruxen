@@ -598,6 +598,9 @@ pub struct Location {
     pub log_not_found: Option<bool>,
     /// Location-scope `recursive_error_pages`. `None` inherits from server.
     pub recursive_error_pages: Option<bool>,
+    /// `internal;`: only internal redirects (rewrite, error_page,
+    /// try_files, index, X-Accel-Redirect) may land here.
+    pub internal: bool,
     /// Location-scope `server_tokens`. `None` inherits from server.
     pub server_tokens: Option<ServerTokens>,
     /// Location-scope `autoindex on|off;`. `None` inherits from server.
