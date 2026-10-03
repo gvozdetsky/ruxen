@@ -229,3 +229,41 @@ fn zero_means_unlimited() {
     );
     assert!(resp.ends_with("read"));
 }
+
+/// Refusing a body by its Content-Length while the client is still sending
+/// it: ruxen keeps reading (and discarding) the upload until the client is
+/// done, as nginx's lingering close, so the client's send completes and it
+/// reads the 413. It used to close with unread input, and the kernel's RST
+/// failed the client's send (and, off loopback, could lose the response).
+#[test]
+fn refused_upload_is_drained_not_reset() {
+    let server = start(
+        "client_max_body_size 1k;\n\
+         server { listen 127.0.0.1:%%PORT%%; location / { return 200 \"ok\"; } }",
+    );
+    let len = 20 * 1024 * 1024;
+    let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        s,
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\n\r\n"
+    )
+    .unwrap();
+    let mut writer = s.try_clone().unwrap();
+    let upload = std::thread::spawn(move || {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut sent = 0;
+        while sent < len {
+            writer.write_all(&chunk)?;
+            sent += chunk.len();
+        }
+        // Done sending: the server sees EOF and closes.
+        writer.shutdown(std::net::Shutdown::Write)
+    });
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    let sent = upload.join().unwrap();
+    assert!(sent.is_ok(), "upload failed: {sent:?}");
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+}

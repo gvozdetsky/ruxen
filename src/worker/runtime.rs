@@ -1629,6 +1629,10 @@ pub(crate) async fn handle<S: ConnIo>(
                                     conn_log!(),
                                 )
                                 .await;
+                                // The client is likely still sending the
+                                // body: let it, so it gets the 413 (nginx's
+                                // lingering close; not for 400s, as nginx).
+                                Box::pin(lingering_close(stream, &mut *scratch)).await;
                                 return;
                             }
                             let body_start = base + req.consumed;
@@ -1684,9 +1688,11 @@ pub(crate) async fn handle<S: ConnIo>(
                                     (decoded.consumed_initial, decoded.raw_consumed)
                                 }
                                 Err(error) => {
-                                    let response = match error {
-                                        ChunkedBodyError::TooLarge => &http.entity_too_large,
-                                        ChunkedBodyError::Invalid => &http.bad_request,
+                                    let too_large = matches!(error, ChunkedBodyError::TooLarge);
+                                    let response = if too_large {
+                                        &http.entity_too_large
+                                    } else {
+                                        &http.bad_request
                                     };
                                     reject_request(
                                         stream,
@@ -1697,6 +1703,9 @@ pub(crate) async fn handle<S: ConnIo>(
                                         conn_log!(),
                                     )
                                     .await;
+                                    if too_large {
+                                        Box::pin(lingering_close(stream, &mut *scratch)).await;
+                                    }
                                     return;
                                 }
                             }
