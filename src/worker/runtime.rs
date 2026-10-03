@@ -286,6 +286,9 @@ async fn settle_proxy_response(
         return (response, process_meta);
     };
 
+    // The first pass is inline (an `async fn` layer here costs on the
+    // proxy hot path); later passes, after an internal redirect, are in
+    // `settle_redirected`.
     let redirects = plan.response.redirects;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
@@ -303,8 +306,10 @@ async fn settle_proxy_response(
             &report.failures,
         );
     }
-    let upstream_resp = {
-        let ctx = phase::RequestCtx {
+    let upstream_resp = if error_pages.is_empty() {
+        upstream_resp
+    } else {
+        let pass_ctx = phase::RequestCtx {
             upstream_states: &report.states,
             ..*ctx
         };
@@ -313,27 +318,55 @@ async fn settle_proxy_response(
             error_pages,
             recursive_error_pages,
             http,
-            &ctx,
+            &pass_ctx,
             &process_meta,
             server_bytes,
         )
     };
-    if let Response::Reroute(rr) = upstream_resp {
+    let (reroute, as_get) = match upstream_resp {
         // `proxy_intercept_errors` or an `error_page` for the proxy's own
-        // 502/504: the error page still sees the attempts in
-        // `$upstream_*`, as in nginx.
-        let ctx = phase::RequestCtx {
-            upstream_states: &report.states,
-            ..*ctx
-        };
-        let (resp2, mut meta2) = phase::process_with_meta_from_reroute(http, &ctx, url_scratch, rr);
-        meta2.upstream_states = report.states;
-        return (resp2, meta2);
-    }
+        // 502/504.
+        Response::Reroute(reroute) => (reroute, false),
+        // nginx's ngx_http_upstream_process_headers: the response is dropped
+        // and the request redirected internally, as a GET.
+        _ if report.accel_redirect.is_some() => (
+            accel_redirect_reroute(report.accel_redirect.take().unwrap_or_default()),
+            !matches!(ctx.method, Method::Head),
+        ),
+        upstream_resp => {
+            return finish_proxy_response(
+                upstream_resp,
+                report,
+                redirects,
+                http,
+                ctx,
+                process_meta,
+            );
+        }
+    };
+    // Cold. Boxed so its state doesn't grow every connection's future.
+    Box::pin(settle_redirected(
+        http,
+        ctx,
+        url_scratch,
+        reroute,
+        report.states,
+        as_get,
+    ))
+    .await
+}
 
-    // Apply the proxy location's `add_header` directives now that the
-    // upstream headers are visible to `$upstream_http_*` / `$upstream_cookie_*`.
-    let mut process_meta = process_meta;
+/// The upstream response goes to the client: apply `proxy_redirect` and
+/// the location's `add_header` / `add_trailer` / `expires`, with the
+/// upstream headers visible to `$upstream_http_*` / `$upstream_cookie_*`.
+fn finish_proxy_response(
+    upstream_resp: Response,
+    mut report: crate::proxy::ProxyReport,
+    redirects: &'static [PreparedRedirect],
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    mut process_meta: phase::ProcessMeta,
+) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
     // nginx rewrites Location / Refresh while processing the upstream
     // header, before the add_header filter sees the response.
@@ -358,6 +391,173 @@ async fn settle_proxy_response(
     );
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
+}
+
+enum PassOutcome {
+    /// The response to send, with its metadata.
+    Done(Response, phase::ProcessMeta),
+    /// The request is redirected internally: an error page (intercept or
+    /// the proxy's own 502/504) or an upstream X-Accel-Redirect.
+    Redirect {
+        reroute: phase::Reroute,
+        states: Vec<crate::proxy::UpstreamState>,
+        as_get: bool,
+    },
+}
+
+/// One upstream pass: run the plan, then either finish the response
+/// (proxy_redirect, add_header) or say where the request is redirected.
+/// `as_get`: the request already went through an X-Accel-Redirect.
+async fn run_proxy_pass(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    plan: crate::proxy::ProxyPlan,
+    process_meta: phase::ProcessMeta,
+    as_get: bool,
+) -> PassOutcome {
+    let redirects = plan.response.redirects;
+    let server_bytes = plan.server_bytes;
+    let recursive_error_pages = plan.response.recursive_error_pages;
+    let error_pages: &'static [PreparedErrorPage] = if plan.in_error_page {
+        &[]
+    } else {
+        plan.response.error_pages
+    };
+    let mut report = crate::proxy::ProxyReport::default();
+    let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
+    if !report.failures.is_empty() {
+        write_upstream_error_log(
+            &process_meta.log,
+            &ErrorLogRequest::new(&pass_request(ctx, as_get), process_meta.server_name),
+            &report.failures,
+        );
+    }
+    let upstream_resp = if error_pages.is_empty() {
+        upstream_resp
+    } else {
+        let pass_ctx = phase::RequestCtx {
+            upstream_states: &report.states,
+            ..pass_request(ctx, as_get)
+        };
+        intercept_proxy_error(
+            upstream_resp,
+            error_pages,
+            recursive_error_pages,
+            http,
+            &pass_ctx,
+            &process_meta,
+            server_bytes,
+        )
+    };
+    match upstream_resp {
+        // `proxy_intercept_errors` or an `error_page` for the proxy's own
+        // 502/504.
+        Response::Reroute(reroute) => PassOutcome::Redirect {
+            reroute,
+            states: report.states,
+            as_get,
+        },
+        // nginx's ngx_http_upstream_process_headers: the response is dropped
+        // and the request redirected internally, as a GET.
+        _ if report.accel_redirect.is_some() => PassOutcome::Redirect {
+            reroute: accel_redirect_reroute(report.accel_redirect.take().unwrap_or_default()),
+            states: report.states,
+            as_get: !matches!(ctx.method, Method::Head),
+        },
+        upstream_resp => {
+            let (response, process_meta) =
+                finish_proxy_response(upstream_resp, report, redirects, http, ctx, process_meta);
+            PassOutcome::Done(response, process_meta)
+        }
+    }
+}
+
+/// A proxied request redirected internally: process the target, and if it
+/// proxies again, run that pass too. The attempts of every pass stay in
+/// `$upstream_*`, as nginx keeps them across internal redirects. Bounded
+/// like the reroute loop in `phase` (nginx's `uri_changes`).
+async fn settle_redirected(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    mut reroute: phase::Reroute,
+    mut states: Vec<crate::proxy::UpstreamState>,
+    mut as_get: bool,
+) -> (Response, phase::ProcessMeta) {
+    for _ in 0..phase::MAX_REROUTES {
+        let pass_ctx = phase::RequestCtx {
+            upstream_states: &states,
+            ..pass_request(ctx, as_get)
+        };
+        let (response, mut process_meta) =
+            phase::process_with_meta_from_reroute(http, &pass_ctx, url_scratch, reroute);
+        let Response::Proxy(plan) = response else {
+            process_meta.upstream_states = states;
+            return (response, process_meta);
+        };
+        match run_proxy_pass(http, ctx, plan, process_meta, as_get).await {
+            PassOutcome::Done(response, mut meta) => {
+                states.append(&mut meta.upstream_states);
+                meta.upstream_states = states;
+                return (response, meta);
+            }
+            PassOutcome::Redirect {
+                reroute: next,
+                states: mut more,
+                as_get: next_as_get,
+            } => {
+                states.append(&mut more);
+                reroute = next;
+                as_get = next_as_get;
+            }
+        }
+    }
+    // nginx: "rewrite or internal redirection cycle" → 500.
+    let response = Response::Owned(http::build_response_for_method(
+        500,
+        "Internal Server Error\n",
+        ctx.method,
+        phase::default_server_header(http),
+    ));
+    (response, phase::ProcessMeta::default())
+}
+
+/// The request as a later upstream pass sees it: a GET after an
+/// X-Accel-Redirect (HEAD stays HEAD).
+fn pass_request<'a>(ctx: &phase::RequestCtx<'a>, as_get: bool) -> phase::RequestCtx<'a> {
+    if as_get {
+        phase::RequestCtx {
+            method: Method::Get,
+            method_bytes: b"GET",
+            ..*ctx
+        }
+    } else {
+        *ctx
+    }
+}
+
+/// An `X-Accel-Redirect` value as an internal redirect: `@name` jumps to a
+/// named location, anything else is a URI with optional `?args`.
+fn accel_redirect_reroute(target: Vec<u8>) -> phase::Reroute {
+    let (target, args) = if target.first() == Some(&b'@') {
+        (phase::RerouteTarget::Named(target), None)
+    } else {
+        match target.iter().position(|&b| b == b'?') {
+            Some(i) => (
+                phase::RerouteTarget::Uri(target[..i].to_vec()),
+                Some(target[i + 1..].to_vec()),
+            ),
+            None => (phase::RerouteTarget::Uri(target), None),
+        }
+    };
+    phase::Reroute {
+        target,
+        args,
+        error_page_status: None,
+        enters_error_page: false,
+        preserved_location: None,
+        preserved_www_authenticate: Vec::new(),
+    }
 }
 
 async fn run_post_action(

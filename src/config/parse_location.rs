@@ -350,6 +350,7 @@ pub(crate) fn parse_location_block(
     let mut proxy_pass_request_headers: Option<bool> = None;
     let mut proxy_pass_request_body: Option<bool> = None;
     let mut proxy_set_body: Option<Vec<ValuePart>> = None;
+    let mut proxy_ignore_headers: Option<Vec<String>> = None;
     let mut proxy_connect_timeout_ms: Option<u64> = None;
     let mut proxy_read_timeout_ms: Option<u64> = None;
     let mut proxy_send_timeout_ms: Option<u64> = None;
@@ -459,6 +460,7 @@ pub(crate) fn parse_location_block(
                         proxy_pass_request_headers,
                         proxy_pass_request_body,
                         proxy_set_body,
+                        proxy_ignore_headers,
                         proxy_connect_timeout_ms,
                         proxy_read_timeout_ms,
                         proxy_send_timeout_ms,
@@ -725,6 +727,12 @@ pub(crate) fn parse_location_block(
                 proxy_pass_request_headers =
                     Some(parse_on_off_args(&args[1..], "proxy_pass_request_headers")?);
             }
+            ("proxy_ignore_headers", Terminator::Semi) => {
+                if proxy_ignore_headers.is_some() {
+                    return Err(Error::Duplicate("proxy_ignore_headers"));
+                }
+                proxy_ignore_headers = Some(parse_proxy_ignore_headers(&args[1..])?);
+            }
             ("proxy_set_body", Terminator::Semi) => {
                 if proxy_set_body.is_some() {
                     return Err(Error::Duplicate("proxy_set_body"));
@@ -946,6 +954,7 @@ pub(crate) fn parse_location_block(
                 | "proxy_pass_request_headers"
                 | "proxy_pass_request_body"
                 | "proxy_set_body"
+                | "proxy_ignore_headers"
                 | "proxy_connect_timeout"
                 | "proxy_read_timeout"
                 | "proxy_send_timeout"
@@ -1256,4 +1265,37 @@ pub(crate) fn parse_add_header_args(args: &[String]) -> Result<AddHeader, Error>
         value,
         always,
     })
+}
+
+/// `proxy_ignore_headers`: the fields nginx accepts there. Only
+/// X-Accel-Redirect changes anything in ruxen (no cache, no X-Accel-*
+/// buffering or rate controls), the others are already not acted on.
+pub(crate) fn parse_proxy_ignore_headers(args: &[String]) -> Result<Vec<String>, Error> {
+    const FIELDS: &[&str] = &[
+        "x-accel-redirect",
+        "x-accel-expires",
+        "x-accel-limit-rate",
+        "x-accel-buffering",
+        "x-accel-charset",
+        "expires",
+        "cache-control",
+        "set-cookie",
+        "vary",
+    ];
+    if args.is_empty() {
+        return Err(Error::MissingArg("proxy_ignore_headers"));
+    }
+    args.iter()
+        .map(|a| {
+            let lower = a.to_ascii_lowercase();
+            if FIELDS.contains(&lower.as_str()) {
+                Ok(lower)
+            } else {
+                Err(Error::BadValue {
+                    what: "proxy_ignore_headers",
+                    got: a.clone(),
+                })
+            }
+        })
+        .collect()
 }

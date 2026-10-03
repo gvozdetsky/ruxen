@@ -599,6 +599,8 @@ http {{
         listen %%PORT%%;
         location / {{
             proxy_pass http://127.0.0.1:{};
+            # Hidden, not followed (that's m61).
+            proxy_ignore_headers X-Accel-Redirect;
             add_header X-Up-Server $upstream_http_server;
             add_header X-Up-Date $upstream_http_date;
             add_header X-Up-Accel $upstream_http_x_accel_expires;

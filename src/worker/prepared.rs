@@ -396,6 +396,9 @@ pub struct ProxyResponseRules {
     /// The location's `recursive_error_pages`, for those and for
     /// `proxy_intercept_errors`.
     pub recursive_error_pages: bool,
+    /// `proxy_ignore_headers X-Accel-Redirect`: forward the response
+    /// instead of following the header.
+    pub ignore_accel_redirect: bool,
 }
 
 /// One prepared `proxy_redirect` rule.
@@ -496,6 +499,7 @@ pub(crate) struct ProxyEffective {
     pub pass_request_headers: bool,
     pub pass_request_body: bool,
     pub set_body: Option<&'static [PreparedValuePart]>,
+    pub ignore_accel_redirect: bool,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
@@ -530,6 +534,7 @@ impl ProxyEffective {
             pass_request_headers: true,
             pass_request_body: true,
             set_body: None,
+            ignore_accel_redirect: false,
             connect_timeout_ms: 60_000,
             read_timeout_ms: 60_000,
             send_timeout_ms: 60_000,

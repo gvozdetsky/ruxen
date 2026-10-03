@@ -744,7 +744,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_force_ranges",
     "proxy_pass_header",
     "proxy_hide_header",
-    "proxy_ignore_headers",
     "proxy_cookie_domain",
     "proxy_cookie_path",
     "proxy_cookie_flags",

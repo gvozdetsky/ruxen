@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 /// `NGX_HTTP_MAX_URI_CHANGES` (default 10) for the same purpose; we pick
 /// 8 as a slightly tighter budget since our reroute surface is narrower
 /// (no rewrite engine, only try_files fallback).
-const MAX_REROUTES: u32 = 8;
+pub(crate) const MAX_REROUTES: u32 = 8;
 
 /// Planned nginx-compatible phase list.
 ///
@@ -1003,7 +1003,7 @@ fn select_listen<'h>(http: &'h PreparedHttp, listen_index: usize) -> Option<&'h 
     http.listens.get(listen_index)
 }
 
-fn default_server_header(http: &PreparedHttp) -> &'static [u8] {
+pub(crate) fn default_server_header(http: &PreparedHttp) -> &'static [u8] {
     http.listens
         .first()
         .and_then(|listen| listen.servers.get(listen.default_server))
