@@ -58,6 +58,7 @@ pub(crate) async fn write_access_logs(
     epoch_secs: u64,
     epoch_ms: u16,
     tls: Option<&crate::tls::HandshakeInfo>,
+    proxy_protocol: Option<&crate::proxy_protocol::ProxyHeader>,
     http: &'static PreparedHttp,
     // The request's processing result, for `$proxy_host` and the
     // upstream variables; `None` for a request refused before routing.
@@ -132,6 +133,7 @@ pub(crate) async fn write_access_logs(
         upstream_states: meta.map_or(&[][..], |m| &m.upstream_states),
         sent_trailers: &[],
         tls,
+        proxy_protocol,
     };
 
     for log in logs.iter() {
@@ -200,6 +202,7 @@ pub(crate) struct ConnLogCtx<'a> {
     pub connection_requests: u64,
     pub connection_start: Instant,
     pub tls: Option<&'a crate::tls::HandshakeInfo>,
+    pub proxy_protocol: Option<&'a crate::proxy_protocol::ProxyHeader>,
 }
 
 /// Send a canned error for a request refused before a server is chosen (a
@@ -268,6 +271,7 @@ async fn reject_request<S: ConnIo>(
         now.as_secs(),
         now.subsec_millis() as u16,
         conn.tls,
+        conn.proxy_protocol,
         http,
         None,
         None,
@@ -714,6 +718,7 @@ async fn run_post_action(
             base_ctx.epoch_secs,
             base_ctx.epoch_ms,
             base_ctx.tls,
+            base_ctx.proxy_protocol,
             http,
             Some(&post_meta),
             final_uri(&post_meta, url_scratch),
@@ -911,6 +916,19 @@ pub(crate) fn spawn_connection(
     state: Arc<RuntimeState>,
     connection_id: u64,
 ) {
+    if prepared.proxy_protocol {
+        // Cold: `listen … proxy_protocol`.
+        monoio::spawn(handle_proxy_protocol(
+            prepared,
+            stream,
+            peer_addr,
+            listen_index,
+            http,
+            state,
+            connection_id,
+        ));
+        return;
+    }
     match &prepared.tls {
         None => {
             monoio::spawn(handle_plain(
@@ -920,6 +938,7 @@ pub(crate) fn spawn_connection(
                 http,
                 state,
                 connection_id,
+                None,
             ));
         }
         Some(acceptor) => {
@@ -932,7 +951,65 @@ pub(crate) fn spawn_connection(
                 http,
                 state,
                 connection_id,
+                None,
             ));
+        }
+    }
+}
+
+/// `listen … proxy_protocol`: read the PROXY header (within the default
+/// server's `client_header_timeout`), then serve the connection as usual.
+/// A connection without a valid header is closed with an error-log line,
+/// as nginx does ("broken header: …").
+async fn handle_proxy_protocol(
+    prepared: &'static PreparedListen,
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    listen_index: usize,
+    http: &'static PreparedHttp,
+    state: Arc<RuntimeState>,
+    connection_id: u64,
+) {
+    let server = &prepared.servers[prepared.default_server];
+    let header = match crate::proxy_protocol::read(&stream, server.timeouts.header).await {
+        Ok(header) => header,
+        Err(reason) => {
+            write_worker_log(
+                server.error_logs,
+                ErrorLogLevel::Error,
+                &format!(
+                    "*{connection_id} {reason} while reading PROXY protocol, client: {}",
+                    peer_addr.ip()
+                ),
+            );
+            return;
+        }
+    };
+    match &prepared.tls {
+        None => {
+            handle_plain(
+                stream,
+                peer_addr,
+                listen_index,
+                http,
+                state,
+                connection_id,
+                Some(header),
+            )
+            .await
+        }
+        Some(acceptor) => {
+            handle_tls(
+                stream,
+                acceptor.clone(),
+                peer_addr,
+                listen_index,
+                http,
+                state,
+                connection_id,
+                Some(header),
+            )
+            .await
         }
     }
 }
@@ -1153,6 +1230,7 @@ pub(crate) async fn handle_plain(
     http: &'static PreparedHttp,
     state: Arc<RuntimeState>,
     connection_id: u64,
+    proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
 ) {
     let _guard = ConnectionGuard(state.clone());
     handle(
@@ -1161,6 +1239,7 @@ pub(crate) async fn handle_plain(
         listen_index,
         None,
         None,
+        proxy_protocol.as_ref(),
         http,
         state,
         connection_id,
@@ -1176,6 +1255,7 @@ pub(crate) async fn handle_tls(
     http: &'static PreparedHttp,
     state: Arc<RuntimeState>,
     connection_id: u64,
+    proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
 ) {
     let _guard = ConnectionGuard(state.clone());
     let (mut tls_stream, info) = match crate::tls::accept_with_timeout(
@@ -1211,6 +1291,7 @@ pub(crate) async fn handle_tls(
         listen_index,
         sni.as_deref(),
         Some(&info),
+        proxy_protocol.as_ref(),
         http,
         state,
         connection_id,
@@ -1227,6 +1308,7 @@ pub(crate) async fn handle<S: ConnIo>(
     listen_index: usize,
     sni: Option<&[u8]>,
     tls: Option<&crate::tls::HandshakeInfo>,
+    proxy_protocol: Option<&crate::proxy_protocol::ProxyHeader>,
     http: &'static PreparedHttp,
     state: Arc<RuntimeState>,
     connection_id: u64,
@@ -1307,6 +1389,7 @@ pub(crate) async fn handle<S: ConnIo>(
                 connection_requests: request_count,
                 connection_start,
                 tls,
+                proxy_protocol,
             }
         };
     }
@@ -1674,6 +1757,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             body_len,
                             body_file,
                             tls,
+                            proxy_protocol,
                             refuse,
                         };
                         let (response, mut process_meta) =
@@ -1951,6 +2035,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 epoch_secs,
                                 epoch_ms,
                                 tls,
+                                proxy_protocol,
                                 http,
                                 Some(&process_meta),
                                 final_uri(&process_meta, url_scratch),

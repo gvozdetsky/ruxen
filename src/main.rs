@@ -25,6 +25,7 @@ mod http;
 mod http_date;
 mod phase;
 mod proxy;
+mod proxy_protocol;
 mod tls;
 mod tls_certs;
 mod tls_session;

@@ -241,10 +241,6 @@ fn is_nginx_variable(name: &str) -> bool {
         "proxy_internal_body_length",
         "proxy_internal_chunked",
         "proxy_port",
-        "proxy_protocol_addr",
-        "proxy_protocol_port",
-        "proxy_protocol_server_addr",
-        "proxy_protocol_server_port",
         "quic",
         "realip_remote_addr",
         "realip_remote_port",
@@ -266,7 +262,7 @@ fn is_nginx_variable(name: &str) -> bool {
         "upstream_cache_status",
         "upstream_cache_last_modified",
     ];
-    const PREFIXES: &[&str] = &["ssl_", "upstream_trailer_", "geoip_"];
+    const PREFIXES: &[&str] = &["ssl_", "upstream_trailer_", "geoip_", "proxy_protocol_tlv_"];
     NAMES.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
@@ -280,6 +276,10 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"request_uri" => Variable::RequestUri,
         b"request_method" => Variable::RequestMethod,
         b"request" => Variable::Request,
+        b"proxy_protocol_addr" => Variable::ProxyProtocolAddr,
+        b"proxy_protocol_port" => Variable::ProxyProtocolPort,
+        b"proxy_protocol_server_addr" => Variable::ProxyProtocolServerAddr,
+        b"proxy_protocol_server_port" => Variable::ProxyProtocolServerPort,
         b"server_protocol" => Variable::ServerProtocol,
         b"host" => Variable::Host,
         b"server_name" => Variable::ServerName,

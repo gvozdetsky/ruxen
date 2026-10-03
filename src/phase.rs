@@ -139,6 +139,9 @@ pub struct RequestCtx<'a> {
     /// `None` for plain-HTTP connections. Drives `$scheme` and `$ssl_*`
     /// variable rendering; otherwise untouched on the hot path.
     pub tls: Option<&'a crate::tls::HandshakeInfo>,
+    /// The connection's PROXY protocol header, if its listen has
+    /// `proxy_protocol`.
+    pub proxy_protocol: Option<&'a crate::proxy_protocol::ProxyHeader>,
     /// The worker already refused the request with this status (400 for an
     /// invalid Host, 400/501 for Transfer-Encoding) and didn't read its
     /// body. `process` answers it at the server level, where the server's
@@ -1504,6 +1507,7 @@ mod tests {
             body_len: 0,
             body_file: &[],
             tls: None,
+            proxy_protocol: None,
             refuse: None,
         }
     }
