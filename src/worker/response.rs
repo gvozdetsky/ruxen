@@ -681,8 +681,12 @@ pub(crate) fn apply_proxy_add_headers(
     if meta.proxy_add_headers.is_empty() && meta.proxy_add_trailers.is_empty() && !needs_expires {
         return response;
     }
-    let Response::Owned(bytes) = response else {
-        return response;
+    let bytes = match response {
+        Response::Owned(bytes) => bytes,
+        // A 502/504 the proxy produced itself: `add_header ... always`
+        // applies to it too.
+        Response::Prebuilt(bytes) => bytes.to_vec(),
+        other => return other,
     };
     // `$upstream_http_*` read the upstream's own header lines, which still
     // include the ones hidden from the client (Server, Date, X-Accel-*).
@@ -715,6 +719,34 @@ pub(crate) fn apply_proxy_add_headers(
         out = inject_add_trailers(out, meta.proxy_add_trailers, &render_ctx);
     }
     Response::Owned(out)
+}
+
+/// A 502/504 the proxy produced itself (every attempt failed) goes through
+/// the location's `error_page`, as nginx's special response handler does;
+/// `proxy_intercept_errors` is only about responses from the upstream.
+pub(crate) fn intercept_proxy_error(
+    response: Response,
+    error_pages: &[PreparedErrorPage],
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    server: &'static [u8],
+) -> Response {
+    if error_pages.is_empty() {
+        return response;
+    }
+    let Response::Prebuilt(bytes) = response else {
+        return response;
+    };
+    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(bytes), &[]);
+    maybe_intercept_error_page(
+        Response::Prebuilt(bytes),
+        error_pages,
+        ctx,
+        &render_ctx,
+        false,
+        server,
+    )
 }
 
 /// The variable context for rendering against a proxied response

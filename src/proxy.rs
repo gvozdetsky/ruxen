@@ -128,6 +128,9 @@ pub struct ProxyPlan {
     /// classification granularity, so we precompute this against the
     /// raw method bytes in the worker before building the plan.
     pub method_idempotent: bool,
+    /// The proxied location was reached as an error page, so its own
+    /// `error_page` doesn't apply again (no `recursive_error_pages`).
+    pub in_error_page: bool,
     /// `proxy_intercept_errors on;` (M43): when `Some`, an upstream
     /// status that matches one of these rules is reflected back as a
     /// `Response::Reroute` instead of being forwarded to the client. The

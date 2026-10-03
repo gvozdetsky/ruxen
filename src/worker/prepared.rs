@@ -390,6 +390,9 @@ pub struct ProxyResponseRules {
     /// Default-hidden headers let through by `proxy_pass_header`, as
     /// `proxy::default_hidden_bit` bits.
     pub pass_mask: u16,
+    /// The location's `error_page` list, for a 502/504 the proxy itself
+    /// produces (nginx applies it without `proxy_intercept_errors`).
+    pub error_pages: &'static [PreparedErrorPage],
 }
 
 /// One prepared `proxy_redirect` rule.
@@ -506,6 +509,8 @@ pub(crate) struct ProxyEffective {
     /// (each list inherits on its own, as in nginx).
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    /// The location's `error_page` list (for the proxy's own 502/504).
+    pub error_pages: &'static [PreparedErrorPage],
 }
 
 impl ProxyEffective {
@@ -530,6 +535,7 @@ impl ProxyEffective {
             redirect: None,
             hide_headers: None,
             pass_headers: None,
+            error_pages: &[],
         }
     }
 }

@@ -189,3 +189,32 @@ fn access_log_renders_upstream_and_map_variables() {
         "{log}"
     );
 }
+
+/// When every attempt fails, the proxy's own 502 goes through the
+/// location's `error_page` (no `proxy_intercept_errors` needed) and gets
+/// `add_header ... always`, as in nginx. It used to be the built-in page.
+#[test]
+fn proxy_generated_errors_use_error_page_and_add_header_always() {
+    let dead = DeadPort::new();
+    let server = start(
+        "generated",
+        &format!(
+            "server {{ listen 127.0.0.1:%%PORT%%;\n\
+               add_header X-IP $upstream_addr always;\n\
+               location /plain {{ proxy_pass http://127.0.0.1:{dead}; }}\n\
+               location /paged {{ proxy_pass http://127.0.0.1:{dead}; error_page 502 /e; }}\n\
+               location = /e {{ return 200 \"page $upstream_addr|$upstream_status\"; }}\n\
+             }}",
+            dead = dead.port(),
+        ),
+    );
+    let peer = format!("127.0.0.1:{}", dead.port());
+
+    let resp = get(server.port, "/plain");
+    assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
+    assert!(resp.contains(&format!("\r\nX-IP: {peer}\r\n")), "{resp}");
+
+    let resp = get(server.port, "/paged");
+    assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
+    assert_eq!(body(&resp), format!("page {peer}|502"), "{resp}");
+}

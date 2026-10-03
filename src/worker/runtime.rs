@@ -274,6 +274,12 @@ async fn settle_proxy_response(
     };
 
     let redirects = plan.response.redirects;
+    let server_bytes = plan.server_bytes;
+    let error_pages: &'static [PreparedErrorPage] = if plan.in_error_page {
+        &[]
+    } else {
+        plan.response.error_pages
+    };
     let mut report = crate::proxy::ProxyReport::default();
     let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
     if !report.failures.is_empty() {
@@ -283,9 +289,24 @@ async fn settle_proxy_response(
             &report.failures,
         );
     }
+    let upstream_resp = {
+        let ctx = phase::RequestCtx {
+            upstream_states: &report.states,
+            ..*ctx
+        };
+        intercept_proxy_error(
+            upstream_resp,
+            error_pages,
+            http,
+            &ctx,
+            &process_meta,
+            server_bytes,
+        )
+    };
     if let Response::Reroute(rr) = upstream_resp {
-        // `proxy_intercept_errors`: the error page still sees the
-        // attempts in `$upstream_*`, as in nginx.
+        // `proxy_intercept_errors` or an `error_page` for the proxy's own
+        // 502/504: the error page still sees the attempts in
+        // `$upstream_*`, as in nginx.
         let ctx = phase::RequestCtx {
             upstream_states: &report.states,
             ..*ctx

@@ -641,6 +641,7 @@ pub(crate) fn run_location_handler(
                 || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
             response: proxy.response,
             method_idempotent: is_idempotent_method_bytes(req.method_bytes),
+            in_error_page,
             intercept,
         });
     }
