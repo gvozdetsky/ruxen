@@ -350,21 +350,22 @@ pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
     // duplicating the fd. Dropping `file` at the end closes the fd.
-    let mut file = std::fs::File::from(body.fd);
-    if body.offset != 0 && file.seek(SeekFrom::Start(body.offset)).is_err() {
-        return false;
-    }
-
+    // Positional reads: the fd may be a `dup` of an `alias` file's anchor,
+    // whose file offset is shared with every other dup of it.
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::from(body.fd);
+    let mut offset = body.offset;
     let mut remaining = body.len;
     let chunk = body.len.clamp(1, 65_536) as usize;
     let mut buf: Vec<u8> = vec![0u8; chunk];
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
-        let n = match file.read(&mut buf[..want]) {
+        let n = match file.read_at(&mut buf[..want], offset) {
             Ok(0) => return false,
             Ok(n) => n,
             Err(_) => return false,
         };
+        offset += n as u64;
         let (res, returned) = write_all_timed(
             stream,
             std::mem::take(&mut buf),
