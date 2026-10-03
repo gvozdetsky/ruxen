@@ -1717,49 +1717,12 @@ pub(crate) fn build_handler(
             is_regex_location,
         )?),
         Handler::Root { path, mapping } => {
-            // Canonicalize once to fail fast on a bad root path; the
-            // resolved inode will also be the one `openat2(RESOLVE_BENEATH)`
-            // is anchored to, so symlinks in the configured root path can't
-            // retarget the "beneath" set at runtime. nginx resolves root per
-            // request and starts with a missing one; ruxen can't, so say so.
-            let directive = match mapping {
-                PathMapping::Root => "root",
-                PathMapping::Alias => "alias",
-            };
-            let canonical = path.canonicalize().map_err(|e| {
-                format!(
-                    "{directive} \"{}\" is not accessible: realpath() failed ({}); \
-                     ruxen needs {directive} paths to exist at startup",
-                    path.display(),
-                    errno_text(&e)
-                )
-            })?;
+            // nginx resolves `root` per request and starts without it: a
+            // missing root is a 404 at request time. ruxen opens the root
+            // as an `openat2(RESOLVE_BENEATH)` anchor, at startup when it
+            // exists, else on first use (`PreparedRoot::fd`).
             let root: &'static Path = Box::leak(path.into_boxed_path());
-            let root_fd = {
-                use std::os::unix::fs::OpenOptionsExt;
-                use std::os::unix::io::IntoRawFd;
-                // No `O_DIRECTORY` — nginx allows `alias /some/file;` at
-                // exact locations, so the configured "root" can legally
-                // be a regular file. The resolver handles both shapes:
-                // dir becomes an `openat2` anchor, file is `dup`'d back
-                // out as the served fd when the URL-mapped rel is empty.
-                let flags = libc::O_CLOEXEC;
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(flags)
-                    .open(&canonical)
-                    .map_err(|e| {
-                        format!(
-                            "{directive} \"{}\" is not accessible: open() failed ({})",
-                            canonical.display(),
-                            errno_text(&e)
-                        )
-                    })?;
-                // `into_raw_fd` suppresses the `File::drop`, so the fd
-                // lives for process lifetime — paired with `PreparedHttp`
-                // being leaked.
-                f.into_raw_fd()
-            };
+            let root_fd = std::sync::atomic::AtomicI32::new(open_root(root).unwrap_or(-1));
             let path_mapping = match mapping {
                 PathMapping::Root => PreparedPathMapping::Root,
                 PathMapping::Alias => {

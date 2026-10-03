@@ -391,7 +391,12 @@ pub(crate) fn parse_location_block(
                             body: Vec::new(),
                         }
                     } else {
-                        return Err(Error::MissingArg("return or root/alias"));
+                        // nginx's default `root`: `html` under the prefix
+                        // (ruxen's working directory, set by `-p`).
+                        Handler::Root {
+                            path: PathBuf::from("html"),
+                            mapping: PathMapping::Root,
+                        }
                     };
                     // Propagate parent-location `server_tokens` into this
                     // location when this block didn't set its own — mirrors

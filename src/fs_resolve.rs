@@ -249,13 +249,17 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
     // requires a non-empty pathname (there's no `AT_EMPTY_PATH` knob in
     // `open_how.resolve`), so we `dup(2)` the cached root fd instead:
     // one syscall, no path walk, no race between stat and open.
+    let root_fd = match root.fd() {
+        Ok(fd) => fd,
+        Err(e) => return io_to_outcome(e),
+    };
     let fd = if rel.is_empty() {
-        match dup_fd(root.root_fd) {
+        match dup_fd(root_fd) {
             Ok(fd) => fd,
             Err(e) => return io_to_outcome(e),
         }
     } else {
-        match openat2_beneath(root.root_fd, rel) {
+        match openat2_beneath(root_fd, rel) {
             Ok(fd) => fd,
             Err(e) => return io_to_outcome(e),
         }
@@ -484,7 +488,7 @@ mod tests {
             root: Path::new("/srv"),
             // `AT_FDCWD` is fine for tests that only exercise the path
             // utilities below — none of them hit `openat2`.
-            root_fd: libc::AT_FDCWD,
+            root_fd: std::sync::atomic::AtomicI32::new(libc::AT_FDCWD),
             path_mapping: mapping,
             index: &[],
             autoindex: false,

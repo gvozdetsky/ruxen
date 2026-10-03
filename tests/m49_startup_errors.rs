@@ -125,31 +125,18 @@ fn test_mode_rejects_certificate_that_does_not_match_key() {
 }
 
 #[test]
-fn test_mode_rejects_missing_root() {
+fn missing_root_is_not_a_config_error() {
+    // nginx resolves `root` per request: a missing one is a 404 then, not
+    // a `-t` failure (see m58_lazy_root).
     let dir = TempDir::new("root");
     let missing = dir.path().join("no-such-dir");
     let conf = dir.write_conf(&format!(
         "server {{ listen 127.0.0.1:1; root {}; }}",
         missing.display()
     ));
-
-    let expected = format!(
-        "root \"{}\" is not accessible: realpath() failed (2: No such file or directory)",
-        missing.display()
-    );
     let out = run_expecting_exit(ruxen(&dir, &conf, &["-t"]));
-    assert_emerg(&out, &expected);
-
-    // Like nginx, a config-time `[emerg]` also goes to the `-e` log, which
-    // Test::Nginx reads after the test.
-    let errlog = dir.path().join("error.log");
-    let out = run_expecting_exit(ruxen(&dir, &conf, &["-e", errlog.to_str().unwrap()]));
-    assert_emerg(&out, &expected);
-    let logged = std::fs::read_to_string(&errlog).unwrap();
-    assert!(
-        logged.contains(&format!("ruxen: [emerg] {expected}")),
-        "error.log: {logged}"
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
 }
 
 #[test]
