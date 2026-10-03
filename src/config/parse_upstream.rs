@@ -353,6 +353,38 @@ pub(crate) fn parse_client_max_body_size_args(args: &[String]) -> Result<u64, Er
     })
 }
 
+/// `client_body_temp_path path [level1 [level2 [level3]]]`, validated as
+/// nginx's ngx_conf_set_path_slot (each level at least 1, ten digits in
+/// all). Returns the path; ruxen doesn't hash files into level
+/// directories.
+pub(crate) fn parse_temp_path_args(args: &[String]) -> Result<PathBuf, Error> {
+    let bad = || Error::BadValue {
+        what: "client_body_temp_path",
+        got: args.join(" "),
+    };
+    let (path, levels) = args
+        .split_first()
+        .ok_or(Error::MissingArg("client_body_temp_path"))?;
+    if path.is_empty() || levels.len() > 3 {
+        return Err(bad());
+    }
+    let mut digits = 0;
+    for level in levels {
+        match level.parse::<usize>() {
+            Ok(n) if n > 0 => digits += n,
+            _ => return Err(bad()),
+        }
+    }
+    if digits > 10 {
+        return Err(bad());
+    }
+    let trimmed = match path.strip_suffix('/') {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => path.as_str(),
+    };
+    Ok(PathBuf::from(trimmed))
+}
+
 /// Parse `proxy_next_upstream`'s flag list. Tokens come from a fixed set
 /// (mirrors nginx's `ngx_http_proxy_next_upstream_masks` table). `off` is
 /// a sentinel that turns the whole mask off and may not be combined with

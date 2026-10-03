@@ -113,6 +113,9 @@ pub struct HttpConfig {
     pub auth_delay_ms: Option<u64>,
     /// http-scope `client_max_body_size` in bytes. `None` means "not set".
     pub client_max_body_size: Option<u64>,
+    /// http-scope `client_body_temp_path` (the levels are accepted and not
+    /// used). `None`: a private directory per process.
+    pub client_body_temp_path: Option<PathBuf>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
