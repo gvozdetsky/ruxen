@@ -157,7 +157,8 @@ fn busy_port_is_one_emerg_and_no_pid_file() {
     let out = run_expecting_exit(cmd);
     assert_emerg(
         &out,
-        &format!("bind() to 127.0.0.1:{port} failed (98: Address already in use)"),
+        // The errno text is the libc's (glibc and musl word it differently).
+        &format!("bind() to 127.0.0.1:{port} failed (98: "),
     );
     assert!(!dir.path().join("ruxen.pid").exists());
 }

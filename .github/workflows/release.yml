@@ -1,9 +1,9 @@
 name: Release
 
-# Push a `v*` tag to test and build the Linux binary and publish a GitHub
+# Push a `v*` tag to test and build the Linux binaries and publish a GitHub
 # release with the notes from `.github/release-notes/<tag>.md`. Run it by
-# hand (workflow_dispatch) to build and upload the tarball as a workflow
-# artifact without creating a release. Publishing to crates.io is a
+# hand (workflow_dispatch) to build and upload the tarballs as workflow
+# artifacts without creating a release. Publishing to crates.io is a
 # separate, manual `cargo publish` (see CONTRIBUTING.md, "Releasing").
 
 on:
@@ -16,15 +16,41 @@ env:
 
 jobs:
   build:
-    # Built on 22.04 so the binary runs on glibc 2.35 and newer.
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc builds on 22.04, so they run on glibc 2.35 and newer.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            name: x86_64-linux-gnu
+          # Built natively on GitHub's ARM runner: no cross toolchain.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            name: aarch64-linux-gnu
+          # Static: runs on any x86_64 Linux, including Alpine and glibc
+          # older than 2.35.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            name: x86_64-linux-musl
+            musl: true
+    runs-on: ${{ matrix.os }}
+    env:
+      # monoio uses statx, which the libc crate declares for musl only when
+      # told the musl is 1.2.3+. The binary links the musl that ships with
+      # Rust's musl target (newer than that) statically; musl-tools only
+      # provides musl-gcc for aws-lc's C code.
+      RUST_LIBC_UNSTABLE_MUSL_V1_2_3: ${{ matrix.musl && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+          targets: ${{ matrix.target }}
+
+      - name: musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Version
         id: version
@@ -42,54 +68,78 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "dist=ruxen-${tag}-x86_64-linux-gnu" >> "$GITHUB_OUTPUT"
+          echo "dist=ruxen-${tag}-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
 
       # The tagged commit is released as tested here, whether or not it
-      # went through CI (a fix-up pushed with the tag, an amended commit).
+      # went through CI (a fix-up pushed with the tag, an amended commit),
+      # and on every target: CI runs on x86_64 glibc only.
       - name: Format
         run: cargo fmt --check
 
       - name: Test
-        run: cargo test --release --locked
+        run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Smoke test
         run: |
-          ./target/release/ruxen -V 2>&1 | grep -Fx "ruxen version: ruxen/${{ steps.version.outputs.version }}"
+          bin=target/${{ matrix.target }}/release/ruxen
+          file "$bin"
+          "$bin" -V 2>&1 | grep -Fx "ruxen version: ruxen/${{ steps.version.outputs.version }}"
           for conf in examples/*.conf; do
-            ./target/release/ruxen -t -c "$PWD/$conf"
+            "$bin" -t -c "$PWD/$conf"
           done
 
       - name: Package
         run: |
           dist=${{ steps.version.outputs.dist }}
           mkdir -p "$dist/examples"
-          cp target/release/ruxen README.md LICENSE "$dist/"
+          cp target/${{ matrix.target }}/release/ruxen README.md LICENSE "$dist/"
           cp examples/*.conf "$dist/examples/"
           tar czf "$dist.tar.gz" "$dist"
           # The same tarball under a version-less name, so
-          # releases/latest/download/ruxen-x86_64-linux-gnu.tar.gz (the
-          # README's install link) always points at the newest release.
-          cp "$dist.tar.gz" ruxen-x86_64-linux-gnu.tar.gz
-          sha256sum "$dist.tar.gz" ruxen-x86_64-linux-gnu.tar.gz > SHA256SUMS
-          cat SHA256SUMS
+          # releases/latest/download/ruxen-<target>.tar.gz (the README's
+          # install links) always points at the newest release.
+          cp "$dist.tar.gz" "ruxen-${{ matrix.name }}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.version.outputs.dist }}
           path: |
             ${{ steps.version.outputs.dist }}.tar.gz
-            ruxen-x86_64-linux-gnu.tar.gz
-            SHA256SUMS
+            ruxen-${{ matrix.name }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
 
       - name: GitHub release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag=${{ steps.version.outputs.tag }}
+          tag="${GITHUB_REF_NAME}"
           prerelease=()
           [[ "$tag" == *-* ]] && prerelease=(--prerelease)
           # Releases are immutable once published, so attach the assets to
@@ -97,5 +147,5 @@ jobs:
           gh release create "$tag" --draft "${prerelease[@]}" \
             --title "ruxen $tag" \
             --notes-file ".github/release-notes/$tag.md" \
-            ${{ steps.version.outputs.dist }}.tar.gz ruxen-x86_64-linux-gnu.tar.gz SHA256SUMS
+            dist/*.tar.gz dist/SHA256SUMS
           gh release edit "$tag" --draft=false
