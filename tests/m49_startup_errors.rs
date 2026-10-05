@@ -247,3 +247,86 @@ fn test_mode_reports_success_like_nginx() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `worker_rlimit_nofile` sets the open-files limit (soft and hard) before
+/// the workers start, as nginx's ngx_worker_process_init, and too many
+/// `worker_connections` for it is a `[warn]` in the error log (nginx's
+/// ngx_event_module_init). The directive used to be accepted and ignored.
+#[test]
+fn worker_rlimit_nofile_is_applied() {
+    let setup = common::ports::setup_lock();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dir = TempDir::new("rlimit");
+    let conf = dir.path().join("nginx.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "pid {d}/ruxen.pid;\nworker_rlimit_nofile 1000;\nerror_log {d}/info.log info;\n\
+             events {{ worker_connections 4096; }}\n\
+             http {{ server {{ listen 127.0.0.1:{port}; location / {{ return 200 ok; }} }} }}\n",
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    // Start from a soft limit of 512 (the hard one unchanged), as from
+    // `ulimit -Sn 512`: under 4096 connections, so the warning applies.
+    let mut cmd = ruxen(&dir, &conf, &[]);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    // SAFETY: getrlimit / setrlimit only, between fork and exec.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+            lim.rlim_cur = 512;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let pid_path = dir.path().join("ruxen.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pid_path.exists() {
+        assert!(Instant::now() < deadline, "pid file never appeared");
+        sleep(Duration::from_millis(5));
+    }
+    drop(setup);
+    let limits = std::fs::read_to_string(format!("/proc/{}/limits", child.id())).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = std::fs::read_to_string(dir.path().join("info.log")).unwrap_or_default();
+
+    let open_files = limits
+        .lines()
+        .find(|l| l.starts_with("Max open files"))
+        .unwrap();
+    let fields: Vec<&str> = open_files.split_whitespace().collect();
+    assert_eq!(&fields[3..5], ["1000", "1000"], "{open_files}");
+    assert!(
+        log.contains("[warn]")
+            && log.contains("4096 worker_connections exceed open file resource limit: 1000"),
+        "{log}"
+    );
+}
+
+#[test]
+fn worker_rlimit_values_are_checked() {
+    for (tag, line) in [
+        ("nofile", "worker_rlimit_nofile lots;"),
+        ("core", "worker_rlimit_core 5q;"),
+    ] {
+        let dir = TempDir::new(tag);
+        let conf = dir.path().join("nginx.conf");
+        std::fs::write(&conf, format!("{line}\nevents {{}}\nhttp {{}}\n")).unwrap();
+        let out = run_expecting_exit(ruxen(&dir, &conf, &["-t"]));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("[emerg]"), "{line}: {stderr}");
+    }
+}

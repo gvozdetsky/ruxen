@@ -148,6 +148,38 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
             ("error_log", Terminator::Semi) => {
                 runtime.error_logs.push(parse_error_log_args(&args[1..])?);
             }
+            // nginx's ngx_conf_set_num_slot / ngx_conf_set_off_slot.
+            ("worker_rlimit_nofile" | "worker_rlimit_core", Terminator::Semi) => {
+                let nofile = name == "worker_rlimit_nofile";
+                let what = if nofile {
+                    "worker_rlimit_nofile"
+                } else {
+                    "worker_rlimit_core"
+                };
+                let slot = if nofile {
+                    &mut runtime.worker_rlimit_nofile
+                } else {
+                    &mut runtime.worker_rlimit_core
+                };
+                if slot.is_some() {
+                    return Err(Error::Duplicate(what));
+                }
+                let [_, raw] = args.as_slice() else {
+                    return Err(Error::BadValue {
+                        what,
+                        got: args[1..].join(" "),
+                    });
+                };
+                let value = if nofile {
+                    raw.parse::<u64>().ok()
+                } else {
+                    parse_size(raw.as_bytes())
+                };
+                *slot = Some(value.ok_or_else(|| Error::BadValue {
+                    what,
+                    got: raw.clone(),
+                })?);
+            }
             // `user name [group];` — recorded so `main` can refuse a switch
             // it can't make (see `check_privileges`).
             ("user", Terminator::Semi) => {
@@ -672,8 +704,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "master_process",
     "worker_priority",
     "worker_cpu_affinity",
-    "worker_rlimit_nofile",
-    "worker_rlimit_core",
     "worker_shutdown_timeout",
     "load_module",
     "error_log",

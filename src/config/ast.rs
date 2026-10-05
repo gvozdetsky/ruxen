@@ -65,6 +65,11 @@ pub struct RuntimeOpts {
     /// users; `main` uses this to decide whether running as root is
     /// what the config asked for.
     pub user: Option<String>,
+    /// `worker_rlimit_nofile N;`: the open-files limit set before the
+    /// workers start.
+    pub worker_rlimit_nofile: Option<u64>,
+    /// `worker_rlimit_core size;`: the core-file size limit.
+    pub worker_rlimit_core: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone)]
