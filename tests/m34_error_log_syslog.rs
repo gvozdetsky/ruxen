@@ -170,9 +170,44 @@ fn m34_error_log_syslog_unix_sink_and_level_filter() {
     sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let n = sock.recv(&mut buf).expect("recv syslog datagram");
     let msg = String::from_utf8_lossy(&buf[..n]);
-    assert!(msg.starts_with("<11>m34: "));
-    assert!(msg.contains("/on/missing"));
+    // nginx's datagram: local7 with the line's level (error), the RFC 3164
+    // header, then the whole error-log line.
+    let re = regex::Regex::new(
+        r#"^<187>[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d \S+ m34: \d{4}/\d\d/\d\d \d\d:\d\d:\d\d \[error\] \d+#\d+: \*\d+ open\(\) ".*/on/missing" failed"#,
+    )
+    .unwrap();
+    assert!(re.is_match(&msg), "{msg:?}");
 
     drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `facility=` and `nohostname` apply, over UDP; `severity=` doesn't (the
+/// line's level does), as nginx's ngx_syslog_writer. They used to be
+/// parsed and ignored, with facility user always.
+#[test]
+fn m34_error_log_syslog_facility_and_nohostname() {
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let peer = udp.local_addr().unwrap();
+    let (guard, port) = spawn_server(|_| {
+        format!(
+            "    location / {{ error_log syslog:server={peer},facility=user,severity=alert,nohostname; }}\n"
+        )
+    });
+    let resp = request(
+        port,
+        b"GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
+    let mut buf = [0u8; 2048];
+    let n = udp.recv(&mut buf).expect("recv syslog datagram");
+    let msg = String::from_utf8_lossy(&buf[..n]);
+    // user.error = 1 * 8 + 3; no host before the tag.
+    let re = regex::Regex::new(
+        r#"^<11>[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d ruxen: \d{4}/\d\d/\d\d \d\d:\d\d:\d\d \[error\] .*/missing" failed"#,
+    )
+    .unwrap();
+    assert!(re.is_match(&msg), "{msg:?}");
+    drop(guard);
 }

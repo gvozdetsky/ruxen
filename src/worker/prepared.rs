@@ -327,11 +327,14 @@ pub struct PreparedAccessLog {
 }
 
 /// A prepared `syslog:` peer (see `crate::syslog`).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PreparedSyslogPeer {
     pub server: PreparedErrorLogSyslogServer,
-    /// RFC 3164 PRI: facility * 8 + severity.
-    pub pri: u8,
+    /// RFC 3164 facility code.
+    pub facility: u8,
+    /// RFC 3164 severity code: `access_log`'s; `error_log` uses each
+    /// message's level instead, as nginx's ngx_syslog_writer.
+    pub severity: u8,
     pub tag: &'static [u8],
     pub nohostname: bool,
 }
@@ -346,13 +349,7 @@ pub struct PreparedErrorLog {
 pub enum PreparedErrorLogTarget {
     File(&'static Path),
     Stderr,
-    Syslog(PreparedErrorLogSyslogTarget),
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct PreparedErrorLogSyslogTarget {
-    pub server: PreparedErrorLogSyslogServer,
-    pub tag: &'static [u8],
+    Syslog(&'static PreparedSyslogPeer),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

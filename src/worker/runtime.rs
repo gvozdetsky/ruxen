@@ -192,10 +192,7 @@ fn send_syslog_access_line(
         return;
     };
     let mut msg = Vec::with_capacity(128);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    crate::syslog::write_header(&mut msg, peer, now);
+    crate::syslog::write_header(&mut msg, peer, peer.severity, crate::syslog::now_secs());
     let start = msg.len();
     render_log_parts(log.format, log.escape, ctx, &mut msg);
     if msg.len() == start {

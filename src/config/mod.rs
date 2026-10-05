@@ -2189,9 +2189,12 @@ mod tests {
         assert_eq!(logs[0].level, ErrorLogLevel::Info);
         assert_eq!(
             logs[0].target,
-            ErrorLogTarget::Syslog(ErrorLogSyslogTarget {
+            ErrorLogTarget::Syslog(SyslogPeer {
                 server: ErrorLogSyslogServer::Unix(std::path::Path::new("/tmp/ruxen.sock").into()),
+                facility: 23,
+                severity: 4,
                 tag: Some("edge".into()),
+                nohostname: true,
             })
         );
     }
@@ -2209,10 +2212,7 @@ mod tests {
         "#;
         assert!(matches!(
             parse(src),
-            Err(Error::BadValue {
-                what: "error_log syslog",
-                ..
-            })
+            Err(Error::BadValue { what: "syslog", .. })
         ));
     }
 
