@@ -15,11 +15,6 @@ pub use rustls::ServerConfig;
 
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
 
-/// Default handshake timeout. Matches nginx's `ssl_handshake_timeout 60s;`.
-/// The directive is parsed as an accepted no-op elsewhere; runtime timeout
-/// selection is still fixed at this default.
-pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-
 #[derive(Debug)]
 pub enum AcceptError {
     Tls(std::io::Error),

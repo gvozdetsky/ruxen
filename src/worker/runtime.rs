@@ -991,6 +991,7 @@ pub(crate) fn spawn_connection(
                 state,
                 connection_id,
                 None,
+                Instant::now(),
                 guard,
             ));
         }
@@ -1011,6 +1012,7 @@ async fn handle_proxy_protocol(
     connection_id: u64,
     guard: ConnectionGuard,
 ) {
+    let accepted_at = Instant::now();
     let server = &prepared.servers[prepared.default_server];
     let header = match crate::proxy_protocol::read(&stream, server.timeouts.header).await {
         Ok(header) => header,
@@ -1054,6 +1056,7 @@ async fn handle_proxy_protocol(
                 state,
                 connection_id,
                 Some(header),
+                accepted_at,
                 guard,
             )
             .await
@@ -1303,12 +1306,18 @@ pub(crate) async fn handle_tls(
     state: Arc<RuntimeState>,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
+    accepted_at: Instant,
     _guard: ConnectionGuard,
 ) {
+    // nginx 1.24 has no separate handshake timeout: the handshake runs
+    // under the default server's client_header_timeout, armed at accept
+    // (ngx_http_init_connection), so a PROXY header read shares it.
+    let listen = &http.listens[listen_index];
+    let budget = listen.servers[listen.default_server].timeouts.header;
     let (mut tls_stream, info) = match crate::tls::accept_with_timeout(
         &acceptor,
         stream,
-        crate::tls::DEFAULT_HANDSHAKE_TIMEOUT,
+        budget.saturating_sub(accepted_at.elapsed()),
     )
     .await
     {
