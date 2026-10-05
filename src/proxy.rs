@@ -452,8 +452,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     return build_intercept_reroute(
                         rule,
                         status,
-                        &resp,
+                        resp,
                         plan.response.recursive_error_pages,
+                        plan.method,
+                        plan.server_bytes,
                     );
                 }
                 // This try is still in flight while the response header is
@@ -537,13 +539,17 @@ fn response_status(resp: &Response) -> Option<u16> {
 fn build_intercept_reroute(
     rule: &InterceptRule,
     upstream_status: u16,
-    upstream_resp: &Response,
+    upstream_resp: Response,
     recursive: bool,
+    method: Method,
+    server: &[u8],
 ) -> Response {
     use crate::phase::{ErrorPageStatus, Reroute, RerouteTarget};
     use crate::worker::PreparedErrorPageAction;
+    // A target that renders empty: no error page, the upstream response
+    // goes through, as for a local error_page.
     if rule.target.is_empty() {
-        return Response::Owned(Vec::new());
+        return upstream_resp;
     }
     let error_page_status = match rule.action {
         PreparedErrorPageAction::PreserveOriginal => {
@@ -556,7 +562,7 @@ fn build_intercept_reroute(
     // intercepting a 401 — nginx keeps every challenge value (ticket
     // #485). Empty for non-401 statuses.
     let preserved_www_authenticate = if upstream_status == 401 {
-        let bytes: &[u8] = match upstream_resp {
+        let bytes: &[u8] = match &upstream_resp {
             Response::Prebuilt(b) => b,
             Response::Owned(b) => b,
             Response::File { headers, .. } => headers,
@@ -593,8 +599,14 @@ fn build_intercept_reroute(
             preserved_www_authenticate,
         });
     }
-    // Absolute-URL intercept target — punt for v0.1.
-    Response::Owned(Vec::new())
+    // An absolute URL: a redirect to it, 302 unless `=301` etc. says
+    // otherwise (ngx_http_send_error_page), as for a local error_page.
+    Response::Owned(crate::http::build_redirect_response(
+        crate::worker::external_error_page_status(rule.action),
+        &rule.target,
+        method,
+        server,
+    ))
 }
 
 fn parse_response_status(bytes: &[u8]) -> Option<u16> {

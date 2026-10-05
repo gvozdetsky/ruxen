@@ -1436,6 +1436,11 @@ pub(crate) fn scan_response_headers(bytes: &[u8]) -> Option<ResponseHeaderScan> 
 /// or add the header at the end of the head if it has none. nginx's header
 /// filter writes `Date` into every response the same way.
 pub(crate) fn stamp_date(response: &mut Vec<u8>, scan: &mut ResponseHeaderScan) {
+    // No header block (a malformed or empty response): nothing to stamp,
+    // and no offset to insert at.
+    if response.get(scan.head_end..scan.head_end + 4) != Some(b"\r\n\r\n") {
+        return;
+    }
     let now = http_date::now();
     if let Some(at) = scan.date_at {
         response[at..at + http_date::LEN].copy_from_slice(&now);
