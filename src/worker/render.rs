@@ -380,6 +380,7 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::ProxyHost => out.extend_from_slice(self.proxy_host),
+            Variable::ProxyPort => out.extend_from_slice(proxy_port(self.proxy_host)),
             Variable::ProxyAddXForwardedFor => {
                 let existing =
                     lookup_request_header(self.headers_raw, b"x-forwarded-for").unwrap_or(b"");
@@ -899,6 +900,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::RequestBody
             | Variable::RequestBodyFile
             | Variable::ProxyHost
+            | Variable::ProxyPort
             | Variable::UpstreamHttp(_)
             | Variable::UpstreamCookie(_)
             | Variable::UpstreamResponseLength
@@ -1240,6 +1242,24 @@ pub(crate) fn write_time_local(out: &mut Vec<u8>, secs: u64) {
     write_u2(&mut buf[15..17], minute);
     write_u2(&mut buf[18..20], second);
     out.extend_from_slice(&buf);
+}
+
+/// `$proxy_port`: the port written in `$proxy_host` (`host:port`,
+/// `[v6]:port`), else the scheme's default, as nginx's
+/// ngx_http_proxy_set_vars. Only `http://` is proxied today, so that's 80.
+/// Empty outside a proxy context, like `$proxy_host`.
+fn proxy_port(proxy_host: &[u8]) -> &[u8] {
+    if proxy_host.is_empty() {
+        return b"";
+    }
+    let after_host = match proxy_host.iter().rposition(|&b| b == b']') {
+        Some(i) => &proxy_host[i + 1..],
+        None => proxy_host,
+    };
+    match after_host.iter().rposition(|&b| b == b':') {
+        Some(i) => &after_host[i + 1..],
+        None => b"80",
+    }
 }
 
 /// `Oct  5 09:04:07` — the RFC 3164 timestamp nginx puts in syslog
