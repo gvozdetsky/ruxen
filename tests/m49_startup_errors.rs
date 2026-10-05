@@ -142,7 +142,10 @@ fn missing_root_is_not_a_config_error() {
 #[test]
 fn busy_port_is_one_emerg_and_no_pid_file() {
     // A plain listener has no SO_REUSEPORT, so ruxen's bind must fail.
-    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
     let port = held.local_addr().unwrap().port();
     let dir = TempDir::new("busy");
     let conf = dir.write_conf(&format!(
@@ -161,6 +164,7 @@ fn busy_port_is_one_emerg_and_no_pid_file() {
 
 #[test]
 fn pid_file_appears_once_listening() {
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -181,6 +185,7 @@ fn pid_file_appears_once_listening() {
         assert!(Instant::now() < deadline, "pid file never appeared");
         sleep(Duration::from_millis(5));
     }
+    drop(setup);
     // Test::Nginx treats the pid file as "started": the port must already
     // accept connections at that point.
     let connected = TcpStream::connect(("127.0.0.1", port));

@@ -39,6 +39,7 @@ fn free_ports<const N: usize>() -> [u16; N] {
 /// error pages. The backends answer `/bad` with `a_bad` / `b_bad` and
 /// everything else with their name.
 fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u16, [u16; 2]) {
+    let _setup = common::ports::setup_lock();
     let [front, a, b] = free_ports::<3>();
     let dir = std::env::temp_dir().join(format!("ruxen-m65-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -166,6 +167,7 @@ fn the_last_try_goes_through_intercept_errors() {
 /// reached the live peer at the end.
 #[test]
 fn failover_reaches_every_peer_of_a_large_upstream() {
+    let setup = common::ports::setup_lock();
     let dead = common::ports::DeadPort::new();
     let [front, live] = free_ports::<2>();
     let dir = std::env::temp_dir().join(format!("ruxen-m65-large-{}", std::process::id()));
@@ -199,6 +201,7 @@ fn failover_reaches_every_peer_of_a_large_upstream() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(10));
     }
+    drop(setup);
     let results: Vec<(u16, String)> = (0..10).map(|_| get(front, "/")).collect();
     let _ = child.kill();
     let _ = child.wait();
