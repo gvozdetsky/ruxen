@@ -1,6 +1,6 @@
 [package]
 name = "ruxen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Let-chains (`if let … && let …`) need 1.88; CI checks it (job `msrv`).
 rust-version = "1.88"
