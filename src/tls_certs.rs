@@ -219,6 +219,10 @@ pub struct ServerNameResolver {
     exact: HashMap<String, Vec<Arc<CertifiedKey>>>,
     /// Lowercased suffix (without leading `*.`), in declaration order.
     wildcard: Vec<(String, Vec<Arc<CertifiedKey>>)>,
+    /// Lowercased head (without trailing `.*`) of `www.example.*` names.
+    wildcard_trailing: Vec<(String, Vec<Arc<CertifiedKey>>)>,
+    /// `~regex` names, in declaration order.
+    regex: Vec<(regex::Regex, Vec<Arc<CertifiedKey>>)>,
     default: Vec<Arc<CertifiedKey>>,
 }
 
@@ -245,6 +249,35 @@ impl ServerNameResolver {
         self.wildcard.push((normalized, vec![key]));
     }
 
+    /// Register `key` under a trailing wildcard, `head` being the name
+    /// without its `.*` (`www.example` for `www.example.*`).
+    pub fn add_wildcard_trailing(&mut self, head: &str, key: Arc<CertifiedKey>) {
+        let normalized = normalize_host(head);
+        if let Some((_, slot)) = self
+            .wildcard_trailing
+            .iter_mut()
+            .find(|(h, _)| *h == normalized)
+        {
+            slot.push(key);
+            return;
+        }
+        self.wildcard_trailing.push((normalized, vec![key]));
+    }
+
+    /// Register `key` under a `~regex` server name. A regex registered
+    /// again (same server, RSA + ECDSA) adds to its slot.
+    pub fn add_regex(&mut self, regex: &regex::Regex, key: Arc<CertifiedKey>) {
+        if let Some((_, slot)) = self
+            .regex
+            .iter_mut()
+            .find(|(r, _)| r.as_str() == regex.as_str())
+        {
+            slot.push(key);
+            return;
+        }
+        self.regex.push((regex.clone(), vec![key]));
+    }
+
     /// Set the keys returned when no SNI hostname matches (or when the
     /// client sent no SNI). Empty means "abort the handshake".
     pub fn set_default(&mut self, keys: Vec<Arc<CertifiedKey>>) {
@@ -252,7 +285,11 @@ impl ServerNameResolver {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.wildcard.is_empty() && self.default.is_empty()
+        self.exact.is_empty()
+            && self.wildcard.is_empty()
+            && self.wildcard_trailing.is_empty()
+            && self.regex.is_empty()
+            && self.default.is_empty()
     }
 
     fn select(
@@ -286,6 +323,26 @@ impl ServerNameResolver {
                 if prefix.ends_with('.') {
                     return Self::select(slot, schemes);
                 }
+            }
+        }
+        // Then, as for `Host` (and nginx's ngx_http_find_virtual_server):
+        // the longest trailing wildcard, then the first regex.
+        let trailing = self
+            .wildcard_trailing
+            .iter()
+            .filter(|(head, _)| {
+                normalized == *head
+                    || normalized
+                        .strip_prefix(head.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+            })
+            .max_by_key(|(head, _)| head.len());
+        if let Some((_, slot)) = trailing {
+            return Self::select(slot, schemes);
+        }
+        for (regex, slot) in &self.regex {
+            if regex.is_match(&normalized) {
+                return Self::select(slot, schemes);
             }
         }
         None

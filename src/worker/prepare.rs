@@ -324,14 +324,23 @@ pub(crate) fn build_listen_tls(
                     ServerNameSpec::WildcardLeading { suffix, .. } => {
                         resolver.add_wildcard(suffix, ck.clone());
                     }
-                    // WildcardTrailing / Regex / Empty don't map to TLS-layer
-                    // SNI dispatch — rustls only sees the host, not the
-                    // leading-label or pattern. The HTTP-layer match_server
-                    // ladder still routes these correctly once the handshake
-                    // settles on the default cert.
-                    ServerNameSpec::WildcardTrailing { .. }
-                    | ServerNameSpec::Regex { .. }
-                    | ServerNameSpec::Empty => {}
+                    ServerNameSpec::WildcardTrailing { head, .. } => {
+                        resolver.add_wildcard_trailing(head, ck.clone());
+                    }
+                    ServerNameSpec::Regex {
+                        pattern,
+                        case_insensitive,
+                        ..
+                    } => {
+                        let regex = regex::RegexBuilder::new(pattern)
+                            .case_insensitive(*case_insensitive)
+                            .build()
+                            .map_err(|e| format!("server_name regex \"{pattern}\": {e}"))?;
+                        resolver.add_regex(&regex, ck.clone());
+                    }
+                    // A request without a Host header; there's always an SNI
+                    // name or none, so nothing to register.
+                    ServerNameSpec::Empty => {}
                 }
             }
         }
