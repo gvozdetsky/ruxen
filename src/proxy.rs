@@ -1244,6 +1244,15 @@ async fn attempt(
         }
         decoded_chunked_body = Some(body);
     } else if let Some(cl) = content_length {
+        // Refused before reading, like the chunked and close-delimited
+        // bodies once they pass the cap.
+        if cl > MAX_BUFFERED_BODY as u64 {
+            return AttemptOutcome::Failed(
+                Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                FailKind::Error,
+                Box::new(UpstreamError::TooBigBody),
+            );
+        }
         let cl_usize = cl as usize;
         // We may have already read more than cl_usize bytes in the header
         // pull (the upstream pipelined another response or sent stray
@@ -1330,7 +1339,7 @@ async fn attempt(
                     );
                 }
             }
-            if body_len_in_accum > MAX_UNFRAMED_BODY {
+            if body_len_in_accum > MAX_BUFFERED_BODY {
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
@@ -1618,7 +1627,7 @@ async fn read_chunked_body_with_buf(
         pos = line_end + 1;
         // Bound the size before any arithmetic on it: `FFFFFFFFFFFFFFFF`
         // would overflow `chunk_size + 2` below and panic the worker.
-        if chunk_size > (MAX_UNFRAMED_BODY - decoded.len()) as u64 {
+        if chunk_size > (MAX_BUFFERED_BODY - decoded.len()) as u64 {
             return Err((false, UpstreamError::TooBigBody));
         }
         if chunk_size == 0 {
@@ -1684,9 +1693,10 @@ async fn read_chunked_body_with_buf(
     }
 }
 
-/// Largest chunked or close-delimited upstream body we buffer before
-/// answering 502. Responses are buffered whole until they stream.
-const MAX_UNFRAMED_BODY: usize = 64 * 1024 * 1024;
+/// Largest upstream body we buffer, however it is framed: past it the
+/// answer is a 502. Responses are buffered whole until they stream (#88),
+/// so without this one response could take a worker's memory.
+const MAX_BUFFERED_BODY: usize = 64 * 1024 * 1024;
 
 /// Upper bound on the up-front reservation for a `Content-Length` body.
 const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
