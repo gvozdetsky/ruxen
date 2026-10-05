@@ -6,6 +6,7 @@
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::unix::net::UnixDatagram;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::worker::{PreparedErrorLogSyslogServer, PreparedSyslogPeer};
 
@@ -72,10 +73,11 @@ impl SyslogSocket {
 }
 
 /// `<PRI>Mmm dd hh:mm:ss host tag: ` (nginx's ngx_syslog_add_header; the
-/// time is UTC, like every time ruxen writes).
-pub(crate) fn write_header(out: &mut Vec<u8>, peer: &PreparedSyslogPeer, secs: u64) {
+/// time is UTC, like every time ruxen writes). `severity` is the peer's
+/// for `access_log`, the message's level for `error_log`.
+pub(crate) fn write_header(out: &mut Vec<u8>, peer: &PreparedSyslogPeer, severity: u8, secs: u64) {
     out.push(b'<');
-    crate::worker::write_u64_decimal(out, u64::from(peer.pri));
+    crate::worker::write_u64_decimal(out, u64::from(peer.facility) * 8 + u64::from(severity));
     out.push(b'>');
     crate::worker::write_time_syslog(out, secs);
     out.push(b' ');
@@ -85,4 +87,44 @@ pub(crate) fn write_header(out: &mut Vec<u8>, peer: &PreparedSyslogPeer, secs: u
     }
     out.extend_from_slice(peer.tag);
     out.extend_from_slice(b": ");
+}
+
+/// Seconds since the epoch, for the header.
+pub(crate) fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+thread_local! {
+    /// `error_log` peers' sockets in this thread, opened on first use: error
+    /// lines are written from workers and from the main thread alike.
+    static ERROR_LOG_SOCKETS: std::cell::RefCell<
+        Vec<(*const PreparedSyslogPeer, SyslogSocket)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Send one error-log line (without its newline) to `peer`, as nginx's
+/// ngx_syslog_writer: the whole line after the header, the PRI's severity
+/// from the line's level.
+pub(crate) fn send_error_line(
+    peer: &'static PreparedSyslogPeer,
+    severity: u8,
+    line: &[u8],
+) -> io::Result<()> {
+    let mut msg = Vec::with_capacity(line.len() + 64);
+    write_header(&mut msg, peer, severity, now_secs());
+    msg.extend_from_slice(line);
+    ERROR_LOG_SOCKETS.with(|cell| {
+        let mut sockets = cell.borrow_mut();
+        let key = peer as *const PreparedSyslogPeer;
+        let i = match sockets.iter().position(|(p, _)| *p == key) {
+            Some(i) => i,
+            None => {
+                sockets.push((key, SyslogSocket::open(peer)?));
+                sockets.len() - 1
+            }
+        };
+        sockets[i].1.send(&msg)
+    })
 }

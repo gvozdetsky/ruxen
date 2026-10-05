@@ -1,6 +1,6 @@
 //! Per-request error-log emission in nginx's line format:
 //! `write_lookup_error_log` for failed file lookups, `write_upstream_error_log` for
-//! failed proxy attempts, `send_syslog_error` for the syslog target.
+//! failed proxy attempts; syslog targets go through `crate::syslog`.
 
 #![allow(unused_imports)]
 
@@ -133,7 +133,7 @@ pub(crate) fn write_worker_log(sinks: &[PreparedErrorLog], level: ErrorLogLevel,
     let mut line = log_line_prefix(level);
     line.extend_from_slice(message.as_bytes());
     line.push(b'\n');
-    emit(sinks, level, &line, message.as_bytes());
+    emit(sinks, level, &line);
 }
 
 fn level_name(level: ErrorLogLevel) -> &'static [u8] {
@@ -183,12 +183,12 @@ pub(crate) fn write_error_log(
     line.extend_from_slice(&text);
     line.push(b'\n');
 
-    emit(sinks, level, &line, &text);
+    emit(sinks, level, &line);
 }
 
-/// Write a finished line to every sink that takes `level`; syslog gets
-/// `text`, the line without nginx's date/level/pid prefix.
-fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8], text: &[u8]) {
+/// Write a finished line to every sink that takes `level`; syslog gets it
+/// without the newline, after its own header, as nginx sends it.
+fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8]) {
     reopen_stderr_if_needed();
     for sink in sinks {
         if !sink.level.allows(level) {
@@ -213,7 +213,9 @@ fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8], text: &[u
                 }
             }
             PreparedErrorLogTarget::Syslog(target) => {
-                if let Err(e) = send_syslog_error(target, syslog_severity(level), text) {
+                let line = line.strip_suffix(b"\n").unwrap_or(line);
+                if let Err(e) = crate::syslog::send_error_line(target, syslog_severity(level), line)
+                {
                     eprintln!("ruxen: error_log syslog send failed: {e}");
                 }
             }
@@ -258,29 +260,5 @@ pub(crate) fn write_upstream_error_log(
             message.as_bytes(),
             Some(&failure.upstream),
         );
-    }
-}
-
-pub(crate) fn send_syslog_error(
-    target: PreparedErrorLogSyslogTarget,
-    severity: u8,
-    message: &[u8],
-) -> std::io::Result<()> {
-    // PRI = user facility (1) * 8 + severity.
-    let mut payload = Vec::with_capacity(message.len() + target.tag.len() + 8);
-    payload.extend_from_slice(format!("<{}>", 8 + severity).as_bytes());
-    payload.extend_from_slice(target.tag);
-    payload.extend_from_slice(b": ");
-    payload.extend_from_slice(message);
-    match target.server {
-        PreparedErrorLogSyslogServer::Unix(path) => {
-            let sock = UnixDatagram::unbound()?;
-            sock.send_to(&payload, path).map(|_| ())
-        }
-        PreparedErrorLogSyslogServer::Udp(addr) => {
-            let sock = std::net::UdpSocket::bind("0.0.0.0:0")
-                .or_else(|_| std::net::UdpSocket::bind("[::]:0"))?;
-            sock.send_to(&payload, addr).map(|_| ())
-        }
     }
 }

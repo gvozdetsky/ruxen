@@ -1,6 +1,5 @@
-//! `log_format`, `access_log`, and `error_log` (including syslog target)
-//! parsers. The error-log syslog grammar is the nginx-compatible
-//! `syslog:server=...,facility=...,tag=...,severity=...` form.
+//! `log_format`, `access_log`, and `error_log` parsers, including the
+//! nginx-compatible `syslog:server=...,facility=...,tag=...` targets.
 
 use super::*;
 use std::net::SocketAddr;
@@ -125,77 +124,9 @@ pub(crate) fn parse_error_log_target(raw: &str) -> Result<ErrorLogTarget, Error>
         return Ok(ErrorLogTarget::Stderr);
     }
     if let Some(syslog) = raw.strip_prefix("syslog:") {
-        return Ok(ErrorLogTarget::Syslog(parse_error_log_syslog_target(
-            syslog,
-        )?));
+        return Ok(ErrorLogTarget::Syslog(parse_syslog_peer(syslog)?));
     }
     Ok(ErrorLogTarget::File(PathBuf::from(raw)))
-}
-
-pub(crate) fn parse_error_log_syslog_target(raw: &str) -> Result<ErrorLogSyslogTarget, Error> {
-    let mut server: Option<ErrorLogSyslogServer> = None;
-    let mut tag: Option<String> = None;
-
-    for part in raw.split(',') {
-        if part.is_empty() {
-            return Err(Error::BadValue {
-                what: "error_log syslog",
-                got: raw.to_string(),
-            });
-        }
-        if part == "nohostname" {
-            continue;
-        }
-        if let Some(v) = part.strip_prefix("server=") {
-            if server.is_some() {
-                return Err(Error::BadValue {
-                    what: "error_log syslog",
-                    got: raw.to_string(),
-                });
-            }
-            server = Some(parse_error_log_syslog_server(v)?);
-            continue;
-        }
-        if let Some(v) = part.strip_prefix("tag=") {
-            if v.is_empty() || tag.is_some() {
-                return Err(Error::BadValue {
-                    what: "error_log syslog",
-                    got: raw.to_string(),
-                });
-            }
-            tag = Some(v.to_string());
-            continue;
-        }
-        // Accepted but currently not used for our `log_not_found` writes.
-        if let Some(v) = part.strip_prefix("facility=") {
-            if v.is_empty() {
-                return Err(Error::BadValue {
-                    what: "error_log syslog",
-                    got: raw.to_string(),
-                });
-            }
-            continue;
-        }
-        if let Some(v) = part.strip_prefix("severity=") {
-            if parse_error_log_level(v).is_err() {
-                return Err(Error::BadValue {
-                    what: "error_log syslog",
-                    got: raw.to_string(),
-                });
-            }
-            continue;
-        }
-        return Err(Error::BadValue {
-            what: "error_log syslog",
-            got: raw.to_string(),
-        });
-    }
-
-    let server = server.ok_or_else(|| Error::BadValue {
-        what: "error_log syslog",
-        got: raw.to_string(),
-    })?;
-    Ok(ErrorLogSyslogTarget { server, tag })
 }
 
 /// RFC 3164 facility names, by code, as nginx spells them.

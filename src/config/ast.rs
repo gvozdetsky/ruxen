@@ -956,19 +956,12 @@ impl ErrorLogLevel {
 pub enum ErrorLogTarget {
     File(PathBuf),
     Stderr,
-    Syslog(ErrorLogSyslogTarget),
-}
-
-/// Parsed `syslog:...` descriptor used by `error_log`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ErrorLogSyslogTarget {
-    pub server: ErrorLogSyslogServer,
-    /// Optional `tag=...` override. Defaults to `ruxen`.
-    pub tag: Option<String>,
+    Syslog(SyslogPeer),
 }
 
 /// `syslog:server=…[,facility=…][,severity=…][,tag=…][,nohostname]`, as
-/// ngx_syslog_process_conf parses it. Used by `access_log`.
+/// ngx_syslog_process_conf parses it. Used by `access_log` and
+/// `error_log` (which takes the severity from each message's level).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyslogPeer {
     pub server: ErrorLogSyslogServer,

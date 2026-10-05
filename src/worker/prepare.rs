@@ -1512,8 +1512,9 @@ pub(crate) fn prepare_maps(
 /// concatenation of every prepared sink in declaration order; per-scope
 /// slices share `file_index` values that point back into it, so the
 /// per-worker fd table opened from the canonical list serves all scopes.
-/// A `syslog:` peer for `access_log`. A UDP server is resolved now, so a
-/// bad host fails at startup, as nginx's ngx_parse_url does.
+/// A `syslog:` peer for `access_log` or `error_log`. A UDP server is
+/// resolved now, so a bad host fails at startup, as nginx's ngx_parse_url
+/// does.
 fn prepare_syslog_peer(
     peer: &crate::config::SyslogPeer,
 ) -> Result<&'static PreparedSyslogPeer, String> {
@@ -1532,7 +1533,8 @@ fn prepare_syslog_peer(
     };
     Ok(Box::leak(Box::new(PreparedSyslogPeer {
         server,
-        pri: peer.facility * 8 + peer.severity,
+        facility: peer.facility,
+        severity: peer.severity,
         tag,
         nohostname: peer.nohostname,
     })))
@@ -1888,21 +1890,7 @@ pub(crate) fn prepare_error_log_target(
             PreparedErrorLogTarget::File(Box::leak(path.into_boxed_path()))
         }
         ErrorLogTarget::Stderr => PreparedErrorLogTarget::Stderr,
-        ErrorLogTarget::Syslog(s) => {
-            let tag: &'static [u8] = match s.tag {
-                Some(tag) => Box::leak(tag.into_bytes().into_boxed_slice()),
-                None => b"ruxen",
-            };
-            let server = match s.server {
-                ErrorLogSyslogServer::Unix(path) => {
-                    PreparedErrorLogSyslogServer::Unix(Box::leak(path.into_boxed_path()))
-                }
-                ErrorLogSyslogServer::Udp(addr) => {
-                    PreparedErrorLogSyslogServer::Udp(Box::leak(addr.into_boxed_str()))
-                }
-            };
-            PreparedErrorLogTarget::Syslog(PreparedErrorLogSyslogTarget { server, tag })
-        }
+        ErrorLogTarget::Syslog(peer) => PreparedErrorLogTarget::Syslog(prepare_syslog_peer(&peer)?),
     })
 }
 
