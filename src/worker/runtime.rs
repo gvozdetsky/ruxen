@@ -1737,7 +1737,10 @@ pub(crate) async fn handle<S: ConnIo>(
                         // REQUEST_BODY_IN_MEMORY and go to a temp file past
                         // that (`BodySink`), within `max_body` above.
                         let mut pipelined_tail: Vec<u8> = Vec::new();
-                        let mut sink = BodySink::with_capacity(req.content_length.unwrap_or(0));
+                        let mut sink = BodySink::with_capacity(
+                            req.content_length.unwrap_or(0),
+                            &http.body_temp,
+                        );
                         let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
                             (0, 0)
                         } else if let Some(cl) = req.content_length {
@@ -1842,7 +1845,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         // temp-file path bytes for `$request_body_file`.
                         let request_body_file = match spooled {
                             Some(file) => Some(file),
-                            None => maybe_spill_request_body_to_file(&body_vec),
+                            None => maybe_spill_request_body_to_file(&body_vec, &http.body_temp),
                         };
                         let body_file = request_body_file
                             .as_ref()

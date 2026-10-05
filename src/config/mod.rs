@@ -198,6 +198,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
     let mut client_max_body_size: Option<u64> = None;
+    let mut client_body_temp_path: Option<PathBuf> = None;
     let mut sendfile: Option<bool> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
@@ -242,6 +243,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     auth_basic_user_file,
                     auth_delay_ms,
                     client_max_body_size,
+                    client_body_temp_path,
                     sendfile,
                     limit_rate,
                     limit_rate_after,
@@ -534,6 +536,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     return Err(Error::Duplicate("limit_rate_after"));
                 }
                 limit_rate_after = Some(parse_size_value(&args[1..], "limit_rate_after")?);
+            }
+            ("client_body_temp_path", Terminator::Semi) => {
+                if client_body_temp_path.is_some() {
+                    return Err(Error::Duplicate("client_body_temp_path"));
+                }
+                client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
             }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {

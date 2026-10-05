@@ -414,6 +414,7 @@ fn real_main() -> Result<(), Failure> {
     runtime.begin_shutdown();
     drop(workers_done);
     let _ = signal_monitor.join();
+    http.body_temp.remove_private_if_empty();
 
     if let Some(path) = &pid_path {
         let _ = std::fs::remove_file(path);

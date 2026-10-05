@@ -213,7 +213,135 @@ pub(crate) fn hostname() -> &'static [u8] {
 /// can be populated for nginx-tests cases.
 pub(crate) const REQUEST_BODY_FILE_THRESHOLD: usize = 2 * 1024;
 
-pub(crate) static REQUEST_BODY_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Next request-body temp file number, nginx's `ngx_temp_number`: seeded
+/// once per process, bumped by a jump when a name is taken.
+static REQUEST_BODY_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Where request-body temp files go. Only the ruxen user can get at them:
+/// the directory is created `0700` and each file `0600` with `O_EXCL`, as
+/// nginx's `ngx_create_temp_file`. Without `client_body_temp_path` that is
+/// a private directory of this process under the system temp directory,
+/// made on first use: ruxen has no build-time prefix for nginx's default
+/// `<prefix>/client_body_temp`.
+pub(crate) struct BodyTempDir {
+    /// `client_body_temp_path` (http scope), relative to the prefix.
+    configured: Option<&'static Path>,
+    /// The private directory, made on first use and again if it went
+    /// away (a temp-directory cleaner): a new one, never the old name,
+    /// which someone else could have taken by then.
+    private: std::sync::Mutex<Option<std::path::PathBuf>>,
+}
+
+impl BodyTempDir {
+    pub(crate) fn new(configured: Option<&'static Path>) -> Self {
+        BodyTempDir {
+            configured,
+            private: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The directory to create a file in. `gone`: the last one was
+    /// missing, so the private directory is made anew.
+    fn dir(&self, gone: bool) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Some(dir) = self.configured {
+            // nginx's ngx_create_paths: one level, 0700; an existing
+            // directory is fine.
+            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+            return Some(dir.to_path_buf());
+        }
+        let mut private = self.private.lock().unwrap_or_else(|e| e.into_inner());
+        if gone || private.is_none() {
+            *private = make_private_dir();
+        }
+        private.clone()
+    }
+
+    /// Removes the private directory if nothing is left in it (files kept
+    /// by `client_body_in_file_only on` stay, and so does it).
+    pub(crate) fn remove_private_if_empty(&self) {
+        let private = self.private.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dir) = private.as_deref() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+/// `mkdtemp($TMPDIR/ruxen-<pid>-XXXXXX)`: a new directory, mode 0700.
+fn make_private_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let template = std::env::temp_dir().join(format!("ruxen-{}-XXXXXX", std::process::id()));
+    let mut bytes = template.into_os_string().into_vec();
+    bytes.push(0);
+    // SAFETY: a NUL-terminated buffer we own, which mkdtemp edits in place.
+    let made = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+    if made.is_null() {
+        return None;
+    }
+    bytes.pop();
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        bytes,
+    )))
+}
+
+/// Creates a new request-body temp file in `temp`: `0600`, `O_EXCL` (a
+/// name that exists, or a symlink there, is skipped, never opened), named
+/// like nginx's (`0000000042`).
+fn new_body_file(temp: &BodyTempDir) -> Option<(std::fs::File, SpilledBody)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut dir = temp.dir(false)?;
+    let mut remade = false;
+    if REQUEST_BODY_FILE_SEQ.load(Ordering::Relaxed) == 0 {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0)
+            ^ ((std::process::id() as u64) << 20);
+        let _ = REQUEST_BODY_FILE_SEQ.compare_exchange(
+            0,
+            seed % 1_000_000_000 + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+    let mut step = 1;
+    for _ in 0..64 {
+        let n = REQUEST_BODY_FILE_SEQ.fetch_add(step, Ordering::Relaxed) % 10_000_000_000;
+        let path = dir.join(format!("{n:010}"));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => {
+                let path_bytes = path.to_string_lossy().into_owned().into_bytes();
+                let spilled = SpilledBody {
+                    path,
+                    path_bytes,
+                    keep: std::cell::Cell::new(false),
+                };
+                return Some((file, spilled));
+            }
+            // Taken (another process, or a kept file): jump ahead, as
+            // nginx's ngx_next_temp_number(1).
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => step = 0x10000 + n % 0x10000,
+            // The directory went away: once, make it again.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !remade => {
+                remade = true;
+                dir = temp.dir(true)?;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
 
 /// Owns the on-disk temp file for a spilled request body. The file is
 /// unlinked when this guard drops at end-of-request, mirroring nginx's
@@ -245,22 +373,17 @@ impl Drop for SpilledBody {
     }
 }
 
-pub(crate) fn maybe_spill_request_body_to_file(body: &[u8]) -> Option<SpilledBody> {
+pub(crate) fn maybe_spill_request_body_to_file(
+    body: &[u8],
+    temp: &BodyTempDir,
+) -> Option<SpilledBody> {
     if body.len() <= REQUEST_BODY_FILE_THRESHOLD {
         return None;
     }
-    let seq = REQUEST_BODY_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!("ruxen-body-{}-{}.tmp", std::process::id(), seq));
-    if std::fs::write(&path, body).is_err() {
-        return None;
-    }
-    let path_bytes = path.to_string_lossy().into_owned().into_bytes();
-    Some(SpilledBody {
-        path,
-        path_bytes,
-        keep: std::cell::Cell::new(false),
-    })
+    // On a failed write the guard removes the partial file.
+    let (mut file, spilled) = new_body_file(temp)?;
+    file.write_all(body).ok()?;
+    Some(spilled)
 }
 
 /// Request bodies up to this size stay in memory, where the proxy forwards
@@ -273,18 +396,20 @@ pub(crate) const DEFAULT_CLIENT_MAX_BODY_SIZE: u64 = 1 << 20;
 
 /// Collects a request body: in memory up to `REQUEST_BODY_IN_MEMORY`, then
 /// in a temp file (removed with the `SpilledBody` unless kept).
-pub(crate) struct BodySink {
+pub(crate) struct BodySink<'t> {
     mem: Vec<u8>,
     file: Option<(std::fs::File, SpilledBody)>,
     len: u64,
+    temp: &'t BodyTempDir,
 }
 
-impl BodySink {
-    pub(crate) fn with_capacity(expected: u64) -> Self {
+impl<'t> BodySink<'t> {
+    pub(crate) fn with_capacity(expected: u64, temp: &'t BodyTempDir) -> Self {
         BodySink {
             mem: Vec::with_capacity(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
             file: None,
             len: 0,
+            temp,
         }
     }
 
@@ -295,10 +420,7 @@ impl BodySink {
     /// Append `data`; `false` if the temp file couldn't be written.
     pub(crate) fn extend(&mut self, data: &[u8]) -> bool {
         if self.file.is_none() && self.mem.len() + data.len() > REQUEST_BODY_IN_MEMORY {
-            let Some(spilled) = new_body_file() else {
-                return false;
-            };
-            let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&spilled.path) else {
+            let Some((mut file, spilled)) = new_body_file(self.temp) else {
                 return false;
             };
             if file.write_all(&self.mem).is_err() {
@@ -325,23 +447,6 @@ impl BodySink {
             None => (self.mem, None),
         }
     }
-}
-
-fn new_body_file() -> Option<SpilledBody> {
-    let seq = REQUEST_BODY_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!("ruxen-body-{}-{}.tmp", std::process::id(), seq));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .ok()?;
-    let path_bytes = path.to_string_lossy().into_owned().into_bytes();
-    Some(SpilledBody {
-        path,
-        path_bytes,
-        keep: std::cell::Cell::new(false),
-    })
 }
 
 /// Normalize the raw request path. Used by `phase::process` before entering

@@ -1149,6 +1149,8 @@ pub struct PreparedHttp {
     /// read before routing, so this bounds the read, and the matched
     /// location checks its own limit afterwards.
     pub max_request_body: u64,
+    /// Where request bodies too large for memory go.
+    pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],
     pub split_clients: std::collections::HashMap<&'static str, PreparedSplitClients>,
     /// http-scope `map` programs, keyed by output variable name. Rendered

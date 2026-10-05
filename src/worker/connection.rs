@@ -551,7 +551,7 @@ pub(crate) async fn read_chunked_request_body<S: ConnIo>(
     stream: &mut S,
     initial: &[u8],
     max_body: u64,
-    sink: &mut BodySink,
+    sink: &mut BodySink<'_>,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
 ) -> Result<ChunkedBody, ChunkedBodyError> {
