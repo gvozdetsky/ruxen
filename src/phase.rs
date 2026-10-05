@@ -65,10 +65,11 @@ pub struct RequestCtx<'a> {
     pub path: &'a [u8],
     /// The request line without its CRLF (`$request`).
     pub request_line: &'a [u8],
-    /// Upstream attempts made so far, for `$upstream_*` in an error page
-    /// reached through `proxy_intercept_errors` (nginx keeps them across
-    /// the internal redirect). Empty otherwise.
-    pub upstream_states: &'a [crate::proxy::UpstreamState],
+    /// What upstream passes left before an internal redirect, for
+    /// `$upstream_*` in an error page reached through
+    /// `proxy_intercept_errors` or in an X-Accel-Redirect target (nginx's
+    /// `r->upstream` survives the redirect). `None` otherwise.
+    pub upstream: Option<&'a crate::proxy::UpstreamTrail>,
     pub http_11: bool,
     pub host: Option<&'a [u8]>,
     /// SNI hostname captured at TLS handshake time, lowercased. `None` for
@@ -1586,7 +1587,7 @@ mod tests {
             method_bytes: method_bytes_for(method),
             path,
             request_line: b"",
-            upstream_states: &[],
+            upstream: None,
             http_11,
             host,
             sni: None,
