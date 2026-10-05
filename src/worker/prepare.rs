@@ -162,6 +162,17 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             })
             .collect();
         let proxy_protocol = servers_for_addr.iter().any(|s| s.listen.proxy_protocol);
+        // Socket options belong to the address: one server may set them
+        // (nginx's "duplicate listen options").
+        let mut with_options = servers_for_addr
+            .iter()
+            .map(|s| &s.listen)
+            .filter(|l| l.has_socket_options());
+        let options = with_options.next();
+        if with_options.next().is_some() {
+            return Err(format!("duplicate listen options for {addr}"));
+        }
+        let socket = ListenSocket::from_listen(options);
         let servers: Vec<PreparedServer> = servers_for_addr
             .into_iter()
             .map(|s| {
@@ -196,6 +207,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             default_server: 0,
             tls,
             proxy_protocol,
+            socket,
         });
     }
 

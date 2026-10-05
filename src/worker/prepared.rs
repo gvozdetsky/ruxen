@@ -1132,6 +1132,41 @@ pub struct PreparedListen {
     /// `listen … proxy_protocol` on any server of this address: every
     /// connection starts with a PROXY protocol header.
     pub proxy_protocol: bool,
+    /// The listening socket's options.
+    pub socket: ListenSocket,
+}
+
+/// A listening socket's `listen` options (`backlog=`, `rcvbuf=`, …), from
+/// the one server of the address that sets them, as nginx.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenSocket {
+    /// nginx's default is 511; ruxen keeps 4096 for its benchmarks'
+    /// connection bursts unless `backlog=` says otherwise.
+    pub backlog: i32,
+    pub rcvbuf: Option<usize>,
+    pub sndbuf: Option<usize>,
+    pub deferred: bool,
+    pub fastopen: Option<u32>,
+    pub keepalive: Option<crate::config::SoKeepalive>,
+    /// `IPV6_V6ONLY` for an IPv6 address: on unless `ipv6only=off`, as
+    /// nginx (a `[::]` listen doesn't take IPv4 clients).
+    pub ipv6only: bool,
+}
+
+impl ListenSocket {
+    pub(crate) fn from_listen(listen: Option<&crate::config::Listen>) -> Self {
+        ListenSocket {
+            backlog: listen
+                .and_then(|l| l.backlog)
+                .map_or(4096, |n| n.min(i32::MAX as u32) as i32),
+            rcvbuf: listen.and_then(|l| l.rcvbuf).map(|n| n as usize),
+            sndbuf: listen.and_then(|l| l.sndbuf).map(|n| n as usize),
+            deferred: listen.is_some_and(|l| l.deferred),
+            fastopen: listen.and_then(|l| l.fastopen),
+            keepalive: listen.and_then(|l| l.so_keepalive),
+            ipv6only: listen.and_then(|l| l.ipv6only).unwrap_or(true),
+        }
+    }
 }
 
 /// Top-level prepared state.

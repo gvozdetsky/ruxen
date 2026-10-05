@@ -1183,4 +1183,68 @@ mod tests {
         let text = std::str::from_utf8(&out).unwrap();
         assert!(text.contains("X-Len: 7\r\n"));
     }
+
+    fn sockopt_int(fd: i32, level: i32, name: i32) -> i32 {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: an int option into our own buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt {level}/{name}");
+        value
+    }
+
+    /// The `listen` options reach the socket, as nginx's
+    /// ngx_configure_listening_sockets; they used to be parsed and dropped.
+    #[test]
+    pub(crate) fn listen_options_are_set_on_the_socket() {
+        use std::os::fd::AsRawFd;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let http = prepare(parse_cfg(&format!(
+            "http {{ server {{ listen 127.0.0.1:{port} backlog=100 rcvbuf=64k sndbuf=32k \
+             deferred fastopen=10 so_keepalive=30m:10:5; }} }}"
+        )))
+        .expect("prepare");
+        let socket = listen_socket(http, &http.listens[0]).expect("listen");
+        let fd = socket.as_raw_fd();
+        // The kernel doubles SO_RCVBUF / SO_SNDBUF for bookkeeping.
+        assert_eq!(
+            sockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF),
+            128 * 1024
+        );
+        assert_eq!(
+            sockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF),
+            64 * 1024
+        );
+        assert_eq!(sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        assert_eq!(
+            sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE),
+            30 * 60
+        );
+        assert_eq!(sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 10);
+        assert_eq!(sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT), 5);
+        assert!(sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT) > 0);
+        assert_eq!(sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN), 10);
+        drop(socket);
+
+        // A second server with options on the same address is an error.
+        let err = prepare(parse_cfg(&format!(
+            "http {{ server {{ listen 127.0.0.1:{port} backlog=100; }} \
+             server {{ listen 127.0.0.1:{port} rcvbuf=8k; }} }}"
+        )))
+        .err()
+        .expect("duplicate options");
+        assert!(err.contains("duplicate listen options"), "{err}");
+    }
 }
