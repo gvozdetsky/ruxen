@@ -1579,6 +1579,83 @@ pub(crate) async fn handle<S: ConnIo>(
                         // buffer ⇒ pipelined. Matches nginx's `r->pipeline`
                         // semantic.
                         let pipe_byte: u8 = if read_start > 0 { b'p' } else { b'.' };
+                        let request_line =
+                            trim_crlf(&buf[base + req.method_start..base + req.headers_start]);
+                        macro_rules! request_ctx {
+                            ($body:expr, $body_len:expr, $body_file:expr, $request_length:expr,
+                             $epoch_secs:expr, $epoch_ms:expr) => {
+                                phase::RequestCtx {
+                                    method,
+                                    method_bytes,
+                                    path,
+                                    request_line,
+                                    upstream_states: &[],
+                                    http_11: req.http_11,
+                                    host,
+                                    sni,
+                                    listen_index,
+                                    remote_addr: &remote_addr,
+                                    remote_port,
+                                    if_modified_since,
+                                    if_unmodified_since,
+                                    if_none_match,
+                                    if_match,
+                                    range,
+                                    if_range,
+                                    headers_raw,
+                                    connection_id,
+                                    connection_requests: request_count,
+                                    connection_time_us,
+                                    request_time_us,
+                                    request_port,
+                                    pipe: pipe_byte,
+                                    request_length: $request_length,
+                                    epoch_secs: $epoch_secs,
+                                    epoch_ms: $epoch_ms,
+                                    body: $body,
+                                    body_len: $body_len,
+                                    body_file: $body_file,
+                                    tls,
+                                    proxy_protocol,
+                                    refuse,
+                                }
+                            };
+                        }
+                        // The read is bounded by the client_max_body_size
+                        // of the location the request is routed to first,
+                        // and a Content-Length over it is refused unread,
+                        // as nginx's find_config phase does. Without a
+                        // location (refused, answered by the server's
+                        // rewrite phase) the bound is the largest of any
+                        // location; the matched location checks its own
+                        // limit after the read either way.
+                        let mut max_body = http.max_request_body;
+                        let has_body = req.content_length.is_some_and(|cl| cl > 0)
+                            || req.transfer_encoding_chunked;
+                        if refuse.is_none() && has_body {
+                            let cl = req.content_length.unwrap_or(0);
+                            let probe = request_ctx!(&[], cl, &[], req.consumed as u64 + cl, 0, 0);
+                            if let Some(first) =
+                                phase::first_body_limit(http, &probe, &mut *url_scratch)
+                            {
+                                max_body = match first.max {
+                                    0 => u64::MAX,
+                                    n => n,
+                                };
+                                if cl > max_body {
+                                    write_error_log(
+                                        first.error_logs,
+                                        ErrorLogLevel::Error,
+                                        &ErrorLogRequest::new(&probe, first.server_name),
+                                        format!(
+                                            "client intended to send too large body: {cl} bytes"
+                                        )
+                                        .as_bytes(),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
                         // Expect: 100-continue (nginx ngx_http_test_expect):
                         // when the client sent the exact value "100-continue"
                         // on HTTP/1.1, send the interim `HTTP/1.1 100 Continue`
@@ -1591,7 +1668,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // / unknown) are silently ignored — RFC says 417, but
                         // nginx never implemented that branch and the upstream
                         // test marks it TODO.
-                        if req.http_11 && refuse.is_none() {
+                        // Not when the body is refused from its
+                        // Content-Length below: nginx sets expect_tested
+                        // before discarding it, so no 100 goes out.
+                        let refused_unread = req.content_length.is_some_and(|cl| cl > max_body);
+                        if req.http_11 && refuse.is_none() && !refused_unread {
                             if let Some(expect) = lookup_request_header(
                                 &buf[base + req.headers_start..base + req.headers_end],
                                 b"expect",
@@ -1607,11 +1688,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         }
                         // Request bodies stay in memory up to
                         // REQUEST_BODY_IN_MEMORY and go to a temp file past
-                        // that (`BodySink`). The read is bounded by the
-                        // largest client_max_body_size of any location —
-                        // routing comes after — and the matched location
-                        // checks its own limit.
-                        let max_body = http.max_request_body;
+                        // that (`BodySink`), within `max_body` above.
                         let mut pipelined_tail: Vec<u8> = Vec::new();
                         let mut sink = BodySink::with_capacity(req.content_length.unwrap_or(0));
                         let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
@@ -1732,43 +1809,14 @@ pub(crate) async fn handle<S: ConnIo>(
                         let epoch_secs = now.as_secs();
                         let epoch_ms = (now.subsec_millis() as u16) % 1000;
 
-                        let request_line =
-                            trim_crlf(&buf[base + req.method_start..base + req.headers_start]);
-                        let ctx = phase::RequestCtx {
-                            method,
-                            method_bytes,
-                            path,
-                            request_line,
-                            upstream_states: &[],
-                            http_11: req.http_11,
-                            host,
-                            sni,
-                            listen_index,
-                            remote_addr: &remote_addr,
-                            remote_port,
-                            if_modified_since,
-                            if_unmodified_since,
-                            if_none_match,
-                            if_match,
-                            range,
-                            if_range,
-                            headers_raw,
-                            connection_id,
-                            connection_requests: request_count,
-                            connection_time_us,
-                            request_time_us,
-                            request_port,
-                            pipe: pipe_byte,
-                            request_length,
-                            epoch_secs,
-                            epoch_ms,
-                            body: body_vec.as_slice(),
+                        let ctx = request_ctx!(
+                            body_vec.as_slice(),
                             body_len,
                             body_file,
-                            tls,
-                            proxy_protocol,
-                            refuse,
-                        };
+                            request_length,
+                            epoch_secs,
+                            epoch_ms
+                        );
                         let (response, mut process_meta) =
                             phase::process_with_meta(http, &ctx, &mut *url_scratch);
                         if let Some(spilled) = request_body_file.as_ref() {

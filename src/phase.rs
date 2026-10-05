@@ -1072,6 +1072,72 @@ pub struct ServerNameCaptures {
     pub names: Vec<(&'static str, Vec<u8>)>,
 }
 
+/// `client_max_body_size` of the location a request is routed to first,
+/// with what an error-log line about it needs.
+pub(crate) struct FirstBodyLimit {
+    /// In bytes; `0` turns the check off.
+    pub max: u64,
+    pub error_logs: &'static [PreparedErrorLog],
+    pub server_name: &'static [u8],
+}
+
+/// The limit nginx holds a request's Content-Length to before reading the
+/// body: that of the location `ngx_http_core_find_config_phase` finds
+/// first, after the server's rewrite phase. The worker reads bodies before
+/// routing, so it asks this first and refuses an oversized body unread.
+/// `None` when the request doesn't get to a location that way (refused,
+/// answered by the server's rewrite phase, an `internal` location): then
+/// the body is read and the pipeline answers as before. Pure: runs the
+/// server's rewrite program on a throwaway state, and leaves `url_scratch`
+/// to be reset by `process_with_meta`.
+pub(crate) fn first_body_limit(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+) -> Option<FirstBodyLimit> {
+    let listen = select_listen(http, req.listen_index)?;
+    if req.refuse.is_some()
+        || (req.http_11 && req.host.is_none_or(|h| h.is_empty()))
+        || matches!(req.method, Method::Trace | Method::Connect)
+    {
+        return None;
+    }
+    let (server, regex_captures) = find_config(listen, req.host, req.sni);
+    url_scratch.clear();
+    normalize_request_uri_into(http, req, server.merge_slashes, url_scratch).ok()?;
+    let mut rewrite_state = RewriteState::default();
+    if !server.rewrite_program.is_empty() {
+        let mut current_args = None;
+        if crate::worker::run_server_rewrite(
+            http,
+            server,
+            req,
+            url_scratch,
+            &mut current_args,
+            &mut rewrite_state,
+            regex_captures.as_ref(),
+        )
+        .is_some()
+        {
+            return None;
+        }
+    }
+    let loc = match match_location(server, url_scratch, &mut rewrite_state) {
+        Some(loc) => loc,
+        None => MatchedLocation::from_prefix(server.server_default.as_ref()?),
+    };
+    if loc.internal {
+        return None;
+    }
+    Some(FirstBodyLimit {
+        max: loc
+            .client_max_body_size
+            .unwrap_or(crate::worker::DEFAULT_CLIENT_MAX_BODY_SIZE),
+        error_logs: loc.error_logs,
+        server_name: server.primary_server_name,
+    })
+}
+
 fn select_listen<'h>(http: &'h PreparedHttp, listen_index: usize) -> Option<&'h PreparedListen> {
     http.listens.get(listen_index)
 }
