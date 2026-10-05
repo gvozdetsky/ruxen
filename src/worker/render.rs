@@ -328,9 +328,9 @@ impl RenderCtx<'_> {
             Variable::UpstreamHeaderTime => {
                 self.write_upstream_list(out, |out, s| write_upstream_ms(out, s.header_ms))
             }
-            Variable::UpstreamResponseTime => {
-                self.write_upstream_list(out, |out, s| write_upstream_ms(out, s.response_ms))
-            }
+            Variable::UpstreamResponseTime => self.write_upstream_list(out, |out, s| {
+                write_upstream_ms(out, if s.in_flight { None } else { s.response_ms })
+            }),
             Variable::UpstreamResponseLength => {
                 self.write_upstream_list(out, |out, s| write_u64_decimal(out, s.response_length))
             }

@@ -218,3 +218,53 @@ fn proxy_generated_errors_use_error_page_and_add_header_always() {
     assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
     assert_eq!(body(&resp), format!("page {peer}|502"), "{resp}");
 }
+
+/// While the response header is filtered, the try it came from is still
+/// in flight: its `$upstream_response_time` is `-` (nginx sets it when the
+/// upstream request is finalized), and only finished tries have a time.
+/// The access log, written after the response, has a time for every try.
+/// `add_header` used to show the header time for the current try.
+#[test]
+fn response_time_is_a_dash_while_in_flight() {
+    let dead = DeadPort::new();
+    let backend = spawn_backend();
+    let server = start(
+        "inflight",
+        &format!(
+            "log_format t '$upstream_response_time';\n\
+             upstream u {{ server 127.0.0.1:{dead}; server 127.0.0.1:{backend}; }}\n\
+             server {{ listen 127.0.0.1:%%PORT%%;\n\
+               access_log %%DIR%%/t.log t;\n\
+               add_header X-RT $upstream_response_time;\n\
+               location / {{ proxy_pass http://u; }}\n\
+             }}",
+            dead = dead.port(),
+        ),
+    );
+    let is_time = |t: &str| t.len() == 5 && t.as_bytes()[1] == b'.';
+    // Round-robin may start with either peer; the dead one fails once and
+    // is then skipped, so one of these has two tries.
+    let mut headers = Vec::new();
+    for _ in 0..3 {
+        let resp = get(server.port, "/a");
+        assert!(resp.ends_with("hello"), "{resp}");
+        let rt = resp
+            .lines()
+            .find_map(|l| l.strip_prefix("X-RT: "))
+            .unwrap_or_else(|| panic!("{resp}"));
+        headers.push(rt.to_string());
+    }
+    for rt in &headers {
+        let tries: Vec<&str> = rt.split(", ").collect();
+        let (last, earlier) = tries.split_last().unwrap();
+        assert_eq!(*last, "-", "{headers:?}");
+        assert!(earlier.iter().all(|t| is_time(t)), "{headers:?}");
+    }
+    assert!(headers.iter().any(|rt| rt.contains(", ")), "{headers:?}");
+    sleep(Duration::from_millis(50));
+    let log = std::fs::read_to_string(server.dir.join("t.log")).unwrap();
+    for line in log.lines() {
+        assert!(line.split(", ").all(is_time), "{log}");
+    }
+    assert_eq!(log.lines().count(), 3, "{log}");
+}
