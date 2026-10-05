@@ -364,13 +364,7 @@ async fn settle_proxy_response(
         // nginx's ngx_http_upstream_process_headers: the response is dropped
         // and the request redirected internally, as a GET.
         _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => (
-            accel_redirect_reroute(
-                report
-                    .accel
-                    .as_mut()
-                    .and_then(|a| a.redirect.take())
-                    .unwrap_or_default(),
-            ),
+            accel_redirect(&mut report),
             !matches!(ctx.method, Method::Head),
         ),
         upstream_resp => {
@@ -435,6 +429,9 @@ fn finish_proxy_response(
         &process_meta,
         &report.upstream_headers,
     );
+    // The header is filtered; the body is already read (responses are
+    // buffered whole), so the upstream request is over.
+    crate::proxy::finish_answer(&mut process_meta.upstream_states);
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
 }
@@ -510,13 +507,7 @@ async fn run_proxy_pass(
         // nginx's ngx_http_upstream_process_headers: the response is dropped
         // and the request redirected internally, as a GET.
         _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => PassOutcome::Redirect {
-            reroute: accel_redirect_reroute(
-                report
-                    .accel
-                    .as_mut()
-                    .and_then(|a| a.redirect.take())
-                    .unwrap_or_default(),
-            ),
+            reroute: accel_redirect(&mut report),
             states: report.states,
             as_get: !matches!(ctx.method, Method::Head),
             limit_rate: report.accel.as_ref().and_then(|a| a.limit_rate),
@@ -602,6 +593,19 @@ fn pass_request<'a>(ctx: &phase::RequestCtx<'a>, as_get: bool) -> phase::Request
 
 /// An `X-Accel-Redirect` value as an internal redirect: `@name` jumps to a
 /// named location, anything else is a URI with optional `?args`.
+/// The upstream's X-Accel-Redirect: its request is over (nginx finalizes
+/// it before redirecting), and the request goes to the target.
+fn accel_redirect(report: &mut crate::proxy::ProxyReport) -> phase::Reroute {
+    crate::proxy::finish_answer(&mut report.states);
+    accel_redirect_reroute(
+        report
+            .accel
+            .as_mut()
+            .and_then(|a| a.redirect.take())
+            .unwrap_or_default(),
+    )
+}
+
 fn accel_redirect_reroute(target: Vec<u8>) -> phase::Reroute {
     let (target, args) = if target.first() == Some(&b'@') {
         (phase::RerouteTarget::Named(target), None)

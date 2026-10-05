@@ -455,6 +455,12 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                         plan.response.recursive_error_pages,
                     );
                 }
+                // This try is still in flight while the response header is
+                // filtered: nginx's response_time is -1 (`-`) until the
+                // upstream request is finalized.
+                if let Some(state) = states.last_mut() {
+                    state.in_flight = true;
+                }
                 return resp;
             }
             AttemptOutcome::PooledStale => {
@@ -771,6 +777,15 @@ pub struct ProxyReport {
     pub states: Vec<UpstreamState>,
 }
 
+/// The answer's upstream request is over (its header filtered, or the
+/// request redirected internally): its `$upstream_response_time` shows,
+/// as after ngx_http_upstream_finalize_request.
+pub fn finish_answer(states: &mut [UpstreamState]) {
+    if let Some(state) = states.last_mut() {
+        state.in_flight = false;
+    }
+}
+
 /// Record an upstream `X-Accel-Redirect` / `X-Accel-Limit-Rate` unless
 /// `proxy_ignore_headers` lists it. Cold: kept out of the attempt's code.
 #[cold]
@@ -812,6 +827,11 @@ pub struct UpstreamState {
     pub peer: UpstreamPeerName,
     /// Status from the upstream, or 502/504 when the attempt failed.
     pub status: u16,
+    /// The try whose response is being sent, while its header is filtered:
+    /// `$upstream_response_time` is `-` then, as nginx's response_time is
+    /// -1 until the upstream request is finalized. `response_ms` already
+    /// holds the time (the body is read whole before the header filter).
+    pub in_flight: bool,
     /// Milliseconds from the start of the attempt; `None` until reached.
     pub connect_ms: Option<u64>,
     pub header_ms: Option<u64>,
@@ -834,6 +854,7 @@ impl UpstreamState {
         UpstreamState {
             peer,
             status: 0,
+            in_flight: false,
             connect_ms: None,
             header_ms: None,
             response_ms: None,
