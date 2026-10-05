@@ -796,3 +796,130 @@ fn tls_keepalive_serves_requests_around_idle_waits() {
     sleep(Duration::from_millis(1200));
     assert!(tls_get(&mut c).starts_with("HTTP/1.1 200"));
 }
+
+const SESSION_ID_CONF: &str = r#"
+events {}
+http {
+    ssl_session_cache shared:SSL:1m;
+    server {
+        listen 127.0.0.1:%%PORT%% ssl;
+        server_name localhost;
+        ssl_certificate %%CERT%%;
+        ssl_certificate_key %%KEY%%;
+        location / { return 200 "id=$ssl_session_id reused=$ssl_session_reused"; }
+    }
+}
+"#;
+
+/// One request on a new connection with `config` (whose session cache
+/// carries resumption between calls); returns the body.
+fn session_get(port: u16, config: &std::sync::Arc<rustls::ClientConfig>) -> String {
+    use std::io::Read;
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(config.clone(), name).unwrap();
+    let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut c = rustls::StreamOwned::new(conn, sock);
+    std::io::Write::write_all(
+        &mut c,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    let out = String::from_utf8(out).unwrap();
+    out.split("\r\n\r\n").nth(1).unwrap_or_default().to_string()
+}
+
+fn session_client(
+    ca_pem: &Path,
+    version: &'static rustls::SupportedProtocolVersion,
+) -> std::sync::Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read(ca_pem).unwrap();
+    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder_with_protocol_versions(&[version])
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+fn session_id_of(body: &str) -> &str {
+    let id = body
+        .strip_prefix("id=")
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("{body:?}"));
+    assert!(
+        id.is_empty() || (id.len() == 64 && id.bytes().all(|b| b"0123456789abcdef".contains(&b))),
+        "{body:?}"
+    );
+    id
+}
+
+/// `$ssl_session_id` is 64 lowercase hex digits, as nginx's, and stays the
+/// same when a TLS 1.3 client resumes the session, again and again: with a
+/// ticket, and from the session cache.
+#[test]
+fn ssl_session_id_survives_tls13_resumption() {
+    tls13_resumption_keeps_the_session_id(SESSION_ID_CONF);
+    tls13_resumption_keeps_the_session_id(&SESSION_ID_CONF.replace(
+        "ssl_session_cache shared:SSL:1m;",
+        "ssl_session_cache shared:SSL:1m; ssl_session_tickets off;",
+    ));
+}
+
+fn tls13_resumption_keeps_the_session_id(conf: &str) {
+    let certs = make_ca_and_leaf("localhost");
+    let ca = certs.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server(conf, certs);
+    let client = session_client(&ca, &rustls::version::TLS13);
+
+    let first = session_get(server.port, &client);
+    let second = session_get(server.port, &client);
+    let third = session_get(server.port, &client);
+    assert!(first.ends_with(" reused=."), "{first:?}");
+    assert!(second.ends_with(" reused=r"), "{second:?}");
+    assert!(third.ends_with(" reused=r"), "{third:?}");
+    let id = session_id_of(&first);
+    assert_eq!(id.len(), 64);
+    assert_eq!(session_id_of(&second), id);
+    assert_eq!(session_id_of(&third), id);
+
+    // Another client's session has another id.
+    let other = session_get(server.port, &session_client(&ca, &rustls::version::TLS13));
+    assert_ne!(session_id_of(&other), id);
+}
+
+/// TLS 1.2: a full handshake has an id. rustls doesn't return the data
+/// stored with a resumed TLS 1.2 session, so a resumption renders empty
+/// rather than a made-up id.
+#[test]
+fn ssl_session_id_over_tls12() {
+    let certs = make_ca_and_leaf("localhost");
+    let ca = certs.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server(SESSION_ID_CONF, certs);
+    let client = session_client(&ca, &rustls::version::TLS12);
+
+    let first = session_get(server.port, &client);
+    let second = session_get(server.port, &client);
+    assert!(first.ends_with(" reused=."), "{first:?}");
+    assert_eq!(session_id_of(&first).len(), 64);
+    assert_eq!(second, "id= reused=r");
+}
+
+/// Without session resumption there is no session to identify.
+#[test]
+fn ssl_session_id_is_empty_without_resumption() {
+    let certs = make_ca_and_leaf("localhost");
+    let ca = certs.ca_path().unwrap().to_path_buf();
+    let conf = SESSION_ID_CONF.replace(
+        "ssl_session_cache shared:SSL:1m;",
+        "ssl_session_cache off; ssl_session_tickets off;",
+    );
+    let server = spawn_https_server(&conf, certs);
+    let body = session_get(server.port, &session_client(&ca, &rustls::version::TLS13));
+    assert_eq!(body, "id= reused=.");
+}

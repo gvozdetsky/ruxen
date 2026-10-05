@@ -31,7 +31,7 @@ mod values;
 
 pub use ast::*;
 pub use error::*;
-pub use values::parse_value_with_vars;
+pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
 pub(crate) use lexer::*;
 pub(crate) use parse_location::*;

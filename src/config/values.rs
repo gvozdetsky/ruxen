@@ -318,6 +318,12 @@ fn classify_proxy_protocol_tlv(name: &[u8]) -> ProxyProtocolTlv {
     }
 }
 
+/// Some value in the configuration reads `$ssl_session_id`. TLS listens
+/// with session resumption then give each session an id (see
+/// `TlsAcceptor::with_session_ids`); otherwise handshakes don't pay for it.
+pub static SSL_SESSION_ID_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
     Ok(match name {
         b"uri" => Variable::Uri,
@@ -343,7 +349,10 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"ssl_ciphers" => Variable::SslCiphers,
         b"ssl_server_name" => Variable::SslServerName,
         b"ssl_session_reused" => Variable::SslSessionReused,
-        b"ssl_session_id" => Variable::SslSessionId,
+        b"ssl_session_id" => {
+            SSL_SESSION_ID_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+            Variable::SslSessionId
+        }
         b"ssl_client_verify" => Variable::SslClientVerify,
         b"ssl_client_i_dn" => Variable::SslClientIDn,
         b"ssl_client_i_dn_legacy" => Variable::SslClientIDnLegacy,

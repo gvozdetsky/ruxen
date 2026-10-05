@@ -41,28 +41,56 @@ const WRITE_BUF_KEEP: usize = 32 * 1024;
 #[derive(Clone)]
 pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
+    session_ids: bool,
 }
 
 impl From<Arc<ServerConfig>> for TlsAcceptor {
     fn from(config: Arc<ServerConfig>) -> Self {
-        Self { config }
+        Self {
+            config,
+            session_ids: false,
+        }
     }
 }
 
 impl TlsAcceptor {
+    /// Give each session an id for `$ssl_session_id`, when the config
+    /// resumes sessions at all. rustls exposes neither the TLS 1.2 session
+    /// ID nor the TLS 1.3 ticket, so a full handshake draws 32 random bytes
+    /// and stores them in the session as its resumption data (see
+    /// `TlsStream::session_id`).
+    pub fn with_session_ids(mut self) -> Self {
+        self.session_ids =
+            self.config.session_storage.can_cache() || self.config.ticketer.enabled();
+        self
+    }
+
     /// Run the server handshake over `io`. rustls errors surface as
     /// `InvalidData`, a peer that hangs up mid-handshake as `UnexpectedEof`.
     pub async fn accept<IO>(&self, io: IO) -> io::Result<TlsStream<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
     {
-        let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
+        let mut conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
+        let session_id = if self.session_ids {
+            let mut id = [0; 32];
+            self.config
+                .crypto_provider()
+                .secure_random
+                .fill(&mut id)
+                .map_err(|_| io::Error::other("no random bytes for a session id"))?;
+            conn.set_resumption_data(&id);
+            Some(id)
+        } else {
+            None
+        };
         let mut stream = TlsStream {
             io,
             conn,
             rbuf: Vec::new(),
             rpos: 0,
             wbuf: Vec::new(),
+            session_id,
         };
         stream.handshake().await?;
         Ok(stream)
@@ -80,12 +108,26 @@ pub struct TlsStream<IO> {
     /// Outgoing ciphertext staging, reused across writes (see
     /// `WRITE_BUF_KEEP`).
     wbuf: Vec<u8>,
+    /// The session's `$ssl_session_id` bytes, with `with_session_ids`.
+    session_id: Option<[u8; 32]>,
 }
 
 impl<IO> TlsStream<IO> {
     /// The rustls session, for reading negotiated parameters.
     pub fn connection(&self) -> &ServerConnection {
         &self.conn
+    }
+
+    /// The id `with_session_ids` gave this session: drawn on a full
+    /// handshake, carried over on a TLS 1.3 resumption. rustls doesn't
+    /// return the resumption data of a resumed TLS 1.2 session, so that
+    /// one has none, like a listen without resumption.
+    pub fn session_id(&self) -> Option<&[u8; 32]> {
+        let resumed = self.conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
+        if resumed && self.conn.received_resumption_data().map(<[u8]>::len) != Some(32) {
+            return None;
+        }
+        self.session_id.as_ref()
     }
 
     /// The underlying transport, for waiting on the socket directly.
@@ -119,6 +161,18 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
                     io::ErrorKind::UnexpectedEof,
                     "tls handshake eof",
                 ));
+            }
+            // A resumed TLS 1.3 session keeps its id, also in the tickets
+            // issued now (after the client's Finished, a later flight).
+            if let Some(id) = &mut self.session_id
+                && let Some(Ok(received)) = self
+                    .conn
+                    .received_resumption_data()
+                    .map(<[u8; 32]>::try_from)
+                && received != *id
+            {
+                *id = received;
+                self.conn.set_resumption_data(&received);
             }
         }
     }
