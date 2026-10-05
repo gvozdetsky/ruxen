@@ -1512,6 +1512,32 @@ pub(crate) fn prepare_maps(
 /// concatenation of every prepared sink in declaration order; per-scope
 /// slices share `file_index` values that point back into it, so the
 /// per-worker fd table opened from the canonical list serves all scopes.
+/// A `syslog:` peer for `access_log`. A UDP server is resolved now, so a
+/// bad host fails at startup, as nginx's ngx_parse_url does.
+fn prepare_syslog_peer(
+    peer: &crate::config::SyslogPeer,
+) -> Result<&'static PreparedSyslogPeer, String> {
+    let server = match &peer.server {
+        ErrorLogSyslogServer::Unix(path) => {
+            PreparedErrorLogSyslogServer::Unix(Box::leak(path.clone().into_boxed_path()))
+        }
+        ErrorLogSyslogServer::Udp(addr) => {
+            crate::syslog::resolve(addr).map_err(|e| format!("syslog server \"{addr}\": {e}"))?;
+            PreparedErrorLogSyslogServer::Udp(Box::leak(addr.clone().into_boxed_str()))
+        }
+    };
+    let tag: &'static [u8] = match &peer.tag {
+        Some(tag) => Box::leak(tag.clone().into_bytes().into_boxed_slice()),
+        None => b"ruxen",
+    };
+    Ok(Box::leak(Box::new(PreparedSyslogPeer {
+        server,
+        pri: peer.facility * 8 + peer.severity,
+        tag,
+        nohostname: peer.nohostname,
+    })))
+}
+
 pub(crate) struct AccessLogPrep<'a> {
     format_map: std::collections::HashMap<&'a str, &'a LogFormatDef>,
     canonical: Vec<PreparedAccessLog>,
@@ -1550,7 +1576,13 @@ impl<'a> AccessLogPrep<'a> {
         // Create the file up front, as nginx does at startup: an unwritable
         // path fails here rather than in every worker, and tests that read
         // the log don't hit ENOENT when no request matches `if=...`.
-        open_log_file(&log.path)?;
+        let syslog = match &log.syslog {
+            Some(peer) => Some(prepare_syslog_peer(peer)?),
+            None => {
+                open_log_file(&log.path)?;
+                None
+            }
+        };
 
         let file_index = self.canonical.len();
         let prepared = PreparedAccessLog {
@@ -1565,6 +1597,7 @@ impl<'a> AccessLogPrep<'a> {
             }),
             condition: log.condition.clone().map(prepare_value_parts),
             file_index,
+            syslog,
         };
         self.canonical.push(prepared);
         Ok(prepared)

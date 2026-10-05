@@ -114,13 +114,30 @@ thread_local! {
     /// This worker's access_log files (indexed by `file_index`) and the
     /// reopen generation they were opened at. An `Rc` so a write still in
     /// flight keeps the old files open across a reopen.
-    static ACCESS_LOG_FILES: std::cell::RefCell<(u64, Option<std::rc::Rc<[AsyncFile]>>)> =
+    static ACCESS_LOG_FILES: std::cell::RefCell<(u64, Option<std::rc::Rc<[AccessLogSink]>>)> =
         const { std::cell::RefCell::new((0, None)) };
 }
 
-fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AsyncFile]>, String> {
-    let mut opened: Vec<AsyncFile> = Vec::with_capacity(logs.len());
+/// Where one access_log's lines go in this worker.
+pub(crate) enum AccessLogSink {
+    File(AsyncFile),
+    Syslog(crate::syslog::SyslogSocket),
+}
+
+fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AccessLogSink]>, String> {
+    let mut opened: Vec<AccessLogSink> = Vec::with_capacity(logs.len());
     for log in logs {
+        if let Some(peer) = log.syslog {
+            let sock = crate::syslog::SyslogSocket::open(peer).map_err(|e| {
+                format!(
+                    "syslog \"{}\" failed ({})",
+                    log.path.display(),
+                    errno_text(&e)
+                )
+            })?;
+            opened.push(AccessLogSink::Syslog(sock));
+            continue;
+        }
         let open_failed = |e: std::io::Error| {
             format!(
                 "open() \"{}\" failed ({})",
@@ -133,7 +150,9 @@ fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AsyncFile
             .append(true)
             .open(log.path)
             .map_err(open_failed)?;
-        opened.push(AsyncFile::from_std(std_file).map_err(open_failed)?);
+        opened.push(AccessLogSink::File(
+            AsyncFile::from_std(std_file).map_err(open_failed)?,
+        ));
     }
     Ok(opened.into())
 }
@@ -153,7 +172,7 @@ pub(crate) fn init_access_logs_for_worker(logs: &[PreparedAccessLog]) -> Result<
 
 /// This worker's access_log files, reopened first if SIGUSR1 arrived
 /// since they were opened. `None` before `init_access_logs_for_worker`.
-pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc<[AsyncFile]>> {
+pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc<[AccessLogSink]>> {
     let generation = LOG_REOPEN_GEN.load(std::sync::atomic::Ordering::Relaxed);
     ACCESS_LOG_FILES.with(|cell| {
         let mut cell = cell.borrow_mut();
