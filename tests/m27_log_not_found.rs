@@ -288,3 +288,29 @@ fn concurrent_lookups_each_log_their_own_line() {
         );
     }
 }
+
+/// The `host:` context is the Host header line, port included, as nginx
+/// prints `r->headers_in.host->value`; it used to be the routing host,
+/// without the port. (Letter case is still folded: the request parser
+/// lowercases the host in place.)
+#[test]
+fn host_context_is_the_header_as_sent() {
+    let (guard, port) = spawn_server(|dir| {
+        format!(
+            "    error_log {root}/e.log;\n    location / {{ }}\n",
+            root = dir.display()
+        )
+    });
+    let resp = request(
+        port,
+        b"GET /x HTTP/1.1\r\nHost: example.test:18160\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
+    sleep(Duration::from_millis(50));
+    let log = std::fs::read_to_string(guard.tempdir.join("e.log")).unwrap_or_default();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("/x\" failed") && l.ends_with(", host: \"example.test:18160\"")),
+        "{log}"
+    );
+}

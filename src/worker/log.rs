@@ -62,7 +62,10 @@ impl<'a> ErrorLogRequest<'a> {
             method: ctx.method_bytes,
             uri: ctx.path,
             http_11: ctx.http_11,
-            host: ctx.host,
+            // The Host header line (nginx's r->headers_in.host->value),
+            // port included, not the host used for routing. Its letters
+            // are already lowercased: the parser folds them in place.
+            host: lookup_request_header(ctx.headers_raw, b"host"),
         }
     }
 
