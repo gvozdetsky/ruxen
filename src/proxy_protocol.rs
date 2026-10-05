@@ -11,6 +11,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
+use crate::config::ErrorLogLevel;
+use crate::worker::errno_text;
+
 /// The client's and the proxy's addresses as the header gives them.
 /// `None` for `PROXY UNKNOWN` and v2 `LOCAL` (health checks): the
 /// connection is used with its own addresses.
@@ -160,6 +163,15 @@ fn parse_v2(buf: &[u8]) -> Parsed {
     Parsed::Header(header, len)
 }
 
+/// nginx's line for `client_header_timeout` running out (logged with
+/// `NGX_ETIMEDOUT`).
+fn timed_out() -> (ErrorLogLevel, String) {
+    (
+        ErrorLogLevel::Info,
+        "client timed out (110: Connection timed out)".into(),
+    )
+}
+
 /// `what: "<the bytes>"`, as nginx shows a header it refused: up to the
 /// first CR or LF (and, here, at most a v1 line's worth).
 fn broken(what: &str, got: &[u8]) -> String {
@@ -170,25 +182,27 @@ fn broken(what: &str, got: &[u8]) -> String {
 }
 
 /// Read the PROXY header off `stream` within `timeout`, leaving the bytes
-/// after it in the socket. `Err` carries the reason for the error log;
-/// the caller closes the connection.
+/// after it in the socket. `Err` carries the error-log level and the bare
+/// reason (the caller adds nginx's "while reading PROXY protocol" and the
+/// connection context) and closes the connection. As nginx, a client
+/// that timed out, closed or reset is `info`; a broken header is `error`.
 pub async fn read(
     stream: &monoio::net::TcpStream,
     timeout: Duration,
-) -> Result<ProxyHeader, String> {
+) -> Result<ProxyHeader, (ErrorLogLevel, String)> {
     let deadline = monoio::time::Instant::now() + timeout;
     let fd = stream.as_raw_fd();
     let mut buf = vec![0u8; V2_MAX];
     loop {
         let remaining = deadline.saturating_duration_since(monoio::time::Instant::now());
         if remaining.is_zero() {
-            return Err("client timed out while reading PROXY protocol".into());
+            return Err(timed_out());
         }
         if monoio::time::timeout(remaining, stream.readable(false))
             .await
             .is_err()
         {
-            return Err("client timed out while reading PROXY protocol".into());
+            return Err(timed_out());
         }
         // SAFETY: recv into our own buffer; MSG_DONTWAIT keeps it from
         // blocking the worker whatever the socket's mode.
@@ -205,10 +219,24 @@ pub async fn read(
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 continue;
             }
-            return Err(format!("recv() failed ({e})"));
+            // ngx_connection_error: a peer that went away is info.
+            let level = match e.raw_os_error() {
+                Some(
+                    libc::ECONNRESET
+                    | libc::ENOTCONN
+                    | libc::ETIMEDOUT
+                    | libc::ECONNREFUSED
+                    | libc::ENETDOWN
+                    | libc::ENETUNREACH
+                    | libc::EHOSTDOWN
+                    | libc::EHOSTUNREACH,
+                ) => ErrorLogLevel::Info,
+                _ => ErrorLogLevel::Error,
+            };
+            return Err((level, format!("recv() failed ({})", errno_text(&e))));
         }
         if n == 0 {
-            return Err("client closed connection while reading PROXY protocol".into());
+            return Err((ErrorLogLevel::Info, "client closed connection".into()));
         }
         match parse(&buf[..n as usize]) {
             Parsed::Header(header, len) => {
@@ -217,7 +245,10 @@ pub async fn read(
                 let consumed =
                     unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), len, libc::MSG_DONTWAIT) };
                 if consumed != len as isize {
-                    return Err("recv() of the PROXY protocol header failed".into());
+                    return Err((
+                        ErrorLogLevel::Error,
+                        "recv() of the PROXY protocol header failed".into(),
+                    ));
                 }
                 return Ok(header);
             }
@@ -240,7 +271,7 @@ pub async fn read(
                 // too, so closing it is a FIN rather than a reset.
                 // SAFETY: as above.
                 unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), n as usize, libc::MSG_DONTWAIT) };
-                return Err(reason);
+                return Err((ErrorLogLevel::Error, reason));
             }
         }
     }
