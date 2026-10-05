@@ -393,6 +393,41 @@ fn feed(
 }
 
 #[inline]
+/// nginx's ngx_http_parse_unsafe_uri, for an X-Accel-Redirect path (the
+/// part before `?`): empty, `..` as a whole segment at the start or after
+/// a `/`, or a NUL, as written or once percent-decoded.
+pub fn is_unsafe(path: &[u8]) -> bool {
+    fn unsafe_as_is(p: &[u8]) -> bool {
+        let dot_dot_at =
+            |i: usize| p[i..].starts_with(b"..") && (p.len() == i + 2 || p[i + 2] == b'/');
+        dot_dot_at(0) || p.contains(&0) || (0..p.len()).any(|i| p[i] == b'/' && dot_dot_at(i + 1))
+    }
+    if path.is_empty() || unsafe_as_is(path) {
+        return true;
+    }
+    if !path.contains(&b'%') {
+        return false;
+    }
+    // ngx_unescape_uri: `%XX` decodes, anything else stays.
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut i = 0;
+    while i < path.len() {
+        if path[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                path.get(i + 1).copied().and_then(hex),
+                path.get(i + 2).copied().and_then(hex),
+            )
+        {
+            decoded.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            decoded.push(path[i]);
+            i += 1;
+        }
+    }
+    unsafe_as_is(&decoded)
+}
+
 fn hex(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -405,6 +440,39 @@ fn hex(c: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_uris_as_nginx() {
+        for p in [
+            &b""[..],
+            b"..",
+            b"../foo",
+            b"/..",
+            b"/foo/..",
+            b"/foo/../bar",
+            b"/foo/.%2e",
+            b"/foo/%2E%2E/bar",
+            b"%2e%2e",
+            b"/a\0b",
+            b"/a%00b",
+        ] {
+            assert!(is_unsafe(p), "{:?}", String::from_utf8_lossy(p));
+        }
+        for p in [
+            &b"/"[..],
+            b"/index.html",
+            b"/foo bar",
+            b"/foo%20bar",
+            b"/..foo",
+            b"/foo..",
+            b"/foo/...",
+            b"/foo/./bar",
+            b"@named",
+            b"/100%",
+        ] {
+            assert!(!is_unsafe(p), "{:?}", String::from_utf8_lossy(p));
+        }
+    }
 
     fn norm(s: &[u8]) -> Result<Vec<u8>, UriError> {
         let mut out = Vec::new();
