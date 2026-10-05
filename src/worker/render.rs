@@ -1242,6 +1242,26 @@ pub(crate) fn write_time_local(out: &mut Vec<u8>, secs: u64) {
     out.extend_from_slice(&buf);
 }
 
+/// `Oct  5 09:04:07` — the RFC 3164 timestamp nginx puts in syslog
+/// messages (`ngx_cached_syslog_time`: the day space-padded), in UTC.
+pub(crate) fn write_time_syslog(out: &mut Vec<u8>, secs: u64) {
+    const MON: [&[u8; 3]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    let (_, mon, day, hour, minute, second) = civil_from_secs(secs);
+    let mut buf = *b"Mon 00 00:00:00";
+    buf[0..3].copy_from_slice(MON[mon as usize]);
+    write_u2(&mut buf[4..6], day + 1);
+    if buf[4] == b'0' {
+        buf[4] = b' ';
+    }
+    write_u2(&mut buf[7..9], hour);
+    write_u2(&mut buf[10..12], minute);
+    write_u2(&mut buf[13..15], second);
+    out.extend_from_slice(&buf);
+}
+
 /// `1234567890.123` — UNIX seconds, dot, three-digit ms fraction.
 pub(crate) fn write_msec(out: &mut Vec<u8>, secs: u64, ms: u16) {
     write_u64_decimal(out, secs);

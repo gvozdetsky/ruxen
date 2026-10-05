@@ -890,7 +890,10 @@ pub enum LogEscape {
 /// One `access_log path [format] [if=expr];` sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessLog {
+    /// The file, or the `syslog:…` argument as written (for messages).
     pub path: PathBuf,
+    /// `access_log syslog:…`: the peer to send the lines to instead.
+    pub syslog: Option<SyslogPeer>,
     pub format: Option<String>,
     pub condition: Option<Vec<ValuePart>>,
 }
@@ -962,6 +965,19 @@ pub struct ErrorLogSyslogTarget {
     pub server: ErrorLogSyslogServer,
     /// Optional `tag=...` override. Defaults to `ruxen`.
     pub tag: Option<String>,
+}
+
+/// `syslog:server=…[,facility=…][,severity=…][,tag=…][,nohostname]`, as
+/// ngx_syslog_process_conf parses it. Used by `access_log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyslogPeer {
+    pub server: ErrorLogSyslogServer,
+    /// RFC 3164 facility code (default 23, local7).
+    pub facility: u8,
+    /// RFC 3164 severity code (default 6, info).
+    pub severity: u8,
+    pub tag: Option<String>,
+    pub nohostname: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

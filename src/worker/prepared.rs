@@ -322,6 +322,18 @@ pub struct PreparedAccessLog {
     pub reads_upstream_headers: bool,
     pub condition: Option<&'static [PreparedValuePart]>,
     pub file_index: usize,
+    /// `access_log syslog:…`: lines go to this peer, not to `path`.
+    pub syslog: Option<&'static PreparedSyslogPeer>,
+}
+
+/// A prepared `syslog:` peer (see `crate::syslog`).
+#[derive(Debug)]
+pub struct PreparedSyslogPeer {
+    pub server: PreparedErrorLogSyslogServer,
+    /// RFC 3164 PRI: facility * 8 + severity.
+    pub pri: u8,
+    pub tag: &'static [u8],
+    pub nohostname: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

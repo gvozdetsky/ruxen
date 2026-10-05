@@ -145,6 +145,10 @@ pub(crate) async fn write_access_logs(
             }
         }
 
+        if let Some(peer) = log.syslog {
+            send_syslog_access_line(peer, &files, log, &ctx);
+            continue;
+        }
         let mut line = Vec::with_capacity(64);
         render_log_parts(log.format, log.escape, &ctx, &mut line);
         if line.is_empty() {
@@ -160,7 +164,7 @@ pub(crate) async fn write_access_logs(
         // `file_index` is the slot in `PreparedHttp::access_logs` (the
         // canonical list); the per-worker fd table is opened from that
         // same list so this lookup is always in range.
-        let Some(file) = files.get(log.file_index) else {
+        let Some(AccessLogSink::File(file)) = files.get(log.file_index) else {
             continue;
         };
         let (res, _buf) = file.write_all_at(line, 0).await;
@@ -170,6 +174,38 @@ pub(crate) async fn write_access_logs(
                 log.path.display()
             );
         }
+    }
+}
+
+/// `access_log syslog:…`: one datagram, the syslog header and the line
+/// without a newline (nginx's ngx_http_log_handler). Cold: syslog access
+/// logs are rare, and the send doesn't block.
+#[cold]
+#[inline(never)]
+fn send_syslog_access_line(
+    peer: &PreparedSyslogPeer,
+    files: &[AccessLogSink],
+    log: &PreparedAccessLog,
+    ctx: &RenderCtx<'_>,
+) {
+    let Some(AccessLogSink::Syslog(sock)) = files.get(log.file_index) else {
+        return;
+    };
+    let mut msg = Vec::with_capacity(128);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    crate::syslog::write_header(&mut msg, peer, now);
+    let start = msg.len();
+    render_log_parts(log.format, log.escape, ctx, &mut msg);
+    if msg.len() == start {
+        msg.push(b'-');
+    }
+    if let Err(e) = sock.send(&msg) {
+        eprintln!(
+            "ruxen: access_log send to {} failed: {e}",
+            log.path.display()
+        );
     }
 }
 
