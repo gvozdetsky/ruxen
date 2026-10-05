@@ -415,16 +415,27 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 // elsewhere).
                 let status = response_status(&resp).unwrap_or(0);
                 if plan.next_upstream.matches_status(status) {
-                    upstream::report_failure(upstream, current.peer_idx);
                     last_failure = Some(resp);
-                    // Failover budget check.
+                    // nginx moves on only while a try is left
+                    // (ngx_http_upstream_test_next: `u->peer.tries > 1`);
+                    // otherwise this is the answer, and the peer isn't
+                    // blamed for it.
                     if attempts >= max_tries
                         || !sent_may_retry
                         || deadline_exceeded(overall_deadline)
                     {
+                        upstream::report_success(upstream, current.peer_idx);
                         return last_failure.unwrap_or_else(|| {
                             Response::Prebuilt(plan.bad_gateway.pick(plan.method))
                         });
+                    }
+                    // http_403 / http_404 move on without counting against
+                    // max_fails (NGX_PEER_NEXT, ngx_http_upstream_next);
+                    // 5xx and 429 are failures.
+                    if matches!(status, 403 | 404) {
+                        upstream::report_success(upstream, current.peer_idx);
+                    } else {
+                        upstream::report_failure(upstream, current.peer_idx);
                     }
                     let Some(next) = upstream::pick_peer(upstream, tried_mask) else {
                         return last_failure.unwrap_or_else(|| {
