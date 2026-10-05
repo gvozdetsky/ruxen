@@ -81,8 +81,10 @@ fn parse_certified_key(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<CertifiedKey, LoadCertError> {
-    let mut cert_reader = std::io::BufReader::new(cert_pem);
+    let cert_pem = with_trusted_certificates_relabeled(cert_pem);
+    let mut cert_reader = std::io::BufReader::new(&cert_pem[..]);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .map(|cert| cert.map(only_the_certificate))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| LoadCertError::Pem {
             path: cert_path.to_path_buf(),
@@ -108,6 +110,38 @@ fn parse_certified_key(
     let certified = CertifiedKey::new(certs, signing_key);
     keys_match(&certified).map_err(LoadCertError::Rustls)?;
     Ok(certified)
+}
+
+/// OpenSSL's `-trustout` form, `-----BEGIN TRUSTED CERTIFICATE-----`, is a
+/// certificate followed by its `X509_CERT_AUX` trust settings. nginx reads
+/// it (`PEM_read_bio_X509_AUX`); rustls-pemfile skips the label. Relabel
+/// it as a plain certificate, and `only_the_certificate` drops the trust
+/// settings, which ruxen has no use for.
+fn with_trusted_certificates_relabeled(pem: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const TRUSTED: &[u8] = b"-----BEGIN TRUSTED CERTIFICATE-----";
+    if !pem.windows(TRUSTED.len()).any(|w| w == TRUSTED) {
+        return std::borrow::Cow::Borrowed(pem);
+    }
+    let text = String::from_utf8_lossy(pem)
+        .replace(
+            "-----BEGIN TRUSTED CERTIFICATE-----",
+            "-----BEGIN CERTIFICATE-----",
+        )
+        .replace(
+            "-----END TRUSTED CERTIFICATE-----",
+            "-----END CERTIFICATE-----",
+        );
+    std::borrow::Cow::Owned(text.into_bytes())
+}
+
+/// The first DER element of a certificate block: the certificate itself,
+/// without trust settings that follow it in the `TRUSTED CERTIFICATE`
+/// form. A plain certificate is exactly one element and comes back as is.
+fn only_the_certificate(cert: CertificateDer<'static>) -> CertificateDer<'static> {
+    match der_tlv(cert.as_ref()) {
+        Some((_, element, _, rest)) if !rest.is_empty() => CertificateDer::from(element.to_vec()),
+        _ => cert,
+    }
 }
 
 /// `CertifiedKey::from_der` checks the key against the leaf with webpki,
