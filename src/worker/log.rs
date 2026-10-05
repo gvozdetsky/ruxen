@@ -226,10 +226,13 @@ fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8], text: &[u
 /// `fs_resolve`. "Not found" lines need `log_not_found`. A 404 that didn't
 /// come from a file lookup (`return 404`, no location) logs nothing, as in
 /// nginx.
-pub(crate) fn write_lookup_error_log(meta: phase::LogMeta, req: &ErrorLogRequest<'_>) {
-    let Some((message, not_found)) = crate::fs_resolve::take_failed_lookup() else {
-        return;
-    };
+#[cold]
+#[inline(never)]
+pub(crate) fn write_lookup_error_log(
+    meta: phase::LogMeta,
+    req: &ErrorLogRequest<'_>,
+    (message, not_found): (Vec<u8>, bool),
+) {
     if not_found && !meta.log_not_found {
         return;
     }
