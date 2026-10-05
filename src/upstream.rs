@@ -78,33 +78,81 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// Pick the next peer for `upstream`. Returns the index into
-/// `upstream.peers`, or `None` if every peer is `down`/cooling-off — that
-/// maps to a 502 in the proxy attempt. The returned `LeasedPeer` decrements
-/// the active-conn counter when dropped, which least_conn relies on.
-///
-/// `tried_mask` is a bitmask of peer indexes already attempted on this
-/// request; passing `0` requests the first peer. Bits beyond the peer
-/// count are ignored. Used by the `proxy_next_upstream` retry loop in
-/// `proxy.rs` to avoid re-trying a peer that already failed.
+/// Peers already tried on this request, nginx's `rrp->tried`: one word
+/// inline, and a heap bitmap only once a peer past index 63 is tried
+/// (`ngx_http_upstream_round_robin.c:284`, `:404`). Empty and
+/// allocation-free by default.
+#[derive(Default)]
+pub struct Tried {
+    low: u64,
+    /// Peers from index 64 up. Boxed so the set stays two words.
+    high: Option<Box<Vec<u64>>>,
+}
+
+impl Tried {
+    #[inline]
+    pub fn contains(&self, i: usize) -> bool {
+        if i < 64 {
+            self.low & (1u64 << i) != 0
+        } else {
+            self.contains_high(i - 64)
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, i: usize) {
+        if i < 64 {
+            self.low |= 1u64 << i;
+        } else {
+            self.insert_high(i - 64);
+        }
+    }
+
+    /// Cold: only upstreams of more than 64 peers get here.
+    #[cold]
+    #[inline(never)]
+    fn contains_high(&self, i: usize) -> bool {
+        self.high
+            .as_ref()
+            .and_then(|h| h.get(i / 64))
+            .is_some_and(|w| w & (1u64 << (i % 64)) != 0)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn insert_high(&mut self, i: usize) {
+        let high = self.high.get_or_insert_with(Box::default);
+        if i / 64 >= high.len() {
+            high.resize(i / 64 + 1, 0);
+        }
+        high[i / 64] |= 1u64 << (i % 64);
+    }
+}
+
 /// One primary peer and no backups: nginx's `peers->single`.
 fn is_single(upstream: &PreparedUpstream) -> bool {
     matches!(upstream.peers, [only] if !only.backup)
 }
 
-pub fn pick_peer(upstream: &'static PreparedUpstream, tried_mask: u64) -> Option<LeasedPeer> {
+/// Pick the next peer for `upstream`. Returns the index into
+/// `upstream.peers`, or `None` if every peer is `down`/cooling-off — that
+/// maps to a 502 in the proxy attempt. The returned `LeasedPeer` decrements
+/// the active-conn counter when dropped, which least_conn relies on.
+///
+/// `tried` holds the peers already attempted on this request (empty for
+/// the first pick). Used by the `proxy_next_upstream` retry loop in
+/// `proxy.rs` to avoid re-trying a peer that already failed.
+pub fn pick_peer(upstream: &'static PreparedUpstream, tried: &Tried) -> Option<LeasedPeer> {
     let now = Instant::now();
     LB_STATE.with(|state| {
         let mut map = state.borrow_mut();
         let key = upstream as *const PreparedUpstream;
         let rt = map.entry(key).or_insert_with(|| ensure_rt(upstream));
         let pick = match upstream.lb {
-            LbAlgorithm::RoundRobin => {
-                rr_pick_with_filter(rt, upstream.peers, false, tried_mask, now)
-                    .or_else(|| rr_pick_with_filter(rt, upstream.peers, true, tried_mask, now))
-            }
-            LbAlgorithm::LeastConn => least_conn_pick(rt, upstream.peers, false, tried_mask, now)
-                .or_else(|| least_conn_pick(rt, upstream.peers, true, tried_mask, now)),
+            LbAlgorithm::RoundRobin => rr_pick_with_filter(rt, upstream.peers, false, tried, now)
+                .or_else(|| rr_pick_with_filter(rt, upstream.peers, true, tried, now)),
+            LbAlgorithm::LeastConn => least_conn_pick(rt, upstream.peers, false, tried, now)
+                .or_else(|| least_conn_pick(rt, upstream.peers, true, tried, now)),
         };
         let idx = pick?;
         rt.peers[idx].active = rt.peers[idx].active.saturating_add(1);
@@ -120,7 +168,7 @@ fn peer_eligible(
     peers: &[PreparedPeer],
     i: usize,
     backup_tier: bool,
-    tried_mask: u64,
+    tried: &Tried,
     now: Instant,
 ) -> bool {
     let p = &peers[i];
@@ -130,7 +178,7 @@ fn peer_eligible(
     if p.backup != backup_tier {
         return false;
     }
-    if (tried_mask & (1u64 << (i.min(63)))) != 0 {
+    if tried.contains(i) {
         return false;
     }
     let s = &rt.peers[i];
@@ -150,13 +198,13 @@ fn rr_pick_with_filter(
     rt: &mut UpstreamRt,
     peers: &[PreparedPeer],
     backup_tier: bool,
-    tried_mask: u64,
+    tried: &Tried,
     now: Instant,
 ) -> Option<usize> {
     let mut total: i64 = 0;
     let mut best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried_mask, now) {
+        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
             continue;
         }
         let s = &mut rt.peers[i];
@@ -181,7 +229,7 @@ fn least_conn_pick(
     rt: &mut UpstreamRt,
     peers: &[PreparedPeer],
     backup_tier: bool,
-    tried_mask: u64,
+    tried: &Tried,
     now: Instant,
 ) -> Option<usize> {
     // First pass: find the smallest active/weight ratio across eligible
@@ -189,7 +237,7 @@ fn least_conn_pick(
     // `c1 * w2 vs c2 * w1` to avoid float math; we mirror that with i128.
     let mut best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried_mask, now) {
+        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
             continue;
         }
         match best {
@@ -216,7 +264,7 @@ fn least_conn_pick(
     // `n == many` fallback (lc.c:171–219).
     let mut tie_count = 0;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried_mask, now) {
+        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
             continue;
         }
         let pi = &peers[i];
@@ -234,7 +282,7 @@ fn least_conn_pick(
     let mut total: i64 = 0;
     let mut tie_best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried_mask, now) {
+        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
             continue;
         }
         let pi = &peers[i];
@@ -495,7 +543,7 @@ mod tests {
     }
 
     fn pick_release(u: &'static PreparedUpstream) -> Option<usize> {
-        let leased = pick_peer(u, 0)?;
+        let leased = pick_peer(u, &Tried::default())?;
         let i = leased.peer_idx;
         drop(leased);
         Some(i)
@@ -545,18 +593,51 @@ mod tests {
     #[test]
     fn all_down_returns_none() {
         let u = mk_upstream(&[(1, true, false), (1, true, true)]);
-        assert!(pick_peer(u, 0).is_none());
+        assert!(pick_peer(u, &Tried::default()).is_none());
     }
 
     #[test]
-    fn tried_mask_excludes_peers_within_attempt() {
+    fn tried_peers_are_excluded_within_attempt() {
         let u = mk_upstream(&[(1, false, false), (1, false, false), (1, false, false)]);
-        let l0 = pick_peer(u, 0).unwrap();
-        let l1 = pick_peer(u, 1u64 << l0.peer_idx).unwrap();
+        let mut tried = Tried::default();
+        let l0 = pick_peer(u, &tried).unwrap();
+        tried.insert(l0.peer_idx);
+        let l1 = pick_peer(u, &tried).unwrap();
         assert_ne!(l0.peer_idx, l1.peer_idx);
-        let l2 = pick_peer(u, (1u64 << l0.peer_idx) | (1u64 << l1.peer_idx)).unwrap();
+        tried.insert(l1.peer_idx);
+        let l2 = pick_peer(u, &tried).unwrap();
         assert_ne!(l2.peer_idx, l0.peer_idx);
         assert_ne!(l2.peer_idx, l1.peer_idx);
+        tried.insert(l2.peer_idx);
+        assert!(pick_peer(u, &tried).is_none());
+    }
+
+    /// Peers past index 63 each have their own bit; they used to share
+    /// one, so trying any of them excluded all the others.
+    #[test]
+    fn tried_set_fits_any_upstream_size() {
+        let mut tried = Tried::default();
+        for i in [0, 63, 64, 70, 200] {
+            assert!(!tried.contains(i));
+            tried.insert(i);
+            assert!(tried.contains(i));
+        }
+        for i in [1, 62, 65, 69, 71, 127, 128, 199, 201, 1000] {
+            assert!(!tried.contains(i), "{i}");
+        }
+
+        let u = mk_upstream(&[(1, false, false); 70]);
+        let mut tried = Tried::default();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(leased) = pick_peer(u, &tried) {
+            assert!(
+                seen.insert(leased.peer_idx),
+                "{} picked twice",
+                leased.peer_idx
+            );
+            tried.insert(leased.peer_idx);
+        }
+        assert_eq!(seen.len(), 70);
     }
 
     #[test]
@@ -606,8 +687,8 @@ mod tests {
             LbAlgorithm::LeastConn,
         );
         // Hold a lease on peer 0, force least_conn to pick peer 1.
-        let l0 = pick_peer(u, 0).unwrap();
-        let next = pick_peer(u, 0).unwrap();
+        let l0 = pick_peer(u, &Tried::default()).unwrap();
+        let next = pick_peer(u, &Tried::default()).unwrap();
         assert_ne!(next.peer_idx, l0.peer_idx);
         drop(next);
         drop(l0);

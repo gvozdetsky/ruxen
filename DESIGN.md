@@ -300,7 +300,7 @@ The last arg is the fallback:
 
 **M43 architecture decisions worth carrying.**
 - Plan-build-time peer leasing: `pick_peer` now returns a `LeasedPeer` RAII guard. The plan owns it across `run_proxy.await`; failover replaces it via Drop+pick. Active-conn counters can't underflow because the guard always runs.
-- `tried_mask: u64` is a per-attempt bitmask of peers we've already tried + reported FAILED. Bits beyond 63 are silently elided (no v0.1 deployment has 64+ peers per upstream block; if that ever changes the mask becomes `Vec<bool>`).
+- `upstream::Tried` is the per-request set of peers already tried, nginx's `rrp->tried`: one inline `u64` for the first 64 peers, and a heap bitmap only once a peer past index 63 is tried. (Until #125 it was a single `u64` whose bit 63 stood for every peer from 63 up.)
 - `last_failure: Option<Response>` is the sticky "what we'd return if this is the final attempt" buffer. Reset every loop iteration after a Failed; survives across iterations because failover may skip multiple peers before exhausting `tries`.
 - `proxy_intercept_errors`'s pre-render-then-reroute shape avoids needing `RenderCtx` to live across an `await`. The downside is that the same target bytes are rendered for every request even when intercept never fires; cheap for typical configs (one or two `error_page` rules) and avoids a second-pass render.
 - `is_idempotent_method_bytes` lives in worker.rs because it reads raw method bytes; the `Method` enum's coarse classification (Get/Head/Trace/Connect/Other) loses PUT/DELETE/OPTIONS distinction needed for the gate.
