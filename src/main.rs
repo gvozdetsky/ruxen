@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod auth;
 mod autoindex;
@@ -279,6 +279,12 @@ fn real_main() -> Result<(), Failure> {
     let worker_connections = cfg.runtime.worker_connections.unwrap_or(512);
     let rlimit_nofile = cfg.runtime.worker_rlimit_nofile;
     let rlimit_core = cfg.runtime.worker_rlimit_core;
+    // nginx's 0 is "no limit", the same as unset.
+    let shutdown_timeout = cfg
+        .runtime
+        .worker_shutdown_timeout_ms
+        .filter(|&ms| ms != 0)
+        .map(Duration::from_millis);
     // Load certificates, open roots and log files. `-t` does this too, so
     // it catches everything short of a busy port, like `nginx -t`.
     let http: &'static worker::PreparedHttp =
@@ -373,21 +379,30 @@ fn real_main() -> Result<(), Failure> {
     // so SIGTERM still works during a graceful shutdown.
     let (workers_done, monitor_rx) = std::sync::mpsc::channel::<()>();
     let signal_monitor = thread::spawn(move || {
+        let mut quit_at = None;
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             monitor_rx.recv_timeout(Duration::from_millis(10))
         {
             // SIGTERM / SIGINT: nginx's fast shutdown. Its workers exit
             // without waiting for their requests, and the master deletes
             // the pid file and exits 0. Leaving the process does both.
-            if SIGTERM_SEEN.load(Ordering::SeqCst) {
+            // `worker_shutdown_timeout` ends a graceful shutdown the same
+            // way: nginx closes the connections still open when it fires
+            // (ngx_shutdown_timer_handler), and its workers then exit.
+            let timed_out = matches!(
+                (quit_at, shutdown_timeout),
+                (Some(at), Some(limit)) if Instant::now().duration_since(at) >= limit
+            );
+            if SIGTERM_SEEN.load(Ordering::SeqCst) || timed_out {
                 signal_runtime.begin_shutdown();
                 if let Some(path) = &monitor_pid_path {
                     let _ = std::fs::remove_file(path);
                 }
                 std::process::exit(0);
             }
-            if SIGQUIT_SEEN.load(Ordering::SeqCst) {
+            if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
                 signal_runtime.begin_shutdown();
+                quit_at = Some(Instant::now());
             }
             // Drain any pending SIGHUP into a reload-gen bump. The signal
             // handler stores `true`; clearing it here means we coalesce

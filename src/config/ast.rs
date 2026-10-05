@@ -70,6 +70,10 @@ pub struct RuntimeOpts {
     pub worker_rlimit_nofile: Option<u64>,
     /// `worker_rlimit_core size;`: the core-file size limit.
     pub worker_rlimit_core: Option<u64>,
+    /// `worker_shutdown_timeout time;`: how long a graceful shutdown
+    /// waits for in-flight connections, in ms. `None` (and nginx's `0`)
+    /// waits without limit.
+    pub worker_shutdown_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone)]
