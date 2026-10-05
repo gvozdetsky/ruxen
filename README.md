@@ -40,7 +40,7 @@ The v0.1 scope is deliberately limited:
 - no HTTP cache
 - no HTTP/2 yet
 
-The upstream `nginx-tests` suite is used as a compatibility test. **49 of the 104 test files that ruxen currently opts into pass end-to-end.**
+The upstream `nginx-tests` suite is used as a compatibility test. **63 of the 105 test files that ruxen currently opts into pass end-to-end** (v0.1.1).
 
 See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status.
 
@@ -144,6 +144,11 @@ You are now serving an nginx-style configuration with ruxen.
   - `^~`
   - regex (`~`, `~*`)
   - named locations
+- `internal` locations
+- `listen` port ranges and `listen … proxy_protocol` (PROXY protocol v1 and v2, `$proxy_protocol_*`)
+- `worker_connections`, `client_header_timeout`, `client_body_timeout`, `send_timeout`
+- request bodies of any `client_max_body_size`, spilled to private temp files (`client_body_temp_path`), with an early 413
+- `limit_rate`, `limit_rate_after` and `$limit_rate`
 
 ### Static files
 
@@ -176,9 +181,13 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - per-worker upstream keep-alive pools
 - `proxy_http_version`
 - `proxy_set_header`
-- request-body forwarding
-- `proxy_next_upstream`
+- request-body forwarding and `proxy_set_body`
+- `proxy_next_upstream` (including `_tries` / `_timeout`)
 - `proxy_intercept_errors`
+- `proxy_redirect`, including the implicit default
+- `proxy_hide_header` / `proxy_pass_header`
+- `X-Accel-Redirect`, `X-Accel-Limit-Rate` and `proxy_ignore_headers`
+- `$upstream_*` per-attempt variables, `$proxy_host`, `$proxy_port`
 
 ### TLS
 
@@ -192,7 +201,7 @@ Currently supported:
 - RSA and ECDSA certificates
 - multiple certificates per server
 - SNI
-- in-memory TLS session cache
+- `ssl_session_cache` (in memory, shared by the workers), `ssl_session_tickets`, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 
 ALPN currently advertises HTTP/1.1 only.
@@ -205,18 +214,17 @@ A growing nginx-compatible configuration surface is implemented, including:
 - `add_header`
 - `add_trailer`
 - `expires`
-- `error_page`
+- `error_page` and `recursive_error_pages`
 - `post_action`
 - `set`
 - `if`
 - `rewrite`
-- `map`
+- `map` (including `hostnames`)
 - `split_clients`
 - `auth_basic`
 - `auth_basic_user_file`
 - `log_format`
-- `access_log`
-- `error_log`
+- `access_log` and `error_log`, including `syslog:` targets
 
 Many common nginx variables are also available, including request, response, upstream, TLS, cookie, header and rewrite variables.
 
@@ -321,13 +329,13 @@ The following are intentionally outside the current v0.1 scope:
 - OCSP stapling
 - client certificate authentication
 - 0-RTT / TLS early data
-- persistent or shared TLS session caches
+- persistent TLS session caches (the cache lives in memory and is lost on restart)
 - hot certificate reload
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
 - switching workers to an unprivileged `user`
 
-Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on`, `disable_symlinks on|if_not_owner` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
 Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
 

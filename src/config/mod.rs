@@ -741,7 +741,8 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Without allow/deny (not implemented, so an error), `satisfy any`
     // and `all` both reduce to auth_basic alone.
     "satisfy",
-    // DNS resolver (we don't proxy, these are swallowed preamble)
+    // DNS resolver: accepted and unused, since proxy_pass addresses are
+    // resolved at startup (runtime DNS is #133).
     "resolver",
     "resolver_timeout",
     // Proxy tuning knobs we don't implement yet but accept as no-ops so
@@ -775,9 +776,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_cookie_flags",
     "proxy_socket_keepalive",
     "proxy_bind",
-    // limit_rate / limit_rate_after: no rate-limiting subsystem yet, accepted
-    // as no-ops so configs (including upstream nginx-tests) load. `$limit_rate`
-    // is also rendered as `0` for the same reason — see `worker::render`.
     "proxy_store",
     "proxy_store_access",
     // File I/O knobs (we use std::fs; these are nginx-only tuning)
