@@ -272,3 +272,35 @@ fn response_time_is_a_dash_while_in_flight() {
     }
     assert_eq!(log.lines().count(), 3, "{log}");
 }
+
+/// `$proxy_port`: the port of the `proxy_pass` URL, 80 for an upstream
+/// group (nginx's ngx_http_proxy_set_vars), empty outside a proxied
+/// location. It used to be an unsupported variable that rendered empty.
+#[test]
+fn proxy_port_is_the_proxy_pass_port() {
+    let backend = spawn_backend();
+    let server = start(
+        "proxyport",
+        &format!(
+            "upstream u {{ server 127.0.0.1:{backend}; }}\n\
+             server {{ listen 127.0.0.1:%%PORT%%;\n\
+               add_header X-PP \"[$proxy_host|$proxy_port]\";\n\
+               location /direct {{ proxy_pass http://127.0.0.1:{backend}; }}\n\
+               location /group {{ proxy_pass http://u; }}\n\
+               location /local {{ return 200 x; }}\n\
+             }}"
+        ),
+    );
+    let header = |path: &str| {
+        let resp = get(server.port, path);
+        resp.lines()
+            .find_map(|l| l.strip_prefix("X-PP: ").map(str::to_string))
+            .unwrap_or_else(|| panic!("{resp}"))
+    };
+    assert_eq!(
+        header("/direct"),
+        format!("[127.0.0.1:{backend}|{backend}]")
+    );
+    assert_eq!(header("/group"), "[u|80]");
+    assert_eq!(header("/local"), "[|]");
+}

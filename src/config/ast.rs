@@ -1334,6 +1334,9 @@ pub enum Variable {
     /// `$proxy_host` — the host:port (or upstream block name) from the
     /// matched `proxy_pass` URL. Empty outside a proxy context.
     ProxyHost,
+    /// `$proxy_port` — the port of the matched `proxy_pass` URL: the one
+    /// written in `$proxy_host`, else 80. Empty outside a proxy context.
+    ProxyPort,
     /// `$proxy_add_x_forwarded_for` — the incoming `X-Forwarded-For`
     /// header value (if any) followed by `, $remote_addr`. When the
     /// incoming header is absent the value is just `$remote_addr`.
