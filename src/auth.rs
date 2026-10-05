@@ -399,8 +399,10 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
 #[cfg(unix)]
 static CRYPT_LOCK: Mutex<()> = Mutex::new(());
 
+// glibc has crypt() in libcrypt (libxcrypt); musl has it in libc itself,
+// and linking a glibc libcrypt.a into a static musl binary fails.
 #[cfg(unix)]
-#[link(name = "crypt")]
+#[cfg_attr(not(target_env = "musl"), link(name = "crypt"))]
 unsafe extern "C" {
     fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
 }

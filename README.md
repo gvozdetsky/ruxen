@@ -54,7 +54,13 @@ See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status.
 
 ### Install
 
-**Prebuilt binary** (x86_64 Linux, glibc 2.35 or newer — Ubuntu 22.04, Debian 12 and later; on older systems it fails with ``version `GLIBC_2.34' not found``, so build from source) from [GitHub Releases](https://github.com/gvozdetsky/ruxen/releases):
+**Prebuilt binary** from [GitHub Releases](https://github.com/gvozdetsky/ruxen/releases):
+
+| tarball | runs on |
+| --- | --- |
+| `ruxen-x86_64-linux-gnu.tar.gz` | x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later) |
+| `ruxen-aarch64-linux-gnu.tar.gz` | ARM64 with glibc 2.35 or newer (Graviton, Ampere, Raspberry Pi 5 on a 64-bit OS) |
+| `ruxen-x86_64-linux-musl.tar.gz` | any x86_64 Linux, static (Alpine, older glibc). See the release notes for its performance. |
 
 ```bash
 curl -LO https://github.com/gvozdetsky/ruxen/releases/latest/download/ruxen-x86_64-linux-gnu.tar.gz
@@ -63,7 +69,7 @@ cd ruxen-v*-x86_64-linux-gnu
 ./ruxen -V
 ```
 
-Each release also has the tarball under a versioned name (`ruxen-v<version>-x86_64-linux-gnu.tar.gz`) and a `SHA256SUMS` file.
+On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`) and a `SHA256SUMS` file.
 
 **From crates.io:**
 

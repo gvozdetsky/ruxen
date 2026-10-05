@@ -110,7 +110,8 @@ fn fd_exhaustion_backs_off_instead_of_spinning() {
     assert!(used < 30, "accept loop used {used} CPU ticks in 1 s");
     assert!(
         log.lines().any(|l| l.contains(" [crit] ")
-            && l.ends_with(": accept() failed (24: Too many open files)")),
+            // The errno text is the libc's (glibc and musl word it differently).
+            && l.contains(": accept() failed (24: ")),
         "error log: {log}"
     );
     assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
