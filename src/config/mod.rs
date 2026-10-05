@@ -735,6 +735,8 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "etag",
     "msie_padding",
     "msie_refresh",
+    // Only `off` gets here: the other values are refused by
+    // `reject_unenforced`.
     "disable_symlinks",
     // Without allow/deny (not implemented, so an error), `satisfy any`
     // and `all` both reduce to auth_basic alone.
@@ -828,6 +830,11 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
         }
         Some("ssl_reject_handshake") if value == Some("on") => {
             "handshakes for unknown names would complete with the default certificate"
+        }
+        // `on` / `if_not_owner` refuse symlinked paths with 403; ignoring
+        // them would serve the link targets. `off` is the default.
+        Some("disable_symlinks") if value != Some("off") => {
+            "symlinks under the root would be followed and served"
         }
         _ => return Ok(()),
     };
@@ -1474,6 +1481,17 @@ mod tests {
         };
         unenforced_err(&tls("ssl_verify_client on;"));
         unenforced_err(&tls("ssl_reject_handshake on;"));
+        for value in ["on", "if_not_owner", "on from=$document_root"] {
+            let err = unenforced_err(&format!(
+                "http {{ server {{ listen 80; location / {{ disable_symlinks {value}; }} }} }}"
+            ));
+            assert_eq!(
+                err,
+                "\"disable_symlinks\" is not supported yet, and ignoring it is unsafe: \
+                 symlinks under the root would be followed and served"
+            );
+        }
+        parse("http { disable_symlinks off; server { listen 80; } }").unwrap();
         // The forms nginx doesn't enforce either still load; `optional*`
         // warns (nginx admits certless clients there too, and ruxen's
         // `$ssl_client_verify` is always NONE, never SUCCESS).
