@@ -1463,12 +1463,20 @@ async fn attempt(
 
     // 8. Pool eligibility — return the socket only if all of these hold:
     //    - upstream block opted into keepalive (plan.keepalive_eligible)
+    //    - the response isn't a 101: the connection now speaks another
+    //      protocol, and a later request from another client would be
+    //      written into that tunnel (nginx sets u->keepalive = 0 for it)
     //    - upstream did not signal close
     //    - the upstream announced HTTP/1.1
     //    - we framed the body (chunked or content-length) so we know we
     //      consumed exactly the right number of bytes
     let response_framed = chunked || content_length.is_some() || !body_has_content;
-    if plan.keepalive_eligible && !upstream_close && upstream_is_11 && response_framed {
+    if plan.keepalive_eligible
+        && status_code != 101
+        && !upstream_close
+        && upstream_is_11
+        && response_framed
+    {
         upstream::pool_release(
             plan.upstream,
             peer_idx,
