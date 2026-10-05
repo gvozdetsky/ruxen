@@ -166,7 +166,7 @@ thread_local! {
     /// The error-log line for this request's failed file lookup, as nginx's
     /// static and index modules word it, and whether it's a "not found"
     /// (logged only with `log_not_found`). Set on the cold failure paths
-    /// here, taken by the worker when it logs the request.
+    /// here, taken (and logged) as soon as phase processing returns.
     static FAILED_LOOKUP: std::cell::RefCell<Option<(Vec<u8>, bool)>> =
         const { std::cell::RefCell::new(None) };
 }

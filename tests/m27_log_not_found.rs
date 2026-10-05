@@ -84,6 +84,7 @@ http {{
 
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
+        .env("RUXEN_WORKERS", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -239,4 +240,51 @@ fn lookup_errors_name_the_path_like_nginx() {
         )),
         "{log}"
     );
+}
+
+/// Two connections on one worker: the first is stalled writing a large
+/// error page while the second asks for another missing file. Each request
+/// gets its own `open() failed` line, with its own context, as nginx logs
+/// the line where the open fails. The note used to be read only after the
+/// response was written, so the stalled request's line went missing (or
+/// carried the other request's context).
+#[test]
+fn concurrent_lookups_each_log_their_own_line() {
+    let (guard, port) = spawn_server(|dir| {
+        std::fs::write(dir.join("big"), vec![b'x'; 8 << 20]).unwrap();
+        format!(
+            "    error_log {root}/e.log;\n    error_page 404 /big;\n    location / {{ }}\n",
+            root = dir.display()
+        )
+    });
+    let mut stalled = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stalled
+        .write_all(b"GET /a-miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    sleep(Duration::from_millis(200));
+    let other = request(
+        port,
+        b"GET /b-miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_line(&other), "HTTP/1.1 404 Not Found");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut rest = Vec::new();
+    let _ = stalled.read_to_end(&mut rest);
+    assert_eq!(status_line(&rest), "HTTP/1.1 404 Not Found");
+    sleep(Duration::from_millis(100));
+
+    let log = std::fs::read_to_string(guard.tempdir.join("e.log")).unwrap_or_default();
+    for name in ["a-miss", "b-miss"] {
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(&format!("/{name}\" failed")))
+            .collect();
+        assert_eq!(lines.len(), 1, "{name}: {log}");
+        assert!(
+            lines[0].contains(&format!("request: \"GET /{name} HTTP/1.1\"")),
+            "{name}: {log}"
+        );
+    }
 }

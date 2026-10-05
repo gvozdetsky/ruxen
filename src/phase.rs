@@ -458,7 +458,9 @@ pub fn process_with_meta(
     req: &RequestCtx<'_>,
     url_scratch: &mut Vec<u8>,
 ) -> (Response, ProcessMeta) {
-    process_with_meta_inner(http, req, url_scratch, None)
+    let out = process_with_meta_inner(http, req, url_scratch, None);
+    log_failed_lookup(req, &out.1);
+    out
 }
 
 /// Re-enter the pipeline starting from an already-resolved reroute target.
@@ -471,7 +473,23 @@ pub fn process_with_meta_from_reroute(
     url_scratch: &mut Vec<u8>,
     reroute: Reroute,
 ) -> (Response, ProcessMeta) {
-    process_with_meta_inner(http, req, url_scratch, Some(reroute))
+    let out = process_with_meta_inner(http, req, url_scratch, Some(reroute));
+    log_failed_lookup(req, &out.1);
+    out
+}
+
+/// A file lookup that failed while processing (`open() "…" failed`) is
+/// logged now, with this request's context, as nginx logs it where the
+/// open fails. The note is per worker thread, so it has to be taken
+/// before anything awaits: another connection would overwrite it.
+fn log_failed_lookup(req: &RequestCtx<'_>, meta: &ProcessMeta) {
+    if let Some(failed) = crate::fs_resolve::take_failed_lookup() {
+        crate::worker::write_lookup_error_log(
+            meta.log,
+            &crate::worker::ErrorLogRequest::new(req, meta.server_name),
+            failed,
+        );
+    }
 }
 
 fn process_with_meta_inner(
