@@ -759,13 +759,16 @@ fn accel_carried_headers(upstream_headers: &[u8], out: &mut Vec<u8>) {
 /// unless the target is proxied and its upstream sends one. `Set-Cookie`
 /// and `Accept-Ranges` add up (a static file then has two Accept-Ranges,
 /// as in nginx). The others go in when the target doesn't set them
-/// itself (`expires`).
+/// itself (`expires`). An error response (a missing file, say) is nginx's
+/// special response, which sets its own `text/html` and clears
+/// Accept-Ranges (ngx_http_send_special_response).
 fn carry_accel_headers(response: Response, carried: &[u8], proxied: bool) -> Response {
     if carried.is_empty() {
         return response;
     }
     let merge = |head: Vec<u8>| {
         let mut head = head;
+        let error = response_status(&head) >= 400;
         let mut extra = Vec::new();
         // Which of ACCEL_CARRIED are in `extra`; the first of a repeated
         // one wins, as for the upstream's own single-valued headers.
@@ -781,13 +784,16 @@ fn carry_accel_headers(response: Response, carried: &[u8], proxied: bool) -> Res
             else {
                 continue;
             };
+            if error && name.eq_ignore_ascii_case(b"accept-ranges") {
+                continue;
+            }
             if !name.eq_ignore_ascii_case(b"set-cookie")
                 && !name.eq_ignore_ascii_case(b"accept-ranges")
             {
                 if added & (1 << i) != 0 {
                     continue;
                 }
-                if i == 0 && !proxied {
+                if i == 0 && !proxied && !error {
                     head = strip_header_lines(head, name);
                 } else if response_header_value(&head, name).is_some() {
                     continue;

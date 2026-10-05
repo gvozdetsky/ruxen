@@ -134,8 +134,9 @@ fn x_accel_redirect_redirects_internally() {
     assert!(send(server.port, "GET", "/loop/").starts_with("HTTP/1.1 500"));
 }
 
-/// Backend for the carried headers: redirects `/c/file` to `/f.txt` and
-/// anything else to `/internal/show`, with the headers nginx carries over
+/// Backend for the carried headers: redirects `/c/file` to `/f.txt`,
+/// `/c/missing` to a file that doesn't exist and anything else to
+/// `/internal/show`, with the headers nginx carries over
 /// an X-Accel-Redirect and two it doesn't.
 fn spawn_carrying_backend() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -152,6 +153,8 @@ fn spawn_carrying_backend() -> u16 {
             }
             let target = if head.windows(7).any(|w| w == b"/c/file") {
                 "/f.txt"
+            } else if head.windows(10).any(|w| w == b"/c/missing") {
+                "/missing.txt"
             } else {
                 "/internal/show"
             };
@@ -219,7 +222,15 @@ fn x_accel_redirect_keeps_upstream_headers() {
     assert_eq!(ranges, ["bytes", "parrots"], "{resp}");
     assert_eq!(header_lines(&resp, "Set-Cookie"), ["a=1", "b=2"], "{resp}");
 
+    // An error page keeps its own type and has no Accept-Ranges, as
+    // nginx's special response; the cookies still go out.
+    let resp = send(server.port, "GET", "/c/missing");
+    assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+    assert_eq!(header_lines(&resp, "Content-Type"), ["text/plain"], "{resp}");
+    assert!(header_lines(&resp, "Accept-Ranges").is_empty(), "{resp}");
+    assert_eq!(header_lines(&resp, "Set-Cookie"), ["a=1", "b=2"], "{resp}");
+
     let log = std::fs::read_to_string(root.join("access.log")).unwrap();
     let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(log, "/internal/show 7\n/f.txt 7\n");
+    assert_eq!(log, "/internal/show 7\n/f.txt 7\n/missing.txt 7\n");
 }
