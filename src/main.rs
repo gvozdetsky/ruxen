@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod auth;
 mod autoindex;
@@ -276,10 +276,20 @@ fn real_main() -> Result<(), Failure> {
             .unwrap_or(1),
         None => 1,
     };
+    let worker_connections = cfg.runtime.worker_connections.unwrap_or(512);
+    let rlimit_nofile = cfg.runtime.worker_rlimit_nofile;
+    let rlimit_core = cfg.runtime.worker_rlimit_core;
+    // nginx's 0 is "no limit", the same as unset.
+    let shutdown_timeout = cfg
+        .runtime
+        .worker_shutdown_timeout_ms
+        .filter(|&ms| ms != 0)
+        .map(Duration::from_millis);
     // Load certificates, open roots and log files. `-t` does this too, so
     // it catches everything short of a busy port, like `nginx -t`.
     let http: &'static worker::PreparedHttp =
         worker::prepare(cfg).map_err(|e| report_emerg(&e, &cli, &main_path))?;
+    warn_if_fd_limit_too_low(http, worker_connections, rlimit_nofile);
     if cli.test_only {
         if report_test {
             eprintln!(
@@ -294,6 +304,11 @@ fn real_main() -> Result<(), Failure> {
         redirect_stderr(errlog)?;
         let _ = worker::STDERR_LOG_PATH.set(errlog.clone());
     }
+    // Workers are threads, so the limits are set once for the process.
+    // Each worker's fd table is its own (unshare), so RLIMIT_NOFILE then
+    // bounds every worker, as nginx's per-worker setrlimit does.
+    set_rlimit(true, rlimit_nofile);
+    set_rlimit(false, rlimit_core);
 
     // Workers can't run without io_uring; say why up front instead of
     // letting every worker thread panic on runtime setup.
@@ -364,21 +379,30 @@ fn real_main() -> Result<(), Failure> {
     // so SIGTERM still works during a graceful shutdown.
     let (workers_done, monitor_rx) = std::sync::mpsc::channel::<()>();
     let signal_monitor = thread::spawn(move || {
+        let mut quit_at = None;
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             monitor_rx.recv_timeout(Duration::from_millis(10))
         {
             // SIGTERM / SIGINT: nginx's fast shutdown. Its workers exit
             // without waiting for their requests, and the master deletes
             // the pid file and exits 0. Leaving the process does both.
-            if SIGTERM_SEEN.load(Ordering::SeqCst) {
+            // `worker_shutdown_timeout` ends a graceful shutdown the same
+            // way: nginx closes the connections still open when it fires
+            // (ngx_shutdown_timer_handler), and its workers then exit.
+            let timed_out = matches!(
+                (quit_at, shutdown_timeout),
+                (Some(at), Some(limit)) if Instant::now().duration_since(at) >= limit
+            );
+            if SIGTERM_SEEN.load(Ordering::SeqCst) || timed_out {
                 signal_runtime.begin_shutdown();
                 if let Some(path) = &monitor_pid_path {
                     let _ = std::fs::remove_file(path);
                 }
                 std::process::exit(0);
             }
-            if SIGQUIT_SEEN.load(Ordering::SeqCst) {
+            if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
                 signal_runtime.begin_shutdown();
+                quit_at = Some(Instant::now());
             }
             // Drain any pending SIGHUP into a reload-gen bump. The signal
             // handler stores `true`; clearing it here means we coalesce
@@ -528,6 +552,67 @@ fn version_output() -> &'static str {
 
 /// `-s NAME`: the signal nginx sends for it. `reload` is refused: SIGHUP
 /// only closes idle keep-alive connections, ruxen can't re-read its config.
+/// nginx's ngx_event_module_init warning: more `worker_connections` than
+/// file descriptors (the `worker_rlimit_nofile` to be set, else the
+/// current soft limit). A `[warn]` in the top-level error log, so with
+/// nginx's default level (`error`) it isn't shown, as in nginx.
+fn warn_if_fd_limit_too_low(
+    http: &worker::PreparedHttp,
+    worker_connections: usize,
+    rlimit_nofile: Option<u64>,
+) {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the struct we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } != 0 {
+        return;
+    }
+    let connections = worker_connections as u64;
+    if connections > current.rlim_cur && rlimit_nofile.is_none_or(|n| connections > n) {
+        let limit = rlimit_nofile.unwrap_or(current.rlim_cur);
+        worker::write_worker_log(
+            http.error_logs,
+            config::ErrorLogLevel::Warn,
+            &format!("{connections} worker_connections exceed open file resource limit: {limit}"),
+        );
+    }
+}
+
+/// `worker_rlimit_nofile` / `worker_rlimit_core`: both soft and hard limits
+/// to `value`, as nginx's ngx_worker_process_init; a failure is an
+/// `[alert]` and startup carries on.
+fn set_rlimit(nofile: bool, value: Option<u64>) {
+    let Some(value) = value else {
+        return;
+    };
+    let limit = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    // The resource is named in each call: its type differs between glibc
+    // and musl.
+    // SAFETY: setrlimit reads the struct we pass.
+    let (rc, name) = unsafe {
+        if nofile {
+            (
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit),
+                "RLIMIT_NOFILE",
+            )
+        } else {
+            (libc::setrlimit(libc::RLIMIT_CORE, &limit), "RLIMIT_CORE")
+        }
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        eprintln!(
+            "ruxen: [alert] setrlimit({name}, {value}) failed ({})",
+            worker::errno_text(&e)
+        );
+    }
+}
+
 fn signal_for(name: &str) -> Result<i32, String> {
     match name {
         "stop" => Ok(libc::SIGTERM),

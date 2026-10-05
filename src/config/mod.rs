@@ -148,6 +148,51 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
             ("error_log", Terminator::Semi) => {
                 runtime.error_logs.push(parse_error_log_args(&args[1..])?);
             }
+            // nginx's ngx_conf_set_num_slot / ngx_conf_set_off_slot.
+            ("worker_rlimit_nofile" | "worker_rlimit_core", Terminator::Semi) => {
+                let nofile = name == "worker_rlimit_nofile";
+                let what = if nofile {
+                    "worker_rlimit_nofile"
+                } else {
+                    "worker_rlimit_core"
+                };
+                let slot = if nofile {
+                    &mut runtime.worker_rlimit_nofile
+                } else {
+                    &mut runtime.worker_rlimit_core
+                };
+                if slot.is_some() {
+                    return Err(Error::Duplicate(what));
+                }
+                let [_, raw] = args.as_slice() else {
+                    return Err(Error::BadValue {
+                        what,
+                        got: args[1..].join(" "),
+                    });
+                };
+                let value = if nofile {
+                    raw.parse::<u64>().ok()
+                } else {
+                    parse_size(raw.as_bytes())
+                };
+                *slot = Some(value.ok_or_else(|| Error::BadValue {
+                    what,
+                    got: raw.clone(),
+                })?);
+            }
+            ("worker_shutdown_timeout", Terminator::Semi) => {
+                if runtime.worker_shutdown_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("worker_shutdown_timeout"));
+                }
+                let [_, raw] = args.as_slice() else {
+                    return Err(Error::BadValue {
+                        what: "worker_shutdown_timeout",
+                        got: args[1..].join(" "),
+                    });
+                };
+                runtime.worker_shutdown_timeout_ms =
+                    Some(parse_duration_ms(raw, "worker_shutdown_timeout")?);
+            }
             // `user name [group];` — recorded so `main` can refuse a switch
             // it can't make (see `check_privileges`).
             ("user", Terminator::Semi) => {
@@ -672,9 +717,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "master_process",
     "worker_priority",
     "worker_cpu_affinity",
-    "worker_rlimit_nofile",
-    "worker_rlimit_core",
-    "worker_shutdown_timeout",
     "load_module",
     "error_log",
     "timer_resolution",
@@ -1219,6 +1261,27 @@ mod tests {
         assert_eq!(
             cfg.runtime.pid.as_deref(),
             Some(std::path::Path::new("logs/nginx.pid"))
+        );
+    }
+
+    #[test]
+    fn worker_shutdown_timeout_is_a_main_level_time() {
+        let with = |directive: &str| {
+            parse(&format!(
+                "{directive}\nevents {{}}\nhttp {{ server {{ listen 80; }} }}"
+            ))
+        };
+        let timeout = |directive| with(directive).unwrap().runtime.worker_shutdown_timeout_ms;
+        assert_eq!(timeout(""), None);
+        assert_eq!(timeout("worker_shutdown_timeout 10ms;"), Some(10));
+        assert_eq!(timeout("worker_shutdown_timeout 2m;"), Some(120_000));
+        assert_eq!(timeout("worker_shutdown_timeout 0;"), Some(0));
+        assert!(with("worker_shutdown_timeout;").is_err());
+        assert!(with("worker_shutdown_timeout soon;").is_err());
+        assert!(with("worker_shutdown_timeout 1s; worker_shutdown_timeout 2s;").is_err());
+        // Main context only, as nginx.
+        assert!(
+            parse("events {} http { worker_shutdown_timeout 1s; server { listen 80; } }").is_err()
         );
     }
 
