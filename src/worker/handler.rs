@@ -463,7 +463,7 @@ pub(crate) fn run_location_handler(
         // Pick the first peer via the per-worker LB. None means every
         // peer is `down` or in a `max_fails` cooldown: `run_proxy` answers
         // 502 and reports `no live upstreams` for the error log.
-        let initial_peer = crate::upstream::pick_peer(proxy.upstream, 0);
+        let initial_peer = crate::upstream::pick_peer(proxy.upstream, &Default::default());
         // Render proxy_set_header values with $proxy_host populated for
         // this location's upstream URL authority. The other RenderCtx
         // fields are inherited from the base built above.

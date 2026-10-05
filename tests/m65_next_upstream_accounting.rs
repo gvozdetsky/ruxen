@@ -3,6 +3,10 @@
 //! only move on to the next peer (NGX_PEER_NEXT), and the last try's
 //! response is the answer, not a failure. ruxen used to count both, so
 //! one 404 took a healthy backend out of rotation for `fail_timeout`.
+//! Also: the last try's response goes through proxy_intercept_errors, and
+//! failover can reach every peer of an upstream of more than 64.
+
+mod common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -154,4 +158,55 @@ fn the_last_try_goes_through_intercept_errors() {
     let mut want = [format!("127.0.0.1:{a}"), format!("127.0.0.1:{b}")];
     want.sort();
     assert_eq!(tried, want, "{body}");
+}
+
+/// An upstream of more than 64 peers: every peer has its own "tried" bit.
+/// Peers from index 63 up used to share one, so once one of them failed
+/// the others counted as tried, and failover ended in a 502 before it
+/// reached the live peer at the end.
+#[test]
+fn failover_reaches_every_peer_of_a_large_upstream() {
+    let dead = common::ports::DeadPort::new();
+    let [front, live] = free_ports::<2>();
+    let dir = std::env::temp_dir().join(format!("ruxen-m65-large-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let servers: String = (0..69)
+        .map(|_| format!("server 127.0.0.1:{} max_fails=0; ", dead.port()))
+        .collect();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{\n\
+             upstream u {{ {servers}server 127.0.0.1:{live} max_fails=0; }}\n\
+             server {{ listen 127.0.0.1:{front}; location / {{ proxy_pass http://u; }} }}\n\
+             server {{ listen 127.0.0.1:{live}; location / {{ return 200 live; }} }}\n\
+             }}\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+        .arg("-c")
+        .arg(dir.join("nginx.conf"))
+        .env("RUXEN_WORKERS", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !dir.join("ruxen.pid").exists() {
+        assert!(Instant::now() < deadline, "ruxen did not start");
+        sleep(Duration::from_millis(10));
+    }
+    let results: Vec<(u16, String)> = (0..10).map(|_| get(front, "/")).collect();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        results
+            .iter()
+            .all(|(status, body)| *status == 200 && body == "live"),
+        "{results:?}"
+    );
 }

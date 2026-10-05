@@ -302,7 +302,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
         Some(Instant::now() + plan.next_upstream_timeout)
     };
     // Take ownership of the initial leased peer. `current` always names
-    // the peer we're about to try; tried_mask records peers already
+    // the peer we're about to try; `tried` records peers already
     // attempted (and reported FAILED) so the next pick skips them.
     // No initial peer: every peer is `down` or cooling off after
     // `max_fails`.
@@ -318,7 +318,8 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
         });
         return Response::Prebuilt(plan.bad_gateway.pick(plan.method));
     };
-    let mut tried_mask: u64 = 1u64 << current.peer_idx.min(63);
+    let mut tried = upstream::Tried::default();
+    tried.insert(current.peer_idx);
     let mut attempts: u32 = 0;
     // nginx's NGX_HTTP_UPSTREAM_FT_NON_IDEMPOTENT: once the request went
     // out, POST/LOCK/PATCH move to the next peer only with
@@ -432,10 +433,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     } else {
                         upstream::report_failure(upstream, current.peer_idx);
                     }
-                    let Some(next) = upstream::pick_peer(upstream, tried_mask) else {
+                    let Some(next) = upstream::pick_peer(upstream, &tried) else {
                         return resp;
                     };
-                    tried_mask |= 1u64 << next.peer_idx.min(63);
+                    tried.insert(next.peer_idx);
                     drop(current);
                     current = next;
                     continue;
@@ -489,11 +490,11 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     return last_failure
                         .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
                 }
-                let Some(next) = upstream::pick_peer(upstream, tried_mask) else {
+                let Some(next) = upstream::pick_peer(upstream, &tried) else {
                     return last_failure
                         .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
                 };
-                tried_mask |= 1u64 << next.peer_idx.min(63);
+                tried.insert(next.peer_idx);
                 drop(current);
                 current = next;
                 continue;
