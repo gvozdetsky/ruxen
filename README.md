@@ -57,11 +57,13 @@ See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status.
 **Prebuilt binary** (x86_64 Linux, glibc 2.35 or newer — Ubuntu 22.04, Debian 12 and later; on older systems it fails with ``version `GLIBC_2.34' not found``, so build from source) from [GitHub Releases](https://github.com/gvozdetsky/ruxen/releases):
 
 ```bash
-curl -LO https://github.com/gvozdetsky/ruxen/releases/download/v0.1.0/ruxen-v0.1.0-x86_64-linux-gnu.tar.gz
-tar xzf ruxen-v0.1.0-x86_64-linux-gnu.tar.gz
-cd ruxen-v0.1.0-x86_64-linux-gnu
+curl -LO https://github.com/gvozdetsky/ruxen/releases/latest/download/ruxen-x86_64-linux-gnu.tar.gz
+tar xzf ruxen-x86_64-linux-gnu.tar.gz
+cd ruxen-v*-x86_64-linux-gnu
 ./ruxen -V
 ```
+
+Each release also has the tarball under a versioned name (`ruxen-v<version>-x86_64-linux-gnu.tar.gz`) and a `SHA256SUMS` file.
 
 **From crates.io:**
 

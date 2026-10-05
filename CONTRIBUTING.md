@@ -104,6 +104,26 @@ report is a config small enough to paste, one request (a `curl` command),
 and both responses. Reducing a failing nginx-tests file to that shape is a
 great first contribution on its own.
 
+## Releasing
+
+For the maintainer. The tag drives the GitHub release; crates.io is a
+separate step, so do them in this order:
+
+1. On `main`, bump `version` in `Cargo.toml` (and `Cargo.lock` with
+   `cargo update -p ruxen`), and add `.github/release-notes/v<version>.md`.
+   Merge that through a PR so CI runs on it.
+2. `cargo publish --dry-run --locked` on that commit: it packages the
+   crate and builds the package on its own.
+3. Tag the commit `v<version>` and push the tag. `release.yml` checks the
+   tag against `Cargo.toml` and the notes file, runs `cargo fmt --check`
+   and `cargo test`, builds, smoke-tests (`-V`, `-t` on `examples/`), and
+   publishes the release with the versioned tarball, a version-less copy
+   for the README's `releases/latest` link, and `SHA256SUMS`.
+4. When the release is up, `cargo publish --locked`. A crates.io version
+   can't be replaced, only yanked, so this goes last.
+5. Security fixes in the release: publish their advisories (see
+   `SECURITY.md`) and file any follow-up issues they mention.
+
 ## License
 
 By contributing you agree that your contributions are licensed under the
