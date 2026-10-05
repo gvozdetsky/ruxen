@@ -243,19 +243,23 @@ fn tls_after_the_header() {
             certs.key_path().display()
         ),
     );
+    // `--haproxy-protocol` alone (curl 7.60+; `--haproxy-clientip` needs
+    // 8.2, newer than Ubuntu 22.04's) sends the connection's own
+    // addresses: the header was read if its ports show up.
     let out = Command::new("curl")
-        .args([
-            "-sk",
-            "--haproxy-protocol",
-            "--haproxy-clientip",
-            "203.0.113.7",
-        ])
+        .args(["-sk", "--haproxy-protocol"])
         .arg(format!("https://localhost:{}/", server.port))
         .output()
         .expect("curl");
     let body = String::from_utf8_lossy(&out.stdout);
+    let fields: Vec<&str> = body.split(' ').collect();
+    let port_of = |addr: &str| addr.rsplit_once(':').map(|(_, p)| p.to_string());
     assert!(
-        body.starts_with("203.0.113.7:") && body.ends_with(" 127.0.0.1"),
+        fields.len() == 3
+            && fields[0].starts_with("127.0.0.1:")
+            && port_of(fields[0]).is_some_and(|p| p.parse::<u16>().is_ok())
+            && fields[1] == format!("127.0.0.1:{}", server.port)
+            && fields[2] == "127.0.0.1",
         "{body} / {}",
         String::from_utf8_lossy(&out.stderr)
     );
