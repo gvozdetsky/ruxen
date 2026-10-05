@@ -498,7 +498,7 @@ pub(crate) fn build_proxy(
             }));
             PreparedProxy {
                 upstream,
-                host_header: host_header_static,
+                host_header: without_default_port(host_header_static),
                 set_headers: eff.set_headers,
                 pass_request_headers: eff.pass_request_headers,
                 pass_request_body: eff.pass_request_body,
@@ -554,6 +554,31 @@ pub(crate) fn build_proxy(
             }
         }
     })
+}
+
+/// `$proxy_host` and the upstream `Host` for a `proxy_pass` authority: a
+/// port equal to the scheme's default (80; only `http://` is proxied) is
+/// dropped, as ngx_http_proxy_set_vars does. The URL as written still
+/// names the peer and feeds `proxy_redirect default`.
+fn without_default_port(authority: &'static [u8]) -> &'static [u8] {
+    let host_end = authority
+        .iter()
+        .rposition(|&b| b == b']')
+        .map_or(0, |i| i + 1);
+    match authority[host_end..].iter().rposition(|&b| b == b':') {
+        Some(i) => {
+            let colon = host_end + i;
+            let port = std::str::from_utf8(&authority[colon + 1..])
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok());
+            if port == Some(80) {
+                &authority[..colon]
+            } else {
+                authority
+            }
+        }
+        None => authority,
+    }
 }
 
 /// nginx's hidden set: its defaults, plus `proxy_hide_header`, minus
@@ -2360,4 +2385,26 @@ pub(crate) fn prepare_try_files(
         TryFilesFallback::Named(u) => PreparedFallback::Named(leak_bytes(u.as_bytes())),
     };
     Box::leak(Box::new(PreparedTryFiles { probes, fallback }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_default_port;
+
+    #[test]
+    fn default_port_is_dropped_from_proxy_host() {
+        for (authority, want) in [
+            ("127.0.0.1:80", "127.0.0.1"),
+            ("example.test:80", "example.test"),
+            ("[::1]:80", "[::1]"),
+            ("127.0.0.1:8080", "127.0.0.1:8080"),
+            ("[::1]:8080", "[::1]:8080"),
+            ("example.test", "example.test"),
+            ("[::1]", "[::1]"),
+            ("u", "u"),
+        ] {
+            let got = without_default_port(Box::leak(authority.as_bytes().into()));
+            assert_eq!(got, want.as_bytes(), "{authority}");
+        }
+    }
 }

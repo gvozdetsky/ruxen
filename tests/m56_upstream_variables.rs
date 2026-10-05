@@ -304,3 +304,21 @@ fn proxy_port_is_the_proxy_pass_port() {
     assert_eq!(header("/group"), "[u|80]");
     assert_eq!(header("/local"), "[|]");
 }
+
+/// `proxy_pass http://host:80` drops the default port from `$proxy_host`
+/// (and so from the Host header sent upstream), as nginx's
+/// ngx_http_proxy_set_vars; it used to keep `:80`.
+#[test]
+fn proxy_host_drops_the_default_port() {
+    let server = start(
+        "proxyhost80",
+        "server { listen 127.0.0.1:%%PORT%%;\n\
+           add_header X-PH \"[$proxy_host]\" always;\n\
+           location / { proxy_pass http://127.0.0.1:80; proxy_connect_timeout 1s; }\n\
+         }",
+    );
+    // Nothing listens on :80 in the test environment, or something does:
+    // either way the header is the proxy's own.
+    let resp = get(server.port, "/");
+    assert!(resp.contains("\r\nX-PH: [127.0.0.1]\r\n"), "{resp}");
+}
