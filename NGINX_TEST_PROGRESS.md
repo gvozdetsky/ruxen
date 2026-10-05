@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-03 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-05 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 61
-- **Intentionally skipped (`-V` banner excludes the module):** 401
-- **Failing — work in progress:** 43
+- **Passing in ruxen:** 63
+- **Intentionally skipped (`-V` banner excludes the module):** 400
+- **Failing — work in progress:** 42
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (61)
+## Passing in ruxen (63)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -53,6 +53,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_intercept_errors.t`
 - `proxy_limit_rate.t`
 - `proxy_max_temp_file_size.t`
+- `proxy_next_upstream.t`
 - `proxy_noclose.t`
 - `proxy_non_idempotent.t`
 - `proxy_pass_request.t`
@@ -75,11 +76,12 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `trailers.t`
 - `upstream.t`
 - `upstream_keepalive.t`
+- `upstream_least_conn.t`
 - `worker_channel.t`
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (43)
+## Failing — actively being worked on (42)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -95,7 +97,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_cookie_flags.t` — 12/16
 - `proxy_if.t` — 15/17
 - `proxy_method.t` — 3/6
-- `proxy_next_upstream.t` — 2/10
 - `proxy_next_upstream_tries.t` — 8/10
 - `proxy_protocol2_tlv.t` — 14/16
 - `proxy_redirect.t` — 15/17
@@ -127,7 +128,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_verify_client.t` — 14/16
 - `ssl_verify_depth.t` — 9/11
 
-## Intentionally skipped (401)
+## Intentionally skipped (400)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
@@ -520,6 +521,13 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `mp4_start_key_frame.t`
 - `range_mp4.t`
 
+### no upstream_ip_hash available (4)
+
+- `upstream_ip_hash.t`
+- `upstream_ip_hash_ipv6.t`
+- `upstream_max_conns.t`
+- `upstream_sticky_route.t`
+
 ### can leave orphaned process group (3)
 
 - `binary_upgrade.t`
@@ -568,12 +576,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `tunnel_auth_basic.t`
 - `tunnel_next_upstream.t`
 
-### no upstream_ip_hash available (3)
-
-- `upstream_ip_hash.t`
-- `upstream_ip_hash_ipv6.t`
-- `upstream_sticky_route.t`
-
 ### no xslt available (3)
 
 - `xslt.t`
@@ -615,11 +617,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `mirror.t`
 - `mirror_proxy.t`
-
-### no upstream_least_conn available (2)
-
-- `upstream_least_conn.t`
-- `upstream_max_conns.t`
 
 ### no userid available (2)
 
