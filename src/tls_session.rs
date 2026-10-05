@@ -9,8 +9,9 @@
 // This module provides:
 //
 // - `ExpiringSessionStorage`: wraps any `StoresServerSessions` and stamps
-//   each `put()` with the insert time. `get`/`take` returns `None` for any
-//   entry older than the configured timeout. Used for TLS 1.2 SessionID
+//   each `put()` value with the insert time (prefixed to the value, so the
+//   inner cache's own capacity bounds it). `get`/`take` returns `None` for
+//   any entry older than the configured timeout. Used for TLS 1.2 SessionID
 //   resumption.
 // - `ExpiringTicketer`: wraps any `ProducesTickets` and prepends a u64
 //   wall-clock timestamp (seconds since UNIX epoch) to each plaintext
@@ -21,7 +22,6 @@
 //   so clients receive an honest hint.
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustls::server::{ProducesTickets, StoresServerSessions};
@@ -30,56 +30,53 @@ use rustls::server::{ProducesTickets, StoresServerSessions};
 pub struct ExpiringSessionStorage {
     inner: Arc<dyn StoresServerSessions>,
     timeout: Duration,
-    timestamps: Mutex<std::collections::HashMap<Vec<u8>, Instant>>,
+}
+
+/// The insert time travels with the stored value, as 8 bytes of
+/// milliseconds since a process-wide origin in front of it. A side map
+/// keyed by session id would keep entries for sessions the inner cache
+/// evicted on its own, and grow with every handshake.
+fn now_ms() -> u64 {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 impl ExpiringSessionStorage {
     pub fn new(inner: Arc<dyn StoresServerSessions>, timeout: Duration) -> Self {
-        Self {
-            inner,
-            timeout,
-            timestamps: Mutex::new(std::collections::HashMap::new()),
-        }
+        Self { inner, timeout }
     }
 
-    fn is_fresh(&self, key: &[u8]) -> bool {
-        let mut guard = self.timestamps.lock().unwrap();
-        let Some(&inserted) = guard.get(key) else {
-            return false;
-        };
-        if inserted.elapsed() > self.timeout {
-            guard.remove(key);
-            false
-        } else {
-            true
+    /// The stored value without its timestamp, if it's still fresh.
+    fn unwrap_fresh(&self, stored: Vec<u8>) -> Option<Vec<u8>> {
+        let stamp: [u8; 8] = stored.get(..8)?.try_into().ok()?;
+        let age = now_ms().saturating_sub(u64::from_be_bytes(stamp));
+        if age > self.timeout.as_millis() as u64 {
+            return None;
         }
+        Some(stored[8..].to_vec())
     }
 }
 
 impl StoresServerSessions for ExpiringSessionStorage {
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        let stored = self.inner.put(key.clone(), value);
-        if stored {
-            self.timestamps.lock().unwrap().insert(key, Instant::now());
-        }
-        stored
+        let mut stamped = Vec::with_capacity(8 + value.len());
+        stamped.extend_from_slice(&now_ms().to_be_bytes());
+        stamped.extend_from_slice(&value);
+        self.inner.put(key, stamped)
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if !self.is_fresh(key) {
+        let value = self.unwrap_fresh(self.inner.get(key)?);
+        if value.is_none() {
             // Drop the inner entry so a future client can't keep resuming
             // a session that's already past `ssl_session_timeout`.
             let _ = self.inner.take(key);
-            return None;
         }
-        self.inner.get(key)
+        value
     }
 
     fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let fresh = self.is_fresh(key);
-        self.timestamps.lock().unwrap().remove(key);
-        let value = self.inner.take(key);
-        if fresh { value } else { None }
+        self.unwrap_fresh(self.inner.take(key)?)
     }
 
     fn can_cache(&self) -> bool {
@@ -165,5 +162,19 @@ mod tests {
         assert!(store.put(b"k".to_vec(), b"v".to_vec()));
         assert_eq!(store.take(b"k"), Some(b"v".to_vec()));
         assert_eq!(store.get(b"k"), None);
+    }
+
+    /// Nothing outside the inner cache grows: many more sessions than it
+    /// holds leave it at its capacity, and the newest ones still resume.
+    /// The timestamps used to live in a side map that kept an entry for
+    /// every session the inner cache had evicted.
+    #[test]
+    fn session_storage_stays_within_the_inner_capacity() {
+        let inner = ServerSessionMemoryCache::new(16);
+        let store = ExpiringSessionStorage::new(inner, Duration::from_secs(60));
+        for i in 0..10_000u32 {
+            assert!(store.put(i.to_be_bytes().to_vec(), b"v".to_vec()));
+        }
+        assert_eq!(store.get(&9_999u32.to_be_bytes()), Some(b"v".to_vec()));
     }
 }
