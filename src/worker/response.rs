@@ -803,7 +803,7 @@ fn proxy_render_ctx<'a>(
         epoch_secs: ctx.epoch_secs,
         epoch_ms: ctx.epoch_ms,
         server_name_captures: &[],
-        rewrite_state: None,
+        rewrite_state: meta.rewrite_state.as_deref(),
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.proxy_host,

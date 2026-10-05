@@ -207,6 +207,7 @@ pub struct PreparedMap {
     pub default: Option<&'static [PreparedValuePart]>,
 }
 
+#[derive(Debug, Clone)]
 pub struct RewriteState {
     user_vars: Vec<(&'static [u8], Vec<u8>)>,
     numbered_captures: Vec<Vec<u8>>,
