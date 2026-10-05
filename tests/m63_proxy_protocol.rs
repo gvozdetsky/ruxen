@@ -131,9 +131,50 @@ fn a_connection_without_the_header_is_closed() {
     let log = std::fs::read_to_string(server.dir.join("error.log")).unwrap_or_default();
     assert!(
         log.contains("[error]")
-            && log.contains("broken header: \"GET / HTTP/1.1\" while reading PROXY protocol"),
+            && log.contains(&format!(
+                "broken header: \"GET / HTTP/1.1\" while reading PROXY protocol, \
+                 client: 127.0.0.1, server: 127.0.0.1:{}",
+                server.port
+            )),
         "{log}"
     );
+}
+
+/// A client that closes or times out before sending the header is logged
+/// at info, as nginx (ngx_http_wait_request_handler), with the action once
+/// and the listening address as `server:`. ruxen used to log both at
+/// error, with "while reading PROXY protocol" twice and no `server:`.
+#[test]
+fn a_client_gone_before_the_header_is_info() {
+    let dir = std::env::temp_dir().join(format!("ruxen-m63-gone-{}", std::process::id()));
+    let server = start(
+        "gone",
+        "",
+        &format!(
+            "client_header_timeout 1s; error_log {} info;",
+            dir.join("info.log").display()
+        ),
+    );
+    drop(TcpStream::connect(("127.0.0.1", server.port)).unwrap());
+    let started = Instant::now();
+    assert_eq!(exchange(server.port, &[]), "");
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    sleep(Duration::from_millis(50));
+    let log = std::fs::read_to_string(dir.join("info.log")).unwrap_or_default();
+    let context = format!(
+        " while reading PROXY protocol, client: 127.0.0.1, server: 127.0.0.1:{}",
+        server.port
+    );
+    for line in [
+        "client closed connection",
+        "client timed out (110: Connection timed out)",
+    ] {
+        assert!(
+            log.lines()
+                .any(|l| l.contains("[info]") && l.ends_with(&format!("{line}{context}"))),
+            "{line}: {log}"
+        );
+    }
 }
 
 /// What arrives first is all nginx looks at (ngx_http_wait_request_handler

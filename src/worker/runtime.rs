@@ -980,13 +980,17 @@ async fn handle_proxy_protocol(
     let server = &prepared.servers[prepared.default_server];
     let header = match crate::proxy_protocol::read(&stream, server.timeouts.header).await {
         Ok(header) => header,
-        Err(reason) => {
+        Err((level, reason)) => {
+            // There's no request yet, so nginx's context is the client and
+            // the listening address.
             write_worker_log(
                 server.error_logs,
-                ErrorLogLevel::Error,
+                level,
                 &format!(
-                    "*{connection_id} {reason} while reading PROXY protocol, client: {}",
-                    peer_addr.ip()
+                    "*{connection_id} {reason} while reading PROXY protocol, \
+                     client: {}, server: {}",
+                    peer_addr.ip(),
+                    prepared.addr
                 ),
             );
             return;
