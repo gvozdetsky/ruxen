@@ -264,3 +264,43 @@ fn tls_after_the_header() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `$proxy_protocol_tlv_*` read the v2 header's TLVs, as nginx: by name,
+/// by hex type, inside the SSL TLV, and its verify field. They used to be
+/// unsupported variables that rendered empty.
+#[test]
+fn v2_tlvs_are_variables() {
+    let server = start(
+        "tlv",
+        "",
+        "add_header X-ALPN $proxy_protocol_tlv_alpn-$proxy_protocol_tlv_0x01;\n\
+         add_header X-SSL-CN $proxy_protocol_tlv_ssl_cn;\n\
+         add_header X-VERIFY $proxy_protocol_tlv_ssl_verify;\n\
+         add_header X-NONE [$proxy_protocol_tlv_authority];",
+    );
+    let tlv = |ty: u8, value: &[u8]| {
+        let mut out = vec![ty];
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value);
+        out
+    };
+    // SSL TLV: client, verify = 255, then a CN sub-TLV.
+    let mut ssl = vec![0x01, 0, 0, 0, 255];
+    ssl.extend(tlv(0x22, b"example.com"));
+    let tlvs = [tlv(0x01, b"ALPN1"), tlv(0x20, &ssl)].concat();
+    let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    v2.extend_from_slice(&[0x21, 0x11]);
+    v2.extend_from_slice(&((12 + tlvs.len()) as u16).to_be_bytes());
+    v2.extend_from_slice(&[192, 0, 2, 1, 192, 0, 2, 2, 0xc7, 0x38, 0, 80]);
+    v2.extend_from_slice(&tlvs);
+    let resp = exchange(server.port, &[&[&v2[..], GET].concat()]);
+    assert!(resp.contains("\r\nX-ALPN: ALPN1-ALPN1\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-SSL-CN: example.com\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-VERIFY: 255\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-NONE: []\r\n"), "{resp}");
+
+    // A v1 header has no TLVs: the variables are empty.
+    let resp = exchange(server.port, &[V1, GET]);
+    assert!(resp.contains("\r\nX-NONE: []\r\n"), "{resp}");
+    assert!(!resp.contains("X-SSL-CN"), "{resp}");
+}

@@ -178,6 +178,11 @@ impl RenderCtx<'_> {
                     };
                 }
             }
+            Variable::ProxyProtocolTlv(tlv) => {
+                if let Some(header) = self.proxy_protocol {
+                    crate::proxy_protocol::write_tlv(&header.tlvs, tlv, out);
+                }
+            }
             Variable::ServerProtocol => out.extend_from_slice(server_protocol(self.request_line)),
             Variable::Host => out.extend_from_slice(self.host),
             Variable::RemoteAddr => out.extend_from_slice(self.remote_addr),
@@ -928,6 +933,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::ProxyProtocolPort
             | Variable::ProxyProtocolServerAddr
             | Variable::ProxyProtocolServerPort
+            | Variable::ProxyProtocolTlv(_)
     )
 }
 

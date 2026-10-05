@@ -261,12 +261,61 @@ fn is_nginx_variable(name: &str) -> bool {
         "upstream_cache_status",
         "upstream_cache_last_modified",
     ];
-    const PREFIXES: &[&str] = &["ssl_", "upstream_trailer_", "geoip_", "proxy_protocol_tlv_"];
+    const PREFIXES: &[&str] = &["ssl_", "upstream_trailer_", "geoip_"];
     NAMES.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 fn note_unknown_variable(name: &str) {
     VARIABLES.with(|v| v.borrow_mut().referenced.push(name.to_string()));
+}
+
+/// The TLV a `$proxy_protocol_tlv_<name>` names, as nginx's
+/// ngx_proxy_protocol_get_tlv reads `<name>`: an `ssl_` prefix moves to the
+/// SSL TLV's sub-TLVs, `0x…` is a hex type, else one of nginx's names.
+fn classify_proxy_protocol_tlv(name: &[u8]) -> ProxyProtocolTlv {
+    const TOP: &[(&[u8], u8)] = &[
+        (b"alpn", 0x01),
+        (b"authority", 0x02),
+        (b"unique_id", 0x05),
+        (b"ssl", 0x20),
+        (b"netns", 0x30),
+    ];
+    const SSL: &[(&[u8], u8)] = &[
+        (b"version", 0x21),
+        (b"cn", 0x22),
+        (b"cipher", 0x23),
+        (b"sig_alg", 0x24),
+        (b"key_alg", 0x25),
+    ];
+    let (ssl, rest) = match name.strip_prefix(b"ssl_") {
+        Some(rest) => (true, rest),
+        None => (false, name),
+    };
+    if ssl && rest == b"verify" {
+        return ProxyProtocolTlv::SslVerify;
+    }
+    let ty = if let Some(hex) = rest.strip_prefix(b"0x") {
+        // nginx's ngx_hextoi: one or more hex digits.
+        match std::str::from_utf8(hex)
+            .ok()
+            .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(|h| u64::from_str_radix(h, 16))
+        {
+            Some(Ok(n)) => u8::try_from(n).ok(),
+            _ => return ProxyProtocolTlv::Unknown,
+        }
+    } else {
+        let table = if ssl { SSL } else { TOP };
+        match table.iter().find(|(n, _)| *n == rest) {
+            Some(&(_, ty)) => Some(ty),
+            None => return ProxyProtocolTlv::Unknown,
+        }
+    };
+    if ssl {
+        ProxyProtocolTlv::Ssl(ty)
+    } else {
+        ProxyProtocolTlv::Type(ty)
+    }
 }
 
 pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
@@ -279,6 +328,9 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"proxy_protocol_port" => Variable::ProxyProtocolPort,
         b"proxy_protocol_server_addr" => Variable::ProxyProtocolServerAddr,
         b"proxy_protocol_server_port" => Variable::ProxyProtocolServerPort,
+        _ if name.starts_with(b"proxy_protocol_tlv_") => Variable::ProxyProtocolTlv(
+            classify_proxy_protocol_tlv(&name[b"proxy_protocol_tlv_".len()..]),
+        ),
         b"server_protocol" => Variable::ServerProtocol,
         b"host" => Variable::Host,
         b"server_name" => Variable::ServerName,
@@ -393,4 +445,26 @@ pub(crate) fn is_var_name_first(c: u8) -> bool {
 #[inline]
 pub(crate) fn is_var_name_cont(c: u8) -> bool {
     matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_proxy_protocol_tlv as c;
+    use crate::config::ProxyProtocolTlv as T;
+
+    #[test]
+    fn proxy_protocol_tlv_names_like_nginx() {
+        assert_eq!(c(b"alpn"), T::Type(Some(0x01)));
+        assert_eq!(c(b"ssl"), T::Type(Some(0x20)));
+        assert_eq!(c(b"0x01"), T::Type(Some(0x01)));
+        assert_eq!(c(b"0x000ae"), T::Type(Some(0xae)));
+        assert_eq!(c(b"0x100"), T::Type(None));
+        assert_eq!(c(b"ssl_cn"), T::Ssl(Some(0x22)));
+        assert_eq!(c(b"ssl_0x22"), T::Ssl(Some(0x22)));
+        assert_eq!(c(b"ssl_verify"), T::SslVerify);
+        assert_eq!(c(b"0x"), T::Unknown);
+        assert_eq!(c(b"0xzz"), T::Unknown);
+        assert_eq!(c(b"nope"), T::Unknown);
+        assert_eq!(c(b"ssl_nope"), T::Unknown);
+    }
 }
