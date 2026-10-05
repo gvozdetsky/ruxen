@@ -242,16 +242,33 @@ pub struct Listen {
     pub quic: bool,
     /// `proxy_protocol` — connections start with a PROXY protocol header.
     pub proxy_protocol: bool,
-    /// `deferred` — Linux `TCP_DEFER_ACCEPT`; accepted, ignored.
+    /// `deferred` — Linux `TCP_DEFER_ACCEPT`.
     pub deferred: bool,
-    /// `fastopen=N` — TCP fast-open queue length; accepted, ignored.
+    /// `fastopen=N` — TCP fast-open queue length.
     pub fastopen: Option<u32>,
-    /// `backlog=N` — listen backlog; accepted, ignored.
+    /// `backlog=N` — listen backlog.
     pub backlog: Option<u32>,
-    /// `rcvbuf=N` — `SO_RCVBUF`; accepted, ignored.
+    /// `rcvbuf=N` — `SO_RCVBUF`.
     pub rcvbuf: Option<u64>,
-    /// `sndbuf=N` — `SO_SNDBUF`; accepted, ignored.
+    /// `sndbuf=N` — `SO_SNDBUF`.
     pub sndbuf: Option<u64>,
+    /// `ipv6only=on|off` — `IPV6_V6ONLY` on an IPv6 socket (nginx's
+    /// default is on).
+    pub ipv6only: Option<bool>,
+    /// `so_keepalive=on|off|[idle]:[intvl]:[cnt]`.
+    pub so_keepalive: Option<SoKeepalive>,
+}
+
+/// `listen … so_keepalive=`: `SO_KEEPALIVE`, and with the third form the
+/// `TCP_KEEPIDLE` / `TCP_KEEPINTVL` (seconds) / `TCP_KEEPCNT` that are set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoKeepalive {
+    Off,
+    On {
+        idle: Option<u32>,
+        intvl: Option<u32>,
+        cnt: Option<u32>,
+    },
 }
 
 impl Listen {
@@ -270,7 +287,21 @@ impl Listen {
             backlog: None,
             rcvbuf: None,
             sndbuf: None,
+            ipv6only: None,
+            so_keepalive: None,
         }
+    }
+
+    /// Any of the socket options that belong to the address, not to one
+    /// server (nginx's "duplicate listen options" check).
+    pub(crate) fn has_socket_options(&self) -> bool {
+        self.deferred
+            || self.fastopen.is_some()
+            || self.backlog.is_some()
+            || self.rcvbuf.is_some()
+            || self.sndbuf.is_some()
+            || self.ipv6only.is_some()
+            || self.so_keepalive.is_some()
     }
 }
 

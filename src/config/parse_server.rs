@@ -1035,8 +1035,19 @@ pub(crate) fn parse_listen_args(args: &[String]) -> Result<Listen, Error> {
             ("proxy_protocol", None) => listen.proxy_protocol = true,
             ("deferred", None) => listen.deferred = true,
             ("bind", None) => {} // implicit when address is given; nginx-tests configs use it
-            ("ipv6only", Some(_)) => {} // accepted-and-ignored: rustls/monoio handle dual-stack uniformly
-            ("so_keepalive", Some(_)) => {}
+            ("ipv6only", Some(v)) => {
+                listen.ipv6only = Some(match v {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "listen ipv6only",
+                            got: v.to_string(),
+                        });
+                    }
+                });
+            }
+            ("so_keepalive", Some(v)) => listen.so_keepalive = Some(parse_so_keepalive(v)?),
             ("setfib", Some(_)) => {}
             ("accept_filter", Some(_)) => {}
             ("fastopen", Some(v)) => {
@@ -1072,6 +1083,53 @@ pub(crate) fn parse_listen_args(args: &[String]) -> Result<Listen, Error> {
         }
     }
     Ok(listen)
+}
+
+/// `so_keepalive=on|off|[keepidle]:[keepintvl]:[keepcnt]`, as nginx's
+/// ngx_http_core_listen: idle and interval are times (seconds, with nginx's
+/// suffixes), count a number; any of the three may be empty.
+fn parse_so_keepalive(v: &str) -> Result<SoKeepalive, Error> {
+    let bad = || Error::BadValue {
+        what: "listen so_keepalive",
+        got: v.to_string(),
+    };
+    match v {
+        "on" => {
+            return Ok(SoKeepalive::On {
+                idle: None,
+                intvl: None,
+                cnt: None,
+            });
+        }
+        "off" => return Ok(SoKeepalive::Off),
+        _ => {}
+    }
+    let parts: Vec<&str> = v.split(':').collect();
+    let [idle, intvl, cnt] = parts.as_slice() else {
+        return Err(bad());
+    };
+    let secs = |s: &str| -> Result<Option<u32>, Error> {
+        if s.is_empty() {
+            return Ok(None);
+        }
+        let ms = parse_duration_ms(s, "listen so_keepalive")?;
+        u32::try_from(ms / 1000)
+            .ok()
+            .filter(|&n| n > 0)
+            .map(Some)
+            .ok_or_else(bad)
+    };
+    let idle = secs(idle)?;
+    let intvl = secs(intvl)?;
+    let cnt = if cnt.is_empty() {
+        None
+    } else {
+        Some(cnt.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(bad)?)
+    };
+    if idle.is_none() && intvl.is_none() && cnt.is_none() {
+        return Err(bad());
+    }
+    Ok(SoKeepalive::On { idle, intvl, cnt })
 }
 
 /// Parse `1k` / `1K` / `1m` / `1M` size suffixes used by `rcvbuf` / `sndbuf`.

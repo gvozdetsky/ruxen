@@ -828,13 +828,11 @@ pub fn run(
             return;
         }
 
-        let opts = ListenerOpts::new()
-            .reuse_port(true)
-            .reuse_addr(true)
-            .backlog(4096);
         let mut listeners = Vec::with_capacity(http.listens.len());
         for prepared in &http.listens {
-            match TcpListener::bind_with_config(prepared.addr, &opts) {
+            let bound = listen_socket(http, prepared)
+                .and_then(|socket| TcpListener::from_std(socket.into()));
+            match bound {
                 Ok(listener) => listeners.push(listener),
                 Err(e) => {
                     let _ = ready.send(Err(format!(
@@ -1061,6 +1059,110 @@ async fn handle_proxy_protocol(
             )
             .await
         }
+    }
+}
+
+/// The listening socket for `prepared`, with its `listen` options, as
+/// nginx's ngx_open_listening_sockets and ngx_configure_listening_sockets:
+/// `IPV6_V6ONLY` before bind, the rest before listen. A failed option is an
+/// `[alert] … ignored`, as in nginx; a failed bind or listen fails.
+pub(crate) fn listen_socket(
+    http: &PreparedHttp,
+    prepared: &PreparedListen,
+) -> std::io::Result<socket2::Socket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr = prepared.addr;
+    let o = &prepared.socket;
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_port(true)?;
+    socket.set_reuse_address(true)?;
+    let alert = |what: String, e: std::io::Error| {
+        write_worker_log(
+            http.error_logs,
+            ErrorLogLevel::Alert,
+            &format!(
+                "setsockopt({what}) {addr} failed ({}), ignored",
+                errno_text(&e)
+            ),
+        );
+    };
+    if addr.is_ipv6()
+        && let Err(e) = socket.set_only_v6(o.ipv6only)
+    {
+        alert(format!("IPV6_V6ONLY, {}", o.ipv6only as i32), e);
+    }
+    socket.bind(&addr.into())?;
+    if let Some(n) = o.rcvbuf
+        && let Err(e) = socket.set_recv_buffer_size(n)
+    {
+        alert(format!("SO_RCVBUF, {n}"), e);
+    }
+    if let Some(n) = o.sndbuf
+        && let Err(e) = socket.set_send_buffer_size(n)
+    {
+        alert(format!("SO_SNDBUF, {n}"), e);
+    }
+    if let Some(keepalive) = o.keepalive {
+        let on = !matches!(keepalive, crate::config::SoKeepalive::Off);
+        if let Err(e) = socket.set_keepalive(on) {
+            alert(format!("SO_KEEPALIVE, {}", on as i32), e);
+        }
+        if let crate::config::SoKeepalive::On { idle, intvl, cnt } = keepalive {
+            for (opt, name, value) in [
+                (libc::TCP_KEEPIDLE, "TCP_KEEPIDLE", idle),
+                (libc::TCP_KEEPINTVL, "TCP_KEEPINTVL", intvl),
+                (libc::TCP_KEEPCNT, "TCP_KEEPCNT", cnt),
+            ] {
+                if let Some(v) = value
+                    && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, opt, v as i32)
+                {
+                    alert(format!("{name}, {v}"), e);
+                }
+            }
+        }
+    }
+    if let Some(n) = o.fastopen
+        && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, n as i32)
+    {
+        alert(format!("TCP_FASTOPEN, {n}"), e);
+    }
+    socket.listen(o.backlog)?;
+    // nginx: a 1 s defer, since how long a connection queued can't be known.
+    if o.deferred
+        && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, 1)
+    {
+        alert("TCP_DEFER_ACCEPT, 1".to_string(), e);
+    }
+    Ok(socket)
+}
+
+fn setsockopt_int(
+    socket: &socket2::Socket,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: an int option on a socket we own.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            name,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

@@ -584,6 +584,7 @@ dependencies = [
  "regex",
  "rustls",
  "rustls-pemfile",
+ "socket2",
 ]
 
 [[package]]
