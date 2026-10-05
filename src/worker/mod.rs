@@ -886,7 +886,7 @@ mod tests {
             upstream_states: &[],
             sent_trailers: &[],
             tls: None,
-            proxy_protocol: None,
+            conn: &phase::ConnInfo::NONE,
         };
         render_parts(replace.error_pages[0].target, &ctx, &mut rendered);
         assert_eq!(rendered, b"/local-fallback");
@@ -940,7 +940,7 @@ mod tests {
             body_len: 0,
             body_file: None,
             tls: None,
-            proxy_protocol: None,
+            conn: &phase::ConnInfo::NONE,
             refuse: None,
         };
 
@@ -1079,7 +1079,7 @@ mod tests {
             upstream_states: &[],
             sent_trailers: &[],
             tls: None,
-            proxy_protocol: None,
+            conn: &phase::ConnInfo::NONE,
         };
         let out = inject_add_headers(response, headers, &ctx);
         let text = std::str::from_utf8(&out).unwrap();
@@ -1135,7 +1135,7 @@ mod tests {
             upstream_states: &[],
             sent_trailers: &[],
             tls: None,
-            proxy_protocol: None,
+            conn: &phase::ConnInfo::NONE,
         };
         let out = inject_add_headers(response, headers, &ctx);
         let text = std::str::from_utf8(&out).unwrap();
@@ -1199,7 +1199,7 @@ mod tests {
             upstream_states: &[],
             sent_trailers: &[],
             tls: None,
-            proxy_protocol: None,
+            conn: &phase::ConnInfo::NONE,
         };
         let out = inject_add_headers(response, headers, &ctx);
         let text = std::str::from_utf8(&out).unwrap();

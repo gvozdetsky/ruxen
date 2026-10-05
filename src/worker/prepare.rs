@@ -203,6 +203,11 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         let tls = build_listen_tls(addr, &tls_inputs)?;
         listens.push(PreparedListen {
             addr,
+            addr_text: if addr.ip().is_unspecified() {
+                b""
+            } else {
+                Box::leak(addr.ip().to_string().into_bytes().into_boxed_slice())
+            },
             servers,
             default_server: 0,
             tls,

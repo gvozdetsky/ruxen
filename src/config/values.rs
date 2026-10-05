@@ -18,6 +18,12 @@ pub(crate) fn is_header_name_char(c: u8) -> bool {
     )
 }
 
+/// Some value in the configuration reads `$server_addr`. Connections on a
+/// wildcard listen then look up their local address (`getsockname`) once;
+/// otherwise the accept path doesn't pay for it.
+pub static SERVER_ADDR_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Parse a value string into alternating literal + variable parts. A `$`
 /// that isn't followed by at least one variable-name char is treated as a
 /// literal dollar sign (matches nginx's tokenizer for directive values).
@@ -249,7 +255,6 @@ fn is_nginx_variable(name: &str) -> bool {
         "request_id",
         "secure_link",
         "secure_link_expires",
-        "server_addr",
         "slice_range",
         "tcpinfo_rcv_space",
         "tcpinfo_rtt",
@@ -373,6 +378,10 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"request_time" => Variable::RequestTime,
         b"limit_rate" => Variable::LimitRate,
         b"server_port" => Variable::ServerPort,
+        b"server_addr" => {
+            SERVER_ADDR_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+            Variable::ServerAddr
+        }
         b"request_port" => Variable::RequestPort,
         b"is_request_port" => Variable::IsRequestPort,
         b"pipe" => Variable::Pipe,

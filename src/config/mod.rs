@@ -2823,13 +2823,13 @@ mod tests {
         assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
         // A variable nginx has and ruxen doesn't: loads, with a warning.
         let cfg = parse(
-            "http { server { listen 80; location / { add_header X $server_addr$ssl_early_data; return 204; } } }",
+            "http { server { listen 80; location / { add_header X $tcpinfo_rtt$ssl_early_data; return 204; } } }",
         )
         .unwrap();
         assert_eq!(
             cfg.warnings,
             [
-                "variable \"$server_addr\" is not supported yet and is always empty",
+                "variable \"$tcpinfo_rtt\" is not supported yet and is always empty",
                 "variable \"$ssl_early_data\" is not supported yet and is always empty",
             ]
         );

@@ -133,7 +133,8 @@ pub(crate) struct RenderCtx<'a> {
     pub tls: Option<&'a crate::tls::HandshakeInfo>,
     /// The connection's PROXY protocol header (`listen … proxy_protocol`),
     /// for `$proxy_protocol_*`.
-    pub proxy_protocol: Option<&'a crate::proxy_protocol::ProxyHeader>,
+    /// The connection's PROXY protocol header and `$server_addr`.
+    pub conn: &'a phase::ConnInfo,
 }
 
 impl RenderCtx<'_> {
@@ -161,7 +162,7 @@ impl RenderCtx<'_> {
             | Variable::ProxyProtocolPort
             | Variable::ProxyProtocolServerAddr
             | Variable::ProxyProtocolServerPort => {
-                let header = self.proxy_protocol;
+                let header = self.conn.proxy_protocol.as_ref();
                 let addr = match var {
                     Variable::ProxyProtocolAddr | Variable::ProxyProtocolPort => {
                         header.and_then(|h| h.source)
@@ -179,7 +180,7 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::ProxyProtocolTlv(tlv) => {
-                if let Some(header) = self.proxy_protocol {
+                if let Some(header) = &self.conn.proxy_protocol {
                     crate::proxy_protocol::write_tlv(&header.tlvs, tlv, out);
                 }
             }
@@ -370,6 +371,7 @@ impl RenderCtx<'_> {
                 write_u64_decimal(out, rate);
             }
             Variable::ServerPort => write_u16_decimal(out, self.server_port),
+            Variable::ServerAddr => out.extend_from_slice(&self.conn.server_addr),
             Variable::RequestPort => out.extend_from_slice(self.request_port),
             Variable::IsRequestPort => {
                 if !self.request_port.is_empty() {

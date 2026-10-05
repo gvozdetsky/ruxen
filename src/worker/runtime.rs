@@ -58,7 +58,7 @@ pub(crate) async fn write_access_logs(
     epoch_secs: u64,
     epoch_ms: u16,
     tls: Option<&crate::tls::HandshakeInfo>,
-    proxy_protocol: Option<&crate::proxy_protocol::ProxyHeader>,
+    conn: &phase::ConnInfo,
     http: &'static PreparedHttp,
     // The request's processing result, for `$proxy_host` and the
     // upstream variables; `None` for a request refused before routing.
@@ -133,7 +133,7 @@ pub(crate) async fn write_access_logs(
         upstream_states: meta.map_or(&[][..], |m| &m.upstream_states),
         sent_trailers: &[],
         tls,
-        proxy_protocol,
+        conn,
     };
 
     for log in logs.iter() {
@@ -235,7 +235,7 @@ pub(crate) struct ConnLogCtx<'a> {
     pub connection_requests: u64,
     pub connection_start: Instant,
     pub tls: Option<&'a crate::tls::HandshakeInfo>,
-    pub proxy_protocol: Option<&'a crate::proxy_protocol::ProxyHeader>,
+    pub conn: &'a phase::ConnInfo,
 }
 
 /// Send a canned error for a request refused before a server is chosen (a
@@ -304,7 +304,7 @@ async fn reject_request<S: ConnIo>(
         now.as_secs(),
         now.subsec_millis() as u16,
         conn.tls,
-        conn.proxy_protocol,
+        conn.conn,
         http,
         None,
         None,
@@ -752,7 +752,7 @@ async fn run_post_action(
             base_ctx.epoch_secs,
             base_ctx.epoch_ms,
             base_ctx.tls,
-            base_ctx.proxy_protocol,
+            base_ctx.conn,
             http,
             Some(&post_meta),
             final_uri(&post_meta, url_scratch),
@@ -1375,6 +1375,31 @@ impl Drop for IdleMark {
     }
 }
 
+/// `$server_addr` for a connection: the listen address, formatted at
+/// startup, or for a wildcard listen the socket's own local address. That
+/// takes a `getsockname`, so it's done only when some value reads
+/// `$server_addr` (nginx calls it lazily, `ngx_connection_local_sockaddr`).
+fn server_addr_text(
+    listen: &PreparedListen,
+    stream: &TcpStream,
+) -> std::borrow::Cow<'static, [u8]> {
+    if !listen.addr_text.is_empty()
+        || !crate::config::SERVER_ADDR_USED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return std::borrow::Cow::Borrowed(listen.addr_text);
+    }
+    local_addr_text(stream)
+}
+
+#[cold]
+#[inline(never)]
+fn local_addr_text(stream: &TcpStream) -> std::borrow::Cow<'static, [u8]> {
+    match stream.local_addr() {
+        Ok(addr) => std::borrow::Cow::Owned(addr.ip().to_string().into_bytes()),
+        Err(_) => std::borrow::Cow::Borrowed(b""),
+    }
+}
+
 pub(crate) async fn handle_plain(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -1385,13 +1410,17 @@ pub(crate) async fn handle_plain(
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     _guard: ConnectionGuard,
 ) {
+    let conn = phase::ConnInfo {
+        server_addr: server_addr_text(&http.listens[listen_index], &stream),
+        proxy_protocol,
+    };
     handle(
         &mut stream,
         peer_addr,
         listen_index,
         None,
         None,
-        proxy_protocol.as_ref(),
+        &conn,
         http,
         state,
         connection_id,
@@ -1416,6 +1445,10 @@ pub(crate) async fn handle_tls(
     // (ngx_http_init_connection), so a PROXY header read shares it.
     let listen = &http.listens[listen_index];
     let budget = listen.servers[listen.default_server].timeouts.header;
+    let conn = phase::ConnInfo {
+        server_addr: server_addr_text(&http.listens[listen_index], &stream),
+        proxy_protocol,
+    };
     let (mut tls_stream, info) = match crate::tls::accept_with_timeout(
         &acceptor,
         stream,
@@ -1449,7 +1482,7 @@ pub(crate) async fn handle_tls(
         listen_index,
         sni.as_deref(),
         Some(&info),
-        proxy_protocol.as_ref(),
+        &conn,
         http,
         state,
         connection_id,
@@ -1466,7 +1499,7 @@ pub(crate) async fn handle<S: ConnIo>(
     listen_index: usize,
     sni: Option<&[u8]>,
     tls: Option<&crate::tls::HandshakeInfo>,
-    proxy_protocol: Option<&crate::proxy_protocol::ProxyHeader>,
+    conn: &phase::ConnInfo,
     http: &'static PreparedHttp,
     state: Arc<RuntimeState>,
     connection_id: u64,
@@ -1547,7 +1580,7 @@ pub(crate) async fn handle<S: ConnIo>(
                 connection_requests: request_count,
                 connection_start,
                 tls,
-                proxy_protocol,
+                conn,
             }
         };
     }
@@ -1774,7 +1807,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     body_len: $body_len,
                                     body_file: $body_file,
                                     tls,
-                                    proxy_protocol,
+                                    conn,
                                     refuse,
                                 }
                             };
@@ -2244,7 +2277,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 epoch_secs,
                                 epoch_ms,
                                 tls,
-                                proxy_protocol,
+                                conn,
                                 http,
                                 Some(&process_meta),
                                 final_uri(&process_meta, url_scratch),

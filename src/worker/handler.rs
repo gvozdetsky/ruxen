@@ -402,7 +402,7 @@ pub(crate) fn run_location_handler(
         upstream_states: req.upstream_states,
         sent_trailers: &[],
         tls: req.tls,
-        proxy_protocol: req.proxy_protocol,
+        conn: req.conn,
     };
 
     let server_bytes = loc.server_header;
