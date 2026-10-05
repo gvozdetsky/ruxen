@@ -125,7 +125,7 @@ pub(crate) async fn write_access_logs(
         // empty here, which mirrors nginx (where regex captures are
         // discarded after request termination).
         server_name_captures: &[],
-        rewrite_state: None,
+        rewrite_state: meta.and_then(|m| m.rewrite_state.as_deref()),
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.map_or(&[][..], |m| m.proxy_host),

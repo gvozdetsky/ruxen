@@ -257,6 +257,11 @@ pub struct ProcessMeta {
     /// The URI was refused before routing (`/../x`): logged with
     /// the server's access_log and an empty `$uri`, as nginx.
     pub invalid_uri: bool,
+    /// The request's `set` variables, for what renders after the handler:
+    /// a proxied response's `add_header` / `proxy_redirect` and the access
+    /// log (nginx's `r->variables` live as long as the request). `None`
+    /// when nothing was `set`, the common case.
+    pub rewrite_state: Option<Box<RewriteState>>,
 }
 
 impl Default for ProcessMeta {
@@ -282,8 +287,17 @@ impl Default for ProcessMeta {
             upstream_headers: Vec::new(),
             proxy_expires: crate::worker::PreparedExpires::Off,
             invalid_uri: false,
+            rewrite_state: None,
         }
     }
+}
+
+/// Keep the request's variables past the handler (see
+/// `ProcessMeta::rewrite_state`). Cold: most requests have none.
+#[cold]
+#[inline(never)]
+fn keep_rewrite_state(meta: &mut ProcessMeta, state: RewriteState) {
+    meta.rewrite_state = Some(Box::new(state));
 }
 
 /// Logging context for a request refused at the server level, before any
@@ -848,9 +862,17 @@ fn process_with_meta_inner(
                 meta.proxy_chunked_transfer_encoding = loc_chunked_te;
                 meta.proxy_expires = loc_expires;
                 meta.underscores_in_headers = server.underscores_in_headers;
+                if rewrite_state.has_user_vars() {
+                    keep_rewrite_state(&mut meta, rewrite_state);
+                }
                 return (Response::Proxy(plan), meta);
             }
-            other => return (other, meta),
+            other => {
+                if rewrite_state.has_user_vars() {
+                    keep_rewrite_state(&mut meta, rewrite_state);
+                }
+                return (other, meta);
+            }
         }
     }
     // Budget exhausted: nginx returns 500; we match.
