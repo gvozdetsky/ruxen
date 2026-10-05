@@ -1411,7 +1411,9 @@ pub fn build_response_bytes(status: u16, body: &[u8], server: &[u8]) -> Vec<u8> 
 /// reuse a per-connection scratch `Vec<u8>` across requests.
 pub fn write_response_bytes(out: &mut Vec<u8>, status: u16, body: &[u8], server: &[u8]) {
     write_head(out, status, body.len(), server);
-    out.extend_from_slice(body);
+    if status != 204 {
+        out.extend_from_slice(body);
+    }
 }
 
 /// Build a redirect response. Status is usually 301; body is a tiny HTML
@@ -1525,7 +1527,7 @@ pub fn write_response_bytes_with_content_type(
     server: &[u8],
 ) {
     write_head_with_content_type(out, status, body.len(), content_type, server);
-    if !matches!(method, Method::Head) {
+    if !matches!(method, Method::Head) && status != 204 {
         out.extend_from_slice(body);
     }
 }
@@ -1547,6 +1549,12 @@ fn write_head_with_content_type(
     out.push(b' ');
     out.extend_from_slice(reason.as_bytes());
     write_server_and_date(out, server);
+    // nginx's header filter sends a 204 header-only, without Content-Type
+    // and Content-Length (RFC 9110 §8.6: it MUST NOT have the latter).
+    if status == 204 {
+        out.extend_from_slice(b"\r\n\r\n");
+        return;
+    }
     out.extend_from_slice(b"\r\nContent-Type: ");
     out.extend_from_slice(content_type);
     out.extend_from_slice(b"\r\nContent-Length: ");

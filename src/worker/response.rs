@@ -651,15 +651,44 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
     }
 }
 
+///
+/// The 204 rule of nginx's header filter follows the status that goes
+/// out: a response turned into a 204 loses Content-Type, Content-Length,
+/// Last-Modified and its body, and a 204 (built header-only) turned into
+/// another status gets an empty `text/plain` body's headers back. A
+/// `return 204 "text"` under such an `error_page` loses the text (nginx
+/// would send it); the status override of a 204 is rare enough.
 pub(crate) fn rewrite_response_status(response: Vec<u8>, status: u16) -> Vec<u8> {
     let Some(line_end) = response.windows(2).position(|w| w == b"\r\n") else {
         return response;
     };
-    let mut out = Vec::with_capacity(response.len() + 16);
+    let old_status = response_status(&response);
+    let mut out = Vec::with_capacity(response.len() + 64);
     out.extend_from_slice(b"HTTP/1.1 ");
     write_u16_decimal(&mut out, status);
     out.push(b' ');
     out.extend_from_slice(status_reason(status).as_bytes());
+    if status == 204 && old_status != 204 {
+        let head_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(response.len(), |i| i + 4);
+        out.extend_from_slice(&response[line_end..head_end]);
+        for name in [&b"content-type"[..], b"content-length", b"last-modified"] {
+            out = strip_header_lines(out, name);
+        }
+        return out;
+    }
+    if old_status == 204 && response_header_value(&response, b"content-length").is_none() {
+        let head_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap_or(response.len());
+        out.extend_from_slice(&response[line_end..head_end]);
+        out.extend_from_slice(b"\r\nContent-Type: text/plain\r\nContent-Length: 0");
+        out.extend_from_slice(&response[head_end..]);
+        return out;
+    }
     out.extend_from_slice(&response[line_end..]);
     out
 }
