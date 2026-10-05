@@ -331,18 +331,15 @@ pub(crate) fn run_location_handler(
     server_name_captures: Option<&phase::ServerNameCaptures>,
 ) -> Response {
     // nginx's default client_max_body_size is 1m; `0` turns the check off.
+    // Not again on the way to an error page: nginx has discarded the body
+    // by then (`!r->discard_body` in ngx_http_core_find_config_phase).
     let body_limit = loc
         .client_max_body_size
         .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    if body_limit > 0 && req.body_len > body_limit {
-        let body = "413 Request Entity Too Large\n";
-        let response = if matches!(req.method, Method::Head) {
-            http::build_head_response(413, body.len(), loc.server_header)
-        } else {
-            http::build_response(413, body, loc.server_header)
-        };
-        return Response::Owned(response);
-    }
+    let too_large = body_limit > 0
+        && req.body_len > body_limit
+        && !in_error_page
+        && error_page_status.is_none();
 
     // Build the per-request variable-render context once; both the `return`
     // body and any `add_header` values share it.
@@ -405,6 +402,15 @@ pub(crate) fn run_location_handler(
     };
 
     let server_bytes = loc.server_header;
+    if too_large {
+        return entity_too_large(
+            &loc,
+            req,
+            &render_ctx_base,
+            in_error_page,
+            preserved_www_authenticate,
+        );
+    }
     // The plan carries everything `proxy::run_proxy` needs for async work.
     // The worker awaits it after `process_with_meta`, then applies the
     // location's proxy add_header/add_trailer state with `$upstream_*`
@@ -848,6 +854,49 @@ pub(crate) fn run_location_handler(
         &render_ctx_base,
         error_page_status,
         preserved_location,
+        preserved_www_authenticate,
+        loc.expires,
+    )
+}
+
+/// The 413 for a body over the location's `client_max_body_size`, sent as
+/// nginx's special response: the location's `error_page` and `add_header
+/// … always` apply (ngx_http_finalize_request(r, 413) from the find_config
+/// phase). Cold.
+#[cold]
+#[inline(never)]
+fn entity_too_large(
+    loc: &MatchedLocation<'static>,
+    req: &phase::RequestCtx<'_>,
+    render_ctx_base: &RenderCtx<'_>,
+    in_error_page: bool,
+    preserved_www_authenticate: &[Vec<u8>],
+) -> Response {
+    let body = "413 Request Entity Too Large\n";
+    let response = if matches!(req.method, Method::Head) {
+        http::build_head_response(413, body.len(), loc.server_header)
+    } else {
+        http::build_response(413, body, loc.server_header)
+    };
+    let intercepted = maybe_intercept_error_page(
+        Response::Owned(response),
+        loc.error_pages,
+        req,
+        render_ctx_base,
+        in_error_page,
+        loc.recursive_error_pages,
+        loc.server_header,
+    );
+    let trailers_allowed =
+        req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
+    finalize_location_response(
+        intercepted,
+        loc.add_headers,
+        loc.add_trailers,
+        trailers_allowed,
+        render_ctx_base,
+        None,
+        None,
         preserved_www_authenticate,
         loc.expires,
     )

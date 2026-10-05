@@ -1166,8 +1166,6 @@ pub struct PreparedHttp {
     pub forbidden: Prebuilt,
     pub bad_gateway: Prebuilt,
     pub gateway_timeout: Prebuilt,
-    /// 413 for a body over `max_request_body`, sent before reading it.
-    pub entity_too_large: Prebuilt,
     /// http-scope `upstream {}` blocks keyed by name. `proxy_pass http://NAME`
     /// resolves through this map at prepare time. M42 reads it on the hot
     /// path for round-robin selection.
