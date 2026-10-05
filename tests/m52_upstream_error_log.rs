@@ -10,11 +10,10 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use common::ports::DeadPort;
+use common::ports::{DeadPort, setup_lock};
 
 struct Server {
     child: Child,
@@ -30,17 +29,8 @@ impl Drop for Server {
     }
 }
 
-/// Held from picking a port (bind :0, then drop) until ruxen listens on
-/// it, and while a test binds its own backends: otherwise a parallel test
-/// can bind the port in between, and the readiness check (any listener
-/// accepting) passes against the wrong server.
-fn ports_lock() -> MutexGuard<'static, ()> {
-    static PORTS: Mutex<()> = Mutex::new(());
-    PORTS.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 fn start(tag: &str, server_body: &str) -> Server {
-    let _ports = ports_lock();
+    let _ports = setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -115,7 +105,7 @@ fn line_with<'a>(log: &'a str, needle: &str) -> &'a str {
 
 #[test]
 fn upstream_failures_are_logged_like_nginx() {
-    let ports = ports_lock();
+    let ports = setup_lock();
     let refused = DeadPort::new();
     let dead = DeadPort::new();
     let dead2 = DeadPort::new();
@@ -212,7 +202,7 @@ fn upstream_failures_are_logged_like_nginx() {
 #[test]
 fn configured_error_log_takes_upstream_errors() {
     let refused = {
-        let _ports = ports_lock();
+        let _ports = setup_lock();
         DeadPort::new()
     };
     let server = start(
@@ -235,7 +225,7 @@ fn configured_error_log_takes_upstream_errors() {
 /// http- and top-level lines were ignored.
 #[test]
 fn error_log_inherits_from_http_and_top_level() {
-    let ports = ports_lock();
+    let ports = setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()

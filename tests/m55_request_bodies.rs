@@ -7,6 +7,8 @@
 //! limit of the location the request is routed to is refused before the
 //! body is read, as nginx's find_config phase does.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -31,7 +33,10 @@ impl Drop for Server {
 /// Upstream that reads a Content-Length body and answers with its length
 /// and a checksum.
 fn spawn_echo_upstream() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -77,6 +82,7 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 fn start(conf_http: &str) -> Server {
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()

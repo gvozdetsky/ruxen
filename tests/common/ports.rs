@@ -5,6 +5,23 @@
 // answer on the address this test expected to be dead.
 
 use std::io;
+use std::sync::{Mutex, MutexGuard};
+
+/// Held from picking a port (bind :0, then drop) until the server under
+/// test listens on it, and while a test binds its own listeners or
+/// `DeadPort`s. Without it, a parallel test in the same binary can bind
+/// the port in between, and a readiness check that waits for "something
+/// accepts" passes against the wrong server. Not reentrant: take it once.
+pub fn setup_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A `DeadPort`, made under `setup_lock`.
+pub fn dead_port() -> DeadPort {
+    let _setup = setup_lock();
+    DeadPort::new()
+}
 
 /// A loopback TCP port that refuses connections for as long as this value
 /// is alive. The socket is bound but never `listen()`s, so `connect()` gets

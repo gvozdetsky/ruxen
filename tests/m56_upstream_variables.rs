@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use common::ports::DeadPort;
+use common::ports::{dead_port, setup_lock};
 
 struct Server {
     child: Child,
@@ -32,6 +32,7 @@ impl Drop for Server {
 }
 
 fn start(tag: &str, http_body: &str) -> Server {
+    let _setup = setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -68,7 +69,10 @@ const OK_REPLY: &[u8] =
 
 /// Backend: `/nf…` answers 404, anything else `OK_REPLY`.
 fn spawn_backend() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = {
+        let _setup = setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for mut s in listener.incoming().flatten() {
@@ -110,7 +114,7 @@ fn body(resp: &str) -> &str {
 
 #[test]
 fn attempts_are_listed_and_survive_intercept() {
-    let dead = DeadPort::new();
+    let dead = dead_port();
     let backend = spawn_backend();
     let server = start(
         "intercept",
@@ -137,7 +141,7 @@ fn attempts_are_listed_and_survive_intercept() {
 
 #[test]
 fn access_log_renders_upstream_and_map_variables() {
-    let dead = DeadPort::new();
+    let dead = dead_port();
     let backend = spawn_backend();
     let server = start(
         "log",
@@ -195,7 +199,7 @@ fn access_log_renders_upstream_and_map_variables() {
 /// `add_header ... always`, as in nginx. It used to be the built-in page.
 #[test]
 fn proxy_generated_errors_use_error_page_and_add_header_always() {
-    let dead = DeadPort::new();
+    let dead = dead_port();
     let server = start(
         "generated",
         &format!(
@@ -226,7 +230,7 @@ fn proxy_generated_errors_use_error_page_and_add_header_always() {
 /// `add_header` used to show the header time for the current try.
 #[test]
 fn response_time_is_a_dash_while_in_flight() {
-    let dead = DeadPort::new();
+    let dead = dead_port();
     let backend = spawn_backend();
     let server = start(
         "inflight",
