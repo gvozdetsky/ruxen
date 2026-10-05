@@ -31,9 +31,10 @@ fn free_ports<const N: usize>() -> [u16; N] {
     std::array::from_fn(|i| probes[i].local_addr().unwrap().port())
 }
 
-/// `front` proxies to an upstream of `a` and `b`. Both backends answer
-/// `/bad` with `bad_status` and everything else with their name.
-fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u16) {
+/// `front` proxies to an upstream of `a` and `b`, and has `/err` for
+/// error pages. The backends answer `/bad` with `a_bad` / `b_bad` and
+/// everything else with their name.
+fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u16, [u16; 2]) {
     let [front, a, b] = free_ports::<3>();
     let dir = std::env::temp_dir().join(format!("ruxen-m65-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -44,7 +45,8 @@ fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u1
             "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{\n\
              upstream u {{ server 127.0.0.1:{a}; server 127.0.0.1:{b}; }}\n\
              server {{ listen 127.0.0.1:{front};\n\
-               location / {{ proxy_pass http://u; {location_extra} }} }}\n\
+               location / {{ proxy_pass http://u; {location_extra} }}\n\
+               location /err {{ return 200 \"$upstream_addr\"; }} }}\n\
              server {{ listen 127.0.0.1:{a};\n\
                location / {{ return 200 A; }} location /bad {{ return {a_bad}; }} }}\n\
              server {{ listen 127.0.0.1:{b};\n\
@@ -67,7 +69,7 @@ fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u1
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(10));
     }
-    (Server { child, dir }, front)
+    (Server { child, dir }, front, [a, b])
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -97,21 +99,21 @@ fn assert_both_in_rotation(port: u16) {
 
 #[test]
 fn a_404_moves_on_without_failing_the_peer() {
-    let (_server, port) = start("404", "proxy_next_upstream http_404;", 404, 404);
+    let (_server, port, _) = start("404", "proxy_next_upstream http_404;", 404, 404);
     assert_eq!(get(port, "/bad").0, 404);
     assert_both_in_rotation(port);
 }
 
 #[test]
 fn a_403_moves_on_without_failing_the_peer() {
-    let (_server, port) = start("403", "proxy_next_upstream http_403;", 403, 403);
+    let (_server, port, _) = start("403", "proxy_next_upstream http_403;", 403, 403);
     assert_eq!(get(port, "/bad").0, 403);
     assert_both_in_rotation(port);
 }
 
 #[test]
 fn the_last_try_is_not_a_failure() {
-    let (_server, port) = start(
+    let (_server, port, _) = start(
         "last",
         "proxy_next_upstream http_500; proxy_next_upstream_tries 1;",
         500,
@@ -125,10 +127,31 @@ fn the_last_try_is_not_a_failure() {
 fn a_500_with_a_try_left_still_fails_the_peer() {
     // A answers /bad with 500, B with 200: whichever is tried first, A
     // ends up failed (max_fails=1), so the plain requests all go to B.
-    let (_server, port) = start("500", "proxy_next_upstream http_500;", 500, 200);
+    let (_server, port, _) = start("500", "proxy_next_upstream http_500;", 500, 200);
     for _ in 0..2 {
         assert_eq!(get(port, "/bad").0, 200);
     }
     let bodies: Vec<String> = (0..4).map(|_| get(port, "/ok").1).collect();
     assert!(bodies.iter().all(|b| b == "B"), "{bodies:?}");
+}
+
+/// When no try is left, a status in the mask is the answer like any other
+/// and goes through proxy_intercept_errors (nginx's test_next declines,
+/// then ngx_http_upstream_intercept_errors). It used to be passed through
+/// as-is, skipping the error_page.
+#[test]
+fn the_last_try_goes_through_intercept_errors() {
+    let (_server, port, [a, b]) = start(
+        "intercept",
+        "proxy_next_upstream http_404; proxy_intercept_errors on; error_page 404 /err;",
+        404,
+        404,
+    );
+    let (status, body) = get(port, "/bad");
+    assert_eq!(status, 404);
+    let mut tried: Vec<&str> = body.split(", ").collect();
+    tried.sort();
+    let mut want = [format!("127.0.0.1:{a}"), format!("127.0.0.1:{b}")];
+    want.sort();
+    assert_eq!(tried, want, "{body}");
 }
