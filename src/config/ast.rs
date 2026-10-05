@@ -1171,6 +1171,23 @@ pub enum ValuePart {
 /// resolve nor recognize becomes `Unknown` — nginx renders unknown vars
 /// as the empty string at runtime rather than failing the config, and
 /// test suites rely on that leniency.
+/// Which TLV a `$proxy_protocol_tlv_<name>` reads, resolved from the name
+/// when the configuration is parsed (nginx resolves it per request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyProtocolTlv {
+    /// `alpn`, `authority`, `unique_id`, `ssl`, `netns`, or `0xNN`. `None`:
+    /// a hex type over `0xff`, which no TLV has.
+    Type(Option<u8>),
+    /// `ssl_version`, `ssl_cn`, `ssl_cipher`, `ssl_sig_alg`, `ssl_key_alg`,
+    /// or `ssl_0xNN`: a sub-TLV of the SSL TLV.
+    Ssl(Option<u8>),
+    /// `ssl_verify`: the SSL TLV's 32-bit verify field.
+    SslVerify,
+    /// A name nginx doesn't know: always empty (nginx logs "unknown PROXY
+    /// protocol TLV" per request).
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Variable {
     /// Normalized request URI (no query string).
@@ -1356,6 +1373,9 @@ pub enum Variable {
     ProxyProtocolPort,
     ProxyProtocolServerAddr,
     ProxyProtocolServerPort,
+    /// `$proxy_protocol_tlv_<name>`: a TLV of the connection's PROXY
+    /// protocol v2 header.
+    ProxyProtocolTlv(ProxyProtocolTlv),
     /// `$server_protocol` — `HTTP/1.0` or `HTTP/1.1` from the request line.
     ServerProtocol,
     /// Unrecognized `$name`. Renders empty at runtime, matching nginx's

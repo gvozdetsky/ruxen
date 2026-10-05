@@ -17,10 +17,14 @@ use crate::worker::errno_text;
 /// The client's and the proxy's addresses as the header gives them.
 /// `None` for `PROXY UNKNOWN` and v2 `LOCAL` (health checks): the
 /// connection is used with its own addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyHeader {
     pub source: Option<SocketAddr>,
     pub destination: Option<SocketAddr>,
+    /// A v2 header's TLV block (after the addresses), kept raw and read
+    /// when a `$proxy_protocol_tlv_*` variable is rendered, as nginx's
+    /// `pp->tlvs`. Empty for v1 and for v2 without TLVs.
+    pub tlvs: Box<[u8]>,
 }
 
 /// The v2 signature.
@@ -74,6 +78,7 @@ fn parse_v1(buf: &[u8]) -> Parsed {
     let unknown = ProxyHeader {
         source: None,
         destination: None,
+        tlvs: Box::default(),
     };
     match fields.as_slice() {
         ["UNKNOWN", ..] => Parsed::Header(unknown, len),
@@ -96,6 +101,7 @@ fn parse_v1(buf: &[u8]) -> Parsed {
                     ProxyHeader {
                         source: Some(source),
                         destination: Some(destination),
+                        tlvs: Box::default(),
                     },
                     len,
                 ),
@@ -127,6 +133,7 @@ fn parse_v2(buf: &[u8]) -> Parsed {
     let unknown = ProxyHeader {
         source: None,
         destination: None,
+        tlvs: Box::default(),
     };
     match command {
         // LOCAL: the proxy's own connection (a health check).
@@ -142,6 +149,7 @@ fn parse_v2(buf: &[u8]) -> Parsed {
             ProxyHeader {
                 source: Some(SocketAddr::new(ip(&body[0..4]), port(&body[8..10]))),
                 destination: Some(SocketAddr::new(ip(&body[4..8]), port(&body[10..12]))),
+                tlvs: body[12..].into(),
             }
         }
         // AF_INET6: 16 + 16 + 2 + 2.
@@ -154,6 +162,7 @@ fn parse_v2(buf: &[u8]) -> Parsed {
             ProxyHeader {
                 source: Some(SocketAddr::new(ip(&body[0..16]), port(&body[32..34]))),
                 destination: Some(SocketAddr::new(ip(&body[16..32]), port(&body[34..36]))),
+                tlvs: body[36..].into(),
             }
         }
         // AF_UNSPEC / AF_UNIX: no usable addresses, as nginx.
@@ -170,6 +179,53 @@ fn timed_out() -> (ErrorLogLevel, String) {
         ErrorLogLevel::Info,
         "client timed out (110: Connection timed out)".into(),
     )
+}
+
+/// The value of TLV `ty` in `tlvs`, as nginx's
+/// ngx_proxy_protocol_lookup_tlv: entries are `type (1) | length (2, big
+/// endian) | value`. `None` when it isn't there, and when the block is
+/// broken (nginx logs "broken PROXY protocol TLV" and fails the variable):
+/// every length is checked, since this is the client's input.
+fn lookup_tlv(mut tlvs: &[u8], ty: u8) -> Option<&[u8]> {
+    while !tlvs.is_empty() {
+        let [t, hi, lo, rest @ ..] = tlvs else {
+            return None;
+        };
+        let len = u16::from_be_bytes([*hi, *lo]) as usize;
+        if rest.len() < len {
+            return None;
+        }
+        if *t == ty {
+            return Some(&rest[..len]);
+        }
+        tlvs = &rest[len..];
+    }
+    None
+}
+
+/// `$proxy_protocol_tlv_<name>` for this header, as nginx's
+/// ngx_proxy_protocol_get_tlv. `ssl_*` names read the SSL TLV (`0x20`):
+/// `client (1) | verify (4, big endian) | sub-TLVs`.
+pub fn write_tlv(tlvs: &[u8], name: &crate::config::ProxyProtocolTlv, out: &mut Vec<u8>) {
+    use crate::config::ProxyProtocolTlv as Tlv;
+    let value = match *name {
+        Tlv::Type(Some(ty)) => lookup_tlv(tlvs, ty),
+        Tlv::Ssl(Some(ty)) => lookup_tlv(tlvs, 0x20)
+            .filter(|ssl| ssl.len() >= 5)
+            .and_then(|ssl| lookup_tlv(&ssl[5..], ty)),
+        Tlv::SslVerify => {
+            if let Some(ssl) = lookup_tlv(tlvs, 0x20).filter(|ssl| ssl.len() >= 5) {
+                let verify = u32::from_be_bytes([ssl[1], ssl[2], ssl[3], ssl[4]]);
+                out.extend_from_slice(verify.to_string().as_bytes());
+            }
+            return;
+        }
+        // A type over 0xff, or a name nginx doesn't know: never there.
+        Tlv::Type(None) | Tlv::Ssl(None) | Tlv::Unknown => None,
+    };
+    if let Some(value) = value {
+        out.extend_from_slice(value);
+    }
 }
 
 /// `what: "<the bytes>"`, as nginx shows a header it refused: up to the
@@ -285,6 +341,7 @@ mod tests {
         ProxyHeader {
             source: Some(src.parse().unwrap()),
             destination: Some(dst.parse().unwrap()),
+            tlvs: Box::default(),
         }
     }
 
@@ -305,7 +362,8 @@ mod tests {
             Parsed::Header(
                 ProxyHeader {
                     source: None,
-                    destination: None
+                    destination: None,
+                    tlvs: Box::default()
                 },
                 15
             )
@@ -344,7 +402,8 @@ mod tests {
             Parsed::Header(
                 ProxyHeader {
                     source: None,
-                    destination: None
+                    destination: None,
+                    tlvs: Box::default()
                 },
                 19
             )
@@ -352,5 +411,71 @@ mod tests {
         let mut bad = V2_SIGNATURE.to_vec();
         bad.extend_from_slice(&[0x31, 0x11, 0, 0]);
         assert!(matches!(parse(&bad), Parsed::Invalid(_)));
+    }
+
+    fn tlv(ty: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![ty];
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn render(tlvs: &[u8], name: crate::config::ProxyProtocolTlv) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_tlv(tlvs, &name, &mut out);
+        out
+    }
+
+    #[test]
+    fn tlvs_by_type_and_inside_the_ssl_tlv() {
+        use crate::config::ProxyProtocolTlv as T;
+        // SSL TLV: client 0x01, verify 255, then a CN sub-TLV.
+        let mut ssl = vec![0x01, 0, 0, 0, 255];
+        ssl.extend(tlv(0x22, b"example.com"));
+        let tlvs = [tlv(0x01, b"ALPN1"), tlv(0x20, &ssl), tlv(0x05, b"id")].concat();
+        assert_eq!(render(&tlvs, T::Type(Some(0x01))), b"ALPN1");
+        assert_eq!(render(&tlvs, T::Type(Some(0x05))), b"id");
+        assert_eq!(render(&tlvs, T::Ssl(Some(0x22))), b"example.com");
+        assert_eq!(render(&tlvs, T::SslVerify), b"255");
+        assert_eq!(render(&tlvs, T::Type(Some(0x02))), b"");
+        assert_eq!(render(&tlvs, T::Ssl(Some(0x23))), b"");
+        assert_eq!(render(&tlvs, T::Type(None)), b"");
+        assert_eq!(render(&tlvs, T::Unknown), b"");
+        assert_eq!(render(&[], T::SslVerify), b"");
+    }
+
+    #[test]
+    fn broken_tlv_blocks_read_as_absent() {
+        use crate::config::ProxyProtocolTlv as T;
+        let good = tlv(0x01, b"ALPN1");
+        // Every truncation of a valid block: never a panic, never data
+        // from past the end.
+        for cut in 0..good.len() {
+            assert_eq!(render(&good[..cut], T::Type(Some(0x01))), b"", "{cut}");
+        }
+        // A length larger than what follows hides everything after it.
+        let lying = [vec![0x02, 0xff, 0xff, b'x'], tlv(0x01, b"A")].concat();
+        assert_eq!(render(&lying, T::Type(Some(0x01))), b"");
+        // An SSL TLV shorter than client + verify has no sub-TLVs.
+        let short_ssl = tlv(0x20, &[0x01, 0, 0]);
+        assert_eq!(render(&short_ssl, T::SslVerify), b"");
+        assert_eq!(render(&short_ssl, T::Ssl(Some(0x22))), b"");
+    }
+
+    #[test]
+    fn v2_keeps_the_tlv_block() {
+        let mut h = V2_SIGNATURE.to_vec();
+        let tlvs = tlv(0x01, b"h2");
+        h.extend_from_slice(&[0x21, 0x11]);
+        h.extend_from_slice(&((12 + tlvs.len()) as u16).to_be_bytes());
+        h.extend_from_slice(&[192, 0, 2, 1, 192, 0, 2, 2, 0xc7, 0x38, 0, 80]);
+        h.extend_from_slice(&tlvs);
+        match parse(&h) {
+            Parsed::Header(header, len) => {
+                assert_eq!(len, h.len());
+                assert_eq!(&*header.tlvs, &tlvs[..]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
