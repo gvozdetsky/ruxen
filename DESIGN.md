@@ -388,10 +388,11 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   no-poll build): a keep-alive request now takes a readiness wait plus
   a read instead of one read, as plain TCP already does. A single read
   raced against the deadline would avoid that for both.
-- **Handshake timeout is hardcoded to 60s.** nginx 1.24 has no
-  separate handshake timeout: the handshake runs under the default
-  server's `client_header_timeout` (#120). `ssl_handshake_timeout`
-  (nginx 1.25.3+) is an unknown directive here.
+- **The handshake runs under `client_header_timeout`.** As in nginx
+  1.24, which has no separate handshake timeout: the default server's
+  `client_header_timeout` (60 s unless set) is armed at accept, and a
+  PROXY protocol header read on the same listen shares it.
+  `ssl_handshake_timeout` (nginx 1.25.3+) is an unknown directive here.
 - **Session resumption follows nginx's defaults.** `ssl_session_cache`
   is off unless configured; when on, it is one in-memory
   `ServerSessionMemoryCache` (4096 entries) shared by all workers, with
