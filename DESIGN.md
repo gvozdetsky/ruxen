@@ -353,12 +353,14 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   doesn't match its certificate, as `nginx -t` does.
   Listens with no `ssl;` get `tls: None` and pay one `Option::is_some`
   on the accept path.
-- **SNI resolver mirrors the HTTP `match_server` ladder.** Exact match
-  beats leading-wildcard (`*.example.com` registered under suffix
-  `example.com`), wildcard-tail / regex `server_name` forms don't
-  participate in TLS-layer dispatch (rustls only sees the host, not the
-  Host header) and instead fall through to the listen's default
-  certificate. Multi-cert per server (RSA + ECDSA both registered under
+- **SNI resolver mirrors the HTTP `match_server` ladder**, as nginx's
+  `ngx_http_ssl_servername` uses the same lookup as `Host`: exact, then
+  leading wildcard (`*.example.com` registered under suffix
+  `example.com`), then the longest trailing wildcard (`www.example.*`),
+  then `~regex` names in declaration order (compiled a second time for
+  the resolver at startup; they run only for SNI names that miss the
+  tables before them). A name that matches nothing gets the listen's
+  default certificate. Multi-cert per server (RSA + ECDSA both registered under
   one name) is supported by storing `Vec<Arc<CertifiedKey>>` per slot
   and selecting via `SigningKey::choose_scheme` against the
   `ClientHello`'s announced signature schemes — first match wins, falls
