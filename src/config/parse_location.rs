@@ -340,23 +340,7 @@ pub(crate) fn parse_location_block(
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
-    let mut proxy_set_headers: Option<Vec<ProxySetHeader>> = None;
-    let mut proxy_pass_request_headers: Option<bool> = None;
-    let mut proxy_pass_request_body: Option<bool> = None;
-    let mut proxy_set_body: Option<Vec<ValuePart>> = None;
-    let mut proxy_ignore_headers: Option<Vec<String>> = None;
-    let mut proxy_connect_timeout_ms: Option<u64> = None;
-    let mut proxy_read_timeout_ms: Option<u64> = None;
-    let mut proxy_send_timeout_ms: Option<u64> = None;
-    let mut proxy_limit_rate: Option<u64> = None;
-    let mut proxy_http_version: Option<u8> = None;
-    let mut proxy_next_upstream: Option<ProxyNextUpstream> = None;
-    let mut proxy_next_upstream_tries: Option<u32> = None;
-    let mut proxy_next_upstream_timeout_ms: Option<u64> = None;
-    let mut proxy_intercept_errors: Option<bool> = None;
-    let mut proxy_redirect: Option<ProxyRedirect> = None;
-    let mut proxy_hide_headers: Option<Vec<String>> = None;
-    let mut proxy_pass_headers: Option<Vec<String>> = None;
+    let mut proxy = ProxyConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
@@ -468,23 +452,7 @@ pub(crate) fn parse_location_block(
                         client_body_in_file_only,
                         post_action: effective_post_action,
                         expires: effective_expires,
-                        proxy_set_headers,
-                        proxy_pass_request_headers,
-                        proxy_pass_request_body,
-                        proxy_set_body,
-                        proxy_ignore_headers,
-                        proxy_connect_timeout_ms,
-                        proxy_read_timeout_ms,
-                        proxy_send_timeout_ms,
-                        proxy_limit_rate,
-                        proxy_http_version,
-                        proxy_next_upstream,
-                        proxy_next_upstream_tries,
-                        proxy_next_upstream_timeout_ms,
-                        proxy_intercept_errors,
-                        proxy_redirect: proxy_redirect.clone(),
-                        proxy_hide_headers: proxy_hide_headers.clone(),
-                        proxy_pass_headers: proxy_pass_headers.clone(),
+                        proxy,
                         chunked_transfer_encoding,
                         alias_prefix_override,
                     });
@@ -728,134 +696,7 @@ pub(crate) fn parse_location_block(
                 }
                 proxy_pass = Some(parse_proxy_pass_arg(&args[1..])?);
             }
-            ("proxy_set_header", Terminator::Semi) => {
-                let entry = parse_proxy_set_header_args(&args[1..])?;
-                proxy_set_headers.get_or_insert_with(Vec::new).push(entry);
-            }
-            ("proxy_pass_request_headers", Terminator::Semi) => {
-                if proxy_pass_request_headers.is_some() {
-                    return Err(Error::Duplicate("proxy_pass_request_headers"));
-                }
-                proxy_pass_request_headers =
-                    Some(parse_on_off_args(&args[1..], "proxy_pass_request_headers")?);
-            }
-            ("proxy_ignore_headers", Terminator::Semi) => {
-                if proxy_ignore_headers.is_some() {
-                    return Err(Error::Duplicate("proxy_ignore_headers"));
-                }
-                proxy_ignore_headers = Some(parse_proxy_ignore_headers(&args[1..])?);
-            }
-            ("proxy_set_body", Terminator::Semi) => {
-                if proxy_set_body.is_some() {
-                    return Err(Error::Duplicate("proxy_set_body"));
-                }
-                if args.len() != 2 {
-                    return Err(Error::BadValue {
-                        what: "proxy_set_body",
-                        got: args[1..].join(" "),
-                    });
-                }
-                proxy_set_body = Some(parse_value_with_vars(&args[1])?);
-            }
-            ("proxy_pass_request_body", Terminator::Semi) => {
-                if proxy_pass_request_body.is_some() {
-                    return Err(Error::Duplicate("proxy_pass_request_body"));
-                }
-                proxy_pass_request_body =
-                    Some(parse_on_off_args(&args[1..], "proxy_pass_request_body")?);
-            }
-            ("proxy_connect_timeout", Terminator::Semi) => {
-                if proxy_connect_timeout_ms.is_some() {
-                    return Err(Error::Duplicate("proxy_connect_timeout"));
-                }
-                proxy_connect_timeout_ms = Some(parse_proxy_timeout_args(
-                    &args[1..],
-                    "proxy_connect_timeout",
-                )?);
-            }
-            ("proxy_read_timeout", Terminator::Semi) => {
-                if proxy_read_timeout_ms.is_some() {
-                    return Err(Error::Duplicate("proxy_read_timeout"));
-                }
-                proxy_read_timeout_ms =
-                    Some(parse_proxy_timeout_args(&args[1..], "proxy_read_timeout")?);
-            }
-            ("proxy_send_timeout", Terminator::Semi) => {
-                if proxy_send_timeout_ms.is_some() {
-                    return Err(Error::Duplicate("proxy_send_timeout"));
-                }
-                proxy_send_timeout_ms =
-                    Some(parse_proxy_timeout_args(&args[1..], "proxy_send_timeout")?);
-            }
-            ("proxy_limit_rate", Terminator::Semi) => {
-                if proxy_limit_rate.is_some() {
-                    return Err(Error::Duplicate("proxy_limit_rate"));
-                }
-                let v = args.get(1).ok_or(Error::MissingArg("proxy_limit_rate"))?;
-                proxy_limit_rate = Some(crate::config::parse_server::parse_size_bytes(v).ok_or(
-                    Error::BadValue {
-                        what: "proxy_limit_rate",
-                        got: v.clone(),
-                    },
-                )?);
-            }
-            ("proxy_http_version", Terminator::Semi) => {
-                if proxy_http_version.is_some() {
-                    return Err(Error::Duplicate("proxy_http_version"));
-                }
-                proxy_http_version = Some(parse_proxy_http_version_args(&args[1..])?);
-            }
-            ("proxy_next_upstream", Terminator::Semi) => {
-                if proxy_next_upstream.is_some() {
-                    return Err(Error::Duplicate("proxy_next_upstream"));
-                }
-                proxy_next_upstream = Some(parse_proxy_next_upstream_args(&args[1..])?);
-            }
-            ("proxy_next_upstream_tries", Terminator::Semi) => {
-                if proxy_next_upstream_tries.is_some() {
-                    return Err(Error::Duplicate("proxy_next_upstream_tries"));
-                }
-                let v = args
-                    .get(1)
-                    .ok_or(Error::MissingArg("proxy_next_upstream_tries"))?;
-                proxy_next_upstream_tries =
-                    Some(v.parse::<u32>().map_err(|_| Error::BadValue {
-                        what: "proxy_next_upstream_tries",
-                        got: v.clone(),
-                    })?);
-            }
-            ("proxy_next_upstream_timeout", Terminator::Semi) => {
-                if proxy_next_upstream_timeout_ms.is_some() {
-                    return Err(Error::Duplicate("proxy_next_upstream_timeout"));
-                }
-                let v = args
-                    .get(1)
-                    .ok_or(Error::MissingArg("proxy_next_upstream_timeout"))?;
-                proxy_next_upstream_timeout_ms =
-                    Some(parse_duration_ms(v, "proxy_next_upstream_timeout")?);
-            }
-            ("proxy_redirect", Terminator::Semi) => {
-                parse_proxy_redirect(&args, &mut proxy_redirect)?;
-            }
-            ("proxy_hide_header", Terminator::Semi) => {
-                let name = args.get(1).ok_or(Error::MissingArg("proxy_hide_header"))?;
-                proxy_hide_headers
-                    .get_or_insert_with(Vec::new)
-                    .push(name.clone());
-            }
-            ("proxy_pass_header", Terminator::Semi) => {
-                let name = args.get(1).ok_or(Error::MissingArg("proxy_pass_header"))?;
-                proxy_pass_headers
-                    .get_or_insert_with(Vec::new)
-                    .push(name.clone());
-            }
-            ("proxy_intercept_errors", Terminator::Semi) => {
-                if proxy_intercept_errors.is_some() {
-                    return Err(Error::Duplicate("proxy_intercept_errors"));
-                }
-                proxy_intercept_errors =
-                    Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
-            }
+            (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
             ("limit_rate", Terminator::Semi) => {
                 if limit_rate.is_some() {
                     return Err(Error::Duplicate("limit_rate"));

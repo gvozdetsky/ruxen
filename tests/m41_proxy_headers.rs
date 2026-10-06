@@ -428,3 +428,37 @@ http {{
         String::from_utf8_lossy(&captured)
     );
 }
+
+#[test]
+fn m41_http_level_proxy_settings_reach_every_location() {
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
+    // `proxy_http_version` after the server block still applies to it, and
+    // a level with its own `proxy_set_header` replaces the inherited list.
+    let conf = format!(
+        r#"
+http {{
+    proxy_set_header X-Level http;
+    server {{
+        listen %%PORT%%;
+        location /a {{ proxy_pass http://127.0.0.1:{port}; }}
+        location /b {{ proxy_pass http://127.0.0.1:{port}; proxy_set_header X-Level location; }}
+    }}
+    proxy_http_version 1.1;
+}}
+"#,
+        port = backend.addr.port()
+    );
+    let (_guard, port) = spawn_ruxen(&conf);
+    for (path, level) in [("/a", "http"), ("/b", "location")] {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: c\r\nConnection: close\r\n\r\n");
+        let resp = http_send(port, req.as_bytes());
+        assert!(resp.starts_with(b"HTTP/1.1 200"), "{path}");
+        let seen = backend.last_request().unwrap();
+        let text = String::from_utf8_lossy(&seen);
+        assert!(
+            text.starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+            "{text}"
+        );
+        assert_eq!(header_value(&seen, "X-Level"), Some(level), "{text}");
+    }
+}
