@@ -303,14 +303,14 @@ fn host_context_is_the_header_as_sent() {
     });
     let resp = request(
         port,
-        b"GET /x HTTP/1.1\r\nHost: example.test:18160\r\nConnection: close\r\n\r\n",
+        b"GET /x HTTP/1.1\r\nHost: Example.TEST:18160\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
     sleep(Duration::from_millis(50));
     let log = std::fs::read_to_string(guard.tempdir.join("e.log")).unwrap_or_default();
     assert!(
         log.lines()
-            .any(|l| l.contains("/x\" failed") && l.ends_with(", host: \"example.test:18160\"")),
+            .any(|l| l.contains("/x\" failed") && l.ends_with(", host: \"Example.TEST:18160\"")),
         "{log}"
     );
 }
