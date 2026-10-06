@@ -202,6 +202,10 @@ pub(crate) fn finalize_location_response(
             // worker to wrap the body in chunked encoding on the way out;
             // the static-file path doesn't support that today. Quietly skip
             // — the directive is rare on static content anyway.
+            if status == 204 {
+                // `error_page … =204`: header-only, the file isn't sent.
+                return Response::Owned(out);
+            }
             Response::File { headers: out, body }
         }
     }

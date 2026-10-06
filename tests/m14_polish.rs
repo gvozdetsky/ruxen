@@ -555,3 +555,64 @@ http {
     assert_eq!(header_value(&r, "X-S"), Some("s"));
     assert_ne!(body(&r), b"e");
 }
+
+#[test]
+fn no_content_is_header_only() {
+    // nginx's header filter sends a 204 without Content-Type and
+    // Content-Length, and without a body, whatever `return` gave it
+    // (checked against nginx 1.24). ruxen sent `Content-Type: text/plain`
+    // and `Content-Length: 0`, and the text of `return 204 "text"`.
+    let conf = r#"
+events { }
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    root %%TESTDIR%%;
+    location /plain { return 204; }
+    location /text { return 204 "text"; }
+    location /var { return 204 "u=$uri"; }
+    location /typed { add_header Content-Type text/blah; return 204; }
+    location /to405 { error_page 405 /plain; return 405; }
+    location /to204 { error_page 404 =204 /text200; return 404; }
+    location /text200 { return 200 "text"; }
+    location /file204 { error_page 404 =204 /f.txt; return 404; }
+  }
+}
+"#;
+    let (g, port) = spawn_server(conf);
+    std::fs::write(g.tempdir.join("f.txt"), "file").unwrap();
+    for path in ["/plain", "/text", "/var", "/typed"] {
+        let r = http_get(port, path);
+        assert!(status_line(&r).starts_with("HTTP/1.1 204"), "{path}");
+        assert_eq!(header_value(&r, "Content-Length"), None, "{path}");
+        assert_eq!(body(&r), b"", "{path}");
+    }
+    assert_eq!(header_value(&http_get(port, "/text"), "Content-Type"), None);
+    assert_eq!(
+        header_value(&http_get(port, "/typed"), "Content-Type"),
+        Some("text/blah")
+    );
+
+    // The rule follows the status that goes out: a 204 kept as a 405 by
+    // `error_page` has a (zero) length again, and a response turned into
+    // a 204 by `error_page … =204` loses its type, length and body.
+    let r = http_get(port, "/to405");
+    assert!(status_line(&r).starts_with("HTTP/1.1 405"));
+    assert_eq!(header_value(&r, "Content-Length"), Some("0"));
+    assert_eq!(header_value(&r, "Content-Type"), Some("text/plain"));
+    for path in ["/to204", "/file204"] {
+        let r = http_get(port, path);
+        assert!(status_line(&r).starts_with("HTTP/1.1 204"), "{path}");
+        assert_eq!(header_value(&r, "Content-Length"), None, "{path}");
+        assert_eq!(header_value(&r, "Content-Type"), None, "{path}");
+        assert_eq!(body(&r), b"", "{path}");
+    }
+
+    // Still framed: the next response on the connection follows at once.
+    let r = send_request(
+        port,
+        b"GET /var HTTP/1.1\r\nHost: x\r\n\r\nGET /plain HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    let text = String::from_utf8_lossy(&r);
+    assert_eq!(text.matches("HTTP/1.1 204").count(), 2, "{text}");
+}
