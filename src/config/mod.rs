@@ -260,6 +260,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ignore_invalid_headers: Option<bool> = None;
     let mut underscores_in_headers: Option<bool> = None;
     let mut upstreams: Vec<UpstreamBlock> = Vec::new();
+    // Server-level defaults set at http scope: servers without their own
+    // inherit them once the block is closed (see `BlockClose`).
+    let mut index: Option<Vec<IndexEntry>> = None;
+    let mut error_pages: Option<Vec<ErrorPage>> = None;
+    let mut recursive_error_pages: Option<bool> = None;
+    let mut merge_slashes: Option<bool> = None;
     // http-scope SSL defaults inherited by `server {}` blocks unless
     // they define their own cert/key pair.
     let mut ssl_certs: Vec<PathBuf> = Vec::new();
@@ -279,6 +285,17 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     // below a server still applies to it, as in nginx.
                     for server in &mut servers {
                         server.proxy = std::mem::take(&mut server.proxy).inherit(&proxy);
+                        if server.index.is_none() {
+                            server.index.clone_from(&index);
+                        }
+                        // A level with any error_page replaces the inherited
+                        // list (ngx_http_core_merge_loc_conf).
+                        if server.error_pages.is_none() {
+                            server.error_pages.clone_from(&error_pages);
+                        }
+                        server.recursive_error_pages =
+                            server.recursive_error_pages.or(recursive_error_pages);
+                        server.merge_slashes = server.merge_slashes.or(merge_slashes);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -352,14 +369,36 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 });
             }
             ("merge_slashes", Terminator::Semi) => {
-                // Accepted at http scope so configs that set it once outside
-                // the server block still parse. Inheritance: we don't plumb
-                // an http-level merge-slashes into every server, so this is
-                // effectively a no-op today — server-level `merge_slashes`
-                // is what actually flips the normalizer. Documenting that
-                // here so a future pass can wire inheritance if a test
-                // needs it.
-                let _ = args.get(1).ok_or(Error::MissingArg("merge_slashes"))?;
+                let raw = args.get(1).ok_or(Error::MissingArg("merge_slashes"))?;
+                merge_slashes = match raw.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "merge_slashes",
+                            got: raw.clone(),
+                        });
+                    }
+                };
+            }
+            ("index", Terminator::Semi) => {
+                if args.len() < 2 {
+                    return Err(Error::MissingArg("index"));
+                }
+                index
+                    .get_or_insert_with(Vec::new)
+                    .extend(parse_index_entries(&args[1..])?);
+            }
+            ("error_page", Terminator::Semi) => {
+                let entries = parse_error_page_args(&args[1..])?;
+                error_pages.get_or_insert_with(Vec::new).extend(entries);
+            }
+            ("recursive_error_pages", Terminator::Semi) => {
+                if recursive_error_pages.is_some() {
+                    return Err(Error::Duplicate("recursive_error_pages"));
+                }
+                recursive_error_pages =
+                    Some(parse_on_off_args(&args[1..], "recursive_error_pages")?);
             }
             ("log_format", Terminator::Semi) => {
                 log_formats.push(parse_log_format_args(&args[1..])?);
@@ -1789,6 +1828,66 @@ mod tests {
         }
         parse(&tls("ssl_reject_handshake off;")).unwrap();
         parse(&tls("ssl_client_certificate ca.pem;")).unwrap();
+    }
+
+    #[test]
+    fn server_defaults_at_http_scope_are_inherited() {
+        // index, error_page, recursive_error_pages and merge_slashes at http
+        // level apply to servers without their own, even when they come
+        // after the server block (nginx merges after parsing).
+        let cfg = parse(
+            r#"
+            http {
+                index a.html;
+                index b.html;
+                error_page 404 /404.html;
+                error_page 500 502 /50x.html;
+                server { listen 80; }
+                server {
+                    listen 81;
+                    index own.html;
+                    error_page 403 /403.html;
+                    recursive_error_pages off;
+                    merge_slashes on;
+                }
+                recursive_error_pages on;
+                merge_slashes off;
+            }
+            "#,
+        )
+        .unwrap();
+        let (inherits, own) = (&cfg.servers[0], &cfg.servers[1]);
+        assert_eq!(inherits.index.as_ref().map(Vec::len), Some(2));
+        let statuses =
+            |s: &Server| -> Vec<u16> { s.error_pages.iter().flatten().map(|e| e.status).collect() };
+        assert_eq!(statuses(inherits), [404, 500, 502]);
+        assert_eq!(inherits.recursive_error_pages, Some(true));
+        assert_eq!(inherits.merge_slashes, Some(false));
+        // A level with its own list replaces the inherited one.
+        assert_eq!(own.index.as_ref().map(Vec::len), Some(1));
+        assert_eq!(statuses(own), [403]);
+        assert_eq!(own.recursive_error_pages, Some(false));
+        assert_eq!(own.merge_slashes, Some(true));
+        // Unset everywhere: nginx's defaults are applied at prepare time.
+        let cfg = parse("http { server { listen 80; } }").unwrap();
+        assert_eq!(cfg.servers[0].index, None);
+        assert_eq!(cfg.servers[0].merge_slashes, None);
+    }
+
+    #[test]
+    fn repeated_index_directives_append() {
+        let cfg = parse(
+            "http { server { listen 80; index a.html; index b.html c.html; \
+             location / { index x.html; index y.html; } } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers[0].index.as_ref().map(Vec::len), Some(3));
+        assert_eq!(
+            cfg.servers[0].locations[0].index.as_ref().map(Vec::len),
+            Some(2)
+        );
+        assert!(parse("http { index; server { listen 80; } }").is_err());
+        assert!(parse("http { merge_slashes maybe; server { listen 80; } }").is_err());
     }
 
     #[test]

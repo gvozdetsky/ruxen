@@ -886,7 +886,7 @@ pub(crate) fn prepare_server(
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedServer, String> {
     let listen_port = server.listen.addr.port();
-    let merge_slashes = server.merge_slashes;
+    let merge_slashes = server.merge_slashes.unwrap_or(true);
     let server_ignore_invalid_headers = server
         .ignore_invalid_headers
         .unwrap_or(http_ignore_invalid_headers);
