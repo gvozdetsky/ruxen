@@ -50,6 +50,10 @@ The most valuable single step is running ruxen in front of something real, start
 
 A written compatibility statement (what is supported, and where ruxen deliberately differs), stability guarantees for that surface, an external security review, and HTTP/3. Extensions in the form of WASM filters, which nginx can't offer, are a possible differentiator here.
 
+## Releases
+
+Minor versions (v0.2.0, v0.3.0) are the milestones above, and the plan is made there. Patch releases in between (v0.1.x, v0.2.x) have no milestone and no scope of their own: each is a snapshot of `main`, cut when there is a reason, such as a security fix, a regression, or enough user-visible change. `main` stays releasable because a feature reaches the directive allowlist and `-V` only together with its implementation.
+
 ## How progress is measured
 
 Each release reports these four numbers:
