@@ -101,7 +101,7 @@ pub(crate) fn parse_server_block(
                         ssl_keys = inherited_ssl_keys.to_vec();
                     }
                     if listens.is_empty() {
-                        return Err(Error::MissingArg("listen"));
+                        listens.push(Listen::from_addr(default_listen_addr()));
                     }
                     // Whether this server's certificates are required, and
                     // whether its ssl_* lines take effect, depends on the
@@ -139,7 +139,9 @@ pub(crate) fn parse_server_block(
                     let katm = keepalive_time_ms.or(inherited_keepalive_time_ms);
                     let kad = keepalive_disable.or(inherited_keepalive_disable);
                     let mut listens_iter = listens.into_iter();
-                    let first_listen = listens_iter.next().expect("non-empty checked above");
+                    let first_listen = listens_iter
+                        .next()
+                        .expect("a default listen is added above");
                     let mut out: Vec<Server> = Vec::new();
                     out.push(Server {
                         listen: first_listen,
@@ -1226,6 +1228,18 @@ pub(crate) fn parse_proxy_redirect(
         Some(ProxyRedirect::Off) => return Err(Error::Duplicate("proxy_redirect")),
     }
     Ok(())
+}
+
+/// Where a `server` without `listen` listens: `*:80`, or `*:8000` when not
+/// run by root (`ngx_http_core_server`, which checks the real uid).
+fn default_listen_addr() -> SocketAddr {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let port = if unsafe { libc::getuid() } == 0 {
+        80
+    } else {
+        8000
+    };
+    SocketAddr::from(([0, 0, 0, 0], port))
 }
 
 /// A time value of an msec directive (`ngx_conf_set_msec_slot`), in
