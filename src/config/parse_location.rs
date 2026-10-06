@@ -302,6 +302,7 @@ pub(crate) fn parse_location_block(
     inherited_post_action: Option<String>,
     inherited_expires: Option<ExpiresDirective>,
     inherited_sendfile: Option<bool>,
+    inherited_client_body_temp_path: Option<TempPath>,
     sink: &mut Vec<Location>,
 ) -> Result<(), Error> {
     let mut ret: Option<(u16, Vec<ValuePart>)> = None;
@@ -365,6 +366,7 @@ pub(crate) fn parse_location_block(
     let mut proxy_pass_headers: Option<Vec<String>> = None;
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
+    let mut client_body_temp_path: Option<TempPath> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     // Children parsed inside this block — appended to `sink` after the
@@ -425,6 +427,9 @@ pub(crate) fn parse_location_block(
                     let effective_post_action = post_action.or(inherited_post_action);
                     let effective_expires = expires.or(inherited_expires);
                     let effective_sendfile = sendfile.or(inherited_sendfile);
+                    let effective_client_body_temp_path = client_body_temp_path
+                        .clone()
+                        .or_else(|| inherited_client_body_temp_path.clone());
                     sink.push(Location {
                         mode: spec.mode,
                         pattern: spec.pattern,
@@ -455,6 +460,7 @@ pub(crate) fn parse_location_block(
                         auth_delay_ms: effective_auth_delay_ms,
                         client_max_body_size: effective_client_max_body_size,
                         sendfile: effective_sendfile,
+                        client_body_temp_path: effective_client_body_temp_path,
                         limit_rate: limit_rate.clone(),
                         limit_rate_after: limit_rate_after.clone(),
                         client_body_in_file_only,
@@ -860,6 +866,12 @@ pub(crate) fn parse_location_block(
                 }
                 limit_rate_after = Some(parse_size_value(&args[1..], "limit_rate_after")?);
             }
+            ("client_body_temp_path", Terminator::Semi) => {
+                if client_body_temp_path.is_some() {
+                    return Err(Error::Duplicate("client_body_temp_path"));
+                }
+                client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
+            }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
                     return Err(Error::Duplicate("sendfile"));
@@ -895,6 +907,9 @@ pub(crate) fn parse_location_block(
                 let pass_post_action = post_action.clone().or(inherited_post_action.clone());
                 let pass_expires = expires.clone().or(inherited_expires.clone());
                 let pass_sendfile = sendfile.or(inherited_sendfile);
+                let pass_client_body_temp_path = client_body_temp_path
+                    .clone()
+                    .or_else(|| inherited_client_body_temp_path.clone());
                 // Cascade alias info to nested children (mirrors nginx's
                 // `merge_loc_conf` for the core module's path bits): a
                 // local `alias` here propagates as Alias-with-this-pattern;
@@ -929,6 +944,7 @@ pub(crate) fn parse_location_block(
                     pass_post_action,
                     pass_expires,
                     pass_sendfile,
+                    pass_client_body_temp_path,
                     &mut children,
                 )?;
             }
@@ -962,6 +978,7 @@ pub(crate) fn parse_location_block(
                 | "auth_basic_user_file"
                 | "auth_delay"
                 | "client_max_body_size"
+                | "client_body_temp_path"
                 | "client_body_in_file_only"
                 | "post_action"
                 | "expires"

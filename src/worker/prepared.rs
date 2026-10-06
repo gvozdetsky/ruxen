@@ -838,6 +838,9 @@ pub struct PreparedLocation {
     /// the spilled body file after the request; `Clean` and `Off` unlink
     /// at end-of-request.
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    /// The location's or its server's own `client_body_temp_path`; `None`
+    /// uses `PreparedHttp::body_temp`.
+    pub body_temp: Option<&'static BodyTempDir>,
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
@@ -882,6 +885,7 @@ pub struct PreparedRegexLocation {
     pub auth_delay_ms: u64,
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    pub body_temp: Option<&'static BodyTempDir>,
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
@@ -915,6 +919,7 @@ pub struct MatchedLocation<'a> {
     pub auth_delay_ms: u64,
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
+    pub body_temp: Option<&'static BodyTempDir>,
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
@@ -945,6 +950,7 @@ impl<'a> MatchedLocation<'a> {
             auth_delay_ms: loc.auth_delay_ms,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
+            body_temp: loc.body_temp,
             sendfile: loc.sendfile,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
@@ -979,6 +985,7 @@ impl<'a> MatchedLocation<'a> {
             auth_delay_ms: loc.auth_delay_ms,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
+            body_temp: loc.body_temp,
             sendfile: loc.sendfile,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,

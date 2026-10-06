@@ -224,8 +224,8 @@ static REQUEST_BODY_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// made on first use: ruxen has no build-time prefix for nginx's default
 /// `<prefix>/client_body_temp`.
 pub(crate) struct BodyTempDir {
-    /// `client_body_temp_path` (http scope), relative to the prefix.
-    configured: Option<&'static Path>,
+    /// `client_body_temp_path`, relative to the prefix, and its levels.
+    configured: Option<(&'static Path, [u8; 3])>,
     /// The private directory, made on first use and again if it went
     /// away (a temp-directory cleaner): a new one, never the old name,
     /// which someone else could have taken by then.
@@ -233,18 +233,43 @@ pub(crate) struct BodyTempDir {
 }
 
 impl BodyTempDir {
-    pub(crate) fn new(configured: Option<&'static Path>) -> Self {
+    pub(crate) fn new(configured: Option<crate::config::TempPath>) -> Self {
         BodyTempDir {
-            configured,
+            configured: configured.map(|t| (prepare::leak_path_buf(t.path), t.levels)),
             private: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The directory of a server's or location's own
+    /// `client_body_temp_path`.
+    pub(crate) fn leak(configured: crate::config::TempPath) -> &'static BodyTempDir {
+        Box::leak(Box::new(BodyTempDir::new(Some(configured))))
+    }
+
+    /// Where a file named `name` goes: nginx's ngx_create_hashed_filename.
+    /// Each level is named by the digits of the name before the previous
+    /// level's: `1 2` puts `0000000123` in `3/12/`.
+    fn file_path(&self, dir: &Path, name: &str) -> std::path::PathBuf {
+        let mut path = dir.to_path_buf();
+        let mut end = name.len();
+        let levels = self.configured.map_or([0; 3], |c| c.1);
+        for level in levels {
+            let level = usize::from(level);
+            if level == 0 {
+                break;
+            }
+            path.push(&name[end - level..end]);
+            end -= level;
+        }
+        path.push(name);
+        path
     }
 
     /// The directory to create a file in. `gone`: the last one was
     /// missing, so the private directory is made anew.
     fn dir(&self, gone: bool) -> Option<std::path::PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
-        if let Some(dir) = self.configured {
+        if let Some((dir, _)) = self.configured {
             // nginx's ngx_create_paths: one level, 0700; an existing
             // directory is fine.
             match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -311,18 +336,37 @@ fn new_body_file(temp: &BodyTempDir, persistent: bool) -> Option<SpilledBody> {
             Ordering::Relaxed,
         );
     }
-    let mut step = 1;
-    for _ in 0..64 {
-        let n = REQUEST_BODY_FILE_SEQ.fetch_add(step, Ordering::Relaxed) % 10_000_000_000;
-        let path = dir.join(format!("{n:010}"));
-        match std::fs::OpenOptions::new()
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-        {
+            .open(path)
+    };
+    let mut step = 1;
+    for _ in 0..64 {
+        let n = REQUEST_BODY_FILE_SEQ.fetch_add(step, Ordering::Relaxed) % 10_000_000_000;
+        let name = format!("{n:010}");
+        let mut path = temp.file_path(&dir, &name);
+        let mut opened = open(&path);
+        // A level directory not made yet, or the directory went away:
+        // once, make them (nginx's ngx_create_full_path, 0700) and retry.
+        if matches!(&opened, Err(e) if e.kind() == std::io::ErrorKind::NotFound) && !remade {
+            remade = true;
+            dir = temp.dir(true)?;
+            path = temp.file_path(&dir, &name);
+            if let Some(parent) = path.parent().filter(|p| *p != dir) {
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent);
+            }
+            opened = open(&path);
+        }
+        match opened {
             Ok(file) => {
                 if !persistent {
                     let _ = std::fs::remove_file(&path);
@@ -338,11 +382,6 @@ fn new_body_file(temp: &BodyTempDir, persistent: bool) -> Option<SpilledBody> {
             // Taken (another process, or a kept file): jump ahead, as
             // nginx's ngx_next_temp_number(1).
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => step = 0x10000 + n % 0x10000,
-            // The directory went away: once, make it again.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !remade => {
-                remade = true;
-                dir = temp.dir(true)?;
-            }
             Err(_) => return None,
         }
     }

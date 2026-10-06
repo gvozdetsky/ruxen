@@ -243,7 +243,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
     let mut client_max_body_size: Option<u64> = None;
-    let mut client_body_temp_path: Option<PathBuf> = None;
+    let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
@@ -733,7 +733,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "log_subrequest",
     "rewrite_log",
     // Body / header buffer tuning
-    "client_body_temp_path",
     "client_body_buffer_size",
     "client_body_timeout",
     "client_body_in_file_only",

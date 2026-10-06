@@ -122,9 +122,9 @@ pub struct HttpConfig {
     pub auth_delay_ms: Option<u64>,
     /// http-scope `client_max_body_size` in bytes. `None` means "not set".
     pub client_max_body_size: Option<u64>,
-    /// http-scope `client_body_temp_path` (the levels are accepted and not
-    /// used). `None`: a private directory per process.
-    pub client_body_temp_path: Option<PathBuf>,
+    /// http-scope `client_body_temp_path`. `None`: a private directory per
+    /// process.
+    pub client_body_temp_path: Option<TempPath>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
@@ -520,6 +520,8 @@ pub struct Server {
     pub auth_delay_ms: Option<u64>,
     /// Server-scope `client_max_body_size` in bytes. `None` inherits from http.
     pub client_max_body_size: Option<u64>,
+    /// Server-scope `client_body_temp_path`. `None` inherits from http.
+    pub client_body_temp_path: Option<TempPath>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
     pub sendfile: Option<bool>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
@@ -680,6 +682,8 @@ pub struct Location {
     /// Location-scope `sendfile on|off`, inherited through nested locations
     /// at parse time. `None` inherits from server/http at prepare time.
     pub sendfile: Option<bool>,
+    /// Location-scope `client_body_temp_path`, inherited like `sendfile`.
+    pub client_body_temp_path: Option<TempPath>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
     /// `None` inherits.
     pub limit_rate: Option<Vec<ValuePart>>,
@@ -949,6 +953,15 @@ pub struct AccessLog {
 pub enum AuthBasic {
     Off,
     Realm(Vec<u8>),
+}
+
+/// `client_body_temp_path path [level1 [level2 [level3]]]`: the directory
+/// for request-body temp files, and the digits of the file number that
+/// name each level of subdirectories (`0` = no such level).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempPath {
+    pub path: PathBuf,
+    pub levels: [u8; 3],
 }
 
 /// `client_body_in_file_only on|clean|off;`. `Off` is nginx's default —

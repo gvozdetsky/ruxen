@@ -223,7 +223,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         worker_connections: runtime.worker_connections.unwrap_or(512),
         error_logs: main_error_logs,
         max_request_body,
-        body_temp: BodyTempDir::new(client_body_temp_path.map(leak_path_buf)),
+        body_temp: BodyTempDir::new(client_body_temp_path),
         listens,
         access_logs: canonical_access_logs,
         split_clients: prepared_split_clients,
@@ -1034,6 +1034,9 @@ pub(crate) fn prepare_server(
     let server_auth_delay_ms = server.auth_delay_ms.unwrap_or(http_auth_delay_ms);
     let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
     let server_sendfile = server.sendfile.or(http_sendfile).unwrap_or(false);
+    // A server's own `client_body_temp_path`; without one its locations
+    // use the http-level directory (`PreparedHttp::body_temp`).
+    let server_body_temp = server.client_body_temp_path.clone().map(BodyTempDir::leak);
     let server_limit_rate = PreparedLimitRate::inherit(
         server.limit_rate.take(),
         server.limit_rate_after.take(),
@@ -1103,6 +1106,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_body_temp,
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1132,6 +1136,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_body_temp,
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1161,6 +1166,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_body_temp,
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1191,6 +1197,7 @@ pub(crate) fn prepare_server(
                 server_auth_delay_ms,
                 server_client_max_body_size,
                 server_sendfile,
+                server_body_temp,
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1265,6 +1272,7 @@ pub(crate) fn prepare_server(
                 sendfile: server_sendfile,
                 limit_rate: server_limit_rate.for_location(),
                 client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
+                body_temp: server_body_temp,
                 post_action: server_post_action,
                 expires: server_expires,
                 chunked_transfer_encoding: server_chunked_transfer_encoding,
@@ -1990,6 +1998,7 @@ pub(crate) fn build_prefix_or_exact(
     server_auth_delay_ms: u64,
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
+    server_body_temp: Option<&'static BodyTempDir>,
     server_limit_rate: PreparedLimitRate,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
@@ -2028,6 +2037,7 @@ pub(crate) fn build_prefix_or_exact(
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
+        client_body_temp_path: location_client_body_temp_path,
         limit_rate: location_limit_rate,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
@@ -2131,6 +2141,9 @@ pub(crate) fn build_prefix_or_exact(
     let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
+    let body_temp = location_client_body_temp_path
+        .map(BodyTempDir::leak)
+        .or(server_body_temp);
     let limit_rate = PreparedLimitRate::inherit(
         location_limit_rate,
         location_limit_rate_after,
@@ -2168,6 +2181,7 @@ pub(crate) fn build_prefix_or_exact(
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
+        body_temp,
         post_action,
         expires,
         chunked_transfer_encoding,
@@ -2196,6 +2210,7 @@ pub(crate) fn build_regex_location(
     server_auth_delay_ms: u64,
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
+    server_body_temp: Option<&'static BodyTempDir>,
     server_limit_rate: PreparedLimitRate,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
@@ -2234,6 +2249,7 @@ pub(crate) fn build_regex_location(
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
+        client_body_temp_path: location_client_body_temp_path,
         limit_rate: location_limit_rate,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
@@ -2348,6 +2364,9 @@ pub(crate) fn build_regex_location(
     let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
+    let body_temp = location_client_body_temp_path
+        .map(BodyTempDir::leak)
+        .or(server_body_temp);
     let limit_rate = PreparedLimitRate::inherit(
         location_limit_rate,
         location_limit_rate_after,
@@ -2383,6 +2402,7 @@ pub(crate) fn build_regex_location(
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
+        body_temp,
         post_action,
         expires,
         chunked_transfer_encoding,
