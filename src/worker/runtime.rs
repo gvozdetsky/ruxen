@@ -1943,10 +1943,9 @@ pub(crate) async fn handle<S: ConnIo>(
                         // to absolute buffer offsets before indexing.
                         let base = read_start;
                         // Copy the method into a small stack buffer up
-                        // front. The read buffer below is borrowed mutably
-                        // by `normalize_host_in_place`, which would
-                        // otherwise overlap with a long-lived method-bytes
-                        // slice into `buf`. Methods are short ASCII tokens
+                        // front (from when the host was lowercased in the
+                        // read buffer; it costs a few bytes on the stack).
+                        // Methods are short ASCII tokens
                         // (longest standardized: `OPTIONS` / `CONNECT` =
                         // 7 bytes); 16 covers any future additions before
                         // we'd need to revisit. Requests with a longer
@@ -1999,7 +1998,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             req.request_line_host.map(|(s, e)| (base + s, base + e));
                         let header_host = req.host.map(|(s, e)| (base + s, base + e));
                         let request_line_host = match request_line_host {
-                            Some((s, e)) => match http::normalize_host_in_place(&mut *buf, s, e) {
+                            Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
                                 Some(nh) => Some(nh),
                                 None => {
                                     // An invalid Host is refused by the
@@ -2014,7 +2013,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             None => None,
                         };
                         let header_host = match header_host {
-                            Some((s, e)) => match http::normalize_host_in_place(&mut *buf, s, e) {
+                            Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
                                 Some(nh) => Some(nh),
                                 None => {
                                     // An invalid Host is refused by the
@@ -2038,7 +2037,20 @@ pub(crate) async fn handle<S: ConnIo>(
                         } else {
                             request_line_host.as_ref().or(header_host.as_ref())
                         };
-                        let host = chosen_authority.map(|nh| &buf[nh.host.0..nh.host.1]);
+                        // Routing uses the host lowercased; the buffer keeps
+                        // it as sent. A copy only when it has capitals.
+                        let mut host_lowercased = Vec::new();
+                        if let Some(nh) = chosen_authority.filter(|nh| nh.uppercase) {
+                            host_lowercased.extend_from_slice(&buf[nh.host.0..nh.host.1]);
+                            host_lowercased.make_ascii_lowercase();
+                        }
+                        let host = chosen_authority.map(|nh| {
+                            if nh.uppercase {
+                                host_lowercased.as_slice()
+                            } else {
+                                &buf[nh.host.0..nh.host.1]
+                            }
+                        });
                         let request_port: &[u8] = chosen_authority
                             .and_then(|nh| nh.port.map(|(s, e)| &buf[s..e]))
                             .unwrap_or(&[]);

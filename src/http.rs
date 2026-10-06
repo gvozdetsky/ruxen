@@ -1139,17 +1139,21 @@ fn connection_has_token(value: &[u8], target: &[u8]) -> bool {
     false
 }
 
-/// Result of normalizing a Host header value (or absolute-form authority)
-/// in place. `host` is the lowercased, port-stripped, trailing-dot-trimmed
-/// hostname range. `port` is the digits-only port range (no leading colon)
-/// when the input contained `:NNNN`, or `None`. Both are absolute buffer
-/// offsets into the same `buf` passed in.
+/// Result of validating a Host header value (or absolute-form authority),
+/// nginx's ngx_http_validate_host. `host` is the port-stripped,
+/// trailing-dot-trimmed hostname range; `port` is the digits-only port
+/// range (no leading colon) when the input contained `:NNNN`, or `None`.
+/// Both are absolute offsets into the `buf` passed in, which is left as
+/// the client sent it (`$http_host`, `$request`). `uppercase`: the host
+/// has capital letters, so the host used for routing is a lowercased copy
+/// (nginx allocates one in that case only).
 pub struct NormalizedHost {
     pub host: (usize, usize),
     pub port: Option<(usize, usize)>,
+    pub uppercase: bool,
 }
 
-pub fn normalize_host_in_place(buf: &mut [u8], start: usize, end: usize) -> Option<NormalizedHost> {
+pub fn normalize_host(buf: &[u8], start: usize, end: usize) -> Option<NormalizedHost> {
     #[derive(Copy, Clone)]
     enum State {
         HostStart,
@@ -1164,6 +1168,7 @@ pub fn normalize_host_in_place(buf: &mut [u8], start: usize, end: usize) -> Opti
     let mut host_len = end.saturating_sub(start);
     let mut port: u32 = 0;
     let mut port_start: Option<usize> = None;
+    let mut uppercase = false;
 
     for i in start..end {
         let ch = buf[i];
@@ -1200,7 +1205,7 @@ pub fn normalize_host_in_place(buf: &mut [u8], start: usize, end: usize) -> Opti
         match state {
             State::Host => {
                 if ch.is_ascii_uppercase() {
-                    buf[i] = ch.to_ascii_lowercase();
+                    uppercase = true;
                     continue;
                 }
                 if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
@@ -1226,7 +1231,7 @@ pub fn normalize_host_in_place(buf: &mut [u8], start: usize, end: usize) -> Opti
             }
             State::HostIpLiteral => {
                 if ch.is_ascii_uppercase() {
-                    buf[i] = ch.to_ascii_lowercase();
+                    uppercase = true;
                     continue;
                 }
                 if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
@@ -1274,6 +1279,7 @@ pub fn normalize_host_in_place(buf: &mut [u8], start: usize, end: usize) -> Opti
     Some(NormalizedHost {
         host: (start, start + host_len),
         port: port_range,
+        uppercase,
     })
 }
 
@@ -1897,12 +1903,12 @@ mod tests {
 
     #[test]
     fn host_port_is_stripped() {
-        let mut req = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".to_vec();
+        let req = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".to_vec();
         match parse_fresh(&req) {
             Parse::Complete(r) => {
                 let (s, e) = r.host.unwrap();
                 assert_eq!(&req[s..e], b"example.com:8080");
-                let nh = normalize_host_in_place(&mut req, s, e).unwrap();
+                let nh = normalize_host(&req, s, e).unwrap();
                 let (s, e) = nh.host;
                 assert_eq!(&req[s..e], b"example.com");
                 let (ps, pe) = nh.port.unwrap();
@@ -1914,12 +1920,12 @@ mod tests {
 
     #[test]
     fn host_ipv6_bracketed_with_port() {
-        let mut req = b"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n".to_vec();
+        let req = b"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n".to_vec();
         match parse_fresh(&req) {
             Parse::Complete(r) => {
                 let (s, e) = r.host.unwrap();
                 assert_eq!(&req[s..e], b"[::1]:8080");
-                let nh = normalize_host_in_place(&mut req, s, e).unwrap();
+                let nh = normalize_host(&req, s, e).unwrap();
                 let (s, e) = nh.host;
                 assert_eq!(&req[s..e], b"[::1]");
                 let (ps, pe) = nh.port.unwrap();
@@ -1931,11 +1937,11 @@ mod tests {
 
     #[test]
     fn host_ipv6_bracketed_no_port() {
-        let mut req = b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n".to_vec();
+        let req = b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n".to_vec();
         match parse_fresh(&req) {
             Parse::Complete(r) => {
                 let (s, e) = r.host.unwrap();
-                let nh = normalize_host_in_place(&mut req, s, e).unwrap();
+                let nh = normalize_host(&req, s, e).unwrap();
                 let (s, e) = nh.host;
                 assert_eq!(&req[s..e], b"[::1]");
                 assert!(nh.port.is_none());
@@ -1945,20 +1951,22 @@ mod tests {
     }
 
     #[test]
-    fn host_normalizer_trims_trailing_dot_and_lowercases() {
-        let mut host = b"Example.COM.:8080".to_vec();
+    fn host_normalizer_trims_trailing_dot_and_flags_uppercase() {
+        let host = b"Example.COM.:8080".to_vec();
         let end = host.len();
-        let nh = normalize_host_in_place(&mut host, 0, end).unwrap();
+        let nh = normalize_host(&host, 0, end).unwrap();
         let (s, e) = nh.host;
-        assert_eq!(&host[s..e], b"example.com");
+        // The bytes stay as sent; the caller lowercases a copy.
+        assert_eq!(&host[s..e], b"Example.COM");
+        assert!(nh.uppercase);
+        assert!(!normalize_host(b"example.com", 0, 11).unwrap().uppercase);
         let (ps, pe) = nh.port.unwrap();
         assert_eq!(&host[ps..pe], b"8080");
     }
 
     #[test]
     fn host_normalizer_rejects_empty_dot_host() {
-        let mut host = b".".to_vec();
-        assert!(normalize_host_in_place(&mut host, 0, 1).is_none());
+        assert!(normalize_host(b".", 0, 1).is_none());
     }
 
     #[test]

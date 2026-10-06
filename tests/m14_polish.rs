@@ -616,3 +616,42 @@ http {
     let text = String::from_utf8_lossy(&r);
     assert_eq!(text.matches("HTTP/1.1 204").count(), 2, "{text}");
 }
+
+#[test]
+fn host_is_lowercased_only_for_routing() {
+    // nginx lowercases a copy of the host for `$host` and server selection
+    // (ngx_http_validate_host); `$http_host` and `$request` show what the
+    // client sent. ruxen lowercased the request buffer itself, so both
+    // came out lowercased (checked against nginx 1.24).
+    let conf = r#"
+events { }
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    return 404;
+  }
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    server_name example.test;
+    location / { return 200 "$host|$http_host|$request"; }
+  }
+}
+"#;
+    let (_g, port) = spawn_server(conf);
+    let r = send_request(
+        port,
+        b"GET /h HTTP/1.1\r\nHost: Example.TEST:8080\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(body(&r)),
+        "example.test|Example.TEST:8080|GET /h HTTP/1.1"
+    );
+    let r = send_request(
+        port,
+        b"GET http://Example.TEST/h HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(body(&r)),
+        "example.test|x|GET http://Example.TEST/h HTTP/1.1"
+    );
+}
