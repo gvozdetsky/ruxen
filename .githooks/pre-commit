@@ -1,0 +1,7 @@
+#!/bin/sh
+# Refuse a commit that CI's `cargo fmt --check` would fail.
+# Enable once per clone: git config core.hooksPath .githooks
+if ! cargo fmt --check >/dev/null 2>&1; then
+    echo "pre-commit: not rustfmt-clean; run \`cargo fmt\` and stage the result" >&2
+    exit 1
+fi
