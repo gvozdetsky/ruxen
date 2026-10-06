@@ -102,6 +102,9 @@ fn start(conf_http: &str) -> Server {
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg("-c")
         .arg(dir.join("nginx.conf"))
+        // Its private body-temp directory goes under `dir`, which is
+        // removed afterwards; a killed ruxen can't remove it itself.
+        .env("TMPDIR", &dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

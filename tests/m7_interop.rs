@@ -126,11 +126,25 @@ fn m7_t_validates_repo_configs_and_rejects_broken_conf() {
         "bench/m3/nginx.conf",
         "bench/m5/nginx.conf",
     ] {
+        // `-t` opens the error log the config names (under /tmp for the
+        // bench configs): remove the ones this check created, not a
+        // benchmark run's.
+        let conf = std::fs::read_to_string(root.join(rel)).unwrap();
+        let logs: Vec<PathBuf> = conf
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("error_log"))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(|p| PathBuf::from(p.trim_end_matches(';')))
+            .filter(|p| p.is_absolute() && !p.exists())
+            .collect();
         let status = Command::new(env!("CARGO_BIN_EXE_ruxen"))
             .args(["-t", "-c"])
             .arg(root.join(rel))
             .status()
             .unwrap();
+        for log in logs {
+            let _ = std::fs::remove_file(log);
+        }
         assert!(status.success(), "{rel} should validate");
     }
 

@@ -36,6 +36,15 @@ fn pick_port() -> (u16, MutexGuard<'static, ()>) {
     (p, g)
 }
 
+/// Removes a test's own directory when the test ends, passed or not.
+struct RemoveDir(PathBuf);
+
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn unique_dir() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
@@ -428,6 +437,7 @@ fn strong_form_etag_matches_if_match_and_rejects_weak_prefix() {
     // nginx's wire format. `If-Match` uses strong comparison: echoing the
     // header verbatim succeeds (200), prefixing with `W/` forces 412.
     let dir = unique_dir();
+    let _cleanup = RemoveDir(dir.clone());
     std::fs::write(dir.join("t"), b"abc").unwrap();
     let testdir = dir.to_str().unwrap().to_string();
     let conf = format!(
@@ -489,6 +499,7 @@ http {{
 #[test]
 fn if_none_match_accepts_comma_separated_list_and_weak_form() {
     let dir = unique_dir();
+    let _cleanup = RemoveDir(dir.clone());
     std::fs::write(dir.join("t"), b"abc").unwrap();
     let testdir = dir.to_str().unwrap().to_string();
     let conf = format!(
