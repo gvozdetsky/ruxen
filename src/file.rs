@@ -1833,6 +1833,7 @@ mod tests {
         assert!(matches!(serve(&large, true), Response::File { .. }));
         // sendfile off keeps the old rule: everything up to 8 KiB is inline.
         assert!(matches!(serve(&large, false), Response::Owned(_)));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// The year/month walk `civil_from_days` replaced, kept as the oracle.
