@@ -226,6 +226,9 @@ pub struct RewriteState {
     /// request, internal redirects included, unless the map is `volatile`.
     /// Filled while rendering, which only has `&self`.
     map_cache: std::cell::RefCell<Vec<(usize, Vec<u8>)>>,
+    /// The chosen location's (or, in the server's rewrite phase, the
+    /// server's) root, for `$request_filename` / `$document_root`.
+    pub(crate) doc_root: Option<&'static DocRoot>,
 }
 
 impl Default for RewriteState {
@@ -235,6 +238,7 @@ impl Default for RewriteState {
             numbered_captures: Vec::new(),
             valid_location: true,
             map_cache: std::cell::RefCell::new(Vec::new()),
+            doc_root: None,
         }
     }
 }
@@ -739,6 +743,16 @@ pub struct PreparedRoot {
     pub try_files: Option<&'static PreparedTryFiles>,
 }
 
+/// Where a location's URIs map on disk, whatever its handler: its `root`
+/// or `alias` (else `html`), for `$request_filename` / `$document_root`.
+#[derive(Debug)]
+pub struct DocRoot {
+    pub path: &'static Path,
+    pub mapping: PreparedPathMapping,
+    /// The location's `disable_symlinks`, for `if -f` and the like.
+    pub symlinks: PreparedSymlinks,
+}
+
 /// Effective `disable_symlinks` of a location.
 #[derive(Debug, Clone, Copy)]
 pub struct PreparedSymlinks {
@@ -937,6 +951,8 @@ pub struct PreparedLocation {
     /// The location's or its server's own `client_body_temp_path`; `None`
     /// uses `PreparedHttp::body_temp`.
     pub body_temp: Option<&'static BodyTempDir>,
+    /// `$request_filename` / `$document_root` (`RewriteState::doc_root`).
+    pub doc_root: &'static DocRoot,
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
@@ -982,6 +998,7 @@ pub struct PreparedRegexLocation {
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
+    pub doc_root: &'static DocRoot,
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
@@ -1016,6 +1033,7 @@ pub struct MatchedLocation<'a> {
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
+    pub doc_root: &'static DocRoot,
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
@@ -1047,6 +1065,7 @@ impl<'a> MatchedLocation<'a> {
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,
+            doc_root: loc.doc_root,
             sendfile: loc.sendfile,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
@@ -1082,6 +1101,7 @@ impl<'a> MatchedLocation<'a> {
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,
+            doc_root: loc.doc_root,
             sendfile: loc.sendfile,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
@@ -1144,6 +1164,9 @@ impl PreparedClientTimeouts {
 /// server; cross-server selection happens in `phase::find_config` which
 /// walks the table priorities in nginx order.
 pub struct PreparedServer {
+    /// The server's `root` (else `html`), for `$request_filename` in its
+    /// rewrite phase.
+    pub doc_root: &'static DocRoot,
     /// Client-side timeouts. The worker uses the listen's default server's
     /// values for the whole connection (see `handle`).
     pub timeouts: PreparedClientTimeouts,

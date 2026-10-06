@@ -511,12 +511,21 @@ fn trim_trailing_slashes(bytes: &[u8]) -> &[u8] {
 /// try_files or index probe): ELOOP, or ENOTDIR for a link before the
 /// last component under `on`. Other errors are left to the probe.
 fn symlinks_refused(root: &PreparedRoot, path: &Path) -> Option<i32> {
-    if matches!(root.symlinks.mode, SymlinkMode::Off) {
+    symlink_refusal(&root.symlinks, root.root, path.as_os_str().as_bytes())
+}
+
+/// `symlinks_refused` for a policy and document root, and a path that
+/// isn't a static lookup (`if -f`): ELOOP or ENOTDIR when refused.
+pub(crate) fn symlink_refusal(
+    policy: &PreparedSymlinks,
+    document_root: &Path,
+    full: &[u8],
+) -> Option<i32> {
+    if matches!(policy.mode, SymlinkMode::Off) {
         return None;
     }
-    let full = path.as_os_str().as_bytes();
-    let boundary = symlink_boundary(&root.symlinks, root.root.as_os_str().as_bytes(), full)?;
-    let checked = match root.symlinks.mode {
+    let boundary = symlink_boundary(policy, document_root.as_os_str().as_bytes(), full)?;
+    let checked = match policy.mode {
         SymlinkMode::NotOwner => check_symlink_owners(full, boundary),
         _ => refuse_symlinks_after(full, boundary),
     };
@@ -751,6 +760,18 @@ fn relative_uri_path_for_try_files_probe<'a>(root: &PreparedRoot, probe_uri: &'a
         // `add_uri_to_alias`.
         PreparedPathMapping::AliasRegex => trim_leading_slashes(probe_uri),
     }
+}
+
+/// `$request_filename`: `uri` under a location's root or alias.
+pub(crate) fn request_filename(doc_root: &crate::worker::DocRoot, uri: &[u8]) -> PathBuf {
+    let rel = match doc_root.mapping {
+        PreparedPathMapping::Root => trim_leading_slashes(uri),
+        PreparedPathMapping::AliasPrefix { prefix } => {
+            trim_leading_slashes(uri.strip_prefix(prefix).unwrap_or(uri))
+        }
+        PreparedPathMapping::AliasRegex => b"",
+    };
+    join(doc_root.path, rel)
 }
 
 fn map_uri_for_static(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -> PathBuf {

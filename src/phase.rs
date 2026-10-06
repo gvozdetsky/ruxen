@@ -644,6 +644,7 @@ fn process_with_meta_inner(
         }
     }
     let mut rewrite_state = RewriteState::default();
+    rewrite_state.doc_root = Some(server.doc_root);
     // A regex server_name's captures are `$1`…`$9` until another regex
     // matches (nginx's r->captures from ngx_http_find_virtual_server).
     if let Some(captures) = regex_captures.as_ref() {
@@ -744,6 +745,7 @@ fn process_with_meta_inner(
                 },
             }
         };
+        rewrite_state.doc_root = Some(loc.doc_root);
         meta.keepalive = KeepaliveMeta {
             allow: loc.keepalive.allow,
             idle_timeout_ms: loc.keepalive.idle_timeout_ms,

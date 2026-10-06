@@ -138,6 +138,30 @@ pub(crate) struct RenderCtx<'a> {
 }
 
 impl RenderCtx<'_> {
+    /// `$request_filename`, `$document_root`, `$realpath_root`: the
+    /// current location's root or alias (`RewriteState::doc_root`, set
+    /// when the location is chosen) and the URI mapped under it, as
+    /// nginx's ngx_http_map_uri_to_path. Empty outside request processing.
+    #[cold]
+    fn write_doc_root_var(&self, v: &Variable, out: &mut Vec<u8>) {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(doc_root) = self.rewrite_state.and_then(|s| s.doc_root) else {
+            return;
+        };
+        match v {
+            Variable::RequestFilename => {
+                let path = crate::fs_resolve::request_filename(doc_root, self.uri);
+                out.extend_from_slice(path.as_os_str().as_bytes());
+            }
+            Variable::DocumentRoot => out.extend_from_slice(doc_root.path.as_os_str().as_bytes()),
+            _ => {
+                if let Ok(real) = doc_root.path.canonicalize() {
+                    out.extend_from_slice(real.as_os_str().as_bytes());
+                }
+            }
+        }
+    }
+
     /// nginx's `$upstream_*` lists: one value per attempt, `, `-separated.
     fn write_upstream_list(
         &self,
@@ -372,6 +396,9 @@ impl RenderCtx<'_> {
             }
             Variable::ServerPort => write_u16_decimal(out, self.server_port),
             Variable::ServerAddr => out.extend_from_slice(&self.conn.server_addr),
+            Variable::RequestFilename | Variable::DocumentRoot | Variable::RealpathRoot => {
+                self.write_doc_root_var(var, out);
+            }
             Variable::RequestPort => out.extend_from_slice(self.request_port),
             Variable::IsRequestPort => {
                 if !self.request_port.is_empty() {

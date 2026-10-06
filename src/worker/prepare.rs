@@ -1233,6 +1233,18 @@ pub(crate) fn prepare_server(
     // lists via the same path explicit locations use.
     let have_root_catchall =
         exact.iter().any(|l| l.pattern == b"/") || prefix.iter().any(|l| l.pattern == b"/");
+    // The server's own root (else nginx's `html`): its rewrite phase's
+    // `$request_filename`, and its implicit `/` location's.
+    let server_doc_root = leak_doc_root(
+        (
+            server.root.clone().unwrap_or_else(|| "html".into()),
+            PathMapping::Root,
+        ),
+        b"/",
+        false,
+        None,
+        server_disable_symlinks.clone(),
+    );
     let server_default =
         if let Some(root_path) = server.root.clone().filter(|_| !have_root_catchall) {
             let pattern: &'static [u8] = b"/";
@@ -1284,6 +1296,7 @@ pub(crate) fn prepare_server(
                 limit_rate: server_limit_rate.for_location(),
                 client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
                 body_temp: server_body_temp,
+                doc_root: server_doc_root,
                 post_action: server_post_action,
                 expires: server_expires,
                 chunked_transfer_encoding: server_chunked_transfer_encoding,
@@ -1293,6 +1306,7 @@ pub(crate) fn prepare_server(
         };
 
     Ok(PreparedServer {
+        doc_root: server_doc_root,
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
         exact_names,
         wildcard_leading,
@@ -1880,6 +1894,60 @@ pub(crate) fn prepare_return(
     }
 }
 
+/// How a location maps a URI under its `root` / `alias` path.
+pub(crate) fn prepare_path_mapping(
+    mapping: PathMapping,
+    location_pattern: &'static [u8],
+    is_regex_location: bool,
+    alias_prefix_override: Option<&'static [u8]>,
+) -> PreparedPathMapping {
+    match mapping {
+        PathMapping::Root => PreparedPathMapping::Root,
+        PathMapping::Alias => {
+            if let Some(prefix) = alias_prefix_override {
+                // Inherited from an ancestor prefix-alias location: strip
+                // the ancestor's pattern, even when this location is a
+                // regex (which has no pattern of its own to use as a
+                // prefix).
+                PreparedPathMapping::AliasPrefix { prefix }
+            } else if is_regex_location {
+                PreparedPathMapping::AliasRegex
+            } else {
+                PreparedPathMapping::AliasPrefix {
+                    prefix: location_pattern,
+                }
+            }
+        }
+    }
+}
+
+/// A location's (or server's) `DocRoot`, leaked for the process.
+pub(crate) fn leak_doc_root(
+    (path, mapping): (std::path::PathBuf, PathMapping),
+    location_pattern: &'static [u8],
+    is_regex_location: bool,
+    alias_prefix_override: Option<&'static [u8]>,
+    disable_symlinks: Option<crate::config::DisableSymlinks>,
+) -> &'static DocRoot {
+    // nginx resolves a relative root under the prefix (ruxen's working
+    // directory by now) and prints it absolute.
+    let path = if path.is_relative() {
+        std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(&path))
+    } else {
+        path
+    };
+    Box::leak(Box::new(DocRoot {
+        path: leak_path_buf(path),
+        mapping: prepare_path_mapping(
+            mapping,
+            location_pattern,
+            is_regex_location,
+            alias_prefix_override,
+        ),
+        symlinks: PreparedSymlinks::new(disable_symlinks),
+    }))
+}
+
 pub(crate) fn build_handler(
     handler: Handler,
     location_pattern: &'static [u8],
@@ -1919,24 +1987,12 @@ pub(crate) fn build_handler(
             // exists, else on first use (`PreparedRoot::fd`).
             let root: &'static Path = Box::leak(path.into_boxed_path());
             let root_fd = open_root(root).unwrap_or(-1);
-            let path_mapping = match mapping {
-                PathMapping::Root => PreparedPathMapping::Root,
-                PathMapping::Alias => {
-                    if let Some(prefix) = alias_prefix_override {
-                        // Inherited from an ancestor prefix-alias location:
-                        // strip the ancestor's pattern, even when this
-                        // location is a regex (which has no pattern of
-                        // its own to use as a prefix).
-                        PreparedPathMapping::AliasPrefix { prefix }
-                    } else if is_regex_location {
-                        PreparedPathMapping::AliasRegex
-                    } else {
-                        PreparedPathMapping::AliasPrefix {
-                            prefix: location_pattern,
-                        }
-                    }
-                }
-            };
+            let path_mapping = prepare_path_mapping(
+                mapping,
+                location_pattern,
+                is_regex_location,
+                alias_prefix_override,
+            );
 
             // Index inheritance: location list wins; else server list; else
             // the built-in default from ngx_http_index_module.c
@@ -2105,6 +2161,7 @@ pub(crate) fn build_prefix_or_exact(
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
+        document_root,
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
@@ -2172,6 +2229,15 @@ pub(crate) fn build_prefix_or_exact(
         recursive_error_pages,
         ..proxy_effective
     };
+    let doc_root = leak_doc_root(
+        document_root,
+        pattern,
+        false,
+        alias_prefix_override,
+        location_disable_symlinks
+            .clone()
+            .or_else(|| server_disable_symlinks.clone()),
+    );
     let handler = build_handler(
         handler,
         pattern,
@@ -2252,6 +2318,7 @@ pub(crate) fn build_prefix_or_exact(
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
         body_temp,
+        doc_root,
         post_action,
         expires,
         chunked_transfer_encoding,
@@ -2320,6 +2387,7 @@ pub(crate) fn build_regex_location(
         auth_delay_ms: location_auth_delay_ms,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
+        document_root,
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
@@ -2399,6 +2467,15 @@ pub(crate) fn build_regex_location(
         recursive_error_pages,
         ..proxy_effective
     };
+    let doc_root = leak_doc_root(
+        document_root,
+        location_pattern,
+        true,
+        alias_prefix_override,
+        location_disable_symlinks
+            .clone()
+            .or_else(|| server_disable_symlinks.clone()),
+    );
     let handler = build_handler(
         handler,
         location_pattern,
@@ -2476,6 +2553,7 @@ pub(crate) fn build_regex_location(
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
         body_temp,
+        doc_root,
         post_action,
         expires,
         chunked_transfer_encoding,

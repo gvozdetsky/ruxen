@@ -134,7 +134,13 @@ fn eval_guard_plain(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> bool {
         } => {
             let mut rendered = Vec::with_capacity(64);
             render_parts(path, ctx, &mut rendered);
-            let ok = guard_file_test(*kind, &rendered);
+            // nginx opens the path under the location's disable_symlinks
+            // (ngx_http_script_file_code): a refused link fails the test
+            // like a missing file.
+            let refused = ctx.rewrite_state.and_then(|s| s.doc_root).is_some_and(|d| {
+                crate::fs_resolve::symlink_refusal(&d.symlinks, d.path, &rendered).is_some()
+            });
+            let ok = !refused && guard_file_test(*kind, &rendered);
             if *negated { !ok } else { ok }
         }
     }

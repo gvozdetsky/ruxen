@@ -239,7 +239,6 @@ fn is_nginx_variable(name: &str) -> bool {
         "bytes_received",
         "date_gmt",
         "date_local",
-        "document_root",
         "document_uri",
         "fastcgi_path_info",
         "fastcgi_script_name",
@@ -259,9 +258,7 @@ fn is_nginx_variable(name: &str) -> bool {
         "quic",
         "realip_remote_addr",
         "realip_remote_port",
-        "realpath_root",
         "request_completion",
-        "request_filename",
         "request_id",
         "secure_link",
         "secure_link_expires",
@@ -388,6 +385,9 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"request_time" => Variable::RequestTime,
         b"limit_rate" => Variable::LimitRate,
         b"server_port" => Variable::ServerPort,
+        b"request_filename" => Variable::RequestFilename,
+        b"document_root" => Variable::DocumentRoot,
+        b"realpath_root" => Variable::RealpathRoot,
         b"server_addr" => {
             SERVER_ADDR_USED.store(true, std::sync::atomic::Ordering::Relaxed);
             Variable::ServerAddr

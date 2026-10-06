@@ -439,6 +439,9 @@ pub(crate) fn parse_location_block(
                     // are set. `proxy_pass` wins over `root`/`alias`
                     // (you can't have both in nginx — content phase
                     // dispatch is single-handler).
+                    let document_root = root
+                        .clone()
+                        .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
                     let handler = if let Some((status, body)) = ret {
                         Handler::Return { status, body }
                     } else if let Some(pp) = proxy_pass {
@@ -519,6 +522,7 @@ pub(crate) fn parse_location_block(
                         auth_delay_ms: effective_auth_delay_ms,
                         client_max_body_size: effective_client_max_body_size,
                         sendfile: effective_sendfile,
+                        document_root,
                         client_body_temp_path: effective_client_body_temp_path,
                         disable_symlinks: effective_disable_symlinks,
                         limit_rate: limit_rate.clone(),
