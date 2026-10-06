@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-05 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-06 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 63
-- **Intentionally skipped (`-V` banner excludes the module):** 400
-- **Failing — work in progress:** 42
+- **Passing in ruxen:** 65
+- **Intentionally skipped (`-V` banner excludes the module):** 399
+- **Failing — work in progress:** 41
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (63)
+## Passing in ruxen (65)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -44,6 +44,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `limit_rate.t`
 - `map.t`
 - `map_complex.t`
+- `map_volatile.t`
 - `merge_slashes.t`
 - `not_modified.t`
 - `post_action.t`
@@ -61,6 +62,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_set_body.t`
 - `proxy_upstream_cookie.t`
 - `proxy_variables.t`
+- `proxy_xar.t`
 - `range_if_range.t`
 - `rewrite.t`
 - `rewrite_if.t`
@@ -81,16 +83,16 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (42)
+## Failing — actively being worked on (41)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
 - `http_absolute_redirect.t` — 16/25
+- `http_disable_symlinks.t` — 5/30
 - `http_listen.t` — 0/0
 - `http_resolver.t` — 0/0
 - `http_resolver_cleanup.t` — 1/3
 - `http_resolver_cname.t` — 11/13
-- `map_volatile.t` — 0/0
 - `proxy.t` — 28/30
 - `proxy_bind.t` — 3/7
 - `proxy_cookie.t` — 8/11
@@ -112,8 +114,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_ssl_verify.t` — 6/8
 - `proxy_ssl_verify_ip.t` — 8/10
 - `proxy_unix.t` — 5/7
-- `proxy_xar.t` — 11/18
-- `ssl.t` — 4/23
+- `ssl.t` — 3/23
 - `ssl_cache.t` — 4/6
 - `ssl_certificate_aux.t` — 0/0
 - `ssl_client_escaped_cert.t` — 2/5
@@ -128,7 +129,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_verify_client.t` — 14/16
 - `ssl_verify_depth.t` — 9/11
 
-## Intentionally skipped (400)
+## Intentionally skipped (399)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
@@ -654,10 +655,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 ### no auth_request available (1)
 
 - `auth_request_set.t`
-
-### no disable_symlinks (1)
-
-- `http_disable_symlinks.t`
 
 ### no empty_gif available (1)
 
