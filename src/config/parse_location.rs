@@ -1281,10 +1281,10 @@ pub(crate) fn classify_probe(s: &str) -> Result<TryFilesProbe, Error> {
             TryFilesProbe::Uri
         })
     } else if name.contains('$') {
-        // Any other variable reference is out of scope for M6.
-        Err(Error::BadValue {
-            what: "try_files probe (unsupported variable)",
-            got: s.into(),
+        // nginx compiles every probe as a complex value.
+        Ok(TryFilesProbe::Template {
+            parts: parse_value_with_vars(name)?,
+            dir: is_slash,
         })
     } else if is_slash {
         Ok(TryFilesProbe::LiteralSlash(name.into()))
@@ -1315,10 +1315,7 @@ pub(crate) fn classify_fallback(s: &str) -> Result<TryFilesFallback, Error> {
         }
         Ok(TryFilesFallback::Named(s.into()))
     } else if s.contains('$') {
-        Err(Error::BadValue {
-            what: "try_files fallback (variables not supported)",
-            got: s.into(),
-        })
+        Ok(TryFilesFallback::UriTemplate(parse_value_with_vars(s)?))
     } else {
         Ok(TryFilesFallback::Uri(s.into()))
     }

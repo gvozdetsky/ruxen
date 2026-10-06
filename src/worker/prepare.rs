@@ -2494,6 +2494,10 @@ pub(crate) fn prepare_try_files(
             TryFilesProbe::UriSlash => PreparedProbe::UriSlash,
             TryFilesProbe::Literal(s) => PreparedProbe::Literal(leak_bytes(s.as_bytes())),
             TryFilesProbe::LiteralSlash(s) => PreparedProbe::LiteralSlash(leak_bytes(s.as_bytes())),
+            TryFilesProbe::Template { parts, dir } => PreparedProbe::Template {
+                parts: prepare_value_parts(parts),
+                dir,
+            },
         })
         .collect();
     let server_bytes = http::server_header_value(tokens);
@@ -2502,6 +2506,9 @@ pub(crate) fn prepare_try_files(
             PreparedFallback::Status(Prebuilt::leak(code, fallback_body(code), server_bytes))
         }
         TryFilesFallback::Uri(u) => PreparedFallback::Uri(leak_bytes(u.as_bytes())),
+        TryFilesFallback::UriTemplate(parts) => {
+            PreparedFallback::UriTemplate(prepare_value_parts(parts))
+        }
         TryFilesFallback::Named(u) => PreparedFallback::Named(leak_bytes(u.as_bytes())),
     };
     Box::leak(Box::new(PreparedTryFiles { probes, fallback }))

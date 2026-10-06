@@ -862,6 +862,12 @@ pub enum PreparedProbe {
     Literal(&'static [u8]),
     /// Literal ending in `/`, tested as a directory.
     LiteralSlash(&'static [u8]),
+    /// A value with variables, rendered per request; `dir`: tested as a
+    /// directory.
+    Template {
+        parts: &'static [PreparedValuePart],
+        dir: bool,
+    },
 }
 
 pub enum PreparedFallback {
@@ -871,6 +877,8 @@ pub enum PreparedFallback {
     /// URI to internally redirect to. Re-enters location matching with
     /// the hop budget in `phase::process`.
     Uri(&'static [u8]),
+    /// A URI with variables, rendered when the probes miss.
+    UriTemplate(&'static [PreparedValuePart]),
     /// Internal-only named location target. Preserves the current `$uri`
     /// and `$args`; only the location context changes.
     Named(&'static [u8]),

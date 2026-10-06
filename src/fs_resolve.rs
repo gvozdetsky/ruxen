@@ -82,12 +82,12 @@ pub fn resolve(
     render_ctx: &RenderCtx<'_>,
 ) -> Outcome {
     if let Some(tf) = root.try_files {
-        match run_try_files(root, tf, url_path) {
+        match run_try_files(root, tf, url_path, render_ctx) {
             TryFilesResult::Hit {
                 new_url,
                 add_uri_to_alias,
             } => return resolve_static(root, &new_url, render_ctx, add_uri_to_alias),
-            TryFilesResult::Miss => return apply_fallback(&tf.fallback),
+            TryFilesResult::Miss => return apply_fallback(&tf.fallback, render_ctx),
         }
     }
     resolve_static(root, url_path, render_ctx, false)
@@ -103,7 +103,12 @@ enum TryFilesResult {
     Miss,
 }
 
-fn run_try_files(root: &PreparedRoot, tf: &PreparedTryFiles, url_path: &[u8]) -> TryFilesResult {
+fn run_try_files(
+    root: &PreparedRoot,
+    tf: &PreparedTryFiles,
+    url_path: &[u8],
+    render_ctx: &RenderCtx<'_>,
+) -> TryFilesResult {
     for probe in &tf.probes {
         let (fs_path, new_url, want_dir) = match probe {
             PreparedProbe::Uri => (
@@ -125,6 +130,14 @@ fn run_try_files(root: &PreparedRoot, tf: &PreparedTryFiles, url_path: &[u8]) ->
                 // would be joined.
                 let fs_path = map_uri_for_try_files_probe(root, bytes);
                 (fs_path, bytes.to_vec(), false)
+            }
+            PreparedProbe::Template { parts, dir } => {
+                // Rendered, then tried like a literal URI of the same
+                // shape (nginx's ngx_http_try_files_handler).
+                let mut rendered = Vec::with_capacity(url_path.len() + 16);
+                render_parts(parts, render_ctx, &mut rendered);
+                let fs_path = map_uri_for_try_files_probe(root, &rendered);
+                (fs_path, rendered, *dir)
             }
             PreparedProbe::LiteralSlash(bytes) => {
                 // `bytes` already had its trailing `/` stripped at parse
@@ -172,8 +185,13 @@ fn run_try_files(root: &PreparedRoot, tf: &PreparedTryFiles, url_path: &[u8]) ->
     TryFilesResult::Miss
 }
 
-fn apply_fallback(fallback: &'static PreparedFallback) -> Outcome {
+fn apply_fallback(fallback: &'static PreparedFallback, render_ctx: &RenderCtx<'_>) -> Outcome {
     match fallback {
+        PreparedFallback::UriTemplate(parts) => {
+            let mut rendered = Vec::with_capacity(64);
+            render_parts(parts, render_ctx, &mut rendered);
+            Outcome::Reroute(RerouteTarget::Uri(rendered))
+        }
         PreparedFallback::Status(prebuilt) => Outcome::StatusPrebuilt(prebuilt),
         PreparedFallback::Uri(bytes) => Outcome::Reroute(RerouteTarget::Uri(bytes.to_vec())),
         PreparedFallback::Named(name) => Outcome::Reroute(RerouteTarget::Named(name.to_vec())),

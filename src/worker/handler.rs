@@ -698,9 +698,25 @@ pub(crate) fn run_location_handler(
                     ))
                 }
                 fs_resolve::Outcome::Reroute(target) => {
+                    // A try_files fallback such as `/index.php?$args`
+                    // brings its own arguments: nginx's internal redirect
+                    // takes the part after `?` as the new `$args`.
+                    let (target, args) = match target {
+                        phase::RerouteTarget::Uri(mut uri) => {
+                            match uri.iter().position(|&b| b == b'?') {
+                                Some(q) => {
+                                    let args = uri[q + 1..].to_vec();
+                                    uri.truncate(q);
+                                    (phase::RerouteTarget::Uri(uri), Some(args))
+                                }
+                                None => (phase::RerouteTarget::Uri(uri), None),
+                            }
+                        }
+                        named => (named, None),
+                    };
                     return Response::Reroute(phase::Reroute {
                         target,
-                        args: None,
+                        args,
                         error_page_status: None,
                         enters_error_page: false,
                         preserved_location: None,
