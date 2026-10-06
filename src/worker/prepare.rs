@@ -229,7 +229,6 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         forbidden: Prebuilt::leak(403, "Forbidden\n", http_server_bytes),
         bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),
         gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
-        entity_too_large: Prebuilt::leak(413, "413 Request Entity Too Large\n", http_server_bytes),
         upstreams: prepared_upstreams,
         conf_prefix: conf_prefix.map(leak_path_buf),
     })))

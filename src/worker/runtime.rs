@@ -1857,62 +1857,57 @@ pub(crate) async fn handle<S: ConnIo>(
                             &http.body_temp,
                             persistent_body,
                         );
+                        // The body is over the limit and isn't read: the
+                        // location answers 413 through its error_page, and
+                        // the connection closes after it (lingering).
+                        let mut body_too_large = false;
                         let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
                             (0, 0)
                         } else if let Some(cl) = req.content_length {
-                            if cl > max_body {
-                                // nginx answers 413 from the Content-Length
-                                // alone, without reading the body.
-                                reject_request(
-                                    stream,
-                                    &mut *scratch,
-                                    http,
-                                    http.entity_too_large.pick(method),
-                                    &buf[read_start..filled],
-                                    conn_log!(),
-                                )
-                                .await;
-                                // The client is likely still sending the
-                                // body: let it, so it gets the 413 (nginx's
-                                // lingering close; not for 400s, as nginx).
-                                Box::pin(lingering_close(stream, &mut *scratch)).await;
-                                return;
-                            }
-                            let body_start = base + req.consumed;
-                            let already = filled.saturating_sub(body_start);
-                            let take = (already as u64).min(cl) as usize;
-                            if !sink.extend(&buf[body_start..body_start + take]) {
-                                return;
-                            }
-                            // One read buffer for the whole body; each read
-                            // stops at the body's end so a pipelined next
-                            // request isn't consumed.
-                            let mut chunk: Vec<u8> = Vec::with_capacity(64 * 1024);
-                            while sink.len() < cl {
-                                let want = (cl - sink.len()).min(chunk.capacity() as u64) as usize;
-                                chunk.clear();
-                                let slice = std::mem::take(&mut chunk).slice_mut(0..want);
-                                // client_body_timeout between reads.
-                                let Some((res, returned)) = with_timeout(
-                                    timers.io.as_mut(),
-                                    timeouts.body,
-                                    stream.read(slice),
-                                )
-                                .await
-                                else {
+                            'read: {
+                                if cl > max_body {
+                                    // nginx answers 413 from the Content-Length
+                                    // alone, without reading the body.
+                                    body_too_large = true;
+                                    break 'read (0, cl);
+                                }
+                                let body_start = base + req.consumed;
+                                let already = filled.saturating_sub(body_start);
+                                let take = (already as u64).min(cl) as usize;
+                                if !sink.extend(&buf[body_start..body_start + take]) {
                                     return;
-                                };
-                                chunk = returned.into_inner();
-                                match res {
-                                    Ok(0) | Err(_) => return,
-                                    Ok(n) => {
-                                        if !sink.extend(&chunk[..n]) {
-                                            return;
+                                }
+                                // One read buffer for the whole body; each read
+                                // stops at the body's end so a pipelined next
+                                // request isn't consumed.
+                                let mut chunk: Vec<u8> = Vec::with_capacity(64 * 1024);
+                                while sink.len() < cl {
+                                    let want =
+                                        (cl - sink.len()).min(chunk.capacity() as u64) as usize;
+                                    chunk.clear();
+                                    let slice = std::mem::take(&mut chunk).slice_mut(0..want);
+                                    // client_body_timeout between reads.
+                                    let Some((res, returned)) = with_timeout(
+                                        timers.io.as_mut(),
+                                        timeouts.body,
+                                        stream.read(slice),
+                                    )
+                                    .await
+                                    else {
+                                        return;
+                                    };
+                                    chunk = returned.into_inner();
+                                    match res {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => {
+                                            if !sink.extend(&chunk[..n]) {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
+                                (take, cl)
                             }
-                            (take, cl)
                         } else if req.transfer_encoding_chunked {
                             let body_start = base + req.consumed;
                             let initial = &buf[body_start..filled];
@@ -1930,32 +1925,32 @@ pub(crate) async fn handle<S: ConnIo>(
                                     pipelined_tail = decoded.pipelined_tail;
                                     (decoded.consumed_initial, decoded.raw_consumed)
                                 }
-                                Err(error) => {
-                                    let too_large = matches!(error, ChunkedBodyError::TooLarge);
-                                    let response = if too_large {
-                                        &http.entity_too_large
-                                    } else {
-                                        &http.bad_request
-                                    };
+                                Err(ChunkedBodyError::TooLarge) => {
+                                    body_too_large = true;
+                                    (0, 0)
+                                }
+                                Err(_) => {
                                     reject_request(
                                         stream,
                                         &mut *scratch,
                                         http,
-                                        response.pick(method),
+                                        http.bad_request.pick(method),
                                         &buf[read_start..filled],
                                         conn_log!(),
                                     )
                                     .await;
-                                    if too_large {
-                                        Box::pin(lingering_close(stream, &mut *scratch)).await;
-                                    }
                                     return;
                                 }
                             }
                         } else {
                             (0, 0)
                         };
-                        let body_len = sink.len();
+                        // Over the limit: big enough for the location's check.
+                        let body_len = if body_too_large {
+                            request_body_len.max(max_body.saturating_add(1))
+                        } else {
+                            sink.len()
+                        };
                         let (body_vec, spooled) = sink.finish();
                         // Bound to this request iteration; holds the
                         // temp-file path bytes for `$request_body_file`.
@@ -2062,6 +2057,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             }
                         };
                         let mut close_after = !keep_alive
+                            || body_too_large
                             || !process_meta.keepalive.allow
                             || request_count >= process_meta.keepalive.max_requests
                             || connection_time_us / 1_000 > process_meta.keepalive.max_time_ms
@@ -2281,6 +2277,13 @@ pub(crate) async fn handle<S: ConnIo>(
                             filled = pipelined_tail.len();
                         }
 
+                        if body_too_large {
+                            // The client is likely still sending the body:
+                            // let it, so it gets the 413 (nginx's lingering
+                            // close; not for 400s, as nginx).
+                            Box::pin(lingering_close(stream, &mut *scratch)).await;
+                            return;
+                        }
                         if close_after {
                             return;
                         }

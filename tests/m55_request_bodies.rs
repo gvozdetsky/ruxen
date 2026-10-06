@@ -336,3 +336,41 @@ fn oversized_content_length_is_refused_unread() {
     );
     assert!(resp.starts_with("HTTP/1.1 100 Continue"), "{resp:?}");
 }
+
+/// The 413 for a body over `client_max_body_size` goes through the
+/// location's `error_page` and `add_header … always`, as nginx's special
+/// response (ngx_http_finalize_request(r, 413)), and closes the connection
+/// (nginx clears keepalive for 413). The error page doesn't check the size
+/// again. It used to be the built-in 413 page.
+#[test]
+fn oversized_body_gets_the_locations_error_page() {
+    let upstream = spawn_echo_upstream();
+    let server = start(&format!(
+        "server {{ listen 127.0.0.1:%%PORT%%;\n\
+           location / {{ client_max_body_size 1k; error_page 413 /e413;\n\
+             return 200 \"ok\"; }}\n\
+           location /up {{ client_max_body_size 1k; error_page 413 /e413;\n\
+             add_header X-Always yes always;\n\
+             proxy_pass http://127.0.0.1:{upstream}; }}\n\
+           location /plain {{ client_max_body_size 1k; add_header X-Always yes always;\n\
+             return 200 \"ok\"; }}\n\
+           location = /e413 {{ client_max_body_size 1k; return 200 \"custom 413 page\"; }} }}"
+    ));
+    let body = vec![b'z'; 5000];
+
+    // Refused from the Content-Length, unread.
+    let resp = post_cl(server.port, "/", &body);
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+    assert!(resp.ends_with("custom 413 page"), "{resp}");
+    assert!(resp.contains("\r\nConnection: close\r\n"), "{resp}");
+
+    // Chunked, refused while reading it.
+    let resp = post_chunked(server.port, "/up", &body, 700);
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+    assert!(resp.ends_with("custom 413 page"), "{resp}");
+
+    // No error_page: the built-in page, with the location's headers.
+    let resp = post_cl(server.port, "/plain", &body);
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+    assert!(resp.contains("\r\nX-Always: yes\r\n"), "{resp}");
+}
