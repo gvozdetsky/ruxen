@@ -478,7 +478,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 let v = args
                     .get(1)
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
-                ssl_session_timeout_ms = Some(parse_duration_ms(v, "ssl_session_timeout")?);
+                ssl_session_timeout_ms = Some(ssl_session_timeout_ms_arg(v)?);
             }
             (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
                 resumption.parse(name, &args)?;
@@ -1002,6 +1002,62 @@ mod tests {
         assert_eq!(entries.len(), expected.len());
         for (entry, expected) in entries.iter().zip(expected) {
             assert_eq!(entry.parts, vec![ValuePart::Literal((*expected).into())]);
+        }
+    }
+
+    #[test]
+    fn time_values_follow_ngx_parse_time() {
+        let ms = |v| parse_time(v, false);
+        let secs = |v| parse_time(v, true);
+        assert_eq!(ms("500ms"), Some(500));
+        assert_eq!(ms("30"), Some(30_000));
+        assert_eq!(ms("1d"), Some(86_400_000));
+        assert_eq!(ms("2w"), Some(14 * 86_400_000));
+        assert_eq!(ms("1h30m"), Some(5_400_000));
+        assert_eq!(ms("1h 30m"), Some(5_400_000));
+        assert_eq!(ms("1m30"), Some(90_000));
+        assert_eq!(ms("1s500ms"), Some(1_500));
+        assert_eq!(secs("1y"), Some(365 * 86_400));
+        assert_eq!(secs("1M"), Some(30 * 86_400));
+        assert_eq!(secs("1d12h"), Some(129_600));
+        assert_eq!(secs("0"), Some(0));
+        // msec directives take neither years nor months, seconds ones no ms.
+        assert_eq!(ms("1y"), None);
+        assert_eq!(ms("1M"), None);
+        assert_eq!(secs("500ms"), None);
+        // Descending order, each unit once, at least one digit.
+        assert_eq!(ms("1m1h"), None);
+        assert_eq!(ms("1s1s"), None);
+        assert_eq!(ms(""), None);
+        assert_eq!(ms("h"), None);
+        assert_eq!(ms("1x"), None);
+        assert_eq!(ms("-1"), None);
+        assert_eq!(secs("9223372036854775807"), Some(i64::MAX));
+        assert_eq!(secs("9223372036854775808"), None);
+        assert_eq!(ms("9223372036854775807"), None);
+        assert_eq!(secs("300000000000y"), None);
+    }
+
+    #[test]
+    fn time_directives_take_days() {
+        let src = r#"
+            http {
+                ssl_session_timeout 1d;
+                keepalive_timeout 1h 1d;
+                client_body_timeout 1d;
+                server { listen 80; proxy_read_timeout 1w; expires 1M;
+                    location / { expires @1h30m; proxy_send_timeout 1d12h; return 200; }
+                }
+            }
+        "#;
+        parse(src).unwrap();
+        for bad in [
+            "http { ssl_session_timeout 500ms; server { listen 80; } }",
+            "http { keepalive_timeout 1y; server { listen 80; } }",
+            "http { server { listen 80; expires 1m1h; } }",
+            "http { server { listen 80; expires @25h; } }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
         }
     }
 
