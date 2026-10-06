@@ -913,7 +913,7 @@ mod tests {
             method_bytes: b"HEAD",
             path: b"/loop",
             request_line: b"",
-            upstream_states: &[],
+            upstream: None,
             http_11: true,
             host: Some(b"h"),
             sni: None,

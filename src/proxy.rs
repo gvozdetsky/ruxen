@@ -770,6 +770,15 @@ impl std::fmt::Display for UpstreamError {
     }
 }
 
+/// What the upstream passes before an internal redirect leave for
+/// `$upstream_*`: every attempt, and the answering upstream's header lines
+/// (as `ProxyReport::upstream_headers`).
+#[derive(Default)]
+pub struct UpstreamTrail {
+    pub states: Vec<UpstreamState>,
+    pub headers: Vec<u8>,
+}
+
 /// What `run_proxy` reports besides the response.
 #[derive(Default)]
 pub struct ProxyReport {
@@ -778,7 +787,8 @@ pub struct ProxyReport {
     pub failures: Vec<AttemptFailure>,
     /// The upstream's own header lines (each ending in CRLF), including
     /// the ones hidden from the client, for `$upstream_http_*`. Filled
-    /// only when `ProxyPlan::keep_upstream_headers` is set.
+    /// only when `ProxyPlan::keep_upstream_headers` is set, or for an
+    /// X-Accel-Redirect.
     pub upstream_headers: Vec<u8>,
     /// The response has a `Location` or `Refresh` header and there are
     /// `proxy_redirect` rules to apply to it.
@@ -1401,7 +1411,10 @@ async fn attempt(
         }
     }
     out.extend_from_slice(b"\r\n");
-    if plan.keep_upstream_headers {
+    // An X-Accel-Redirect target reads them too: its `$upstream_http_*`,
+    // and the headers nginx carries over to its response.
+    let keep_upstream_headers = plan.keep_upstream_headers || skip_body;
+    if keep_upstream_headers {
         upstream_headers.clear();
     }
     let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
@@ -1422,7 +1435,7 @@ async fn attempt(
             None => continue,
         };
         let name = trim_ascii(&line[..colon]);
-        if plan.keep_upstream_headers {
+        if keep_upstream_headers {
             upstream_headers.extend_from_slice(line);
             upstream_headers.extend_from_slice(b"\r\n");
         }

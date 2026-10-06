@@ -376,30 +376,31 @@ async fn settle_proxy_response(
     let upstream_resp = if error_pages.is_empty() {
         upstream_resp
     } else {
-        let pass_ctx = phase::RequestCtx {
-            upstream_states: &report.states,
-            ..*ctx
-        };
-        intercept_proxy_error(
+        intercept_with_report(
             upstream_resp,
+            &mut report,
             error_pages,
             recursive_error_pages,
             http,
-            &pass_ctx,
+            ctx,
             &process_meta,
             server_bytes,
         )
     };
+    let mut carried = Vec::new();
     let (reroute, as_get) = match upstream_resp {
         // `proxy_intercept_errors` or an `error_page` for the proxy's own
         // 502/504.
         Response::Reroute(reroute) => (reroute, false),
         // nginx's ngx_http_upstream_process_headers: the response is dropped
         // and the request redirected internally, as a GET.
-        _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => (
-            accel_redirect(&mut report),
-            !matches!(ctx.method, Method::Head),
-        ),
+        _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => {
+            accel_carried_headers(&report.upstream_headers, &mut carried);
+            (
+                accel_redirect(&mut report),
+                !matches!(ctx.method, Method::Head),
+            )
+        }
         upstream_resp => {
             return finish_proxy_response(
                 upstream_resp,
@@ -412,16 +413,57 @@ async fn settle_proxy_response(
         }
     };
     // Cold. Boxed so its state doesn't grow every connection's future.
+    let limit_rate = report.accel.as_ref().and_then(|a| a.limit_rate);
+    let trail = crate::proxy::UpstreamTrail {
+        states: report.states,
+        headers: report.upstream_headers,
+    };
     Box::pin(settle_redirected(
         http,
         ctx,
         url_scratch,
         reroute,
-        report.states,
+        trail,
+        carried,
         as_get,
-        report.accel.as_ref().and_then(|a| a.limit_rate),
+        limit_rate,
     ))
     .await
+}
+
+/// `intercept_proxy_error` with this pass's attempts and upstream headers
+/// visible to the error page's `$upstream_*`.
+#[allow(clippy::too_many_arguments)]
+fn intercept_with_report(
+    upstream_resp: Response,
+    report: &mut crate::proxy::ProxyReport,
+    error_pages: &'static [PreparedErrorPage],
+    recursive_error_pages: bool,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    process_meta: &phase::ProcessMeta,
+    server_bytes: &'static [u8],
+) -> Response {
+    let trail = crate::proxy::UpstreamTrail {
+        states: std::mem::take(&mut report.states),
+        headers: std::mem::take(&mut report.upstream_headers),
+    };
+    let pass_ctx = phase::RequestCtx {
+        upstream: Some(&trail),
+        ..*ctx
+    };
+    let response = intercept_proxy_error(
+        upstream_resp,
+        error_pages,
+        recursive_error_pages,
+        http,
+        &pass_ctx,
+        process_meta,
+        server_bytes,
+    );
+    report.states = trail.states;
+    report.upstream_headers = trail.headers;
+    response
 }
 
 /// The upstream response goes to the client: apply `proxy_redirect` and
@@ -476,7 +518,11 @@ enum PassOutcome {
     /// the proxy's own 502/504) or an upstream X-Accel-Redirect.
     Redirect {
         reroute: phase::Reroute,
-        states: Vec<crate::proxy::UpstreamState>,
+        /// This pass's attempts and upstream headers.
+        trail: crate::proxy::UpstreamTrail,
+        /// For an X-Accel-Redirect, the upstream headers its target's
+        /// response gets (`accel_carried_headers`).
+        carried: Vec<u8>,
         as_get: bool,
         /// The upstream's `X-Accel-Limit-Rate`: it outlives the redirect
         /// (nginx's `r->limit_rate_set`).
@@ -514,37 +560,47 @@ async fn run_proxy_pass(
     let upstream_resp = if error_pages.is_empty() {
         upstream_resp
     } else {
-        let pass_ctx = phase::RequestCtx {
-            upstream_states: &report.states,
-            ..pass_request(ctx, as_get)
-        };
-        intercept_proxy_error(
+        intercept_with_report(
             upstream_resp,
+            &mut report,
             error_pages,
             recursive_error_pages,
             http,
-            &pass_ctx,
+            &pass_request(ctx, as_get),
             &process_meta,
             server_bytes,
         )
     };
+    let limit_rate = report.accel.as_ref().and_then(|a| a.limit_rate);
     match upstream_resp {
         // `proxy_intercept_errors` or an `error_page` for the proxy's own
         // 502/504.
         Response::Reroute(reroute) => PassOutcome::Redirect {
             reroute,
-            states: report.states,
+            trail: crate::proxy::UpstreamTrail {
+                states: report.states,
+                headers: report.upstream_headers,
+            },
+            carried: Vec::new(),
             as_get,
-            limit_rate: report.accel.as_ref().and_then(|a| a.limit_rate),
+            limit_rate,
         },
         // nginx's ngx_http_upstream_process_headers: the response is dropped
         // and the request redirected internally, as a GET.
-        _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => PassOutcome::Redirect {
-            reroute: accel_redirect(&mut report),
-            states: report.states,
-            as_get: !matches!(ctx.method, Method::Head),
-            limit_rate: report.accel.as_ref().and_then(|a| a.limit_rate),
-        },
+        _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => {
+            let mut carried = Vec::new();
+            accel_carried_headers(&report.upstream_headers, &mut carried);
+            PassOutcome::Redirect {
+                reroute: accel_redirect(&mut report),
+                trail: crate::proxy::UpstreamTrail {
+                    states: report.states,
+                    headers: report.upstream_headers,
+                },
+                carried,
+                as_get: !matches!(ctx.method, Method::Head),
+                limit_rate,
+            }
+        }
         upstream_resp => {
             let (response, process_meta) =
                 finish_proxy_response(upstream_resp, report, redirects, http, ctx, process_meta);
@@ -555,20 +611,24 @@ async fn run_proxy_pass(
 
 /// A proxied request redirected internally: process the target, and if it
 /// proxies again, run that pass too. The attempts of every pass stay in
-/// `$upstream_*`, as nginx keeps them across internal redirects. Bounded
-/// like the reroute loop in `phase` (nginx's `uri_changes`).
+/// `$upstream_*`, as nginx keeps them across internal redirects, and so do
+/// the last upstream's headers (`$upstream_http_*`). An X-Accel-Redirect's
+/// `carried` headers go onto the target's response. Bounded like the
+/// reroute loop in `phase` (nginx's `uri_changes`).
+#[allow(clippy::too_many_arguments)]
 async fn settle_redirected(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     url_scratch: &mut Vec<u8>,
     mut reroute: phase::Reroute,
-    mut states: Vec<crate::proxy::UpstreamState>,
+    mut trail: crate::proxy::UpstreamTrail,
+    mut carried: Vec<u8>,
     mut as_get: bool,
     mut accel_limit_rate: Option<u64>,
 ) -> (Response, phase::ProcessMeta) {
     for _ in 0..phase::MAX_REROUTES {
         let pass_ctx = phase::RequestCtx {
-            upstream_states: &states,
+            upstream: Some(&trail),
             ..pass_request(ctx, as_get)
         };
         let (response, mut process_meta) =
@@ -578,22 +638,26 @@ async fn settle_redirected(
                 phase::ResponseLimit::with_rate(process_meta.limit_rate.take(), rate);
         }
         let Response::Proxy(plan) = response else {
-            process_meta.upstream_states = states;
-            return (response, process_meta);
+            process_meta.upstream_states = trail.states;
+            process_meta.upstream_headers = trail.headers;
+            return (carry_accel_headers(response, &carried, false), process_meta);
         };
         match run_proxy_pass(http, ctx, plan, process_meta, as_get).await {
             PassOutcome::Done(response, mut meta) => {
-                states.append(&mut meta.upstream_states);
-                meta.upstream_states = states;
-                return (response, meta);
+                trail.states.append(&mut meta.upstream_states);
+                meta.upstream_states = trail.states;
+                return (carry_accel_headers(response, &carried, true), meta);
             }
             PassOutcome::Redirect {
                 reroute: next,
-                states: mut more,
+                trail: mut more,
+                carried: more_carried,
                 as_get: next_as_get,
                 limit_rate,
             } => {
-                states.append(&mut more);
+                trail.states.append(&mut more.states);
+                trail.headers = more.headers;
+                carried.extend_from_slice(&more_carried);
                 reroute = next;
                 as_get = next_as_get;
                 accel_limit_rate = limit_rate.or(accel_limit_rate);
@@ -658,6 +722,103 @@ fn accel_redirect_reroute(target: Vec<u8>) -> phase::Reroute {
         enters_error_page: false,
         preserved_location: None,
         preserved_www_authenticate: Vec::new(),
+    }
+}
+
+/// The upstream headers nginx copies onto the request before an
+/// X-Accel-Redirect, so the target's response has them (`redirect` in
+/// ngx_http_upstream_headers_in).
+const ACCEL_CARRIED: [&[u8]; 6] = [
+    b"content-type",
+    b"set-cookie",
+    b"content-disposition",
+    b"cache-control",
+    b"expires",
+    b"accept-ranges",
+];
+
+/// Append the lines of `upstream_headers` (each ending in CRLF) that an
+/// X-Accel-Redirect carries over.
+fn accel_carried_headers(upstream_headers: &[u8], out: &mut Vec<u8>) {
+    for line in upstream_headers.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = line[..colon].trim_ascii();
+        if ACCEL_CARRIED.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
+/// The X-Accel-Redirect target's response with the `carried` upstream
+/// headers. As in nginx, the carried `Content-Type` wins over the
+/// target's own type (it is already set when the target picks one),
+/// unless the target is proxied and its upstream sends one. `Set-Cookie`
+/// and `Accept-Ranges` add up (a static file then has two Accept-Ranges,
+/// as in nginx). The others go in when the target doesn't set them
+/// itself (`expires`). An error response (a missing file, say) is nginx's
+/// special response, which sets its own `text/html` and clears
+/// Accept-Ranges (ngx_http_send_special_response).
+fn carry_accel_headers(response: Response, carried: &[u8], proxied: bool) -> Response {
+    if carried.is_empty() {
+        return response;
+    }
+    let merge = |head: Vec<u8>| {
+        let mut head = head;
+        let error = response_status(&head) >= 400;
+        let mut extra = Vec::new();
+        // Which of ACCEL_CARRIED are in `extra`; the first of a repeated
+        // one wins, as for the upstream's own single-valued headers.
+        let mut added = 0u8;
+        for line in carried.split_inclusive(|&b| b == b'\n') {
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                continue;
+            };
+            let name = line[..colon].trim_ascii();
+            let Some(i) = ACCEL_CARRIED
+                .iter()
+                .position(|h| h.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if error && name.eq_ignore_ascii_case(b"accept-ranges") {
+                continue;
+            }
+            if !name.eq_ignore_ascii_case(b"set-cookie")
+                && !name.eq_ignore_ascii_case(b"accept-ranges")
+            {
+                if added & (1 << i) != 0 {
+                    continue;
+                }
+                if i == 0 && !proxied && !error {
+                    head = strip_header_lines(head, name);
+                } else if response_header_value(&head, name).is_some() {
+                    continue;
+                }
+                added |= 1 << i;
+            }
+            extra.extend_from_slice(line);
+        }
+        let Some(sep) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return head;
+        };
+        let mut out = Vec::with_capacity(head.len() + extra.len());
+        out.extend_from_slice(&head[..sep + 2]);
+        out.extend_from_slice(&extra);
+        out.extend_from_slice(&head[sep + 2..]);
+        out
+    };
+    match response {
+        Response::Prebuilt(bytes) => Response::Owned(merge(bytes.to_vec())),
+        Response::Owned(bytes) => Response::Owned(merge(bytes)),
+        Response::File { headers, body } => Response::File {
+            headers: merge(headers),
+            body,
+        },
+        other => other,
     }
 }
 
@@ -1747,7 +1908,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     method_bytes,
                                     path,
                                     request_line,
-                                    upstream_states: &[],
+                                    upstream: None,
                                     http_11: req.http_11,
                                     host,
                                     sni,
