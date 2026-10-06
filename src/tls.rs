@@ -75,6 +75,8 @@ pub struct HandshakeInfo {
     /// `true` when rustls reported `HandshakeKind::Resumed` for this
     /// connection — drives `$ssl_session_reused`.
     pub session_reused: bool,
+    /// `$ssl_session_id` bytes (`TlsStream::session_id`).
+    pub session_id: Option<[u8; 32]>,
 }
 
 impl HandshakeInfo {
@@ -86,6 +88,7 @@ impl HandshakeInfo {
             protocol_version: conn.protocol_version(),
             negotiated_cipher_suite: conn.negotiated_cipher_suite(),
             session_reused: matches!(conn.handshake_kind(), Some(rustls::HandshakeKind::Resumed)),
+            session_id: stream.session_id().copied(),
         }
     }
 }
@@ -137,7 +140,12 @@ pub fn cipher_suite_iana_name(s: rustls::SupportedCipherSuite) -> &'static str {
 
 /// Wrap a fully-built `rustls::ServerConfig` as a clonable acceptor.
 pub fn acceptor_from_config(cfg: Arc<ServerConfig>) -> TlsAcceptor {
-    TlsAcceptor::from(cfg)
+    let acceptor = TlsAcceptor::from(cfg);
+    if crate::config::SSL_SESSION_ID_USED.load(std::sync::atomic::Ordering::Relaxed) {
+        acceptor.with_session_ids()
+    } else {
+        acceptor
+    }
 }
 
 #[cfg(test)]

@@ -251,9 +251,15 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::SslSessionId => {
-                // ruxen has no API for the resumed session id yet; render
-                // empty (matches nginx outside TLS, and won't make a test
-                // accidentally pass via a stable-looking constant).
+                // nginx's ngx_ssl_get_session_id: the id in lowercase hex,
+                // empty without one (or outside TLS).
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                if let Some(id) = self.tls.and_then(|info| info.session_id.as_ref()) {
+                    for b in id {
+                        out.push(HEX[(b >> 4) as usize]);
+                        out.push(HEX[(b & 0xf) as usize]);
+                    }
+                }
             }
             Variable::SslClientVerify => {
                 // ruxen does not request client certificates. nginx renders

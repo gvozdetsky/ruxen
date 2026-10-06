@@ -403,6 +403,16 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   rotation, client cert auth, OCSP stapling, 0-RTT, hot cert reload,
   password-protected keys, and `proxy_ssl_*` are out of v0.1 scope (see
   README).
+- **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
+  rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
+  When the variable is used and the listen resumes sessions, a full
+  handshake draws 32 random bytes. They are stored in the session as
+  rustls resumption data (`set_resumption_data`), and a TLS 1.3
+  resumption gets them back. The value is 64 hex digits, as nginx's, and
+  stable across resumptions, which is what log correlation and sticky
+  keys need. rustls 0.23 doesn't return the data for a resumed TLS 1.2
+  session, so that one renders empty. Without the variable in the
+  config, handshakes are unchanged.
 
 ## Open questions
 
