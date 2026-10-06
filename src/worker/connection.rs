@@ -281,35 +281,96 @@ pub(crate) struct ConnTimers<'a> {
 }
 
 /// Run `fut` unless `deadline` passes first, using `timer` (see
-/// `ConnTimers`). The operation is polled first, so one that is ready
-/// never waits on the timer.
-pub(crate) async fn with_deadline<F: std::future::Future>(
-    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+/// `ConnTimers`). The operation is polled first, and the timer is armed
+/// only once it has to wait: most reads and writes complete on the first
+/// poll, and they then cost neither a clock read nor a timer update.
+pub(crate) fn with_deadline<F: std::future::Future>(
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
     deadline: monoio::time::Instant,
     fut: F,
-) -> Option<F::Output> {
-    use std::task::Poll;
-    timer.as_mut().reset(deadline);
-    let mut fut = std::pin::pin!(fut);
-    std::future::poll_fn(|cx| {
-        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
-            return Poll::Ready(Some(out));
-        }
-        if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
-    })
-    .await
+) -> Timed<'_, F, impl FnOnce() -> monoio::time::Instant> {
+    Timed {
+        timer,
+        deadline: Some(move || deadline),
+        due: None,
+        fut,
+    }
 }
 
-/// `with_deadline` for a timeout that starts now.
-pub(crate) async fn with_timeout<F: std::future::Future>(
+/// `with_deadline` for a timeout that starts when the operation first
+/// waits, as nginx arms its timer when a read or send would block.
+pub(crate) fn with_timeout<F: std::future::Future>(
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
     timeout: Duration,
     fut: F,
-) -> Option<F::Output> {
-    with_deadline(timer, monoio::time::Instant::now() + timeout, fut).await
+) -> Timed<'_, F, impl FnOnce() -> monoio::time::Instant> {
+    Timed {
+        timer,
+        deadline: Some(move || monoio::time::Instant::now() + timeout),
+        due: None,
+        fut,
+    }
+}
+
+/// The future of `with_deadline` / `with_timeout`: `None` when the timer
+/// fires first.
+pub(crate) struct Timed<'t, F, D> {
+    timer: std::pin::Pin<&'t mut monoio::time::Sleep>,
+    /// Taken when the timer is armed, on the first `Pending`.
+    deadline: Option<D>,
+    /// The operation's own deadline, once armed: the timer may be due a
+    /// little earlier (kept from the previous operation).
+    due: Option<monoio::time::Instant>,
+    fut: F,
+}
+
+/// How much earlier than an operation's deadline the connection's timer
+/// may stay set, rather than being moved for every read and write.
+const TIMER_SLACK: Duration = Duration::from_secs(1);
+
+impl<F, D> std::future::Future for Timed<'_, F, D>
+where
+    F: std::future::Future,
+    D: FnOnce() -> monoio::time::Instant,
+{
+    type Output = Option<F::Output>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        // SAFETY: `fut` is structurally pinned: it is never moved out of
+        // `self`, and `Timed` has no `Drop` impl or `Unpin` impl of its own.
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { std::pin::Pin::new_unchecked(&mut this.fut) };
+        if let Poll::Ready(out) = fut.poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        if let Some(deadline) = this.deadline.take() {
+            let due = deadline();
+            this.due = Some(due);
+            let set = this.timer.deadline();
+            if !this.timer.is_elapsed() && set <= due && set + TIMER_SLACK >= due {
+                // Still set (and polled by this connection) for a moment
+                // before `due`: an early fire is re-armed below.
+                return Poll::Pending;
+            }
+            this.timer.as_mut().reset(due);
+        }
+        if this.timer.as_mut().poll(cx).is_ready() {
+            match this.due {
+                Some(due) if monoio::time::Instant::now() < due => {
+                    this.timer.as_mut().reset(due);
+                    if this.timer.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(None);
+                    }
+                }
+                _ => return Poll::Ready(None),
+            }
+        }
+        Poll::Pending
+    }
 }
 
 /// `write_all` with nginx's `send_timeout`: the connection is given up
