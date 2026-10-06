@@ -44,10 +44,12 @@ Sibling checkouts are expected one directory up:
 The backlog is GitHub issues, nothing else; there is no backlog file.
 
 - Query it: `gh issue list --state open --json number,title,labels,milestone`,
-  narrowed with `--label area:proxy`, `--milestone v0.1.1`, etc. Labels:
+  narrowed with `--label area:proxy`, `--milestone v0.2.0`, etc. Labels:
   `area:{proxy,http,tls,config,static,cli,core,logging}`, `size:{S,M,L}`,
   `nginx-compatibility`, `performance`, `bug`, `documentation`,
-  `good first issue`, `help wanted`. Milestones: `v0.1.1`, `v0.2.0`.
+  `good first issue`, `help wanted`. Milestones: `v0.2.0`, `v0.3.0` (the
+  phases in `ROADMAP.md`). Patch releases after v0.1.2 have no milestone:
+  they are snapshots of main (see `ROADMAP.md`, Releases).
 - One issue = one root cause. Sections: Summary, Repro (minimal config +
   command, nginx vs ruxen), nginx reference (`file.c:line` at 1.24.0),
   Unlocks (nginx-tests files), Notes, Where in ruxen (files, no line
