@@ -758,6 +758,10 @@ pub struct Location {
     /// direct root/alias and for inheritance from server scope (which
     /// is always Root mapping, no prefix needed).
     pub alias_prefix_override: Option<String>,
+    /// The effective `root` / `alias` whatever the handler (`proxy_pass`,
+    /// `return`), or nginx's default `html`: `$request_filename`,
+    /// `$document_root`.
+    pub document_root: (PathBuf, PathMapping),
 }
 
 /// `proxy_next_upstream` bitmask. nginx's defaults are `error | timeout`.
@@ -1409,6 +1413,12 @@ pub enum Variable {
     /// `$server_addr` — the local address of the connection, without
     /// brackets for IPv6 (nginx's ngx_http_variable_server_addr).
     ServerAddr,
+    /// The file the URI maps to under the location's root or alias.
+    RequestFilename,
+    /// The location's root or alias path.
+    DocumentRoot,
+    /// `DocumentRoot` with symlinks resolved.
+    RealpathRoot,
     /// Port part of the request authority — comes from `Host: host:port`
     /// or absolute-form `GET http://host:port/ ...`. Empty if no explicit
     /// port was sent.
