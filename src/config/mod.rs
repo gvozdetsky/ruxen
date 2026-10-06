@@ -208,7 +208,7 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => {}
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(&mut lx)?,
             _ => {
                 return Err(Error::UnknownDirective {
@@ -588,7 +588,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 if client_body_temp_path.is_some() {
                     return Err(Error::Duplicate("client_body_temp_path"));
                 }
-                client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
+                client_body_temp_path =
+                    Some(parse_temp_path_args(&args[1..], "client_body_temp_path")?);
             }
             ("disable_symlinks", Terminator::Semi) => {
                 if disable_symlinks.is_some() {
@@ -699,7 +700,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     .get_or_insert_with(Vec::new)
                     .push(parse_error_log_args(&args[1..])?);
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => {}
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
             (other, _) => {
                 return Err(Error::UnknownDirective {
@@ -805,6 +806,16 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_busy_buffers_size",
     "proxy_request_buffering",
     "proxy_ignore_client_abort",
+    // Temp directories of modules ruxen doesn't have (`fastcgi_pass` and
+    // friends stay unknown), so never used. Container images' default
+    // configurations set all of them. Arguments are checked
+    // (`check_ignored_args`).
+    "fastcgi_temp_path",
+    "uwsgi_temp_path",
+    "scgi_temp_path",
+    // Caches the descriptors of access logs whose path has variables; ruxen
+    // opens access logs once per worker anyway. Arguments are checked.
+    "open_log_file_cache",
     // Read only by the proxy cache (ngx_http_upstream_cache, when
     // `proxy_cache` is set). Without it, which ruxen doesn't implement
     // (`proxy_cache` stays unknown), nginx ignores them too. The WebSocket
@@ -969,6 +980,69 @@ fn parse_events_block(lx: &mut Lexer, runtime: &mut RuntimeOpts) -> Result<(), E
 #[inline]
 pub(crate) fn is_ignored_stmt(name: &str) -> bool {
     IGNORED_STMT.iter().any(|&d| d == name)
+}
+
+/// Validate the arguments of the allowlisted directives whose grammar is
+/// cheap to check, so that a typo still fails `-t` as in nginx. The rest of
+/// `IGNORED_STMT` is accepted with any arguments.
+pub(crate) fn check_ignored_args(args: &[String]) -> Result<(), Error> {
+    let what = match args[0].as_str() {
+        "proxy_temp_path" => "proxy_temp_path",
+        "fastcgi_temp_path" => "fastcgi_temp_path",
+        "uwsgi_temp_path" => "uwsgi_temp_path",
+        "scgi_temp_path" => "scgi_temp_path",
+        "open_log_file_cache" => return check_open_log_file_cache_args(&args[1..]),
+        _ => return Ok(()),
+    };
+    parse_temp_path_args(&args[1..], what).map(drop)
+}
+
+/// `open_log_file_cache max=N [inactive=time] [min_uses=N] [valid=time] | off`
+/// (`ngx_http_log_open_file_cache`).
+fn check_open_log_file_cache_args(args: &[String]) -> Result<(), Error> {
+    const WHAT: &str = "open_log_file_cache";
+    if args.is_empty() {
+        return Err(Error::MissingArg(WHAT));
+    }
+    if args.len() > 4 {
+        return Err(Error::BadValue {
+            what: WHAT,
+            got: args.join(" "),
+        });
+    }
+    let count = |v: &str| v.parse::<u64>().is_ok() && v.bytes().all(|b| b.is_ascii_digit());
+    let (mut max, mut off) = (0_u64, false);
+    for a in args {
+        let ok = if let Some(v) = a.strip_prefix("max=") {
+            max = v.parse().unwrap_or(0);
+            count(v)
+        } else if let Some(v) = a.strip_prefix("min_uses=") {
+            count(v)
+        } else if let Some(v) = a
+            .strip_prefix("inactive=")
+            .or_else(|| a.strip_prefix("valid="))
+        {
+            parse_time(v, true).is_some()
+        } else if a == "off" {
+            off = true;
+            true
+        } else {
+            false
+        };
+        if !ok {
+            return Err(Error::BadValue {
+                what: WHAT,
+                got: a.clone(),
+            });
+        }
+    }
+    if !off && max == 0 {
+        return Err(Error::BadValue {
+            what: "open_log_file_cache (must have \"max\" parameter)",
+            got: args.join(" "),
+        });
+    }
+    Ok(())
 }
 
 #[inline]
@@ -2795,6 +2869,39 @@ mod tests {
             TryFilesProbe::Template { dir: true, .. }
         ));
         assert!(matches!(tf.fallback, TryFilesFallback::UriTemplate(_)));
+    }
+
+    #[test]
+    fn module_temp_paths_and_open_log_file_cache_are_checked_no_ops() {
+        let src = r#"
+            http {
+                fastcgi_temp_path /var/cache/nginx/fastcgi_temp 1 2;
+                uwsgi_temp_path /tmp/u;
+                scgi_temp_path /tmp/s 1;
+                proxy_temp_path /tmp/p 1 2;
+                open_log_file_cache max=1000 inactive=20s valid=1m min_uses=2;
+                server { listen 80; open_log_file_cache off;
+                    location / { fastcgi_temp_path /tmp/f; return 200; }
+                }
+            }
+        "#;
+        parse(src).unwrap();
+        for bad in [
+            "fastcgi_temp_path;",
+            "uwsgi_temp_path /tmp/u 3 0;",
+            "scgi_temp_path /tmp/s 1 2 3 4;",
+            "proxy_temp_path /tmp/p x;",
+            "open_log_file_cache;",
+            "open_log_file_cache inactive=20s;",
+            "open_log_file_cache max=10 inactive=20x;",
+            "open_log_file_cache max=10 valid=500ms;",
+            "open_log_file_cache max=+10;",
+            "open_log_file_cache max=10 maxx=1;",
+            "fastcgi_pass 127.0.0.1:9000;",
+        ] {
+            let src = format!("http {{ {bad} server {{ listen 80; }} }}");
+            assert!(parse(&src).is_err(), "{bad}");
+        }
     }
 
     #[test]

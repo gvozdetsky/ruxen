@@ -872,7 +872,8 @@ pub(crate) fn parse_location_block(
                 if client_body_temp_path.is_some() {
                     return Err(Error::Duplicate("client_body_temp_path"));
                 }
-                client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
+                client_body_temp_path =
+                    Some(parse_temp_path_args(&args[1..], "client_body_temp_path")?);
             }
             ("disable_symlinks", Terminator::Semi) => {
                 if disable_symlinks.is_some() {
@@ -1021,7 +1022,7 @@ pub(crate) fn parse_location_block(
                     ctx: "location",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => {}
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
             (other, _) => {
                 return Err(Error::UnknownDirective {

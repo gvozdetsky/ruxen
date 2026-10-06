@@ -560,7 +560,8 @@ pub(crate) fn parse_server_block(
                 if client_body_temp_path.is_some() {
                     return Err(Error::Duplicate("client_body_temp_path"));
                 }
-                client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
+                client_body_temp_path =
+                    Some(parse_temp_path_args(&args[1..], "client_body_temp_path")?);
             }
             ("location", Terminator::BlockOpen) => {
                 let spec = parse_location_spec(&args[1..])?;
@@ -820,7 +821,7 @@ pub(crate) fn parse_server_block(
                     ctx: "server",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => {}
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
             (other, _) => {
                 return Err(Error::UnknownDirective {

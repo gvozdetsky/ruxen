@@ -136,7 +136,7 @@ pub(crate) fn parse_rewrite_block(lx: &mut Lexer) -> Result<Vec<RewriteOp>, Erro
                     ctx: "if",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => {}
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
             (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
             (other, _) => {
                 return Err(Error::UnknownDirective {
