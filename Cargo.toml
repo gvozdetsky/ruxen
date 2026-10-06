@@ -32,5 +32,10 @@ socket2 = "0.5"
 rustls = "0.23"
 rustls-pemfile = "2"
 
+# musl's allocator is slow on the per-request proxy and TLS paths (#199);
+# the glibc builds keep the system allocator.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [dev-dependencies]
 rcgen = "0.14"
