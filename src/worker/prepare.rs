@@ -1506,6 +1506,15 @@ pub(crate) fn prepare_maps(
             wildcards,
             volatile,
         } = block;
+        // Caching only shows when a result could differ later in the
+        // request; a map of request constants (headers, the client's
+        // address, literals) gives the same value every time.
+        let cached = !volatile
+            && !(request_constant(&key)
+                && exact.iter().all(|e| request_constant(&e.value))
+                && wildcards.iter().all(|e| request_constant(&e.value))
+                && regex.iter().all(|e| request_constant(&e.value))
+                && default.as_deref().is_none_or(request_constant));
         let mut exact_map: std::collections::HashMap<Vec<u8>, &'static [PreparedValuePart]> =
             std::collections::HashMap::with_capacity(exact.len());
         for MapExactEntry { key: k, value } in exact {
@@ -1552,13 +1561,55 @@ pub(crate) fn prepare_maps(
             wildcard_tail: Box::leak(wildcard_tail.into_boxed_slice()),
             regex: Box::leak(regex_entries.into_boxed_slice()),
             default: default.map(prepare_value_parts),
-            volatile,
+            cached,
             slot,
         };
         let var_key: &'static str = Box::leak(variable.into_boxed_str());
         out.insert(var_key, prepared);
     }
     out
+}
+
+/// Whether `parts` render the same all through a request: literals and
+/// variables nothing in the request changes (not `$uri`, `$args`, `set`
+/// or other maps' values, captures, `$request_method`, which an
+/// X-Accel-Redirect turns into GET, or anything upstream or response).
+fn request_constant(parts: &[ValuePart]) -> bool {
+    parts.iter().all(|part| match part {
+        ValuePart::Literal(_) => true,
+        ValuePart::Var(v) => matches!(
+            v,
+            Variable::RequestUri
+                | Variable::Host
+                | Variable::Scheme
+                | Variable::Http(_)
+                | Variable::Cookie(_)
+                | Variable::ContentLength
+                | Variable::ContentType
+                | Variable::RemoteAddr
+                | Variable::RemotePort
+                | Variable::Hostname
+                | Variable::Connection
+                | Variable::ConnectionRequests
+                | Variable::ServerPort
+                | Variable::ServerAddr
+                | Variable::RequestPort
+                | Variable::IsRequestPort
+                | Variable::Request
+                | Variable::ServerProtocol
+                | Variable::SslProtocol
+                | Variable::SslCipher
+                | Variable::SslCiphers
+                | Variable::SslServerName
+                | Variable::SslSessionReused
+                | Variable::SslSessionId
+                | Variable::ProxyProtocolAddr
+                | Variable::ProxyProtocolPort
+                | Variable::ProxyProtocolServerAddr
+                | Variable::ProxyProtocolServerPort
+                | Variable::ProxyProtocolTlv(_)
+        ),
+    })
 }
 
 /// Builder used during `prepare()` to assign sequential `file_index`

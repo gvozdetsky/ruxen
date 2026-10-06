@@ -205,8 +205,9 @@ pub struct PreparedMap {
     pub wildcard_tail: &'static [(Vec<u8>, &'static [PreparedValuePart])],
     pub regex: &'static [PreparedMapRegex],
     pub default: Option<&'static [PreparedValuePart]>,
-    /// `volatile;`: evaluated on every reference.
-    pub volatile: bool,
+    /// Its first result is kept for the request (`RewriteState`): not
+    /// `volatile`, and its key or values can change during a request.
+    pub cached: bool,
     /// This map's index, for the request's cache (`RewriteState`).
     pub slot: usize,
 }

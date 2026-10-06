@@ -437,7 +437,7 @@ impl RenderCtx<'_> {
                 {
                     // The first result stays for the rest of the request
                     // (nginx's cacheable variables), unless `volatile`.
-                    match self.rewrite_state.filter(|_| !program.volatile) {
+                    match self.rewrite_state.filter(|_| program.cached) {
                         Some(state) => {
                             if !state.cached_map(program.slot, out) {
                                 let start = out.len();
