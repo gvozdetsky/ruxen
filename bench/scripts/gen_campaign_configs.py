@@ -472,3 +472,91 @@ gen_sh("tls2", [FILE, '../tls/generate.sh >/dev/null',
     '[ -s $d/rsa-key.pem ] || openssl req -x509 -nodes -newkey rsa:2048 -keyout $d/rsa-key.pem -out $d/rsa-cert.pem -days 365 -subj /CN=localhost -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1',
     "mkdir -p html", "f html/hello1k.txt 1024; f html/1M.bin 1048576"])
 print("ok")
+
+# --- proxy_ext: frontends in front of one external nginx backend ----------------
+KA2 = """            proxy_http_version 1.1;
+            proxy_set_header Connection "";"""
+write("proxy_ext", "Proxy frontends in front of a separate nginx backend (bench/proxy_ext/backend.conf, started once for the whole phase), so both servers under test are measured as proxies only.", f"""
+    client_body_temp_path /tmp/ruxen-bench-body-temp;
+    proxy_temp_path       /tmp/ruxen-bench-proxy-temp;
+
+    upstream ext {{
+        server 127.0.0.1:19140;
+        keepalive 64;
+    }}
+
+    upstream extfiles {{
+        server 127.0.0.1:19141;
+        keepalive 64;
+    }}
+
+    upstream extmisc {{
+        server 127.0.0.1:19142;
+        keepalive 64;
+    }}
+
+    server {{
+        listen 8160 reuseport backlog=4096;
+        server_name _;
+        root html;
+
+        location / {{
+            proxy_pass http://ext;
+{KA2}
+        }}
+        location = /direct {{
+            proxy_pass http://127.0.0.1:19140;
+        }}
+        location /files/ {{
+            proxy_pass http://extfiles;
+{KA2}
+        }}
+        location = /xar {{
+            proxy_pass http://extmisc;
+{KA2}
+        }}
+        location /internal/ {{
+            internal;
+        }}
+    }}
+""")
+with open("bench/proxy_ext/backend.conf", "w") as f:
+    f.write("""# Backend for bench/proxy_ext: a plain nginx, started once for the phase:
+#   nginx -p "$PWD/bench/proxy_ext/" -c "$PWD/bench/proxy_ext/backend.conf"
+worker_processes  4;
+worker_rlimit_nofile 1048576;
+error_log  /tmp/ruxen-bench-proxy_ext-backend-error.log  crit;
+pid        /tmp/ruxen-bench-proxy_ext-backend.pid;
+events {
+    worker_connections  4096;
+    use                 epoll;
+    multi_accept        on;
+}
+http {
+    access_log           off;
+    default_type         text/plain;
+    sendfile             on;
+    tcp_nopush           on;
+    tcp_nodelay          on;
+    keepalive_timeout    65;
+    keepalive_requests   1000000;
+    client_body_temp_path /tmp/ruxen-bench-backend-body-temp;
+
+    server {
+        listen 19140 reuseport backlog=4096;
+        return 200 "hello";
+    }
+    server {
+        listen 19141 reuseport backlog=4096;
+        root html;
+    }
+    server {
+        listen 19142 reuseport backlog=4096;
+        location = /xar {
+            add_header X-Accel-Redirect /internal/hello1k.txt;
+            return 200 "";
+        }
+    }
+}
+""")
+gen_sh("proxy_ext", [FILE, "mkdir -p html/files html/internal", "f html/files/64k.bin 65536; f html/files/1M.bin 1048576; f html/internal/hello1k.txt 1024"])

@@ -87,3 +87,13 @@ tls13_rsa_handshake|TLS 1.3, RSA 2048, a handshake per request|8453|/|16|512|30s
 tls_static_1k|TLS 1.3 static 1 KiB file|8454|/hello1k.txt|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
 tls_static_1m|TLS 1.3 static 1 MiB file|8454|/1M.bin|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
 tls_proxy_hello|TLS 1.3 termination in front of proxy_pass|8455|/|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+#
+# proxy_ext: the server under test is only the proxy; the upstream is a
+# separate nginx (bench/proxy_ext/backend.conf) started once for the phase.
+proxy_ext_hello|proxy to external nginx backend, upstream keep-alive|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_no_keepalive|proxy to external nginx backend, new upstream connection per request|8160|/direct|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_64k|proxy to external nginx backend, 64 KiB response|8160|/files/64k.bin|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_1m|proxy to external nginx backend, 1 MiB response|8160|/files/1M.bin|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_post_1k|POST 1 KiB through proxy to external nginx backend|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|lua|bench/body/post_1k.lua|http
+proxy_ext_post_64k|POST 64 KiB through proxy to external nginx backend|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|lua|bench/body/post_64k.lua|http
+proxy_ext_xar|X-Accel-Redirect from external nginx backend to an internal 1 KiB file|8160|/xar|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http

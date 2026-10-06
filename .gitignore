@@ -10,3 +10,4 @@ __pycache__/
 /bench/logging/html/
 /bench/proxy2/html/
 /bench/tls2/html/
+/bench/proxy_ext/html/
