@@ -146,6 +146,15 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
             let _ = self.write_tls().await;
             return Err(io::Error::new(io::ErrorKind::InvalidData, e));
         }
+        // What rustls queued in answer (the `no_renegotiation` alert for a
+        // TLS 1.2 ClientHello after the handshake, the KeyUpdate a TLS 1.3
+        // `update_requested` asks for) goes out now: the server may be
+        // waiting for request bytes and not write anything else. OpenSSL
+        // writes these from inside SSL_read. The handshake loop flushes on
+        // its own.
+        if self.conn.wants_write() && !self.conn.is_handshaking() {
+            self.write_tls().await?;
+        }
         Ok(n)
     }
 
