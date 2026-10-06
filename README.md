@@ -343,7 +343,7 @@ The following are intentionally outside the current v0.1 scope:
 - full nginx process supervision and binary upgrade behaviour
 - switching workers to an unprivileged `user`
 
-Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on`, `disable_symlinks on|if_not_owner` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on`, and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
 Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
 
