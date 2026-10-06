@@ -356,14 +356,12 @@ pub(crate) fn parse_client_max_body_size_args(args: &[String]) -> Result<u64, Er
 /// `client_body_temp_path path [level1 [level2 [level3]]]`, validated as
 /// nginx's ngx_conf_set_path_slot (each level at least 1, ten digits in
 /// all).
-pub(crate) fn parse_temp_path_args(args: &[String]) -> Result<TempPath, Error> {
+pub(crate) fn parse_temp_path_args(args: &[String], what: &'static str) -> Result<TempPath, Error> {
     let bad = || Error::BadValue {
-        what: "client_body_temp_path",
+        what,
         got: args.join(" "),
     };
-    let (path, levels) = args
-        .split_first()
-        .ok_or(Error::MissingArg("client_body_temp_path"))?;
+    let (path, levels) = args.split_first().ok_or(Error::MissingArg(what))?;
     if path.is_empty() || levels.len() > 3 {
         return Err(bad());
     }
