@@ -1592,6 +1592,9 @@ pub enum TryFilesProbe {
     Literal(String),
     /// Literal path ending with `/`, tested as a directory.
     LiteralSlash(String),
+    /// Any other value with variables (`$uri.html`, `/cache$uri`), rendered
+    /// per request; `dir` when it ends with `/` (tested as a directory).
+    Template { parts: Vec<ValuePart>, dir: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -1601,6 +1604,8 @@ pub enum TryFilesFallback {
     Status(u16),
     /// A URI that re-enters location matching (internal redirect).
     Uri(String),
+    /// A URI with variables (`/index.php?$args`), rendered per request.
+    UriTemplate(Vec<ValuePart>),
     /// An internal-only named location target.
     Named(String),
 }

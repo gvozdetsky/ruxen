@@ -2776,14 +2776,25 @@ mod tests {
     }
 
     #[test]
-    fn try_files_rejects_unknown_variables() {
+    fn try_files_takes_variables_in_probes_and_fallback() {
         let src = r#"
             http { server { listen 80; location / {
                 root /var/www;
-                try_files $uri $request_filename /index.html;
+                try_files $uri $uri.html /cache$uri/ /index.php?q=$uri&$args;
             } } }
         "#;
-        assert!(parse(src).is_err());
+        let cfg = parse(src).unwrap();
+        let tf = cfg.servers[0].locations[0].try_files.as_ref().unwrap();
+        assert!(matches!(tf.probes[0], TryFilesProbe::Uri));
+        assert!(matches!(
+            tf.probes[1],
+            TryFilesProbe::Template { dir: false, .. }
+        ));
+        assert!(matches!(
+            tf.probes[2],
+            TryFilesProbe::Template { dir: true, .. }
+        ));
+        assert!(matches!(tf.fallback, TryFilesFallback::UriTemplate(_)));
     }
 
     #[test]
