@@ -1,0 +1,28 @@
+# Curated real-world nginx configurations. Fetched at run time and cached in
+# corpus/.cache (never committed: their licences vary). Columns:
+#   id <TAB> use <TAB> kind <TAB> url <TAB> entries
+# use:   proxy | static | php | mixed  (what the configuration is for)
+# kind:  file (one configuration)
+#        md   (every ```nginx block of a Markdown page is a case)
+#        git  (a repository at a pinned ref; entries = files to test, ',' separated)
+# Fragments (a server block, a few directives) are wrapped in events/http/server
+# by scripts/corpus.py.
+nginx-default	static	file	https://raw.githubusercontent.com/nginx/nginx/release-1.24.0/conf/nginx.conf
+mastodon	proxy	file	https://raw.githubusercontent.com/mastodon/mastodon/main/dist/nginx.conf
+nextcloud-root	php	file	https://raw.githubusercontent.com/nextcloud/documentation/master/admin_manual/installation/nginx-root.conf.sample
+nextcloud-subdir	php	file	https://raw.githubusercontent.com/nextcloud/documentation/master/admin_manual/installation/nginx-subdir.conf.sample
+certbot-options	proxy	file	https://raw.githubusercontent.com/certbot/certbot/main/certbot/src/certbot/_internal/plugins/nginx/tls_configs/options-ssl-nginx.conf
+gitlab-ssl	proxy	file	https://gitlab.com/gitlab-org/gitlab/-/raw/master/lib/support/nginx/gitlab-ssl
+gitlab	proxy	file	https://gitlab.com/gitlab-org/gitlab/-/raw/master/lib/support/nginx/gitlab
+sentry	proxy	file	https://raw.githubusercontent.com/getsentry/self-hosted/master/nginx.conf
+gunicorn	proxy	file	https://raw.githubusercontent.com/benoitc/gunicorn/master/examples/nginx.conf
+synapse	proxy	md	https://raw.githubusercontent.com/element-hq/synapse/develop/docs/reverse_proxy.md
+vaultwarden	proxy	md	https://raw.githubusercontent.com/wiki/dani-garcia/vaultwarden/Proxy-examples.md
+laravel	php	md	https://raw.githubusercontent.com/laravel/docs/11.x/deployment.md
+puma	proxy	md	https://raw.githubusercontent.com/puma/puma/master/docs/nginx.md
+immich	proxy	md	https://raw.githubusercontent.com/immich-app/immich/main/docs/docs/administration/reverse-proxy.md
+uptime-kuma	proxy	md	https://raw.githubusercontent.com/wiki/louislam/uptime-kuma/Reverse-Proxy.md
+code-server	proxy	md	https://raw.githubusercontent.com/coder/code-server/main/docs/guide.md
+grafana	proxy	md	https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/tutorials/run-grafana-behind-a-proxy/index.md
+jellyfin	proxy	md	https://raw.githubusercontent.com/jellyfin/jellyfin.org/master/docs/general/post-install/networking/8_reverse-proxy/nginx.md
+h5bp	static	git	https://github.com/h5bp/server-configs-nginx	nginx.conf,conf.d/templates/example.com.conf,conf.d/templates/no-ssl.example.com.conf
