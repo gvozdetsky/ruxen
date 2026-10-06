@@ -42,7 +42,7 @@ The v0.1 scope is deliberately limited:
 
 The upstream `nginx-tests` suite is used as a compatibility test. **63 of the 105 test files that ruxen currently opts into pass end-to-end** (v0.1.1).
 
-See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status.
+See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, and [`ROADMAP.md`](ROADMAP.md) for where ruxen is going: first a memory-safe edge server (TLS termination, reverse proxy, static files) that takes your nginx configuration.
 
 ## Quick start
 

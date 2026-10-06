@@ -2,7 +2,9 @@
 
 Rust port of nginx (Linux-only, HTTP/1.1, thread-per-core on monoio/io_uring).
 Read `DESIGN.md` first: philosophy, architecture decisions, and per-milestone
-notes from the nginx C source.
+notes from the nginx C source. `ROADMAP.md` holds the positioning (edge server:
+TLS termination, reverse proxy, static files) and the phases behind the
+milestones.
 
 ## Layout on the dev machine
 
