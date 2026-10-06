@@ -1359,6 +1359,9 @@ pub enum Variable {
     LimitRate,
     /// Listening port from `listen NN;` for the matched server.
     ServerPort,
+    /// `$server_addr` — the local address of the connection, without
+    /// brackets for IPv6 (nginx's ngx_http_variable_server_addr).
+    ServerAddr,
     /// Port part of the request authority — comes from `Host: host:port`
     /// or absolute-form `GET http://host:port/ ...`. Empty if no explicit
     /// port was sent.

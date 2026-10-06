@@ -51,6 +51,24 @@ pub enum Phase {
     Log,
 }
 
+/// What a connection carries for every request on it: the PROXY protocol
+/// header, when the listen has `proxy_protocol`, and `$server_addr`.
+/// Requests point at it, so it costs them one word however much it holds.
+pub struct ConnInfo {
+    pub proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
+    /// The connection's local address as `$server_addr` shows it.
+    pub server_addr: std::borrow::Cow<'static, [u8]>,
+}
+
+impl ConnInfo {
+    /// For request contexts built by tests.
+    #[cfg(test)]
+    pub const NONE: ConnInfo = ConnInfo {
+        proxy_protocol: None,
+        server_addr: std::borrow::Cow::Borrowed(b""),
+    };
+}
+
 /// Per-request inputs the pipeline needs from the parser + connection.
 /// Narrow on purpose — each field added here is a new dependency between
 /// the worker's parse loop and the phase machinery.
@@ -142,7 +160,8 @@ pub struct RequestCtx<'a> {
     pub tls: Option<&'a crate::tls::HandshakeInfo>,
     /// The connection's PROXY protocol header, if its listen has
     /// `proxy_protocol`.
-    pub proxy_protocol: Option<&'a crate::proxy_protocol::ProxyHeader>,
+    /// What the connection carries for every request on it.
+    pub conn: &'a ConnInfo,
     /// The worker already refused the request with this status (400 for an
     /// invalid Host, 400/501 for Transfer-Encoding) and didn't read its
     /// body. `process` answers it at the server level, where the server's
@@ -1621,7 +1640,7 @@ mod tests {
             body_len: 0,
             body_file: None,
             tls: None,
-            proxy_protocol: None,
+            conn: &ConnInfo::NONE,
             refuse: None,
         }
     }

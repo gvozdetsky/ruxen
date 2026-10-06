@@ -1119,6 +1119,9 @@ pub struct PreparedServer {
 /// this bucket only.
 pub struct PreparedListen {
     pub addr: SocketAddr,
+    /// `addr`'s IP as `$server_addr` shows it (no brackets for IPv6); empty
+    /// for a wildcard address, where each connection's own is used.
+    pub addr_text: &'static [u8],
     pub servers: Vec<PreparedServer>,
     /// Index into `servers` for the default server on this listen
     /// address (first declared block today).
