@@ -342,3 +342,38 @@ http {
         assert_eq!(String::from_utf8_lossy(&got), format!("y={want}"), "{args}");
     }
 }
+
+#[test]
+fn map_result_is_cached_for_the_request_unless_volatile() {
+    // nginx caches a map's first result for the rest of the request, past
+    // internal redirects and into the access log (`r->variables`); a
+    // `volatile` map is evaluated on every reference. ruxen used to
+    // re-evaluate every map and reject `volatile`.
+    let conf = r#"
+events {}
+http {
+  map $uri $first { default $uri; }
+  map $uri $every { volatile; default $uri; }
+  log_format m "$uri $first $every";
+
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    access_log %%DIR%%/access.log m;
+    location = /a { rewrite ^ /b?f=$first:$every last; }
+    location = /b { return 200 "$arg_f $first $every"; }
+  }
+}
+"#;
+    let (g, port) = spawn_server(conf);
+
+    assert_eq!(body(&http_get(port, "/a")), b"/a:/a /a /b");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let log = loop {
+        let log = std::fs::read_to_string(g.tempdir.join("access.log")).unwrap_or_default();
+        if !log.is_empty() || std::time::Instant::now() > deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(log, "/b /a /b\n");
+}

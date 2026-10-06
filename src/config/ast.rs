@@ -1119,6 +1119,8 @@ pub struct MapBlock {
     pub hostnames: bool,
     /// The wildcard keys of a `hostnames` map, as written.
     pub wildcards: Vec<MapExactEntry>,
+    /// `volatile;`: the result isn't cached for the rest of the request.
+    pub volatile: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

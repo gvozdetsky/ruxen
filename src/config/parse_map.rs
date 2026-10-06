@@ -184,6 +184,7 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
     let mut regex: Vec<MapRegexEntry> = Vec::new();
     let mut default: Option<Vec<ValuePart>> = None;
     let mut hostnames = false;
+    let mut volatile = false;
     let mut wildcards: Vec<MapExactEntry> = Vec::new();
 
     loop {
@@ -209,10 +210,8 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
             continue;
         }
         if line_args[0] == "volatile" && line_args.len() == 1 {
-            return Err(Error::UnknownDirective {
-                name: line_args[0].clone(),
-                ctx: "map",
-            });
+            volatile = true;
+            continue;
         }
         if line_args.len() != 2 {
             return Err(Error::BadValue {
@@ -297,6 +296,7 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
         default,
         hostnames,
         wildcards,
+        volatile,
     })
 }
 

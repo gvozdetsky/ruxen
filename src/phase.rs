@@ -900,13 +900,13 @@ fn process_with_meta_inner(
                 meta.proxy_chunked_transfer_encoding = loc_chunked_te;
                 meta.proxy_expires = loc_expires;
                 meta.underscores_in_headers = server.underscores_in_headers;
-                if rewrite_state.has_user_vars() {
+                if rewrite_state.worth_keeping() {
                     keep_rewrite_state(&mut meta, rewrite_state);
                 }
                 return (Response::Proxy(plan), meta);
             }
             other => {
-                if rewrite_state.has_user_vars() {
+                if rewrite_state.worth_keeping() {
                     keep_rewrite_state(&mut meta, rewrite_state);
                 }
                 return (other, meta);
