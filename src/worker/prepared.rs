@@ -205,6 +205,10 @@ pub struct PreparedMap {
     pub wildcard_tail: &'static [(Vec<u8>, &'static [PreparedValuePart])],
     pub regex: &'static [PreparedMapRegex],
     pub default: Option<&'static [PreparedValuePart]>,
+    /// `volatile;`: evaluated on every reference.
+    pub volatile: bool,
+    /// This map's index, for the request's cache (`RewriteState`).
+    pub slot: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +220,11 @@ pub struct RewriteState {
     /// to decide whether to apply its configured URI prefix substitution
     /// (when false, the rewritten URI is forwarded as-is to upstream).
     pub(crate) valid_location: bool,
+    /// `map` results already computed for this request, by map slot: nginx
+    /// caches a variable's value in `r->variables` for the rest of the
+    /// request, internal redirects included, unless the map is `volatile`.
+    /// Filled while rendering, which only has `&self`.
+    map_cache: std::cell::RefCell<Vec<(usize, Vec<u8>)>>,
 }
 
 impl Default for RewriteState {
@@ -224,6 +233,7 @@ impl Default for RewriteState {
             user_vars: Vec::new(),
             numbered_captures: Vec::new(),
             valid_location: true,
+            map_cache: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -284,6 +294,31 @@ impl RewriteState {
     /// No `set` ran (the common case; a field check, no name compare).
     pub(crate) fn has_user_vars(&self) -> bool {
         !self.user_vars.is_empty()
+    }
+
+    /// Something later rendering (the access log, a proxied response's
+    /// `add_header`) needs from this state: `set` values or cached maps.
+    pub(crate) fn worth_keeping(&self) -> bool {
+        self.has_user_vars() || !self.map_cache.borrow().is_empty()
+    }
+
+    /// Appends the cached result of map `slot` to `out`, if there is one.
+    pub(crate) fn cached_map(&self, slot: usize, out: &mut Vec<u8>) -> bool {
+        let cache = self.map_cache.borrow();
+        match cache.iter().find(|(s, _)| *s == slot) {
+            Some((_, value)) => {
+                out.extend_from_slice(value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn cache_map(&self, slot: usize, value: &[u8]) {
+        let mut cache = self.map_cache.borrow_mut();
+        if !cache.iter().any(|(s, _)| *s == slot) {
+            cache.push((slot, value.to_vec()));
+        }
     }
 
     pub(crate) fn user_var(&self, name: &str) -> Option<&[u8]> {

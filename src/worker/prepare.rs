@@ -1495,7 +1495,7 @@ pub(crate) fn prepare_maps(
     blocks: Vec<MapBlock>,
 ) -> std::collections::HashMap<&'static str, PreparedMap> {
     let mut out = std::collections::HashMap::new();
-    for block in blocks {
+    for (slot, block) in blocks.into_iter().enumerate() {
         let MapBlock {
             key,
             variable,
@@ -1504,6 +1504,7 @@ pub(crate) fn prepare_maps(
             default,
             hostnames,
             wildcards,
+            volatile,
         } = block;
         let mut exact_map: std::collections::HashMap<Vec<u8>, &'static [PreparedValuePart]> =
             std::collections::HashMap::with_capacity(exact.len());
@@ -1551,6 +1552,8 @@ pub(crate) fn prepare_maps(
             wildcard_tail: Box::leak(wildcard_tail.into_boxed_slice()),
             regex: Box::leak(regex_entries.into_boxed_slice()),
             default: default.map(prepare_value_parts),
+            volatile,
+            slot,
         };
         let var_key: &'static str = Box::leak(variable.into_boxed_str());
         out.insert(var_key, prepared);

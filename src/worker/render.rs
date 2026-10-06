@@ -435,32 +435,17 @@ impl RenderCtx<'_> {
                 if let Some(maps) = self.maps
                     && let Some(program) = maps.get(name.as_str())
                 {
-                    // Render the source key, try exact → wildcards → regex →
-                    // default (nginx's `ngx_http_map_module.c` lookup order).
-                    let mut key = Vec::with_capacity(32);
-                    render_parts(program.key, self, &mut key);
-                    if program.hostnames && key.last() == Some(&b'.') {
-                        key.pop();
-                    }
-                    // The hash lookup is case-insensitive; regexes see the
-                    // value as it is.
-                    let lower = key.to_ascii_lowercase();
-                    if let Some(value) = program.exact.get(lower.as_slice()) {
-                        render_parts(value, self, out);
-                        return;
-                    }
-                    if let Some(value) = map_wildcard(program, &lower) {
-                        render_parts(value, self, out);
-                        return;
-                    }
-                    for entry in program.regex {
-                        if entry.regex.is_match(&key) {
-                            render_parts(entry.value, self, out);
-                            return;
+                    // The first result stays for the rest of the request
+                    // (nginx's cacheable variables), unless `volatile`.
+                    match self.rewrite_state.filter(|_| !program.volatile) {
+                        Some(state) => {
+                            if !state.cached_map(program.slot, out) {
+                                let start = out.len();
+                                render_map(program, self, out);
+                                state.cache_map(program.slot, &out[start..]);
+                            }
                         }
-                    }
-                    if let Some(default) = program.default {
-                        render_parts(default, self, out);
+                        None => render_map(program, self, out),
                     }
                 }
             } // (Vec<u8> values keep the captures slice independent of the
@@ -828,6 +813,35 @@ fn write_upstream_ms(out: &mut Vec<u8>, ms: Option<u64>) {
         b'0' + (frac / 10 % 10) as u8,
         b'0' + (frac % 10) as u8,
     ]);
+}
+
+/// One `map` lookup: render the source key, try exact → wildcards → regex
+/// → default (nginx's `ngx_http_map_module.c` lookup order).
+fn render_map(program: &PreparedMap, ctx: &RenderCtx<'_>, out: &mut Vec<u8>) {
+    let mut key = Vec::with_capacity(32);
+    render_parts(program.key, ctx, &mut key);
+    if program.hostnames && key.last() == Some(&b'.') {
+        key.pop();
+    }
+    // The hash lookup is case-insensitive; regexes see the value as it is.
+    let lower = key.to_ascii_lowercase();
+    if let Some(value) = program.exact.get(lower.as_slice()) {
+        render_parts(value, ctx, out);
+        return;
+    }
+    if let Some(value) = map_wildcard(program, &lower) {
+        render_parts(value, ctx, out);
+        return;
+    }
+    for entry in program.regex {
+        if entry.regex.is_match(&key) {
+            render_parts(entry.value, ctx, out);
+            return;
+        }
+    }
+    if let Some(default) = program.default {
+        render_parts(default, ctx, out);
+    }
 }
 
 /// A `hostnames` map's wildcard match for a lowercased host: the longest
