@@ -67,6 +67,7 @@ pub(crate) fn parse_server_block(
     let mut client_max_body_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
+    let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     let mut post_action: Option<String> = None;
@@ -173,6 +174,7 @@ pub(crate) fn parse_server_block(
                         client_max_body_size,
                         client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
+                        disable_symlinks: disable_symlinks.clone(),
                         limit_rate,
                         limit_rate_after,
                         post_action,
@@ -530,6 +532,12 @@ pub(crate) fn parse_server_block(
                 }
                 limit_rate_after = Some(parse_size_value(&args[1..], "limit_rate_after")?);
             }
+            ("disable_symlinks", Terminator::Semi) => {
+                if disable_symlinks.is_some() {
+                    return Err(Error::Duplicate("disable_symlinks"));
+                }
+                disable_symlinks = Some(parse_disable_symlinks_args(&args[1..])?);
+            }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
                     return Err(Error::Duplicate("sendfile"));
@@ -574,6 +582,7 @@ pub(crate) fn parse_server_block(
                     None,
                     None,
                     client_max_body_size.or(inherited_client_max_body_size),
+                    None,
                     None,
                     None,
                     None,
@@ -759,6 +768,7 @@ pub(crate) fn parse_server_block(
                 | "auth_delay"
                 | "client_max_body_size"
                 | "client_body_temp_path"
+                | "disable_symlinks"
                 | "post_action"
                 | "expires"
                 | "proxy_set_header"

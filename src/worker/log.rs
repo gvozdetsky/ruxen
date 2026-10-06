@@ -236,12 +236,12 @@ fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8]) {
 pub(crate) fn write_lookup_error_log(
     meta: phase::LogMeta,
     req: &ErrorLogRequest<'_>,
-    (message, not_found): (Vec<u8>, bool),
+    (message, not_found, level): (Vec<u8>, bool, ErrorLogLevel),
 ) {
     if not_found && !meta.log_not_found {
         return;
     }
-    write_error_log(meta.error_logs, ErrorLogLevel::Error, req, &message, None);
+    write_error_log(meta.error_logs, level, req, &message, None);
 }
 
 /// Error-log lines for the failed upstream attempts behind a proxied

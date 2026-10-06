@@ -936,7 +936,8 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn head_internal_server_error_from_root_handler_has_no_body() {
+    pub(crate) fn head_error_from_root_handler_has_no_body() {
+        // A symlink loop: ELOOP, a 403 as in nginx's static module.
         let root = unique_dir();
         std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
 
@@ -1008,7 +1009,7 @@ mod tests {
         assert!(
             std::str::from_utf8(&r)
                 .unwrap()
-                .starts_with("HTTP/1.1 500 Internal Server Error")
+                .starts_with("HTTP/1.1 403 Forbidden")
         );
         assert_eq!(response_body(&r), b"");
 

@@ -698,6 +698,8 @@ pub struct PreparedRoot {
     /// time if possible, else on first use; leaked for process lifetime
     /// (closed at exit only).
     pub root_fd: std::os::unix::io::RawFd,
+    /// Effective `disable_symlinks` (`fs_resolve::open_and_stat`).
+    pub symlinks: PreparedSymlinks,
     /// `root` appends the whole URI.
     /// Prefix/exact `alias` strips the matched location prefix before
     /// joining. Regex-location `alias` uses nginx's `add_uri_to_alias`
@@ -715,6 +717,44 @@ pub struct PreparedRoot {
     /// Effective `autoindex_format ...;` for this location.
     pub autoindex_format: AutoindexFormat,
     pub try_files: Option<&'static PreparedTryFiles>,
+}
+
+/// Effective `disable_symlinks` of a location.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedSymlinks {
+    pub mode: crate::config::SymlinkMode,
+    pub from: PreparedSymlinkFrom,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PreparedSymlinkFrom {
+    None,
+    /// `from=$document_root`: the location's root (or alias) path.
+    DocumentRoot,
+    Path(&'static [u8]),
+}
+
+impl PreparedSymlinks {
+    pub(crate) fn new(config: Option<crate::config::DisableSymlinks>) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(config) = config else {
+            return PreparedSymlinks {
+                mode: crate::config::SymlinkMode::Off,
+                from: PreparedSymlinkFrom::None,
+            };
+        };
+        let from = match config.from {
+            None => PreparedSymlinkFrom::None,
+            Some(crate::config::SymlinkFrom::DocumentRoot) => PreparedSymlinkFrom::DocumentRoot,
+            Some(crate::config::SymlinkFrom::Path(p)) => {
+                PreparedSymlinkFrom::Path(Box::leak(p.as_os_str().as_bytes().into()))
+            }
+        };
+        PreparedSymlinks {
+            mode: config.mode,
+            from,
+        }
+    }
 }
 
 thread_local! {
