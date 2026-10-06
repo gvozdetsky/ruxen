@@ -148,7 +148,7 @@ pub(crate) fn parse_expires_static(value: &str, modified: bool) -> Result<Expire
                 got: value.to_string(),
             });
         }
-        let secs = parse_compound_seconds(rest, "expires")?;
+        let secs = parse_expires_time(rest)?;
         if secs < 0 || secs > 24 * 60 * 60 {
             return Err(Error::BadValue {
                 what: "expires (daily time must be < 24h)",
@@ -164,7 +164,7 @@ pub(crate) fn parse_expires_static(value: &str, modified: bool) -> Result<Expire
     } else {
         (false, value)
     };
-    let secs = parse_compound_seconds(num, "expires")?;
+    let secs = parse_expires_time(num)?;
     let signed = if negative { -secs } else { secs };
     Ok(if modified {
         ExpiresDirective::Modified(signed)
@@ -173,73 +173,11 @@ pub(crate) fn parse_expires_static(value: &str, modified: bool) -> Result<Expire
     })
 }
 
-/// Parse a duration spelled in nginx's compound seconds form (e.g.
-/// `1h30m`, `15h30m33s`, `2048`, `7d`). Bare integers are seconds. We don't
-/// support `ms` here because `expires` resolution is whole seconds. Months
-/// (`M`) are 30 days, years (`y`) are 365 days — same as nginx.
-fn parse_compound_seconds(raw: &str, what: &'static str) -> Result<i64, Error> {
-    if raw.is_empty() {
-        return Err(Error::BadValue {
-            what,
-            got: raw.to_string(),
-        });
-    }
-    let bytes = raw.as_bytes();
-    let mut total: i64 = 0;
-    let mut cur: i64 = 0;
-    let mut has_digit = false;
-    for &b in bytes {
-        if b.is_ascii_digit() {
-            cur = cur
-                .checked_mul(10)
-                .and_then(|v| v.checked_add((b - b'0') as i64))
-                .ok_or(Error::BadValue {
-                    what,
-                    got: raw.to_string(),
-                })?;
-            has_digit = true;
-            continue;
-        }
-        if !has_digit {
-            return Err(Error::BadValue {
-                what,
-                got: raw.to_string(),
-            });
-        }
-        let mult: i64 = match b {
-            b'y' => 365 * 24 * 60 * 60,
-            b'M' => 30 * 24 * 60 * 60,
-            b'w' => 7 * 24 * 60 * 60,
-            b'd' => 24 * 60 * 60,
-            b'h' => 60 * 60,
-            b'm' => 60,
-            b's' => 1,
-            _ => {
-                return Err(Error::BadValue {
-                    what,
-                    got: raw.to_string(),
-                });
-            }
-        };
-        total = total
-            .checked_add(cur.checked_mul(mult).ok_or(Error::BadValue {
-                what,
-                got: raw.to_string(),
-            })?)
-            .ok_or(Error::BadValue {
-                what,
-                got: raw.to_string(),
-            })?;
-        cur = 0;
-        has_digit = false;
-    }
-    if has_digit {
-        total = total.checked_add(cur).ok_or(Error::BadValue {
-            what,
-            got: raw.to_string(),
-        })?;
-    }
-    Ok(total)
+fn parse_expires_time(raw: &str) -> Result<i64, Error> {
+    parse_time(raw, true).ok_or_else(|| Error::BadValue {
+        what: "expires",
+        got: raw.to_string(),
+    })
 }
 
 /// Outcome of parsing the modifier+pattern that follow `location` and

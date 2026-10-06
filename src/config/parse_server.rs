@@ -302,7 +302,7 @@ pub(crate) fn parse_server_block(
                 let v = args
                     .get(1)
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
-                ssl_session_timeout_ms = Some(parse_duration_ms(v, "ssl_session_timeout")?);
+                ssl_session_timeout_ms = Some(ssl_session_timeout_ms_arg(v)?);
             }
             // SSL directives we accept-and-ignore at server scope. Matched
             // here (rather than via the global IGNORED_STMT allowlist) so
@@ -1132,8 +1132,8 @@ fn parse_so_keepalive(v: &str) -> Result<SoKeepalive, Error> {
         if s.is_empty() {
             return Ok(None);
         }
-        let ms = parse_duration_ms(s, "listen so_keepalive")?;
-        u32::try_from(ms / 1000)
+        let secs = parse_duration_secs(s, "listen so_keepalive")?;
+        u32::try_from(secs)
             .ok()
             .filter(|&n| n > 0)
             .map(Some)
@@ -1227,27 +1227,103 @@ pub(crate) fn parse_proxy_redirect(
     Ok(())
 }
 
+/// A time value of an msec directive (`ngx_conf_set_msec_slot`), in
+/// milliseconds: `ms` is allowed, `y` and `M` are not.
 pub(crate) fn parse_duration_ms(raw: &str, what: &'static str) -> Result<u64, Error> {
-    let (num, mult) = if let Some(s) = raw.strip_suffix("ms") {
-        (s, 1_u64)
-    } else if let Some(s) = raw.strip_suffix('s') {
-        (s, 1_000_u64)
-    } else if let Some(s) = raw.strip_suffix('m') {
-        (s, 60_000_u64)
-    } else if let Some(s) = raw.strip_suffix('h') {
-        (s, 3_600_000_u64)
-    } else {
-        // nginx defaults to seconds for bare integer values.
-        (raw, 1_000_u64)
-    };
-    let value = num.parse::<u64>().map_err(|_| Error::BadValue {
-        what,
-        got: raw.to_string(),
-    })?;
-    value.checked_mul(mult).ok_or(Error::BadValue {
-        what,
+    parse_time(raw, false)
+        .map(|v| v as u64)
+        .ok_or_else(|| Error::BadValue {
+            what,
+            got: raw.to_string(),
+        })
+}
+
+/// A time value of a seconds directive (`ngx_conf_set_sec_slot`), in
+/// seconds: `y` and `M` are allowed, `ms` is not.
+pub(crate) fn parse_duration_secs(raw: &str, what: &'static str) -> Result<u64, Error> {
+    parse_time(raw, true)
+        .map(|v| v as u64)
+        .ok_or_else(|| Error::BadValue {
+            what,
+            got: raw.to_string(),
+        })
+}
+
+/// `ssl_session_timeout` is a seconds directive; ruxen keeps it in ms.
+pub(crate) fn ssl_session_timeout_ms_arg(raw: &str) -> Result<u64, Error> {
+    let secs = parse_duration_secs(raw, "ssl_session_timeout")?;
+    secs.checked_mul(1000).ok_or_else(|| Error::BadValue {
+        what: "ssl_session_timeout",
         got: raw.to_string(),
     })
+}
+
+/// Port of `ngx_parse_time` (src/core/ngx_parse.c): parts such as `1h30m`
+/// in descending unit order (`y M w d h m s ms`), each unit at most once;
+/// a trailing bare number is seconds. Returns seconds when `is_sec`,
+/// milliseconds otherwise; `None` where nginx returns NGX_ERROR.
+pub(crate) fn parse_time(raw: &str, is_sec: bool) -> Option<i64> {
+    #[derive(PartialEq, PartialOrd)]
+    enum Step {
+        Start,
+        Year,
+        Month,
+        Week,
+        Day,
+        Hour,
+        Min,
+        Sec,
+        Msec,
+        Last,
+    }
+    const DAY: i64 = 60 * 60 * 24;
+    let b = raw.as_bytes();
+    let mut step = if is_sec { Step::Start } else { Step::Month };
+    let (mut valid, mut value, mut total) = (false, 0_i64, 0_i64);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        i += 1;
+        if c.is_ascii_digit() {
+            value = value.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+            valid = true;
+            continue;
+        }
+        let (next, mut scale) = match c {
+            b'y' if step == Step::Start => (Step::Year, 365 * DAY),
+            b'M' if step < Step::Month => (Step::Month, 30 * DAY),
+            b'w' if step < Step::Week => (Step::Week, 7 * DAY),
+            b'd' if step < Step::Day => (Step::Day, DAY),
+            b'h' if step < Step::Hour => (Step::Hour, 60 * 60),
+            b'm' if b.get(i) == Some(&b's') => {
+                if is_sec || step >= Step::Msec {
+                    return None;
+                }
+                i += 1;
+                (Step::Msec, 1)
+            }
+            b'm' if step < Step::Min => (Step::Min, 60),
+            b's' if step < Step::Sec => (Step::Sec, 1),
+            b' ' if step < Step::Sec => (Step::Last, 1),
+            _ => return None,
+        };
+        if next != Step::Msec && !is_sec {
+            scale *= 1000;
+        }
+        step = next;
+        total = total.checked_add(value.checked_mul(scale)?)?;
+        value = 0;
+        while b.get(i) == Some(&b' ') {
+            i += 1;
+        }
+    }
+    if !valid {
+        return None;
+    }
+    if !is_sec {
+        value = value.checked_mul(1000)?;
+    }
+    total.checked_add(value)
 }
 
 pub(crate) fn parse_keepalive_timeout_args(args: &[String]) -> Result<KeepaliveTimeout, Error> {
@@ -1258,20 +1334,10 @@ pub(crate) fn parse_keepalive_timeout_args(args: &[String]) -> Result<KeepaliveT
         });
     }
     let timeout_ms = parse_duration_ms(&args[0], "keepalive_timeout")?;
-    // The second arg becomes the `Keep-Alive: timeout=N` hint, which uses
-    // integer seconds on the wire. Reject sub-second values rather than
-    // rounding to zero (nginx errors out instead of emitting `timeout=0`).
+    // The second arg becomes the `Keep-Alive: timeout=N` hint, in whole
+    // seconds: nginx parses it as seconds, so `ms` is rejected.
     let header_timeout_secs = match args.get(1) {
-        Some(v) => {
-            let ms = parse_duration_ms(v, "keepalive_timeout header")?;
-            if ms % 1_000 != 0 {
-                return Err(Error::BadValue {
-                    what: "keepalive_timeout header (must be whole seconds)",
-                    got: v.clone(),
-                });
-            }
-            Some(ms / 1_000)
-        }
+        Some(v) => Some(parse_duration_secs(v, "keepalive_timeout header")?),
         None => None,
     };
     Ok(KeepaliveTimeout {
