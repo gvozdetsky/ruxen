@@ -35,6 +35,7 @@ git clone https://github.com/gvozdetsky/ruxen.git
 cd ruxen
 cargo build --release
 cargo test --release
+git config core.hooksPath .githooks   # refuse commits that aren't rustfmt-clean
 ```
 
 Integration tests (`tests/*.rs`) start the real binary on loopback ports; the
@@ -82,7 +83,8 @@ welcome — open an issue with the "Benchmark results" template.
 
 - **One logical change per PR**, with a test that fails before it and passes
   after. Behaviour changes need an integration test under `tests/`.
-- **`cargo fmt`** before committing; CI runs `cargo fmt --check`. Clippy is
+- **`cargo fmt`** before committing; CI runs `cargo fmt --check`, and the
+  hook in `.githooks/` (enabled in Setup) catches it locally. Clippy is
   not gated yet — please don't mix clippy-only cleanups into feature PRs.
 - **Run `cargo test --release`.** If you touched request handling, also run
   the relevant nginx-tests files and say which ones in the PR.
