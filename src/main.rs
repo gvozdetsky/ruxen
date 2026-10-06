@@ -35,6 +35,12 @@ mod upstream;
 mod uri;
 mod worker;
 
+/// musl's malloc costs the static build most of its proxy and TLS
+/// throughput (#199). glibc builds keep the system allocator.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 static SIGQUIT_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGTERM_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGHUP_SEEN: AtomicBool = AtomicBool::new(false);
