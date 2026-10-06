@@ -262,6 +262,26 @@ impl RewriteState {
         }
     }
 
+    /// `set_numbered_from_regex_captures` from capture ranges taken
+    /// earlier (index 0 is the whole match).
+    pub(crate) fn set_numbered_from_ranges(
+        &mut self,
+        subject: &[u8],
+        ranges: &[Option<(usize, usize)>],
+    ) {
+        self.clear_numbered_captures();
+        for (n, range) in ranges.iter().enumerate().take(10).skip(1) {
+            if let Some((start, end)) = range {
+                self.set_numbered_capture(n, &subject[*start..*end]);
+            }
+        }
+    }
+
+    /// Whether a regex left `$1`…`$9` to render later.
+    pub(crate) fn has_numbered_captures(&self) -> bool {
+        self.numbered_captures.iter().any(|c| !c.is_empty())
+    }
+
     pub(crate) fn set_numbered_from_regex_captures(
         &mut self,
         captures: &regex::bytes::Captures<'_>,

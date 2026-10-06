@@ -14,7 +14,7 @@ pub(crate) fn parse_split_clients_block(
             got: args.join(" "),
         });
     }
-    let key = parse_value_with_vars(&args[0])?;
+    let key = parse_value_without_captures(&args[0])?;
     reject_sent_http_parts(&key, "split_clients key ($sent_http_* unavailable)")?;
     let variable = parse_rewrite_variable_name(&args[1], "split_clients variable")?;
 
@@ -59,7 +59,7 @@ pub(crate) fn parse_split_clients_block(
             }
             Some(parse_split_percent_hundredths(&line_args[0])?)
         };
-        let value = parse_value_with_vars(&line_args[1])?;
+        let value = parse_value_without_captures(&line_args[1])?;
         reject_sent_http_parts(&value, "split_clients value ($sent_http_* unavailable)")?;
         parts_raw.push((percent, value));
     }
@@ -176,7 +176,7 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
             got: args.join(" "),
         });
     }
-    let key = parse_value_with_vars(&args[0])?;
+    let key = parse_value_without_captures(&args[0])?;
     reject_sent_http_parts(&key, "map key ($sent_http_* unavailable)")?;
     let variable = parse_rewrite_variable_name(&args[1], "map variable")?;
 
@@ -220,7 +220,7 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
             });
         }
         let (lhs, rhs) = (&line_args[0], &line_args[1]);
-        let value = parse_value_with_vars(rhs)?;
+        let value = parse_value_without_captures(rhs)?;
         reject_sent_http_parts(&value, "map value ($sent_http_* unavailable)")?;
 
         if lhs == "default" {

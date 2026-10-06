@@ -71,7 +71,36 @@ pub(crate) fn guard_file_test(kind: FileTestKind, path: &[u8]) -> bool {
     }
 }
 
-pub(crate) fn eval_guard(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> bool {
+/// What an `if` regex does to `$1`…`$9`, as nginx's script regex code: a
+/// match sets them from its subject and capture ranges (whether the test
+/// is `~` or `!~`), no match clears them.
+pub(crate) enum GuardCaptures {
+    Unchanged,
+    Clear,
+    Set(Vec<u8>, Vec<Option<(usize, usize)>>),
+}
+
+/// Whether an `if` condition holds, and what it does to the captures.
+pub(crate) fn eval_guard(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> (bool, GuardCaptures) {
+    if let PreparedGuard::Regex {
+        left,
+        regex,
+        negated,
+    } = guard
+    {
+        let left = render_variable_to_vec(left, ctx);
+        let Some(captures) = regex.captures(&left) else {
+            return (*negated, GuardCaptures::Clear);
+        };
+        let ranges = (0..captures.len())
+            .map(|n| captures.get(n).map(|m| (m.start(), m.end())))
+            .collect();
+        return (!*negated, GuardCaptures::Set(left, ranges));
+    }
+    (eval_guard_plain(guard, ctx), GuardCaptures::Unchanged)
+}
+
+fn eval_guard_plain(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> bool {
     match guard {
         PreparedGuard::VarTruthy(var) => {
             let rendered = render_variable_to_vec(var, ctx);
@@ -298,7 +327,15 @@ pub(crate) fn execute_rewrite_ops(
                     captures_slice,
                     rewrite_state,
                 );
-                if eval_guard(guard, &ctx) {
+                let (holds, captures) = eval_guard(guard, &ctx);
+                match captures {
+                    GuardCaptures::Unchanged => {}
+                    GuardCaptures::Clear => rewrite_state.clear_numbered_captures(),
+                    GuardCaptures::Set(subject, ranges) => {
+                        rewrite_state.set_numbered_from_ranges(&subject, &ranges);
+                    }
+                }
+                if holds {
                     match execute_rewrite_ops(
                         body,
                         http,
@@ -323,6 +360,8 @@ pub(crate) fn execute_rewrite_ops(
                 drop_args,
             } => {
                 let Some(captures) = regex.captures(uri_path.as_slice()) else {
+                    // nginx's script regex code clears them on no match.
+                    rewrite_state.clear_numbered_captures();
                     continue;
                 };
                 rewrite_state.set_numbered_from_regex_captures(&captures, uri_path);

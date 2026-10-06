@@ -37,7 +37,7 @@ pub(crate) fn parse_log_format_args(args: &[String]) -> Result<LogFormatDef, Err
     Ok(LogFormatDef {
         name,
         escape,
-        value: parse_value_with_vars(&value)?,
+        value: parse_value_without_captures(&value)?,
     })
 }
 
