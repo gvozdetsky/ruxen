@@ -385,7 +385,7 @@ pub(crate) fn run_location_handler(
         pipe: req.pipe,
         request_length: req.request_length,
         request_body: req.body,
-        request_body_file: req.body_file,
+        request_body_file: req.body_file.map_or(&[][..], |f| f.path_bytes()),
         // Filled in by access-log render after the response is on the wire;
         // handler-time templates that touch these read 0.
         bytes_sent: 0,
@@ -539,13 +539,14 @@ pub(crate) fn run_location_handler(
         };
         // A body too large to keep in memory is only in the temp file;
         // `run_proxy` streams it after the header block.
-        let body_file = (forward_len > forward_body.len() as u64).then(|| {
-            use std::os::unix::ffi::OsStrExt;
-            crate::proxy::RequestBodyFile {
-                path: std::path::PathBuf::from(std::ffi::OsStr::from_bytes(req.body_file)),
+        let body_file = req
+            .body_file
+            .filter(|_| forward_len > forward_body.len() as u64)
+            .and_then(|spilled| spilled.reader().ok())
+            .map(|file| crate::proxy::RequestBodyFile {
+                file,
                 len: forward_len,
-            }
-        });
+            });
         // Synthesize Content-Length when forwarding a body; nginx always
         // emits CL on the upstream side, recomputed from the actual
         // forwarded byte count regardless of the client header.

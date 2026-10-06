@@ -134,7 +134,7 @@ pub struct RequestCtx<'a> {
     pub body_len: u64,
     /// Path to a temp file containing the request body when the worker
     /// spilled it. Empty when no spill file exists.
-    pub body_file: &'a [u8],
+    pub body_file: Option<&'a crate::worker::SpilledBody>,
     /// Negotiated TLS handshake info, taken once at handshake completion.
     /// `None` for plain-HTTP connections. Drives `$scheme` and `$ssl_*`
     /// variable rendering; otherwise untouched on the hot path.
@@ -1119,6 +1119,9 @@ pub(crate) struct FirstBodyLimit {
     pub max: u64,
     pub error_logs: &'static [PreparedErrorLog],
     pub server_name: &'static [u8],
+    /// `client_body_in_file_only on`: a temp file holding the body
+    /// outlives the request (nginx's `request_body_in_persistent_file`).
+    pub persistent: bool,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -1175,6 +1178,10 @@ pub(crate) fn first_body_limit(
             .unwrap_or(crate::worker::DEFAULT_CLIENT_MAX_BODY_SIZE),
         error_logs: loc.error_logs,
         server_name: server.primary_server_name,
+        persistent: matches!(
+            loc.client_body_in_file_only,
+            crate::config::ClientBodyInFileOnly::On
+        ),
     })
 }
 
@@ -1611,7 +1618,7 @@ mod tests {
             epoch_ms: 0,
             body: &[],
             body_len: 0,
-            body_file: &[],
+            body_file: None,
             tls: None,
             proxy_protocol: None,
             refuse: None,

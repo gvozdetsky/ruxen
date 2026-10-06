@@ -398,6 +398,10 @@ fn real_main() -> Result<(), Failure> {
                 if let Some(path) = &monitor_pid_path {
                     let _ = std::fs::remove_file(path);
                 }
+                // Request-body temp files in flight have no names (they
+                // were unlinked at creation), so the private directory is
+                // empty unless `client_body_in_file_only on` kept some.
+                http.body_temp.remove_private_if_empty();
                 std::process::exit(0);
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {

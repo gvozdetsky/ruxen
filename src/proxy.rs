@@ -145,9 +145,10 @@ pub struct ProxyPlan {
     pub response: &'static crate::worker::ProxyResponseRules,
 }
 
-/// The temp file holding a large request body, and its length.
+/// The temp file holding a large request body (an open descriptor: the
+/// name may already be gone), and its length.
 pub struct RequestBodyFile {
-    pub path: std::path::PathBuf,
+    pub file: std::fs::File,
     pub len: u64,
 }
 
@@ -1528,14 +1529,17 @@ async fn send_body_file(
     send_timeout: Duration,
 ) -> Result<(), UpstreamError> {
     use monoio::buf::IoBuf;
-    use std::io::Read;
-    let mut source = std::fs::File::open(&file.path).map_err(UpstreamError::SendFailed)?;
+    use std::os::unix::fs::FileExt;
+    // Positional reads from the start: each attempt re-sends the whole
+    // body through the same descriptor.
+    let mut offset = 0u64;
     let mut left = file.len;
     let mut buf = vec![0u8; 64 * 1024];
     while left > 0 {
         let want = left.min(buf.len() as u64) as usize;
-        let n = source
-            .read(&mut buf[..want])
+        let n = file
+            .file
+            .read_at(&mut buf[..want], offset)
             .map_err(UpstreamError::SendFailed)?;
         if n == 0 {
             return Err(UpstreamError::SendFailed(
@@ -1548,6 +1552,7 @@ async fn send_body_file(
         buf = returned.into_inner();
         res.map_err(UpstreamError::SendFailed)?;
         left -= n as u64;
+        offset += n as u64;
     }
     Ok(())
 }

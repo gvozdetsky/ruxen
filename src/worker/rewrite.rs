@@ -229,7 +229,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
         pipe: req.pipe,
         request_length: req.request_length,
         request_body: req.body,
-        request_body_file: req.body_file,
+        request_body_file: req.body_file.map_or(&[][..], |f| f.path_bytes()),
         bytes_sent: 0,
         body_bytes_sent: 0,
         epoch_secs: req.epoch_secs,

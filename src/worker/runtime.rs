@@ -686,7 +686,7 @@ async fn run_post_action(
         path: post_path,
         body: empty,
         body_len: 0,
-        body_file: empty,
+        body_file: None,
         refuse: None,
         ..*base_ctx
     };
@@ -1788,14 +1788,18 @@ pub(crate) async fn handle<S: ConnIo>(
                         // location; the matched location checks its own
                         // limit after the read either way.
                         let mut max_body = http.max_request_body;
+                        // `client_body_in_file_only on` where the request goes:
+                        // a temp file holding the body outlives it.
+                        let mut persistent_body = false;
                         let has_body = req.content_length.is_some_and(|cl| cl > 0)
                             || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
                             let cl = req.content_length.unwrap_or(0);
-                            let probe = request_ctx!(&[], cl, &[], req.consumed as u64 + cl, 0, 0);
+                            let probe = request_ctx!(&[], cl, None, req.consumed as u64 + cl, 0, 0);
                             if let Some(first) =
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
+                                persistent_body = first.persistent;
                                 max_body = match first.max {
                                     0 => u64::MAX,
                                     n => n,
@@ -1851,6 +1855,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut sink = BodySink::with_capacity(
                             req.content_length.unwrap_or(0),
                             &http.body_temp,
+                            persistent_body,
                         );
                         let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
                             (0, 0)
@@ -1956,12 +1961,13 @@ pub(crate) async fn handle<S: ConnIo>(
                         // temp-file path bytes for `$request_body_file`.
                         let request_body_file = match spooled {
                             Some(file) => Some(file),
-                            None => maybe_spill_request_body_to_file(&body_vec, &http.body_temp),
+                            None => maybe_spill_request_body_to_file(
+                                &body_vec,
+                                &http.body_temp,
+                                persistent_body,
+                            ),
                         };
-                        let body_file = request_body_file
-                            .as_ref()
-                            .map(SpilledBody::path_bytes)
-                            .unwrap_or(&[]);
+                        let body_file = request_body_file.as_ref();
                         let request_total_consumed = req.consumed + body_in_buf;
                         let request_length = req.consumed as u64 + request_body_len as u64;
                         let now = std::time::SystemTime::now()
@@ -1980,14 +1986,6 @@ pub(crate) async fn handle<S: ConnIo>(
                         );
                         let (response, mut process_meta) =
                             phase::process_with_meta(http, &ctx, &mut *url_scratch);
-                        if let Some(spilled) = request_body_file.as_ref() {
-                            if matches!(
-                                process_meta.client_body_in_file_only,
-                                crate::config::ClientBodyInFileOnly::On
-                            ) {
-                                spilled.set_keep(true);
-                            }
-                        }
 
                         let (response, settled_meta) = settle_proxy_response(
                             http,

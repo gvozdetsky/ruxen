@@ -290,8 +290,11 @@ fn make_private_dir() -> Option<std::path::PathBuf> {
 
 /// Creates a new request-body temp file in `temp`: `0600`, `O_EXCL` (a
 /// name that exists, or a symlink there, is skipped, never opened), named
-/// like nginx's (`0000000042`).
-fn new_body_file(temp: &BodyTempDir) -> Option<(std::fs::File, SpilledBody)> {
+/// like nginx's (`0000000042`). Unless `persistent`, the name is removed
+/// right away and only the open file remains, as nginx's
+/// `ngx_create_temp_file`: nothing is left behind whatever happens to the
+/// process.
+fn new_body_file(temp: &BodyTempDir, persistent: bool) -> Option<SpilledBody> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut dir = temp.dir(false)?;
     let mut remade = false;
@@ -321,13 +324,16 @@ fn new_body_file(temp: &BodyTempDir) -> Option<(std::fs::File, SpilledBody)> {
             .open(&path)
         {
             Ok(file) => {
+                if !persistent {
+                    let _ = std::fs::remove_file(&path);
+                }
                 let path_bytes = path.to_string_lossy().into_owned().into_bytes();
-                let spilled = SpilledBody {
+                return Some(SpilledBody {
+                    file,
                     path,
                     path_bytes,
-                    keep: std::cell::Cell::new(false),
-                };
-                return Some((file, spilled));
+                    persistent,
+                });
             }
             // Taken (another process, or a kept file): jump ahead, as
             // nginx's ngx_next_temp_number(1).
@@ -343,16 +349,17 @@ fn new_body_file(temp: &BodyTempDir) -> Option<(std::fs::File, SpilledBody)> {
     None
 }
 
-/// Owns the on-disk temp file for a spilled request body. The file is
-/// unlinked when this guard drops at end-of-request, mirroring nginx's
-/// default `client_body_in_file_only off`. Set `keep` to true (after the
-/// matched location is known) when `client_body_in_file_only on` so the
-/// file persists past the response.
+/// A request body in a temp file. The file stays open: the proxy reads the
+/// body back through it, from the start, for each attempt. Unless
+/// `client_body_in_file_only on` made it persistent, its name is already
+/// gone (`new_body_file`), and the space is freed when the last descriptor
+/// closes. `$request_body_file` still shows the name, as in nginx.
 pub(crate) struct SpilledBody {
+    file: std::fs::File,
     path: std::path::PathBuf,
     /// Cached UTF-8 bytes of `path` for cheap `&[u8]` rendering.
     path_bytes: Vec<u8>,
-    keep: std::cell::Cell<bool>,
+    persistent: bool,
 }
 
 impl SpilledBody {
@@ -360,14 +367,16 @@ impl SpilledBody {
         &self.path_bytes
     }
 
-    pub(crate) fn set_keep(&self, keep: bool) {
-        self.keep.set(keep);
+    /// A descriptor of its own for reading the body back.
+    pub(crate) fn reader(&self) -> std::io::Result<std::fs::File> {
+        self.file.try_clone()
     }
-}
 
-impl Drop for SpilledBody {
-    fn drop(&mut self) {
-        if !self.keep.get() {
+    /// After a failed write: a persistent file has a name to remove. (A
+    /// non-persistent one has none, and removing by name could hit
+    /// another request's file of the same name.)
+    fn discard(&self) {
+        if self.persistent {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -376,13 +385,16 @@ impl Drop for SpilledBody {
 pub(crate) fn maybe_spill_request_body_to_file(
     body: &[u8],
     temp: &BodyTempDir,
+    persistent: bool,
 ) -> Option<SpilledBody> {
     if body.len() <= REQUEST_BODY_FILE_THRESHOLD {
         return None;
     }
-    // On a failed write the guard removes the partial file.
-    let (mut file, spilled) = new_body_file(temp)?;
-    file.write_all(body).ok()?;
+    let spilled = new_body_file(temp, persistent)?;
+    if (&spilled.file).write_all(body).is_err() {
+        spilled.discard();
+        return None;
+    }
     Some(spilled)
 }
 
@@ -395,21 +407,24 @@ pub(crate) const REQUEST_BODY_IN_MEMORY: usize = 1 << 20;
 pub(crate) const DEFAULT_CLIENT_MAX_BODY_SIZE: u64 = 1 << 20;
 
 /// Collects a request body: in memory up to `REQUEST_BODY_IN_MEMORY`, then
-/// in a temp file (removed with the `SpilledBody` unless kept).
+/// in a temp file (see `SpilledBody`).
 pub(crate) struct BodySink<'t> {
     mem: Vec<u8>,
-    file: Option<(std::fs::File, SpilledBody)>,
+    file: Option<SpilledBody>,
     len: u64,
     temp: &'t BodyTempDir,
+    /// `client_body_in_file_only on` for the location the request goes to.
+    persistent: bool,
 }
 
 impl<'t> BodySink<'t> {
-    pub(crate) fn with_capacity(expected: u64, temp: &'t BodyTempDir) -> Self {
+    pub(crate) fn with_capacity(expected: u64, temp: &'t BodyTempDir, persistent: bool) -> Self {
         BodySink {
             mem: Vec::with_capacity(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
             file: None,
             len: 0,
             temp,
+            persistent,
         }
     }
 
@@ -420,17 +435,24 @@ impl<'t> BodySink<'t> {
     /// Append `data`; `false` if the temp file couldn't be written.
     pub(crate) fn extend(&mut self, data: &[u8]) -> bool {
         if self.file.is_none() && self.mem.len() + data.len() > REQUEST_BODY_IN_MEMORY {
-            let Some((mut file, spilled)) = new_body_file(self.temp) else {
+            let Some(spilled) = new_body_file(self.temp, self.persistent) else {
                 return false;
             };
-            if file.write_all(&self.mem).is_err() {
+            if (&spilled.file).write_all(&self.mem).is_err() {
+                spilled.discard();
                 return false;
             }
             self.mem = Vec::new();
-            self.file = Some((file, spilled));
+            self.file = Some(spilled);
         }
-        let ok = match &mut self.file {
-            Some((file, _)) => file.write_all(data).is_ok(),
+        let ok = match &self.file {
+            Some(spilled) => {
+                let ok = (&spilled.file).write_all(data).is_ok();
+                if !ok {
+                    spilled.discard();
+                }
+                ok
+            }
             None => {
                 self.mem.extend_from_slice(data);
                 true
@@ -443,7 +465,7 @@ impl<'t> BodySink<'t> {
     /// The in-memory body (empty when spilled) and the file, if any.
     pub(crate) fn finish(self) -> (Vec<u8>, Option<SpilledBody>) {
         match self.file {
-            Some((_, spilled)) => (Vec::new(), Some(spilled)),
+            Some(spilled) => (Vec::new(), Some(spilled)),
             None => (self.mem, None),
         }
     }
@@ -916,7 +938,7 @@ mod tests {
             epoch_ms: 0,
             body: &[],
             body_len: 0,
-            body_file: &[],
+            body_file: None,
             tls: None,
             proxy_protocol: None,
             refuse: None,
