@@ -1062,6 +1062,22 @@ mod tests {
     }
 
     #[test]
+    fn server_without_listen_listens_on_80_or_8000() {
+        let cfg = parse("http { server { server_name a.test; return 200; } }").unwrap();
+        let port = if unsafe { libc::getuid() } == 0 {
+            80
+        } else {
+            8000
+        };
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(
+            cfg.servers[0].listen.addr,
+            std::net::SocketAddr::from(([0, 0, 0, 0], port))
+        );
+        assert!(!cfg.servers[0].listen.default_server);
+    }
+
+    #[test]
     fn milestone_1_config() {
         let src = r#"
             http {
