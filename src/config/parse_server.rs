@@ -66,6 +66,7 @@ pub(crate) fn parse_server_block(
     let mut auth_delay_ms: Option<u64> = None;
     let mut client_max_body_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
+    let mut client_body_temp_path: Option<TempPath> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     let mut post_action: Option<String> = None;
@@ -170,6 +171,7 @@ pub(crate) fn parse_server_block(
                         auth_basic_user_file,
                         auth_delay_ms,
                         client_max_body_size,
+                        client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
                         limit_rate,
                         limit_rate_after,
@@ -546,6 +548,12 @@ pub(crate) fn parse_server_block(
                 }
                 expires = Some(parse_expires_args(&args[1..])?);
             }
+            ("client_body_temp_path", Terminator::Semi) => {
+                if client_body_temp_path.is_some() {
+                    return Err(Error::Duplicate("client_body_temp_path"));
+                }
+                client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
+            }
             ("location", Terminator::BlockOpen) => {
                 let spec = parse_location_spec(&args[1..])?;
                 // Top-level locations inherit `server_tokens` from the
@@ -566,6 +574,7 @@ pub(crate) fn parse_server_block(
                     None,
                     None,
                     client_max_body_size.or(inherited_client_max_body_size),
+                    None,
                     None,
                     None,
                     None,
@@ -749,6 +758,7 @@ pub(crate) fn parse_server_block(
                 | "auth_basic_user_file"
                 | "auth_delay"
                 | "client_max_body_size"
+                | "client_body_temp_path"
                 | "post_action"
                 | "expires"
                 | "proxy_set_header"

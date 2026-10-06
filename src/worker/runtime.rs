@@ -1985,6 +1985,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // `client_body_in_file_only on` where the request goes:
                         // a temp file holding the body outlives it.
                         let mut persistent_body = false;
+                        // And its `client_body_temp_path`, else the http one.
+                        let mut body_temp = &http.body_temp;
                         let has_body = req.content_length.is_some_and(|cl| cl > 0)
                             || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
@@ -1994,6 +1996,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
                                 persistent_body = first.persistent;
+                                body_temp = first.body_temp.unwrap_or(body_temp);
                                 max_body = match first.max {
                                     0 => u64::MAX,
                                     n => n,
@@ -2048,7 +2051,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut pipelined_tail: Vec<u8> = Vec::new();
                         let mut sink = BodySink::with_capacity(
                             req.content_length.unwrap_or(0),
-                            &http.body_temp,
+                            body_temp,
                             persistent_body,
                         );
                         // The body is over the limit and isn't read: the
@@ -2152,7 +2155,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             Some(file) => Some(file),
                             None => maybe_spill_request_body_to_file(
                                 &body_vec,
-                                &http.body_temp,
+                                body_temp,
                                 persistent_body,
                             ),
                         };

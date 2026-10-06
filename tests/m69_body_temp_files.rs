@@ -91,7 +91,14 @@ fn configured_client_body_temp_path_is_private() {
     for size in SIZES {
         let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let file = post(server.port, &body);
-        assert_eq!(file.parent(), Some(temp.as_path()), "{}", file.display());
+        // Levels `1 2`: `<temp>/<last digit>/<two before it>/<name>`.
+        let name = file.file_name().unwrap().to_str().unwrap().to_string();
+        let inner = file.parent().unwrap();
+        let outer = inner.parent().unwrap();
+        assert_eq!(outer.parent(), Some(temp.as_path()), "{}", file.display());
+        assert_eq!(outer.file_name().unwrap().to_str(), Some(&name[9..]));
+        assert_eq!(inner.file_name().unwrap().to_str(), Some(&name[7..9]));
+        assert_eq!((mode(outer), mode(inner)), (0o700, 0o700));
         assert_eq!(std::fs::read(&file).unwrap(), body);
         assert_eq!(mode(&file), 0o600, "{}", file.display());
     }

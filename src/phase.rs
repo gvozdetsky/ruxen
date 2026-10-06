@@ -1142,6 +1142,9 @@ pub(crate) struct FirstBodyLimit {
     /// `client_body_in_file_only on`: a temp file holding the body
     /// outlives the request (nginx's `request_body_in_persistent_file`).
     pub persistent: bool,
+    /// The location's `client_body_temp_path` directory, if it (or its
+    /// server) has its own.
+    pub body_temp: Option<&'static crate::worker::BodyTempDir>,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -1202,6 +1205,7 @@ pub(crate) fn first_body_limit(
             loc.client_body_in_file_only,
             crate::config::ClientBodyInFileOnly::On
         ),
+        body_temp: loc.body_temp,
     })
 }
 

@@ -355,9 +355,8 @@ pub(crate) fn parse_client_max_body_size_args(args: &[String]) -> Result<u64, Er
 
 /// `client_body_temp_path path [level1 [level2 [level3]]]`, validated as
 /// nginx's ngx_conf_set_path_slot (each level at least 1, ten digits in
-/// all). Returns the path; ruxen doesn't hash files into level
-/// directories.
-pub(crate) fn parse_temp_path_args(args: &[String]) -> Result<PathBuf, Error> {
+/// all).
+pub(crate) fn parse_temp_path_args(args: &[String]) -> Result<TempPath, Error> {
     let bad = || Error::BadValue {
         what: "client_body_temp_path",
         got: args.join(" "),
@@ -369,9 +368,13 @@ pub(crate) fn parse_temp_path_args(args: &[String]) -> Result<PathBuf, Error> {
         return Err(bad());
     }
     let mut digits = 0;
-    for level in levels {
-        match level.parse::<usize>() {
-            Ok(n) if n > 0 => digits += n,
+    let mut parsed = [0u8; 3];
+    for (slot, level) in parsed.iter_mut().zip(levels) {
+        match level.parse::<u8>() {
+            Ok(n) if (1..=10).contains(&n) => {
+                digits += usize::from(n);
+                *slot = n;
+            }
             _ => return Err(bad()),
         }
     }
@@ -382,7 +385,10 @@ pub(crate) fn parse_temp_path_args(args: &[String]) -> Result<PathBuf, Error> {
         Some(rest) if !rest.is_empty() => rest,
         _ => path.as_str(),
     };
-    Ok(PathBuf::from(trimmed))
+    Ok(TempPath {
+        path: PathBuf::from(trimmed),
+        levels: parsed,
+    })
 }
 
 /// Parse `proxy_next_upstream`'s flag list. Tokens come from a fixed set
