@@ -24,8 +24,8 @@ use crate::config::{
     ErrorLogSyslogServer, ErrorLogTarget, ErrorPage, ErrorPageAction, ExpiresDirective,
     FileTestKind, Handler, HttpConfig, IfGuard, IndexEntry, KeepaliveDisable, KeepaliveTimeout,
     Location, LogFormatDef, MapBlock, MapExactEntry, MapRegexEntry, MatchMode, PathMapping,
-    ProxyPass, ProxySetHeader, RewriteFlag as ConfigRewriteFlag, RewriteOp, RewriteRule, Server,
-    SplitClients, TryFiles, TryFilesFallback, TryFilesProbe, ValuePart, Variable,
+    ProxyConf, ProxyPass, ProxySetHeader, RewriteFlag as ConfigRewriteFlag, RewriteOp, RewriteRule,
+    Server, SplitClients, TryFiles, TryFilesFallback, TryFilesProbe, ValuePart, Variable,
 };
 use crate::http::{self, Method, Parse, ParseState, READ_BUF};
 use crate::phase::{self, Response};
@@ -742,58 +742,47 @@ fn leak_list(list: Option<Vec<String>>) -> Option<&'static [String]> {
 }
 
 impl ServerProxyDefaults {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
-        proxy_set_headers: Option<Vec<ProxySetHeader>>,
-        proxy_pass_request_headers: Option<bool>,
-        proxy_pass_request_body: Option<bool>,
-        proxy_set_body: Option<Vec<ValuePart>>,
-        proxy_ignore_headers: Option<Vec<String>>,
-        proxy_connect_timeout_ms: Option<u64>,
-        proxy_read_timeout_ms: Option<u64>,
-        proxy_send_timeout_ms: Option<u64>,
-        proxy_limit_rate: Option<u64>,
-        proxy_http_version: Option<u8>,
-        proxy_next_upstream: Option<crate::config::ProxyNextUpstream>,
-        proxy_next_upstream_tries: Option<u32>,
-        proxy_next_upstream_timeout_ms: Option<u64>,
-        proxy_intercept_errors: Option<bool>,
+        conf: ProxyConf,
         ignore_invalid_headers: bool,
         underscores_in_headers: bool,
-        proxy_redirect: Option<crate::config::ProxyRedirect>,
-        proxy_hide_headers: Option<Vec<String>>,
-        proxy_pass_headers: Option<Vec<String>>,
     ) -> Self {
         let defaults = ProxyEffective::defaults();
-        let set_headers: &'static [PreparedProxySetHeader] = match proxy_set_headers {
+        let set_headers: &'static [PreparedProxySetHeader] = match conf.set_headers {
             Some(list) => prepare_proxy_set_headers(list),
             None => &[],
         };
         Self {
             set_headers,
-            pass_request_headers: proxy_pass_request_headers
+            pass_request_headers: conf
+                .pass_request_headers
                 .unwrap_or(defaults.pass_request_headers),
-            pass_request_body: proxy_pass_request_body.unwrap_or(defaults.pass_request_body),
-            set_body: proxy_set_body.map(prepare_value_parts),
-            ignore_accel_redirect: ignores(proxy_ignore_headers.as_deref(), "x-accel-redirect")
+            pass_request_body: conf.pass_request_body.unwrap_or(defaults.pass_request_body),
+            set_body: conf.set_body.map(prepare_value_parts),
+            ignore_accel_redirect: ignores(conf.ignore_headers.as_deref(), "x-accel-redirect")
                 .unwrap_or(false),
-            ignore_accel_limit_rate: ignores(proxy_ignore_headers.as_deref(), "x-accel-limit-rate")
+            ignore_accel_limit_rate: ignores(conf.ignore_headers.as_deref(), "x-accel-limit-rate")
                 .unwrap_or(false),
-            connect_timeout_ms: proxy_connect_timeout_ms.unwrap_or(defaults.connect_timeout_ms),
-            read_timeout_ms: proxy_read_timeout_ms.unwrap_or(defaults.read_timeout_ms),
-            send_timeout_ms: proxy_send_timeout_ms.unwrap_or(defaults.send_timeout_ms),
-            limit_rate: proxy_limit_rate.unwrap_or(defaults.limit_rate),
-            http_version: proxy_http_version.unwrap_or(defaults.http_version),
-            next_upstream: proxy_next_upstream.unwrap_or(defaults.next_upstream),
-            next_upstream_tries: proxy_next_upstream_tries.unwrap_or(defaults.next_upstream_tries),
-            next_upstream_timeout_ms: proxy_next_upstream_timeout_ms
+            connect_timeout_ms: conf
+                .connect_timeout_ms
+                .unwrap_or(defaults.connect_timeout_ms),
+            read_timeout_ms: conf.read_timeout_ms.unwrap_or(defaults.read_timeout_ms),
+            send_timeout_ms: conf.send_timeout_ms.unwrap_or(defaults.send_timeout_ms),
+            limit_rate: conf.limit_rate.unwrap_or(defaults.limit_rate),
+            http_version: conf.http_version.unwrap_or(defaults.http_version),
+            next_upstream: conf.next_upstream.unwrap_or(defaults.next_upstream),
+            next_upstream_tries: conf
+                .next_upstream_tries
+                .unwrap_or(defaults.next_upstream_tries),
+            next_upstream_timeout_ms: conf
+                .next_upstream_timeout_ms
                 .unwrap_or(defaults.next_upstream_timeout_ms),
-            intercept_errors: proxy_intercept_errors.unwrap_or(defaults.intercept_errors),
+            intercept_errors: conf.intercept_errors.unwrap_or(defaults.intercept_errors),
             ignore_invalid_headers,
             underscores_in_headers,
-            redirect: proxy_redirect.map(|r| &*Box::leak(Box::new(r))),
-            hide_headers: leak_list(proxy_hide_headers),
-            pass_headers: leak_list(proxy_pass_headers),
+            redirect: conf.redirect.map(|r| &*Box::leak(Box::new(r))),
+            hide_headers: leak_list(conf.hide_headers),
+            pass_headers: leak_list(conf.pass_headers),
         }
     }
 }
@@ -810,63 +799,63 @@ pub(crate) fn prepare_proxy_set_headers(
     Box::leak(out.into_boxed_slice())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_proxy_effective(
-    location_set_headers: Option<Vec<ProxySetHeader>>,
-    location_pass_request_headers: Option<bool>,
-    location_pass_request_body: Option<bool>,
-    location_set_body: Option<Vec<ValuePart>>,
-    location_ignore_headers: Option<Vec<String>>,
-    location_connect_timeout_ms: Option<u64>,
-    location_read_timeout_ms: Option<u64>,
-    location_send_timeout_ms: Option<u64>,
-    location_limit_rate: Option<u64>,
-    location_http_version: Option<u8>,
-    location_next_upstream: Option<crate::config::ProxyNextUpstream>,
-    location_next_upstream_tries: Option<u32>,
-    location_next_upstream_timeout_ms: Option<u64>,
-    location_intercept_errors: Option<bool>,
-    location_redirect: Option<crate::config::ProxyRedirect>,
-    location_hide_headers: Option<Vec<String>>,
-    location_pass_headers: Option<Vec<String>>,
+    location: ProxyConf,
     server_defaults: ServerProxyDefaults,
 ) -> ProxyEffective {
-    let set_headers: &'static [PreparedProxySetHeader] = match location_set_headers {
+    let set_headers: &'static [PreparedProxySetHeader] = match location.set_headers {
         Some(list) => prepare_proxy_set_headers(list),
         None => server_defaults.set_headers,
     };
     ProxyEffective {
         set_headers,
-        http_version: location_http_version.unwrap_or(server_defaults.http_version),
-        pass_request_headers: location_pass_request_headers
+        http_version: location
+            .http_version
+            .unwrap_or(server_defaults.http_version),
+        pass_request_headers: location
+            .pass_request_headers
             .unwrap_or(server_defaults.pass_request_headers),
-        pass_request_body: location_pass_request_body.unwrap_or(server_defaults.pass_request_body),
-        ignore_accel_redirect: ignores(location_ignore_headers.as_deref(), "x-accel-redirect")
+        pass_request_body: location
+            .pass_request_body
+            .unwrap_or(server_defaults.pass_request_body),
+        ignore_accel_redirect: ignores(location.ignore_headers.as_deref(), "x-accel-redirect")
             .unwrap_or(server_defaults.ignore_accel_redirect),
-        ignore_accel_limit_rate: ignores(location_ignore_headers.as_deref(), "x-accel-limit-rate")
+        ignore_accel_limit_rate: ignores(location.ignore_headers.as_deref(), "x-accel-limit-rate")
             .unwrap_or(server_defaults.ignore_accel_limit_rate),
-        set_body: location_set_body
+        set_body: location
+            .set_body
             .map(prepare_value_parts)
             .or(server_defaults.set_body),
-        connect_timeout_ms: location_connect_timeout_ms
+        connect_timeout_ms: location
+            .connect_timeout_ms
             .unwrap_or(server_defaults.connect_timeout_ms),
-        read_timeout_ms: location_read_timeout_ms.unwrap_or(server_defaults.read_timeout_ms),
-        send_timeout_ms: location_send_timeout_ms.unwrap_or(server_defaults.send_timeout_ms),
-        limit_rate: location_limit_rate.unwrap_or(server_defaults.limit_rate),
-        next_upstream: location_next_upstream.unwrap_or(server_defaults.next_upstream),
-        next_upstream_tries: location_next_upstream_tries
+        read_timeout_ms: location
+            .read_timeout_ms
+            .unwrap_or(server_defaults.read_timeout_ms),
+        send_timeout_ms: location
+            .send_timeout_ms
+            .unwrap_or(server_defaults.send_timeout_ms),
+        limit_rate: location.limit_rate.unwrap_or(server_defaults.limit_rate),
+        next_upstream: location
+            .next_upstream
+            .unwrap_or(server_defaults.next_upstream),
+        next_upstream_tries: location
+            .next_upstream_tries
             .unwrap_or(server_defaults.next_upstream_tries),
-        next_upstream_timeout_ms: location_next_upstream_timeout_ms
+        next_upstream_timeout_ms: location
+            .next_upstream_timeout_ms
             .unwrap_or(server_defaults.next_upstream_timeout_ms),
-        intercept_errors: location_intercept_errors.unwrap_or(server_defaults.intercept_errors),
+        intercept_errors: location
+            .intercept_errors
+            .unwrap_or(server_defaults.intercept_errors),
         ignore_invalid_headers: server_defaults.ignore_invalid_headers,
         underscores_in_headers: server_defaults.underscores_in_headers,
-        redirect: match location_redirect {
+        redirect: match location.redirect {
             Some(r) => Some(&*Box::leak(Box::new(r))),
             None => server_defaults.redirect,
         },
-        hide_headers: leak_list(location_hide_headers).or(server_defaults.hide_headers),
-        pass_headers: leak_list(location_pass_headers).or(server_defaults.pass_headers),
+        hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
+        pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
@@ -904,28 +893,10 @@ pub(crate) fn prepare_server(
     let server_underscores_in_headers = server
         .underscores_in_headers
         .unwrap_or(http_underscores_in_headers);
-    // Take ownership of proxy_* fields up front. Partial moves below
-    // (Option::map) would otherwise prevent later access.
     let server_proxy_defaults = ServerProxyDefaults::build(
-        server.proxy_set_headers.take(),
-        server.proxy_pass_request_headers,
-        server.proxy_pass_request_body,
-        server.proxy_set_body.take(),
-        server.proxy_ignore_headers.take(),
-        server.proxy_connect_timeout_ms,
-        server.proxy_read_timeout_ms,
-        server.proxy_send_timeout_ms,
-        server.proxy_limit_rate,
-        server.proxy_http_version,
-        server.proxy_next_upstream,
-        server.proxy_next_upstream_tries,
-        server.proxy_next_upstream_timeout_ms,
-        server.proxy_intercept_errors,
+        std::mem::take(&mut server.proxy),
         server_ignore_invalid_headers,
         server_underscores_in_headers,
-        server.proxy_redirect.take(),
-        server.proxy_hide_headers.take(),
-        server.proxy_pass_headers.take(),
     );
     // Split the parsed `server_name` specs into the four match buckets
     // plus the `matches_empty` flag. Lowercasing is already handled
@@ -2169,46 +2140,11 @@ pub(crate) fn build_prefix_or_exact(
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
-        proxy_set_headers: location_proxy_set_headers,
-        proxy_pass_request_headers: location_proxy_pass_request_headers,
-        proxy_pass_request_body: location_proxy_pass_request_body,
-        proxy_set_body: location_proxy_set_body,
-        proxy_ignore_headers: location_proxy_ignore_headers,
-        proxy_connect_timeout_ms: location_proxy_connect_timeout_ms,
-        proxy_read_timeout_ms: location_proxy_read_timeout_ms,
-        proxy_send_timeout_ms: location_proxy_send_timeout_ms,
-        proxy_limit_rate: location_proxy_limit_rate,
-        proxy_http_version: location_proxy_http_version,
-        proxy_next_upstream: location_proxy_next_upstream,
-        proxy_next_upstream_tries: location_proxy_next_upstream_tries,
-        proxy_next_upstream_timeout_ms: location_proxy_next_upstream_timeout_ms,
-        proxy_intercept_errors: location_proxy_intercept_errors,
-        proxy_redirect: location_proxy_redirect,
-        proxy_hide_headers: location_proxy_hide_headers,
-        proxy_pass_headers: location_proxy_pass_headers,
+        proxy: location_proxy,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
     } = l;
-    let proxy_effective = resolve_proxy_effective(
-        location_proxy_set_headers,
-        location_proxy_pass_request_headers,
-        location_proxy_pass_request_body,
-        location_proxy_set_body,
-        location_proxy_ignore_headers,
-        location_proxy_connect_timeout_ms,
-        location_proxy_read_timeout_ms,
-        location_proxy_send_timeout_ms,
-        location_proxy_limit_rate,
-        location_proxy_http_version,
-        location_proxy_next_upstream,
-        location_proxy_next_upstream_tries,
-        location_proxy_next_upstream_timeout_ms,
-        location_proxy_intercept_errors,
-        location_proxy_redirect,
-        location_proxy_hide_headers,
-        location_proxy_pass_headers,
-        server_proxy_defaults,
-    );
+    let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
     let alias_prefix_override: Option<&'static [u8]> = alias_prefix_override
         .map(|s| Box::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
@@ -2395,46 +2331,11 @@ pub(crate) fn build_regex_location(
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
-        proxy_set_headers: location_proxy_set_headers,
-        proxy_pass_request_headers: location_proxy_pass_request_headers,
-        proxy_pass_request_body: location_proxy_pass_request_body,
-        proxy_set_body: location_proxy_set_body,
-        proxy_ignore_headers: location_proxy_ignore_headers,
-        proxy_connect_timeout_ms: location_proxy_connect_timeout_ms,
-        proxy_read_timeout_ms: location_proxy_read_timeout_ms,
-        proxy_send_timeout_ms: location_proxy_send_timeout_ms,
-        proxy_limit_rate: location_proxy_limit_rate,
-        proxy_http_version: location_proxy_http_version,
-        proxy_next_upstream: location_proxy_next_upstream,
-        proxy_next_upstream_tries: location_proxy_next_upstream_tries,
-        proxy_next_upstream_timeout_ms: location_proxy_next_upstream_timeout_ms,
-        proxy_intercept_errors: location_proxy_intercept_errors,
-        proxy_redirect: location_proxy_redirect,
-        proxy_hide_headers: location_proxy_hide_headers,
-        proxy_pass_headers: location_proxy_pass_headers,
+        proxy: location_proxy,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
     } = l;
-    let proxy_effective = resolve_proxy_effective(
-        location_proxy_set_headers,
-        location_proxy_pass_request_headers,
-        location_proxy_pass_request_body,
-        location_proxy_set_body,
-        location_proxy_ignore_headers,
-        location_proxy_connect_timeout_ms,
-        location_proxy_read_timeout_ms,
-        location_proxy_send_timeout_ms,
-        location_proxy_limit_rate,
-        location_proxy_http_version,
-        location_proxy_next_upstream,
-        location_proxy_next_upstream_tries,
-        location_proxy_next_upstream_timeout_ms,
-        location_proxy_intercept_errors,
-        location_proxy_redirect,
-        location_proxy_hide_headers,
-        location_proxy_pass_headers,
-        server_proxy_defaults,
-    );
+    let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     // The parser already validated this with the same flags + the same
     // `regex::bytes` builder; rebuild here because the compiled `Regex`
     // doesn't survive the AST.

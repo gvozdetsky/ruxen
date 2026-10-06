@@ -436,6 +436,164 @@ pub(crate) fn parse_proxy_next_upstream_args(args: &[String]) -> Result<ProxyNex
     Ok(mask)
 }
 
+impl ProxyConf {
+    /// The directives `parse` takes.
+    pub(crate) const DIRECTIVES: &'static [&'static str] = &[
+        "proxy_set_header",
+        "proxy_pass_request_headers",
+        "proxy_pass_request_body",
+        "proxy_set_body",
+        "proxy_ignore_headers",
+        "proxy_connect_timeout",
+        "proxy_read_timeout",
+        "proxy_send_timeout",
+        "proxy_limit_rate",
+        "proxy_http_version",
+        "proxy_next_upstream",
+        "proxy_next_upstream_tries",
+        "proxy_next_upstream_timeout",
+        "proxy_intercept_errors",
+        "proxy_redirect",
+        "proxy_hide_header",
+        "proxy_pass_header",
+    ];
+
+    pub(crate) fn takes(name: &str) -> bool {
+        Self::DIRECTIVES.contains(&name)
+    }
+
+    /// Parse one of `DIRECTIVES` (`args[0]`) into `self`, at any level.
+    pub(crate) fn parse(&mut self, args: &[String]) -> Result<(), Error> {
+        match args[0].as_str() {
+            "proxy_set_header" => {
+                let entry = parse_proxy_set_header_args(&args[1..])?;
+                self.set_headers.get_or_insert_with(Vec::new).push(entry);
+            }
+            "proxy_pass_request_headers" => {
+                if self.pass_request_headers.is_some() {
+                    return Err(Error::Duplicate("proxy_pass_request_headers"));
+                }
+                self.pass_request_headers =
+                    Some(parse_on_off_args(&args[1..], "proxy_pass_request_headers")?);
+            }
+            "proxy_ignore_headers" => {
+                if self.ignore_headers.is_some() {
+                    return Err(Error::Duplicate("proxy_ignore_headers"));
+                }
+                self.ignore_headers = Some(parse_proxy_ignore_headers(&args[1..])?);
+            }
+            "proxy_set_body" => {
+                if self.set_body.is_some() {
+                    return Err(Error::Duplicate("proxy_set_body"));
+                }
+                if args.len() != 2 {
+                    return Err(Error::BadValue {
+                        what: "proxy_set_body",
+                        got: args[1..].join(" "),
+                    });
+                }
+                self.set_body = Some(parse_value_with_vars(&args[1])?);
+            }
+            "proxy_pass_request_body" => {
+                if self.pass_request_body.is_some() {
+                    return Err(Error::Duplicate("proxy_pass_request_body"));
+                }
+                self.pass_request_body =
+                    Some(parse_on_off_args(&args[1..], "proxy_pass_request_body")?);
+            }
+            "proxy_connect_timeout" => {
+                if self.connect_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("proxy_connect_timeout"));
+                }
+                self.connect_timeout_ms = Some(parse_proxy_timeout_args(
+                    &args[1..],
+                    "proxy_connect_timeout",
+                )?);
+            }
+            "proxy_read_timeout" => {
+                if self.read_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("proxy_read_timeout"));
+                }
+                self.read_timeout_ms =
+                    Some(parse_proxy_timeout_args(&args[1..], "proxy_read_timeout")?);
+            }
+            "proxy_send_timeout" => {
+                if self.send_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("proxy_send_timeout"));
+                }
+                self.send_timeout_ms =
+                    Some(parse_proxy_timeout_args(&args[1..], "proxy_send_timeout")?);
+            }
+            "proxy_limit_rate" => {
+                if self.limit_rate.is_some() {
+                    return Err(Error::Duplicate("proxy_limit_rate"));
+                }
+                let v = args.get(1).ok_or(Error::MissingArg("proxy_limit_rate"))?;
+                self.limit_rate = Some(parse_size_bytes(v).ok_or(Error::BadValue {
+                    what: "proxy_limit_rate",
+                    got: v.clone(),
+                })?);
+            }
+            "proxy_http_version" => {
+                if self.http_version.is_some() {
+                    return Err(Error::Duplicate("proxy_http_version"));
+                }
+                self.http_version = Some(parse_proxy_http_version_args(&args[1..])?);
+            }
+            "proxy_next_upstream" => {
+                if self.next_upstream.is_some() {
+                    return Err(Error::Duplicate("proxy_next_upstream"));
+                }
+                self.next_upstream = Some(parse_proxy_next_upstream_args(&args[1..])?);
+            }
+            "proxy_next_upstream_tries" => {
+                if self.next_upstream_tries.is_some() {
+                    return Err(Error::Duplicate("proxy_next_upstream_tries"));
+                }
+                let v = args
+                    .get(1)
+                    .ok_or(Error::MissingArg("proxy_next_upstream_tries"))?;
+                self.next_upstream_tries = Some(v.parse::<u32>().map_err(|_| Error::BadValue {
+                    what: "proxy_next_upstream_tries",
+                    got: v.clone(),
+                })?);
+            }
+            "proxy_next_upstream_timeout" => {
+                if self.next_upstream_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("proxy_next_upstream_timeout"));
+                }
+                let v = args
+                    .get(1)
+                    .ok_or(Error::MissingArg("proxy_next_upstream_timeout"))?;
+                self.next_upstream_timeout_ms =
+                    Some(parse_duration_ms(v, "proxy_next_upstream_timeout")?);
+            }
+            "proxy_redirect" => parse_proxy_redirect(args, &mut self.redirect)?,
+            "proxy_hide_header" => {
+                let name = args.get(1).ok_or(Error::MissingArg("proxy_hide_header"))?;
+                self.hide_headers
+                    .get_or_insert_with(Vec::new)
+                    .push(name.clone());
+            }
+            "proxy_pass_header" => {
+                let name = args.get(1).ok_or(Error::MissingArg("proxy_pass_header"))?;
+                self.pass_headers
+                    .get_or_insert_with(Vec::new)
+                    .push(name.clone());
+            }
+            "proxy_intercept_errors" => {
+                if self.intercept_errors.is_some() {
+                    return Err(Error::Duplicate("proxy_intercept_errors"));
+                }
+                self.intercept_errors =
+                    Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
+            }
+            other => unreachable!("not a ProxyConf directive: {other}"),
+        }
+        Ok(())
+    }
+}
+
 /// Parse a `proxy_*_timeout` argument. Single time-suffix value (`60s`,
 /// `5000ms`, `1m`); bare integers default to seconds, matching nginx's
 /// directive grammar (`ngx_conf_set_msec_slot`).

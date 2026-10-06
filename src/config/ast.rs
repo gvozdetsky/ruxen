@@ -48,6 +48,70 @@ impl ClientTimeouts {
     }
 }
 
+/// The `proxy_*` directives every level takes (http, server, location),
+/// each `None` until set there. A level inherits each unset value from the
+/// one above, as `ngx_http_proxy_merge_loc_conf` does; lists such as
+/// `proxy_set_header` are inherited or replaced whole, never appended to.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyConf {
+    /// `proxy_set_header` stack.
+    pub set_headers: Option<Vec<ProxySetHeader>>,
+    pub pass_request_headers: Option<bool>,
+    pub pass_request_body: Option<bool>,
+    /// `proxy_set_body`: the body sent upstream instead of the client's.
+    pub set_body: Option<Vec<ValuePart>>,
+    /// `proxy_ignore_headers`, lowercased.
+    pub ignore_headers: Option<Vec<String>>,
+    pub connect_timeout_ms: Option<u64>,
+    pub read_timeout_ms: Option<u64>,
+    pub send_timeout_ms: Option<u64>,
+    /// `proxy_limit_rate` in bytes/sec; `0` means unlimited.
+    pub limit_rate: Option<u64>,
+    /// `proxy_http_version 1.0|1.1`, stored as the minor digit.
+    pub http_version: Option<u8>,
+    /// `proxy_next_upstream`; unset means nginx's `error timeout`.
+    pub next_upstream: Option<ProxyNextUpstream>,
+    /// `proxy_next_upstream_tries`; `0` means no cap.
+    pub next_upstream_tries: Option<u32>,
+    /// `proxy_next_upstream_timeout`; `0` means no cap.
+    pub next_upstream_timeout_ms: Option<u64>,
+    pub intercept_errors: Option<bool>,
+    /// `proxy_redirect`; unset means nginx's implicit `default`.
+    pub redirect: Option<ProxyRedirect>,
+    /// `proxy_hide_header` / `proxy_pass_header` names.
+    pub hide_headers: Option<Vec<String>>,
+    pub pass_headers: Option<Vec<String>>,
+}
+
+impl ProxyConf {
+    /// Unset values come from `parent`.
+    pub(crate) fn inherit(self, parent: &ProxyConf) -> ProxyConf {
+        ProxyConf {
+            set_headers: self.set_headers.or_else(|| parent.set_headers.clone()),
+            pass_request_headers: self.pass_request_headers.or(parent.pass_request_headers),
+            pass_request_body: self.pass_request_body.or(parent.pass_request_body),
+            set_body: self.set_body.or_else(|| parent.set_body.clone()),
+            ignore_headers: self
+                .ignore_headers
+                .or_else(|| parent.ignore_headers.clone()),
+            connect_timeout_ms: self.connect_timeout_ms.or(parent.connect_timeout_ms),
+            read_timeout_ms: self.read_timeout_ms.or(parent.read_timeout_ms),
+            send_timeout_ms: self.send_timeout_ms.or(parent.send_timeout_ms),
+            limit_rate: self.limit_rate.or(parent.limit_rate),
+            http_version: self.http_version.or(parent.http_version),
+            next_upstream: self.next_upstream.or(parent.next_upstream),
+            next_upstream_tries: self.next_upstream_tries.or(parent.next_upstream_tries),
+            next_upstream_timeout_ms: self
+                .next_upstream_timeout_ms
+                .or(parent.next_upstream_timeout_ms),
+            intercept_errors: self.intercept_errors.or(parent.intercept_errors),
+            redirect: self.redirect.or_else(|| parent.redirect.clone()),
+            hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
+            pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RuntimeOpts {
     pub pid: Option<PathBuf>,
@@ -536,47 +600,8 @@ pub struct Server {
     pub post_action: Option<String>,
     /// Server-scope `expires` directive. `None` inherits from http.
     pub expires: Option<ExpiresDirective>,
-    /// Server-scope `proxy_set_header` stack. `None` inherits from http
-    /// scope; `Some(list)` replaces the parent list outright (matches
-    /// nginx's `ngx_http_proxy_module.c::ngx_http_proxy_merge_loc_conf`).
-    pub proxy_set_headers: Option<Vec<ProxySetHeader>>,
-    /// Server-scope `proxy_pass_request_headers on|off;`. `None` inherits.
-    pub proxy_pass_request_headers: Option<bool>,
-    /// Server-scope `proxy_pass_request_body on|off;`. `None` inherits.
-    pub proxy_pass_request_body: Option<bool>,
-    /// Server-scope `proxy_set_body VALUE;`. `None` inherits.
-    pub proxy_set_body: Option<Vec<ValuePart>>,
-    /// Server-scope `proxy_ignore_headers`, lowercased. `None` inherits.
-    pub proxy_ignore_headers: Option<Vec<String>>,
-    /// Server-scope `proxy_connect_timeout` in milliseconds.
-    pub proxy_connect_timeout_ms: Option<u64>,
-    /// Server-scope `proxy_read_timeout` in milliseconds.
-    pub proxy_read_timeout_ms: Option<u64>,
-    /// Server-scope `proxy_send_timeout` in milliseconds.
-    pub proxy_send_timeout_ms: Option<u64>,
-    /// Server-scope `proxy_limit_rate` in bytes/sec. `0` (and `None` defaulting
-    /// to it) means unlimited.
-    pub proxy_limit_rate: Option<u64>,
-    /// Server-scope `proxy_http_version 1.0|1.1;`. `None` inherits.
-    /// Stored as the minor digit (`0` or `1`).
-    pub proxy_http_version: Option<u8>,
-    /// Server-scope `proxy_next_upstream` bitmask. `None` inherits the
-    /// nginx default (`error timeout`).
-    pub proxy_next_upstream: Option<ProxyNextUpstream>,
-    /// Server-scope `proxy_next_upstream_tries N;`. `0` means "no cap"
-    /// in nginx; we mirror that. `None` inherits.
-    pub proxy_next_upstream_tries: Option<u32>,
-    /// Server-scope `proxy_next_upstream_timeout T;`. `0` means no cap.
-    pub proxy_next_upstream_timeout_ms: Option<u64>,
-    /// Server-scope `proxy_intercept_errors on|off;`. `None` inherits.
-    pub proxy_intercept_errors: Option<bool>,
-    /// Server-scope `proxy_redirect` directives. `None` inherits (nginx's
-    /// implicit `default`).
-    pub proxy_redirect: Option<ProxyRedirect>,
-    /// Server-scope `proxy_hide_header` / `proxy_pass_header` names.
-    /// `None` inherits.
-    pub proxy_hide_headers: Option<Vec<String>>,
-    pub proxy_pass_headers: Option<Vec<String>>,
+    /// Server-scope `proxy_*` settings; unset ones inherit from http.
+    pub proxy: ProxyConf,
     /// Server-scope `chunked_transfer_encoding on|off;`. `None` inherits the
     /// nginx default (`on`). When `false`, response bodies stay framed by
     /// `Content-Length` and `add_trailer` directives are silently dropped
@@ -709,41 +734,8 @@ pub struct Location {
     /// at parse time, then from server/http at prepare time. `None` after
     /// inheritance means "no expires header injection".
     pub expires: Option<ExpiresDirective>,
-    /// Location-scope `proxy_set_header` stack. `None` inherits from server.
-    pub proxy_set_headers: Option<Vec<ProxySetHeader>>,
-    /// Location-scope `proxy_pass_request_headers`. `None` inherits.
-    pub proxy_pass_request_headers: Option<bool>,
-    /// Location-scope `proxy_pass_request_body`. `None` inherits.
-    pub proxy_pass_request_body: Option<bool>,
-    /// Location-scope `proxy_set_body`: the body sent upstream instead of
-    /// the client's. `None` inherits.
-    pub proxy_set_body: Option<Vec<ValuePart>>,
-    /// Location-scope `proxy_ignore_headers`, lowercased. `None` inherits.
-    pub proxy_ignore_headers: Option<Vec<String>>,
-    /// Location-scope `proxy_connect_timeout`. `None` inherits.
-    pub proxy_connect_timeout_ms: Option<u64>,
-    /// Location-scope `proxy_read_timeout`. `None` inherits.
-    pub proxy_read_timeout_ms: Option<u64>,
-    /// Location-scope `proxy_send_timeout`. `None` inherits.
-    pub proxy_send_timeout_ms: Option<u64>,
-    /// Location-scope `proxy_limit_rate` in bytes/sec. `None` inherits.
-    pub proxy_limit_rate: Option<u64>,
-    /// Location-scope `proxy_http_version 1.0|1.1;`. `None` inherits.
-    pub proxy_http_version: Option<u8>,
-    /// Location-scope `proxy_next_upstream`. `None` inherits.
-    pub proxy_next_upstream: Option<ProxyNextUpstream>,
-    /// Location-scope `proxy_next_upstream_tries`. `None` inherits.
-    pub proxy_next_upstream_tries: Option<u32>,
-    /// Location-scope `proxy_next_upstream_timeout`. `None` inherits.
-    pub proxy_next_upstream_timeout_ms: Option<u64>,
-    /// Location-scope `proxy_intercept_errors`. `None` inherits.
-    pub proxy_intercept_errors: Option<bool>,
-    /// Location-scope `proxy_redirect` directives. `None` inherits.
-    pub proxy_redirect: Option<ProxyRedirect>,
-    /// Location-scope `proxy_hide_header` / `proxy_pass_header` names.
-    /// `None` inherits.
-    pub proxy_hide_headers: Option<Vec<String>>,
-    pub proxy_pass_headers: Option<Vec<String>>,
+    /// Location-scope `proxy_*` settings; unset ones inherit from server.
+    pub proxy: ProxyConf,
     /// Location-scope `chunked_transfer_encoding on|off;`. `None` inherits
     /// from server scope, which itself defaults to nginx's `on`. When
     /// `false`, the response body uses `Content-Length` framing and any

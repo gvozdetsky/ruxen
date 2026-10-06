@@ -228,7 +228,8 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
 }
 
 pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
-    let mut servers = Vec::new();
+    let mut servers: Vec<Server> = Vec::new();
+    let mut proxy = ProxyConf::default();
     let mut root: Option<PathBuf> = None;
     let mut log_formats: Vec<LogFormatDef> = Vec::new();
     let mut access_logs: Vec<AccessLog> = Vec::new();
@@ -273,37 +274,44 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
         let (args, term) = lx.read_directive()?;
         if args.is_empty() {
             return match term {
-                Terminator::BlockClose => Ok(HttpConfig {
-                    runtime: RuntimeOpts::default(),
-                    error_logs,
-                    log_formats,
-                    access_logs,
-                    server_tokens,
-                    autoindex,
-                    autoindex_exact_size,
-                    autoindex_localtime,
-                    autoindex_format,
-                    split_clients,
-                    maps,
-                    auth_basic,
-                    auth_basic_user_file,
-                    auth_delay_ms,
-                    client_max_body_size,
-                    client_body_temp_path,
-                    sendfile,
-                    disable_symlinks,
-                    limit_rate,
-                    limit_rate_after,
-                    post_action,
-                    expires,
-                    ignore_invalid_headers,
-                    underscores_in_headers,
-                    upstreams,
-                    warnings: warn_ssl_without_ssl_listen(&servers, warnings),
-                    servers,
-                    dump_files: Vec::new(),
-                    conf_prefix: None,
-                }),
+                Terminator::BlockClose => {
+                    // After the whole block: an http-level proxy_* line
+                    // below a server still applies to it, as in nginx.
+                    for server in &mut servers {
+                        server.proxy = std::mem::take(&mut server.proxy).inherit(&proxy);
+                    }
+                    Ok(HttpConfig {
+                        runtime: RuntimeOpts::default(),
+                        error_logs,
+                        log_formats,
+                        access_logs,
+                        server_tokens,
+                        autoindex,
+                        autoindex_exact_size,
+                        autoindex_localtime,
+                        autoindex_format,
+                        split_clients,
+                        maps,
+                        auth_basic,
+                        auth_basic_user_file,
+                        auth_delay_ms,
+                        client_max_body_size,
+                        client_body_temp_path,
+                        sendfile,
+                        disable_symlinks,
+                        limit_rate,
+                        limit_rate_after,
+                        post_action,
+                        expires,
+                        ignore_invalid_headers,
+                        underscores_in_headers,
+                        upstreams,
+                        warnings: warn_ssl_without_ssl_listen(&servers, warnings),
+                        servers,
+                        dump_files: Vec::new(),
+                        conf_prefix: None,
+                    })
+                }
                 Terminator::Eof => Err(Error::UnclosedBlock),
                 _ => Err(Error::UnexpectedEof),
             };
@@ -695,6 +703,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             ) => {
                 client_timeouts.parse(name, &args)?;
             }
+            (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
             ("error_log", Terminator::Semi) => {
                 error_logs
                     .get_or_insert_with(Vec::new)
@@ -822,20 +831,8 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // boilerplate `proxy_cache_bypass $http_upgrade;` is in many configs.
     "proxy_cache_bypass",
     "proxy_no_cache",
-    // proxy_intercept_errors / proxy_next_upstream / _tries / _timeout are
-    // explicitly handled at server + location scope; they remain in
-    // this allowlist so http-scope occurrences (e.g., from upstream tests'
-    // TEST_GLOBALS_HTTP preambles) are silently ignored.
-    "proxy_intercept_errors",
-    "proxy_next_upstream",
-    "proxy_next_upstream_tries",
-    "proxy_next_upstream_timeout",
-    "proxy_redirect",
     "proxy_method",
-    "proxy_http_version",
     "proxy_force_ranges",
-    "proxy_pass_header",
-    "proxy_hide_header",
     "proxy_cookie_domain",
     "proxy_cookie_path",
     "proxy_cookie_flags",
@@ -1149,6 +1146,54 @@ mod tests {
             std::net::SocketAddr::from(([0, 0, 0, 0], port))
         );
         assert!(!cfg.servers[0].listen.default_server);
+    }
+
+    #[test]
+    fn proxy_settings_inherit_from_http() {
+        let cfg = parse(
+            r#"
+            http {
+                proxy_connect_timeout 5s;
+                proxy_set_header Host $host;
+                proxy_hide_header X-Powered-By;
+                server { listen 80; proxy_read_timeout 1m; location / { proxy_pass http://127.0.0.1:81; } }
+                server { listen 81; proxy_set_header X-A a; proxy_connect_timeout 1s; }
+                proxy_intercept_errors on;
+            }
+            "#,
+        )
+        .unwrap();
+        let (a, b) = (&cfg.servers[0].proxy, &cfg.servers[1].proxy);
+        assert_eq!(a.connect_timeout_ms, Some(5_000));
+        assert_eq!(a.read_timeout_ms, Some(60_000));
+        assert_eq!(a.set_headers.as_ref().unwrap()[0].name, "Host");
+        assert_eq!(
+            a.hide_headers.as_deref(),
+            Some(&["X-Powered-By".to_string()][..])
+        );
+        // Below the servers, still inherited.
+        assert_eq!(a.intercept_errors, Some(true));
+        assert_eq!(b.connect_timeout_ms, Some(1_000));
+        // Replaced whole, not appended to.
+        let names: Vec<_> = b
+            .set_headers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|h| &h.name)
+            .collect();
+        assert_eq!(names, ["X-A"]);
+        // The location keeps only its own; prepare merges it with the server.
+        assert_eq!(cfg.servers[0].locations[0].proxy.connect_timeout_ms, None);
+
+        for bad in [
+            "http { proxy_connect_timeout 1s; proxy_connect_timeout 2s; server { listen 80; } }",
+            "http { proxy_http_version 2.0; server { listen 80; } }",
+            "proxy_read_timeout 1s; http { server { listen 80; } }",
+            "http { server { listen 80; location / { if ($arg_a) { proxy_redirect off; } } } }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1833,7 +1878,7 @@ mod tests {
             let cfg = parse(&format!(
                 "http {{ server {{ listen 80; location / {{ proxy_pass http://127.0.0.1:1/; {body} }} }} }}"
             ))?;
-            Ok::<_, Error>(cfg.servers[0].locations[0].proxy_redirect.clone())
+            Ok::<_, Error>(cfg.servers[0].locations[0].proxy.redirect.clone())
         };
         assert_eq!(loc("").unwrap(), None);
         assert_eq!(
@@ -2094,25 +2139,29 @@ mod tests {
     }
 
     #[test]
-    fn proxy_set_body_parses_at_server_and_location_only() {
+    fn proxy_set_body_parses_at_every_level() {
         let cfg = parse(
             "http { server { listen 80; proxy_set_body a; \
              location / { proxy_set_body \"b-$arg_x\"; proxy_pass http://127.0.0.1:1; } } }",
         )
         .unwrap();
         assert_eq!(
-            cfg.servers[0].proxy_set_body,
+            cfg.servers[0].proxy.set_body,
             Some(vec![ValuePart::Literal("a".into())])
         );
         assert_eq!(
-            cfg.servers[0].locations[0].proxy_set_body,
+            cfg.servers[0].locations[0].proxy.set_body,
             Some(vec![
                 ValuePart::Literal("b-".into()),
                 ValuePart::Var(Variable::Arg("x".into())),
             ])
         );
-        // Not at http scope (like proxy_set_header), and once per block.
-        assert!(parse("http { proxy_set_body a; server { listen 80; } }").is_err());
+        // At http scope too, inherited by servers; once per block.
+        let cfg = parse("http { proxy_set_body a; server { listen 80; } }").unwrap();
+        assert_eq!(
+            cfg.servers[0].proxy.set_body,
+            Some(vec![ValuePart::Literal("a".into())])
+        );
         assert!(
             parse(
                 "http { server { listen 80; location / { proxy_set_body a; proxy_set_body b; } } }"
