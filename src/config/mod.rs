@@ -805,6 +805,12 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_busy_buffers_size",
     "proxy_request_buffering",
     "proxy_ignore_client_abort",
+    // Read only by the proxy cache (ngx_http_upstream_cache, when
+    // `proxy_cache` is set). Without it, which ruxen doesn't implement
+    // (`proxy_cache` stays unknown), nginx ignores them too. The WebSocket
+    // boilerplate `proxy_cache_bypass $http_upgrade;` is in many configs.
+    "proxy_cache_bypass",
+    "proxy_no_cache",
     // proxy_intercept_errors / proxy_next_upstream / _tries / _timeout are
     // explicitly handled at server + location scope; they remain in
     // this allowlist so http-scope occurrences (e.g., from upstream tests'
@@ -2722,6 +2728,19 @@ mod tests {
             } } }
         "#;
         assert!(parse(src).is_err());
+    }
+
+    #[test]
+    fn proxy_cache_bypass_and_no_cache_are_no_ops_without_a_cache() {
+        let src = r#"
+            http { proxy_cache_bypass $http_upgrade; server { listen 80; proxy_no_cache $arg_x;
+                location / { proxy_pass http://127.0.0.1:8080; proxy_cache_bypass $http_upgrade; }
+            } }
+        "#;
+        parse(src).unwrap();
+        // The cache itself is still unknown.
+        let cached = "http { server { listen 80; location / { proxy_cache one; } } }";
+        assert!(parse(cached).is_err());
     }
 
     #[test]
