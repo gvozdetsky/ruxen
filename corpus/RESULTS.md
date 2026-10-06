@@ -6,11 +6,11 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 113 of 238 configurations nginx accepts (47%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 139 of 238 configurations nginx accepts (58%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 104 | 49% |
+| github | 214 | 130 | 61% |
 | php | 3 | 0 | 0% |
 | proxy | 17 | 6 | 35% |
 | static | 4 | 3 | 75% |
@@ -19,17 +19,17 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
 | configurations | first error in ruxen | examples |
 |---:|---|---|
-| 33 | unknown directive `proxy_cache_bypass` | gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example, gh:jsjfai/AgentDNS-Node/nginx.conf.example, gh:inab/openEBench-nuxt/nginx.conf.devci, gh:mohamedtharwat000/eliteTech/nginx.config … |
 | 9 | bad value for upstream server (unix: not supported): unix:… | gitlab-ssl, gitlab, gunicorn, puma#1 … |
 | 9 | open() "…" failed (No such file or directory (os error N)) | h5bp:nginx.conf, gh:ocftw/OpenGovReport14-16/nginx.config, gh:guilhermewebdev/stock/server/proxy/prod/nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf … |
-| 6 | bad value for proxy_pass ($var dynamic upstream not supported in vN.N; declare an upstream{} block): | gh:gsw945/wechat-demo4dev/app-nginx.conf, gh:vazw/siamstr/nginx.config, gh:sul-cidr/mime/nginx.config, gh:chelebyy/link-manager/frontend/nginx.conf … |
+| 7 | bad value for proxy_pass ($var dynamic upstream not supported in vN.N; declare an upstream{} block): | gh:gsw945/wechat-demo4dev/app-nginx.conf, gh:vazw/siamstr/nginx.config, gh:sul-cidr/mime/nginx.config, gh:chelebyy/link-manager/frontend/nginx.conf … |
 | 6 | unknown directive `deny` | gh:limingxinleo/phalcon/swoole.nginx.conf, gh:limingxinleo/basic-phalcon/swoole.nginx.conf, gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf, gh:tibbotech/yocto_layers/meta-tibbo/recipes-core/tps-node-apps/tps-node-demo/demo0/conf/nginx.conf.off … |
 | 5 | bad value for ssl_session_timeout: Nd | gh:runzhliu/welink/dev-nginx.conf, gh:wednesday-solutions/react-template/app/.nginx.conf, gh:SiddOnKeys/react-temp-wednesday/app/.nginx.conf, gh:tusharanekardev/react-template/app/.nginx.conf … |
 | 5 | unknown directive `fastcgi_temp_path` | gh:TaitoUnited/full-stack-template/docker-nginx.conf, gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:Ecalose/ocr/nginx.conf … |
 | 5 | unknown directive `limit_req_zone` | gh:thuongtruong109/flashot/nginx.conf, gh:hatanaca/quick-filler-test/nginx.conf, gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf, gh:rizkikasim/HelloProject-Muhamad-Rizki-Kasim_1303220030/nginx.conf … |
 | 5 | unknown directive `open_log_file_cache` | gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt, gh:Azigaming404/cyber/nginx.conf.txt, gh:essoojay/Autoscript-by-azi/nginx.conf.txt … |
+| 4 | missing argument for `listen` | immich#1, uptime-kuma#3, gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/prod-nginx.conf, gh:TortugaPower/bookplayer-api/nginx.config |
+| 4 | unknown directive `proxy_cache` | gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example, gh:jsjfai/AgentDNS-Node/nginx.conf.example, gh:azzaraq-creator/admix/deploy/nginx.conf.template, gh:tesfandiari1/LLM-txt/frontend/nginx.conf |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
-| 3 | missing argument for `listen` | immich#1, uptime-kuma#3, gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/prod-nginx.conf |
 | 3 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf |
 | 3 | unknown directive `http2` | gh:refluxdb/influxdb3-community/iox-nginx.conf, gh:qida/gohp/jsonx/nginx.conf.txt, gh:exp0logy/familycal/frontend/nginx.conf |
 | 3 | unknown directive `proxy_connect_timeout` | gh:deft1991/watchman/docker/proxy/nginx.conf, gh:HendrickFS/olive-oil-digital-twin/ditto/deployment/docker/nginx.conf, gh:dheerajsharma2399/ditto-twin/ditto/deployment/docker/nginx.conf |
@@ -47,8 +47,9 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | 1 | bad value for upstream server param: resolve | gh:rajim59/SwarmFort/infra/docker/nginx.conf |
 | 1 | unknown directive `auth_request` | gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf |
 | 1 | unknown directive `fastcgi_buffers` | nextcloud-root |
+| 1 | unknown directive `limit_req` | gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf |
+| 1 | unknown directive `proxy_cache_revalidate` | gh:rahualrai/howard-safe/nginx.conf |
 | 1 | unknown directive `proxy_cache_valid` | gh:Ozrlz/odoo-nginx-reverse-proxy/odoo-nginx.conf |
-| 1 | unknown directive `proxy_cache` | gh:azzaraq-creator/admix/deploy/nginx.conf.template |
 | 1 | unknown directive `real_ip_header` | gh:gopavasanth/video-cut-tool/.nginx.conf |
 | 1 | unknown directive `stream` | gh:alphadx/nginx-proxy-html-mysql/nginx.conf |
 | 1 | unknown directive `uwsgi_pass_request_headers` | gh:lijiejie/eyes.sh/dnslog_nginx.conf |
@@ -67,12 +68,12 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | sentry | proxy | ok | FAIL | ruxen: [emerg] unknown directive `set_real_ip_from` in http |
 | gunicorn | proxy | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/tmp/gunicorn.sock |
 | synapse#1 | proxy | ok | ok |  |
-| synapse#2 | proxy | — | — | (nginx: [emerg] unknown directive "Add" in /tmp/ruxen-corpus-b6qq4z2r/conf/nginx.) |
-| synapse#3 | proxy | — | — | (nginx: [emerg] unknown directive "frontend" in /tmp/ruxen-corpus-9ie_n9ta/conf/n) |
-| synapse#4 | proxy | — | — | (nginx: [emerg] unknown directive "frontend" in /tmp/ruxen-corpus-c9pcpjyn/conf/n) |
-| synapse#5 | proxy | — | — | (nginx: [emerg] unexpected "}" in /tmp/ruxen-corpus-osrenmmt/conf/nginx.conf:24) |
-| synapse#6 | proxy | — | — | (nginx: [emerg] unknown directive "table" in /tmp/ruxen-corpus-q5mc97_y/conf/ngin) |
-| synapse#7 | proxy | — | — | (nginx: [emerg] unexpected "," in /tmp/ruxen-corpus-znr032x2/conf/nginx.conf:7) |
+| synapse#2 | proxy | — | — | (nginx: [emerg] unknown directive "Add" in /tmp/ruxen-corpus-3y1s3cam/conf/nginx.) |
+| synapse#3 | proxy | — | — | (nginx: [emerg] unknown directive "frontend" in /tmp/ruxen-corpus-oz5nyzpe/conf/n) |
+| synapse#4 | proxy | — | — | (nginx: [emerg] unknown directive "frontend" in /tmp/ruxen-corpus-ooc4wxns/conf/n) |
+| synapse#5 | proxy | — | — | (nginx: [emerg] unexpected "}" in /tmp/ruxen-corpus-c929y5n5/conf/nginx.conf:24) |
+| synapse#6 | proxy | — | — | (nginx: [emerg] unknown directive "table" in /tmp/ruxen-corpus-2v7rs3da/conf/ngin) |
+| synapse#7 | proxy | — | — | (nginx: [emerg] unexpected "," in /tmp/ruxen-corpus-q3rnu3oc/conf/nginx.conf:7) |
 | vaultwarden#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in upstream |
 | vaultwarden#2 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in upstream |
 | vaultwarden#3 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `set_real_ip_from` in http |
@@ -84,82 +85,82 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | uptime-kuma#3 | proxy | ok | FAIL | ruxen: [emerg] missing argument for `listen` |
 | grafana#1 | proxy | ok | ok |  |
 | grafana#2 | proxy | ok | ok |  |
-| h5bp:nginx.conf | static | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-7lm7n43b/conf/custom.d/*.conf" failed (No such file or directory (os error 2)) |
+| h5bp:nginx.conf | static | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-kj0m6i9o/conf/custom.d/*.conf" failed (No such file or directory (os error 2)) |
 | h5bp:conf.d/templates/example.com.conf | static | ok | ok |  |
 | h5bp:conf.d/templates/no-ssl.example.com.conf | static | ok | ok |  |
 | gh:Cloud-CV/Fabrik/ide_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in location |
 | gh:rock-app/fabu.love/fabu_nginx.conf | github | ok | ok |  |
 | gh:micwallace/wallacepos/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
-| gh:MontageD/nuxt-maopingshou/nginx.conf.md | github | — | — | (nginx: [emerg] unknown directive "//" in /tmp/ruxen-corpus-wa0w7slz/conf/nginx.c) |
-| gh:censusreporter/censusreporter/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-w3frwo9u/conf/nginx.conf:4) |
-| gh:AntSwordProject/ant/nginx.conf.sample | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-vat_qj7o/conf/nginx.) |
+| gh:MontageD/nuxt-maopingshou/nginx.conf.md | github | — | — | (nginx: [emerg] unknown directive "//" in /tmp/ruxen-corpus-_n171e7q/conf/nginx.c) |
+| gh:censusreporter/censusreporter/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-nzeof31z/conf/nginx.conf:4) |
+| gh:AntSwordProject/ant/nginx.conf.sample | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-px4o1h97/conf/nginx.) |
 | gh:mwmbl/mwmbl/nginx.conf.sigil | github | — | — | (nginx: [emerg] directive "limit_req_zone" is not terminated by ";" in /tmp/ruxen) |
 | gh:lijiejie/eyes.sh/dnslog_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass_request_headers` in server |
-| gh:caktus/django-project-template/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-h6ojbbkk/conf/nginx.conf:11) |
-| gh:jakearchibald/big-web-quiz/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-whfm5yo3/conf/nginx.conf:4) |
+| gh:caktus/django-project-template/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-phouvxy1/conf/nginx.conf:11) |
+| gh:jakearchibald/big-web-quiz/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-nlu0q340/conf/nginx.conf:4) |
 | gh:limingxinleo/phalcon/swoole.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `deny` in location |
-| gh:tulayang/okdoc/docs/Nginx/nginx.conf.md | github | — | — | (nginx: [emerg] unknown directive "```" in /tmp/ruxen-corpus-dhbxue9r/conf/nginx.) |
-| gh:cqfn/jpeek/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-v31jsj5s/conf/nginx.conf:4) |
+| gh:tulayang/okdoc/docs/Nginx/nginx.conf.md | github | — | — | (nginx: [emerg] unknown directive "```" in /tmp/ruxen-corpus-sykj6tz5/conf/nginx.) |
+| gh:cqfn/jpeek/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-g3vbokql/conf/nginx.conf:4) |
 | gh:pclubiitk/puppy-love/puppy.nginx.conf | github | ok | ok |  |
-| gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache` in location |
 | gh:yunzhu-li/blupig-gomoku/docker-nginx.conf | github | ok | ok |  |
-| gh:healthlocker/healthlocker/nginx.config | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-gzlvkwa8/conf/nginx.) |
+| gh:healthlocker/healthlocker/nginx.config | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-ziu_xjx4/conf/nginx.) |
 | gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in location |
 | gh:decred/dcrstakepool/sample-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `set_real_ip_from` in http |
-| gh:ericbarch/socket-tunnel/nginx.conf.sample | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-wvbartr8/conf/nginx.) |
+| gh:ericbarch/socket-tunnel/nginx.conf.sample | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-j5rc9jfg/conf/nginx.) |
 | gh:runzhliu/welink/dev-nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_session_timeout: 1d |
 | gh:TaitoUnited/full-stack-template/docker-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_temp_path` in http |
-| gh:dataculturegroup/DataBasic/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-q1od2ok5/conf/nginx.conf:4) |
+| gh:dataculturegroup/DataBasic/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-rfpazjgy/conf/nginx.conf:4) |
 | gh:refluxdb/influxdb3-community/iox-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `http2` in server |
 | gh:luckylykkk/nnscholar-search/cloud-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in http |
 | gh:jataware/beaker-notebook/docs/nginx.conf.txt | github | ok | ok |  |
 | gh:wednesday-solutions/react-template/app/.nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_session_timeout: 1d |
-| gh:react-boilerplate/site/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-9fqw6exa/conf/nginx.) |
+| gh:react-boilerplate/site/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-l8an4rdg/conf/nginx.) |
 | gh:ansari-project/ansari-frontend/nginx.conf.sample | github | — | — | (nginx: [emerg] directive "server_name" is not terminated by ";" in /tmp/ruxen-co) |
 | gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in | github | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/tmp/graf-proxy.sock |
-| gh:shufo/nginx-consul-template/nginx.conf.ctmpl | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-b16kakdh/conf/nginx.conf:2) |
+| gh:shufo/nginx-consul-template/nginx.conf.ctmpl | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-m4pti1ip/conf/nginx.conf:2) |
 | gh:tnborg/proxy-conf/hub-nginx.conf | github | — | — | (nginx: [emerg] unknown directive "header_filter_by_lua_block" in /tmp/ruxen-corp) |
 | gh:paperhive/frontend/docker-nginx.conf | github | — | — | (nginx: [emerg] unknown "prerender_token" variable) |
-| gh:benawad/stripcode/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-pd5d71oz/conf/nginx.conf:4) |
+| gh:benawad/stripcode/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-a88fw9re/conf/nginx.conf:4) |
 | gh:dennmart/wanikani-to-anki/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
-| gh:allisterb/Alpheus/Examples/nginx.conf.2 | github | — | — | (nginx: [emerg] unknown directive "﻿user" in /tmp/ruxen-corpus-pg5525_j/conf/ngin) |
+| gh:allisterb/Alpheus/Examples/nginx.conf.2 | github | — | — | (nginx: [emerg] unknown directive "﻿user" in /tmp/ruxen-corpus-a0tepfax/conf/ngin) |
 | gh:sebleier/django-limehouse/nginx.conf.sample | github | ok | ok |  |
-| gh:datenguide/datenguide/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-_ju5q5w3/conf/nginx.conf:4) |
+| gh:datenguide/datenguide/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-y2ynjzps/conf/nginx.conf:4) |
 | gh:gopavasanth/video-cut-tool/.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `real_ip_header` in location |
-| gh:mimischi/minio-dokku/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-3s3fi67v/conf/nginx.conf:4) |
-| gh:visdesignlab/Sanguine/server-nginx.conf | github | — | — | (nginx: [emerg] cannot load certificate key "/tmp/ruxen-corpus-kkxc8j1a/conf/<REP) |
-| gh:maxschulze/elasticbeanstalk-puma-rails4/02nginx.config | github | — | — | (nginx: [emerg] unknown directive "files:" in /tmp/ruxen-corpus-mqmairc6/conf/ngi) |
-| gh:Bitshala-Incubator/silent-pay/dev/nginx.conf.in | github | — | — | (nginx: [emerg] directive "root" is not terminated by ";" in /tmp/ruxen-corpus-rz) |
-| gh:jxltom/scrapymon/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-suvjrkl9/conf/nginx.conf:4) |
-| gh:yegor256/codexia/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-dl6y8aun/conf/nginx.conf:4) |
+| gh:mimischi/minio-dokku/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-lngipvi1/conf/nginx.conf:4) |
+| gh:visdesignlab/Sanguine/server-nginx.conf | github | — | — | (nginx: [emerg] cannot load certificate key "/tmp/ruxen-corpus-qmafmagt/conf/<REP) |
+| gh:maxschulze/elasticbeanstalk-puma-rails4/02nginx.config | github | — | — | (nginx: [emerg] unknown directive "files:" in /tmp/ruxen-corpus-0ln1xsm3/conf/ngi) |
+| gh:Bitshala-Incubator/silent-pay/dev/nginx.conf.in | github | — | — | (nginx: [emerg] directive "root" is not terminated by ";" in /tmp/ruxen-corpus-m_) |
+| gh:jxltom/scrapymon/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-5czd9mwe/conf/nginx.conf:4) |
+| gh:yegor256/codexia/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-fat1q01b/conf/nginx.conf:4) |
 | gh:qida/gohp/jsonx/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `http2` in server |
 | gh:dennmart/echo_for_trello/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
-| gh:OliverRen/olili_blog/nginx/nginx.conf详解.md | github | — | — | (nginx: [emerg] unknown directive "---" in /tmp/ruxen-corpus-0xusgium/conf/nginx.) |
+| gh:OliverRen/olili_blog/nginx/nginx.conf详解.md | github | — | — | (nginx: [emerg] unknown directive "---" in /tmp/ruxen-corpus-c75yeu1q/conf/nginx.) |
 | gh:muddyland/dashy/dashy_nginx.conf | github | — | — | (nginx: [emerg] directive "server_name" is not terminated by ";" in /tmp/ruxen-co) |
 | gh:NASA-AMMOS/CODEX/mlia_nginx.conf | github | ok | ok |  |
 | gh:deshraj/VQA-Chatbot/svqa_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in location |
 | gh:d1ceward-on-dokku/dokku-posteio/nginx.conf.sigil | github | — | — | (nginx: [emerg] directive "server_name" is not terminated by ";" in /tmp/ruxen-co) |
 | gh:MetroStar/paradrop/ui/h3.nginx.conf | github | — | — | (nginx: [emerg] the "quic" parameter requires ngx_http_v3_module in /tmp/ruxen-co) |
-| gh:healthlocker/oxleas-adhd/nginx.config | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-389x40y9/conf/nginx.) |
-| gh:CodeForAfrica/sensors.AFRICA-api/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-sz84i28b/conf/nginx.conf:4) |
-| gh:beydogan/dokku-vendor/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-621zaya9/conf/nginx.conf:4) |
+| gh:healthlocker/oxleas-adhd/nginx.config | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-k2j_ppu7/conf/nginx.) |
+| gh:CodeForAfrica/sensors.AFRICA-api/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-xag76do1/conf/nginx.conf:4) |
+| gh:beydogan/dokku-vendor/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-qdadzw6y/conf/nginx.conf:4) |
 | gh:lizardsystem/lizard-screenshotter/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in /tmp/rux) |
 | gh:nens/krwlight/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in /tmp/rux) |
 | gh:KnowledgeLinks/dpla-service-hub/bibcat-nginx.conf | github | ok | ok |  |
 | gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/prod-nginx.conf | github | ok | FAIL | ruxen: [emerg] missing argument for `listen` |
 | gh:yunzhu-li/multiplayer-snake/docker-nginx.conf | github | ok | ok |  |
 | gh:legendsort/TackleAI/nginx.conf.txt | github | ok | ok |  |
-| gh:jsjfai/AgentDNS-Node/nginx.conf.example | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:jsjfai/AgentDNS-Node/nginx.conf.example | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache` in location |
 | gh:nocomp/scribe/nginx.conf.example | github | ok | ok |  |
 | gh:Apress/adv-microservices/ch4-nginx.conf | github | ok | ok |  |
 | gh:gsw945/wechat-demo4dev/app-nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://app_server/web/$sub_domain$static_file |
 | gh:backupify/yard-server/yard-nginx.conf | github | ok | ok |  |
 | gh:Agunxzzz/XrayCol/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `open_log_file_cache` in http |
-| gh:inab/openEBench-nuxt/nginx.conf.devci | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
-| gh:allisterb/Alpheus/Examples/nginx.conf.1 | github | — | — | (nginx: [emerg] invalid event type "kqueue" in /tmp/ruxen-corpus-flrz4i0w/conf/ng) |
+| gh:inab/openEBench-nuxt/nginx.conf.devci | github | ok | ok |  |
+| gh:allisterb/Alpheus/Examples/nginx.conf.1 | github | — | — | (nginx: [emerg] invalid event type "kqueue" in /tmp/ruxen-corpus-g0rwp67z/conf/ng) |
 | gh:Ozrlz/odoo-nginx-reverse-proxy/odoo-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_valid` in location |
 | gh:kaakaww/vuln_django_play/nginx.conf.micro | github | ok | ok |  |
-| gh:mohamedtharwat000/eliteTech/nginx.config | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:mohamedtharwat000/eliteTech/nginx.config | github | ok | ok |  |
 | gh:vazw/siamstr/nginx.config | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://127.0.0.1:8008/.well-known/lnurlp/$name |
 | gh:awfeequdng/rust-admin/nginx.conf.default | github | ok | ok |  |
 | gh:mazz/kifu/nginx.conf.sample | github | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:///Users/michael/src/pyr/initpyr/foo_env/foo/app.sock |
@@ -167,47 +168,47 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:brick-family/brick/nginx.config | github | ok | ok |  |
 | gh:bakery/openmic/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
 | gh:O-C-R/intotheokavango/nginx.conf.smp | github | ok | ok |  |
-| gh:ocftw/OpenGovReport14-16/nginx.config | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-aprzif1o/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) |
-| gh:TortugaPower/bookplayer-api/nginx.config | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
-| gh:amoeba/treestats.net/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-5t__iwcr/conf/nginx.conf:4) |
+| gh:ocftw/OpenGovReport14-16/nginx.config | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-si_xbnik/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) |
+| gh:TortugaPower/bookplayer-api/nginx.config | github | ok | FAIL | ruxen: [emerg] missing argument for `listen` |
+| gh:amoeba/treestats.net/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-43y4z2hn/conf/nginx.conf:4) |
 | gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for map key ($sent_http_* unavailable): $sent_http_content_type |
 | gh:Fysiksektionen/konsol-2024/outer-nginx.conf | github | ok | ok |  |
-| gh:omni-system-creator/omni/nginx/nginx.conf.readme.txt | github | — | — | (nginx: [emerg] unknown directive "nginx配置说明：" in /tmp/ruxen-corpus-mzgkti9x/conf) |
-| gh:MEGWARE-HPC/xbat/conf/nginx.conf.in | github | — | — | (nginx: [emerg] unexpected "}" in /tmp/ruxen-corpus-l6_7ojo0/conf/nginx.conf:15) |
+| gh:omni-system-creator/omni/nginx/nginx.conf.readme.txt | github | — | — | (nginx: [emerg] unknown directive "nginx配置说明：" in /tmp/ruxen-corpus-qedjryth/conf) |
+| gh:MEGWARE-HPC/xbat/conf/nginx.conf.in | github | — | — | (nginx: [emerg] unexpected "}" in /tmp/ruxen-corpus-idwk9qyn/conf/nginx.conf:15) |
 | gh:rede-sustentabilidade/site-wordpress/nginx.conf.sigil | github | — | — | (nginx: [emerg] directive "server_name" is not terminated by ";" in /tmp/ruxen-co) |
 | gh:sk123/theyownwhat/nginx.conf_dev | github | ok | FAIL | ruxen: [emerg] bad value for try_files probe (unsupported variable): $uri.html |
 | gh:sul-cidr/mime/nginx.config | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://127.0.0.1:5000/frame/$1/$2/ |
-| gh:llong2195/nest-fastify/nginx.conf.d | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:llong2195/nest-fastify/nginx.conf.d | github | ok | ok |  |
 | gh:TetAlius/GoSyncMyCalendars/.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `allow` in location |
-| gh:opensessions/opensessions/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-r8pvidwx/conf/nginx.) |
-| gh:liberalman/nginx-consul-template/nginx.conf.ctmpl | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-uz44a1j4/conf/nginx.conf:6) |
-| gh:alecgorge/iguana/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-3b3kmb3s/conf/nginx.conf:4) |
-| gh:liujitao/tvbox/suntv_nginx.conf | github | — | — | (nginx: [emerg] unknown log format "main" in /tmp/ruxen-corpus-1wamzmkn/conf/ngin) |
+| gh:opensessions/opensessions/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-zugstjrv/conf/nginx.) |
+| gh:liberalman/nginx-consul-template/nginx.conf.ctmpl | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-ra_sqtsv/conf/nginx.conf:6) |
+| gh:alecgorge/iguana/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-rlefpt9z/conf/nginx.conf:4) |
+| gh:liujitao/tvbox/suntv_nginx.conf | github | — | — | (nginx: [emerg] unknown log format "main" in /tmp/ruxen-corpus-rgli0q73/conf/ngin) |
 | gh:gierens/yubipi/yubipi-nginx.conf | github | ok | ok |  |
 | gh:nfdi4health/ldh-deployment/nginx.conf.https | github | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_temp_path` in http |
 | gh:Wubbadub/ClubHub/nginx.config | github | ok | ok |  |
 | gh:EstudioNexos/flautodiscover/fla_nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 |
 | gh:aws-solutions-library-samples/guidance-for-training-an-aws-deepracer-model-using-amazon-sagemaker/dpr401/src/lib/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/tmp/gunicorn.sock |
-| gh:yegor256/jare/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-pcpq6noi/conf/nginx.conf:4) |
-| gh:yegor256/0pdd/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-yqc5hmgf/conf/nginx.conf:4) |
+| gh:yegor256/jare/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-n8kqs4m_/conf/nginx.conf:4) |
+| gh:yegor256/0pdd/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-81mz60ga/conf/nginx.conf:4) |
 | gh:zanfranceschi/rinha-de-backend-2025/participantes/jrblatt-rust-v4/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/tmp/api1.sock |
-| gh:yegor256/rehttp/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-0dij1xdq/conf/nginx.conf:4) |
-| gh:yegor256/mailanes/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-q4620uwr/conf/nginx.conf:4) |
-| gh:bakery/openmic/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-eh1u7j1a/conf/nginx.) |
+| gh:yegor256/rehttp/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-h96bxgju/conf/nginx.conf:4) |
+| gh:yegor256/mailanes/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-qgi8gkog/conf/nginx.conf:4) |
+| gh:bakery/openmic/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-knio13v5/conf/nginx.) |
 | gh:limingxinleo/basic-phalcon/swoole.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `deny` in location |
 | gh:lizardsystem/lizard-efcis/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in /tmp/rux) |
 | gh:feross/play.cash/nginx.conf | github | — | ok | (nginx: [emerg] bind() to 50.116.11.184:18080 failed (99: Cannot assign requested) |
 | gh:flowerinheart/VisualNN/ide_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in location |
-| gh:inab/openEBench-nuxt-v3/nginx.conf.devci | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:inab/openEBench-nuxt-v3/nginx.conf.devci | github | ok | ok |  |
 | gh:keya254/pharmacy-pos/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
 | gh:ddsc/ddsc-site/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in /tmp/rux) |
 | gh:ddsc/ddsc-management/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in /tmp/rux) |
 | gh:ddsc/ddsc-worker/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in /tmp/rux) |
-| gh:llong2195/nest-starter/nginx.conf.d | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:llong2195/nest-starter/nginx.conf.d | github | ok | ok |  |
 | gh:fabiocicerchia/nginx-lua/nginx/1.18.0/ubuntu/18.04/tpl/nginx.conf | github | ok | ok |  |
 | gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `deny` in location |
 | gh:TautvydasDerzinskas/Thingport/frontend/nginx.conf | github | ok | ok |  |
-| gh:nicholas-b-carter/progressive-react/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-0zfqrpp4/conf/nginx.) |
+| gh:nicholas-b-carter/progressive-react/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-w55s__5d/conf/nginx.) |
 | gh:yashab-cyber/metasploit-ai/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in http |
 | gh:Ngugi1/wallacepos/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
 | gh:bleemeo/squirreldb/examples/squirreldb_ha/nginx.conf | github | ok | ok |  |
@@ -220,18 +221,18 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:UKingGit/aifabu/fabu_nginx.conf | github | ok | ok |  |
 | gh:zzxtbl/fabu.love-ok/fabu_nginx.conf | github | ok | ok |  |
 | gh:Chen-T/fabuapp/fabu_nginx.conf | github | ok | ok |  |
-| gh:gravityrail/landln/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-uiogq9u6/conf/nginx.) |
-| gh:mmlngl/flower-of-life/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-1y550k75/conf/nginx.) |
-| gh:PanJ/SimplerCityGlide/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-28xwk3ov/conf/nginx.) |
-| gh:denisflorkin/rbp-immutable-reselect-test-case/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-d44byezr/conf/nginx.) |
-| gh:bdougie/react-boilerplate/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-jmxnkg8k/conf/nginx.) |
+| gh:gravityrail/landln/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-79yi4031/conf/nginx.) |
+| gh:mmlngl/flower-of-life/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-2tq_gwg1/conf/nginx.) |
+| gh:PanJ/SimplerCityGlide/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-zkgoshbr/conf/nginx.) |
+| gh:denisflorkin/rbp-immutable-reselect-test-case/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-dvtw0ybo/conf/nginx.) |
+| gh:bdougie/react-boilerplate/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-1irez_nf/conf/nginx.) |
 | gh:h5gs/NativePOSEngineold/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
 | gh:rpsuman/puppy-love/puppy.nginx.conf | github | ok | ok |  |
 | gh:zikbly/wpos/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in /tmp/ruxen) |
 | gh:piske-alex/multiplayer-snake/docker-nginx.conf | github | ok | ok |  |
-| gh:llong2195/nest-fastify-drizzle/nginx.conf.d | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:llong2195/nest-fastify-drizzle/nginx.conf.d | github | ok | ok |  |
 | gh:OnlyArkMani/Quizzie/frontend/nginx.conf.template | github | — | — | (nginx: [emerg] unknown "backend_url" variable) |
-| gh:karloespiritu/react-boilerplate-redux-form-semantic/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-h4gwf8i9/conf/nginx.) |
+| gh:karloespiritu/react-boilerplate-redux-form-semantic/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in /tmp/ruxen-corpus-uf4xvo9q/conf/nginx.) |
 | gh:haziqq247/django/nginx.conf.micro | github | ok | ok |  |
 | gh:redpower5x5/gomoku/docker-nginx.conf | github | ok | ok |  |
 | gh:YunoHost-Apps/rspamdui_ynh/conf/nginx.conf | github | ok | ok |  |
@@ -239,32 +240,32 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:SiddOnKeys/react-temp-wednesday/app/.nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_session_timeout: 1d |
 | gh:tusharanekardev/react-template/app/.nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_session_timeout: 1d |
 | gh:apurv-wednesday/react-template/app/.nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_session_timeout: 1d |
-| gh:notTanveer/sp-cli/dev/nginx.conf.in | github | — | — | (nginx: [emerg] directive "root" is not terminated by ";" in /tmp/ruxen-corpus-_3) |
-| gh:josuemontano/minio-dokku/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-tvq1icyj/conf/nginx.conf:4) |
-| gh:guilhermewebdev/stock/server/proxy/prod/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-sc7oby3z/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) |
-| gh:vkresch/pdftoxrechnung/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:notTanveer/sp-cli/dev/nginx.conf.in | github | — | — | (nginx: [emerg] directive "root" is not terminated by ";" in /tmp/ruxen-corpus-pl) |
+| gh:josuemontano/minio-dokku/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-wugv3x_6/conf/nginx.conf:4) |
+| gh:guilhermewebdev/stock/server/proxy/prod/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-gzx82t4z/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) |
+| gh:vkresch/pdftoxrechnung/nginx/nginx.conf | github | ok | ok |  |
 | gh:thuongtruong109/flashot/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in http |
 | gh:betarixm/poka-roulette/nginx.conf | github | ok | ok |  |
 | gh:hatanaca/quick-filler-test/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in http |
 | gh:Ecalose/ocr/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_temp_path` in server |
 | gh:chelebyy/link-manager/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): $backend_upstream |
-| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-ylhtybcw/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) |
+| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-hfgalxpc/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) |
 | gh:Ingvord/animated-garbanzo/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in http |
-| gh:cfrank/nextjs-common-host-redirect-issue/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:cfrank/nextjs-common-host-redirect-issue/nginx/nginx.conf | github | ok | ok |  |
 | gh:flajoke/s21-Simple-Docker/src/06/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `stub_status` in location |
 | gh:JonUkmata/ReviewAnalyzer/nginx/nginx.conf.backup.20260104-194315 | github | — | — | (nginx: [emerg] host not found in upstream "user-service:80" in /tmp/ruxen-corpus) |
 | gh:captainRam1413/Hostelmanagement-/frontend/nginx.conf | github | ok | ok |  |
-| gh:CanSell-Team/cansell-waitlist/nginx.conf | github | — | — | (nginx: [emerg] invalid value "must-revalidate" in /tmp/ruxen-corpus-sj9_tvyb/con) |
+| gh:CanSell-Team/cansell-waitlist/nginx.conf | github | — | — | (nginx: [emerg] invalid value "must-revalidate" in /tmp/ruxen-corpus-vqif5tzc/con) |
 | gh:masesmirnov/studcamp/nginx.conf | github | ok | ok |  |
 | gh:alex-odilon/desafio-tec-devops/nginx.conf | github | ok | ok |  |
 | gh:RubiDickens/gp1f5a1/nginx.conf | github | ok | ok |  |
 | gh:EasonChen11/SteveApiServer/nginx.conf | github | ok | ok |  |
 | gh:Vietanh2894/YOLOv8-Acrface/nginx.conf | github | ok | ok |  |
-| gh:P3dr0vt/SIGA/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:P3dr0vt/SIGA/nginx.conf | github | ok | ok |  |
 | gh:holadmex/messaging-que-app/nginx.conf | github | ok | ok |  |
 | gh:vwocu3/VW_OCU3_TASK/nginx.conf | github | ok | ok |  |
 | gh:ThNikGhost/notipus2/nginx.conf | github | ok | ok |  |
-| gh:Gagen4/map4/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:Gagen4/map4/nginx.conf | github | ok | ok |  |
 | gh:ok245/Food-Order-System-Backend/nginx.conf | github | — | — | (nginx: [emerg] unexpected end of file, expecting ";" or "}" in /tmp/ruxen-corpus) |
 | gh:Athenavi/chiron/frontend-vue/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://$chiron_gateway |
 | gh:QuantumBitstream/travelplanner_vue/nginx/nginx.conf | github | ok | ok |  |
@@ -272,26 +273,26 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): $frontend_upstream |
 | gh:Amitkushwaha328/CivicSense-AI/nginx/nginx.conf | github | ok | ok |  |
 | gh:zumassh/foodgram-st/infra/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for try_files fallback (variables not supported): $uri/redoc.html |
-| gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req` in location |
 | gh:Kwon9302/LetsGoToWork/nginx/nginx.conf | github | ok | ok |  |
 | gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in http |
 | gh:c2-07/postOffice/nginx/nginx.conf | github | ok | ok |  |
-| gh:MikhailGubin/knowledge_plus/nginx/nginx.conf | github | — | — | (nginx: [emerg] invalid parameter "8000" in /tmp/ruxen-corpus-dos1pbfx/conf/nginx) |
+| gh:MikhailGubin/knowledge_plus/nginx/nginx.conf | github | — | — | (nginx: [emerg] invalid parameter "8000" in /tmp/ruxen-corpus-ji_cmfcn/conf/nginx) |
 | gh:samuelarogbonlo/p2p-webserver-deployment/config/nginx.conf | github | ok | ok |  |
-| gh:Getsuga01/MicroServices/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:Getsuga01/MicroServices/frontend/nginx.conf | github | ok | ok |  |
 | gh:LJH-apk/CR-monitor/frontend/nginx.conf | github | ok | ok |  |
 | gh:raul-dan23/fsgc-java/frontend/nginx.conf | github | ok | ok |  |
 | gh:relhamdi/aplusa-test_technique_datahub/frontend/nginx.conf | github | ok | ok |  |
 | gh:romitechdev/sevima-semai/apps/web/nginx.conf | github | ok | ok |  |
-| gh:Mumurilo375/nexusFull/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:Mumurilo375/nexusFull/frontend/nginx.conf | github | ok | ok |  |
 | gh:KietLe624/ai-3d-asset-organizer/frontend/nginx.conf | github | ok | ok |  |
-| gh:Ram-agarwal/ChatNow/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:Ram-agarwal/ChatNow/frontend/nginx.conf | github | ok | ok |  |
 | gh:EdDee296/Quorum/frontend/nginx.conf | github | ok | ok |  |
 | gh:Ouonnki/OuonnkiTV/nginx.conf | github | ok | ok |  |
-| gh:jaywcjlove/nginx-editor/website/src/nginx.conf.ts | github | — | — | (nginx: [emerg] unknown directive "export" in /tmp/ruxen-corpus-964vd6t6/conf/ngi) |
-| gh:camptocamp/docker-odoo-nginx/nginx/templates/nginx.conf.tmpl | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-w3nnu29m/conf/nginx.conf:87) |
+| gh:jaywcjlove/nginx-editor/website/src/nginx.conf.ts | github | — | — | (nginx: [emerg] unknown directive "export" in /tmp/ruxen-corpus-wmzcrvmd/conf/ngi) |
+| gh:camptocamp/docker-odoo-nginx/nginx/templates/nginx.conf.tmpl | github | — | — | (nginx: [emerg] unexpected "{" in /tmp/ruxen-corpus-wic3jcfq/conf/nginx.conf:87) |
 | gh:fabiocicerchia/nginx-lua/nginx/1.19.2/ubuntu/20.04/tpl/nginx.conf | github | ok | ok |  |
-| gh:passadis/ai-architect-webapp/frontend/architect-ai/custom_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:passadis/ai-architect-webapp/frontend/architect-ai/custom_nginx.conf | github | ok | ok |  |
 | gh:sparcs-kaist/biseo/nginx.conf | github | — | — | (nginx: [emerg] unknown "server_uri" variable) |
 | gh:freinbichler/drone-nginx-configuration/drone-nginx.conf | github | ok | ok |  |
 | gh:tibbotech/yocto_layers/meta-tibbo/recipes-core/tps-node-apps/tps-node-demo/demo0/conf/nginx.conf.off | github | ok | FAIL | ruxen: [emerg] unknown directive `deny` in location |
@@ -301,10 +302,10 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `auth_request` in location |
 | gh:MRLokop/shiki-proxy/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass scheme (only http:// supported in v0.1): https://135.181.210.175 |
 | gh:codeDogMcGee/Django-RestApi-Appointments/nginx/nginx.conf | github | ok | ok |  |
-| gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-fkeq_v2u/fs/usr/share/nginx/modules/*.conf" failed (No such file or directory (os error 2)) |
+| gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-podake82/fs/usr/share/nginx/modules/*.conf" failed (No such file or directory (os error 2)) |
 | gh:Kwizera250232/Teacher-s-App-frontent/student-nginx.conf | github | ok | ok |  |
 | gh:codest40/edgepaas-project/ansible/templates/nginx.conf.j2 | github | — | — | (nginx: [emerg] directive "server" is not terminated by ";" in /tmp/ruxen-corpus-) |
-| gh:shulieTech/takin-docker/takin-nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-e2ti8nlx/fs/etc/nginx/modules/*.conf" failed (No such file or directory (os error 2)) |
+| gh:shulieTech/takin-docker/takin-nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-29gec2z7/fs/etc/nginx/modules/*.conf" failed (No such file or directory (os error 2)) |
 | gh:moniishhh/ansys-copilot/deploy/nginx.conf | github | ok | ok |  |
 | gh:mechmind-dwv/ftrt-cambrian-correlation/nginx.conf | github | — | — | (nginx: [emerg] invalid port in "${FRONTEND_PORT:-1111}" of the "listen" directiv) |
 | gh:Top-of-the-Top/profession-web-app/frontend/nginx.conf | github | ok | ok |  |
@@ -313,55 +314,55 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:johndoe6345789/DeployButton/nginx/nginx.conf | github | — | — | (nginx: [emerg] unknown "active_backend" variable) |
 | gh:thefewchosen/tfcctf-2024-challs/web/PNGiphy/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_path` in http |
 | gh:Sushindhran/Motley/client/nginx.conf | github | ok | ok |  |
-| gh:Mayank7805/AI-Stock-Predictor/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
-| gh:bkarkusashvili/citycom-fs/apps/web/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:Mayank7805/AI-Stock-Predictor/frontend/nginx.conf | github | ok | ok |  |
+| gh:bkarkusashvili/citycom-fs/apps/web/nginx.conf | github | ok | ok |  |
 | gh:exp0logy/familycal/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `http2` in server |
 | gh:Thybaau/todolist-app/nginx.conf | github | ok | ok |  |
-| gh:milan-lf/quiz/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
-| gh:SangHyunGil/KonerFrontEnd/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-wzinrbtu/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) |
+| gh:milan-lf/quiz/nginx.conf | github | ok | ok |  |
+| gh:SangHyunGil/KonerFrontEnd/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-zobn35pa/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) |
 | gh:vicaqu/gp1f5a14/nginx.conf | github | ok | ok |  |
 | gh:rizkikasim/HelloProject-Muhamad-Rizki-Kasim_1303220030/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in http |
 | gh:kayab23/Base_Costos_PWA/nginx.conf | github | ok | ok |  |
 | gh:NikMassV/nginx/nginx.conf | github | ok | ok |  |
 | gh:Ermuk-code/arenda-site/nginx.conf | github | ok | ok |  |
-| gh:ksanyok/mailforge/docker/web/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:ksanyok/mailforge/docker/web/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://webmail:80$request_uri |
 | gh:Ikeu-1030/iRun/docker/nginx/nginx.conf | github | ok | ok |  |
 | gh:rajim59/SwarmFort/infra/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server param: resolve |
 | gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in http |
 | gh:izumiriyad/bsass-demov2/ops/nginx.conf | github | ok | ok |  |
-| gh:devfernandoa/HyController/panel/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:devfernandoa/HyController/panel/frontend/nginx.conf | github | ok | ok |  |
 | gh:mabels/mailu-arm/core/nginx/conf/nginx.conf | github | — | — | (nginx: [emerg] directive "resolver" is not terminated by ";" in /tmp/ruxen-corpu) |
 | gh:Bonshal/Clairity-2/nginx/nginx.conf | github | ok | ok |  |
 | gh:AdolfCarr/Reto_Tecnico_Direccion-de-Sistemas-de-la-Secretaria-de-Administracion-del-Estado-de-Jalisco/front/nginx.conf | github | ok | ok |  |
 | gh:spandanaerukull/fastapi-devops-production-deployment/nginx/nginx.conf | github | ok | ok |  |
-| gh:coderback/Windrush/nginx/nginx.conf | github | — | — | (nginx: [emerg] host not found in upstream "frontend:3000" in /tmp/ruxen-corpus-6) |
+| gh:coderback/Windrush/nginx/nginx.conf | github | — | — | (nginx: [emerg] host not found in upstream "frontend:3000" in /tmp/ruxen-corpus-f) |
 | gh:BekzatS8/KUB/deploy/nginx.conf | github | ok | ok |  |
 | gh:Madeln2020/ErgalyonManager/deploy/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `deny` in location |
-| gh:mesanyaa/finance_manager/client/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:mesanyaa/finance_manager/client/nginx.conf | github | ok | ok |  |
 | gh:ABCall-Project/abcall-payment-api/docker/nginx.conf | github | ok | ok |  |
-| gh:rahualrai/howard-safe/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:rahualrai/howard-safe/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_revalidate` in location |
 | gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 |
 | gh:franjavi-upct-es/SafeStream-AI/services/dashboard/nginx.conf | github | ok | ok |  |
 | gh:Lucasgarciamdz/reminders_app/frontend/nginx.conf | github | ok | ok |  |
-| gh:tesfandiari1/LLM-txt/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:tesfandiari1/LLM-txt/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache` in location |
 | gh:sujal-goel/Smartleads/frontend/nginx.conf | github | ok | ok |  |
 | gh:Amit-Gupta75/Telecom-Churn-Intelligence/frontend/nginx.conf | github | ok | ok |  |
 | gh:slayer-ak4sh/RetainIQ_F/frontend/nginx.conf | github | ok | ok |  |
 | gh:KevalPatel1508/warehouse-shrinkage-system/frontend/nginx.conf | github | ok | ok |  |
 | gh:simay-uygur/Bilkent-University-TA-Management-System/frontend/nginx.conf | github | ok | ok |  |
 | gh:torantous1337/network-explorer/frontend/nginx.conf | github | ok | ok |  |
-| gh:jeed0o0/task-management-system/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:jeed0o0/task-management-system/frontend/nginx.conf | github | ok | ok |  |
 | gh:hasnat-nawaz/warm-order-hub/frontend/nginx.conf | github | ok | ok |  |
 | gh:imykytenko/opora/frontend/nginx.conf | github | ok | ok |  |
 | gh:fatmagulfidan/DEP-LB1/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `deny` in location |
 | gh:thodotpro/PonchoProphet/frontend/nginx.conf | github | ok | ok |  |
 | gh:vthot4/poc_nifi/examples/Ejemplo_2/nginx-conf/nginx.conf | github | ok | ok |  |
-| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-wnayw2xh/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) |
+| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-7j19tnmr/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) |
 | gh:kc611/microservices-app/m-frontend/nginx.conf | github | ok | ok |  |
-| gh:noam-r/produckt/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:noam-r/produckt/frontend/nginx.conf | github | ok | ok |  |
 | gh:pranali04/SampleTradingApp/api_gateway/nginx.conf | github | ok | ok |  |
 | gh:josiahdavis/deploy-keyword-topic-model/topic-model/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/tmp/gunicorn.sock |
-| gh:dimaslz/local-ssl-management/packages/app/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:dimaslz/local-ssl-management/packages/app/nginx.conf | github | ok | ok |  |
 | gh:AlinAlexMyladoor/VeriCred-Campus/esignet-mock/nginx.conf | github | ok | ok |  |
 | gh:369sabinsaigal-byte/aetheria/aetheria-web/nginx.conf | github | ok | ok |  |
 | gh:zae-hyeong/homeserver/reverse-proxy/nginx.conf | github | ok | ok |  |
@@ -373,17 +374,17 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:HendrickFS/olive-oil-digital-twin/ditto/deployment/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_connect_timeout` in http |
 | gh:dheerajsharma2399/ditto-twin/ditto/deployment/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_connect_timeout` in http |
 | gh:SoggyHammyDev/soggy-pools/soggy-pools-xec-solo/web/nginx.conf | github | ok | ok |  |
-| gh:Hama-Gama/task-tracker/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:Hama-Gama/task-tracker/nginx/nginx.conf | github | ok | ok |  |
 | gh:muhammedhanii/bunzo/nginx/nginx.conf | github | ok | ok |  |
 | gh:johnmathews/game/nginx/nginx.conf | github | ok | ok |  |
 | gh:marcphilippebeaujean-abertay/cs50project2/server/nginx.conf | github | ok | ok |  |
 | gh:djsmacker01/Crayfield/frontend/nginx.conf | github | ok | ok |  |
-| gh:zwlcoding/yt-todo/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:zwlcoding/yt-todo/frontend/nginx.conf | github | ok | ok |  |
 | gh:hypothetical-andrei/compnet-live-2026/s11/1_nginx-reverse-proxy/nginx.conf | github | ok | ok |  |
 | gh:Mozart409/nixos-fleet/hosts/containers/harbor/config/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_temp_path` in http |
-| gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-t3fc5voa/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) |
-| gh:GrabowMar/result_llm_analysis/generated/apps/openai_gpt-5.2-codex-20260114/app1/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "/tmp/ruxen-corpus-sydogqn7/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) |
+| gh:GrabowMar/result_llm_analysis/generated/apps/openai_gpt-5.2-codex-20260114/app1/frontend/nginx.conf | github | ok | ok |  |
 | gh:duongnghia222/DATKLL_Object_Tracking_Robot/Ref/Object-Finding-Rover-master/raspberry_pi_packet_serial/nginx.conf | github | ok | ok |  |
 | gh:wildfly-security/wildfly-elytron/http/oidc/src/test/resources/org/wildfly/security/http/oidc/nginx.conf | github | — | — | (nginx: [emerg] unknown "client_port" variable) |
 | gh:FarrukhCyber/debloating-test-suit/nginx/chisel/nginx_test_cases/test_c/conf/nginx.conf | github | ok | ok |  |
-| gh:jiangxxxue/KOCO-bench/KOCO-bench-en/domain_code_generation/scripts/agent/dataset/dataset_remove_implementation_remove_test_en/raganything/test_examples/Chat-ANYTHING/code/rag-web-ui/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_bypass` in location |
+| gh:jiangxxxue/KOCO-bench/KOCO-bench-en/domain_code_generation/scripts/agent/dataset/dataset_remove_implementation_remove_test_en/raganything/test_examples/Chat-ANYTHING/code/rag-web-ui/nginx.conf | github | ok | ok |  |
