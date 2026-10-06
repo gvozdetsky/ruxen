@@ -155,6 +155,10 @@ fn spawn_carrying_backend() -> u16 {
                 "/f.txt"
             } else if head.windows(10).any(|w| w == b"/c/missing") {
                 "/missing.txt"
+            } else if head.windows(12).any(|w| w == b"/c/unsafe-dd") {
+                "/f.txt/.."
+            } else if head.windows(12).any(|w| w == b"/c/unsafe-es") {
+                "/f.txt/.%2e?a=1"
             } else {
                 "/internal/show"
             };
@@ -237,4 +241,50 @@ fn x_accel_redirect_keeps_upstream_headers() {
     let log = std::fs::read_to_string(root.join("access.log")).unwrap();
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(log, "/internal/show 7\n/f.txt 7\n/missing.txt 7\n");
+}
+
+/// An X-Accel-Redirect to an unsafe URI (`..` segments, also escaped) is
+/// refused with 404 and an error-log line, as nginx's
+/// ngx_http_parse_unsafe_uri; it used to be normalized and followed.
+#[test]
+fn x_accel_redirect_refuses_unsafe_uris() {
+    let up = spawn_carrying_backend();
+    let root = std::env::temp_dir().join(format!("ruxen-m61-unsafe-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("index.html"), "index").unwrap();
+    let server = start(&format!(
+        "error_log {root}/error.log;\n\
+         server {{ listen 127.0.0.1:%%PORT%%; root {root};\n\
+           location /c/ {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+           location /e/ {{ proxy_pass http://127.0.0.1:{up}/c/; error_page 404 /nf; }}\n\
+           location = /nf {{ return 200 \"custom\"; }}\n\
+         }}",
+        root = root.display()
+    ));
+
+    // The location's error_page applies to the 404.
+    let resp = send(server.port, "GET", "/e/unsafe-dd");
+    assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+    assert_eq!(body(&resp), "custom", "{resp}");
+
+    for (path, target) in [
+        ("/c/unsafe-dd", "/f.txt/.."),
+        ("/c/unsafe-es", "/f.txt/.%2e?a=1"),
+    ] {
+        let resp = send(server.port, "GET", path);
+        assert!(resp.starts_with("HTTP/1.1 404"), "{path}: {resp}");
+        assert_eq!(
+            header_lines(&resp, "Content-Type"),
+            ["text/plain"],
+            "{resp}"
+        );
+        assert_eq!(header_lines(&resp, "Set-Cookie"), ["a=1", "b=2"], "{resp}");
+        let log = std::fs::read_to_string(root.join("error.log")).unwrap_or_default();
+        assert!(
+            log.contains("[error]")
+                && log.contains(&format!("unsafe URI \"{target}\" was detected")),
+            "{log}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -396,10 +396,27 @@ async fn settle_proxy_response(
         // and the request redirected internally, as a GET.
         _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => {
             accel_carried_headers(&report.upstream_headers, &mut carried);
-            (
-                accel_redirect(&mut report),
-                !matches!(ctx.method, Method::Head),
-            )
+            match accel_redirect(&mut report) {
+                Ok(reroute) => (reroute, !matches!(ctx.method, Method::Head)),
+                Err(target) => match refuse_unsafe_accel(
+                    &target,
+                    &mut report,
+                    error_pages,
+                    recursive_error_pages,
+                    http,
+                    ctx,
+                    &process_meta,
+                    server_bytes,
+                ) {
+                    Response::Reroute(reroute) => (reroute, false),
+                    response => {
+                        let mut process_meta = process_meta;
+                        process_meta.upstream_states = report.states;
+                        process_meta.upstream_headers = report.upstream_headers;
+                        return (carry_accel_headers(response, &carried, false), process_meta);
+                    }
+                },
+            }
         }
         upstream_resp => {
             return finish_proxy_response(
@@ -590,14 +607,36 @@ async fn run_proxy_pass(
         _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => {
             let mut carried = Vec::new();
             accel_carried_headers(&report.upstream_headers, &mut carried);
+            let (reroute, as_get) = match accel_redirect(&mut report) {
+                Ok(reroute) => (reroute, !matches!(ctx.method, Method::Head)),
+                Err(target) => match refuse_unsafe_accel(
+                    &target,
+                    &mut report,
+                    error_pages,
+                    recursive_error_pages,
+                    http,
+                    &pass_request(ctx, as_get),
+                    &process_meta,
+                    server_bytes,
+                ) {
+                    Response::Reroute(reroute) => (reroute, as_get),
+                    response => {
+                        let mut process_meta = process_meta;
+                        process_meta.upstream_states = report.states;
+                        process_meta.upstream_headers = report.upstream_headers;
+                        let response = carry_accel_headers(response, &carried, false);
+                        return PassOutcome::Done(response, process_meta);
+                    }
+                },
+            };
             PassOutcome::Redirect {
-                reroute: accel_redirect(&mut report),
+                reroute,
                 trail: crate::proxy::UpstreamTrail {
                     states: report.states,
                     headers: report.upstream_headers,
                 },
                 carried,
-                as_get: !matches!(ctx.method, Method::Head),
+                as_get,
                 limit_rate,
             }
         }
@@ -692,14 +731,60 @@ fn pass_request<'a>(ctx: &phase::RequestCtx<'a>, as_get: bool) -> phase::Request
 /// named location, anything else is a URI with optional `?args`.
 /// The upstream's X-Accel-Redirect: its request is over (nginx finalizes
 /// it before redirecting), and the request goes to the target.
-fn accel_redirect(report: &mut crate::proxy::ProxyReport) -> phase::Reroute {
+/// An unsafe URI (`uri::is_unsafe`) is the `Err`, for a 404.
+fn accel_redirect(report: &mut crate::proxy::ProxyReport) -> Result<phase::Reroute, Vec<u8>> {
     crate::proxy::finish_answer(&mut report.states);
-    accel_redirect_reroute(
-        report
-            .accel
-            .as_mut()
-            .and_then(|a| a.redirect.take())
-            .unwrap_or_default(),
+    let target = report
+        .accel
+        .as_mut()
+        .and_then(|a| a.redirect.take())
+        .unwrap_or_default();
+    if target.first() != Some(&b'@') {
+        let path_end = target
+            .iter()
+            .position(|&b| b == b'?')
+            .unwrap_or(target.len());
+        if crate::uri::is_unsafe(&target[..path_end]) {
+            return Err(target);
+        }
+    }
+    Ok(accel_redirect_reroute(target))
+}
+
+/// An X-Accel-Redirect to an unsafe URI: nginx logs it and finalizes the
+/// request with 404 (through the location's `error_page`), as
+/// ngx_http_upstream_process_headers.
+#[cold]
+#[allow(clippy::too_many_arguments)]
+fn refuse_unsafe_accel(
+    target: &[u8],
+    report: &mut crate::proxy::ProxyReport,
+    error_pages: &'static [PreparedErrorPage],
+    recursive_error_pages: bool,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    process_meta: &phase::ProcessMeta,
+    server_bytes: &'static [u8],
+) -> Response {
+    let mut message = b"unsafe URI \"".to_vec();
+    message.extend_from_slice(target);
+    message.extend_from_slice(b"\" was detected");
+    write_error_log(
+        process_meta.log.error_logs,
+        ErrorLogLevel::Error,
+        &ErrorLogRequest::new(ctx, process_meta.server_name),
+        &message,
+        None,
+    );
+    intercept_with_report(
+        Response::Prebuilt(http.not_found.pick(ctx.method)),
+        report,
+        error_pages,
+        recursive_error_pages,
+        http,
+        ctx,
+        process_meta,
+        server_bytes,
     )
 }
 
