@@ -672,13 +672,13 @@ pub(crate) fn parse_location_block(
                 alias_prefix_override = None;
             }
             ("index", Terminator::Semi) => {
-                if index.is_some() {
-                    return Err(Error::Duplicate("index"));
-                }
                 if args.len() < 2 {
                     return Err(Error::MissingArg("index"));
                 }
-                index = Some(parse_index_entries(&args[1..])?);
+                // Repeated `index` lines append, as in nginx.
+                index
+                    .get_or_insert_with(Vec::new)
+                    .extend(parse_index_entries(&args[1..])?);
             }
             ("try_files", Terminator::Semi) => {
                 if try_files.is_some() {

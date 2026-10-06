@@ -547,8 +547,8 @@ pub struct Server {
     /// warning when no server on its address listens with `ssl`).
     pub ssl_directives: bool,
     /// `merge_slashes off` disables the `//` → `/` collapse in URI
-    /// normalization. Default (`true`) matches nginx's default `on`.
-    pub merge_slashes: bool,
+    /// normalization. `None` inherits from http scope (default `on`).
+    pub merge_slashes: Option<bool>,
     /// Server-scope `ignore_invalid_headers on|off;`. `None` inherits from
     /// http scope (default `on`).
     pub ignore_invalid_headers: Option<bool>,

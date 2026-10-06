@@ -49,7 +49,7 @@ pub(crate) fn parse_server_block(
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
-    let mut merge_slashes: bool = true;
+    let mut merge_slashes: Option<bool> = None;
     let mut ignore_invalid_headers: Option<bool> = None;
     let mut underscores_in_headers: Option<bool> = None;
     let mut error_logs: Option<Vec<ErrorLog>> = None;
@@ -322,13 +322,13 @@ pub(crate) fn parse_server_block(
                 }
             }
             ("index", Terminator::Semi) => {
-                if index.is_some() {
-                    return Err(Error::Duplicate("index"));
-                }
                 if args.len() < 2 {
                     return Err(Error::MissingArg("index"));
                 }
-                index = Some(parse_index_entries(&args[1..])?);
+                // Repeated `index` lines append, as in nginx.
+                index
+                    .get_or_insert_with(Vec::new)
+                    .extend(parse_index_entries(&args[1..])?);
             }
             ("root", Terminator::Semi) => {
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
@@ -383,8 +383,8 @@ pub(crate) fn parse_server_block(
             ("merge_slashes", Terminator::Semi) => {
                 let raw = args.get(1).ok_or(Error::MissingArg("merge_slashes"))?;
                 merge_slashes = match raw.as_str() {
-                    "on" => true,
-                    "off" => false,
+                    "on" => Some(true),
+                    "off" => Some(false),
                     _ => {
                         return Err(Error::BadValue {
                             what: "merge_slashes",
