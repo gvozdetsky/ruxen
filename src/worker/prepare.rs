@@ -73,6 +73,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         client_max_body_size,
         client_body_temp_path,
         sendfile,
+        disable_symlinks,
         limit_rate,
         limit_rate_after,
         post_action,
@@ -115,6 +116,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_auth_delay_ms = auth_delay_ms.unwrap_or(0);
     let http_client_max_body_size = client_max_body_size;
     let http_sendfile = sendfile;
+    let http_disable_symlinks = disable_symlinks;
     let http_limit_rate =
         PreparedLimitRate::inherit(limit_rate, limit_rate_after, PreparedLimitRate::default());
     let http_post_action = post_action.map(|target| leak_bytes(target.as_bytes()));
@@ -190,6 +192,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                     http_auth_delay_ms,
                     http_client_max_body_size,
                     http_sendfile,
+                    http_disable_symlinks.clone(),
                     http_limit_rate,
                     http_post_action,
                     http_expires,
@@ -884,6 +887,7 @@ pub(crate) fn prepare_server(
     http_auth_delay_ms: u64,
     http_client_max_body_size: Option<u64>,
     http_sendfile: Option<bool>,
+    http_disable_symlinks: Option<crate::config::DisableSymlinks>,
     http_limit_rate: PreparedLimitRate,
     http_post_action: Option<&'static [u8]>,
     http_expires: PreparedExpires,
@@ -1038,6 +1042,7 @@ pub(crate) fn prepare_server(
     // A server's own `client_body_temp_path`; without one its locations
     // use the http-level directory (`PreparedHttp::body_temp`).
     let server_body_temp = server.client_body_temp_path.clone().map(BodyTempDir::leak);
+    let server_disable_symlinks = server.disable_symlinks.clone().or(http_disable_symlinks);
     let server_limit_rate = PreparedLimitRate::inherit(
         server.limit_rate.take(),
         server.limit_rate_after.take(),
@@ -1108,6 +1113,7 @@ pub(crate) fn prepare_server(
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
+                server_disable_symlinks.clone(),
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1138,6 +1144,7 @@ pub(crate) fn prepare_server(
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
+                server_disable_symlinks.clone(),
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1168,6 +1175,7 @@ pub(crate) fn prepare_server(
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
+                server_disable_symlinks.clone(),
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1199,6 +1207,7 @@ pub(crate) fn prepare_server(
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
+                server_disable_symlinks.clone(),
                 server_limit_rate,
                 server_post_action,
                 server_expires,
@@ -1246,6 +1255,7 @@ pub(crate) fn prepare_server(
                 server_autoindex_exact_size,
                 server_autoindex_localtime,
                 server_autoindex_format,
+                server_disable_symlinks.clone(),
                 server_tokens_value,
                 upstreams,
                 ProxyEffective::defaults(),
@@ -1886,6 +1896,7 @@ pub(crate) fn build_handler(
     server_autoindex_exact_size: bool,
     server_autoindex_localtime: bool,
     server_autoindex_format: AutoindexFormat,
+    disable_symlinks: Option<crate::config::DisableSymlinks>,
     tokens: crate::config::ServerTokens,
     upstreams: &UpstreamMap,
     proxy_effective: ProxyEffective,
@@ -1951,6 +1962,7 @@ pub(crate) fn build_handler(
             PreparedHandler::Root(PreparedRoot {
                 root,
                 root_fd,
+                symlinks: PreparedSymlinks::new(disable_symlinks),
                 path_mapping,
                 index,
                 autoindex,
@@ -2054,6 +2066,7 @@ pub(crate) fn build_prefix_or_exact(
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
+    server_disable_symlinks: Option<crate::config::DisableSymlinks>,
     server_limit_rate: PreparedLimitRate,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
@@ -2093,6 +2106,7 @@ pub(crate) fn build_prefix_or_exact(
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
         client_body_temp_path: location_client_body_temp_path,
+        disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
@@ -2174,6 +2188,7 @@ pub(crate) fn build_prefix_or_exact(
         server_autoindex_exact_size,
         server_autoindex_localtime,
         server_autoindex_format,
+        location_disable_symlinks.or(server_disable_symlinks),
         tokens,
         upstreams,
         proxy_effective,
@@ -2266,6 +2281,7 @@ pub(crate) fn build_regex_location(
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
+    server_disable_symlinks: Option<crate::config::DisableSymlinks>,
     server_limit_rate: PreparedLimitRate,
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
@@ -2305,6 +2321,7 @@ pub(crate) fn build_regex_location(
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
         client_body_temp_path: location_client_body_temp_path,
+        disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
@@ -2398,6 +2415,7 @@ pub(crate) fn build_regex_location(
         server_autoindex_exact_size,
         server_autoindex_localtime,
         server_autoindex_format,
+        location_disable_symlinks.or(server_disable_symlinks),
         tokens,
         upstreams,
         proxy_effective,

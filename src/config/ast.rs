@@ -127,6 +127,8 @@ pub struct HttpConfig {
     pub client_body_temp_path: Option<TempPath>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
+    /// http-scope `disable_symlinks`. `None`: off.
+    pub disable_symlinks: Option<DisableSymlinks>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
     /// `None` inherits.
     pub limit_rate: Option<Vec<ValuePart>>,
@@ -524,6 +526,8 @@ pub struct Server {
     pub client_body_temp_path: Option<TempPath>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
     pub sendfile: Option<bool>,
+    /// Server-scope `disable_symlinks`. `None` inherits from http.
+    pub disable_symlinks: Option<DisableSymlinks>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
     /// `None` inherits.
     pub limit_rate: Option<Vec<ValuePart>>,
@@ -684,6 +688,9 @@ pub struct Location {
     pub sendfile: Option<bool>,
     /// Location-scope `client_body_temp_path`, inherited like `sendfile`.
     pub client_body_temp_path: Option<TempPath>,
+    /// Location-scope `disable_symlinks`, inherited through nested
+    /// locations at parse time. `None` inherits from server/http.
+    pub disable_symlinks: Option<DisableSymlinks>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
     /// `None` inherits.
     pub limit_rate: Option<Vec<ValuePart>>,
@@ -962,6 +969,31 @@ pub enum AuthBasic {
 pub struct TempPath {
     pub path: PathBuf,
     pub levels: [u8; 3],
+}
+
+/// `disable_symlinks off|on|if_not_owner [from=part];`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisableSymlinks {
+    pub mode: SymlinkMode,
+    /// `from=`: the leading part of a path where symlinks are allowed.
+    pub from: Option<SymlinkFrom>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymlinkMode {
+    Off,
+    /// Any symlink in the path is refused.
+    On,
+    /// A symlink is refused when it and its target have different owners.
+    NotOwner,
+}
+
+/// The `from=` values ruxen supports: `$document_root` (the usual form)
+/// or a literal path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymlinkFrom {
+    DocumentRoot,
+    Path(PathBuf),
 }
 
 /// `client_body_in_file_only on|clean|off;`. `Off` is nginx's default —

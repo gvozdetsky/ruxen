@@ -52,6 +52,60 @@ pub(crate) fn parse_post_action_args(args: &[String]) -> Result<String, Error> {
 /// - `modified <duration>`
 /// - `@<time-of-day>` (e.g. `@15h30m33s`; max 24h)
 /// - `$variable` / `modified $variable` — runtime-resolved
+/// `disable_symlinks off|on|if_not_owner [from=part];`, validated as
+/// nginx's ngx_http_disable_symlinks. `from=` takes `$document_root` or a
+/// literal path; other variables are refused rather than ignored, since
+/// ignoring them would allow symlinks nginx refuses.
+pub(crate) fn parse_disable_symlinks_args(args: &[String]) -> Result<DisableSymlinks, Error> {
+    let bad = |got: &str| Error::BadValue {
+        what: "disable_symlinks",
+        got: got.to_string(),
+    };
+    if args.is_empty() || args.len() > 2 {
+        return Err(bad(&args.join(" ")));
+    }
+    let mut mode: Option<SymlinkMode> = None;
+    let mut from: Option<SymlinkFrom> = None;
+    for arg in args {
+        let parsed = match arg.as_str() {
+            "off" => SymlinkMode::Off,
+            "on" => SymlinkMode::On,
+            "if_not_owner" => SymlinkMode::NotOwner,
+            other => {
+                let Some(value) = other.strip_prefix("from=") else {
+                    return Err(bad(other));
+                };
+                if from.is_some() {
+                    return Err(bad(&args.join(" ")));
+                }
+                from = Some(if value == "$document_root" {
+                    SymlinkFrom::DocumentRoot
+                } else if value.contains('$') {
+                    return Err(Error::BadValue {
+                        what: "disable_symlinks from= (only $document_root or a literal path \
+                               is supported)",
+                        got: value.to_string(),
+                    });
+                } else {
+                    SymlinkFrom::Path(PathBuf::from(value))
+                });
+                continue;
+            }
+        };
+        if mode.is_some() {
+            return Err(bad(&args.join(" ")));
+        }
+        mode = Some(parsed);
+    }
+    let Some(mode) = mode else {
+        return Err(bad(&args.join(" ")));
+    };
+    if mode == SymlinkMode::Off && from.is_some() {
+        return Err(bad(&args.join(" ")));
+    }
+    Ok(DisableSymlinks { mode, from })
+}
+
 pub(crate) fn parse_expires_args(args: &[String]) -> Result<ExpiresDirective, Error> {
     let (modified, value) = match args.len() {
         1 => (false, args[0].as_str()),
@@ -303,6 +357,7 @@ pub(crate) fn parse_location_block(
     inherited_expires: Option<ExpiresDirective>,
     inherited_sendfile: Option<bool>,
     inherited_client_body_temp_path: Option<TempPath>,
+    inherited_disable_symlinks: Option<DisableSymlinks>,
     sink: &mut Vec<Location>,
 ) -> Result<(), Error> {
     let mut ret: Option<(u16, Vec<ValuePart>)> = None;
@@ -367,6 +422,7 @@ pub(crate) fn parse_location_block(
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
+    let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     // Children parsed inside this block — appended to `sink` after the
@@ -430,6 +486,9 @@ pub(crate) fn parse_location_block(
                     let effective_client_body_temp_path = client_body_temp_path
                         .clone()
                         .or_else(|| inherited_client_body_temp_path.clone());
+                    let effective_disable_symlinks = disable_symlinks
+                        .clone()
+                        .or_else(|| inherited_disable_symlinks.clone());
                     sink.push(Location {
                         mode: spec.mode,
                         pattern: spec.pattern,
@@ -461,6 +520,7 @@ pub(crate) fn parse_location_block(
                         client_max_body_size: effective_client_max_body_size,
                         sendfile: effective_sendfile,
                         client_body_temp_path: effective_client_body_temp_path,
+                        disable_symlinks: effective_disable_symlinks,
                         limit_rate: limit_rate.clone(),
                         limit_rate_after: limit_rate_after.clone(),
                         client_body_in_file_only,
@@ -872,6 +932,12 @@ pub(crate) fn parse_location_block(
                 }
                 client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
             }
+            ("disable_symlinks", Terminator::Semi) => {
+                if disable_symlinks.is_some() {
+                    return Err(Error::Duplicate("disable_symlinks"));
+                }
+                disable_symlinks = Some(parse_disable_symlinks_args(&args[1..])?);
+            }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
                     return Err(Error::Duplicate("sendfile"));
@@ -910,6 +976,9 @@ pub(crate) fn parse_location_block(
                 let pass_client_body_temp_path = client_body_temp_path
                     .clone()
                     .or_else(|| inherited_client_body_temp_path.clone());
+                let pass_disable_symlinks = disable_symlinks
+                    .clone()
+                    .or_else(|| inherited_disable_symlinks.clone());
                 // Cascade alias info to nested children (mirrors nginx's
                 // `merge_loc_conf` for the core module's path bits): a
                 // local `alias` here propagates as Alias-with-this-pattern;
@@ -945,6 +1014,7 @@ pub(crate) fn parse_location_block(
                     pass_expires,
                     pass_sendfile,
                     pass_client_body_temp_path,
+                    pass_disable_symlinks,
                     &mut children,
                 )?;
             }
@@ -979,6 +1049,7 @@ pub(crate) fn parse_location_block(
                 | "auth_delay"
                 | "client_max_body_size"
                 | "client_body_temp_path"
+                | "disable_symlinks"
                 | "client_body_in_file_only"
                 | "post_action"
                 | "expires"

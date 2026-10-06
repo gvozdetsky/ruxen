@@ -245,6 +245,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut client_max_body_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
+    let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
@@ -290,6 +291,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     client_max_body_size,
                     client_body_temp_path,
                     sendfile,
+                    disable_symlinks,
                     limit_rate,
                     limit_rate_after,
                     post_action,
@@ -588,6 +590,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 client_body_temp_path = Some(parse_temp_path_args(&args[1..])?);
             }
+            ("disable_symlinks", Terminator::Semi) => {
+                if disable_symlinks.is_some() {
+                    return Err(Error::Duplicate("disable_symlinks"));
+                }
+                disable_symlinks = Some(parse_disable_symlinks_args(&args[1..])?);
+            }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
                     return Err(Error::Duplicate("sendfile"));
@@ -778,7 +786,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "msie_refresh",
     // Only `off` gets here: the other values are refused by
     // `reject_unenforced`.
-    "disable_symlinks",
     // Without allow/deny (not implemented, so an error), `satisfy any`
     // and `all` both reduce to auth_basic alone.
     "satisfy",
@@ -869,11 +876,6 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
         }
         Some("ssl_reject_handshake") if value == Some("on") => {
             "handshakes for unknown names would complete with the default certificate"
-        }
-        // `on` / `if_not_owner` refuse symlinked paths with 403; ignoring
-        // them would serve the link targets. `off` is the default.
-        Some("disable_symlinks") if value != Some("off") => {
-            "symlinks under the root would be followed and served"
         }
         _ => return Ok(()),
     };
@@ -1541,17 +1543,40 @@ mod tests {
         };
         unenforced_err(&tls("ssl_verify_client on;"));
         unenforced_err(&tls("ssl_reject_handshake on;"));
-        for value in ["on", "if_not_owner", "on from=$document_root"] {
-            let err = unenforced_err(&format!(
-                "http {{ server {{ listen 80; location / {{ disable_symlinks {value}; }} }} }}"
-            ));
-            assert_eq!(
-                err,
-                "\"disable_symlinks\" is not supported yet, and ignoring it is unsafe: \
-                 symlinks under the root would be followed and served"
+        // disable_symlinks is enforced now (fs_resolve), at every level.
+        let symlinks = |value: &str| {
+            parse(&format!(
+                "http {{ disable_symlinks {value}; server {{ listen 80; disable_symlinks {value}; \
+                 location / {{ disable_symlinks {value}; }} }} }}"
+            ))
+        };
+        for value in [
+            "off",
+            "on",
+            "if_not_owner",
+            "on from=$document_root",
+            "from=/srv on",
+        ] {
+            let cfg = symlinks(value).unwrap();
+            assert!(cfg.disable_symlinks.is_some(), "{value}");
+            assert!(
+                cfg.servers[0].locations[0].disable_symlinks.is_some(),
+                "{value}"
             );
         }
-        parse("http { disable_symlinks off; server { listen 80; } }").unwrap();
+        // nginx's errors: no mode, two modes, `from=` with `off`, a bad
+        // word; and ruxen refuses a `from=` with other variables rather
+        // than ignore it.
+        for value in [
+            "from=/srv",
+            "on off",
+            "off from=/srv",
+            "maybe",
+            "on from=$host",
+            "on from=/a from=/b",
+        ] {
+            assert!(symlinks(value).is_err(), "{value}");
+        }
         // The forms nginx doesn't enforce either still load; `optional*`
         // warns (nginx admits certless clients there too, and ruxen's
         // `$ssl_client_verify` is always NONE, never SUCCESS).

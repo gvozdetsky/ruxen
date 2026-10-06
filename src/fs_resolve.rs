@@ -20,10 +20,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use crate::config::AutoindexFormat;
+use crate::config::{ErrorLogLevel, SymlinkMode};
 use crate::phase::RerouteTarget;
 use crate::worker::{
     Prebuilt, PreparedFallback, PreparedIndexEntry, PreparedPathMapping, PreparedProbe,
-    PreparedRoot, PreparedTryFiles, RenderCtx, render_parts,
+    PreparedRoot, PreparedSymlinkFrom, PreparedSymlinks, PreparedTryFiles, RenderCtx, render_parts,
 };
 
 /// A file successfully opened under the server root, with its metadata
@@ -134,6 +135,23 @@ fn run_try_files(root: &PreparedRoot, tf: &PreparedTryFiles, url_path: &[u8]) ->
                 (fs_path, bytes.to_vec(), true)
             }
         };
+        // nginx's try_files opens the probe like the static module: a
+        // symlink `disable_symlinks` refuses is a miss.
+        if let Some(errno) = symlinks_refused(root, &fs_path) {
+            // nginx's try_files logs it at crit, except ENOTDIR.
+            if errno == libc::ELOOP {
+                note_failed_lookup_at(
+                    format!(
+                        "openat() \"{}\" failed ({})",
+                        fs_path.display(),
+                        crate::worker::errno_text(&std::io::Error::from_raw_os_error(errno))
+                    ),
+                    false,
+                    ErrorLogLevel::Crit,
+                );
+            }
+            continue;
+        }
         match std::fs::metadata(&fs_path) {
             Ok(m) if want_dir && m.is_dir() => {
                 return TryFilesResult::Hit {
@@ -167,18 +185,23 @@ thread_local! {
     /// static and index modules word it, and whether it's a "not found"
     /// (logged only with `log_not_found`). Set on the cold failure paths
     /// here, taken (and logged) as soon as phase processing returns.
-    static FAILED_LOOKUP: std::cell::RefCell<Option<(Vec<u8>, bool)>> =
+    static FAILED_LOOKUP: std::cell::RefCell<Option<(Vec<u8>, bool, ErrorLogLevel)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// The failed lookup noted for this request, if any.
-pub(crate) fn take_failed_lookup() -> Option<(Vec<u8>, bool)> {
+pub(crate) fn take_failed_lookup() -> Option<(Vec<u8>, bool, ErrorLogLevel)> {
     FAILED_LOOKUP.with(|f| f.borrow_mut().take())
 }
 
 #[cold]
 fn note_failed_lookup(message: String, not_found: bool) {
-    FAILED_LOOKUP.with(|f| *f.borrow_mut() = Some((message.into_bytes(), not_found)));
+    note_failed_lookup_at(message, not_found, ErrorLogLevel::Error);
+}
+
+#[cold]
+fn note_failed_lookup_at(message: String, not_found: bool, level: ErrorLogLevel) {
+    FAILED_LOOKUP.with(|f| *f.borrow_mut() = Some((message.into_bytes(), not_found, level)));
 }
 
 fn is_not_found(e: &std::io::Error) -> bool {
@@ -199,9 +222,15 @@ fn open_failed(root: &PreparedRoot, rel: &[u8], e: std::io::Error) -> Outcome {
         } else {
             join(root.root, rel)
         };
+        // nginx's disable_symlinks walk opens with openat().
+        let call = if matches!(root.symlinks.mode, SymlinkMode::Off) {
+            "open()"
+        } else {
+            "openat()"
+        };
         note_failed_lookup(
             format!(
-                "open() \"{}\" failed ({})",
+                "{call} \"{}\" failed ({})",
                 path.display(),
                 crate::worker::errno_text(&e)
             ),
@@ -244,6 +273,14 @@ fn resolve_static(
 
             let mut candidate = fs_path.clone();
             candidate.push(std::ffi::OsStr::from_bytes(&rendered));
+            // nginx's index module: an index file `disable_symlinks`
+            // refuses (ELOOP) is a 403 without a log line; a link before
+            // it (ENOTDIR) a 404.
+            match symlinks_refused(root, &candidate) {
+                Some(libc::ELOOP) => return Outcome::Forbidden,
+                Some(_) => return Outcome::NotFound,
+                None => {}
+            }
             match std::fs::metadata(&candidate) {
                 Ok(m) if m.is_file() => {
                     let mut reroute = url_path.to_vec();
@@ -317,7 +354,12 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
         Ok(fd) => fd,
         Err(e) => return open_failed(root, rel, e),
     };
-    let fd = if rel.is_empty() {
+    let fd = if !matches!(root.symlinks.mode, SymlinkMode::Off) {
+        match open_refusing_symlinks(root, root_fd, rel) {
+            Ok(fd) => fd,
+            Err(e) => return open_failed(root, rel, e),
+        }
+    } else if rel.is_empty() {
         match dup_fd(root_fd) {
             Ok(fd) => fd,
             Err(e) => return open_failed(root, rel, e),
@@ -366,6 +408,250 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
         mtime,
         mime: mime_for_url(url_path),
     })
+}
+
+/// `open_and_stat` under `disable_symlinks on|if_not_owner`, nginx's
+/// ngx_open_file_wrapper: the components of `<root>/<rel>` after the
+/// `from=` boundary may not be symlinks (`on`), or only ones owned like
+/// their targets (`if_not_owner`); ELOOP otherwise (a 403). The open
+/// itself stays `RESOLVE_BENEATH` the root. Under `on`, the part of the
+/// path below the root is opened with `RESOLVE_NO_SYMLINKS`, so a symlink
+/// can't be swapped in between the check and the open; the root's own
+/// components are checked as configured (the root fd was opened at
+/// startup). `if_not_owner` is a walk with fstatat, racy as nginx's.
+#[cold]
+fn open_refusing_symlinks(
+    root: &PreparedRoot,
+    root_fd: RawFd,
+    rel: &[u8],
+) -> std::io::Result<OwnedFd> {
+    let root_path = root.root.as_os_str().as_bytes();
+    let full = join(root.root, rel);
+    let full = full.as_os_str().as_bytes();
+    let Some(boundary) = symlink_boundary(&root.symlinks, root_path, full) else {
+        // `from=` is the whole path: nothing to check.
+        return if rel.is_empty() {
+            dup_fd(root_fd)
+        } else {
+            openat2_beneath(root_fd, rel)
+        };
+    };
+    if matches!(root.symlinks.mode, SymlinkMode::NotOwner) {
+        check_symlink_owners(full, boundary)?;
+        return if rel.is_empty() {
+            dup_fd(root_fd)
+        } else {
+            openat2_beneath(root_fd, rel)
+        };
+    }
+    // `on`: the root's components first, then `rel` in one openat2.
+    let root_len = root_path.len();
+    if boundary < root_len {
+        refuse_symlinks_after(&root_path[..root_len], boundary)?;
+    }
+    if rel.is_empty() {
+        return dup_fd(root_fd);
+    }
+    // `from=` reaching into `rel`: its leading components may be links.
+    let rel_start = full.len() - rel.len();
+    let (anchor, rest) = if boundary > rel_start {
+        let split = boundary - rel_start;
+        (
+            Some(openat2_with(
+                root_fd,
+                &rel[..split],
+                libc::O_PATH | libc::O_DIRECTORY,
+                0,
+            )?),
+            trim_leading_slashes(&rel[split..]),
+        )
+    } else {
+        (None, rel)
+    };
+    if rest.is_empty() {
+        // Nothing past `from=` to check; open it for reading.
+        return openat2_beneath(root_fd, rel);
+    }
+    let dirfd = anchor.as_ref().map_or(root_fd, |fd| fd.as_raw_fd());
+    openat2_no_symlinks(dirfd, rest, libc::O_RDONLY)
+}
+
+/// `openat2(RESOLVE_NO_SYMLINKS)` with nginx's errors for a refused
+/// symlink: its walk opens the components before the last as directories
+/// with O_NOFOLLOW, which fails with ENOTDIR on a link (a 404), and only a
+/// link in the last component is ELOOP (a 403).
+fn openat2_no_symlinks(dirfd: RawFd, rel: &[u8], flags: i32) -> std::io::Result<OwnedFd> {
+    match openat2_with(dirfd, rel, flags, libc::RESOLVE_NO_SYMLINKS) {
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            let parent = match rel.iter().rposition(|&b| b == b'/') {
+                Some(i) => trim_trailing_slashes(&rel[..i]),
+                None => &[][..],
+            };
+            let in_parent = !parent.is_empty()
+                && matches!(
+                    openat2_with(dirfd, parent, libc::O_PATH, libc::RESOLVE_NO_SYMLINKS),
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP)
+                );
+            Err(std::io::Error::from_raw_os_error(if in_parent {
+                libc::ENOTDIR
+            } else {
+                libc::ELOOP
+            }))
+        }
+        other => other,
+    }
+}
+
+fn trim_trailing_slashes(bytes: &[u8]) -> &[u8] {
+    let n = bytes.iter().rev().take_while(|&&b| b == b'/').count();
+    &bytes[..bytes.len() - n]
+}
+
+/// The error `disable_symlinks` refuses the absolute `path` with (a
+/// try_files or index probe): ELOOP, or ENOTDIR for a link before the
+/// last component under `on`. Other errors are left to the probe.
+fn symlinks_refused(root: &PreparedRoot, path: &Path) -> Option<i32> {
+    if matches!(root.symlinks.mode, SymlinkMode::Off) {
+        return None;
+    }
+    let full = path.as_os_str().as_bytes();
+    let boundary = symlink_boundary(&root.symlinks, root.root.as_os_str().as_bytes(), full)?;
+    let checked = match root.symlinks.mode {
+        SymlinkMode::NotOwner => check_symlink_owners(full, boundary),
+        _ => refuse_symlinks_after(full, boundary),
+    };
+    let errno = checked.err()?.raw_os_error()?;
+    matches!(errno, libc::ELOOP | libc::ENOTDIR).then_some(errno)
+}
+
+/// Where `disable_symlinks` starts checking `full`, nginx's
+/// ngx_http_set_disable_symlinks: `None` when `from=` is the whole path
+/// (nothing to check), else the byte offset of the `/` after which every
+/// component is checked (0: all of them).
+fn symlink_boundary(policy: &PreparedSymlinks, document_root: &[u8], full: &[u8]) -> Option<usize> {
+    let from: &[u8] = match policy.from {
+        PreparedSymlinkFrom::None => return Some(0),
+        PreparedSymlinkFrom::DocumentRoot => document_root,
+        PreparedSymlinkFrom::Path(p) => p,
+    };
+    if from.is_empty() || from.len() > full.len() || !full.starts_with(from) {
+        return Some(0);
+    }
+    if from.len() == full.len() {
+        return None;
+    }
+    if full[from.len()] == b'/' {
+        return Some(from.len());
+    }
+    if from.ends_with(b"/") {
+        return Some(from.len() - 1);
+    }
+    Some(0)
+}
+
+/// Where a `disable_symlinks` walk of `path` starts: the directory before
+/// byte `boundary` (followed, links allowed), or for 0 `/` or, for a
+/// relative path, the working directory (nginx's AT_FDCWD); and the rest.
+fn walk_start(path: &[u8], boundary: usize) -> std::io::Result<(OwnedFd, &[u8])> {
+    let start: &[u8] = match boundary {
+        0 if path.first() == Some(&b'/') => b"/",
+        0 => b".",
+        n => &path[..n],
+    };
+    Ok((
+        open_path_dir(start)?,
+        trim_leading_slashes(&path[boundary..]),
+    ))
+}
+
+/// ELOOP if a component of `path` after byte `boundary` is a symlink.
+fn refuse_symlinks_after(path: &[u8], boundary: usize) -> std::io::Result<()> {
+    let (start, rest) = walk_start(path, boundary)?;
+    if !rest.is_empty() {
+        openat2_no_symlinks(start.as_raw_fd(), rest, libc::O_PATH)?;
+    }
+    Ok(())
+}
+
+/// `if_not_owner`: ELOOP if a component of `path` after byte `boundary`
+/// is a symlink owned by someone other than its target's owner, as
+/// nginx's ngx_openat_file_owner (open, then compare the uid of what was
+/// opened with fstatat(AT_SYMLINK_NOFOLLOW) of the name).
+fn check_symlink_owners(path: &[u8], boundary: usize) -> std::io::Result<()> {
+    let (mut at, rest) = walk_start(path, boundary)?;
+    for component in rest.split(|&b| b == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        let name =
+            CString::new(component).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let raw = unsafe {
+            libc::openat(
+                at.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opened = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut link: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                at.as_raw_fd(),
+                name.as_ptr(),
+                &mut link,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if fstat(opened.as_raw_fd())?.st_uid != link.st_uid {
+            return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        at = opened;
+    }
+    Ok(())
+}
+
+/// An `O_PATH` fd of a directory path, following symlinks (the part
+/// before the `disable_symlinks` boundary may have them).
+fn open_path_dir(path: &[u8]) -> std::io::Result<OwnedFd> {
+    let c = CString::new(path).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let raw = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// `openat2(dirfd, rel, { flags | O_CLOEXEC, RESOLVE_BENEATH |
+/// RESOLVE_NO_MAGICLINKS | extra })`.
+fn openat2_with(dirfd: RawFd, rel: &[u8], flags: i32, extra: u64) -> std::io::Result<OwnedFd> {
+    let c_rel = CString::new(rel).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let mut how: libc::open_how = unsafe { core::mem::zeroed() };
+    how.flags = (flags | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | extra;
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            c_rel.as_ptr(),
+            &how as *const libc::open_how,
+            core::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
 }
 
 /// `openat2(dirfd, rel, { O_RDONLY | O_CLOEXEC, RESOLVE_BENEATH |
@@ -528,10 +814,13 @@ fn io_to_outcome(e: std::io::Error) -> Outcome {
     // `openat2(RESOLVE_BENEATH)` signals a containment violation with
     // `EXDEV` (see `nd_jump_root` in fs/namei.c). Rust's `ErrorKind`
     // doesn't have a stable variant for it — `CrossesDevices` is
-    // nightly-only — so we check the raw errno. Pure symlink loops
-    // surface as `ELOOP` and remain `InternalServerError`: an actual
-    // loop isn't a security rejection, it's a misconfigured tree.
-    if e.raw_os_error() == Some(libc::EXDEV) {
+    // nightly-only — so we check the raw errno. ELOOP / EMLINK (a symlink
+    // `disable_symlinks` refuses, or a loop) are 403, as in nginx's static
+    // module.
+    if matches!(
+        e.raw_os_error(),
+        Some(libc::EXDEV | libc::ELOOP | libc::EMLINK)
+    ) {
         return Outcome::Forbidden;
     }
     match e.kind() {
@@ -553,6 +842,7 @@ mod tests {
             // `AT_FDCWD` is fine for tests that only exercise the path
             // utilities below — none of them hit `openat2`.
             root_fd: libc::AT_FDCWD,
+            symlinks: PreparedSymlinks::new(None),
             path_mapping: mapping,
             index: &[],
             autoindex: false,
