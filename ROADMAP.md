@@ -33,6 +33,7 @@ Some of these (#16, #17, #18, #35) are marked `good first issue` / `help wanted`
 **v0.3.0, the rest of the edge**
 - Rate and connection limits (#94, #95), `stub_status` (#96), `hash` / `ip_hash` (#97).
 - Variables in `proxy_pass` (#100), `unix:` upstreams (#101), HTTPS upstreams and their verification (#116, #117), cookie rewriting (#40).
+- Proxy caching (#233). Reverse-proxy configurations cache upstream responses often enough that the corpus counts cache directives among its top blockers.
 - The performance contract on every bench scenario (#127, #128, #129), and nginx's error pages and status phrases (#33, #34).
 
 ## Phase 2: first production users
@@ -40,7 +41,6 @@ Some of these (#16, #17, #18, #35) are marked `good first issue` / `help wanted`
 Goal: a few sites run ruxen in production and report back. The work then follows their reports, and the likely next items are:
 - client certificates and OCSP (#112–#115, #141, #142);
 - the resolver (#133);
-- proxy caching;
 - request-body streaming to upstreams (#134);
 - metrics.
 
