@@ -930,6 +930,11 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
         Some("ssl_reject_handshake") if value == Some("on") => {
             "handshakes for unknown names would complete with the default certificate"
         }
+        // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
+        // dropping them weakens what the config protects. Only `off` loads.
+        Some("proxy_cookie_flags") if value != Some("off") || args.len() != 2 => {
+            "upstream cookies would reach clients without the flags it sets"
+        }
         _ => return Ok(()),
     };
     Err(Error::Unenforced {
@@ -1828,6 +1833,30 @@ mod tests {
         }
         parse(&tls("ssl_reject_handshake off;")).unwrap();
         parse(&tls("ssl_client_certificate ca.pem;")).unwrap();
+        // proxy_cookie_flags isn't implemented: refused at every level,
+        // except `off`, which sets no flags.
+        let cookie_flags = |directive: &str| {
+            [
+                format!("http {{ {directive} server {{ listen 80; }} }}"),
+                format!("http {{ server {{ listen 80; {directive} }} }}"),
+                format!(
+                    "http {{ server {{ listen 80; location / {{ \
+                     proxy_pass http://127.0.0.1:8081; {directive} }} }} }}"
+                ),
+            ]
+        };
+        for src in cookie_flags("proxy_cookie_flags ~ secure httponly samesite=strict;") {
+            assert_eq!(
+                unenforced_err(&src),
+                "\"proxy_cookie_flags\" is not supported yet, and ignoring it is unsafe: \
+                 upstream cookies would reach clients without the flags it sets"
+            );
+        }
+        unenforced_err("http { server { listen 80; proxy_cookie_flags sid secure; } }");
+        unenforced_err("http { server { listen 80; proxy_cookie_flags off secure; } }");
+        for src in cookie_flags("proxy_cookie_flags off;") {
+            parse(&src).unwrap();
+        }
     }
 
     #[test]
