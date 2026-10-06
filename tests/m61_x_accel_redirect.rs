@@ -226,7 +226,11 @@ fn x_accel_redirect_keeps_upstream_headers() {
     // nginx's special response; the cookies still go out.
     let resp = send(server.port, "GET", "/c/missing");
     assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
-    assert_eq!(header_lines(&resp, "Content-Type"), ["text/plain"], "{resp}");
+    assert_eq!(
+        header_lines(&resp, "Content-Type"),
+        ["text/plain"],
+        "{resp}"
+    );
     assert!(header_lines(&resp, "Accept-Ranges").is_empty(), "{resp}");
     assert_eq!(header_lines(&resp, "Set-Cookie"), ["a=1", "b=2"], "{resp}");
 
