@@ -415,7 +415,9 @@ def check(binary, conf, prefix, extra):
         return False, "timed out"
     ok = r.returncode == 0
     lines = [l for l in (r.stderr + r.stdout).splitlines() if "[emerg]" in l or "error" in l.lower()]
-    return ok, (lines[0] if lines else "").strip()
+    # The sandbox is a fresh temporary directory per case; name it the same
+    # way every run, so RESULTS.md only changes when a result does.
+    return ok, (lines[0] if lines else "").strip().replace(prefix, "<sandbox>")
 
 
 def blocker(message):
