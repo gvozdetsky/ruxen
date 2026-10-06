@@ -29,12 +29,23 @@ pub static SERVER_ADDR_USED: std::sync::atomic::AtomicBool =
 /// literal dollar sign (matches nginx's tokenizer for directive values).
 /// Unknown variable names are accepted as `Variable::Unknown` and rendered as
 /// empty at request time, matching nginx's lenient variable lookup.
+///
+/// `$1`…`$9` are the captures of the last regex that matched (a regex
+/// `location`, `rewrite`, `if` or `server_name`), as nginx compiles them in
+/// every complex value (ngx_http_script_compile).
 pub fn parse_value_with_vars(s: &str) -> Result<Vec<ValuePart>, Error> {
-    parse_value_with_vars_impl(s, false)
+    parse_value_with_vars_impl(s, true)
 }
 
 pub(crate) fn parse_value_with_vars_rewrite(s: &str) -> Result<Vec<ValuePart>, Error> {
     parse_value_with_vars_impl(s, true)
+}
+
+/// For `log_format`, `map` and `split_clients`, where `$1` stays literal
+/// text: nginx refuses it in `log_format` (`unknown "1" variable`), and a
+/// map's `$1` is its own regex's capture, which ruxen doesn't provide.
+pub(crate) fn parse_value_without_captures(s: &str) -> Result<Vec<ValuePart>, Error> {
+    parse_value_with_vars_impl(s, false)
 }
 
 pub(crate) fn parse_value_with_vars_impl(
@@ -67,8 +78,7 @@ pub(crate) fn parse_value_with_vars_impl(
             } else {
                 // Variable-name = [A-Za-z_][A-Za-z0-9_]* (nginx's rule). If
                 // the next byte doesn't match, the `$` is a literal, except
-                // in rewrite replacement mode where `$1`..`$9` are numbered
-                // regex captures.
+                // `$1`..`$9`, numbered regex captures.
                 let name_start = i + 1;
                 if name_start >= bytes.len() {
                     i += 1;

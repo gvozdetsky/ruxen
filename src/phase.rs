@@ -644,6 +644,13 @@ fn process_with_meta_inner(
         }
     }
     let mut rewrite_state = RewriteState::default();
+    // A regex server_name's captures are `$1`…`$9` until another regex
+    // matches (nginx's r->captures from ngx_http_find_virtual_server).
+    if let Some(captures) = regex_captures.as_ref() {
+        for (n, value) in captures.numbered.iter().enumerate() {
+            rewrite_state.set_numbered_capture(n + 1, value);
+        }
+    }
     let mut meta = ProcessMeta::default();
     meta.server_port = server.listen_port;
     meta.server_name = server.primary_server_name;
@@ -900,7 +907,9 @@ fn process_with_meta_inner(
                 meta.proxy_chunked_transfer_encoding = loc_chunked_te;
                 meta.proxy_expires = loc_expires;
                 meta.underscores_in_headers = server.underscores_in_headers;
-                if rewrite_state.worth_keeping() {
+                // The proxied response's add_header / proxy_redirect read
+                // `set` values, cached maps and `$1`…`$9` after the handler.
+                if rewrite_state.worth_keeping() || rewrite_state.has_numbered_captures() {
                     keep_rewrite_state(&mut meta, rewrite_state);
                 }
                 return (Response::Proxy(plan), meta);
@@ -1130,6 +1139,9 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// is dropped.
 pub struct ServerNameCaptures {
     pub names: Vec<(&'static str, Vec<u8>)>,
+    /// `$1`…`$9` (index 0 is `$1`; empty when the group didn't take
+    /// part), until a regex location, `rewrite` or `if` replaces them.
+    pub numbered: Vec<Vec<u8>>,
 }
 
 /// `client_max_body_size` of the location a request is routed to first,
@@ -1344,10 +1356,13 @@ fn match_server_name<'h, 'r>(
                         names.push((cn, m.as_bytes().to_vec()));
                     }
                 }
-                let caps_out = if names.is_empty() {
+                let numbered: Vec<Vec<u8>> = (1..caps.len().min(10))
+                    .map(|n| caps.get(n).map_or_else(Vec::new, |m| m.as_bytes().to_vec()))
+                    .collect();
+                let caps_out = if names.is_empty() && numbered.is_empty() {
                     None
                 } else {
-                    Some(ServerNameCaptures { names })
+                    Some(ServerNameCaptures { names, numbered })
                 };
                 return Some((server, caps_out));
             }
@@ -1407,7 +1422,9 @@ pub(crate) fn match_location<'a>(
     path: &[u8],
     rewrite_state: &mut RewriteState,
 ) -> Option<MatchedLocation<'a>> {
-    rewrite_state.clear_numbered_captures();
+    // `$1`…`$9` stay as they are unless a regex location matches: nginx's
+    // location search leaves r->captures alone on no match, so a regex
+    // server_name's (or an earlier rewrite's) captures carry on.
     for loc in &server.exact_locations {
         if loc.pattern == path {
             return Some(MatchedLocation::from_prefix(loc));
