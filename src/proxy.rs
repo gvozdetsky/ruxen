@@ -467,6 +467,9 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 }
                 return resp;
             }
+            AttemptOutcome::NoConnection => {
+                return crate::worker::internal_error_response(plan.method);
+            }
             AttemptOutcome::PooledStale => {
                 // The pre-match collapses PooledStale into either a fresh
                 // retry or a Failed; reaching here is a logic bug.
@@ -915,6 +918,10 @@ enum AttemptOutcome {
     /// keeps this enum the size of a `Response`, which every attempt
     /// returns).
     Failed(Response, FailKind, Box<UpstreamError>),
+    /// No `worker_connections` slot for a new connection: the request ends
+    /// with a 500, without trying another peer or blaming this one
+    /// (ngx_http_upstream_connect on NGX_ERROR).
+    NoConnection,
 }
 
 async fn attempt(
@@ -931,9 +938,12 @@ async fn attempt(
     // Only the answering attempt's X-Accel headers count.
     *accel = None;
     let peer_addr = plan.upstream.peers[peer_idx].addr;
-    let (mut stream, opened_at, requests_served) = if let Some(c) = pooled {
-        (c.stream, c.opened_at, c.requests_served)
+    let (mut stream, opened_at, requests_served, slot) = if let Some(c) = pooled {
+        (c.stream, c.opened_at, c.requests_served, c.slot)
     } else {
+        let Some(slot) = crate::worker::take_upstream_slot() else {
+            return AttemptOutcome::NoConnection;
+        };
         let connect_fut = TcpStream::connect(peer_addr);
         let stream = match timeout(plan.connect_timeout, connect_fut).await {
             Ok(Ok(s)) => s,
@@ -953,7 +963,7 @@ async fn attempt(
             }
         };
         let _ = stream.set_nodelay(true);
-        (stream, Instant::now(), 0)
+        (stream, Instant::now(), 0, slot)
     };
     state.connect_ms = Some(elapsed_ms(started));
 
@@ -1520,6 +1530,7 @@ async fn attempt(
                 last_used: Instant::now(),
                 opened_at,
                 requests_served: requests_served + 1,
+                slot,
             },
         );
     }

@@ -1066,6 +1066,7 @@ pub fn run(
     };
 
     rt.block_on(async move {
+        WORKER_CONNS.with(|w| w.http.set(Some(http)));
         // Open one fd per configured access_log for this worker. Kept in a
         // thread-local so `write_access_logs` can do io_uring writes without
         // re-opening the file per request.
@@ -1524,7 +1525,9 @@ impl Drop for ConnectionGuard {
 /// connections when it runs low (`ngx_drain_connections`). A worker is a
 /// thread that owns its connections, so thread-local cells are enough.
 struct WorkerConns {
-    /// Accepted connections that haven't finished.
+    /// Accepted connections that haven't finished, and upstream
+    /// connections (`UpstreamSlot`): nginx takes both from the worker's
+    /// one connection table.
     active: Cell<usize>,
     /// Connections waiting for a request — nginx's "reusable" ones.
     idle: Cell<usize>,
@@ -1532,6 +1535,9 @@ struct WorkerConns {
     drain: Cell<usize>,
     /// UNIX second of the last "not enough" line: log once a second.
     logged_at: Cell<u64>,
+    /// This worker's configuration, for upstream connections, which are
+    /// opened where only the proxy plan is at hand.
+    http: Cell<Option<&'static PreparedHttp>>,
 }
 
 thread_local! {
@@ -1541,8 +1547,63 @@ thread_local! {
             idle: Cell::new(0),
             drain: Cell::new(0),
             logged_at: Cell::new(0),
+            http: Cell::new(None),
         }
     };
+}
+
+/// An upstream connection's slot in `worker_connections`, held as long as
+/// the socket lives (in the pool too). Outside a worker (unit tests)
+/// nothing is counted.
+pub(crate) struct UpstreamSlot {
+    counted: bool,
+}
+
+impl Drop for UpstreamSlot {
+    fn drop(&mut self) {
+        if self.counted {
+            WORKER_CONNS.with(|w| w.active.set(w.active.get().saturating_sub(1)));
+        }
+    }
+}
+
+/// A slot for a new upstream connection, as nginx's ngx_event_connect_peer
+/// takes one from ngx_get_connection. With none free, an idle keep-alive
+/// upstream connection is closed to make room; failing that, `None`: the
+/// worker logs "worker_connections are not enough", asks idle client
+/// connections to close for later, and the request gets a 500
+/// (`internal_error_response`), as nginx's ngx_http_upstream_connect.
+pub(crate) fn take_upstream_slot() -> Option<UpstreamSlot> {
+    WORKER_CONNS.with(|w| {
+        let Some(http) = w.http.get() else {
+            return Some(UpstreamSlot { counted: false });
+        };
+        if w.active.get() >= http.client_slots() && !crate::upstream::pool_close_one() {
+            let idle = w.idle.get();
+            if idle > 0 {
+                w.drain.set(w.drain.get().max((idle / 8).clamp(1, 32)));
+            }
+            log_connections_not_enough(w, http, ErrorLogLevel::Alert, "");
+            return None;
+        }
+        w.active.set(w.active.get() + 1);
+        Some(UpstreamSlot { counted: true })
+    })
+}
+
+/// The 500 for a request whose upstream connection got no slot.
+#[cold]
+pub(crate) fn internal_error_response(method: Method) -> Response {
+    let http = WORKER_CONNS.with(|w| w.http.get());
+    match http {
+        Some(http) => Response::Prebuilt(http.internal_error.pick(method)),
+        None => Response::Owned(http::build_response_for_method(
+            500,
+            "Internal Server Error\n",
+            method,
+            b"ruxen",
+        )),
+    }
 }
 
 /// Count a newly accepted connection against the worker's slots. When few
@@ -1552,6 +1613,10 @@ thread_local! {
 pub(crate) fn admit_connection(http: &PreparedHttp) -> bool {
     let slots = http.client_slots();
     WORKER_CONNS.with(|w| {
+        // An idle keep-alive upstream connection gives its slot first.
+        if w.active.get() >= slots {
+            crate::upstream::pool_close_one();
+        }
         let active = w.active.get();
         let idle = w.idle.get();
         let full = active >= slots;

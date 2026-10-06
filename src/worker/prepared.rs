@@ -1211,6 +1211,8 @@ pub struct PreparedHttp {
     pub forbidden: Prebuilt,
     pub bad_gateway: Prebuilt,
     pub gateway_timeout: Prebuilt,
+    /// A request whose upstream connection got no `worker_connections` slot.
+    pub internal_error: Prebuilt,
     /// http-scope `upstream {}` blocks keyed by name. `proxy_pass http://NAME`
     /// resolves through this map at prepare time. M42 reads it on the hot
     /// path for round-robin selection.

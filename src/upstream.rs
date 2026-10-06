@@ -431,6 +431,8 @@ pub struct PooledConn {
     pub last_used: Instant,
     pub opened_at: Instant,
     pub requests_served: u32,
+    /// Its `worker_connections` slot, freed with the socket.
+    pub slot: crate::worker::UpstreamSlot,
 }
 
 thread_local! {
@@ -460,6 +462,16 @@ pub fn pool_take(upstream: &'static PreparedUpstream, peer_idx: usize) -> Option
             return Some(c);
         }
         None
+    })
+}
+
+/// Close one idle keep-alive connection, the least recently used of some
+/// pool, to free its `worker_connections` slot. `false` if every pool is
+/// empty.
+pub fn pool_close_one() -> bool {
+    POOL.with(|p| {
+        let mut map = p.borrow_mut();
+        map.values_mut().find_map(|q| q.pop_back()).is_some()
     })
 }
 
