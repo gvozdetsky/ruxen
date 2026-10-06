@@ -5,3 +5,4 @@
 /bench/m19/*.bin
 /.nginx-tests-out/
 /corpus/.cache/
+__pycache__/
