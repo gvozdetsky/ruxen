@@ -752,13 +752,19 @@ pub(crate) fn run_location_handler(
         // Static-file mapping follows the configured path mode:
         // `root` appends the whole normalized URI, while `alias` strips the
         // matched location prefix first. `PreparedRoot` carries that choice.
-        PreparedHandler::Root(root) => {
-            if !matches!(req.method, Method::Get | Method::Head) {
-                return Response::Owned(file::method_not_allowed(req.method, server_bytes));
+        PreparedHandler::Root(root) => 'root: {
+            // The static module takes GET, HEAD and POST; it refuses a POST
+            // only once the file is found (ngx_http_static_handler).
+            let get_or_head = matches!(req.method, Method::Get | Method::Head);
+            if !get_or_head && req.method_bytes != b"POST" {
+                break 'root Response::Owned(file::method_not_allowed(req.method, server_bytes));
             }
             let last_modified_override =
                 last_modified_override_for_conditionals(loc.add_headers, &render_ctx_base);
             match fs_resolve::resolve(root, url_path, &render_ctx_base) {
+                fs_resolve::Outcome::Serve(_) if !get_or_head => {
+                    Response::Owned(file::method_not_allowed(req.method, server_bytes))
+                }
                 fs_resolve::Outcome::Serve(opened) => file::serve_path(
                     opened,
                     req.method,

@@ -311,7 +311,9 @@ fn resolve_static(
 
         match dir_meta.unwrap_or_else(|| std::fs::metadata(&fs_path)) {
             Ok(m) if m.is_dir() => {
-                if root.autoindex {
+                // autoindex lists for GET and HEAD only; a POST falls
+                // through to the 403, as in nginx.
+                if root.autoindex && matches!(render_ctx.request_method, b"GET" | b"HEAD") {
                     return Outcome::Autoindex {
                         dir_path: fs_path,
                         uri: url_path.to_vec(),
