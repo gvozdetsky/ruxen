@@ -65,6 +65,13 @@ parallel runs collide on ports.
 fail, or are skipped. If your change makes a file pass, regenerate it with
 `--update-progress` and include it in the PR.
 
+CI runs the files listed there as passing (`scripts/run_nginx_tests.sh
+--passing`, about a minute) against the nginx-tests commit in
+`scripts/nginx-tests.rev`, and fails if one of them no longer passes. Run the
+same locally with your checkout at that commit. To move to a newer
+nginx-tests, change the commit and regenerate the progress file in the same
+PR.
+
 ### Benchmarks (performance)
 
 See [`bench/README.md`](bench/README.md). Short version: single runs on a

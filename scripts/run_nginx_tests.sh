@@ -9,6 +9,9 @@
 #   - per-file prove transcript in <out_dir>/logs/<name>.log
 #
 # Use --update-progress to overwrite NGINX_TEST_PROGRESS.md from the TSV.
+# Use --passing to run only the files NGINX_TEST_PROGRESS.md lists as
+# passing and exit 1 unless all of them still pass (CI does this, against
+# the nginx-tests commit in scripts/nginx-tests.rev).
 
 set -uo pipefail
 
@@ -22,6 +25,7 @@ PROGRESS_MD="${REPO_ROOT}/NGINX_TEST_PROGRESS.md"
 TIMEOUT_SECS=120
 BUILD_RELEASE=1
 UPDATE_PROGRESS=0
+PASSING_ONLY=0
 
 usage() {
     cat <<'EOF'
@@ -37,6 +41,8 @@ Options:
   --timeout <secs>       per-file timeout (default: 120)
   --no-build             skip cargo build --release
   --update-progress      rewrite NGINX_TEST_PROGRESS.md from results.tsv
+  --passing              run the files NGINX_TEST_PROGRESS.md lists as passing;
+                         exit 1 if any of them doesn't pass
   -h, --help             show this help
 
 Examples:
@@ -59,11 +65,23 @@ while (($# > 0)); do
         --timeout) TIMEOUT_SECS="$2"; shift 2 ;;
         --no-build) BUILD_RELEASE=0; shift ;;
         --update-progress) UPDATE_PROGRESS=1; shift ;;
+        --passing) PASSING_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) FILE_PATTERNS+=("$1"); shift ;;
     esac
 done
+
+if ((PASSING_ONLY == 1)); then
+    ((UPDATE_PROGRESS == 0)) || die "--passing and --update-progress don't combine: regenerate from a full run"
+    ((${#FILE_PATTERNS[@]} == 0)) || die "--passing takes no file patterns"
+    # The `- \`name.t\`` lines of the "Passing in ruxen" section.
+    mapfile -t FILE_PATTERNS < <(awk '
+        /^## / { in_pass = ($0 ~ /^## Passing/) ; next }
+        in_pass && /^- `[^`]+\.t`/ { sub(/^- `/, ""); sub(/`.*/, ""); print }
+    ' "${PROGRESS_MD}")
+    ((${#FILE_PATTERNS[@]} > 0)) || die "no passing files listed in ${PROGRESS_MD}"
+fi
 
 command -v prove >/dev/null 2>&1 || die "missing required command: prove"
 [[ -d "${TESTS_DIR}" ]] || die "tests directory not found: ${TESTS_DIR}"
@@ -170,6 +188,18 @@ echo "Timed out:   ${n_timeout}"
 echo
 echo "Results: ${RESULTS_TSV}"
 echo "Per-file logs: ${OUT_DIR}/logs/"
+
+if ((PASSING_ONLY == 1)); then
+    if ((n_pass != TOTAL || TOTAL != ${#FILE_PATTERNS[@]})); then
+        echo "These files are listed as passing in NGINX_TEST_PROGRESS.md and didn't pass:"
+        awk -F'\t' '$1 != "PASS" { print "  " $1 " " $2 " " $5 }' "${RESULTS_TSV}"
+        listed=$(printf '%s\n' "${FILE_PATTERNS[@]}" | sort)
+        found=$(awk -F'\t' '{ print $2 }' "${RESULTS_TSV}" | sort)
+        comm -23 <(echo "$listed") <(echo "$found") | sed 's/^/  MISSING /'
+        exit 1
+    fi
+    echo "All ${TOTAL} files listed as passing still pass."
+fi
 
 if ((UPDATE_PROGRESS == 1)); then
     log "rewriting ${PROGRESS_MD}"

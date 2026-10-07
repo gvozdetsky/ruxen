@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-06 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-07 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 65
-- **Intentionally skipped (`-V` banner excludes the module):** 399
-- **Failing — work in progress:** 41
+- **Passing in ruxen:** 68
+- **Intentionally skipped (`-V` banner excludes the module):** 391
+- **Failing — work in progress:** 46
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (65)
+## Passing in ruxen (68)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -30,6 +30,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `http_header_buffers.t`
 - `http_headers_multi.t`
 - `http_host.t`
+- `http_include.t`
 - `http_keepalive.t`
 - `http_location.t`
 - `http_location_auto.t`
@@ -64,6 +65,8 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_variables.t`
 - `proxy_xar.t`
 - `range_if_range.t`
+- `realip_remote_addr.t`
+- `realip_remote_port.t`
 - `rewrite.t`
 - `rewrite_if.t`
 - `rewrite_unescape.t`
@@ -83,7 +86,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (41)
+## Failing — actively being worked on (46)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -96,10 +99,12 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy.t` — 28/30
 - `proxy_bind.t` — 3/7
 - `proxy_cookie.t` — 8/11
-- `proxy_cookie_flags.t` — 12/16
+- `proxy_cookie_flags.t` — 0/0
 - `proxy_if.t` — 15/17
 - `proxy_method.t` — 3/6
 - `proxy_next_upstream_tries.t` — 8/10
+- `proxy_protocol.t` — 24/26
+- `proxy_protocol2.t` — 28/30
 - `proxy_protocol2_tlv.t` — 14/16
 - `proxy_redirect.t` — 15/17
 - `proxy_request_buffering.t` — 2/20
@@ -114,6 +119,8 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_ssl_verify.t` — 6/8
 - `proxy_ssl_verify_ip.t` — 8/10
 - `proxy_unix.t` — 5/7
+- `realip.t` — 0/0
+- `realip_hostname.t` — 0/0
 - `ssl.t` — 3/23
 - `ssl_cache.t` — 4/6
 - `ssl_certificate_aux.t` — 0/0
@@ -121,6 +128,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_crl.t` — 5/7
 - `ssl_ocsp.t` — 0/0
 - `ssl_password_file.t` — 3/5
+- `ssl_proxy_protocol.t` — 2/20
 - `ssl_proxy_upgrade.t` — 28/32
 - `ssl_reject_handshake.t` — 7/9
 - `ssl_session_ticket_key.t` — 2/4
@@ -129,12 +137,14 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_verify_client.t` — 14/16
 - `ssl_verify_depth.t` — 9/11
 
-## Intentionally skipped (399)
+## Intentionally skipped (391)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
-### no stream available (82)
+### no stream available (84)
 
+- `proxy_protocol_ipv6.t`
+- `proxy_protocol_unix.t`
 - `stream_access.t`
 - `stream_access_log.t`
 - `stream_access_log_escape.t`
@@ -451,15 +461,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `uwsgi_ssl_certificate_vars.t`
 - `uwsgi_ssl_verify.t`
 
-### no access available (6)
-
-- `access.t`
-- `auth_request_satisfy.t`
-- `http_include.t`
-- `proxy_protocol.t`
-- `proxy_protocol2.t`
-- `ssl_proxy_protocol.t`
-
 ### no geo available (6)
 
 - `geo.t`
@@ -469,15 +470,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `ssl_certificate.t`
 - `ssl_store_keys.t`
 
-### no realip available (6)
-
-- `proxy_protocol_ipv6.t`
-- `proxy_protocol_unix.t`
-- `realip.t`
-- `realip_hostname.t`
-- `realip_remote_addr.t`
-- `realip_remote_port.t`
-
 ### Cache::Memcached not installed (5)
 
 - `gunzip_memcached.t`
@@ -485,6 +477,14 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `memcached_keepalive.t`
 - `memcached_keepalive_stale.t`
 - `upstream_hash_memcached.t`
+
+### no inet6 support (5)
+
+- `access.t`
+- `http_resolver_aaaa.t`
+- `http_resolver_ipv4.t`
+- `proxy_implicit.t`
+- `proxy_ssl_name.t`
 
 ### no perl available (5)
 
@@ -507,13 +507,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `gunzip_perl.t`
 - `gunzip_ssi.t`
 - `gunzip_static.t`
-
-### no inet6 support (4)
-
-- `http_resolver_aaaa.t`
-- `http_resolver_ipv4.t`
-- `proxy_implicit.t`
-- `proxy_ssl_name.t`
 
 ### no mp4 available (4)
 
@@ -599,6 +592,11 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `geo_binary.t`
 - `stream_geo_binary.t`
 
+### no auth_request available (2)
+
+- `auth_request_satisfy.t`
+- `auth_request_set.t`
+
 ### no control_api available (2)
 
 - `control_api.t`
@@ -651,10 +649,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 ### no addition available (1)
 
 - `addition.t`
-
-### no auth_request available (1)
-
-- `auth_request_set.t`
 
 ### no empty_gif available (1)
 
