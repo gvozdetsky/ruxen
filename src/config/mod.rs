@@ -35,6 +35,7 @@ pub use error::*;
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
 pub(crate) use lexer::*;
+pub(crate) use parse_access::parse_inet_addr;
 use parse_access::{parse_access_directive, parse_limit_except_block};
 pub(crate) use parse_location::*;
 pub(crate) use parse_log::*;
@@ -618,10 +619,18 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 let raw = args.get(1).ok_or(Error::MissingArg("auth_delay"))?;
                 auth_delay_ms = Some(parse_duration_ms(raw, "auth_delay")?);
             }
-            ("allow" | "deny" | "satisfy", Terminator::Semi) => {
+            (
+                "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
+                | "real_ip_recursive",
+                Terminator::Semi,
+            ) => {
                 parse_access_directive(&mut access, &args, lx)?;
             }
-            ("allow" | "deny" | "satisfy", _) => {
+            (
+                "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
+                | "real_ip_recursive",
+                _,
+            ) => {
                 return Err(Error::WrongTerminator {
                     name: args[0].clone(),
                     ctx: "http",
@@ -2564,6 +2573,69 @@ mod tests {
                 }
             }]
         );
+    }
+
+    #[test]
+    fn realip_directives_parse_and_inherit() {
+        let src = r#"
+            http {
+                set_real_ip_from 10.0.0.0/8;
+                set_real_ip_from unix:;
+                set_real_ip_from localhost;
+                real_ip_header X-Forwarded-For;
+                server {
+                    listen 80;
+                    real_ip_recursive on;
+                    location /a {
+                        real_ip_header CF-Connecting-IP;
+                        location /a/b { }
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let realip = &cfg.access.realip;
+        assert_eq!(
+            realip.from[..2],
+            [
+                AccessAddr::V4 {
+                    addr: 0x0a00_0000,
+                    mask: 0xff00_0000
+                },
+                AccessAddr::Unix
+            ]
+        );
+        // localhost resolves to at least one full-length address.
+        assert!(realip.from.len() > 2);
+        assert_eq!(realip.header, Some(RealIpHeader::XForwardedFor));
+        let server = &cfg.servers[0];
+        assert_eq!(server.access.realip.recursive, Some(true));
+        let child = server
+            .locations
+            .iter()
+            .find(|l| l.pattern == "/a/b")
+            .unwrap();
+        assert_eq!(
+            child.access.realip.header,
+            Some(RealIpHeader::Other("cf-connecting-ip".into()))
+        );
+        for (src, want) in [
+            (
+                "set_real_ip_from 10.0.0.0/33;",
+                "bad value for set_real_ip_from (host not found): 10.0.0.0/33",
+            ),
+            (
+                "real_ip_header a; real_ip_header b;",
+                "duplicate directive `real_ip_header`",
+            ),
+            (
+                "real_ip_recursive maybe;",
+                "bad value for real_ip_recursive: maybe",
+            ),
+        ] {
+            let conf = format!("http {{ server {{ listen 80; {src} }} }}");
+            assert_eq!(parse(&conf).expect_err(src).to_string(), want, "{src}");
+        }
     }
 
     #[test]

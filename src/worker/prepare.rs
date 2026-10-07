@@ -24,9 +24,9 @@ use crate::config::{
     ErrorLogSyslogServer, ErrorLogTarget, ErrorPage, ErrorPageAction, ExpiresDirective,
     FileTestKind, Handler, HttpConfig, IfGuard, IndexEntry, KeepaliveDisable, KeepaliveTimeout,
     LimitExcept, Location, LogFormatDef, MapBlock, MapExactEntry, MapRegexEntry, MatchMode,
-    PathMapping, ProxyConf, ProxyPass, ProxySetHeader, RewriteFlag as ConfigRewriteFlag, RewriteOp,
-    RewriteRule, Server, SplitClients, TryFiles, TryFilesFallback, TryFilesProbe, ValuePart,
-    Variable,
+    PathMapping, ProxyConf, ProxyPass, ProxySetHeader, RealIpHeader,
+    RewriteFlag as ConfigRewriteFlag, RewriteOp, RewriteRule, Server, SplitClients, TryFiles,
+    TryFilesFallback, TryFilesProbe, ValuePart, Variable,
 };
 use crate::http::{self, Method, Parse, ParseState, READ_BUF};
 use crate::phase::{self, Response};
@@ -1498,8 +1498,8 @@ pub(crate) fn prepare_maps(
             volatile,
         } = block;
         // Caching only shows when a result could differ later in the
-        // request; a map of request constants (headers, the client's
-        // address, literals) gives the same value every time.
+        // request; a map of request constants (headers, literals) gives
+        // the same value every time.
         let cached = !volatile
             && !(request_constant(&key)
                 && exact.iter().all(|e| request_constant(&e.value))
@@ -1564,7 +1564,8 @@ pub(crate) fn prepare_maps(
 /// Whether `parts` render the same all through a request: literals and
 /// variables nothing in the request changes (not `$uri`, `$args`, `set`
 /// or other maps' values, captures, `$request_method`, which an
-/// X-Accel-Redirect turns into GET, or anything upstream or response).
+/// X-Accel-Redirect turns into GET, `$remote_addr`, which a location's
+/// realip settings change, or anything upstream or response).
 fn request_constant(parts: &[ValuePart]) -> bool {
     parts.iter().all(|part| match part {
         ValuePart::Literal(_) => true,
@@ -1577,8 +1578,8 @@ fn request_constant(parts: &[ValuePart]) -> bool {
                 | Variable::Cookie(_)
                 | Variable::ContentLength
                 | Variable::ContentType
-                | Variable::RemoteAddr
-                | Variable::RemotePort
+                | Variable::RealIpRemoteAddr
+                | Variable::RealIpRemotePort
                 | Variable::Hostname
                 | Variable::Connection
                 | Variable::ConnectionRequests
@@ -1931,6 +1932,25 @@ fn resolve_access(
             .map(leak_path_buf)
             .or(parent.auth_basic_user_file),
         auth_delay_ms: auth_delay_ms.unwrap_or(parent.auth_delay_ms),
+        realip: PreparedRealIp {
+            from: if access.realip.from.is_empty() {
+                parent.realip.from
+            } else {
+                Box::leak(access.realip.from.into_boxed_slice())
+            },
+            header: access
+                .realip
+                .header
+                .map_or(parent.realip.header, |h| match h {
+                    RealIpHeader::XRealIp => PreparedRealIpHeader::XRealIp,
+                    RealIpHeader::XForwardedFor => PreparedRealIpHeader::XForwardedFor,
+                    RealIpHeader::ProxyProtocol => PreparedRealIpHeader::ProxyProtocol,
+                    RealIpHeader::Other(name) => {
+                        PreparedRealIpHeader::Other(leak_bytes(name.as_bytes()))
+                    }
+                }),
+            recursive: access.realip.recursive.unwrap_or(parent.realip.recursive),
+        },
     }
 }
 
@@ -1953,7 +1973,7 @@ fn build_limit_except(
 ) -> &'static PreparedLimitExcept {
     let own = AccessConf {
         rules: le.rules,
-        satisfy: None,
+        ..AccessConf::default()
     };
     let access = resolve_access(
         own,

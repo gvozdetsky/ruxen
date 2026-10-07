@@ -448,6 +448,7 @@ pub struct PreparedAccess {
     pub auth_basic_user_file: Option<&'static Path>,
     /// `auth_delay` in milliseconds.
     pub auth_delay_ms: u64,
+    pub realip: PreparedRealIp,
 }
 
 impl PreparedAccess {
@@ -458,7 +459,32 @@ impl PreparedAccess {
         auth_basic: PreparedAuthBasic::Off,
         auth_basic_user_file: None,
         auth_delay_ms: 0,
+        realip: PreparedRealIp {
+            from: &[],
+            header: PreparedRealIpHeader::XRealIp,
+            recursive: false,
+        },
     };
+}
+
+/// The realip module's settings, inheritance resolved. Off while `from`
+/// is empty.
+#[derive(Debug, Copy, Clone)]
+pub struct PreparedRealIp {
+    /// `set_real_ip_from`: the peers whose header is believed.
+    pub from: &'static [crate::config::AccessAddr],
+    pub header: PreparedRealIpHeader,
+    /// `real_ip_recursive on`.
+    pub recursive: bool,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum PreparedRealIpHeader {
+    XRealIp,
+    XForwardedFor,
+    ProxyProtocol,
+    /// A lowercased header name.
+    Other(&'static [u8]),
 }
 
 /// `limit_except`: what a request whose method the block doesn't list
