@@ -975,6 +975,9 @@ pub struct AccessConf {
     pub rules: Vec<AccessRule>,
     /// `None` inherits; the default is `all`.
     pub satisfy: Option<Satisfy>,
+    /// The realip module, which sets the client address before the
+    /// access phase.
+    pub realip: RealIpConf,
 }
 
 impl AccessConf {
@@ -987,8 +990,47 @@ impl AccessConf {
                 self.rules.clone()
             },
             satisfy: self.satisfy.or(parent.satisfy),
+            realip: self.realip.inherit(&parent.realip),
         }
     }
+}
+
+/// `set_real_ip_from`, `real_ip_header` and `real_ip_recursive` at one
+/// scope (ngx_http_realip_module).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealIpConf {
+    /// The trusted addresses (`AccessAddr::All` never occurs). Empty
+    /// inherits the enclosing scope's list whole.
+    pub from: Vec<AccessAddr>,
+    /// `None` inherits; the default is `X-Real-IP`.
+    pub header: Option<RealIpHeader>,
+    /// `None` inherits; the default is `off`.
+    pub recursive: Option<bool>,
+}
+
+impl RealIpConf {
+    pub fn inherit(&self, parent: &RealIpConf) -> RealIpConf {
+        RealIpConf {
+            from: if self.from.is_empty() {
+                parent.from.clone()
+            } else {
+                self.from.clone()
+            },
+            header: self.header.clone().or_else(|| parent.header.clone()),
+            recursive: self.recursive.or(parent.recursive),
+        }
+    }
+}
+
+/// Where `real_ip_header` takes the client address from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RealIpHeader {
+    XRealIp,
+    XForwardedFor,
+    /// The PROXY protocol header's source address and port.
+    ProxyProtocol,
+    /// Any other request header, by its lowercased name.
+    Other(String),
 }
 
 /// One `allow` or `deny` line. The first rule matching the client
@@ -1450,6 +1492,10 @@ pub enum Variable {
     /// Client source port from the accepted peer socket. Mirrors nginx's
     /// `$remote_port`.
     RemotePort,
+    /// `$realip_remote_addr` / `$realip_remote_port`: the connection's own
+    /// peer, also after the realip module set another client address.
+    RealIpRemoteAddr,
+    RealIpRemotePort,
     /// Username from successful HTTP Basic auth. Empty when no user was
     /// authenticated for the request.
     RemoteUser,

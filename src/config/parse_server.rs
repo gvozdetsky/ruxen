@@ -486,7 +486,11 @@ pub(crate) fn parse_server_block(
                 let raw = args.get(1).ok_or(Error::MissingArg("auth_delay"))?;
                 auth_delay_ms = Some(parse_duration_ms(raw, "auth_delay")?);
             }
-            ("allow" | "deny" | "satisfy", Terminator::Semi) => {
+            (
+                "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
+                | "real_ip_recursive",
+                Terminator::Semi,
+            ) => {
                 parse_access_directive(&mut access, &args, lx)?;
             }
             ("client_max_body_size", Terminator::Semi) => {
@@ -621,6 +625,9 @@ pub(crate) fn parse_server_block(
                 | "allow"
                 | "deny"
                 | "satisfy"
+                | "set_real_ip_from"
+                | "real_ip_header"
+                | "real_ip_recursive"
                 | "client_max_body_size"
                 | "client_body_temp_path"
                 | "disable_symlinks"

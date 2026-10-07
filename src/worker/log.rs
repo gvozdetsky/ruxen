@@ -69,6 +69,15 @@ impl<'a> ErrorLogRequest<'a> {
         }
     }
 
+    /// The client address the realip module set while processing, if
+    /// it did: lines written after processing use it, as nginx's do.
+    pub(crate) fn with_realip(mut self, meta: &'a phase::ProcessMeta) -> Self {
+        if let Some(realip) = meta.realip.as_deref() {
+            self.client = &realip.addr;
+        }
+        self
+    }
+
     fn append_context(&self, out: &mut Vec<u8>, upstream: Option<&str>) {
         out.extend_from_slice(b", client: ");
         out.extend_from_slice(self.client);

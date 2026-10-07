@@ -71,6 +71,11 @@ pub(crate) async fn write_access_logs(
     if logs.is_empty() {
         return;
     }
+    // The client address the realip module set, if it did.
+    let (remote_addr, remote_port, conn) = match meta.and_then(|m| m.realip.as_deref()) {
+        Some(realip) => (&realip.addr[..], realip.port, &realip.conn),
+        None => (remote_addr, remote_port, conn),
+    };
     // The worker opens its access_log fds once at startup (see
     // `init_access_logs_for_worker`); if that hasn't run we have nothing to
     // write to, so bail quietly.
@@ -369,7 +374,7 @@ async fn settle_proxy_response(
     if !report.failures.is_empty() {
         write_upstream_error_log(
             &process_meta.log,
-            &ErrorLogRequest::new(ctx, process_meta.server_name),
+            &ErrorLogRequest::new(ctx, process_meta.server_name).with_realip(&process_meta),
             &report.failures,
         );
     }
@@ -570,7 +575,8 @@ async fn run_proxy_pass(
     if !report.failures.is_empty() {
         write_upstream_error_log(
             &process_meta.log,
-            &ErrorLogRequest::new(&pass_request(ctx, as_get), process_meta.server_name),
+            &ErrorLogRequest::new(&pass_request(ctx, as_get), process_meta.server_name)
+                .with_realip(&process_meta),
             &report.failures,
         );
     }
@@ -772,7 +778,7 @@ fn refuse_unsafe_accel(
     write_error_log(
         process_meta.log.error_logs,
         ErrorLogLevel::Error,
-        &ErrorLogRequest::new(ctx, process_meta.server_name),
+        &ErrorLogRequest::new(ctx, process_meta.server_name).with_realip(&process_meta),
         &message,
         None,
     );
@@ -1724,6 +1730,7 @@ pub(crate) async fn handle_plain(
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
         peer_ip: peer_addr.ip(),
+        realip: None,
         proxy_protocol,
     };
     handle(
@@ -1760,6 +1767,7 @@ pub(crate) async fn handle_tls(
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
         peer_ip: peer_addr.ip(),
+        realip: None,
         proxy_protocol,
     };
     let (mut tls_stream, info) = match crate::tls::accept_with_timeout(

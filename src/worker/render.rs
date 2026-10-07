@@ -211,7 +211,23 @@ impl RenderCtx<'_> {
             Variable::ServerProtocol => out.extend_from_slice(server_protocol(self.request_line)),
             Variable::Host => out.extend_from_slice(self.host),
             Variable::RemoteAddr => out.extend_from_slice(self.remote_addr),
+            // Empty when the realip module took an address without a port.
+            Variable::RemotePort if self.remote_port == 0 => {}
             Variable::RemotePort => write_u16_decimal(out, self.remote_port),
+            Variable::RealIpRemoteAddr => match &self.conn.realip {
+                Some(peer) => out.extend_from_slice(&peer.addr),
+                None => out.extend_from_slice(self.remote_addr),
+            },
+            Variable::RealIpRemotePort => {
+                let port = self
+                    .conn
+                    .realip
+                    .as_ref()
+                    .map_or(self.remote_port, |p| p.port);
+                if port != 0 {
+                    write_u16_decimal(out, port);
+                }
+            }
             Variable::RemoteUser => {
                 // Pre-resolved username from a successful auth_basic check
                 // wins; otherwise nginx parses the `Authorization: Basic`

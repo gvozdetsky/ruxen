@@ -55,12 +55,22 @@ pub enum Phase {
 /// What a connection carries for every request on it: the PROXY protocol
 /// header, when the listen has `proxy_protocol`, and `$server_addr`.
 /// Requests point at it, so it costs them one word however much it holds.
+#[derive(Debug, Clone)]
 pub struct ConnInfo {
     pub proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     /// The connection's local address as `$server_addr` shows it.
     pub server_addr: std::borrow::Cow<'static, [u8]>,
     /// The client's address, which `allow` / `deny` match.
     pub peer_ip: IpAddr,
+    /// The connection's own peer, once the realip module replaced
+    /// `peer_ip` for a request (`$realip_remote_addr`, `$realip_remote_port`).
+    pub realip: Option<Box<RealIpPeer>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RealIpPeer {
+    pub addr: Vec<u8>,
+    pub port: u16,
 }
 
 impl ConnInfo {
@@ -70,6 +80,7 @@ impl ConnInfo {
         proxy_protocol: None,
         server_addr: std::borrow::Cow::Borrowed(b""),
         peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        realip: None,
     };
 }
 
@@ -226,6 +237,9 @@ pub struct ProcessMeta {
     pub access_logs: &'static [crate::worker::PreparedAccessLog],
     /// Authenticated user from HTTP Basic auth, for `$remote_user`.
     pub remote_user: Option<Vec<u8>>,
+    /// The client address the realip module set, for the log lines the
+    /// worker writes after processing.
+    pub realip: Option<Box<RealIpState>>,
     /// Location-scope `add_header` list to apply to a `proxy_pass`-served
     /// response. The worker awaits the upstream future, then reuses these
     /// to inject headers (with `$upstream_http_*` populated). Empty when
@@ -296,6 +310,7 @@ impl Default for ProcessMeta {
             server_port: 0,
             access_logs: &[],
             remote_user: None,
+            realip: None,
             proxy_add_headers: &[],
             proxy_add_trailers: &[],
             proxy_chunked_transfer_encoding: true,
@@ -510,7 +525,7 @@ fn log_failed_lookup(req: &RequestCtx<'_>, meta: &ProcessMeta) {
     if let Some(failed) = crate::fs_resolve::take_failed_lookup() {
         crate::worker::write_lookup_error_log(
             meta.log,
-            &crate::worker::ErrorLogRequest::new(req, meta.server_name),
+            &crate::worker::ErrorLogRequest::new(req, meta.server_name).with_realip(meta),
             failed,
         );
     }
@@ -582,8 +597,13 @@ fn process_with_meta_inner(
     let mut in_error_page = false;
     let mut preserved_location: Option<Vec<u8>> = None;
     let mut preserved_www_authenticate: Vec<Vec<u8>> = Vec::new();
-    // The request as GET, once an error_page has sent it to a URI.
-    let mut as_get: Option<RequestCtx<'_>> = None;
+    // The client address the realip module set, if it did. nginx keeps it
+    // for the rest of the request, internal redirects included.
+    let realip: std::cell::OnceCell<RealIpState> = std::cell::OnceCell::new();
+    // The request as the phases see it once it changed: GET after an
+    // error_page sent it to a URI, the realip address.
+    let mut req_now: Option<RequestCtx<'_>> = None;
+    let req_in = req;
     match initial_reroute {
         None => {
             // Normalize the URI once at FindConfig entry; Rewrite / internal
@@ -602,7 +622,7 @@ fn process_with_meta_inner(
         }
         Some(reroute) => {
             if turns_into_get(req, &reroute) {
-                as_get = Some(error_page_request(req));
+                req_now = Some(error_page_request(req));
             }
             if let Some(args) = reroute.args {
                 current_args = Some(args);
@@ -664,6 +684,15 @@ fn process_with_meta_inner(
     let mut meta = ProcessMeta::default();
     meta.server_port = server.listen_port;
     meta.server_name = server.primary_server_name;
+    // The realip module's post-read handler, with the server's settings.
+    if !server.access.realip.from.is_empty() {
+        let req = req_now.as_ref().unwrap_or(req_in);
+        if let Some(state) = real_ip(req, &server.access.realip) {
+            let state = realip.get_or_init(|| state);
+            meta.realip = Some(Box::new(state.clone()));
+            req_now = Some(with_real_ip(req, state));
+        }
+    }
 
     // Reroute loop — nginx calls this `r->internal` handling inside
     // `ngx_http_internal_redirect`; the counter is `r->uri_changes`. We
@@ -673,7 +702,7 @@ fn process_with_meta_inner(
     // internal redirect, but not after a location's `rewrite … last`.
     let mut run_server_rewrite = true;
     for hop in 0..MAX_REROUTES {
-        let req = as_get.as_ref().unwrap_or(req);
+        let req = req_now.as_ref().unwrap_or(req_in);
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
         let internal_request = !refusing || hop > 0;
@@ -706,8 +735,8 @@ fn process_with_meta_inner(
                 )
             {
                 // Answered before any location: the server's error_page,
-                // add_header and logs.
-                return refuse(
+                // add_header and logs, and the realip address.
+                let (response, mut refused) = refuse(
                     http,
                     req,
                     url_scratch,
@@ -716,6 +745,10 @@ fn process_with_meta_inner(
                     false,
                     in_error_page,
                 );
+                if refused.realip.is_none() {
+                    refused.realip = meta.realip.take();
+                }
+                return (response, refused);
             }
             match match_location(server, url_scratch, &mut rewrite_state) {
                 Some(loc) => loc,
@@ -828,6 +861,18 @@ fn process_with_meta_inner(
         meta.remote_user = None;
         let answered_in_rewrite_phase =
             !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
+        // The realip module's pre-access handler, with the location's
+        // settings, unless the post-read one already set the address.
+        if !answered_in_rewrite_phase
+            && !loc.access.realip.from.is_empty()
+            && realip.get().is_none()
+            && let Some(state) = real_ip(req, &loc.access.realip)
+        {
+            let state = realip.get_or_init(|| state);
+            meta.realip = Some(Box::new(state.clone()));
+            req_now = Some(with_real_ip(req, state));
+        }
+        let req = req_now.as_ref().unwrap_or(req_in);
         let mut denied = None;
         if !answered_in_rewrite_phase {
             match run_access_control(http, req, loc.access, loc.server_header, &meta) {
@@ -945,7 +990,7 @@ fn process_with_meta_inner(
                     }
                 }
                 if to_get {
-                    as_get = Some(error_page_request(req));
+                    req_now = Some(error_page_request(req));
                 }
             }
             Response::Proxy(plan) => {
@@ -979,6 +1024,155 @@ fn process_with_meta_inner(
         )),
         meta,
     )
+}
+
+/// What the realip module changed: the client address it set, and the
+/// connection info as the request sees it from then on (`peer_ip`, and
+/// the original peer for `$realip_remote_addr`).
+#[derive(Debug, Clone)]
+pub struct RealIpState {
+    pub addr: Vec<u8>,
+    /// 0 when the header gave no port: `$remote_port` is empty then.
+    pub port: u16,
+    pub conn: ConnInfo,
+}
+
+/// The client address the realip module finds for `req`, if the peer is
+/// trusted and the header gives one (`ngx_http_realip_handler`).
+#[cold]
+#[inline(never)]
+fn real_ip(req: &RequestCtx<'_>, conf: &crate::worker::PreparedRealIp) -> Option<RealIpState> {
+    use crate::worker::PreparedRealIpHeader as H;
+    let mut joined = Vec::new();
+    let (ip, port) = match conf.header {
+        H::ProxyProtocol => {
+            let source = req.conn.proxy_protocol.as_ref()?.source?;
+            if !real_ip_trusted(conf.from, req.conn.peer_ip) {
+                return None;
+            }
+            (source.ip(), source.port())
+        }
+        header => {
+            let value = match header {
+                H::XRealIp => crate::worker::lookup_request_header(req.headers_raw, b"x-real-ip")?,
+                H::Other(name) => crate::worker::lookup_request_header(req.headers_raw, name)?,
+                // Every X-Forwarded-For line, in order, as one list.
+                _ => {
+                    crate::worker::write_all_request_header_values(
+                        &mut joined,
+                        req.headers_raw,
+                        b"x-forwarded-for",
+                    );
+                    &joined
+                }
+            };
+            forwarded_addr(req.conn.peer_ip, value, conf.from, conf.recursive)?
+        }
+    };
+    let mut conn = req.conn.clone();
+    conn.peer_ip = ip;
+    conn.realip = Some(Box::new(RealIpPeer {
+        addr: req.remote_addr.to_vec(),
+        port: req.remote_port,
+    }));
+    Some(RealIpState {
+        addr: ip.to_string().into_bytes(),
+        port,
+        conn,
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn with_real_ip<'a>(req: &RequestCtx<'a>, state: &'a RealIpState) -> RequestCtx<'a> {
+    RequestCtx {
+        remote_addr: &state.addr,
+        remote_port: state.port,
+        conn: &state.conn,
+        ..*req
+    }
+}
+
+/// `ngx_http_get_forwarded_addr_internal`: walk `list` (`addr, addr, …`)
+/// from the right while the address in hand is trusted. Without
+/// `recursive`, only the last entry is taken. `None` when the peer isn't
+/// trusted or the last entry doesn't parse.
+fn forwarded_addr(
+    peer: IpAddr,
+    list: &[u8],
+    from: &[AccessAddr],
+    recursive: bool,
+) -> Option<(IpAddr, u16)> {
+    let is_sep = |b: u8| b == b' ' || b == b',';
+    let mut current = peer;
+    let mut found = None;
+    let mut len = list.len();
+    loop {
+        if !real_ip_trusted(from, current) || len == 0 {
+            return found;
+        }
+        let mut p = len - 1;
+        while p > 0 && is_sep(list[p]) {
+            p -= 1;
+            len -= 1;
+        }
+        while p > 0 {
+            if is_sep(list[p]) {
+                p += 1;
+                break;
+            }
+            p -= 1;
+        }
+        let Some((ip, port)) = parse_addr_port(&list[p..len]) else {
+            return found;
+        };
+        current = ip;
+        found = Some((ip, port));
+        if !recursive || p == 0 {
+            return found;
+        }
+        len = p - 1;
+    }
+}
+
+/// `ngx_parse_addr_port`: an address, or `addr:port` / `[addr]:port`.
+/// The port is 0 when there is none.
+fn parse_addr_port(text: &[u8]) -> Option<(IpAddr, u16)> {
+    let text = std::str::from_utf8(text).ok()?;
+    let addr = |s: &str| {
+        crate::config::parse_inet_addr(s)
+            .map(|v4| IpAddr::V4(v4.into()))
+            .or_else(|| s.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6))
+    };
+    if let Some(ip) = addr(text) {
+        return Some((ip, 0));
+    }
+    let (host, port) = match text.strip_prefix('[') {
+        Some(rest) => {
+            let (host, after) = rest.split_once(']')?;
+            (host, after.strip_prefix(':')?)
+        }
+        None => text.split_once(':')?,
+    };
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port: u16 = port.parse().ok().filter(|&p| p > 0)?;
+    Some((addr(host)?, port))
+}
+
+/// `ngx_cidr_match` against `set_real_ip_from`; IPv4-mapped addresses
+/// match the IPv4 entries.
+fn real_ip_trusted(from: &[AccessAddr], ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    from.iter().any(|entry| match (*entry, ip) {
+        (AccessAddr::V4 { addr, mask }, IpAddr::V4(ip)) => u32::from(ip) & mask == addr,
+        (AccessAddr::V6 { addr, mask }, IpAddr::V6(ip)) => u128::from(ip) & mask == addr,
+        _ => false,
+    })
 }
 
 /// `ngx_http_send_error_page`: an error_page that sends the request to a
@@ -1773,6 +1967,56 @@ mod tests {
 
     fn ctx<'a>(path: &'a [u8], host: Option<&'a [u8]>, http_11: bool) -> RequestCtx<'a> {
         ctx_with_method(Method::Get, path, host, http_11)
+    }
+
+    #[test]
+    fn forwarded_addr_walks_the_list_like_nginx() {
+        use crate::config::AccessAddr::V4;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 127.0.0.0/8 and 192.0.2.0/24 trusted.
+        let from = [
+            V4 {
+                addr: 0x7f00_0000,
+                mask: 0xff00_0000,
+            },
+            V4 {
+                addr: 0xc000_0200,
+                mask: 0xffff_ff00,
+            },
+        ];
+        let peer = ip("127.0.0.1");
+        let get = |list: &str, recursive| forwarded_addr(peer, list.as_bytes(), &from, recursive);
+        // Off: the last entry, trusted or not.
+        assert_eq!(
+            get("10.0.0.1, 192.0.2.7", false),
+            Some((ip("192.0.2.7"), 0))
+        );
+        // On: right to left while trusted.
+        assert_eq!(get("10.0.0.1, 192.0.2.7", true), Some((ip("10.0.0.1"), 0)));
+        assert_eq!(get("192.0.2.8,192.0.2.7", true), Some((ip("192.0.2.8"), 0)));
+        // Separators at the end are skipped; ports and brackets parse.
+        assert_eq!(get("10.0.0.1:81 , ", false), Some((ip("10.0.0.1"), 81)));
+        assert_eq!(
+            get("[2001:db8::1]:99", false),
+            Some((ip("2001:db8::1"), 99))
+        );
+        assert_eq!(get("2001:db8::1", false), Some((ip("2001:db8::1"), 0)));
+        // A bad last entry: nothing; a bad entry further left: the last
+        // good one.
+        assert_eq!(get("10.0.0.1, bogus", true), None);
+        assert_eq!(get("bogus, 192.0.2.7", true), Some((ip("192.0.2.7"), 0)));
+        assert_eq!(get("10.0.0.1:0", false), None);
+        assert_eq!(get("", false), None);
+        // An untrusted peer: the header is ignored.
+        assert_eq!(
+            forwarded_addr(ip("10.9.9.9"), b"1.2.3.4", &from, false),
+            None
+        );
+        // An IPv4-mapped peer matches the IPv4 entries.
+        assert_eq!(
+            forwarded_addr(ip("::ffff:127.0.0.1"), b"1.2.3.4", &from, false),
+            Some((ip("1.2.3.4"), 0))
+        );
     }
 
     #[test]

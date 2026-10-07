@@ -1,11 +1,16 @@
 //! `allow` / `deny` (ngx_http_access_module), `satisfy`, and the
 //! `limit_except` block (ngx_http_core_module).
 
-use super::ast::{AccessAddr, AccessConf, AccessRule, LIMIT_EXCEPT_METHODS, LimitExcept, Satisfy};
+use super::ast::{
+    AccessAddr, AccessConf, AccessRule, LIMIT_EXCEPT_METHODS, LimitExcept, RealIpConf,
+    RealIpHeader, Satisfy,
+};
 use super::error::Error;
 use super::error::Terminator;
 use super::lexer::Lexer;
-use super::parse_location::{parse_auth_basic_args, parse_auth_basic_user_file_args};
+use super::parse_location::{
+    parse_auth_basic_args, parse_auth_basic_user_file_args, parse_on_off_args,
+};
 
 /// `allow`, `deny` or `satisfy` into `conf`; `false` when `args` is none
 /// of them. The caller has checked the `;` terminator.
@@ -31,9 +36,80 @@ pub(crate) fn parse_access_directive(
                 }
             });
         }
+        "set_real_ip_from" => parse_real_ip_from(&mut conf.realip, args, lx)?,
+        "real_ip_header" => {
+            if conf.realip.header.is_some() {
+                return Err(Error::Duplicate("real_ip_header"));
+            }
+            let [_, name] = args else {
+                return Err(Error::BadValue {
+                    what: "real_ip_header",
+                    got: args[1..].join(" "),
+                });
+            };
+            // The three names nginx knows are matched case-sensitively;
+            // anything else is a header name.
+            conf.realip.header = Some(match name.as_str() {
+                "X-Real-IP" => RealIpHeader::XRealIp,
+                "X-Forwarded-For" => RealIpHeader::XForwardedFor,
+                "proxy_protocol" => RealIpHeader::ProxyProtocol,
+                other => RealIpHeader::Other(other.to_ascii_lowercase()),
+            });
+        }
+        "real_ip_recursive" => {
+            if conf.realip.recursive.is_some() {
+                return Err(Error::Duplicate("real_ip_recursive"));
+            }
+            conf.realip.recursive = Some(parse_on_off_args(&args[1..], "real_ip_recursive")?);
+        }
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+/// `ngx_http_realip_from`: `unix:`, an address or CIDR block, or a host
+/// name, resolved now to every address it has.
+fn parse_real_ip_from(conf: &mut RealIpConf, args: &[String], lx: &mut Lexer) -> Result<(), Error> {
+    let [_, value] = args else {
+        return Err(Error::BadValue {
+            what: "set_real_ip_from",
+            got: args[1..].join(" "),
+        });
+    };
+    if value == "unix:" {
+        conf.from.push(AccessAddr::Unix);
+        return Ok(());
+    }
+    if let Some((addr, low_bits)) = parse_cidr(value) {
+        if low_bits {
+            lx.warn(format!("low address bits of {value} are meaningless"));
+        }
+        conf.from.push(addr);
+        return Ok(());
+    }
+    let not_found = || Error::BadValue {
+        what: "set_real_ip_from (host not found)",
+        got: value.clone(),
+    };
+    let addrs =
+        std::net::ToSocketAddrs::to_socket_addrs(&(value.as_str(), 0)).map_err(|_| not_found())?;
+    let before = conf.from.len();
+    for addr in addrs {
+        conf.from.push(match addr.ip() {
+            std::net::IpAddr::V4(ip) => AccessAddr::V4 {
+                addr: ip.into(),
+                mask: u32::MAX,
+            },
+            std::net::IpAddr::V6(ip) => AccessAddr::V6 {
+                addr: ip.into(),
+                mask: u128::MAX,
+            },
+        });
+    }
+    if conf.from.len() == before {
+        return Err(not_found());
+    }
+    Ok(())
 }
 
 /// `ngx_http_access_rule`: `all`, `unix:`, an address or a CIDR block.
@@ -102,7 +178,7 @@ fn parse_cidr(text: &str) -> Option<(AccessAddr, bool)> {
 
 /// `ngx_inet_addr`: four dot-separated decimal octets. Empty octets count
 /// as 0 and leading zeros are decimal, as in nginx.
-fn parse_inet_addr(text: &str) -> Option<u32> {
+pub(crate) fn parse_inet_addr(text: &str) -> Option<u32> {
     let mut addr: u32 = 0;
     let mut octet: u32 = 0;
     let mut dots = 0;
