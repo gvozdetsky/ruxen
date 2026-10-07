@@ -578,6 +578,8 @@ fn process_with_meta_inner(
     let mut in_error_page = false;
     let mut preserved_location: Option<Vec<u8>> = None;
     let mut preserved_www_authenticate: Vec<Vec<u8>> = Vec::new();
+    // The request as GET, once an error_page has sent it to a URI.
+    let mut as_get: Option<RequestCtx<'_>> = None;
     match initial_reroute {
         None => {
             // Normalize the URI once at FindConfig entry; Rewrite / internal
@@ -595,6 +597,9 @@ fn process_with_meta_inner(
             }
         }
         Some(reroute) => {
+            if turns_into_get(req, &reroute) {
+                as_get = Some(error_page_request(req));
+            }
             if let Some(args) = reroute.args {
                 current_args = Some(args);
             }
@@ -664,6 +669,7 @@ fn process_with_meta_inner(
     // internal redirect, but not after a location's `rewrite … last`.
     let mut run_server_rewrite = true;
     for hop in 0..MAX_REROUTES {
+        let req = as_get.as_ref().unwrap_or(req);
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
         let internal_request = !refusing || hop > 0;
@@ -867,6 +873,7 @@ fn process_with_meta_inner(
         ) {
             Response::Reroute(next) => {
                 run_server_rewrite = true;
+                let to_get = turns_into_get(req, &next);
                 if let Some(args) = next.args {
                     current_args = Some(args);
                 }
@@ -902,6 +909,9 @@ fn process_with_meta_inner(
                         named_target = Some(name);
                     }
                 }
+                if to_get {
+                    as_get = Some(error_page_request(req));
+                }
             }
             Response::Proxy(plan) => {
                 meta.proxy_add_headers = loc_add_headers;
@@ -934,6 +944,25 @@ fn process_with_meta_inner(
         )),
         meta,
     )
+}
+
+/// `ngx_http_send_error_page`: an error_page that sends the request to a
+/// URI turns it into a GET, unless it is a HEAD. A named location keeps
+/// the method.
+fn turns_into_get(req: &RequestCtx<'_>, reroute: &Reroute) -> bool {
+    reroute.enters_error_page
+        && matches!(reroute.target, RerouteTarget::Uri(_))
+        && !matches!(req.method, Method::Get | Method::Head)
+}
+
+#[cold]
+#[inline(never)]
+fn error_page_request<'a>(req: &RequestCtx<'a>) -> RequestCtx<'a> {
+    RequestCtx {
+        method: Method::Get,
+        method_bytes: b"GET",
+        ..*req
+    }
 }
 
 enum AccessControl {
