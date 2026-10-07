@@ -67,6 +67,23 @@ jobs:
           path: .nginx-tests-out/
           retention-days: 7
 
+  container:
+    # contrib/docker: the image builds, and serves under the io_uring
+    # seccomp profile it ships with.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -f contrib/docker/Dockerfile -t ruxen:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name ruxen -p 8080:8080 \
+            --security-opt seccomp=contrib/docker/seccomp-io_uring.json ruxen:ci
+          for i in $(seq 50); do curl -sf http://127.0.0.1:8080/ && break; sleep 0.2; done \
+            | grep -q "hello from ruxen"
+          docker stop ruxen
+          test "$(docker inspect ruxen --format '{{.State.ExitCode}}')" = 0
+
   msrv:
     # Keeps `rust-version` in Cargo.toml honest.
     runs-on: ubuntu-24.04

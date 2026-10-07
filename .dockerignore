@@ -1,0 +1,6 @@
+# Build context for contrib/docker/Dockerfile: the sources only.
+target/
+corpus/.cache/
+.nginx-tests-out/
+bench/
+.git/

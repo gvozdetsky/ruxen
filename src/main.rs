@@ -321,8 +321,9 @@ fn real_main() -> Result<(), Failure> {
     if !monoio::utils::detect_uring() {
         eprintln!(
             "ruxen: [emerg] io_uring is not available: it is blocked by seccomp \
-             (in Docker, run with --security-opt seccomp=unconfined), disabled \
-             via the kernel.io_uring_disabled sysctl, or the kernel is too old"
+             (Docker's default profile denies it: use contrib/docker/seccomp-io_uring.json \
+             from the ruxen repository), disabled via the kernel.io_uring_disabled sysctl, \
+             or the kernel is too old"
         );
         return Err(Failure::Reported);
     }
