@@ -229,9 +229,10 @@ impl RenderCtx<'_> {
             Variable::Status => write_u16_decimal(out, self.status),
             Variable::Args => out.extend_from_slice(self.args),
             Variable::IsArgs => out.extend_from_slice(self.is_args),
+            // As sent: nginx doesn't decode `%XX` here (ngx_http_arg).
             Variable::Arg(name) => {
                 if let Some(value) = request_arg_value(self.args, name.as_bytes()) {
-                    write_unescaped_arg_value(out, value);
+                    out.extend_from_slice(value);
                 }
             }
             Variable::Scheme => out.extend_from_slice(self.scheme),
@@ -1108,31 +1109,6 @@ pub(crate) fn request_arg_value<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [
         }
     }
     None
-}
-
-pub(crate) fn write_unescaped_arg_value(out: &mut Vec<u8>, raw: &[u8]) {
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] == b'%'
-            && i + 2 < raw.len()
-            && let (Some(hi), Some(lo)) = (hex_nibble(raw[i + 1]), hex_nibble(raw[i + 2]))
-        {
-            out.push((hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        out.push(raw[i]);
-        i += 1;
-    }
-}
-
-pub(crate) fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 pub(crate) fn murmur_hash2(data: &[u8]) -> u32 {

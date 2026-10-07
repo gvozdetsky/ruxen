@@ -175,6 +175,52 @@ pub(crate) fn build_absolute_redirect_location(
     out
 }
 
+/// `ngx_unescape_uri(…, NGX_UNESCAPE_REDIRECT)`, which a `rewrite …
+/// redirect` target goes through before the request's arguments are
+/// added: `%XX` turns into the byte when it is printable and above `%`,
+/// and the first `?` (written or decoded) ends the decoding.
+fn unescape_redirect(raw: &[u8]) -> Vec<u8> {
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let ch = raw[i];
+        i += 1;
+        if ch == b'?' {
+            out.push(ch);
+            break;
+        }
+        if ch != b'%' {
+            out.push(ch);
+            continue;
+        }
+        // A `%` the input ends on, with one digit or none, is dropped.
+        let Some(&first) = raw.get(i) else { break };
+        i += 1;
+        let Some(high) = hex(first) else {
+            // An invalid first digit: the `%` is dropped.
+            out.push(first);
+            continue;
+        };
+        let Some(&second) = raw.get(i) else { break };
+        i += 1;
+        // An invalid second digit: both are dropped.
+        let Some(low) = hex(second) else { continue };
+        let decoded = (high << 4) | low;
+        if decoded == b'?' {
+            out.push(decoded);
+            break;
+        }
+        if decoded > b'%' && decoded < 0x7f {
+            out.push(decoded);
+        } else {
+            out.extend_from_slice(&[b'%', first, second]);
+        }
+    }
+    out.extend_from_slice(&raw[i..]);
+    out
+}
+
 pub(crate) fn escape_redirect_location(raw: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = Vec::with_capacity(raw.len());
@@ -412,6 +458,7 @@ pub(crate) fn execute_rewrite_ops(
                         rendered.push(b'?');
                         rendered.extend_from_slice(args_buf);
                     }
+                    let mut rendered = unescape_redirect(&rendered);
                     if !*drop_args && !args.is_empty() {
                         rendered.push(if rendered.contains(&b'?') { b'&' } else { b'?' });
                         rendered.extend_from_slice(args);
@@ -541,5 +588,27 @@ pub(crate) fn run_rewrite_program(
         RewriteControl::Stop => RewriteOutcome::Break,
         RewriteControl::Reroute => RewriteOutcome::Reroute,
         RewriteControl::Respond(resp) => RewriteOutcome::Respond(resp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unescape_redirect;
+
+    #[test]
+    fn redirect_targets_unescape_like_nginx() {
+        let u = |s: &str| String::from_utf8(unescape_redirect(s.as_bytes())).unwrap();
+        assert_eq!(
+            u("http%3A%2F%2Fexample.com%2F%3Ffrom%2F"),
+            "http://example.com/?from%2F"
+        );
+        // Control characters, space and `%` itself stay encoded.
+        assert_eq!(u("a%0D%0Ab%20c%25d"), "a%0D%0Ab%20c%25d");
+        // A written `?` ends the decoding too.
+        assert_eq!(u("/a%41?b%41"), "/aA?b%41");
+        // nginx's handling of bad escapes.
+        assert_eq!(u("/a%zz"), "/azz");
+        assert_eq!(u("/a%4z"), "/a");
+        assert_eq!(u("/a%4"), "/a");
     }
 }

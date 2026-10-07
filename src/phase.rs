@@ -1200,7 +1200,7 @@ fn write_auth_path_var(
         }
         Variable::Arg(name) => {
             if let Some(value) = request_arg_value(args, name.as_bytes()) {
-                write_unescaped_arg_value(out, value);
+                out.extend_from_slice(value);
             }
         }
         _ => {}
@@ -1235,31 +1235,6 @@ fn request_arg_value<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
         }
     }
     None
-}
-
-fn write_unescaped_arg_value(out: &mut Vec<u8>, raw: &[u8]) {
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] == b'%'
-            && i + 2 < raw.len()
-            && let (Some(hi), Some(lo)) = (hex_nibble(raw[i + 1]), hex_nibble(raw[i + 2]))
-        {
-            out.push((hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        out.push(raw[i]);
-        i += 1;
-    }
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// One server-name regex hit, with the named-capture values surfaced for
@@ -1849,10 +1824,11 @@ mod tests {
     }
 
     #[test]
-    fn auth_basic_user_file_decodes_percent_encoded_arg_value() {
+    fn auth_basic_user_file_keeps_percent_encoded_arg_value() {
+        // nginx's $arg_f is the query string's bytes, undecoded.
         let req = ctx(b"/var/?f=sub%2Fhtpasswd", Some(b"localhost"), true);
         let resolved = resolve_auth_basic_user_file(&req, Path::new("$arg_f"), None).unwrap();
-        assert_eq!(resolved.as_ref(), Path::new("sub/htpasswd"));
+        assert_eq!(resolved.as_ref(), Path::new("sub%2Fhtpasswd"));
     }
 
     #[test]
