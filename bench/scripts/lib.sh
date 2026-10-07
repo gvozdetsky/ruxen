@@ -251,6 +251,10 @@ resolve_wrk_headers() {
             [[ -n "$etag" ]] || die "failed to fetch ETag for $url"
             printf 'If-None-Match: %s\n' "$etag"
             ;;
+        lua)
+            # headers_raw is a wrk script (repo-relative); run_iteration
+            # passes it with -s.
+            ;;
         last_modified)
             local lm
             lm="$(extract_last_modified "$url" "$scheme")"
@@ -328,6 +332,7 @@ run_iteration() {
     mapfile -t headers < <(resolve_wrk_headers "$header_mode" "$headers_raw" "$url" "$scheme")
 
     local -a wrk_cmd=(wrk -t "$threads" -c "$connections" --latency)
+    [[ "$header_mode" == "lua" ]] && wrk_cmd+=(-s "${REPO_ROOT}/${headers_raw}")
     local h
     for h in "${headers[@]}"; do
         wrk_cmd+=(-H "$h")

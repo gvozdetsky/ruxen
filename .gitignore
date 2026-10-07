@@ -6,3 +6,8 @@
 /.nginx-tests-out/
 /corpus/.cache/
 __pycache__/
+/bench/static2/html/
+/bench/logging/html/
+/bench/proxy2/html/
+/bench/tls2/html/
+/bench/proxy_ext/html/

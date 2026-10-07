@@ -29,3 +29,71 @@ rewrite_hello|rewrite /foo -> /bar last|8097|/foo|16|512|30s|5s|20|bench/rewrite
 vars_map|map $http_user_agent -> return 200 $kind|8100|/|16|512|30s|5s|20|bench/vars_map/nginx.conf||static|User-Agent: wrk|http
 proxy_hello|proxy_pass to in-process upstream with keepalive|8095|/|16|512|30s|5s|20|bench/proxy_pass/nginx.conf||none||http
 tls_hello|TLS 1.3 return 200 "hello"|8443|/|16|512|30s|5s|20|bench/tls/nginx.conf|bench/tls/generate.sh|none||https
+#
+# 0.1.2 performance campaign (added 2026-10-06). Same wrk shape unless the
+# id says otherwise: _c1 = -t1 -c1 (latency-bound), _c32 = -t4 -c32,
+# _c4096 = -t16 -c4096. `lua` header mode runs the given wrk script.
+m1_hello_c1|return 200, one connection|8080|/|1|1|30s|5s|20|bench/m1/nginx.conf||none||http
+m1_hello_c4096|return 200, 4096 connections|8080|/|16|4096|30s|5s|20|bench/m1/nginx.conf||none||http
+static_8k_c4096|static 8 KiB file, 4096 connections|8102|/hello.txt|16|4096|30s|5s|20|bench/static_8k/nginx.conf||none||http
+proxy_hello_c32|proxy_pass with upstream keep-alive, low concurrency|8095|/|4|32|30s|5s|20|bench/proxy_pass/nginx.conf||none||http
+tls_hello_c32|TLS 1.3 return 200, low concurrency|8443|/|4|32|30s|5s|20|bench/tls/nginx.conf|bench/tls/generate.sh|none||https
+redirect_301|return 301 with $request_uri|8110|/redirect?a=1|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+vars_render|return 200 with eight variables|8110|/vars?a=1&b=2|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+args_render|return 200 $arg_x $arg_y|8110|/args?x=hello&y=2&z=3|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+set_if|set + two if (regex, comparison)|8110|/setif|16|512|30s|5s|20|bench/core2/nginx.conf||static|X-Test: yes|http
+split_clients|split_clients on remote_addr + request_uri|8110|/split|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+map_regex_50|map with 50 regex keys, last one matches|8110|/maprx/k49|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+add_header_vars|four add_header with variables|8110|/hdrvars|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+rewrite_captures|rewrite with two captures -> last -> $arg_*|8110|/rc/123/abc|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+error_page_named|return 404 -> error_page = @named|8110|/errnamed|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
+many_request_headers|return 200, 20 browser-like request headers|8110|/hello|16|512|30s|5s|20|bench/core2/nginx.conf||static|Accept: text/html,application/xhtml+xml,application/xml,image/avif,image/webp,*/*;Accept-Language: en-US,en,de,nl;Accept-Encoding: gzip, deflate, br;User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36;Cookie: session=0123456789abcdef0123456789abcdef_0123456789abcdef;Referer: https://www.example.com/some/previous/page?with=query&and=more;Cache-Control: max-age=0;Upgrade-Insecure-Requests: 1;Sec-Fetch-Dest: document;Sec-Fetch-Mode: navigate;Sec-Fetch-Site: same-origin;Sec-Fetch-User: ?1;Sec-Ch-Ua: "Chromium" v="129", "Not=A?Brand" v="8";Sec-Ch-Ua-Mobile: ?0;Sec-Ch-Ua-Platform: "Linux";DNT: 1;X-Requested-With: XMLHttpRequest;X-Forwarded-For: 203.0.113.7;Priority: u=0, i;Pragma: no-cache|http
+regex_locations_50|50 regex locations, last one matches|8130|/re49/item|16|512|30s|5s|20|bench/locations/nginx.conf||none||http
+prefix_locations_200|200 prefix locations|8131|/p150/a/b|16|512|30s|5s|20|bench/locations/nginx.conf||none||http
+vhost_exact_100|Host matches one of 100 exact server_names|8132|/|16|512|30s|5s|20|bench/vhosts/nginx.conf||static|Host: h73.example.com|http
+vhost_wildcard_50|Host matches one of 50 wildcard server_names|8132|/|16|512|30s|5s|20|bench/vhosts/nginx.conf||static|Host: www.w40.example.com|http
+vhost_regex_20|Host matches the 20th regex server_name|8132|/|16|512|30s|5s|20|bench/vhosts/nginx.conf||static|Host: r19-abc.example.org|http
+static_0b|static empty file|8133|/0.txt|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+static_16k|static 16 KiB file|8133|/16k.bin|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+static_64k|static 64 KiB file|8133|/64k.bin|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+static_256k|static 256 KiB file|8133|/256k.bin|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+static_1k_sendfile_off|static 1 KiB file, sendfile off|8133|/nosf/hello1k.txt|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+static_1m_sendfile_off|static 1 MiB file, sendfile off|8133|/nosf/1M.bin|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+static_index|directory request served by index.html|8133|/dir/|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+try_files_hit|try_files $uri /spa/index.html, file exists|8133|/spa/app.js|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+try_files_fallback|try_files $uri /spa/index.html, SPA route|8133|/spa/route/deep/link|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+alias_1k|alias, 1 KiB file|8133|/a/hello1k.txt|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+expires_1k|expires 1h, 1 KiB file|8133|/exp/hello1k.txt|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+autoindex_100|autoindex of 100 files|8133|/list/|16|512|30s|5s|20|bench/static2/nginx.conf|bench/static2/generate.sh|none||http
+access_log_hello|return 200 + access_log combined|8134|/|16|512|30s|5s|20|bench/logging/nginx.conf|bench/logging/generate.sh|none||http
+access_log_static_1k|static 1 KiB file + access_log combined|8134|/hello1k.txt|16|512|30s|5s|20|bench/logging/nginx.conf|bench/logging/generate.sh|none||http
+post_1k_return|POST 1 KiB body to a return|8135|/sink|16|512|30s|5s|20|bench/body/nginx.conf||lua|bench/body/post_1k.lua|http
+proxy_post_1k|POST 1 KiB body through proxy_pass|8135|/proxy|16|512|30s|5s|20|bench/body/nginx.conf||lua|bench/body/post_1k.lua|http
+proxy_post_64k|POST 64 KiB body through proxy_pass|8135|/proxy|16|512|30s|5s|20|bench/body/nginx.conf||lua|bench/body/post_64k.lua|http
+proxy_no_upstream_keepalive|proxy_pass to an address, new upstream connection per request|8140|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_rr4|proxy_pass round robin over 4 servers, keep-alive|8141|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_least_conn4|proxy_pass least_conn over 4 servers, keep-alive|8142|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_headers_vars|proxy_pass + 5 proxy_set_header with variables|8143|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_64k|proxy_pass, 64 KiB upstream response|8144|/64k.bin|16|512|30s|5s|20|bench/proxy2/nginx.conf|bench/proxy2/generate.sh|none||http
+proxy_1m|proxy_pass, 1 MiB upstream response|8144|/1M.bin|16|512|30s|5s|20|bench/proxy2/nginx.conf|bench/proxy2/generate.sh|none||http
+proxy_intercept|upstream 404 -> proxy_intercept_errors -> error_page|8144|/intercept|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_redirect_302|upstream 302, Location rewritten by proxy_redirect default|8144|/redirect|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_xar|upstream X-Accel-Redirect to an internal 1 KiB file|8144|/xar|16|512|30s|5s|20|bench/proxy2/nginx.conf|bench/proxy2/generate.sh|none||http
+proxy_client_no_keepalive|proxy_pass, client without keep-alive|8147|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+tls12_hello|TLS 1.2 return 200, keep-alive|8450|/|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+tls13_handshake|TLS 1.3, ECDSA P-256, a handshake per request|8451|/|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+tls12_handshake|TLS 1.2, ECDSA P-256, a handshake per request|8452|/|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+tls13_rsa_handshake|TLS 1.3, RSA 2048, a handshake per request|8453|/|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+tls_static_1k|TLS 1.3 static 1 KiB file|8454|/hello1k.txt|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+tls_static_1m|TLS 1.3 static 1 MiB file|8454|/1M.bin|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+tls_proxy_hello|TLS 1.3 termination in front of proxy_pass|8455|/|16|512|30s|5s|20|bench/tls2/nginx.conf|bench/tls2/generate.sh|none||https
+#
+# proxy_ext: the server under test is only the proxy; the upstream is a
+# separate nginx (bench/proxy_ext/backend.conf) started once for the phase.
+proxy_ext_hello|proxy to external nginx backend, upstream keep-alive|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_no_keepalive|proxy to external nginx backend, new upstream connection per request|8160|/direct|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_64k|proxy to external nginx backend, 64 KiB response|8160|/files/64k.bin|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_1m|proxy to external nginx backend, 1 MiB response|8160|/files/1M.bin|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+proxy_ext_post_1k|POST 1 KiB through proxy to external nginx backend|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|lua|bench/body/post_1k.lua|http
+proxy_ext_post_64k|POST 64 KiB through proxy to external nginx backend|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|lua|bench/body/post_64k.lua|http
+proxy_ext_xar|X-Accel-Redirect from external nginx backend to an internal 1 KiB file|8160|/xar|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
