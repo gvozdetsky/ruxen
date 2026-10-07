@@ -25,6 +25,47 @@ jobs:
         run: cargo build --release --all-targets --locked
       - name: Test
         run: cargo test --release --locked
+      - name: Keep the binary for nginx-tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruxen-release
+          path: target/release/ruxen
+          retention-days: 3
+
+  nginx-tests:
+    # The files NGINX_TEST_PROGRESS.md lists as passing, against the
+    # nginx-tests commit in scripts/nginx-tests.rev: a PR that breaks one
+    # fails here. Bump the commit together with a regenerated progress
+    # file.
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ruxen-release
+          path: target/release
+      - name: Perl modules
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libio-socket-ssl-perl
+      - name: Fetch nginx-tests
+        run: |
+          git init -q ../nginx-tests
+          git -C ../nginx-tests fetch -q --depth 1 \
+            https://github.com/nginx/nginx-tests.git "$(cat scripts/nginx-tests.rev)"
+          git -C ../nginx-tests checkout -q FETCH_HEAD
+      - name: Run the passing files
+        run: |
+          chmod +x target/release/ruxen
+          scripts/run_nginx_tests.sh --no-build --passing
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-tests-logs
+          path: .nginx-tests-out/
+          retention-days: 7
 
   msrv:
     # Keeps `rust-version` in Cargo.toml honest.
