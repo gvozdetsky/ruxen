@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 mod ast;
 mod error;
 mod lexer;
+mod parse_access;
 mod parse_location;
 mod parse_log;
 mod parse_map;
@@ -34,6 +35,7 @@ pub use error::*;
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
 pub(crate) use lexer::*;
+use parse_access::{parse_access_directive, parse_limit_except_block};
 pub(crate) use parse_location::*;
 pub(crate) use parse_log::*;
 pub(crate) use parse_map::*;
@@ -220,6 +222,7 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
     }
 
     let mut http = http.ok_or(Error::UnexpectedEof)?;
+    http.warnings.extend(lx.take_warnings());
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -243,6 +246,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_basic: Option<AuthBasic> = None;
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
+    let mut access = AccessConf::default();
     let mut client_max_body_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
@@ -312,6 +316,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         auth_basic,
                         auth_basic_user_file,
                         auth_delay_ms,
+                        access,
                         client_max_body_size,
                         client_body_temp_path,
                         sendfile,
@@ -613,6 +618,15 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 let raw = args.get(1).ok_or(Error::MissingArg("auth_delay"))?;
                 auth_delay_ms = Some(parse_duration_ms(raw, "auth_delay")?);
             }
+            ("allow" | "deny" | "satisfy", Terminator::Semi) => {
+                parse_access_directive(&mut access, &args, lx)?;
+            }
+            ("allow" | "deny" | "satisfy", _) => {
+                return Err(Error::WrongTerminator {
+                    name: args[0].clone(),
+                    ctx: "http",
+                });
+            }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
                     return Err(Error::Duplicate("client_max_body_size"));
@@ -833,11 +847,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "etag",
     "msie_padding",
     "msie_refresh",
-    // Only `off` gets here: the other values are refused by
-    // `reject_unenforced`.
-    // Without allow/deny (not implemented, so an error), `satisfy any`
-    // and `all` both reduce to auth_basic alone.
-    "satisfy",
     // DNS resolver: accepted and unused, since proxy_pass addresses are
     // resolved at startup (runtime DNS is #133).
     "resolver",
@@ -923,7 +932,6 @@ pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "types", "charset_map"];
 pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
-        Some("limit_except") => "the method restrictions inside it would not apply",
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
         }
@@ -1764,15 +1772,7 @@ mod tests {
 
     #[test]
     fn access_restrictions_ruxen_cant_enforce_are_rejected() {
-        let err = unenforced_err(
-            "http { server { listen 80; location / { limit_except GET { deny all; } } } }",
-        );
-        assert_eq!(
-            err,
-            "\"limit_except\" is not supported yet, and ignoring it is unsafe: \
-             the method restrictions inside it would not apply"
-        );
-        // `internal` is enforced now (phase::process).
+        // `limit_except` and `internal` are enforced now (phase::process).
         let cfg =
             parse("http { server { listen 80; location /a/ { internal; return 200; } } }").unwrap();
         assert!(cfg.servers[0].locations[0].internal);
@@ -2487,6 +2487,162 @@ mod tests {
         assert_eq!(
             child.auth_basic_user_file.as_deref(),
             Some(std::path::Path::new("/tmp/parent.htpasswd"))
+        );
+    }
+
+    #[test]
+    fn access_rules_parse_at_every_scope_and_nested_locations_inherit() {
+        let src = r#"
+            http {
+                allow 10.0.0.0/8;
+                deny all;
+                satisfy any;
+                server {
+                    listen 80;
+                    deny ::1;
+                    location /a {
+                        allow unix:;
+                        satisfy all;
+                        location /a/inherit { }
+                        location /a/own { deny 192.168.1.1; }
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        assert_eq!(
+            cfg.access.rules,
+            [
+                AccessRule {
+                    deny: false,
+                    addr: AccessAddr::V4 {
+                        addr: 0x0a00_0000,
+                        mask: 0xff00_0000
+                    }
+                },
+                AccessRule {
+                    deny: true,
+                    addr: AccessAddr::All
+                },
+            ]
+        );
+        assert_eq!(cfg.access.satisfy, Some(Satisfy::Any));
+        let server = &cfg.servers[0];
+        assert_eq!(
+            server.access.rules,
+            [AccessRule {
+                deny: true,
+                addr: AccessAddr::V6 {
+                    addr: 1,
+                    mask: u128::MAX
+                }
+            }]
+        );
+        let loc = |pattern: &str| {
+            server
+                .locations
+                .iter()
+                .find(|l| l.pattern == pattern)
+                .unwrap()
+                .access
+                .clone()
+        };
+        let unix = [AccessRule {
+            deny: false,
+            addr: AccessAddr::Unix,
+        }];
+        assert_eq!(loc("/a").rules, unix);
+        assert_eq!(loc("/a/inherit").rules, unix);
+        assert_eq!(loc("/a/inherit").satisfy, Some(Satisfy::All));
+        assert_eq!(
+            loc("/a/own").rules,
+            [AccessRule {
+                deny: true,
+                addr: AccessAddr::V4 {
+                    addr: 0xc0a8_0101,
+                    mask: u32::MAX
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn limit_except_parses_methods_and_access_directives() {
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    location /a {
+                        limit_except get post {
+                            allow 127.0.0.1;
+                            deny all;
+                            auth_basic off;
+                        }
+                    }
+                    location /a/child { }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let le = cfg.servers[0].locations[0]
+            .limit_except
+            .as_ref()
+            .expect("limit_except");
+        // GET implies HEAD.
+        for (method, listed) in [
+            ("GET", true),
+            ("HEAD", true),
+            ("POST", true),
+            ("PUT", false),
+        ] {
+            let bit = limit_except_method_bit(method.as_bytes());
+            assert_eq!(le.methods & bit != 0, listed, "{method}");
+        }
+        assert_eq!(limit_except_method_bit(b"get"), 0);
+        assert_eq!(limit_except_method_bit(b"FOO"), 0);
+        assert_eq!(le.rules.len(), 2);
+        assert_eq!(le.auth_basic, Some(AuthBasic::Off));
+        assert!(cfg.servers[0].locations[1].limit_except.is_none());
+    }
+
+    #[test]
+    fn access_directive_errors() {
+        for (src, want) in [
+            ("allow;", "bad value for allow: "),
+            (
+                "deny 1.2.3.4 5.6.7.8;",
+                "bad value for deny: 1.2.3.4 5.6.7.8",
+            ),
+            ("satisfy all; satisfy any;", "duplicate directive `satisfy`"),
+            (
+                "location / { limit_except { } }",
+                "missing argument for `limit_except`",
+            ),
+            (
+                "location / { limit_except GET { satisfy any; } }",
+                "unknown directive `satisfy` in limit_except",
+            ),
+            (
+                "location / { limit_except GET { location /x { } } }",
+                "unknown directive `location` in limit_except",
+            ),
+            (
+                "limit_except GET { }",
+                "unknown directive `limit_except` in server",
+            ),
+        ] {
+            let conf = format!("http {{ server {{ listen 80; {src} }} }}");
+            let err = parse(&conf).expect_err(src).to_string();
+            assert_eq!(err, want, "{src}");
+        }
+    }
+
+    #[test]
+    fn cidr_with_host_bits_warns() {
+        let cfg = parse("http { allow 10.1.2.3/8; server { listen 80; } }").unwrap();
+        assert_eq!(
+            cfg.warnings,
+            ["low address bits of 10.1.2.3/8 are meaningless"]
         );
     }
 

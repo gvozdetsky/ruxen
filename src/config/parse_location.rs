@@ -290,6 +290,7 @@ pub(crate) fn parse_location_block(
     inherited_auth_basic: Option<AuthBasic>,
     inherited_auth_basic_user_file: Option<PathBuf>,
     inherited_auth_delay_ms: Option<u64>,
+    inherited_access: &AccessConf,
     inherited_client_max_body_size: Option<u64>,
     inherited_post_action: Option<String>,
     inherited_expires: Option<ExpiresDirective>,
@@ -335,6 +336,8 @@ pub(crate) fn parse_location_block(
     let mut auth_basic: Option<AuthBasic> = None;
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
+    let mut access = AccessConf::default();
+    let mut limit_except: Option<LimitExcept> = None;
     let mut client_max_body_size: Option<u64> = None;
     let mut client_body_in_file_only: Option<ClientBodyInFileOnly> = None;
     let mut post_action: Option<String> = None;
@@ -403,6 +406,7 @@ pub(crate) fn parse_location_block(
                     let effective_auth_basic_user_file =
                         auth_basic_user_file.or(inherited_auth_basic_user_file);
                     let effective_auth_delay_ms = auth_delay_ms.or(inherited_auth_delay_ms);
+                    let effective_access = access.inherit(inherited_access);
                     let effective_client_max_body_size =
                         client_max_body_size.or(inherited_client_max_body_size);
                     let effective_post_action = post_action.or(inherited_post_action);
@@ -442,6 +446,8 @@ pub(crate) fn parse_location_block(
                         auth_basic: effective_auth_basic,
                         auth_basic_user_file: effective_auth_basic_user_file,
                         auth_delay_ms: effective_auth_delay_ms,
+                        access: effective_access,
+                        limit_except,
                         client_max_body_size: effective_client_max_body_size,
                         sendfile: effective_sendfile,
                         document_root,
@@ -610,6 +616,15 @@ pub(crate) fn parse_location_block(
                 let raw = args.get(1).ok_or(Error::MissingArg("auth_delay"))?;
                 auth_delay_ms = Some(parse_duration_ms(raw, "auth_delay")?);
             }
+            ("allow" | "deny" | "satisfy", Terminator::Semi) => {
+                parse_access_directive(&mut access, &args, lx)?;
+            }
+            ("limit_except", Terminator::BlockOpen) => {
+                if limit_except.is_some() {
+                    return Err(Error::Duplicate("limit_except"));
+                }
+                limit_except = Some(parse_limit_except_block(&args, lx)?);
+            }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
                     return Err(Error::Duplicate("client_max_body_size"));
@@ -752,6 +767,7 @@ pub(crate) fn parse_location_block(
                     .clone()
                     .or(inherited_auth_basic_user_file.clone());
                 let pass_auth_delay_ms = auth_delay_ms.or(inherited_auth_delay_ms);
+                let pass_access = access.inherit(inherited_access);
                 let pass_client_max_body_size =
                     client_max_body_size.or(inherited_client_max_body_size);
                 let pass_post_action = post_action.clone().or(inherited_post_action.clone());
@@ -793,6 +809,7 @@ pub(crate) fn parse_location_block(
                     pass_auth_basic,
                     pass_auth_file,
                     pass_auth_delay_ms,
+                    &pass_access,
                     pass_client_max_body_size,
                     pass_post_action,
                     pass_expires,
@@ -831,6 +848,10 @@ pub(crate) fn parse_location_block(
                 | "auth_basic"
                 | "auth_basic_user_file"
                 | "auth_delay"
+                | "allow"
+                | "deny"
+                | "satisfy"
+                | "limit_except"
                 | "client_max_body_size"
                 | "client_body_temp_path"
                 | "disable_symlinks"

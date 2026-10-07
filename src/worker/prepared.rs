@@ -436,6 +436,46 @@ pub struct PreparedKeepalive {
     pub disable_safari: bool,
 }
 
+/// The access phase of a location (or of a server, for requests that
+/// match no location), inheritance resolved.
+#[derive(Debug, Copy, Clone)]
+pub struct PreparedAccess {
+    /// `allow` / `deny` in order; empty when none applies.
+    pub rules: &'static [crate::config::AccessRule],
+    /// `satisfy any`: one passing check is enough.
+    pub satisfy_any: bool,
+    pub auth_basic: PreparedAuthBasic,
+    pub auth_basic_user_file: Option<&'static Path>,
+    /// `auth_delay` in milliseconds.
+    pub auth_delay_ms: u64,
+}
+
+impl PreparedAccess {
+    /// No checks: the http scope's parent.
+    pub const NONE: PreparedAccess = PreparedAccess {
+        rules: &[],
+        satisfy_any: false,
+        auth_basic: PreparedAuthBasic::Off,
+        auth_basic_user_file: None,
+        auth_delay_ms: 0,
+    };
+}
+
+/// `limit_except`: what a request whose method the block doesn't list
+/// gets instead of the location's own settings. nginx swaps in the
+/// block's whole location configuration, merged with the location's, and
+/// the merge keeps neither the rewrite directives nor `try_files`. So the
+/// location's rewrite program doesn't run (`MatchedLocation::limited`).
+pub struct PreparedLimitExcept {
+    /// The listed methods, as `config::LIMIT_EXCEPT_METHODS` bits.
+    pub methods: u16,
+    /// The content handler without `try_files`, and the static handler
+    /// where the location answers with `return`. `None`: the location's
+    /// own handler.
+    pub handler: Option<PreparedHandler>,
+    pub access: PreparedAccess,
+}
+
 #[derive(Debug, Copy, Clone)]
 pub enum PreparedAuthBasic {
     Off,
@@ -942,12 +982,9 @@ pub struct PreparedLocation {
     /// points into `PreparedHttp::access_logs` so the per-worker fd table
     /// stays the same regardless of which scope produced the entry.
     pub access_logs: &'static [PreparedAccessLog],
-    /// Effective auth_basic realm (or `Off`) for this location.
-    pub auth_basic: PreparedAuthBasic,
-    /// Effective `auth_basic_user_file` for this location.
-    pub auth_basic_user_file: Option<&'static Path>,
-    /// Effective `auth_delay` in milliseconds for this location.
-    pub auth_delay_ms: u64,
+    /// Effective access-phase settings for this location.
+    pub access: PreparedAccess,
+    pub limit_except: Option<&'static PreparedLimitExcept>,
     /// Effective `client_max_body_size` for this location in bytes.
     /// `None` means "unlimited"; `Some(0)` also disables the limit to
     /// mirror nginx's directive semantics.
@@ -1000,9 +1037,8 @@ pub struct PreparedRegexLocation {
     pub internal: bool,
     pub server_header: &'static [u8],
     pub access_logs: &'static [PreparedAccessLog],
-    pub auth_basic: PreparedAuthBasic,
-    pub auth_basic_user_file: Option<&'static Path>,
-    pub auth_delay_ms: u64,
+    pub access: PreparedAccess,
+    pub limit_except: Option<&'static PreparedLimitExcept>,
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
@@ -1035,9 +1071,8 @@ pub struct MatchedLocation<'a> {
     pub internal: bool,
     pub server_header: &'static [u8],
     pub access_logs: &'static [PreparedAccessLog],
-    pub auth_basic: PreparedAuthBasic,
-    pub auth_basic_user_file: Option<&'static Path>,
-    pub auth_delay_ms: u64,
+    pub access: PreparedAccess,
+    pub limit_except: Option<&'static PreparedLimitExcept>,
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
@@ -1067,9 +1102,8 @@ impl<'a> MatchedLocation<'a> {
             internal: loc.internal,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
-            auth_basic: loc.auth_basic,
-            auth_basic_user_file: loc.auth_basic_user_file,
-            auth_delay_ms: loc.auth_delay_ms,
+            access: loc.access,
+            limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,
@@ -1079,6 +1113,18 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+        }
+    }
+
+    /// The location as a request sees it whose method its `limit_except`
+    /// doesn't list.
+    pub fn limited(self, le: &'a PreparedLimitExcept) -> Self {
+        Self {
+            handler: le.handler.as_ref().unwrap_or(self.handler),
+            rewrite_program: &[],
+            access: le.access,
+            limit_except: None,
+            ..self
         }
     }
 
@@ -1103,9 +1149,8 @@ impl<'a> MatchedLocation<'a> {
             internal: loc.internal,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
-            auth_basic: loc.auth_basic,
-            auth_basic_user_file: loc.auth_basic_user_file,
-            auth_delay_ms: loc.auth_delay_ms,
+            access: loc.access,
+            limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,
@@ -1223,12 +1268,9 @@ pub struct PreparedServer {
     /// Inheritance-resolved `access_log` list for the server scope (used
     /// when no location matched). Falls back to the http-scope list.
     pub access_logs: &'static [PreparedAccessLog],
-    /// Effective server-scope auth_basic realm or `off`.
-    pub auth_basic: PreparedAuthBasic,
-    /// Effective server-scope `auth_basic_user_file`.
-    pub auth_basic_user_file: Option<&'static Path>,
-    /// Effective server-scope `auth_delay` in milliseconds.
-    pub auth_delay_ms: u64,
+    /// Effective server-scope access-phase settings, for requests that
+    /// match no location.
+    pub access: PreparedAccess,
     /// Effective server-scope `underscores_in_headers`. When false,
     /// dynamic-name request-header lookups (`$http_*`, `$cookie_*`,
     /// `$sent_http_*` interpolation feed) skip headers whose names

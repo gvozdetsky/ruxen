@@ -13,15 +13,16 @@
 // handler that runs before the phase machinery).
 
 use crate::auth;
-use crate::config::{ValuePart, Variable};
+use crate::config::{AccessAddr, AccessRule, ValuePart, Variable, limit_except_method_bit};
 use crate::http::Method;
 use crate::uri;
 use crate::worker::{
-    MatchedLocation, PreparedAuthBasic, PreparedErrorLog, PreparedHttp, PreparedListen,
-    PreparedLocation, PreparedServer, RewriteOutcome, RewriteState, normalize_request_uri_into,
-    run_location_handler, run_rewrite_program,
+    MatchedLocation, PreparedAccess, PreparedAuthBasic, PreparedErrorLog, PreparedHttp,
+    PreparedListen, PreparedLocation, PreparedServer, RewriteOutcome, RewriteState,
+    normalize_request_uri_into, run_location_handler, run_rewrite_program,
 };
 use std::borrow::Cow;
+use std::net::IpAddr;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
@@ -58,6 +59,8 @@ pub struct ConnInfo {
     pub proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     /// The connection's local address as `$server_addr` shows it.
     pub server_addr: std::borrow::Cow<'static, [u8]>,
+    /// The client's address, which `allow` / `deny` match.
+    pub peer_ip: IpAddr,
 }
 
 impl ConnInfo {
@@ -66,6 +69,7 @@ impl ConnInfo {
     pub const NONE: ConnInfo = ConnInfo {
         proxy_protocol: None,
         server_addr: std::borrow::Cow::Borrowed(b""),
+        peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     };
 }
 
@@ -667,7 +671,7 @@ fn process_with_meta_inner(
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
         let internal_request = !refusing || hop > 0;
-        let loc = if let Some(name) = named_target.take() {
+        let mut loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
                 Some(loc) => loc,
                 None => {
@@ -727,17 +731,31 @@ fn process_with_meta_inner(
                         match run_access_control(
                             http,
                             req,
-                            server.auth_basic,
-                            server.auth_basic_user_file,
-                            server.auth_delay_ms,
+                            &server.access,
                             server.server_header,
+                            &meta,
                         ) {
                             AccessControl::Allow { remote_user } => {
                                 meta.remote_user = remote_user;
                             }
                             AccessControl::Deny { response, delay_ms } => {
+                                // The server's error_page applies.
                                 meta.response_delay_ms = delay_ms;
-                                return (response, meta);
+                                return match crate::worker::finish_server_response(
+                                    http,
+                                    req,
+                                    server,
+                                    response,
+                                    in_error_page,
+                                ) {
+                                    Response::Reroute(reroute) => process_with_meta_inner(
+                                        http,
+                                        req,
+                                        url_scratch,
+                                        Some(reroute),
+                                    ),
+                                    response => (response, meta),
+                                };
                             }
                         }
                         return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
@@ -775,6 +793,11 @@ fn process_with_meta_inner(
                 meta,
             );
         }
+        if let Some(le) = loc.limit_except
+            && limit_except_method_bit(req.method_bytes) & le.methods == 0
+        {
+            loc = loc.limited(le);
+        }
         let rewrite_broke = match run_rewrite_program(
             http,
             server,
@@ -790,7 +813,7 @@ fn process_with_meta_inner(
             RewriteOutcome::Reroute => continue,
             RewriteOutcome::Respond(response) => return (response, meta),
         };
-        // Access-control phase (auth_basic/auth_basic_user_file): runs after
+        // Access-control phase (allow/deny, auth_basic): runs after
         // rewrite and before content dispatch. A top-level `return` is a
         // rewrite-module directive in nginx, so it answers in the rewrite
         // phase and access control never runs for it — unless a `break`
@@ -799,21 +822,15 @@ fn process_with_meta_inner(
         meta.remote_user = None;
         let answered_in_rewrite_phase =
             !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
+        let mut denied = None;
         if !answered_in_rewrite_phase {
-            match run_access_control(
-                http,
-                req,
-                loc.auth_basic,
-                loc.auth_basic_user_file,
-                loc.auth_delay_ms,
-                loc.server_header,
-            ) {
+            match run_access_control(http, req, &loc.access, loc.server_header, &meta) {
                 AccessControl::Allow { remote_user } => {
                     meta.remote_user = remote_user;
                 }
                 AccessControl::Deny { response, delay_ms } => {
                     meta.response_delay_ms = delay_ms;
-                    return (response, meta);
+                    denied = Some(response);
                 }
             }
         }
@@ -850,21 +867,39 @@ fn process_with_meta_inner(
         if let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler {
             meta.proxy_host = proxy.host_header;
         }
-        match run_location_handler(
-            http,
-            server,
-            loc,
-            req,
-            url_scratch,
-            current_args.as_deref(),
-            meta.remote_user.as_deref(),
-            &rewrite_state,
-            error_page_status,
-            in_error_page,
-            preserved_location.as_deref(),
-            &preserved_www_authenticate,
-            regex_captures.as_ref(),
-        ) {
+        let response = match denied {
+            None => run_location_handler(
+                http,
+                server,
+                loc,
+                req,
+                url_scratch,
+                current_args.as_deref(),
+                meta.remote_user.as_deref(),
+                &rewrite_state,
+                error_page_status,
+                in_error_page,
+                preserved_location.as_deref(),
+                &preserved_www_authenticate,
+                regex_captures.as_ref(),
+            ),
+            Some(response) => crate::worker::finish_access_denial(
+                http,
+                server,
+                loc,
+                req,
+                url_scratch,
+                current_args.as_deref(),
+                &rewrite_state,
+                error_page_status,
+                in_error_page,
+                preserved_location.as_deref(),
+                &preserved_www_authenticate,
+                regex_captures.as_ref(),
+                response,
+            ),
+        };
+        match response {
             Response::Reroute(next) => {
                 run_server_rewrite = true;
                 if let Some(args) = next.args {
@@ -950,53 +985,125 @@ enum AccessControl {
     },
 }
 
+/// The access phase: `allow` / `deny`, then auth_basic, combined as
+/// `satisfy` says (`ngx_http_core_access_phase`). The common case, no
+/// checks at all, stays inline.
+#[inline]
 fn run_access_control(
     http: &PreparedHttp,
     req: &RequestCtx<'_>,
-    auth_basic: PreparedAuthBasic,
-    auth_basic_user_file: Option<&Path>,
-    auth_delay_ms: u64,
+    access: &PreparedAccess,
     server_header: &'static [u8],
+    meta: &ProcessMeta,
 ) -> AccessControl {
-    let PreparedAuthBasic::Realm(realm) = auth_basic else {
+    if access.rules.is_empty() && matches!(access.auth_basic, PreparedAuthBasic::Off) {
         return AccessControl::Allow { remote_user: None };
+    }
+    check_access(http, req, access, server_header, meta)
+}
+
+#[inline(never)]
+fn check_access(
+    http: &PreparedHttp,
+    req: &RequestCtx<'_>,
+    access: &PreparedAccess,
+    server_header: &'static [u8],
+    meta: &ProcessMeta,
+) -> AccessControl {
+    // The access module's handler runs before auth_basic's. With `satisfy
+    // all` a deny answers at once; with `any` an allow does, and a deny
+    // only counts if auth_basic doesn't pass either.
+    let forbidden = match match_access_rules(access.rules, req.conn.peer_ip) {
+        Some(false) if access.satisfy_any => return AccessControl::Allow { remote_user: None },
+        Some(true) if !access.satisfy_any => return access_forbidden(http, req, meta),
+        found => found == Some(true),
     };
-    let Some(user_file) = auth_basic_user_file else {
-        return AccessControl::Deny {
-            response: Response::Owned(crate::http::build_response_for_method(
-                500,
-                "Internal Server Error\n",
-                req.method,
-                server_header,
-            )),
-            delay_ms: 0,
+    match run_auth_basic(http, req, access, server_header) {
+        // auth_basic off: only the rules decided.
+        None if forbidden => access_forbidden(http, req, meta),
+        None => AccessControl::Allow { remote_user: None },
+        // A 401 wins over the rules' 403, and errors end the phase.
+        Some(outcome) => outcome,
+    }
+}
+
+/// The first `allow` / `deny` rule matching `peer`: `Some(deny)`, or
+/// `None` when none does (`ngx_http_access_handler`). An IPv4-mapped IPv6
+/// peer is matched as IPv4.
+fn match_access_rules(rules: &[AccessRule], peer: IpAddr) -> Option<bool> {
+    let peer = match peer {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    rules.iter().find_map(|rule| {
+        let hit = match (rule.addr, peer) {
+            (AccessAddr::All, _) => true,
+            (AccessAddr::V4 { addr, mask }, IpAddr::V4(ip)) => u32::from(ip) & mask == addr,
+            (AccessAddr::V6 { addr, mask }, IpAddr::V6(ip)) => u128::from(ip) & mask == addr,
+            _ => false,
         };
+        hit.then_some(rule.deny)
+    })
+}
+
+/// A 403 from the rules, logged as nginx does.
+#[cold]
+#[inline(never)]
+fn access_forbidden(
+    http: &PreparedHttp,
+    req: &RequestCtx<'_>,
+    meta: &ProcessMeta,
+) -> AccessControl {
+    crate::worker::write_error_log(
+        meta.log.error_logs,
+        crate::config::ErrorLogLevel::Error,
+        &crate::worker::ErrorLogRequest::new(req, meta.server_name),
+        b"access forbidden by rule",
+        None,
+    );
+    AccessControl::Deny {
+        response: Response::Prebuilt(http.forbidden.pick(req.method)),
+        delay_ms: 0,
+    }
+}
+
+/// auth_basic: `None` when it is off, else whether the credentials pass.
+fn run_auth_basic(
+    http: &PreparedHttp,
+    req: &RequestCtx<'_>,
+    access: &PreparedAccess,
+    server_header: &'static [u8],
+) -> Option<AccessControl> {
+    let PreparedAuthBasic::Realm(realm) = access.auth_basic else {
+        return None;
     };
-    let user_file = match resolve_auth_basic_user_file(req, user_file, http.conf_prefix) {
-        Some(path) => path,
-        None => {
-            return AccessControl::Deny {
-                response: Response::Owned(crate::http::build_response_for_method(
-                    500,
-                    "Internal Server Error\n",
-                    req.method,
-                    server_header,
-                )),
-                delay_ms: 0,
-            };
-        }
+    let auth_delay_ms = access.auth_delay_ms;
+    let internal_error = || AccessControl::Deny {
+        response: Response::Owned(crate::http::build_response_for_method(
+            500,
+            "Internal Server Error\n",
+            req.method,
+            server_header,
+        )),
+        delay_ms: 0,
+    };
+    let Some(user_file) = access.auth_basic_user_file else {
+        return Some(internal_error());
+    };
+    let Some(user_file) = resolve_auth_basic_user_file(req, user_file, http.conf_prefix) else {
+        return Some(internal_error());
     };
     let creds = match auth::decode_basic_authorization(req.headers_raw) {
         Ok(creds) => creds,
         Err(auth::BasicHeaderError::Missing | auth::BasicHeaderError::Malformed) => {
             let response = auth::build_unauthorized_response(req.method, server_header, realm);
-            return AccessControl::Deny {
+            return Some(AccessControl::Deny {
                 response: Response::Owned(response),
                 delay_ms: auth_delay_ms,
-            };
+            });
         }
     };
-    match auth::verify_credentials(user_file.as_ref(), &creds) {
+    Some(match auth::verify_credentials(user_file.as_ref(), &creds) {
         Ok(true) => AccessControl::Allow {
             remote_user: Some(creds.username),
         },
@@ -1011,16 +1118,8 @@ fn run_access_control(
         // here: the delay's purpose is to throttle credential-probing
         // attackers; an internal verification fault isn't a probe and
         // shouldn't have the request held open.
-        Err(_) => AccessControl::Deny {
-            response: Response::Owned(crate::http::build_response_for_method(
-                500,
-                "Internal Server Error\n",
-                req.method,
-                server_header,
-            )),
-            delay_ms: 0,
-        },
-    }
+        Err(_) => internal_error(),
+    })
 }
 
 /// Literal paths were already resolved against the config directory at
@@ -1670,6 +1769,47 @@ mod tests {
 
     fn ctx<'a>(path: &'a [u8], host: Option<&'a [u8]>, http_11: bool) -> RequestCtx<'a> {
         ctx_with_method(Method::Get, path, host, http_11)
+    }
+
+    #[test]
+    fn access_rules_match_in_order_and_by_family() {
+        use crate::config::AccessAddr::{All, Unix, V4, V6};
+        let rule = |deny, addr| AccessRule { deny, addr };
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let rules = [
+            rule(true, Unix),
+            rule(
+                false,
+                V4 {
+                    addr: 0x7f00_0000,
+                    mask: 0xff00_0000,
+                },
+            ),
+            rule(
+                true,
+                V6 {
+                    addr: 1,
+                    mask: u128::MAX,
+                },
+            ),
+            rule(true, V4 { addr: 0, mask: 0 }),
+        ];
+        // `unix:` never matches a TCP peer; the first matching rule wins.
+        assert_eq!(match_access_rules(&rules, ip("127.0.0.2")), Some(false));
+        assert_eq!(match_access_rules(&rules, ip("10.0.0.1")), Some(true));
+        assert_eq!(match_access_rules(&rules, ip("::1")), Some(true));
+        // IPv4 rules don't match IPv6 peers…
+        assert_eq!(match_access_rules(&rules, ip("::2")), None);
+        // …but IPv4-mapped peers are matched as IPv4.
+        assert_eq!(
+            match_access_rules(&rules, ip("::ffff:127.0.0.1")),
+            Some(false)
+        );
+        assert_eq!(
+            match_access_rules(&[rule(true, All)], ip("::2")),
+            Some(true)
+        );
+        assert_eq!(match_access_rules(&[], ip("127.0.0.1")), None);
     }
 
     #[test]

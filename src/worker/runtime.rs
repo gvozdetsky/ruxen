@@ -1723,6 +1723,7 @@ pub(crate) async fn handle_plain(
 ) {
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
+        peer_ip: peer_addr.ip(),
         proxy_protocol,
     };
     handle(
@@ -1758,6 +1759,7 @@ pub(crate) async fn handle_tls(
     let budget = listen.servers[listen.default_server].timeouts.header;
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
+        peer_ip: peer_addr.ip(),
         proxy_protocol,
     };
     let (mut tls_stream, info) = match crate::tls::accept_with_timeout(

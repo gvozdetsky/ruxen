@@ -319,35 +319,19 @@ pub(crate) fn forward_client_headers<'a>(
 ///
 /// Return semantics: on `Response::Reroute`, `phase::process` re-runs
 /// location matching with the new URL. All other variants are terminal.
-pub(crate) fn run_location_handler(
+/// The variable-render context of a request in a location: the `return`
+/// body, `add_header` values and error pages share it.
+#[inline]
+fn location_render_ctx<'a>(
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
-    loc: MatchedLocation<'static>,
-    req: &phase::RequestCtx<'_>,
-    url_path: &[u8],
-    current_args: Option<&[u8]>,
-    remote_user: Option<&[u8]>,
-    rewrite_state: &RewriteState,
-    error_page_status: Option<phase::ErrorPageStatus>,
-    in_error_page: bool,
-    preserved_location: Option<&[u8]>,
-    preserved_www_authenticate: &[Vec<u8>],
-    server_name_captures: Option<&phase::ServerNameCaptures>,
-) -> Response {
-    // nginx's default client_max_body_size is 1m; `0` turns the check off.
-    // Not again on the way to an error page: nginx has discarded the body
-    // by then (`!r->discard_body` in ngx_http_core_find_config_phase).
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    let too_large = body_limit > 0
-        && req.body_len > body_limit
-        && !in_error_page
-        && error_page_status.is_none();
-
-    // Build the per-request variable-render context once; both the `return`
-    // body and any `add_header` values share it.
-    //
+    req: &'a phase::RequestCtx<'_>,
+    url_path: &'a [u8],
+    current_args: Option<&'a [u8]>,
+    remote_user: Option<&'a [u8]>,
+    rewrite_state: &'a RewriteState,
+    server_name_captures: Option<&'a phase::ServerNameCaptures>,
+) -> RenderCtx<'a> {
     // nginx's `$host` falls back to the matched server's primary name when
     // the request didn't carry a `Host` header (HTTP/1.0 with no Host, or a
     // raw URI request). Mirroring that here keeps `add_header X-Host $host`
@@ -359,7 +343,7 @@ pub(crate) fn run_location_handler(
         Some(caps) => caps.names.as_slice(),
         None => &[],
     };
-    let render_ctx_base = RenderCtx {
+    RenderCtx {
         uri: url_path,
         request_uri,
         request_method: req.method_bytes,
@@ -403,7 +387,114 @@ pub(crate) fn run_location_handler(
         sent_trailers: &[],
         tls: req.tls,
         conn: req.conn,
-    };
+    }
+}
+
+/// A 401 or 403 from the access phase, sent as nginx's special response:
+/// the location's `error_page` and `add_header … always` apply. A body
+/// over `client_max_body_size` gets its 413 first, as the find_config
+/// phase runs before the access phase.
+#[cold]
+#[inline(never)]
+pub(crate) fn finish_access_denial(
+    http: &'static PreparedHttp,
+    server: &'static PreparedServer,
+    loc: MatchedLocation<'static>,
+    req: &phase::RequestCtx<'_>,
+    url_path: &[u8],
+    current_args: Option<&[u8]>,
+    rewrite_state: &RewriteState,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    in_error_page: bool,
+    preserved_location: Option<&[u8]>,
+    preserved_www_authenticate: &[Vec<u8>],
+    server_name_captures: Option<&phase::ServerNameCaptures>,
+    response: Response,
+) -> Response {
+    let render_ctx_base = location_render_ctx(
+        http,
+        server,
+        req,
+        url_path,
+        current_args,
+        None,
+        rewrite_state,
+        server_name_captures,
+    );
+    let body_limit = loc
+        .client_max_body_size
+        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
+    if body_limit > 0 && req.body_len > body_limit && !in_error_page && error_page_status.is_none()
+    {
+        return entity_too_large(
+            &loc,
+            req,
+            &render_ctx_base,
+            in_error_page,
+            preserved_www_authenticate,
+        );
+    }
+    let intercepted = maybe_intercept_error_page(
+        response,
+        loc.error_pages,
+        req,
+        &render_ctx_base,
+        in_error_page,
+        loc.recursive_error_pages,
+        loc.server_header,
+    );
+    let trailers_allowed =
+        req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
+    finalize_location_response(
+        intercepted,
+        loc.add_headers,
+        loc.add_trailers,
+        trailers_allowed,
+        &render_ctx_base,
+        error_page_status,
+        preserved_location,
+        preserved_www_authenticate,
+        loc.expires,
+    )
+}
+
+pub(crate) fn run_location_handler(
+    http: &'static PreparedHttp,
+    server: &'static PreparedServer,
+    loc: MatchedLocation<'static>,
+    req: &phase::RequestCtx<'_>,
+    url_path: &[u8],
+    current_args: Option<&[u8]>,
+    remote_user: Option<&[u8]>,
+    rewrite_state: &RewriteState,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    in_error_page: bool,
+    preserved_location: Option<&[u8]>,
+    preserved_www_authenticate: &[Vec<u8>],
+    server_name_captures: Option<&phase::ServerNameCaptures>,
+) -> Response {
+    // nginx's default client_max_body_size is 1m; `0` turns the check off.
+    // Not again on the way to an error page: nginx has discarded the body
+    // by then (`!r->discard_body` in ngx_http_core_find_config_phase).
+    let body_limit = loc
+        .client_max_body_size
+        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
+    let too_large = body_limit > 0
+        && req.body_len > body_limit
+        && !in_error_page
+        && error_page_status.is_none();
+
+    let render_ctx_base = location_render_ctx(
+        http,
+        server,
+        req,
+        url_path,
+        current_args,
+        remote_user,
+        rewrite_state,
+        server_name_captures,
+    );
+    let args = render_ctx_base.args;
 
     let server_bytes = loc.server_header;
     if too_large {

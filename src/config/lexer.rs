@@ -23,6 +23,8 @@ pub(crate) struct Lexer {
     conf_prefix: Option<PathBuf>,
     dump_files: Vec<DumpFile>,
     dump_seen: std::collections::HashSet<PathBuf>,
+    /// `[warn]` lines from directives parsed so far.
+    warnings: Vec<String>,
 }
 
 impl Lexer {
@@ -36,6 +38,7 @@ impl Lexer {
             conf_prefix: None,
             dump_files: Vec::new(),
             dump_seen: std::collections::HashSet::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -45,6 +48,7 @@ impl Lexer {
             conf_prefix: path.parent().map(Path::to_path_buf),
             dump_files: Vec::new(),
             dump_seen: std::collections::HashSet::new(),
+            warnings: Vec::new(),
         };
         s.dump_seen.insert(path.clone());
         s.dump_files.push(DumpFile {
@@ -75,6 +79,14 @@ impl Lexer {
 
     pub(crate) fn take_dump_files(&mut self) -> Vec<DumpFile> {
         std::mem::take(&mut self.dump_files)
+    }
+
+    pub(crate) fn warn(&mut self, warning: String) {
+        self.warnings.push(warning);
+    }
+
+    pub(crate) fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     fn skip_ws_and_comments(&mut self) {
