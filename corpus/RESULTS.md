@@ -6,13 +6,13 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 153 of 238 configurations nginx accepts (64%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 155 of 238 configurations nginx accepts (65%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 142 | 66% |
+| github | 214 | 143 | 67% |
 | php | 3 | 0 | 0% |
-| proxy | 17 | 8 | 47% |
+| proxy | 17 | 9 | 53% |
 | static | 4 | 3 | 75% |
 
 ## What blocks the rest
@@ -22,19 +22,18 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | 14 | open() "…" failed (No such file or directory (os error N)) | h5bp:nginx.conf, gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:ocftw/OpenGovReport14-16/nginx.config, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt … |
 | 9 | bad value for upstream server (unix: not supported): unix:… | gitlab-ssl, gitlab, gunicorn, puma#1 … |
 | 7 | bad value for proxy_pass ($var dynamic upstream not supported in vN.N; declare an upstream{} block): | gh:gsw945/wechat-demo4dev/app-nginx.conf, gh:vazw/siamstr/nginx.config, gh:sul-cidr/mime/nginx.config, gh:chelebyy/link-manager/frontend/nginx.conf … |
+| 6 | unknown directive `limit_req_zone` | gh:decred/dcrstakepool/sample-nginx.conf, gh:thuongtruong109/flashot/nginx.conf, gh:hatanaca/quick-filler-test/nginx.conf, gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf … |
 | 6 | unknown directive `proxy_cache` | gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example, gh:jsjfai/AgentDNS-Node/nginx.conf.example, gh:azzaraq-creator/admix/deploy/nginx.conf.template, gh:tesfandiari1/LLM-txt/frontend/nginx.conf … |
-| 5 | unknown directive `limit_req_zone` | gh:thuongtruong109/flashot/nginx.conf, gh:hatanaca/quick-filler-test/nginx.conf, gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf, gh:rizkikasim/HelloProject-Muhamad-Rizki-Kasim_1303220030/nginx.conf … |
 | 5 | unknown directive `proxy_cache_revalidate` | gh:wednesday-solutions/react-template/app/.nginx.conf, gh:SiddOnKeys/react-temp-wednesday/app/.nginx.conf, gh:tusharanekardev/react-template/app/.nginx.conf, gh:apurv-wednesday/react-template/app/.nginx.conf … |
 | 4 | bad value for ssl_protocols (insecure version rejected): TLSvN | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:EstudioNexos/flautodiscover/fla_nginx.conf, gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
 | 3 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf |
 | 3 | unknown directive `http2` | gh:refluxdb/influxdb3-community/iox-nginx.conf, gh:qida/gohp/jsonx/nginx.conf.txt, gh:exp0logy/familycal/frontend/nginx.conf |
 | 3 | unknown directive `proxy_pass` | gh:limingxinleo/phalcon/swoole.nginx.conf, gh:limingxinleo/basic-phalcon/swoole.nginx.conf, gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf |
-| 3 | unknown directive `set_real_ip_from` | sentry, vaultwarden#3, gh:decred/dcrstakepool/sample-nginx.conf |
+| 3 | unknown directive `zone` | vaultwarden#1, vaultwarden#2, vaultwarden#3 |
 | 2 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir |
 | 2 | unknown directive `proxy_cache_path` | mastodon, gh:thefewchosen/tfcctf-2024-challs/web/PNGiphy/nginx.conf |
 | 2 | unknown directive `stub_status` | gh:flajoke/s21-Simple-Docker/src/06/nginx.conf, gh:panyam/onehub/configs/nginx.conf |
-| 2 | unknown directive `zone` | vaultwarden#1, vaultwarden#2 |
 | 1 | bad value for map key ($sent_http_* unavailable): $sent_http_content_type | gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf |
 | 1 | bad value for proxy_pass scheme (only http:… supported in vN.N): https:… | gh:MRLokop/shiki-proxy/nginx.conf |
 | 1 | bad value for ssl_protocols (insecure version rejected): TLSvN.N | gh:TetAlius/GoSyncMyCalendars/.nginx.conf |
@@ -43,7 +42,6 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | 1 | unknown directive `fastcgi_pass` | laravel#1 |
 | 1 | unknown directive `limit_req` | gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf |
 | 1 | unknown directive `proxy_cache_valid` | gh:Ozrlz/odoo-nginx-reverse-proxy/odoo-nginx.conf |
-| 1 | unknown directive `real_ip_header` | gh:gopavasanth/video-cut-tool/.nginx.conf |
 | 1 | unknown directive `stream` | gh:alphadx/nginx-proxy-html-mysql/nginx.conf |
 | 1 | unknown directive `uwsgi_pass_request_headers` | gh:lijiejie/eyes.sh/dnslog_nginx.conf |
 
@@ -58,7 +56,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | certbot-options | proxy | ok | ok |  |
 | gitlab-ssl | proxy | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/home/git/gitlab/tmp/sockets/gitlab-workhorse.socket |
 | gitlab | proxy | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/home/git/gitlab/tmp/sockets/gitlab-workhorse.socket |
-| sentry | proxy | ok | FAIL | ruxen: [emerg] unknown directive `set_real_ip_from` in http |
+| sentry | proxy | ok | ok |  |
 | gunicorn | proxy | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:/tmp/gunicorn.sock |
 | synapse#1 | proxy | ok | ok |  |
 | synapse#2 | proxy | — | — | (nginx: [emerg] unknown directive "Add" in <sandbox>/conf/nginx.conf:20) |
@@ -69,7 +67,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | synapse#7 | proxy | — | — | (nginx: [emerg] unexpected "," in <sandbox>/conf/nginx.conf:7) |
 | vaultwarden#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in upstream |
 | vaultwarden#2 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in upstream |
-| vaultwarden#3 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `set_real_ip_from` in http |
+| vaultwarden#3 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in upstream |
 | laravel#1 | php | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_pass` in location |
 | puma#1 | proxy | ok | FAIL | ruxen: [emerg] bad value for upstream server (unix: not supported): unix:///myapp/tmp/puma.sock |
 | immich#1 | proxy | ok | ok |  |
@@ -99,7 +97,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:yunzhu-li/blupig-gomoku/docker-nginx.conf | github | ok | ok |  |
 | gh:healthlocker/healthlocker/nginx.config | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:35) |
 | gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in location |
-| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `set_real_ip_from` in http |
+| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in http |
 | gh:ericbarch/socket-tunnel/nginx.conf.sample | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:17) |
 | gh:runzhliu/welink/dev-nginx.conf | github | ok | ok |  |
 | gh:TaitoUnited/full-stack-template/docker-nginx.conf | github | ok | ok |  |
@@ -119,7 +117,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:allisterb/Alpheus/Examples/nginx.conf.2 | github | — | — | (nginx: [emerg] unknown directive "﻿user" in <sandbox>/conf/nginx.conf:1) |
 | gh:sebleier/django-limehouse/nginx.conf.sample | github | ok | ok |  |
 | gh:datenguide/datenguide/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
-| gh:gopavasanth/video-cut-tool/.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `real_ip_header` in location |
+| gh:gopavasanth/video-cut-tool/.nginx.conf | github | ok | ok |  |
 | gh:mimischi/minio-dokku/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:visdesignlab/Sanguine/server-nginx.conf | github | — | — | (nginx: [emerg] cannot load certificate key "<sandbox>/conf/<REPLACE-ME>": PEM_re) |
 | gh:maxschulze/elasticbeanstalk-puma-rails4/02nginx.config | github | — | — | (nginx: [emerg] unknown directive "files:" in <sandbox>/conf/nginx.conf:12) |
