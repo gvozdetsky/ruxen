@@ -10,11 +10,13 @@ Measured on 2026-10-06/07, the night before the 0.1.2 release, on the release bi
 
 | calibration | i7 laptop | i9 |
 |---|---:|---:|
-| ruxen vs a copy of itself, `m1_hello` | 99.5% (94.6–101.8) | 106.9% (one pair 161%; median 100.2%) |
+| ruxen vs a copy of itself, `m1_hello` | 99.5% (94.6–101.8) | 100.5% (99.5–102.8) on a rerun; the first run had one wild pair (161%, median 100.2%) |
 | ruxen vs a copy of itself, `proxy_hello` | 99.5% (98.9–100.5) | 100.3% (99.6–101.5) |
 | nginx vs nginx, `m1_hello` | 100.8% (99.4–103.0) | 100.1% (99.5–101.4) |
 
-  Differences within about ±2% are noise. The i9 had one wild pair in its first calibration (a desktop session was open), so read its single-scenario numbers with that in mind; the spread column shows when a run was affected.
+  Differences within about ±2% are noise. The i9 had one wild pair in its first calibration (a desktop session was open); the rerun at the end of the night was clean. The spread column shows when a scenario's run was affected.
+
+  `m1_hello_c1` (one connection, latency-bound) is noisy on the i7 by nature: its first run spread 81–139%, and a rerun with 12 pairs gave 94.9% (86.1–105.4%).
 
 ## Machines
 

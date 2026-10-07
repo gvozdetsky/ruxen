@@ -94,3 +94,4 @@ w8	nginx	ruxen-0.1.2	regex_locations_50_w8	2026-10-07T05:58:55+02:00	2026-10-07T
 w8	nginx	ruxen-0.1.2	vhost_regex_20_w8	2026-10-07T06:04:17+02:00	2026-10-07T06:09:40+02:00	14.12	ruxen:ruxen-0.1.2 / nginx: 75.7% (geometric mean; median 76.6%, min 70.2%, max 79.7%, 8 pairs)
 w8	nginx	ruxen-0.1.2	autoindex_100_w8	2026-10-07T06:09:40+02:00	2026-10-07T06:15:02+02:00	8.36	ruxen:ruxen-0.1.2 / nginx: 73.9% (geometric mean; median 74.1%, min 72.2%, max 75.0%, 8 pairs)
 w8	nginx	ruxen-0.1.2	prefix_locations_200_w8	2026-10-07T06:15:02+02:00	2026-10-07T06:20:24+02:00	16.43	ruxen:ruxen-0.1.2 / nginx: 107.9% (geometric mean; median 110.1%, min 97.2%, max 111.8%, 8 pairs)
+A/A-2	ruxen-0.1.2	ruxen-0.1.2-copy	m1_hello	2026-10-07T06:40:36+02:00	2026-10-07T06:45:58+02:00	38.31	ruxen:ruxen-0.1.2-copy / ruxen:ruxen-0.1.2: 100.5% (geometric mean; median 100.2%, min 99.5%, max 102.8%, 8 pairs)

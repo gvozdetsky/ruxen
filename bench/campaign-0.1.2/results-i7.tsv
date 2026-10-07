@@ -91,3 +91,4 @@ regress	ruxen-0.1.1	ruxen-0.1.2	m1_hello	2026-10-07T05:29:57+02:00	2026-10-07T05
 regress	ruxen-0.1.1	ruxen-0.1.2	proxy_hello	2026-10-07T05:35:17+02:00	2026-10-07T05:40:38+02:00	17.92	ruxen:ruxen-0.1.2 / ruxen:ruxen-0.1.1: 101.2% (geometric mean; median 101.6%, min 99.8%, max 102.3%, 8 pairs)
 regress	ruxen-0.1.1	ruxen-0.1.2	tls_hello	2026-10-07T05:40:38+02:00	2026-10-07T05:46:01+02:00	21.39	ruxen:ruxen-0.1.2 / ruxen:ruxen-0.1.1: 101.3% (geometric mean; median 100.6%, min 98.7%, max 105.5%, 8 pairs)
 regress	ruxen-0.1.1	ruxen-0.1.2	static_8k	2026-10-07T05:46:01+02:00	2026-10-07T05:51:22+02:00	19.37	ruxen:ruxen-0.1.2 / ruxen:ruxen-0.1.1: 99.8% (geometric mean; median 99.8%, min 97.6%, max 101.9%, 8 pairs)
+rerun	nginx	ruxen-0.1.2	m1_hello_c1	2026-10-07T06:40:37+02:00	2026-10-07T06:48:22+02:00	1.06	ruxen:ruxen-0.1.2 / nginx: 94.9% (geometric mean; median 94.7%, min 86.1%, max 105.4%, 12 pairs)
