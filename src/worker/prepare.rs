@@ -1183,17 +1183,17 @@ pub(crate) fn prepare_server(
     prefix.sort_by(|a, b| b.pattern.len().cmp(&a.pattern.len()));
     // regex_locations stay in declaration order — first match wins.
 
-    // Synthesize a nameless catch-all PreparedLocation that fires when the
-    // normal ladder finds no match:
-    //   1. Server-scope `root` without an explicit `/` prefix location —
-    //      nginx always has an implicit `/` that serves from root.
-    //   2. None → real 404 fallback in phase::process.
+    // Synthesize a nameless catch-all PreparedLocation for requests the
+    // location search doesn't match: nginx then handles them with the
+    // server's own configuration (ngx_http_core_find_config_phase keeps
+    // the server's loc_conf), so its static handler serves from the
+    // server's root, or `html`. Only a prefix `/` location matches every
+    // URI and makes it unreachable; `location = /` doesn't.
     // (A server-scope `return` is part of the server rewrite program, which
     // runs before the location search, as in nginx.)
     // The prepared location inherits the server's add_header / error_page
     // lists via the same path explicit locations use.
-    let have_root_catchall =
-        exact.iter().any(|l| l.pattern == b"/") || prefix.iter().any(|l| l.pattern == b"/");
+    let have_root_catchall = prefix.iter().any(|l| l.pattern == b"/");
     // The server's own root (else nginx's `html`): its rewrite phase's
     // `$request_filename`, and its implicit `/` location's.
     let server_doc_root = leak_doc_root(
@@ -1206,64 +1206,64 @@ pub(crate) fn prepare_server(
         None,
         server_disable_symlinks.clone(),
     );
-    let server_default =
-        if let Some(root_path) = server.root.clone().filter(|_| !have_root_catchall) {
-            let pattern: &'static [u8] = b"/";
-            let handler = build_handler(
-                Handler::Root {
-                    path: root_path,
-                    mapping: PathMapping::Root,
-                },
-                pattern,
-                false,
-                None,
-                None,
-                None,
-                server_index,
-                None,
-                None,
-                None,
-                None,
-                server_autoindex,
-                server_autoindex_exact_size,
-                server_autoindex_localtime,
-                server_autoindex_format,
-                server_disable_symlinks.clone(),
-                server_tokens_value,
-                upstreams,
-                ProxyEffective::defaults(),
-            )?;
-            Some(PreparedLocation {
-                pattern,
-                handler,
-                auto_redirect: false,
-                noregex: false,
-                rewrite_program: &[],
-                add_headers: server_add_headers,
-                add_trailers: server_add_trailers,
-                error_pages: server_error_pages,
-                keepalive: server_keepalive,
-                error_logs: server_error_logs,
-                log_not_found: server_log_not_found,
-                recursive_error_pages: server_recursive_error_pages,
-                internal: false,
-                server_header: server_header_bytes,
-                access_logs: server_access_logs,
-                access: server_access,
-                limit_except: None,
-                client_max_body_size: server_client_max_body_size,
-                sendfile: server_sendfile,
-                limit_rate: server_limit_rate.for_location(),
-                client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
-                body_temp: server_body_temp,
-                doc_root: server_doc_root,
-                post_action: server_post_action,
-                expires: server_expires,
-                chunked_transfer_encoding: server_chunked_transfer_encoding,
-            })
-        } else {
-            None
-        };
+    let server_default = if !have_root_catchall {
+        let root_path = server.root.clone().unwrap_or_else(|| "html".into());
+        let pattern: &'static [u8] = b"/";
+        let handler = build_handler(
+            Handler::Root {
+                path: root_path,
+                mapping: PathMapping::Root,
+            },
+            pattern,
+            false,
+            None,
+            None,
+            None,
+            server_index,
+            None,
+            None,
+            None,
+            None,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            server_disable_symlinks.clone(),
+            server_tokens_value,
+            upstreams,
+            ProxyEffective::defaults(),
+        )?;
+        Some(PreparedLocation {
+            pattern,
+            handler,
+            auto_redirect: false,
+            noregex: false,
+            rewrite_program: &[],
+            add_headers: server_add_headers,
+            add_trailers: server_add_trailers,
+            error_pages: server_error_pages,
+            keepalive: server_keepalive,
+            error_logs: server_error_logs,
+            log_not_found: server_log_not_found,
+            recursive_error_pages: server_recursive_error_pages,
+            internal: false,
+            server_header: server_header_bytes,
+            access_logs: server_access_logs,
+            access: server_access,
+            limit_except: None,
+            client_max_body_size: server_client_max_body_size,
+            sendfile: server_sendfile,
+            limit_rate: server_limit_rate.for_location(),
+            client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
+            body_temp: server_body_temp,
+            doc_root: server_doc_root,
+            post_action: server_post_action,
+            expires: server_expires,
+            chunked_transfer_encoding: server_chunked_transfer_encoding,
+        })
+    } else {
+        None
+    };
 
     Ok(PreparedServer {
         doc_root: server_doc_root,
