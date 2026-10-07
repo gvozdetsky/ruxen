@@ -184,6 +184,8 @@ pub struct HttpConfig {
     /// http-scope `auth_delay` in milliseconds. `None` means "not set"
     /// and child scopes inherit/default to no delay.
     pub auth_delay_ms: Option<u64>,
+    /// `allow` / `deny` and `satisfy`; unset parts inherit.
+    pub access: AccessConf,
     /// http-scope `client_max_body_size` in bytes. `None` means "not set".
     pub client_max_body_size: Option<u64>,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
@@ -584,6 +586,8 @@ pub struct Server {
     pub auth_basic_user_file: Option<PathBuf>,
     /// Server-scope `auth_delay` in milliseconds. `None` inherits from http.
     pub auth_delay_ms: Option<u64>,
+    /// `allow` / `deny` and `satisfy`; unset parts inherit.
+    pub access: AccessConf,
     /// Server-scope `client_max_body_size` in bytes. `None` inherits from http.
     pub client_max_body_size: Option<u64>,
     /// Server-scope `client_body_temp_path`. `None` inherits from http.
@@ -683,6 +687,8 @@ pub struct Location {
     /// `internal;`: only internal redirects (rewrite, error_page,
     /// try_files, index, X-Accel-Redirect) may land here.
     pub internal: bool,
+    /// `limit_except`; not inherited by nested locations.
+    pub limit_except: Option<LimitExcept>,
     /// Location-scope `server_tokens`. `None` inherits from server.
     pub server_tokens: Option<ServerTokens>,
     /// Location-scope `autoindex on|off;`. `None` inherits from server.
@@ -705,6 +711,8 @@ pub struct Location {
     /// Location-scope `auth_delay` in milliseconds. `None` inherits from
     /// server.
     pub auth_delay_ms: Option<u64>,
+    /// `allow` / `deny` and `satisfy`; unset parts inherit.
+    pub access: AccessConf,
     /// Location-scope `client_max_body_size` in bytes. `None` inherits from
     /// server.
     pub client_max_body_size: Option<u64>,
@@ -956,6 +964,110 @@ pub struct AccessLog {
 pub enum AuthBasic {
     Off,
     Realm(Vec<u8>),
+}
+
+/// `allow` / `deny` rules and `satisfy` at one scope (http, server,
+/// location, or a `limit_except` block).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessConf {
+    /// In declaration order. Empty inherits the enclosing scope's list
+    /// whole: nginx's merge never concatenates two scopes' rules.
+    pub rules: Vec<AccessRule>,
+    /// `None` inherits; the default is `all`.
+    pub satisfy: Option<Satisfy>,
+}
+
+impl AccessConf {
+    /// This scope's values, falling back to the enclosing scope's.
+    pub fn inherit(&self, parent: &AccessConf) -> AccessConf {
+        AccessConf {
+            rules: if self.rules.is_empty() {
+                parent.rules.clone()
+            } else {
+                self.rules.clone()
+            },
+            satisfy: self.satisfy.or(parent.satisfy),
+        }
+    }
+}
+
+/// One `allow` or `deny` line. The first rule matching the client
+/// address decides (`ngx_http_access_handler`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessRule {
+    pub deny: bool,
+    pub addr: AccessAddr,
+}
+
+/// What an `allow` / `deny` rule matches. Masks and addresses are in host
+/// byte order, with the host bits of `addr` already cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessAddr {
+    /// `all`: every client, of any address family.
+    All,
+    V4 {
+        addr: u32,
+        mask: u32,
+    },
+    V6 {
+        addr: u128,
+        mask: u128,
+    },
+    /// `unix:`: clients on unix-domain sockets, which ruxen doesn't listen
+    /// on, so it never matches.
+    Unix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Satisfy {
+    All,
+    Any,
+}
+
+/// `limit_except METHOD ... { ... }` inside a location. A request whose
+/// method isn't listed gets the block's configuration, merged with the
+/// location's (`ngx_http_update_location_config`). Only the access
+/// directives may appear in the block; what the swap does to the rest of
+/// the location (no rewrite directives, no `try_files`) is in
+/// `worker::prepare::build_limit_except`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitExcept {
+    /// The listed methods, as `LIMIT_EXCEPT_METHODS` bits. `GET` implies
+    /// `HEAD`.
+    pub methods: u16,
+    /// The block's own `allow` / `deny`; empty inherits the location's.
+    pub rules: Vec<AccessRule>,
+    /// The block's own `auth_basic` / `auth_basic_user_file`; `None`
+    /// inherits the location's.
+    pub auth_basic: Option<AuthBasic>,
+    pub auth_basic_user_file: Option<PathBuf>,
+}
+
+/// The methods `limit_except` takes, in `ngx_methods_names` order.
+pub const LIMIT_EXCEPT_METHODS: [&str; 14] = [
+    "GET",
+    "HEAD",
+    "POST",
+    "PUT",
+    "DELETE",
+    "MKCOL",
+    "COPY",
+    "MOVE",
+    "OPTIONS",
+    "PROPFIND",
+    "PROPPATCH",
+    "LOCK",
+    "UNLOCK",
+    "PATCH",
+];
+
+/// The `LIMIT_EXCEPT_METHODS` bit of a request method; 0 for any other
+/// method, which no `limit_except` list can exempt.
+pub fn limit_except_method_bit(method: &[u8]) -> u16 {
+    LIMIT_EXCEPT_METHODS
+        .iter()
+        .position(|m| m.as_bytes() == method)
+        .map_or(0, |i| 1 << i)
 }
 
 /// `client_body_temp_path path [level1 [level2 [level3]]]`: the directory

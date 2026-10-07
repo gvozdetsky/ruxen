@@ -20,12 +20,13 @@ use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 
 use crate::config::{
-    AccessLog, AddHeader, AuthBasic, AutoindexFormat, ErrorLog, ErrorLogLevel,
+    AccessConf, AccessLog, AddHeader, AuthBasic, AutoindexFormat, ErrorLog, ErrorLogLevel,
     ErrorLogSyslogServer, ErrorLogTarget, ErrorPage, ErrorPageAction, ExpiresDirective,
     FileTestKind, Handler, HttpConfig, IfGuard, IndexEntry, KeepaliveDisable, KeepaliveTimeout,
-    Location, LogFormatDef, MapBlock, MapExactEntry, MapRegexEntry, MatchMode, PathMapping,
-    ProxyConf, ProxyPass, ProxySetHeader, RewriteFlag as ConfigRewriteFlag, RewriteOp, RewriteRule,
-    Server, SplitClients, TryFiles, TryFilesFallback, TryFilesProbe, ValuePart, Variable,
+    LimitExcept, Location, LogFormatDef, MapBlock, MapExactEntry, MapRegexEntry, MatchMode,
+    PathMapping, ProxyConf, ProxyPass, ProxySetHeader, RewriteFlag as ConfigRewriteFlag, RewriteOp,
+    RewriteRule, Server, SplitClients, TryFiles, TryFilesFallback, TryFilesProbe, ValuePart,
+    Variable,
 };
 use crate::http::{self, Method, Parse, ParseState, READ_BUF};
 use crate::phase::{self, Response};
@@ -70,6 +71,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         auth_basic,
         auth_basic_user_file,
         auth_delay_ms,
+        access,
         client_max_body_size,
         client_body_temp_path,
         sendfile,
@@ -109,11 +111,13 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_autoindex_exact_size = autoindex_exact_size.unwrap_or(true);
     let http_autoindex_localtime = autoindex_localtime.unwrap_or(false);
     let http_autoindex_format = autoindex_format.unwrap_or(AutoindexFormat::Html);
-    let http_auth_basic = auth_basic
-        .map(prepare_auth_basic)
-        .unwrap_or(PreparedAuthBasic::Off);
-    let http_auth_basic_user_file = auth_basic_user_file.map(leak_path_buf);
-    let http_auth_delay_ms = auth_delay_ms.unwrap_or(0);
+    let http_access = resolve_access(
+        access,
+        auth_basic,
+        auth_basic_user_file,
+        auth_delay_ms,
+        PreparedAccess::NONE,
+    );
     let http_client_max_body_size = client_max_body_size;
     let http_sendfile = sendfile;
     let http_disable_symlinks = disable_symlinks;
@@ -187,9 +191,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                     http_autoindex_exact_size,
                     http_autoindex_localtime,
                     http_autoindex_format,
-                    http_auth_basic,
-                    http_auth_basic_user_file,
-                    http_auth_delay_ms,
+                    http_access,
                     http_client_max_body_size,
                     http_sendfile,
                     http_disable_symlinks.clone(),
@@ -871,9 +873,7 @@ pub(crate) fn prepare_server(
     http_autoindex_exact_size: bool,
     http_autoindex_localtime: bool,
     http_autoindex_format: AutoindexFormat,
-    http_auth_basic: PreparedAuthBasic,
-    http_auth_basic_user_file: Option<&'static Path>,
-    http_auth_delay_ms: u64,
+    http_access: PreparedAccess,
     http_client_max_body_size: Option<u64>,
     http_sendfile: Option<bool>,
     http_disable_symlinks: Option<crate::config::DisableSymlinks>,
@@ -999,15 +999,13 @@ pub(crate) fn prepare_server(
     };
     let server_log_not_found = server.log_not_found.unwrap_or(true);
     let server_recursive_error_pages = server.recursive_error_pages.unwrap_or(false);
-    let server_auth_basic = server
-        .auth_basic
-        .map(prepare_auth_basic)
-        .unwrap_or(http_auth_basic);
-    let server_auth_basic_user_file = server
-        .auth_basic_user_file
-        .map(leak_path_buf)
-        .or(http_auth_basic_user_file);
-    let server_auth_delay_ms = server.auth_delay_ms.unwrap_or(http_auth_delay_ms);
+    let server_access = resolve_access(
+        std::mem::take(&mut server.access),
+        server.auth_basic.take(),
+        server.auth_basic_user_file.take(),
+        server.auth_delay_ms,
+        http_access,
+    );
     let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
     let server_sendfile = server.sendfile.or(http_sendfile).unwrap_or(false);
     // A server's own `client_body_temp_path`; without one its locations
@@ -1078,9 +1076,7 @@ pub(crate) fn prepare_server(
                 server_autoindex_localtime,
                 server_autoindex_format,
                 server_access_logs,
-                server_auth_basic,
-                server_auth_basic_user_file,
-                server_auth_delay_ms,
+                server_access,
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
@@ -1109,9 +1105,7 @@ pub(crate) fn prepare_server(
                 server_autoindex_localtime,
                 server_autoindex_format,
                 server_access_logs,
-                server_auth_basic,
-                server_auth_basic_user_file,
-                server_auth_delay_ms,
+                server_access,
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
@@ -1140,9 +1134,7 @@ pub(crate) fn prepare_server(
                 server_autoindex_localtime,
                 server_autoindex_format,
                 server_access_logs,
-                server_auth_basic,
-                server_auth_basic_user_file,
-                server_auth_delay_ms,
+                server_access,
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
@@ -1172,9 +1164,7 @@ pub(crate) fn prepare_server(
                 server_autoindex_localtime,
                 server_autoindex_format,
                 server_access_logs,
-                server_auth_basic,
-                server_auth_basic_user_file,
-                server_auth_delay_ms,
+                server_access,
                 server_client_max_body_size,
                 server_sendfile,
                 server_body_temp,
@@ -1259,9 +1249,8 @@ pub(crate) fn prepare_server(
                 internal: false,
                 server_header: server_header_bytes,
                 access_logs: server_access_logs,
-                auth_basic: server_auth_basic,
-                auth_basic_user_file: server_auth_basic_user_file,
-                auth_delay_ms: server_auth_delay_ms,
+                access: server_access,
+                limit_except: None,
                 client_max_body_size: server_client_max_body_size,
                 sendfile: server_sendfile,
                 limit_rate: server_limit_rate.for_location(),
@@ -1296,9 +1285,7 @@ pub(crate) fn prepare_server(
         merge_slashes,
         server_header: server_header_bytes,
         access_logs: server_access_logs,
-        auth_basic: server_auth_basic,
-        auth_basic_user_file: server_auth_basic_user_file,
-        auth_delay_ms: server_auth_delay_ms,
+        access: server_access,
         underscores_in_headers: server_underscores_in_headers,
         post_action: server_post_action,
         rewrite_program: server_rewrite_program,
@@ -1919,6 +1906,69 @@ pub(crate) fn leak_doc_root(
     }))
 }
 
+/// Resolve one scope's access phase over its parent's: `allow` / `deny`
+/// lists replace each other whole, the rest inherits per directive.
+fn resolve_access(
+    access: AccessConf,
+    auth_basic: Option<AuthBasic>,
+    auth_basic_user_file: Option<std::path::PathBuf>,
+    auth_delay_ms: Option<u64>,
+    parent: PreparedAccess,
+) -> PreparedAccess {
+    PreparedAccess {
+        rules: if access.rules.is_empty() {
+            parent.rules
+        } else {
+            Box::leak(access.rules.into_boxed_slice())
+        },
+        satisfy_any: access
+            .satisfy
+            .map_or(parent.satisfy_any, |s| s == crate::config::Satisfy::Any),
+        auth_basic: auth_basic
+            .map(prepare_auth_basic)
+            .unwrap_or(parent.auth_basic),
+        auth_basic_user_file: auth_basic_user_file
+            .map(leak_path_buf)
+            .or(parent.auth_basic_user_file),
+        auth_delay_ms: auth_delay_ms.unwrap_or(parent.auth_delay_ms),
+    }
+}
+
+/// Whether the requests a `limit_except` applies to need a content
+/// handler of their own: without the location's rewrite directives (so
+/// without its `return`) and without `try_files`, nginx serves them with
+/// the static handler, or with the location's `proxy_pass`.
+fn limit_except_rebuilds_handler(handler: &Handler, try_files: &Option<TryFiles>) -> bool {
+    match handler {
+        Handler::Proxy(_) => false,
+        Handler::Root { .. } => try_files.is_some(),
+        Handler::Return { .. } => true,
+    }
+}
+
+fn build_limit_except(
+    le: LimitExcept,
+    handler: Option<PreparedHandler>,
+    location_access: PreparedAccess,
+) -> &'static PreparedLimitExcept {
+    let own = AccessConf {
+        rules: le.rules,
+        satisfy: None,
+    };
+    let access = resolve_access(
+        own,
+        le.auth_basic,
+        le.auth_basic_user_file,
+        None,
+        location_access,
+    );
+    Box::leak(Box::new(PreparedLimitExcept {
+        methods: le.methods,
+        handler,
+        access,
+    }))
+}
+
 pub(crate) fn build_handler(
     handler: Handler,
     location_pattern: &'static [u8],
@@ -2087,9 +2137,7 @@ pub(crate) fn build_prefix_or_exact(
     server_autoindex_localtime: bool,
     server_autoindex_format: AutoindexFormat,
     server_access_logs: &'static [PreparedAccessLog],
-    server_auth_basic: PreparedAuthBasic,
-    server_auth_basic_user_file: Option<&'static Path>,
-    server_auth_delay_ms: u64,
+    server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
@@ -2130,6 +2178,8 @@ pub(crate) fn build_prefix_or_exact(
         auth_basic: location_auth_basic,
         auth_basic_user_file: location_auth_basic_user_file,
         auth_delay_ms: location_auth_delay_ms,
+        access: location_access,
+        limit_except,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
         document_root,
@@ -2164,6 +2214,35 @@ pub(crate) fn build_prefix_or_exact(
         error_pages,
         recursive_error_pages,
         ..proxy_effective
+    };
+    let limited_handler = match &limit_except {
+        Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
+            Handler::Root {
+                path: document_root.0.clone(),
+                mapping: document_root.1,
+            },
+            pattern,
+            false,
+            alias_prefix_override,
+            index.clone(),
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            ProxyEffective::defaults(),
+        )?),
+        _ => None,
     };
     let doc_root = leak_doc_root(
         document_root,
@@ -2204,13 +2283,14 @@ pub(crate) fn build_prefix_or_exact(
         Some(ref list) => alp.prepare_list(list)?,
         None => server_access_logs,
     };
-    let auth_basic = location_auth_basic
-        .map(prepare_auth_basic)
-        .unwrap_or(server_auth_basic);
-    let auth_basic_user_file = location_auth_basic_user_file
-        .map(leak_path_buf)
-        .or(server_auth_basic_user_file);
-    let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
+    let access = resolve_access(
+        location_access,
+        location_auth_basic,
+        location_auth_basic_user_file,
+        location_auth_delay_ms,
+        server_access,
+    );
+    let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let body_temp = location_client_body_temp_path
@@ -2245,9 +2325,8 @@ pub(crate) fn build_prefix_or_exact(
         internal,
         server_header: http::server_header_value(tokens),
         access_logs,
-        auth_basic,
-        auth_basic_user_file,
-        auth_delay_ms,
+        access,
+        limit_except,
         client_max_body_size,
         sendfile,
         limit_rate: limit_rate.for_location(),
@@ -2278,9 +2357,7 @@ pub(crate) fn build_regex_location(
     server_autoindex_localtime: bool,
     server_autoindex_format: AutoindexFormat,
     server_access_logs: &'static [PreparedAccessLog],
-    server_auth_basic: PreparedAuthBasic,
-    server_auth_basic_user_file: Option<&'static Path>,
-    server_auth_delay_ms: u64,
+    server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
@@ -2321,6 +2398,8 @@ pub(crate) fn build_regex_location(
         auth_basic: location_auth_basic,
         auth_basic_user_file: location_auth_basic_user_file,
         auth_delay_ms: location_auth_delay_ms,
+        access: location_access,
+        limit_except,
         client_max_body_size: location_client_max_body_size,
         sendfile: location_sendfile,
         document_root,
@@ -2368,6 +2447,35 @@ pub(crate) fn build_regex_location(
         recursive_error_pages,
         ..proxy_effective
     };
+    let limited_handler = match &limit_except {
+        Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
+            Handler::Root {
+                path: document_root.0.clone(),
+                mapping: document_root.1,
+            },
+            location_pattern,
+            true,
+            alias_prefix_override,
+            index.clone(),
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            ProxyEffective::defaults(),
+        )?),
+        _ => None,
+    };
     let doc_root = leak_doc_root(
         document_root,
         location_pattern,
@@ -2406,13 +2514,14 @@ pub(crate) fn build_regex_location(
         Some(ref list) => alp.prepare_list(list)?,
         None => server_access_logs,
     };
-    let auth_basic = location_auth_basic
-        .map(prepare_auth_basic)
-        .unwrap_or(server_auth_basic);
-    let auth_basic_user_file = location_auth_basic_user_file
-        .map(leak_path_buf)
-        .or(server_auth_basic_user_file);
-    let auth_delay_ms = location_auth_delay_ms.unwrap_or(server_auth_delay_ms);
+    let access = resolve_access(
+        location_access,
+        location_auth_basic,
+        location_auth_basic_user_file,
+        location_auth_delay_ms,
+        server_access,
+    );
+    let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let body_temp = location_client_body_temp_path
@@ -2445,9 +2554,8 @@ pub(crate) fn build_regex_location(
         internal,
         server_header: http::server_header_value(tokens),
         access_logs,
-        auth_basic,
-        auth_basic_user_file,
-        auth_delay_ms,
+        access,
+        limit_except,
         client_max_body_size,
         sendfile,
         limit_rate: limit_rate.for_location(),

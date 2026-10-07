@@ -64,6 +64,7 @@ pub(crate) fn parse_server_block(
     let mut auth_basic: Option<AuthBasic> = None;
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
+    let mut access = AccessConf::default();
     let mut client_max_body_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
@@ -157,6 +158,7 @@ pub(crate) fn parse_server_block(
                         auth_basic,
                         auth_basic_user_file,
                         auth_delay_ms,
+                        access,
                         client_max_body_size,
                         client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
@@ -484,6 +486,9 @@ pub(crate) fn parse_server_block(
                 let raw = args.get(1).ok_or(Error::MissingArg("auth_delay"))?;
                 auth_delay_ms = Some(parse_duration_ms(raw, "auth_delay")?);
             }
+            ("allow" | "deny" | "satisfy", Terminator::Semi) => {
+                parse_access_directive(&mut access, &args, lx)?;
+            }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
                     return Err(Error::Duplicate("client_max_body_size"));
@@ -552,6 +557,7 @@ pub(crate) fn parse_server_block(
                     None,
                     None,
                     None,
+                    &AccessConf::default(),
                     client_max_body_size.or(inherited_client_max_body_size),
                     None,
                     None,
@@ -612,6 +618,9 @@ pub(crate) fn parse_server_block(
                 | "auth_basic"
                 | "auth_basic_user_file"
                 | "auth_delay"
+                | "allow"
+                | "deny"
+                | "satisfy"
                 | "client_max_body_size"
                 | "client_body_temp_path"
                 | "disable_symlinks"
