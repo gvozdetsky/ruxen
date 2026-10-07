@@ -152,6 +152,9 @@ pub(crate) fn parse_if_guard(args: &[String]) -> Result<IfGuard, Error> {
     if args.is_empty() {
         return Err(Error::MissingArg("if condition"));
     }
+    if let Some(guard) = parse_if_comparison(args)? {
+        return Ok(guard);
+    }
     let joined = args.join(" ");
     let trimmed = joined.trim();
     if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
@@ -165,6 +168,46 @@ pub(crate) fn parse_if_guard(args: &[String]) -> Result<IfGuard, Error> {
         return Err(Error::MissingArg("if condition"));
     }
     parse_if_guard_inner(inner)
+}
+
+/// `($var = value)` / `($var != value)` as three tokens, the way
+/// `ngx_http_rewrite_if_condition` reads them: the value is the third
+/// token as is, so a quoted empty string (`""`) is a value. `None` for any
+/// other shape, which the joined-string parser handles.
+fn parse_if_comparison(args: &[String]) -> Result<Option<IfGuard>, Error> {
+    let mut tokens: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(first) = tokens.first().and_then(|t| t.strip_prefix('(')) else {
+        return Ok(None);
+    };
+    if first.is_empty() {
+        tokens.remove(0);
+    } else {
+        tokens[0] = first;
+    }
+    match tokens.last() {
+        Some(&")") => {
+            tokens.pop();
+        }
+        Some(last) if last.ends_with(')') => {
+            let n = tokens.len() - 1;
+            tokens[n] = &last[..last.len() - 1];
+        }
+        _ => return Ok(None),
+    }
+    let [left, op @ ("=" | "!="), rhs] = tokens[..] else {
+        return Ok(None);
+    };
+    let (left, rest) = split_if_left_var(left)?;
+    if !rest.is_empty() {
+        return Ok(None);
+    }
+    let right = parse_value_with_vars(rhs)?;
+    reject_sent_http_parts(&right, "if comparison ($sent_http_* unavailable)")?;
+    Ok(Some(if op == "=" {
+        IfGuard::Eq { left, right }
+    } else {
+        IfGuard::NotEq { left, right }
+    }))
 }
 
 pub(crate) fn parse_if_guard_inner(inner: &str) -> Result<IfGuard, Error> {
@@ -336,4 +379,36 @@ pub(crate) fn parse_rewrite_variable_name(raw: &str, what: &'static str) -> Resu
         });
     }
     Ok(name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn guard(src: &[&str]) -> IfGuard {
+        let args: Vec<String> = src.iter().map(|s| s.to_string()).collect();
+        parse_if_guard(&args).unwrap()
+    }
+
+    #[test]
+    fn comparison_takes_the_third_token_as_is() {
+        // The lexer's tokens for `if ($a = "")`, `if ( $a != '' )` and
+        // `if ($a = "x)")`.
+        assert!(matches!(
+            guard(&["($a", "=", "", ")"]),
+            IfGuard::Eq { right, .. } if right.is_empty()
+        ));
+        assert!(matches!(
+            guard(&["(", "$a", "!=", "", ")"]),
+            IfGuard::NotEq { right, .. } if right.is_empty()
+        ));
+        assert!(matches!(
+            guard(&["($a", "=", "x)", ")"]),
+            IfGuard::Eq { right, .. } if right == [ValuePart::Literal("x)".into())]
+        ));
+        // Other shapes still go through the joined parser.
+        assert!(matches!(guard(&["($a", "=", "1)"]), IfGuard::Eq { .. }));
+        assert!(matches!(guard(&["($a)"]), IfGuard::VarTruthy(_)));
+        assert!(matches!(guard(&["(-f", "/x)"]), IfGuard::FileTest { .. }));
+    }
 }

@@ -187,3 +187,41 @@ http {
         "HTTP/1.1 404 Not Found"
     );
 }
+
+/// `if ($var = "")`: the quoted empty string is the value compared
+/// against (#243). It used to be lost when the condition was rejoined
+/// into one string. Checked against nginx 1.24.
+#[test]
+fn if_compares_against_empty_and_quoted_values() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+
+    location /empty {
+      if ($arg_z = "") { return 204; }
+    }
+
+    location /not_empty {
+      if ( $arg_z != '' ) { return 204; }
+    }
+
+    location /paren {
+      if ($arg_w = "a)") { return 204; }
+    }
+  }
+}
+"#;
+
+    let (_guard, port, _dir) = spawn_server(conf);
+    let status = |path: &str| status_line(&http_get(port, path)).to_string();
+
+    assert_eq!(status("/empty?y=1"), "HTTP/1.1 204 No Content");
+    assert_eq!(status("/empty?z="), "HTTP/1.1 204 No Content");
+    assert_eq!(status("/empty?z=1"), "HTTP/1.1 404 Not Found");
+    assert_eq!(status("/not_empty?z=1"), "HTTP/1.1 204 No Content");
+    assert_eq!(status("/not_empty?y=1"), "HTTP/1.1 404 Not Found");
+    assert_eq!(status("/paren?w=a)"), "HTTP/1.1 204 No Content");
+    assert_eq!(status("/paren?w=a"), "HTTP/1.1 404 Not Found");
+}
