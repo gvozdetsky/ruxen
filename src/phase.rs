@@ -599,7 +599,7 @@ fn process_with_meta_inner(
     let mut preserved_www_authenticate: Vec<Vec<u8>> = Vec::new();
     // The client address the realip module set, if it did. nginx keeps it
     // for the rest of the request, internal redirects included.
-    let realip: std::cell::OnceCell<RealIpState> = std::cell::OnceCell::new();
+    let realip: std::cell::OnceCell<Box<RealIpState>> = std::cell::OnceCell::new();
     // The request as the phases see it once it changed: GET after an
     // error_page sent it to a URI, the realip address.
     let mut req_now: Option<RequestCtx<'_>> = None;
@@ -688,7 +688,7 @@ fn process_with_meta_inner(
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
         if let Some(state) = real_ip(req, &server.access.realip) {
-            let state = realip.get_or_init(|| state);
+            let state: &RealIpState = realip.get_or_init(|| Box::new(state));
             meta.realip = Some(Box::new(state.clone()));
             req_now = Some(with_real_ip(req, state));
         }
@@ -868,7 +868,7 @@ fn process_with_meta_inner(
             && realip.get().is_none()
             && let Some(state) = real_ip(req, &loc.access.realip)
         {
-            let state = realip.get_or_init(|| state);
+            let state: &RealIpState = realip.get_or_init(|| Box::new(state));
             meta.realip = Some(Box::new(state.clone()));
             req_now = Some(with_real_ip(req, state));
         }
