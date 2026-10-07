@@ -824,7 +824,7 @@ fn process_with_meta_inner(
             !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
         let mut denied = None;
         if !answered_in_rewrite_phase {
-            match run_access_control(http, req, &loc.access, loc.server_header, &meta) {
+            match run_access_control(http, req, loc.access, loc.server_header, &meta) {
                 AccessControl::Allow { remote_user } => {
                     meta.remote_user = remote_user;
                 }

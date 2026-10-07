@@ -1071,7 +1071,7 @@ pub struct MatchedLocation<'a> {
     pub internal: bool,
     pub server_header: &'static [u8],
     pub access_logs: &'static [PreparedAccessLog],
-    pub access: PreparedAccess,
+    pub access: &'a PreparedAccess,
     pub limit_except: Option<&'static PreparedLimitExcept>,
     pub client_max_body_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
@@ -1102,7 +1102,7 @@ impl<'a> MatchedLocation<'a> {
             internal: loc.internal,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
-            access: loc.access,
+            access: &loc.access,
             limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,
@@ -1122,7 +1122,7 @@ impl<'a> MatchedLocation<'a> {
         Self {
             handler: le.handler.as_ref().unwrap_or(self.handler),
             rewrite_program: &[],
-            access: le.access,
+            access: &le.access,
             limit_except: None,
             ..self
         }
@@ -1149,7 +1149,7 @@ impl<'a> MatchedLocation<'a> {
             internal: loc.internal,
             server_header: loc.server_header,
             access_logs: loc.access_logs,
-            access: loc.access,
+            access: &loc.access,
             limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
             client_body_in_file_only: loc.client_body_in_file_only,

@@ -321,7 +321,7 @@ pub(crate) fn forward_client_headers<'a>(
 /// location matching with the new URL. All other variants are terminal.
 /// The variable-render context of a request in a location: the `return`
 /// body, `add_header` values and error pages share it.
-#[inline]
+#[inline(always)]
 fn location_render_ctx<'a>(
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
