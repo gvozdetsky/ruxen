@@ -86,9 +86,7 @@ cargo build --release
 # the binary is target/release/ruxen
 ```
 
-**In Docker**, the default seccomp profile blocks `io_uring`, so ruxen cannot create its `io_uring` runtime. Run the container with `--security-opt seccomp=unconfined` (or a profile that allows the `io_uring_*` syscalls).
-
-ruxen does not switch to an unprivileged user the way nginx's `user` directive does, so it refuses to start as root unless the configuration says `user root;`. Containers usually run as root: either add `user root;` or run the container with `--user`.
+ruxen does not switch to an unprivileged user the way nginx's `user` directive does, so it refuses to start as root unless the configuration says `user root;`. Start it as an unprivileged user instead; the service and container setups below do.
 
 ### Run
 
@@ -137,6 +135,23 @@ hello from ruxen
 [`examples/static.conf`](examples/static.conf) serves files from a directory and [`examples/proxy.conf`](examples/proxy.conf) proxies to two backends with keep-alive upstream connections.
 
 You are now serving an nginx-style configuration with ruxen.
+
+### Run as a service
+
+ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it gracefully, `SIGTERM` at once, `SIGUSR1` reopens the log files; it can't re-read its configuration yet, so restart it to apply a change.
+
+**systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to the log reopen. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` with it.
+
+**Docker:** the default seccomp profile denies `io_uring`, which ruxen runs on. [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json) is Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`; use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
+
+```bash
+docker build -f contrib/docker/Dockerfile -t ruxen .
+docker run --rm -p 8080:8080 \
+    --security-opt seccomp=contrib/docker/seccomp-io_uring.json \
+    -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ruxen
+```
+
+**Kubernetes:** the `RuntimeDefault` seccomp profile denies `io_uring` too. Install `seccomp-io_uring.json` on the nodes (under the kubelet's `seccomp/` directory) and refer to it with `securityContext.seccompProfile: {type: Localhost, localhostProfile: seccomp-io_uring.json}`.
 
 ## What works
 
