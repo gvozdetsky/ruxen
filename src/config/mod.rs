@@ -301,6 +301,35 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         server.recursive_error_pages =
                             server.recursive_error_pages.or(recursive_error_pages);
                         server.merge_slashes = server.merge_slashes.or(merge_slashes);
+                        if server.root.is_none() {
+                            server.root.clone_from(&root);
+                        }
+                        if let Some(root) = &server.root {
+                            for loc in server.locations.iter_mut().filter(|l| l.inherits_root) {
+                                loc.inherit_root(root);
+                            }
+                        }
+                        server.keepalive_timeout = server.keepalive_timeout.or(keepalive_timeout);
+                        server.keepalive_requests =
+                            server.keepalive_requests.or(keepalive_requests);
+                        server.keepalive_time_ms = server.keepalive_time_ms.or(keepalive_time_ms);
+                        server.keepalive_disable = server.keepalive_disable.or(keepalive_disable);
+                        server.client_timeouts = server.client_timeouts.inherit(client_timeouts);
+                        let ssl = &mut server.ssl;
+                        // A server with its own ssl_certificate lines keeps
+                        // only those.
+                        if ssl.certs.is_empty() && ssl.keys.is_empty() {
+                            ssl.certs.clone_from(&ssl_certs);
+                            ssl.keys.clone_from(&ssl_keys);
+                        }
+                        ssl.protocols = ssl.protocols.or(ssl_protocols);
+                        if ssl.ciphers.is_none() {
+                            ssl.ciphers.clone_from(&ssl_ciphers);
+                        }
+                        ssl.prefer_server_ciphers =
+                            ssl.prefer_server_ciphers.or(ssl_prefer_server_ciphers);
+                        ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
+                        ssl.resumption = ssl.resumption.inherit(resumption);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -340,24 +369,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             };
         }
         match (args[0].as_str(), &term) {
-            ("server", Terminator::BlockOpen) => servers.extend(parse_server_block(
-                lx,
-                root.clone(),
-                &ssl_certs,
-                &ssl_keys,
-                ssl_protocols,
-                ssl_ciphers.as_deref(),
-                ssl_prefer_server_ciphers,
-                ssl_session_timeout_ms,
-                resumption,
-                client_max_body_size,
-                keepalive_timeout,
-                keepalive_requests,
-                keepalive_time_ms,
-                keepalive_disable,
-                client_timeouts,
-                &mut warnings,
-            )?),
+            ("server", Terminator::BlockOpen) => {
+                servers.extend(parse_server_block(lx, &mut warnings)?)
+            }
             ("server", _) => {
                 return Err(Error::WrongTerminator {
                     name: "server".into(),
@@ -1653,9 +1667,10 @@ mod tests {
         assert_eq!(s.listen.addr.port(), 443);
         assert_eq!(s.ssl.certs, vec![PathBuf::from("cert.pem")]);
         assert_eq!(s.ssl.keys, vec![PathBuf::from("key.pem")]);
-        // Default protocols when ssl_protocols omitted.
+        // No ssl_protocols: prepare takes the default (TLSv1.2, TLSv1.3).
+        assert_eq!(s.ssl.protocols, None);
         assert_eq!(
-            s.ssl.protocols,
+            s.ssl.protocols.unwrap_or_default(),
             TlsVersionSet {
                 tlsv1_2: true,
                 tlsv1_3: true
@@ -1724,10 +1739,10 @@ mod tests {
         let cfg = parse(src).unwrap();
         assert_eq!(
             cfg.servers[0].ssl.protocols,
-            TlsVersionSet {
+            Some(TlsVersionSet {
                 tlsv1_2: true,
                 tlsv1_3: true
-            }
+            })
         );
 
         for bad in ["SSLv2", "SSLv3", "TLSv1", "TLSv1.1"] {
@@ -2573,6 +2588,50 @@ mod tests {
                 }
             }]
         );
+    }
+
+    #[test]
+    fn tls_and_keepalive_defaults_below_a_server_apply_to_it() {
+        let src = r#"
+            http {
+                server { listen 443 ssl; }
+                server {
+                    listen 8443 ssl;
+                    ssl_certificate own.pem;
+                    ssl_certificate_key own.key;
+                    ssl_protocols TLSv1.2;
+                    keepalive_requests 7;
+                }
+                ssl_certificate c.pem;
+                ssl_certificate_key k.pem;
+                ssl_protocols TLSv1.3;
+                ssl_session_timeout 10s;
+                keepalive_requests 3;
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let (a, b) = (&cfg.servers[0], &cfg.servers[1]);
+        assert_eq!(a.ssl.certs, [PathBuf::from("c.pem")]);
+        assert_eq!(
+            a.ssl.protocols,
+            Some(TlsVersionSet {
+                tlsv1_2: false,
+                tlsv1_3: true
+            })
+        );
+        assert_eq!(a.ssl.session_timeout_ms, Some(10_000));
+        assert_eq!(a.keepalive_requests, Some(3));
+        // A server's own lines win.
+        assert_eq!(b.ssl.certs, [PathBuf::from("own.pem")]);
+        assert_eq!(
+            b.ssl.protocols,
+            Some(TlsVersionSet {
+                tlsv1_2: true,
+                tlsv1_3: false
+            })
+        );
+        assert_eq!(b.ssl.session_timeout_ms, Some(10_000));
+        assert_eq!(b.keepalive_requests, Some(7));
     }
 
     #[test]

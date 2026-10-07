@@ -311,7 +311,7 @@ pub(crate) fn build_listen_tls(
     }
     // One rustls config per address: protocols and the session timeout
     // follow the default server.
-    let protocols = default.ssl.protocols;
+    let protocols = default.ssl.protocols.unwrap_or_default();
     let session_timeout_secs = default
         .ssl
         .session_timeout_ms
@@ -2213,6 +2213,7 @@ pub(crate) fn build_prefix_or_exact(
         proxy: location_proxy,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
+        inherits_root: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
@@ -2433,6 +2434,7 @@ pub(crate) fn build_regex_location(
         proxy: location_proxy,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
+        inherits_root: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     // The parser already validated this with the same flags + the same

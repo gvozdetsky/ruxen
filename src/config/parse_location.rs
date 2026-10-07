@@ -364,6 +364,7 @@ pub(crate) fn parse_location_block(
                     // are set. `proxy_pass` wins over `root`/`alias`
                     // (you can't have both in nginx — content phase
                     // dispatch is single-handler).
+                    let inherits_root = local_path_mapping.is_none() && inherited_alias.is_none();
                     let document_root = root
                         .clone()
                         .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
@@ -461,6 +462,7 @@ pub(crate) fn parse_location_block(
                         proxy,
                         chunked_transfer_encoding,
                         alias_prefix_override,
+                        inherits_root,
                     });
                     sink.extend(children);
                     Ok(())

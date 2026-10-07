@@ -413,7 +413,8 @@ impl Default for TlsVersionSet {
 pub struct ServerSsl {
     pub certs: Vec<PathBuf>,
     pub keys: Vec<PathBuf>,
-    pub protocols: TlsVersionSet,
+    /// `None`: not set here or at http level; TLSv1.2 and TLSv1.3.
+    pub protocols: Option<TlsVersionSet>,
     /// `ssl_ciphers` — verbatim, not applied: rustls's default suites are
     /// used and the parser warns (`warn_ignored_tls_policy`).
     pub ciphers: Option<String>,
@@ -762,6 +763,19 @@ pub struct Location {
     /// `return`), or nginx's default `html`: `$request_filename`,
     /// `$document_root`.
     pub document_root: (PathBuf, PathMapping),
+    /// No `root` / `alias` here or in an enclosing location: the server's
+    /// (or http's) root applies, once the whole `http {}` block is read.
+    pub inherits_root: bool,
+}
+
+impl Location {
+    /// Point a location that `inherits_root` at the root it inherits.
+    pub(crate) fn inherit_root(&mut self, root: &std::path::Path) {
+        self.document_root.0 = root.to_path_buf();
+        if let Handler::Root { path, .. } = &mut self.handler {
+            *path = root.to_path_buf();
+        }
+    }
 }
 
 /// `proxy_next_upstream` bitmask. nginx's defaults are `error | timeout`.

@@ -8,22 +8,12 @@ use super::*;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+/// One `server {}` block, with only its own settings: the http-level ones
+/// are merged in once the whole `http {}` block is read
+/// (`parse_http_block`), as nginx's `ngx_http_merge_servers` does, so a
+/// directive below the server still applies to it.
 pub(crate) fn parse_server_block(
     lx: &mut Lexer,
-    inherited_root: Option<PathBuf>,
-    inherited_ssl_certs: &[PathBuf],
-    inherited_ssl_keys: &[PathBuf],
-    inherited_ssl_protocols: Option<TlsVersionSet>,
-    inherited_ssl_ciphers: Option<&str>,
-    inherited_ssl_prefer_server_ciphers: Option<bool>,
-    inherited_ssl_session_timeout_ms: Option<u64>,
-    inherited_resumption: SessionResumption,
-    inherited_client_max_body_size: Option<u64>,
-    inherited_keepalive_timeout: Option<KeepaliveTimeout>,
-    inherited_keepalive_requests: Option<u64>,
-    inherited_keepalive_time_ms: Option<u64>,
-    inherited_keepalive_disable: Option<KeepaliveDisable>,
-    inherited_client_timeouts: ClientTimeouts,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Server>, Error> {
     let mut client_timeouts = ClientTimeouts::default();
@@ -39,7 +29,7 @@ pub(crate) fn parse_server_block(
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
     let mut index: Option<Vec<IndexEntry>> = None;
-    let mut root = inherited_root;
+    let mut root: Option<PathBuf> = None;
     let mut locations: Vec<Location> = Vec::new();
     let mut add_headers: Option<Vec<AddHeader>> = None;
     let mut add_trailers: Option<Vec<AddHeader>> = None;
@@ -81,10 +71,6 @@ pub(crate) fn parse_server_block(
         if args.is_empty() {
             return match term {
                 Terminator::BlockClose => {
-                    if !saw_local_ssl_cert_or_key {
-                        ssl_certs = inherited_ssl_certs.to_vec();
-                        ssl_keys = inherited_ssl_keys.to_vec();
-                    }
                     if listens.is_empty() {
                         listens.push(Listen::from_addr(default_listen_addr()));
                     }
@@ -108,21 +94,12 @@ pub(crate) fn parse_server_block(
                     let ssl = ServerSsl {
                         certs: ssl_certs,
                         keys: ssl_keys,
-                        protocols: ssl_protocols
-                            .or(inherited_ssl_protocols)
-                            .unwrap_or_default(),
-                        ciphers: ssl_ciphers
-                            .or_else(|| inherited_ssl_ciphers.map(|v| v.to_string())),
-                        prefer_server_ciphers: ssl_prefer_server_ciphers
-                            .or(inherited_ssl_prefer_server_ciphers),
-                        session_timeout_ms: ssl_session_timeout_ms
-                            .or(inherited_ssl_session_timeout_ms),
-                        resumption: resumption.inherit(inherited_resumption),
+                        protocols: ssl_protocols,
+                        ciphers: ssl_ciphers,
+                        prefer_server_ciphers: ssl_prefer_server_ciphers,
+                        session_timeout_ms: ssl_session_timeout_ms,
+                        resumption,
                     };
-                    let kat = keepalive_timeout.or(inherited_keepalive_timeout);
-                    let kar = keepalive_requests.or(inherited_keepalive_requests);
-                    let katm = keepalive_time_ms.or(inherited_keepalive_time_ms);
-                    let kad = keepalive_disable.or(inherited_keepalive_disable);
                     let mut listens_iter = listens.into_iter();
                     let first_listen = listens_iter
                         .next()
@@ -137,12 +114,12 @@ pub(crate) fn parse_server_block(
                         add_trailers,
                         error_pages,
                         rewrite_ops,
-                        keepalive_timeout: kat,
-                        keepalive_requests: kar,
-                        keepalive_time_ms: katm,
-                        keepalive_disable: kad,
+                        keepalive_timeout,
+                        keepalive_requests,
+                        keepalive_time_ms,
+                        keepalive_disable,
                         ssl_directives: saw_any_ssl_directive || saw_local_ssl_cert_or_key,
-                        client_timeouts: client_timeouts.inherit(inherited_client_timeouts),
+                        client_timeouts,
                         merge_slashes,
                         ignore_invalid_headers,
                         underscores_in_headers,
@@ -548,10 +525,12 @@ pub(crate) fn parse_server_block(
                 // server block (or http above it) at prepare time, not
                 // here — pass `None` so only nested locations propagate
                 // through this chain.
+                // The root is filled in when the http block closes
+                // (`Location::inherits_root`): the server's may come below.
                 parse_location_block(
                     spec,
                     lx,
-                    root.clone(),
+                    None,
                     None,
                     None,
                     None,
@@ -562,7 +541,7 @@ pub(crate) fn parse_server_block(
                     None,
                     None,
                     &AccessConf::default(),
-                    client_max_body_size.or(inherited_client_max_body_size),
+                    None,
                     None,
                     None,
                     None,
