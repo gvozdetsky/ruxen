@@ -288,3 +288,98 @@ fn x_accel_redirect_refuses_unsafe_uris() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Keep-alive backend counting accepted connections: answers every
+/// request on a connection with an X-Accel-Redirect to `/internal/k`,
+/// with an empty body for `/empty` and a 13-byte one otherwise.
+fn spawn_keepalive_backend() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let mut s = s;
+                loop {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if s.read(&mut byte).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let body = if head.windows(6).any(|w| w == b"/empty") {
+                        ""
+                    } else {
+                        "upstream body"
+                    };
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /internal/k\r\n\
+                         Content-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+        }
+    });
+    (port, accepts)
+}
+
+#[test]
+fn x_accel_redirect_keeps_a_bodiless_upstream_connection() {
+    use std::sync::atomic::Ordering;
+    let (up, accepts) = spawn_keepalive_backend();
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let dir = std::env::temp_dir().join(format!("ruxen-m61k-{}-{port}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // One worker: the keep-alive pool is per worker.
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "worker_processes 1;\nevents {{}}\nhttp {{\n\
+             upstream up {{ server 127.0.0.1:{up}; keepalive 4; }}\n\
+             server {{ listen 127.0.0.1:{port};\n\
+               location / {{ proxy_pass http://up; proxy_http_version 1.1; \
+                 proxy_set_header Connection \"\"; }}\n\
+               location /internal/ {{ internal; return 200 \"internal\"; }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+        .arg("-c")
+        .arg(dir.join("nginx.conf"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let server = Server { child, port, dir };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "ruxen did not start");
+        sleep(Duration::from_millis(20));
+    }
+
+    // Without a body, nginx keeps the upstream connection
+    // (ngx_http_proxy_module.c:1999): both redirects use one connection.
+    for _ in 0..2 {
+        assert_eq!(body(&send(server.port, "GET", "/empty")), "internal");
+    }
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+
+    // With a body it is never read, so the connection is closed: the
+    // first one still uses the pooled connection, the second needs a new
+    // one.
+    for _ in 0..2 {
+        assert_eq!(body(&send(server.port, "GET", "/full")), "internal");
+    }
+    assert_eq!(accepts.load(Ordering::SeqCst), 2);
+}

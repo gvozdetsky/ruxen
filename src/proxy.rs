@@ -1232,10 +1232,17 @@ async fn attempt(
     // need a separate decoded buffer because the wire bytes carry chunk
     // sizes that would otherwise leak into the forwarded body.
     // `X-Accel-Redirect` (unless ignored): nginx redirects as soon as it
-    // has the header and closes the upstream connection; the body is never
-    // read, which makes the connection unusable for the pool.
+    // has the header and never reads the body, so a response that may have
+    // one leaves the connection unusable for the pool. A bodiless one (204,
+    // 304, HEAD, or not chunked with Content-Length 0) keeps it, as nginx
+    // does (ngx_http_proxy_module.c:1999), provided nothing was read past
+    // the header.
     let skip_body = accel.as_ref().is_some_and(|a| a.redirect.is_some());
-    if skip_body {
+    let bodiless = matches!(plan.method, Method::Head)
+        || status_code == 204
+        || status_code == 304
+        || (!chunked && content_length == Some(0));
+    if skip_body && !(bodiless && accum.len() == body_start) {
         upstream_close = true;
     }
     let body_has_content = !skip_body
