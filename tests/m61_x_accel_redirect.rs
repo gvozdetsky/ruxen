@@ -375,9 +375,11 @@ fn x_accel_redirect_keeps_a_bodiless_upstream_connection() {
     }
     assert_eq!(accepts.load(Ordering::SeqCst), 1);
 
-    // With a body it is never read, so the connection is closed.
+    // With a body it is never read, so the connection is closed: the
+    // first one still uses the pooled connection, the second needs a new
+    // one.
     for _ in 0..2 {
         assert_eq!(body(&send(server.port, "GET", "/full")), "internal");
     }
-    assert_eq!(accepts.load(Ordering::SeqCst), 3);
+    assert_eq!(accepts.load(Ordering::SeqCst), 2);
 }
