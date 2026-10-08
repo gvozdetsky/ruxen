@@ -26,9 +26,13 @@ sentence a PR description can contain.
 
 ## Setup
 
-You need Linux with `io_uring` (any recent kernel; Docker blocks io_uring by
-default — use `--security-opt seccomp=unconfined`), a stable Rust toolchain,
-and `curl`.
+You need Linux with `io_uring` (any recent kernel), a stable Rust toolchain,
+and `curl`. Docker's default seccomp profile blocks `io_uring`; from the
+repository root, pass
+`--security-opt seccomp=contrib/docker/seccomp-io_uring.json` to `docker run`
+to use the bundled profile, which allows the required `io_uring` syscalls
+while keeping the other default restrictions. See the README's
+[Docker instructions](README.md#run-as-a-service) for a complete example.
 
 ```bash
 git clone https://github.com/gvozdetsky/ruxen.git
