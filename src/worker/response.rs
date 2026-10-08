@@ -625,32 +625,6 @@ pub(crate) fn effective_error_page_status(
     }
 }
 
-pub(crate) fn status_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        206 => "Partial Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        304 => "Not Modified",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Not Allowed",
-        410 => "Gone",
-        416 => "Range Not Satisfiable",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "OK",
-    }
-}
-
 ///
 /// The 204 rule of nginx's header filter follows the status that goes
 /// out: a response turned into a 204 loses Content-Type, Content-Length,
@@ -667,7 +641,7 @@ pub(crate) fn rewrite_response_status(response: Vec<u8>, status: u16) -> Vec<u8>
     out.extend_from_slice(b"HTTP/1.1 ");
     write_u16_decimal(&mut out, status);
     out.push(b' ');
-    out.extend_from_slice(status_reason(status).as_bytes());
+    out.extend_from_slice(crate::http::reason_phrase(status).as_bytes());
     if status == 204 && old_status != 204 {
         let head_end = response
             .windows(4)

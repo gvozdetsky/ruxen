@@ -677,22 +677,7 @@ fn write_status_line(out: &mut Vec<u8>, status: u16) {
     out.extend_from_slice(b"HTTP/1.1 ");
     write_u16(out, status);
     out.push(b' ');
-    out.extend_from_slice(reason_phrase(status));
-}
-
-fn reason_phrase(status: u16) -> &'static [u8] {
-    match status {
-        200 => b"OK",
-        206 => b"Partial Content",
-        304 => b"Not Modified",
-        403 => b"Forbidden",
-        404 => b"Not Found",
-        405 => b"Method Not Allowed",
-        412 => b"Precondition Failed",
-        416 => b"Range Not Satisfiable",
-        500 => b"Internal Server Error",
-        _ => b"Unknown",
-    }
+    out.extend_from_slice(crate::http::reason_phrase(status).as_bytes());
 }
 
 fn write_u16(out: &mut Vec<u8>, mut n: u16) {
@@ -1807,7 +1792,7 @@ mod tests {
         let meta = meta(10, 100);
         let out = build_range_not_satisfiable_response(&meta, b"nginx/1.29.2");
         let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"));
+        assert!(s.starts_with("HTTP/1.1 416 Requested Range Not Satisfiable\r\n"));
         assert!(s.contains("Content-Range: bytes */10\r\n"));
         assert!(s.contains("Content-Length: 0\r\n"));
     }

@@ -173,14 +173,14 @@ http {
     let (_guard, port) = spawn_server(conf);
 
     let escaped = http_get(port, "/t1?r=http%3A%2F%2Fexample.com%2F%3Ffrom");
-    assert_eq!(status_line(&escaped), "HTTP/1.1 302 Found");
+    assert_eq!(status_line(&escaped), "HTTP/1.1 302 Moved Temporarily");
     assert_eq!(
         header_value(&escaped, "Location"),
         Some("http://example.com/?from")
     );
 
     let split = http_get(port, "/t1?r=http%3A%2F%2Fexample.com%0D%0Asplit");
-    assert_eq!(status_line(&split), "HTTP/1.1 302 Found");
+    assert_eq!(status_line(&split), "HTTP/1.1 302 Moved Temporarily");
     assert_eq!(
         header_value(&split, "Location"),
         Some("http://example.com%0D%0Asplit")

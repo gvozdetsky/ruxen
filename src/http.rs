@@ -1448,17 +1448,10 @@ pub fn write_redirect_response(
     server: &[u8],
 ) {
     let body_len = REDIRECT_BODY.len();
-    let reason = match status {
-        301 => "Moved Permanently",
-        302 => "Found",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        _ => "Moved Permanently",
-    };
     out.extend_from_slice(b"HTTP/1.1 ");
     write_u16(out, status);
     out.push(b' ');
-    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(reason_phrase(status).as_bytes());
     write_server_and_date(out, server);
     out.extend_from_slice(b"\r\nLocation: ");
     out.extend_from_slice(location);
@@ -1568,27 +1561,87 @@ fn write_head_with_content_type(
     out.extend_from_slice(b"\r\n\r\n");
 }
 
-fn reason_phrase(status: u16) -> &'static str {
-    let reason = match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Not Allowed",
-        412 => "Precondition Failed",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "OK",
+/// Reason phrases for the status line, copied from `ngx_http_status_lines[]`
+/// in `ngx_http_header_filter_module.c`. Like nginx, the table only holds
+/// 200-206, 301-308, 400-429 and 500-507 back to back, and "" stands for
+/// the codes nginx leaves out (its `ngx_null_string` entries).
+const STATUS_REASONS: [&str; 53] = [
+    // 2xx, from 200
+    "OK",
+    "Created",
+    "Accepted",
+    "", // 203
+    "No Content",
+    "", // 205
+    "Partial Content",
+    // 3xx, from 301
+    "Moved Permanently",
+    "Moved Temporarily",
+    "See Other",
+    "Not Modified",
+    "", // 305
+    "", // 306
+    "Temporary Redirect",
+    "Permanent Redirect",
+    // 4xx, from 400
+    "Bad Request",
+    "Unauthorized",
+    "Payment Required",
+    "Forbidden",
+    "Not Found",
+    "Not Allowed",
+    "Not Acceptable",
+    "", // 407
+    "Request Time-out",
+    "Conflict",
+    "Gone",
+    "Length Required",
+    "Precondition Failed",
+    "Request Entity Too Large",
+    "Request-URI Too Large",
+    "Unsupported Media Type",
+    "Requested Range Not Satisfiable",
+    "", // 417
+    "", // 418
+    "", // 419
+    "", // 420
+    "Misdirected Request",
+    "", // 422
+    "", // 423
+    "", // 424
+    "", // 425
+    "", // 426
+    "", // 427
+    "", // 428
+    "Too Many Requests",
+    // 5xx, from 500
+    "Internal Server Error",
+    "Not Implemented",
+    "Bad Gateway",
+    "Service Temporarily Unavailable",
+    "Gateway Time-out",
+    "HTTP Version Not Supported",
+    "", // 506
+    "Insufficient Storage",
+];
+
+// Where each range starts in STATUS_REASONS (nginx's NGX_HTTP_OFF_*).
+const OFF_3XX: u16 = 207 - 200;
+const OFF_4XX: u16 = 309 - 301 + OFF_3XX;
+const OFF_5XX: u16 = 430 - 400 + OFF_4XX;
+
+/// Reason phrase nginx puts after `status` in the status line. Codes nginx
+/// doesn't know get "", so the line ends up as `HTTP/1.1 418 ` like nginx's
+/// `"%03ui "` fallback. Every status-line writer goes through this.
+pub(crate) fn reason_phrase(status: u16) -> &'static str {
+    let i = match status {
+        200..=206 => status - 200,
+        301..=308 => status - 301 + OFF_3XX,
+        400..=429 => status - 400 + OFF_4XX,
+        500..=507 => status - 500 + OFF_5XX,
+        _ => return "",
     };
-    reason
+    STATUS_REASONS[i as usize]
 }
 
 fn write_u16(out: &mut Vec<u8>, mut n: u16) {
@@ -1628,6 +1681,47 @@ mod tests {
     fn parse_fresh(buf: &[u8]) -> Parse {
         let mut st = ParseState::default();
         parse_request(buf, &mut st)
+    }
+
+    #[test]
+    fn reason_phrase_follows_nginx_table() {
+        // first and last code of each range, so a wrong offset shows up
+        let cases = [
+            (199, ""),
+            (200, "OK"),
+            (206, "Partial Content"),
+            (207, ""),
+            (300, ""),
+            (301, "Moved Permanently"),
+            (302, "Moved Temporarily"),
+            (308, "Permanent Redirect"),
+            (309, ""),
+            (399, ""),
+            (400, "Bad Request"),
+            (429, "Too Many Requests"),
+            (430, ""),
+            (499, ""),
+            (500, "Internal Server Error"),
+            (507, "Insufficient Storage"),
+            (508, ""),
+            (599, ""),
+            // holes inside the ranges (null entries in nginx)
+            (203, ""),
+            (205, ""),
+            (407, ""),
+            (418, ""),
+            (422, ""),
+            (506, ""),
+            // phrases that used to differ between ruxen's old tables
+            (405, "Not Allowed"),
+            (413, "Request Entity Too Large"),
+            (416, "Requested Range Not Satisfiable"),
+            (503, "Service Temporarily Unavailable"),
+            (504, "Gateway Time-out"),
+        ];
+        for (status, want) in cases {
+            assert_eq!(reason_phrase(status), want, "{status}");
+        }
     }
 
     #[test]
