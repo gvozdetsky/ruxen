@@ -185,7 +185,7 @@ fn m12_return_redirect_form_uses_location_header() {
     let (_g, port) = spawn_server(M12_CONF);
 
     let resp = http_get(port, "/return302");
-    assert_eq!(status_line(&resp), "HTTP/1.1 302 Found");
+    assert_eq!(status_line(&resp), "HTTP/1.1 302 Moved Temporarily");
     assert_eq!(header_value(&resp, "Location"), Some("http://example.com/"));
 }
 
@@ -220,7 +220,7 @@ fn m12_error_page_redirect_targets_clear_old_location_and_update_args() {
     let (_g, port) = spawn_server(M12_CONF);
 
     let redirect = http_get(port, "/redir");
-    assert_eq!(status_line(&redirect), "HTTP/1.1 302 Found");
+    assert_eq!(status_line(&redirect), "HTTP/1.1 302 Moved Temporarily");
     assert_eq!(
         header_value(&redirect, "Location"),
         Some("http://example.com/")
@@ -232,7 +232,7 @@ fn m12_error_page_redirect_targets_clear_old_location_and_update_args() {
     );
 
     let var_redirect = http_get(port, "/varredir?a=2");
-    assert_eq!(status_line(&var_redirect), "HTTP/1.1 302 Found");
+    assert_eq!(status_line(&var_redirect), "HTTP/1.1 302 Moved Temporarily");
     assert_eq!(
         header_value(&var_redirect, "Location"),
         Some("http://example.com/2")

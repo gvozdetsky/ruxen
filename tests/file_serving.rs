@@ -657,7 +657,10 @@ fn m5_unsatisfiable_range_returns_416() {
         port,
         b"GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=100-200\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 416 Range Not Satisfiable");
+    assert_eq!(
+        status_line(&r),
+        "HTTP/1.1 416 Requested Range Not Satisfiable"
+    );
     assert_eq!(header(&r, "Content-Range").as_deref(), Some("bytes */11"));
 }
 
