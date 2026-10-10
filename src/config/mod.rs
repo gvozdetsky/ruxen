@@ -902,7 +902,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // boilerplate `proxy_cache_bypass $http_upgrade;` is in many configs.
     "proxy_cache_bypass",
     "proxy_no_cache",
-    "proxy_method",
     "proxy_force_ranges",
     "proxy_cookie_domain",
     "proxy_cookie_path",

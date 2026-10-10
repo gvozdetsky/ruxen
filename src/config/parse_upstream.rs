@@ -456,6 +456,7 @@ impl ProxyConf {
         "proxy_redirect",
         "proxy_hide_header",
         "proxy_pass_header",
+        "proxy_method",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -587,6 +588,10 @@ impl ProxyConf {
                 }
                 self.intercept_errors =
                     Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
+            }
+            "proxy_method" => {
+                let name = args.get(1).ok_or(Error::MissingArg("proxy_method"))?;
+                self.proxy_method = Some(name.clone());
             }
             other => unreachable!("not a ProxyConf directive: {other}"),
         }
