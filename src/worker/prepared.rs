@@ -630,6 +630,9 @@ pub struct PreparedProxy {
     pub request_path: &'static [u8],
     /// What to do with the upstream's response headers.
     pub response: &'static ProxyResponseRules,
+    /// Inheritance-resolved `proxy_method`: rendered per request and sent
+    /// instead of the client's request method.
+    pub proxy_method: Option<&'static [PreparedValuePart]>,
 }
 
 /// One prepared `proxy_set_header NAME VALUE;` entry. Name is a static
@@ -676,6 +679,7 @@ pub(crate) struct ProxyEffective {
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
     pub recursive_error_pages: bool,
+    pub proxy_method: Option<&'static [PreparedValuePart]>,
 }
 
 impl ProxyEffective {
@@ -705,6 +709,7 @@ impl ProxyEffective {
             pass_headers: None,
             error_pages: &[],
             recursive_error_pages: false,
+            proxy_method: None,
         }
     }
 }

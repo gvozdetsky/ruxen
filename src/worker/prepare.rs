@@ -550,6 +550,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                proxy_method: eff.proxy_method,
             }
         }
         ProxyPass::UpstreamRef {
@@ -584,6 +585,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                proxy_method: eff.proxy_method,
             }
         }
     })
@@ -730,6 +732,7 @@ pub(crate) struct ServerProxyDefaults {
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    pub proxy_method: Option<&'static [PreparedValuePart]>,
 }
 
 /// `proxy_ignore_headers` as set at one scope: whether it lists `field`
@@ -785,6 +788,7 @@ impl ServerProxyDefaults {
             redirect: conf.redirect.map(|r| &*Box::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
+            proxy_method: conf.proxy_method.map(prepare_value_parts),
         }
     }
 }
@@ -861,6 +865,10 @@ pub(crate) fn resolve_proxy_effective(
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
+        proxy_method: location
+            .proxy_method
+            .map(prepare_value_parts)
+            .or(server_defaults.proxy_method),
     }
 }
 

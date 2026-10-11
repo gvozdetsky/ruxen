@@ -101,7 +101,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 0/0
 - `proxy_if.t` — 15/17
-- `proxy_method.t` — 3/6
+- `proxy_method.t` — 1/6
 - `proxy_next_upstream_tries.t` — 8/10
 - `proxy_protocol.t` — 24/26
 - `proxy_protocol2.t` — 28/30

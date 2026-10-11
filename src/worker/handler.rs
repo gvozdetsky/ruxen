@@ -688,8 +688,19 @@ pub(crate) fn run_location_handler(
             );
         }
 
+        let proxy_method: Option<Vec<u8>> = proxy.proxy_method.map(|parts| {
+            let mut proxy_method = Vec::new();
+            render_parts(parts, &proxy_render_ctx, &mut proxy_method);
+            proxy_method
+        });
+
+        let forward_method: &[u8] = match &proxy_method {
+            Some(method) => method.as_slice(),
+            None => req.method_bytes,
+        };
+
         let request = crate::proxy::build_request_bytes_with_headers(
-            req.method_bytes,
+            forward_method,
             request_uri,
             proxy.http_version,
             &headers,

@@ -81,7 +81,7 @@ pub struct ProxyConf {
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
-    pub proxy_method: Option<String>,
+    pub proxy_method: Option<Vec<ValuePart>>,
 }
 
 impl ProxyConf {

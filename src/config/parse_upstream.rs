@@ -590,8 +590,17 @@ impl ProxyConf {
                     Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
             }
             "proxy_method" => {
-                let name = args.get(1).ok_or(Error::MissingArg("proxy_method"))?;
-                self.proxy_method = Some(name.clone());
+                if self.proxy_method.is_some() {
+                    return Err(Error::Duplicate("proxy_method"));
+                }
+                let method = args.get(1).ok_or(Error::MissingArg("proxy_method"))?;
+                if args.len() != 2 {
+                    return Err(Error::BadValue {
+                        what: "proxy_method",
+                        got: args[1..].join(" "),
+                    });
+                }
+                self.proxy_method = Some(parse_value_with_vars(&method)?);
             }
             other => unreachable!("not a ProxyConf directive: {other}"),
         }
