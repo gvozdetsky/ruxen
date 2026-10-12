@@ -339,6 +339,21 @@ pub(crate) fn parse_proxy_set_header_args(args: &[String]) -> Result<ProxySetHea
     Ok(ProxySetHeader { name, value })
 }
 
+/// `client_body_buffer_size size;` (ngx_conf_set_size_slot).
+pub(crate) fn parse_client_body_buffer_size_args(args: &[String]) -> Result<u64, Error> {
+    match args {
+        [v] => parse_size(v.as_bytes()).ok_or(Error::BadValue {
+            what: "client_body_buffer_size",
+            got: v.clone(),
+        }),
+        [] => Err(Error::MissingArg("client_body_buffer_size")),
+        _ => Err(Error::BadValue {
+            what: "client_body_buffer_size",
+            got: args.join(" "),
+        }),
+    }
+}
+
 pub(crate) fn parse_client_max_body_size_args(args: &[String]) -> Result<u64, Error> {
     if args.len() != 1 {
         return Err(Error::BadValue {

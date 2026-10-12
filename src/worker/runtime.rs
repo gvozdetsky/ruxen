@@ -2298,6 +2298,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // `client_body_in_file_only on` where the request goes:
                         // a temp file holding the body outlives it.
                         let mut persistent_body = false;
+                        // Bodies above it go to a temp file (#246).
+                        let mut body_buffer = crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE;
                         // And its `client_body_temp_path`, else the http one.
                         let mut body_temp = &http.body_temp;
                         let has_body = req.content_length.is_some_and(|cl| cl > 0)
@@ -2309,6 +2311,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
                                 persistent_body = first.persistent;
+                                body_buffer = first.buffer;
                                 body_temp = first.body_temp.unwrap_or(body_temp);
                                 max_body = match first.max {
                                     0 => u64::MAX,
@@ -2466,11 +2469,20 @@ pub(crate) async fn handle<S: ConnIo>(
                         // temp-file path bytes for `$request_body_file`.
                         let request_body_file = match spooled {
                             Some(file) => Some(file),
-                            None => maybe_spill_request_body_to_file(
-                                &body_vec,
-                                body_temp,
-                                persistent_body,
-                            ),
+                            // A body in memory goes to a file only when
+                            // something reads it there: `$request_body_file`
+                            // in the config, or client_body_in_file_only
+                            // (buffer 0). Otherwise the file would only cost
+                            // a create, write, unlink and close (#246).
+                            None if http.uses_request_body_file || body_buffer == 0 => {
+                                maybe_spill_request_body_to_file(
+                                    &body_vec,
+                                    body_temp,
+                                    persistent_body,
+                                    body_buffer,
+                                )
+                            }
+                            None => None,
                         };
                         let body_file = request_body_file.as_ref();
                         let request_total_consumed = req.consumed + body_in_buf;

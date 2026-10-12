@@ -56,6 +56,7 @@ pub(crate) fn parse_server_block(
     let mut auth_delay_ms: Option<u64> = None;
     let mut access = AccessConf::default();
     let mut client_max_body_size: Option<u64> = None;
+    let mut client_body_buffer_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
@@ -138,6 +139,7 @@ pub(crate) fn parse_server_block(
                         auth_delay_ms,
                         access,
                         client_max_body_size,
+                        client_body_buffer_size,
                         client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
                         disable_symlinks: disable_symlinks.clone(),
@@ -472,6 +474,12 @@ pub(crate) fn parse_server_block(
             ) => {
                 parse_access_directive(&mut access, &args, lx)?;
             }
+            ("client_body_buffer_size", Terminator::Semi) => {
+                if client_body_buffer_size.is_some() {
+                    return Err(Error::Duplicate("client_body_buffer_size"));
+                }
+                client_body_buffer_size = Some(parse_client_body_buffer_size_args(&args[1..])?);
+            }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
                     return Err(Error::Duplicate("client_max_body_size"));
@@ -543,6 +551,7 @@ pub(crate) fn parse_server_block(
                     None,
                     None,
                     &AccessConf::default(),
+                    None,
                     None,
                     None,
                     None,

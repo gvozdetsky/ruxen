@@ -1452,6 +1452,9 @@ pub struct ServerNameCaptures {
 pub(crate) struct FirstBodyLimit {
     /// In bytes; `0` turns the check off.
     pub max: u64,
+    /// `client_body_buffer_size`: a body above it goes to a temp file;
+    /// with `client_body_in_file_only on|clean`, 0: every body does.
+    pub buffer: u64,
     pub error_logs: &'static [PreparedErrorLog],
     pub server_name: &'static [u8],
     /// `client_body_in_file_only on`: a temp file holding the body
@@ -1514,6 +1517,14 @@ pub(crate) fn first_body_limit(
         max: loc
             .client_max_body_size
             .unwrap_or(crate::worker::DEFAULT_CLIENT_MAX_BODY_SIZE),
+        // nginx writes the body to a file whatever its size when
+        // `request_body_in_file_only` is set (ngx_http_read_client_request_body).
+        buffer: match loc.client_body_in_file_only {
+            crate::config::ClientBodyInFileOnly::Off => loc
+                .client_body_buffer_size
+                .unwrap_or(crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE),
+            _ => 0,
+        },
         error_logs: loc.error_logs,
         server_name: server.primary_server_name,
         persistent: matches!(

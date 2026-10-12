@@ -196,6 +196,11 @@ pub struct HttpConfig {
     pub access: AccessConf,
     /// http-scope `client_max_body_size` in bytes. `None` means "not set".
     pub client_max_body_size: Option<u64>,
+    /// http-scope `client_body_buffer_size`: request bodies up to this
+    /// size stay in memory. `None` means "not set" (nginx: 16k).
+    pub client_body_buffer_size: Option<u64>,
+    /// `$request_body_file` appears somewhere in the config.
+    pub uses_request_body_file: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,
@@ -599,6 +604,8 @@ pub struct Server {
     pub access: AccessConf,
     /// Server-scope `client_max_body_size` in bytes. `None` inherits from http.
     pub client_max_body_size: Option<u64>,
+    /// Server-scope `client_body_buffer_size`. `None` inherits from http.
+    pub client_body_buffer_size: Option<u64>,
     /// Server-scope `client_body_temp_path`. `None` inherits from http.
     pub client_body_temp_path: Option<TempPath>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
@@ -727,6 +734,9 @@ pub struct Location {
     /// Location-scope `client_max_body_size` in bytes. `None` inherits from
     /// server.
     pub client_max_body_size: Option<u64>,
+    /// Location-scope `client_body_buffer_size`, inherited through nested
+    /// locations. `None` inherits from server.
+    pub client_body_buffer_size: Option<u64>,
     /// Location-scope `sendfile on|off`, inherited through nested locations
     /// at parse time. `None` inherits from server/http at prepare time.
     pub sendfile: Option<bool>,
