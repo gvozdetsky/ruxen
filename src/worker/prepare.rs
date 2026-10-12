@@ -2106,7 +2106,10 @@ fn open_log_file(path: &Path) -> Result<(), String> {
         .append(true)
         .open(path)
         .map(drop)
-        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))
+        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))?;
+    // Reopened after logrotate by the `user` ruxen switches to.
+    crate::privileges::note_file(path);
+    Ok(())
 }
 
 pub(crate) fn prepare_error_log_target(

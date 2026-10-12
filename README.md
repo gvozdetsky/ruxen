@@ -86,7 +86,7 @@ cargo build --release
 # the binary is target/release/ruxen
 ```
 
-ruxen does not switch to an unprivileged user the way nginx's `user` directive does, so it refuses to start as root unless the configuration says `user root;`. Start it as an unprivileged user instead; the service and container setups below do.
+Started as root, ruxen binds its ports, opens certificates and logs, then switches to the configured `user` (nginx's default `nobody`) before it accepts a connection, as nginx's workers do. ruxen's workers are threads of one process, so the whole process switches and no part of it keeps root. Two consequences differ from nginx, whose master stays root: after logrotate moves a log, the user must be able to open the new file (use logrotate's `create <mode> <user> <group>` or `copytruncate`, or a log directory the user owns), and a pid file in a directory only root can write is left behind on exit, with an `[alert]`. Started as an unprivileged user, as the service and container setups below do, ruxen ignores `user` with nginx's warning.
 
 ### Run
 
@@ -382,7 +382,6 @@ The following are intentionally outside the current v0.1 scope:
 - hot certificate reload
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
-- switching workers to an unprivileged `user`
 
 Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 

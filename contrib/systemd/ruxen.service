@@ -35,8 +35,8 @@ Restart=on-failure
 RestartSec=2s
 
 # An unprivileged user made for the service, allowed to bind ports below
-# 1024. ruxen then needs no `user` directive (which it doesn't support
-# yet; started as root without `user root;` it refuses to run).
+# 1024. ruxen then needs no `user` directive: it applies only when ruxen
+# starts as root, and is ignored with a warning otherwise.
 DynamicUser=yes
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

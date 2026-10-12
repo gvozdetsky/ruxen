@@ -113,6 +113,14 @@ impl ProxyConf {
     }
 }
 
+/// `user name [group];`. Without a group, nginx uses a group named like
+/// the user (`ngx_set_user`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDirective {
+    pub name: String,
+    pub group: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct RuntimeOpts {
     pub pid: Option<PathBuf>,
@@ -126,10 +134,9 @@ pub struct RuntimeOpts {
     /// Top-level `error_log` lines: worker-level messages, and the
     /// fallback for servers and http without their own.
     pub error_logs: Vec<ErrorLog>,
-    /// `user name [group];` — the user name only. ruxen doesn't switch
-    /// users; `main` uses this to decide whether running as root is
-    /// what the config asked for.
-    pub user: Option<String>,
+    /// `user name [group];`: who serves requests when ruxen starts as
+    /// root (`privileges`). Ignored with a warning otherwise, as in nginx.
+    pub user: Option<UserDirective>,
     /// `worker_rlimit_nofile N;`: the open-files limit set before the
     /// workers start.
     pub worker_rlimit_nofile: Option<u64>,

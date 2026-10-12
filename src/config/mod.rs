@@ -210,14 +210,23 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 runtime.worker_shutdown_timeout_ms =
                     Some(parse_duration_ms(raw, "worker_shutdown_timeout")?);
             }
-            // `user name [group];` — recorded so `main` can refuse a switch
-            // it can't make (see `check_privileges`).
+            // `user name [group];`: applied by `main` after binding (see
+            // `privileges`).
             ("user", Terminator::Semi) => {
                 if runtime.user.is_some() {
                     return Err(Error::Duplicate("user"));
                 }
-                let user = args.get(1).ok_or(Error::MissingArg("user"))?;
-                runtime.user = Some(user.clone());
+                let name = args.get(1).ok_or(Error::MissingArg("user"))?;
+                if args.len() > 3 {
+                    return Err(Error::BadValue {
+                        what: "user",
+                        got: args[1..].join(" "),
+                    });
+                }
+                runtime.user = Some(UserDirective {
+                    name: name.clone(),
+                    group: args.get(2).cloned(),
+                });
             }
             ("user", _) => {
                 return Err(Error::WrongTerminator {
