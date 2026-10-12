@@ -199,6 +199,8 @@ pub struct HttpConfig {
     /// http-scope `client_body_buffer_size`: request bodies up to this
     /// size stay in memory. `None` means "not set" (nginx: 16k).
     pub client_body_buffer_size: Option<u64>,
+    /// `$request_body_file` appears somewhere in the config.
+    pub uses_request_body_file: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,

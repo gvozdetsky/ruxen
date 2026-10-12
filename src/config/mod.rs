@@ -247,6 +247,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
 
     let mut http = http.ok_or(Error::UnexpectedEof)?;
     http.warnings.extend(lx.take_warnings());
+    http.uses_request_body_file = values::request_body_file_used();
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -375,6 +376,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         access,
                         client_max_body_size,
                         client_body_buffer_size,
+                        // Set once the whole config is read.
+                        uses_request_body_file: false,
                         client_body_temp_path,
                         sendfile,
                         disable_symlinks,

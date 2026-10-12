@@ -1410,6 +1410,10 @@ pub struct PreparedHttp {
     /// read before routing, so this bounds the read, and the matched
     /// location checks its own limit afterwards.
     pub max_request_body: u64,
+    /// `$request_body_file` appears in the config. If not, a body that is
+    /// in memory is never also written to a temp file: nothing would read
+    /// it (#246).
+    pub uses_request_body_file: bool,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],

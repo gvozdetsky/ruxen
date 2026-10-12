@@ -174,6 +174,14 @@ thread_local! {
 struct VariableRegistry {
     referenced: Vec<String>,
     defined: std::collections::HashSet<String>,
+    /// `$request_body_file` appears somewhere in the config.
+    request_body_file: bool,
+}
+
+/// Whether the config just parsed reads `$request_body_file` anywhere: if
+/// not, a body that is already in memory needs no temp file (#246).
+pub(crate) fn request_body_file_used() -> bool {
+    VARIABLES.with(|v| v.borrow().request_body_file)
 }
 
 pub(crate) fn reset_variable_registry() {
@@ -372,7 +380,10 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"ssl_client_v_end" => Variable::SslClientVEnd,
         b"ssl_client_v_remain" => Variable::SslClientVRemain,
         b"request_body" => Variable::RequestBody,
-        b"request_body_file" => Variable::RequestBodyFile,
+        b"request_body_file" => {
+            VARIABLES.with(|v| v.borrow_mut().request_body_file = true);
+            Variable::RequestBodyFile
+        }
         b"remote_addr" => Variable::RemoteAddr,
         b"remote_port" => Variable::RemotePort,
         b"realip_remote_addr" => Variable::RealIpRemoteAddr,

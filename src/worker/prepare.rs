@@ -57,6 +57,7 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
+        uses_request_body_file,
         runtime,
         error_logs: http_error_logs,
         log_formats,
@@ -231,6 +232,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         worker_connections: runtime.worker_connections.unwrap_or(512),
         error_logs: main_error_logs,
         max_request_body,
+        uses_request_body_file,
         body_temp: BodyTempDir::new(client_body_temp_path),
         listens,
         access_logs: canonical_access_logs,
