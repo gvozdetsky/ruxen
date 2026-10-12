@@ -140,7 +140,7 @@ fn missing_root_is_not_a_config_error() {
 }
 
 #[test]
-fn busy_port_is_one_emerg_and_no_pid_file() {
+fn busy_port_is_nginx_emergs_and_no_pid_file() {
     // A plain listener has no SO_REUSEPORT, so ruxen's bind must fail.
     let held = {
         let _setup = common::ports::setup_lock();
@@ -155,11 +155,19 @@ fn busy_port_is_one_emerg_and_no_pid_file() {
     let mut cmd = ruxen(&dir, &conf, &[]);
     cmd.env("RUXEN_WORKERS", "4");
     let out = run_expecting_exit(cmd);
-    assert_emerg(
-        &out,
-        // The errno text is the libc's (glibc and musl word it differently).
-        &format!("bind() to 127.0.0.1:{port} failed (98: "),
+    // nginx's ngx_open_listening_sockets: five tries 500 ms apart, an
+    // [emerg] for each, then one more. Not one line per worker.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    // The errno text is the libc's (glibc and musl word it differently).
+    let busy = format!("ruxen: [emerg] bind() to 127.0.0.1:{port} failed (98: ");
+    assert_eq!(stderr.matches(&busy).count(), 5, "stderr: {stderr}");
+    assert!(
+        stderr.ends_with("ruxen: [emerg] still could not bind()\n"),
+        "stderr: {stderr}"
     );
+    assert_eq!(stderr.matches("[emerg]").count(), 6, "stderr: {stderr}");
     assert!(!dir.path().join("ruxen.pid").exists());
 }
 

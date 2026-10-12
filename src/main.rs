@@ -330,6 +330,9 @@ fn real_main() -> Result<(), Failure> {
 
     install_signal_handlers()?;
 
+    // Fail like nginx when another process already listens on a port.
+    worker::claim_addresses(&http.listens).map_err(|e| report_emerg(&e, &cli, &main_path))?;
+
     let runtime = Arc::new(worker::RuntimeState::default());
 
     let n_workers: usize = std::env::var("RUXEN_WORKERS")

@@ -1315,6 +1315,59 @@ async fn handle_proxy_protocol(
     }
 }
 
+/// Before the workers bind: makes sure no other process holds a listen
+/// address. Each worker binds its own `SO_REUSEPORT` socket, which a
+/// second ruxen (or anything else with `SO_REUSEPORT`, same user) could
+/// join, splitting the traffic without a word. nginx binds once without
+/// `SO_REUSEPORT` unless `reuseport` is set, so a second instance fails
+/// with `EADDRINUSE`. Here each such address is bound once without it and
+/// closed again, which fails the same way. Like nginx's
+/// ngx_open_listening_sockets: up to five tries 500 ms apart (an old
+/// instance may still be letting go), an `[emerg]` per failed bind, then
+/// `still could not bind()`. Addresses with `reuseport` are skipped, as
+/// nginx shares them too.
+pub(crate) fn claim_addresses(listens: &[PreparedListen]) -> Result<(), String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    for tries in (0..5).rev() {
+        let mut busy = false;
+        for prepared in listens.iter().filter(|l| !l.socket.reuseport) {
+            let addr = prepared.addr;
+            let domain = if addr.is_ipv6() {
+                Domain::IPV6
+            } else {
+                Domain::IPV4
+            };
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+                .map_err(|e| format!("socket() {addr} failed ({})", errno_text(&e)))?;
+            // nginx sets SO_REUSEADDR, so sockets in TIME_WAIT don't count.
+            let _ = socket.set_reuse_address(true);
+            if addr.is_ipv6() {
+                let _ = socket.set_only_v6(prepared.socket.ipv6only);
+            }
+            match socket.bind(&addr.into()) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EADDRINUSE) => {
+                    eprintln!(
+                        "ruxen: [emerg] bind() to {addr} failed ({})",
+                        errno_text(&e)
+                    );
+                    busy = true;
+                }
+                // Anything else (EADDRNOTAVAIL, EACCES) the workers' own
+                // bind reports with the same words.
+                Err(_) => {}
+            }
+        }
+        if !busy {
+            return Ok(());
+        }
+        if tries > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    Err("still could not bind()".to_string())
+}
+
 /// The listening socket for `prepared`, with its `listen` options, as
 /// nginx's ngx_open_listening_sockets and ngx_configure_listening_sockets:
 /// `IPV6_V6ONLY` before bind, the rest before listen. A failed option is an

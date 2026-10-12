@@ -1356,6 +1356,11 @@ pub struct ListenSocket {
     /// `IPV6_V6ONLY` for an IPv6 address: on unless `ipv6only=off`, as
     /// nginx (a `[::]` listen doesn't take IPv4 clients).
     pub ipv6only: bool,
+    /// `reuseport`: other processes may share the address. The workers
+    /// always bind with `SO_REUSEPORT` (one accept queue each); without
+    /// this option, startup first makes sure no one else holds the
+    /// address (`runtime::claim_addresses`).
+    pub reuseport: bool,
 }
 
 impl ListenSocket {
@@ -1370,6 +1375,7 @@ impl ListenSocket {
             fastopen: listen.and_then(|l| l.fastopen),
             keepalive: listen.and_then(|l| l.so_keepalive),
             ipv6only: listen.and_then(|l| l.ipv6only).unwrap_or(true),
+            reuseport: listen.is_some_and(|l| l.reuseport),
         }
     }
 }
