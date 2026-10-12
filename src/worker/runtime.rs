@@ -1125,7 +1125,7 @@ pub fn run(
                     }
                     return;
                 }
-                match accept_or_tick(&listener, &mut tick).await {
+                match accept_or_tick(&listener, &mut tick, state).await {
                     Ok(Some((stream, addr))) => {
                         if !admit_connection(http) {
                             continue;
@@ -1168,7 +1168,7 @@ pub(crate) async fn run_listener(
         if state.is_shutting_down() {
             return;
         }
-        match accept_or_tick(&listener, &mut tick).await {
+        match accept_or_tick(&listener, &mut tick, state).await {
             Ok(Some((stream, addr))) => {
                 if !admit_connection(http) {
                     continue;
@@ -1543,26 +1543,37 @@ impl RepeatedLine {
 pub(crate) async fn accept_or_tick(
     listener: &TcpListener,
     tick: &mut AcceptTick,
+    state: &RuntimeState,
 ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
     use std::pin::pin;
 
     let mut accept = pin!(listener.cancelable_accept(tick.canceller.handle()));
-    monoio::select! {
-        res = &mut accept => res.map(Some),
-        _ = tick.timer.as_mut() => {
-            tick.timer
-                .as_mut()
-                .reset(monoio::time::Instant::now() + ACCEPT_TICK);
-            // If the accept SQE completed in the same poll batch as the
-            // timer, dropping it here closes the accepted fd and the client
-            // sees EOF. Cancel the op, then keep whatever the kernel already
-            // handed back: a real success (race with cancel) hands us the
-            // connection; a genuine cancel returns the canceled-op error.
-            // `cancel` hands back a fresh canceller for the next accepts.
-            tick.canceller = std::mem::take(&mut tick.canceller).cancel();
-            match accept.await {
-                Ok(pair) => Ok(Some(pair)),
-                Err(_) => Ok(None),
+    loop {
+        monoio::select! {
+            res = &mut accept => return res.map(Some),
+            _ = tick.timer.as_mut() => {
+                tick.timer
+                    .as_mut()
+                    .reset(monoio::time::Instant::now() + ACCEPT_TICK);
+                // Shutdown or a reload wakes the idle connections.
+                notice_runtime_events(state);
+                if !state.is_shutting_down() {
+                    // The accept stays in flight: cancelling and submitting
+                    // it again on every tick cost each idle worker CPU.
+                    continue;
+                }
+                // If the accept SQE completed in the same poll batch as the
+                // timer, dropping it here closes the accepted fd and the
+                // client sees EOF. Cancel the op, then keep whatever the
+                // kernel already handed back: a real success (race with
+                // cancel) hands us the connection; a genuine cancel returns
+                // the canceled-op error. `cancel` hands back a fresh
+                // canceller.
+                tick.canceller = std::mem::take(&mut tick.canceller).cancel();
+                return match accept.await {
+                    Ok(pair) => Ok(Some(pair)),
+                    Err(_) => Ok(None),
+                };
             }
         }
     }
