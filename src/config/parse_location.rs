@@ -352,6 +352,7 @@ pub(crate) fn parse_location_block(
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
+    let mut client_timeouts = ClientTimeouts::default();
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     // Children parsed inside this block — appended to `sink` after the
     // parent so the parent's entry appears first in declaration order.
@@ -468,6 +469,7 @@ pub(crate) fn parse_location_block(
                         proxy,
                         gzip,
                         chunked_transfer_encoding,
+                        client_timeouts,
                         alias_prefix_override,
                         inherits_root,
                     });
@@ -723,6 +725,10 @@ pub(crate) fn parse_location_block(
                     return Err(Error::MissingArg("try_files"));
                 }
                 try_files = Some(parse_try_files(&args[1..])?);
+            }
+            // Location settings in nginx; `client_header_timeout` is not.
+            (name @ ("client_body_timeout" | "send_timeout"), Terminator::Semi) => {
+                client_timeouts.parse(name, &args)?;
             }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {

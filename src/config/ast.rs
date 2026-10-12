@@ -780,6 +780,9 @@ pub struct Location {
     /// `false`, the response body uses `Content-Length` framing and any
     /// `add_trailer` directives in scope are silently dropped.
     pub chunked_transfer_encoding: Option<bool>,
+    /// The location's own `client_body_timeout` / `send_timeout` (#147);
+    /// `client_header_timeout` stays a server setting.
+    pub client_timeouts: ClientTimeouts,
     /// Override for the alias-prefix used when this location's
     /// `Handler::Root` was inherited from an ancestor prefix-alias
     /// location (rather than set directly here). Unlike a directly-set

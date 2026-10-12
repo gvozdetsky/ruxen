@@ -235,6 +235,9 @@ pub struct ProcessMeta {
     /// access_logs` — so location-scope `access_log` directives fire
     /// against the right format/path for the request that landed.
     pub access_logs: &'static [crate::worker::PreparedAccessLog],
+    /// The location's `send_timeout` (and `client_body_timeout`) for this
+    /// request; `None` before routing (#147).
+    pub timeouts: Option<&'static crate::worker::PreparedClientTimeouts>,
     /// Authenticated user from HTTP Basic auth, for `$remote_user`.
     pub remote_user: Option<Vec<u8>>,
     /// The client address the realip module set, for the log lines the
@@ -311,6 +314,7 @@ impl Default for ProcessMeta {
             log: LogMeta::default(),
             server_port: 0,
             access_logs: &[],
+            timeouts: None,
             remote_user: None,
             realip: None,
             proxy_add_headers: &[],
@@ -816,6 +820,7 @@ fn process_with_meta_inner(
             disable_safari: loc.keepalive.disable_safari,
         };
         meta.access_logs = loc.access_logs;
+        meta.timeouts = Some(loc.timeouts);
         meta.post_action = loc.post_action;
         meta.log = LogMeta {
             error_logs: loc.error_logs,
@@ -1463,6 +1468,8 @@ pub(crate) struct FirstBodyLimit {
     /// The location's `client_body_temp_path` directory, if it (or its
     /// server) has its own.
     pub body_temp: Option<&'static crate::worker::BodyTempDir>,
+    /// The location's `client_body_timeout` (#147).
+    pub body_timeout: std::time::Duration,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -1532,6 +1539,7 @@ pub(crate) fn first_body_limit(
             crate::config::ClientBodyInFileOnly::On
         ),
         body_temp: loc.body_temp,
+        body_timeout: loc.timeouts.body,
     })
 }
 

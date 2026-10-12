@@ -2100,10 +2100,9 @@ pub(crate) async fn handle<S: ConnIo>(
     let remote_addr = peer_addr.ip().to_string().into_bytes();
     let remote_port = peer_addr.port();
     let mut request_count: u64 = 0;
-    // Client timeouts come from the address's default server for the whole
-    // connection: the header is read before a virtual server is chosen (as
-    // in nginx), and the body here too. nginx switches client_body_timeout
-    // and send_timeout to the chosen server / location afterwards.
+    // The default server's client timeouts: the header is read before a
+    // virtual server is chosen (as in nginx). A request's body and response
+    // use its location's client_body_timeout and send_timeout (#147).
     let timeouts = {
         let listen = &http.listens[listen_index];
         listen.servers[listen.default_server].timeouts
@@ -2426,6 +2425,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut body_buffer = crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE;
                         // And its `client_body_temp_path`, else the http one.
                         let mut body_temp = &http.body_temp;
+                        // The routed location's client_body_timeout (#147).
+                        let mut body_timeout = timeouts.body;
                         let has_body = req.content_length.is_some_and(|cl| cl > 0)
                             || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
@@ -2435,6 +2436,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
                                 persistent_body = first.persistent;
+                                body_timeout = first.body_timeout;
                                 body_buffer = first.buffer;
                                 body_temp = first.body_temp.unwrap_or(body_temp);
                                 max_body = match first.max {
@@ -2529,7 +2531,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         // client_body_timeout between reads.
                                         let Some((res, returned)) = with_timeout(
                                             timers.io.as_mut(),
-                                            timeouts.body,
+                                            body_timeout,
                                             stream.read(slice),
                                         )
                                         .await
@@ -2554,7 +2556,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // client_body_timeout between reads.
                                     let Some((res, returned)) = with_timeout(
                                         timers.io.as_mut(),
-                                        timeouts.body,
+                                        body_timeout,
                                         stream.read(slice),
                                     )
                                     .await
@@ -2582,7 +2584,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 max_body,
                                 &mut sink,
                                 timers.io.as_mut(),
-                                timeouts.body,
+                                body_timeout,
                             )
                             .await
                             {
@@ -2665,6 +2667,10 @@ pub(crate) async fn handle<S: ConnIo>(
                         )
                         .await;
                         process_meta = settled_meta;
+                        // The location's send_timeout for this response (#147);
+                        // the next request's header waits use the default
+                        // server's values again, as in nginx.
+                        let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
 
                         // Defer the response write per `auth_delay`. We
                         // sleep on the runtime, not the OS thread, so other
@@ -2798,7 +2804,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 taken,
                                 len,
                                 timers.io.as_mut(),
-                                timeouts.send,
+                                send_timeout,
                             )
                             .await;
                             *scratch = returned;
@@ -2839,7 +2845,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     limit.after,
                                     request_start,
                                     timers.io.as_mut(),
-                                    timeouts.send,
+                                    send_timeout,
                                 ))
                                 .await
                                 {
@@ -2857,7 +2863,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch,
                                     body,
                                     timers.io.as_mut(),
-                                    timeouts.send,
+                                    send_timeout,
                                 )
                                 .await
                                 {
@@ -2875,7 +2881,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     taken,
                                     len,
                                     timers.io.as_mut(),
-                                    timeouts.send,
+                                    send_timeout,
                                 )
                                 .await;
                                 *scratch = returned;
@@ -2892,7 +2898,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                             body,
                                             gz,
                                             timers.io.as_mut(),
-                                            timeouts.send,
+                                            send_timeout,
                                         )
                                         .await
                                     }
@@ -2900,7 +2906,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         stream,
                                         body,
                                         timers.io.as_mut(),
-                                        timeouts.send,
+                                        send_timeout,
                                         None,
                                     )
                                     .await
