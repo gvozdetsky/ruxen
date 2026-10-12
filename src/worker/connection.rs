@@ -585,19 +585,24 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
     let mut deflater = super::gzip::Deflater::new(gzip);
     let mut offset = body.offset;
     let mut remaining = body.len;
-    let mut input = vec![0u8; body.len.clamp(1, 65_536) as usize];
+    let block = body.len.clamp(1, 65_536) as usize;
+    // Pooled buffers (see `gzip::BUFFER_POOL`): grown once, kept.
+    let mut input = std::mem::take(&mut deflater.input);
+    if input.len() < block {
+        input.resize(block, 0);
+    }
     // Room for the chunk-size line in front of the compressed bytes.
     const PREFIX: usize = 10;
-    let mut out: Vec<u8> = Vec::with_capacity(PREFIX + 65_536);
+    let mut out = std::mem::take(&mut deflater.out);
+    out.reserve(PREFIX + block.min(16_384));
     let mut sent = 0u64;
-    loop {
-        let last = remaining == 0;
-        let n = if last {
+    let result = loop {
+        let n = if remaining == 0 {
             0
         } else {
-            let want = remaining.min(input.len() as u64) as usize;
+            let want = remaining.min(block as u64) as usize;
             match file.read_at(&mut input[..want], offset) {
-                Ok(0) | Err(_) => return None,
+                Ok(0) | Err(_) => break None,
                 Ok(n) => n,
             }
         };
@@ -609,9 +614,13 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
         let data_len = out.len() - PREFIX;
         let start = if gzip.chunked && data_len > 0 {
             // "<hex>\r\n" right before the data, "\r\n" after it.
-            let line = format!("{data_len:x}\r\n");
-            let start = PREFIX - line.len();
-            out[start..PREFIX].copy_from_slice(line.as_bytes());
+            let digits = (usize::BITS - data_len.leading_zeros()).div_ceil(4).max(1) as usize;
+            let start = PREFIX - (digits + 2);
+            for i in 0..digits {
+                let nibble = (data_len >> (4 * (digits - 1 - i))) & 0xf;
+                out[start + i] = b"0123456789abcdef"[nibble];
+            }
+            out[PREFIX - 2..PREFIX].copy_from_slice(b"\r\n");
             out.extend_from_slice(b"\r\n");
             start
         } else {
@@ -621,7 +630,7 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
             out.extend_from_slice(b"0\r\n\r\n");
         }
         if out.len() > start {
-            // Shift so the write starts at the chunk line.
+            // Shift so the write starts at the chunk line (a few KiB).
             out.drain(..start);
             let len = out.len();
             let (res, returned) = write_all_timed(
@@ -634,14 +643,17 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
             .await;
             out = returned;
             if res.is_err() {
-                return None;
+                break None;
             }
             sent += len as u64;
         }
         if remaining == 0 {
-            return Some(sent);
+            break Some(sent);
         }
-    }
+    };
+    deflater.input = input;
+    deflater.out = out;
+    result
 }
 
 /// Outcome of decoding a chunked request body.

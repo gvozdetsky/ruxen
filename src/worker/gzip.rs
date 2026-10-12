@@ -331,6 +331,13 @@ pub(crate) fn filter(
                     let out = rewrite_head(&headers, gz.vary, None);
                     (Response::File { headers: out, body }, None)
                 }
+                Decision::Compress if body.len <= WHOLE_FILE_MAX => {
+                    match compress_file(gz, &headers, body) {
+                        Ok(out) => (Response::Owned(out), None),
+                        // A read error: the plain path reports it.
+                        Err(body) => (Response::File { headers, body }, None),
+                    }
+                }
                 Decision::Compress => {
                     let stream = GzipStream {
                         level: gz.comp_level,
@@ -349,6 +356,60 @@ pub(crate) fn filter(
         }
         other => (other, None),
     }
+}
+
+/// Files up to this size are read and compressed whole: the header and
+/// the body then go out in one write with a `Content-Length`, as other
+/// bodies in memory do. Larger ones are streamed.
+const WHOLE_FILE_MAX: u64 = 64 * 1024;
+
+/// A small file read and compressed into a complete response; the file
+/// back when it can't be read whole.
+fn compress_file(
+    gz: &PreparedGzip,
+    headers: &[u8],
+    body: crate::phase::FileBody,
+) -> Result<Vec<u8>, crate::phase::FileBody> {
+    use std::os::unix::fs::FileExt;
+    let len = body.len as usize;
+    let mut buffers = BUFFER_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| (Vec::new(), Vec::new()));
+    let input = &mut buffers.0;
+    if input.len() < len {
+        input.resize(len, 0);
+    }
+    let file = std::fs::File::from(body.fd);
+    let mut read = 0;
+    while read < len {
+        match file.read_at(&mut input[read..len], body.offset + read as u64) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => read += n,
+        }
+    }
+    let result = if read == len {
+        let compressed = compress_all(&input[..len], gz.comp_level, window_bits(Some(body.len)));
+        let mut length = Vec::with_capacity(40);
+        length.extend_from_slice(b"Content-Length: ");
+        length.extend_from_slice(compressed.len().to_string().as_bytes());
+        length.extend_from_slice(b"\r\n");
+        let mut out = rewrite_head(headers, gz.vary, Some(&length));
+        out.extend_from_slice(&compressed);
+        Ok(out)
+    } else {
+        Err(crate::phase::FileBody {
+            fd: file.into(),
+            offset: body.offset,
+            len: body.len,
+        })
+    };
+    BUFFER_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < DEFLATE_POOL_MAX {
+            p.push(buffers);
+        }
+    });
+    result
 }
 
 enum Decision {
@@ -471,52 +532,118 @@ fn zlib_level(level: u32) -> Compression {
     Compression::new(if level == 1 { 2 } else { level })
 }
 
+thread_local! {
+    /// This worker's idle deflate states, by (level, window bits). A
+    /// deflate state is a few hundred KiB, which glibc maps and unmaps for
+    /// every allocation that size: per response, the page faults, the
+    /// zeroing and the TLB shootdowns across worker threads cost as much
+    /// as compressing (gzip_html_8k: 51 % of nginx). nginx takes the same
+    /// memory from the request pool. Reused states are only reset.
+    static DEFLATE_POOL: std::cell::RefCell<Vec<(u32, u8, Compress)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Read and output buffers of `stream_file_gzip`, for the same reason:
+    /// freed per response, glibc's thread arenas hand their pages back
+    /// (top-chunk trim) and the next response faults them in again.
+    static BUFFER_POOL: std::cell::RefCell<Vec<(Vec<u8>, Vec<u8>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Idle states kept per worker: one per response being compressed at
+/// the same moment, which for whole bodies is one.
+const DEFLATE_POOL_MAX: usize = 16;
+
+fn take_compress(level: u32, window_bits: u8) -> Compress {
+    let pooled = DEFLATE_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        let i = p
+            .iter()
+            .position(|(l, w, _)| *l == level && *w == window_bits)?;
+        Some(p.swap_remove(i).2)
+    });
+    match pooled {
+        Some(mut c) => {
+            c.reset();
+            c
+        }
+        None => Compress::new_gzip(zlib_level(level), window_bits),
+    }
+}
+
+fn give_compress(level: u32, window_bits: u8, c: Compress) {
+    DEFLATE_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < DEFLATE_POOL_MAX {
+            p.push((level, window_bits, c));
+        }
+    });
+}
+
 /// A complete gzip member of `body`.
 pub(crate) fn compress_all(body: &[u8], level: u32, window_bits: u8) -> Vec<u8> {
-    let mut c = Compress::new_gzip(zlib_level(level), window_bits);
+    let mut c = take_compress(level, window_bits);
     let mut out = Vec::with_capacity(body.len() / 2 + 64);
     loop {
         let consumed = c.total_in() as usize;
         match c.compress_vec(&body[consumed..], &mut out, FlushCompress::Finish) {
-            Ok(Status::StreamEnd) => return out,
+            Ok(Status::StreamEnd) => break,
             Ok(_) => out.reserve(out.capacity().max(4096)),
             // Only on misuse of the stream; an empty member would be
             // wrong, so keep what deflate made and stop.
-            Err(_) => return out,
+            Err(_) => break,
         }
     }
+    give_compress(level, window_bits, c);
+    out
 }
 
 /// A streaming compressor for a file body: feed blocks, get gzip bytes.
+/// Its deflate state and its two buffers go back to the worker's pools
+/// when dropped.
 pub(crate) struct Deflater {
-    c: Compress,
+    c: Option<Compress>,
+    level: u32,
+    window_bits: u8,
+    /// File blocks are read into this one.
+    pub(crate) input: Vec<u8>,
+    /// Compressed bytes (with chunk framing) are written from this one.
+    pub(crate) out: Vec<u8>,
 }
 
 impl Deflater {
     pub(crate) fn new(stream: GzipStream) -> Self {
+        let (input, out) = BUFFER_POOL
+            .with(|p| p.borrow_mut().pop())
+            .unwrap_or_else(|| (Vec::new(), Vec::new()));
         Deflater {
-            c: Compress::new_gzip(zlib_level(stream.level), stream.window_bits),
+            c: Some(take_compress(stream.level, stream.window_bits)),
+            level: stream.level,
+            window_bits: stream.window_bits,
+            input,
+            out,
         }
     }
 
     /// Compresses `input` into `out` (appending); `last` finishes the
     /// member.
     pub(crate) fn push(&mut self, input: &[u8], out: &mut Vec<u8>, last: bool) {
+        let Some(c) = self.c.as_mut() else {
+            return;
+        };
         let flush = if last {
             FlushCompress::Finish
         } else {
             FlushCompress::None
         };
-        let start = self.c.total_in();
+        let start = c.total_in();
         loop {
-            let used = (self.c.total_in() - start) as usize;
+            let used = (c.total_in() - start) as usize;
             if out.capacity() - out.len() < 1024 {
                 out.reserve(input.len().max(8192));
             }
-            match self.c.compress_vec(&input[used..], out, flush) {
+            match c.compress_vec(&input[used..], out, flush) {
                 Ok(Status::StreamEnd) => return,
                 Ok(_) => {
-                    let used = (self.c.total_in() - start) as usize;
+                    let used = (c.total_in() - start) as usize;
                     // Not finishing: done once all input is taken and
                     // deflate had room left (it isn't holding output back).
                     if !last && used == input.len() && out.capacity() > out.len() {
@@ -526,6 +653,24 @@ impl Deflater {
                 Err(_) => return,
             }
         }
+    }
+}
+
+impl Drop for Deflater {
+    fn drop(&mut self) {
+        if let Some(c) = self.c.take() {
+            give_compress(self.level, self.window_bits, c);
+        }
+        let buffers = (
+            std::mem::take(&mut self.input),
+            std::mem::take(&mut self.out),
+        );
+        BUFFER_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < DEFLATE_POOL_MAX {
+                p.push(buffers);
+            }
+        });
     }
 }
 
@@ -655,6 +800,14 @@ mod tests {
             d.push(block, &mut out, last);
         }
         assert_eq!(gunzip(&out), data);
+    }
+
+    #[test]
+    fn pooled_states_make_valid_members() {
+        for i in 0..5 {
+            let body = vec![b'a' + i as u8; 1000 + i * 100];
+            assert_eq!(gunzip(&compress_all(&body, 1, 12)), body);
+        }
     }
 
     #[test]
