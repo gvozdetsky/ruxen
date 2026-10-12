@@ -175,11 +175,8 @@ pub struct ProxyHeader<'a> {
     pub value: &'a [u8],
 }
 
-/// Build the upstream request bytes. `http_version_minor` selects HTTP/1.0
-/// vs HTTP/1.1. The headers slice is the final ordered set: caller is
-/// responsible for any `Connection:` header (no auto-injection here —
-/// nginx + the keepalive module manage Connection via `proxy_set_header`
-/// instead, and ruxen mirrors that). A `Host:` header MUST be present.
+/// `write_request` into a fresh buffer.
+#[cfg(test)]
 pub fn build_request_bytes_with_headers(
     method_bytes: &[u8],
     uri: &[u8],
@@ -187,11 +184,37 @@ pub fn build_request_bytes_with_headers(
     headers: &[ProxyHeader<'_>],
     body: &[u8],
 ) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_request(
+        &mut buf,
+        method_bytes,
+        uri,
+        http_version_minor,
+        headers,
+        body,
+    );
+    buf
+}
+
+/// Append the upstream request bytes to `buf` (the caller brings a pooled
+/// buffer). `http_version_minor` selects HTTP/1.0 vs HTTP/1.1. The headers
+/// slice is the final ordered set: caller is
+/// responsible for any `Connection:` header (no auto-injection here —
+/// nginx + the keepalive module manage Connection via `proxy_set_header`
+/// instead, and ruxen mirrors that). A `Host:` header MUST be present.
+pub fn write_request(
+    buf: &mut Vec<u8>,
+    method_bytes: &[u8],
+    uri: &[u8],
+    http_version_minor: u8,
+    headers: &[ProxyHeader<'_>],
+    body: &[u8],
+) {
     let mut size = method_bytes.len() + uri.len() + body.len() + 64;
     for h in headers {
         size += h.name.len() + h.value.len() + 4;
     }
-    let mut buf = Vec::with_capacity(size);
+    buf.reserve(size);
     buf.extend_from_slice(method_bytes);
     buf.push(b' ');
     buf.extend_from_slice(uri);
@@ -213,7 +236,6 @@ pub fn build_request_bytes_with_headers(
     }
     buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(body);
-    buf
 }
 
 #[cfg(test)]
