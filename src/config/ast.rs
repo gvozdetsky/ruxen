@@ -201,6 +201,8 @@ pub struct HttpConfig {
     pub client_body_buffer_size: Option<u64>,
     /// `$request_body_file` appears somewhere in the config.
     pub uses_request_body_file: bool,
+    /// `$request_body` appears somewhere in the config.
+    pub uses_request_body: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,

@@ -2376,6 +2376,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut body_buffer = crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE;
                         // And its `client_body_temp_path`, else the http one.
                         let mut body_temp = &http.body_temp;
+                        // Nothing will read the body: drop it as it comes.
+                        let mut discard_body = false;
                         let has_body = req.content_length.is_some_and(|cl| cl > 0)
                             || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
@@ -2392,6 +2394,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
                                 persistent_body = first.persistent;
+                                discard_body = first.discard;
                                 body_buffer = first.buffer;
                                 body_temp = first.body_temp.unwrap_or(body_temp);
                                 max_body = match first.max {
@@ -2447,7 +2450,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // that (`BodySink`), within `max_body` above.
                         let mut pipelined_tail: Vec<u8> = Vec::new();
                         let mut sink = BodySink::with_capacity(
-                            req.content_length.unwrap_or(0),
+                            if discard_body {
+                                0
+                            } else {
+                                req.content_length.unwrap_or(0)
+                            },
                             body_temp,
                             persistent_body,
                         );
@@ -2468,6 +2475,19 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let body_start = base + req.consumed;
                                 let already = filled.saturating_sub(body_start);
                                 let take = (already as u64).min(cl) as usize;
+                                if discard_body {
+                                    if !discard_request_body(
+                                        stream,
+                                        cl - take as u64,
+                                        timers.io.as_mut(),
+                                        timeouts.body,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    break 'read (take, cl);
+                                }
                                 if !sink.extend(&buf[body_start..body_start + take]) {
                                     return;
                                 }
@@ -2570,6 +2590,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // Over the limit: big enough for the location's check.
                         let body_len = if body_too_large {
                             request_body_len.max(max_body.saturating_add(1))
+                        } else if discard_body && req.content_length.is_some() {
+                            request_body_len
                         } else {
                             sink.len()
                         };

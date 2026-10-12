@@ -176,6 +176,14 @@ struct VariableRegistry {
     defined: std::collections::HashSet<String>,
     /// `$request_body_file` appears somewhere in the config.
     request_body_file: bool,
+    /// `$request_body` appears somewhere in the config.
+    request_body: bool,
+}
+
+/// Whether the config just parsed reads `$request_body` anywhere: if not,
+/// a `return` location can drop a body unread (#289).
+pub(crate) fn request_body_used() -> bool {
+    VARIABLES.with(|v| v.borrow().request_body)
 }
 
 /// Whether the config just parsed reads `$request_body_file` anywhere: if
@@ -379,7 +387,10 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"ssl_client_v_start" => Variable::SslClientVStart,
         b"ssl_client_v_end" => Variable::SslClientVEnd,
         b"ssl_client_v_remain" => Variable::SslClientVRemain,
-        b"request_body" => Variable::RequestBody,
+        b"request_body" => {
+            VARIABLES.with(|v| v.borrow_mut().request_body = true);
+            Variable::RequestBody
+        }
         b"request_body_file" => {
             VARIABLES.with(|v| v.borrow_mut().request_body_file = true);
             Variable::RequestBodyFile

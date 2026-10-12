@@ -1467,6 +1467,12 @@ pub(crate) struct FirstBodyLimit {
     /// The location's `client_body_temp_path` directory, if it (or its
     /// server) has its own.
     pub body_temp: Option<&'static crate::worker::BodyTempDir>,
+    /// Nothing can read the body: the location answers with `return`, has
+    /// no rewrite, `if`, `error_page`, `post_action` or `limit_except` that
+    /// could take the request elsewhere, and neither `$request_body` nor
+    /// `$request_body_file` appears anywhere. The body is then read into a small buffer and dropped, as
+    /// nginx's ngx_http_discard_request_body does, instead of being kept.
+    pub discard: bool,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -1536,6 +1542,13 @@ pub(crate) fn first_body_limit(
             crate::config::ClientBodyInFileOnly::On
         ),
         body_temp: loc.body_temp,
+        discard: !http.uses_request_body
+            && !http.uses_request_body_file
+            && matches!(loc.handler, crate::worker::PreparedHandler::Return(_))
+            && loc.rewrite_program.is_empty()
+            && loc.error_pages.is_empty()
+            && loc.post_action.is_none()
+            && loc.limit_except.is_none(),
     })
 }
 

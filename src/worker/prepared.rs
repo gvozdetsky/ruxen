@@ -1432,6 +1432,9 @@ pub struct PreparedHttp {
     /// in memory is never also written to a temp file: nothing would read
     /// it (#246).
     pub uses_request_body_file: bool,
+    /// `$request_body` appears in the config. If not, a body that a
+    /// `return` location gets is dropped as it is read (#289).
+    pub uses_request_body: bool,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],
