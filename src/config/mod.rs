@@ -2114,8 +2114,18 @@ mod tests {
 
     #[test]
     fn user_directive_is_recorded() {
-        let cfg = parse("user www-data www-data;\nhttp { }").unwrap();
-        assert_eq!(cfg.runtime.user.as_deref(), Some("www-data"));
+        let cfg = parse("user www-data adm;\nhttp { }").unwrap();
+        assert_eq!(
+            cfg.runtime.user,
+            Some(UserDirective {
+                name: "www-data".into(),
+                group: Some("adm".into()),
+            })
+        );
+        let cfg = parse("user www-data;\nhttp { }").unwrap();
+        assert_eq!(cfg.runtime.user.unwrap().group, None);
+        assert!(parse("user a b c;\nhttp { }").is_err());
+        assert!(parse("user;\nhttp { }").is_err());
     }
 
     #[test]
