@@ -2424,6 +2424,17 @@ pub(crate) async fn handle<S: ConnIo>(
                             .await;
                         }
 
+                        // gzip (`gzip on` in the location): a body in memory
+                        // is compressed here, a file on its way out below.
+                        let (response, gzip_stream) = match process_meta.gzip {
+                            Some(gz) => super::gzip::filter(
+                                gz,
+                                &super::gzip::GzipRequest::from_headers(req.http_11, headers_raw),
+                                response,
+                            ),
+                            None => (response, None),
+                        };
+
                         // Funnel the response bytes into `scratch`. Owned and
                         // File variants hand us a Vec the handler allocated
                         // this request — prefer whichever of the two buffers
@@ -2486,7 +2497,10 @@ pub(crate) async fn handle<S: ConnIo>(
                             || matches!(method, Method::Trace | Method::Connect)
                             || state.is_shutting_down()
                             || state.reload_gen() != start_reload_gen
-                            || (scan.has_connection && scan.connection_is_close);
+                            || (scan.has_connection && scan.connection_is_close)
+                            // A compressed file to an HTTP/1.0 client has no
+                            // length or chunks: the close ends it.
+                            || gzip_stream.is_some_and(|g| !g.chunked);
                         // Only scan the raw headers for User-Agent when a
                         // policy could actually trigger. disable_safari fires
                         // on any method; disable_msie6 only on POST. Skipping
@@ -2508,7 +2522,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         // consumes the value — `$bytes_sent` and
                         // `$body_bytes_sent` need it after the write
                         // completes.
-                        let streamed_body_len = file_body.as_ref().map(|b| b.len).unwrap_or(0);
+                        let mut streamed_body_len = file_body.as_ref().map(|b| b.len).unwrap_or(0);
                         let response_for_logs: &[u8];
                         if let Some(base) = prebuilt_base {
                             let variant = cached_prebuilt_variant(
@@ -2560,6 +2574,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             }
                             if let Some(limit) = process_meta.limit_rate.as_deref()
                                 && limit.rate > 0
+                                && gzip_stream.is_none()
                             {
                                 // Cold: `limit_rate`. Boxed so the pacer
                                 // doesn't grow every connection's future.
@@ -2580,6 +2595,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             } else if process_meta.sendfile
                                 && file_body.is_some()
+                                && gzip_stream.is_none()
                                 && stream.sendfile_fd().is_some()
                             {
                                 let body = file_body.take().expect("checked is_some");
@@ -2616,17 +2632,32 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             }
                             response_for_logs = &*scratch;
-                            if let Some(body) = file_body.take()
-                                && !stream_file(
-                                    stream,
-                                    body,
-                                    timers.io.as_mut(),
-                                    timeouts.send,
-                                    None,
-                                )
-                                .await
-                            {
-                                return;
+                            if let Some(body) = file_body.take() {
+                                let sent = match gzip_stream {
+                                    Some(gz) => {
+                                        stream_file_gzip(
+                                            stream,
+                                            body,
+                                            gz,
+                                            timers.io.as_mut(),
+                                            timeouts.send,
+                                        )
+                                        .await
+                                    }
+                                    None => stream_file(
+                                        stream,
+                                        body,
+                                        timers.io.as_mut(),
+                                        timeouts.send,
+                                        None,
+                                    )
+                                    .await
+                                    .then_some(streamed_body_len),
+                                };
+                                match sent {
+                                    Some(n) => streamed_body_len = n,
+                                    None => return,
+                                }
                             }
                         }
 

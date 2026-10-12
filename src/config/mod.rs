@@ -23,6 +23,7 @@ pub mod compat;
 mod error;
 mod lexer;
 mod parse_access;
+mod parse_gzip;
 mod parse_location;
 mod parse_log;
 mod parse_map;
@@ -33,6 +34,7 @@ mod values;
 
 pub use ast::*;
 pub use error::*;
+pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
 pub(crate) use lexer::*;
@@ -246,6 +248,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
 pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut servers: Vec<Server> = Vec::new();
     let mut proxy = ProxyConf::default();
+    let mut gzip = GzipConf::default();
     let mut root: Option<PathBuf> = None;
     let mut log_formats: Vec<LogFormatDef> = Vec::new();
     let mut access_logs: Vec<AccessLog> = Vec::new();
@@ -302,6 +305,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     // below a server still applies to it, as in nginx.
                     for server in &mut servers {
                         server.proxy = std::mem::take(&mut server.proxy).inherit(&proxy);
+                        server.gzip = std::mem::take(&mut server.gzip).inherit(&gzip);
                         if server.index.is_none() {
                             server.index.clone_from(&index);
                         }
@@ -792,6 +796,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 client_timeouts.parse(name, &args)?;
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
+            (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             ("error_log", Terminator::Semi) => {
                 error_logs
                     .get_or_insert_with(Vec::new)

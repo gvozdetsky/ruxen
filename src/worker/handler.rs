@@ -765,21 +765,41 @@ pub(crate) fn run_location_handler(
                 fs_resolve::Outcome::Serve(_) if !get_or_head => {
                     Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
-                fs_resolve::Outcome::Serve(opened) => file::serve_path(
-                    opened,
-                    req.method,
-                    file::Conditionals {
-                        if_modified_since: req.if_modified_since,
-                        if_unmodified_since: req.if_unmodified_since,
-                        if_none_match: req.if_none_match,
-                        if_match: req.if_match,
-                        range: req.range,
-                        if_range: req.if_range,
-                        last_modified_override: last_modified_override.as_deref(),
-                    },
-                    server_bytes,
-                    loc.sendfile,
-                ),
+                fs_resolve::Outcome::Serve(opened) => {
+                    // A file gzip will compress is sent whole, as nginx's
+                    // range filter (after gzip) finds no length to cut.
+                    let range = match (req.range, loc.gzip) {
+                        (Some(_), Some(gz))
+                            if super::gzip::would_compress(
+                                gz,
+                                &super::gzip::GzipRequest::from_headers(
+                                    req.http_11,
+                                    req.headers_raw,
+                                ),
+                                opened.mime,
+                                opened.size,
+                            ) =>
+                        {
+                            None
+                        }
+                        (range, _) => range,
+                    };
+                    file::serve_path(
+                        opened,
+                        req.method,
+                        file::Conditionals {
+                            if_modified_since: req.if_modified_since,
+                            if_unmodified_since: req.if_unmodified_since,
+                            if_none_match: req.if_none_match,
+                            if_match: req.if_match,
+                            range,
+                            if_range: req.if_range,
+                            last_modified_override: last_modified_override.as_deref(),
+                        },
+                        server_bytes,
+                        loc.sendfile,
+                    )
+                }
                 fs_resolve::Outcome::Redirect(location) => {
                     let abs = build_absolute_redirect_location(
                         &location,

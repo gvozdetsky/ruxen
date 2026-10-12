@@ -569,6 +569,93 @@ pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
     true
 }
 
+/// `stream_file` through the gzip filter: the file is read in 64 KiB
+/// blocks, compressed, and sent as HTTP/1.1 chunks (or raw for HTTP/1.0,
+/// where the connection closes after). Returns the bytes written, or
+/// `None` on an error or a file shorter than its stat said.
+pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
+    body: phase::FileBody,
+    gzip: super::gzip::GzipStream,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Option<u64> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::from(body.fd);
+    let mut deflater = super::gzip::Deflater::new(gzip);
+    let mut offset = body.offset;
+    let mut remaining = body.len;
+    let block = body.len.clamp(1, 65_536) as usize;
+    // Pooled buffers (see `gzip::BUFFER_POOL`): grown once, kept.
+    let mut input = std::mem::take(&mut deflater.input);
+    if input.len() < block {
+        input.resize(block, 0);
+    }
+    // Room for the chunk-size line in front of the compressed bytes.
+    const PREFIX: usize = 10;
+    let mut out = std::mem::take(&mut deflater.out);
+    out.reserve(PREFIX + block.min(16_384));
+    let mut sent = 0u64;
+    let result = loop {
+        let n = if remaining == 0 {
+            0
+        } else {
+            let want = remaining.min(block as u64) as usize;
+            match file.read_at(&mut input[..want], offset) {
+                Ok(0) | Err(_) => break None,
+                Ok(n) => n,
+            }
+        };
+        offset += n as u64;
+        remaining -= n as u64;
+        out.clear();
+        out.resize(PREFIX, 0);
+        deflater.push(&input[..n], &mut out, remaining == 0);
+        let data_len = out.len() - PREFIX;
+        let start = if gzip.chunked && data_len > 0 {
+            // "<hex>\r\n" right before the data, "\r\n" after it.
+            let digits = (usize::BITS - data_len.leading_zeros()).div_ceil(4).max(1) as usize;
+            let start = PREFIX - (digits + 2);
+            for i in 0..digits {
+                let nibble = (data_len >> (4 * (digits - 1 - i))) & 0xf;
+                out[start + i] = b"0123456789abcdef"[nibble];
+            }
+            out[PREFIX - 2..PREFIX].copy_from_slice(b"\r\n");
+            out.extend_from_slice(b"\r\n");
+            start
+        } else {
+            PREFIX
+        };
+        if remaining == 0 && gzip.chunked {
+            out.extend_from_slice(b"0\r\n\r\n");
+        }
+        if out.len() > start {
+            // Shift so the write starts at the chunk line (a few KiB).
+            out.drain(..start);
+            let len = out.len();
+            let (res, returned) = write_all_timed(
+                stream,
+                std::mem::take(&mut out),
+                len,
+                timer.as_mut(),
+                send_timeout,
+            )
+            .await;
+            out = returned;
+            if res.is_err() {
+                break None;
+            }
+            sent += len as u64;
+        }
+        if remaining == 0 {
+            break Some(sent);
+        }
+    };
+    deflater.input = input;
+    deflater.out = out;
+    result
+}
+
 /// Outcome of decoding a chunked request body.
 pub(crate) struct ChunkedBody {
     /// Bytes consumed from the caller's `initial` buffer (the slice we

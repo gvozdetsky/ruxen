@@ -97,3 +97,4 @@ proxy_ext_1m|proxy to external nginx backend, 1 MiB response|8160|/files/1M.bin|
 proxy_ext_post_1k|POST 1 KiB through proxy to external nginx backend|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|lua|bench/body/post_1k.lua|http
 proxy_ext_post_64k|POST 64 KiB through proxy to external nginx backend|8160|/|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|lua|bench/body/post_64k.lua|http
 proxy_ext_xar|X-Accel-Redirect from external nginx backend to an internal 1 KiB file|8160|/xar|16|512|30s|5s|20|bench/proxy_ext/nginx.conf|bench/proxy_ext/generate.sh|none||http
+gzip_html_8k|gzip on, 8 KiB HTML, Accept-Encoding: gzip|8105|/index.html|16|512|30s|5s|20|bench/gzip_html_8k/nginx.conf||static|Accept-Encoding: gzip|http

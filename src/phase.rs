@@ -275,6 +275,8 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// The matched location's gzip settings; `None` when gzip is off.
+    pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// `limit_rate` / `limit_rate_after` for this response. Boxed: `None`
     /// (one word) in the common case.
     pub limit_rate: Option<Box<ResponseLimit>>,
@@ -320,6 +322,7 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            gzip: None,
             limit_rate: None,
             post_action: None,
             upstream_states: Vec::new(),
@@ -898,6 +901,7 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
+        meta.gzip = loc.gzip;
         // `set $limit_rate` wins over the directive, as nginx's
         // r->limit_rate_set. Rendered only when something is set.
         meta.limit_rate = if loc.limit_rate.is_none() && !rewrite_state.has_user_vars() {

@@ -189,7 +189,13 @@ pub(crate) fn ignored_block(lx: &Lexer, args: &[String]) {
 /// value (a directive set to it changes nothing), or `None` when any use
 /// differs, and what happens in ruxen instead.
 const DIFFERS: &[(&str, Option<&str>, &str)] = &[
-    ("gzip", Some("off"), "responses are not compressed (#93)"),
+    // gzip works at http, server and location level; only inside `if`
+    // it is still accepted and ignored.
+    (
+        "gzip",
+        Some("off"),
+        "not applied inside `if`: set it in the location instead",
+    ),
     (
         "gzip_static",
         Some("off"),
@@ -408,7 +414,7 @@ mod tests {
     #[test]
     fn ignored_directives_differ_unless_set_to_the_default() {
         let (found, _) = findings(
-            "http { gzip on; etag on; tcp_nopush on; types { text/html html; } server { } }",
+            "http { ssi on; etag on; tcp_nopush on; types { text/html html; } server { } }",
         );
         let got: Vec<(Severity, &str)> = found
             .iter()
@@ -417,7 +423,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Severity::Differs, "gzip on"),
+                (Severity::Differs, "ssi on"),
                 (Severity::Ignored, "etag on"),
                 (Severity::Ignored, "tcp_nopush on"),
                 (Severity::Differs, "types"),

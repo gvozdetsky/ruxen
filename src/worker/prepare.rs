@@ -893,6 +893,7 @@ pub(crate) fn prepare_server(
     let server_underscores_in_headers = server
         .underscores_in_headers
         .unwrap_or(http_underscores_in_headers);
+    let server_gzip = std::mem::take(&mut server.gzip);
     let server_proxy_defaults = ServerProxyDefaults::build(
         std::mem::take(&mut server.proxy),
         server_ignore_invalid_headers,
@@ -1086,6 +1087,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1115,6 +1117,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1144,6 +1147,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1174,6 +1178,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1253,6 +1258,7 @@ pub(crate) fn prepare_server(
             limit_except: None,
             client_max_body_size: server_client_max_body_size,
             sendfile: server_sendfile,
+            gzip: prepare_gzip(server_gzip.clone())?,
             limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             body_temp: server_body_temp,
@@ -2167,6 +2173,7 @@ pub(crate) fn build_prefix_or_exact(
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
     server_proxy_defaults: ServerProxyDefaults,
+    server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedLocation, String> {
@@ -2211,11 +2218,13 @@ pub(crate) fn build_prefix_or_exact(
         post_action: location_post_action,
         expires: location_expires,
         proxy: location_proxy,
+        gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
+    let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
     let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
     let alias_prefix_override: Option<&'static [u8]> = alias_prefix_override
         .map(|s| Box::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
@@ -2350,6 +2359,7 @@ pub(crate) fn build_prefix_or_exact(
         limit_except,
         client_max_body_size,
         sendfile,
+        gzip,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
@@ -2388,6 +2398,7 @@ pub(crate) fn build_regex_location(
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
     server_proxy_defaults: ServerProxyDefaults,
+    server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedRegexLocation, String> {
@@ -2432,11 +2443,13 @@ pub(crate) fn build_regex_location(
         post_action: location_post_action,
         expires: location_expires,
         proxy: location_proxy,
+        gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
+    let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
     // The parser already validated this with the same flags + the same
     // `regex::bytes` builder; rebuild here because the compiled `Regex`
     // doesn't survive the AST.
@@ -2580,6 +2593,7 @@ pub(crate) fn build_regex_location(
         limit_except,
         client_max_body_size,
         sendfile,
+        gzip,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
@@ -2643,4 +2657,49 @@ mod tests {
             assert_eq!(got, want.as_bytes(), "{authority}");
         }
     }
+}
+
+/// The effective `gzip*` settings of a location, or `None` when gzip is
+/// off there: the filter then costs one check per response.
+pub(crate) fn prepare_gzip(
+    conf: crate::config::GzipConf,
+) -> Result<Option<&'static PreparedGzip>, String> {
+    if conf.enable != Some(true) {
+        return Ok(None);
+    }
+    let mut any_type = false;
+    // nginx always compresses text/html (ngx_http_html_default_types).
+    let mut types: Vec<&'static str> = vec!["text/html"];
+    for t in conf.types.unwrap_or_default() {
+        if t == "*" {
+            any_type = true;
+        } else if !types.contains(&t.as_str()) {
+            types.push(Box::leak(t.into_boxed_str()));
+        }
+    }
+    let mut disable_msie6 = false;
+    let mut patterns = Vec::new();
+    for d in conf.disable.unwrap_or_default() {
+        match d.as_str() {
+            "msie6" => disable_msie6 = true,
+            "degradation" => {}
+            _ => patterns.push(format!("(?i){d}")),
+        }
+    }
+    let disable = if patterns.is_empty() {
+        None
+    } else {
+        Some(regex::RegexSet::new(&patterns).map_err(|e| format!("gzip_disable: {e}"))?)
+    };
+    Ok(Some(Box::leak(Box::new(PreparedGzip {
+        any_type,
+        types: Box::leak(types.into_boxed_slice()),
+        min_length: conf.min_length.unwrap_or(20),
+        comp_level: conf.comp_level.unwrap_or(1),
+        vary: conf.vary.unwrap_or(false),
+        http_10: conf.http_version == Some(10),
+        proxied: conf.proxied.unwrap_or(crate::config::gzip_proxied::OFF),
+        disable_msie6,
+        disable,
+    }))))
 }

@@ -64,6 +64,7 @@ pub(crate) fn parse_server_block(
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy = ProxyConf::default();
+    let mut gzip = GzipConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
 
     loop {
@@ -145,6 +146,7 @@ pub(crate) fn parse_server_block(
                         post_action,
                         expires,
                         proxy,
+                        gzip: gzip.clone(),
                         chunked_transfer_encoding,
                         ssl,
                         locations,
@@ -563,6 +565,7 @@ pub(crate) fn parse_server_block(
                 error_pages.get_or_insert_with(Vec::new).extend(entries);
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
+            (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             ("chunked_transfer_encoding", Terminator::Semi) => {
                 if chunked_transfer_encoding.is_some() {
                     return Err(Error::Duplicate("chunked_transfer_encoding"));

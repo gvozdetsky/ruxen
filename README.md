@@ -148,13 +148,13 @@ ruxen --compat -c /etc/nginx/nginx.conf
 ruxen 0.1.2: checking /etc/nginx/nginx.conf
 /etc/nginx/nginx.conf:33: unsupported: ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3 — TLSv1, TLSv1.1 rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old names with a warning)
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
-/etc/nginx/nginx.conf:46: differs: gzip on — responses are not compressed (#93)
+/etc/nginx/nginx.conf:27: differs: default_type application/octet-stream — files of unknown types get ruxen's built-in default (#38)
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
 ruxen does not start with this configuration: 2 unsupported, 1 behaving differently
 ```
 
 - **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
-- **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `gzip off`, is not listed.
+- **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `ssi off`, is not listed.
 - **ignored:** tuning knobs with no visible effect.
 
 With nothing unsupported, the configuration is then loaded the way `-t` does it (certificates, roots, log files). The exit status is 0 when ruxen starts with the configuration. A `#N` refers to the GitHub issue that tracks the gap. `-t` errors also carry nginx's ` in file:line`.
@@ -195,6 +195,7 @@ docker run --rm -p 8080:8080 \
 - `worker_connections`, `client_header_timeout`, `client_body_timeout`, `send_timeout`
 - request bodies of any `client_max_body_size`, spilled to private temp files (`client_body_temp_path`), with an early 413
 - `limit_rate`, `limit_rate_after` and `$limit_rate`
+- gzip compression (`gzip`, `gzip_types`, `gzip_min_length`, `gzip_comp_level`, `gzip_vary`, `gzip_http_version`, `gzip_proxied`, `gzip_disable`) of static files, `return`, error pages and proxied responses, as nginx decides it: the same statuses, types, `Accept-Encoding` q-values, weak `ETag`, no `Accept-Ranges`. A file gzip compresses is sent whole even for a `Range` request, as from nginx. Not yet: `gzip_static`, `gunzip`, `$gzip_ratio`, and gzip under `limit_rate` (such a response goes out unpaced).
 
 ### Static files
 
