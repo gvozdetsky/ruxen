@@ -329,18 +329,26 @@ fn real_main() -> Result<(), Failure> {
         .unwrap_or(config_workers);
     let pin = matches!(std::env::var("RUXEN_PIN").as_deref(), Ok("1"));
 
+    // Panic messages go to the error log (#130).
+    worker::install_panic_hook(http);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
     let mut handles = Vec::with_capacity(n_workers);
     for i in 0..n_workers {
         let cpu = if pin { Some(i) } else { None };
         let runtime = runtime.clone();
         let ready = ready_tx.clone();
+        let exited = WorkerExit(i, exited_tx.clone());
         let handle = thread::Builder::new()
             .name(format!("ruxen-worker-{i}"))
-            .spawn(move || worker::run(http, cpu, runtime, ready))?;
+            .spawn(move || {
+                let _exited = exited;
+                worker::run(http, cpu, runtime, ready)
+            })?;
         handles.push(handle);
     }
     drop(ready_tx);
+    drop(exited_tx);
 
     // Each worker reports once its listeners are bound. Wait for all of
     // them: a busy port becomes one `[emerg]` and exit 1 instead of a
@@ -456,11 +464,23 @@ fn real_main() -> Result<(), Failure> {
         }
     });
 
-    for handle in handles {
-        if handle.join().is_err() {
+    // Workers say when they are gone, in any order. One that panicked
+    // ends the server: the others stop as on SIGQUIT, and ruxen exits 1
+    // for a supervisor to restart it (#130; see worker/panics.rs).
+    let mut worker_panicked = false;
+    for (i, panicked) in exited_rx.iter() {
+        if panicked && !worker_panicked {
+            worker_panicked = true;
+            worker::write_worker_log(
+                http.error_logs,
+                config::ErrorLogLevel::Alert,
+                &format!("worker {i} exited after a panic, stopping"),
+            );
             runtime.begin_shutdown();
-            return Err(io::Error::other("worker thread panicked").into());
         }
+    }
+    for handle in handles {
+        let _ = handle.join();
     }
 
     runtime.begin_shutdown();
@@ -471,7 +491,20 @@ fn real_main() -> Result<(), Failure> {
     if let Some(path) = &pid_path {
         privileges::remove_pid_file_on_exit(path);
     }
+    if worker_panicked {
+        return Err(Failure::Reported);
+    }
     Ok(())
+}
+
+/// Held by a worker thread: tells `main` the worker is gone, and whether it
+/// unwound from a panic, when the thread ends either way.
+struct WorkerExit(usize, std::sync::mpsc::Sender<(usize, bool)>);
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        let _ = self.1.send((self.0, thread::panicking()));
+    }
 }
 
 /// `ruxen --compat`: parse the whole configuration, collecting what ruxen
