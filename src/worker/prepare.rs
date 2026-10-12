@@ -59,6 +59,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         uses_request_body_file,
         uses_stderr_log,
+        uses_stats,
         runtime,
         error_logs: http_error_logs,
         log_formats,
@@ -257,6 +258,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         max_request_body,
         uses_request_body_file,
         uses_stderr_log,
+        stats: uses_stats,
         body_temp: BodyTempDir::new(client_body_temp_path),
         listens,
         access_logs: canonical_access_logs,
@@ -2013,7 +2015,7 @@ fn resolve_access(
 /// the static handler, or with the location's `proxy_pass`.
 fn limit_except_rebuilds_handler(handler: &Handler, try_files: &Option<TryFiles>) -> bool {
     match handler {
-        Handler::Proxy(_) => false,
+        Handler::Proxy(_) | Handler::StubStatus => false,
         Handler::Root { .. } => try_files.is_some(),
         Handler::Return { .. } => true,
     }
@@ -2067,6 +2069,7 @@ pub(crate) fn build_handler(
         Handler::Return { status, body } => {
             PreparedHandler::Return(prepare_return(status, body, tokens))
         }
+        Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
             pp,
             upstreams,

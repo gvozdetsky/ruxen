@@ -203,6 +203,9 @@ pub struct HttpConfig {
     pub uses_request_body_file: bool,
     /// An `error_log stderr` appears somewhere in the config (#309).
     pub uses_stderr_log: bool,
+    /// `stub_status` or a `$connections_*` variable appears in the config:
+    /// the counters are kept.
+    pub uses_stats: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,
@@ -1471,6 +1474,15 @@ pub enum ProxyProtocolTlv {
     Unknown,
 }
 
+/// Which `$connections_*` gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionsGauge {
+    Active,
+    Reading,
+    Writing,
+    Waiting,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Variable {
     /// Normalized request URI (no query string).
@@ -1532,6 +1544,8 @@ pub enum Variable {
     SslClientVRemain,
     /// Request body buffered by the parser.
     RequestBody,
+    /// `$connections_active`, `_reading`, `_writing`, `_waiting` (#96).
+    Connections(ConnectionsGauge),
     /// Path to the spilled request body temp file, when one was created.
     RequestBodyFile,
     /// Client IP address from the accepted peer socket (e.g. `127.0.0.1`,
@@ -1834,6 +1848,8 @@ pub enum Handler {
     /// `proxy_pass http://...;` — reverse proxy this location to an upstream.
     /// Resolution to a concrete peer happens at prepare time.
     Proxy(ProxyPass),
+    /// `stub_status;` — the connection and request counters (#96).
+    StubStatus,
 }
 
 /// Parsed `proxy_pass` argument. nginx allows two forms:

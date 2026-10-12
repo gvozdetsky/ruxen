@@ -58,6 +58,7 @@ mod render;
 mod response;
 mod rewrite;
 mod runtime;
+pub(crate) mod stats;
 
 pub(crate) use connection::*;
 pub(crate) use handler::*;
