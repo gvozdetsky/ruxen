@@ -176,6 +176,19 @@ struct VariableRegistry {
     defined: std::collections::HashSet<String>,
     /// `$request_body_file` appears somewhere in the config.
     request_body_file: bool,
+    /// An `error_log stderr` appears somewhere in the config (not a
+    /// variable, but noted the same way, while parsing).
+    stderr_log: bool,
+}
+
+/// `error_log stderr` was parsed (#309).
+pub(crate) fn note_stderr_log() {
+    VARIABLES.with(|v| v.borrow_mut().stderr_log = true);
+}
+
+/// Whether the config just parsed logs to stderr somewhere.
+pub(crate) fn stderr_log_used() -> bool {
+    VARIABLES.with(|v| v.borrow().stderr_log)
 }
 
 /// Whether the config just parsed reads `$request_body_file` anywhere: if

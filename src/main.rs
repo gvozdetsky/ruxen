@@ -287,9 +287,16 @@ fn real_main() -> Result<(), Failure> {
         return Ok(());
     }
 
+    // `-e` takes over stderr, unless the configuration logs to stderr
+    // itself: then stderr stays, and lines without an error_log of their
+    // own go to the `-e` file (nginx's log_use_stderr, ngx_log_redirect_stderr).
     if let Some(errlog) = &cli.errlog {
-        redirect_stderr(errlog)?;
-        let _ = worker::STDERR_LOG_PATH.set(errlog.clone());
+        if http.uses_stderr_log {
+            worker::default_error_log_file(errlog);
+        } else {
+            redirect_stderr(errlog)?;
+            let _ = worker::STDERR_LOG_PATH.set(errlog.clone());
+        }
     }
     // Workers are threads, so the limits are set once for the process.
     // Each worker's fd table is its own (unshare), so RLIMIT_NOFILE then
@@ -394,7 +401,7 @@ fn real_main() -> Result<(), Failure> {
     runtime.release_workers();
 
     let signal_runtime = runtime.clone();
-    let reopen_stderr = cli.errlog.clone();
+    let reopen_stderr = cli.errlog.clone().filter(|_| !http.uses_stderr_log);
     let monitor_pid_path = pid_path.clone();
     // Runs until the workers have finished (main drops `workers_done`),
     // so SIGTERM still works during a graceful shutdown.
