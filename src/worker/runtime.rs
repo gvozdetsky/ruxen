@@ -1573,6 +1573,81 @@ pub(crate) async fn wait_readable_or_shutdown(
     }
 }
 
+/// `wait_readable_or_shutdown` with the request read in place of the
+/// readiness poll: the read is submitted once and raced against the idle
+/// deadline and the 50 ms tick. A tick that finds nothing to do leaves
+/// the read in flight. The read is cancelled only when the connection is
+/// to close. A read that completes while being cancelled still hands its
+/// bytes back, and a timeout that loses that race serves the request.
+pub(crate) async fn read_first_or_shutdown(
+    stream: &mut TcpStream,
+    buf: Vec<u8>,
+    state: &RuntimeState,
+    idle_timeout: Option<Duration>,
+    start_reload_gen: u64,
+    timers: &mut ConnTimers<'_>,
+) -> (IdleRead, Vec<u8>) {
+    use monoio::io::CancelableAsyncReadRent;
+    use std::task::Poll;
+
+    if let Some(timeout) = idle_timeout {
+        timers
+            .idle
+            .as_mut()
+            .reset(monoio::time::Instant::now() + timeout);
+    }
+    let idle = IdleMark::new();
+    let canceller = monoio::io::Canceller::new();
+    let len = buf.len();
+    let mut read =
+        std::pin::pin!(stream.cancelable_read(buf.slice_mut(0..len), canceller.handle()));
+    let outcome = |res: std::io::Result<usize>| match res {
+        Ok(n) if n > 0 => IdleRead::Read(n),
+        _ => IdleRead::Close,
+    };
+    enum Woke<T> {
+        Read(T),
+        Timeout,
+        Tick,
+    }
+    loop {
+        let closing = state.is_shutting_down()
+            || idle.asked_to_close()
+            || state.reload_gen() != start_reload_gen;
+        if closing {
+            canceller.cancel();
+            let (_, returned) = read.as_mut().await;
+            return (IdleRead::Close, returned.into_inner());
+        }
+        timers
+            .tick
+            .as_mut()
+            .reset(monoio::time::Instant::now() + Duration::from_millis(50));
+        let woke = std::future::poll_fn(|cx| {
+            if let Poll::Ready(done) = read.as_mut().poll(cx) {
+                return Poll::Ready(Woke::Read(done));
+            }
+            if idle_timeout.is_some() && timers.idle.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Woke::Timeout);
+            }
+            if timers.tick.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Woke::Tick);
+            }
+            Poll::Pending
+        })
+        .await;
+        match woke {
+            Woke::Read((res, returned)) => return (outcome(res), returned.into_inner()),
+            Woke::Timeout => {
+                canceller.cancel();
+                let (res, returned) = read.as_mut().await;
+                return (outcome(res), returned.into_inner());
+            }
+            Woke::Tick => {}
+        }
+    }
+}
+
 pub(crate) struct ConnectionGuard(Arc<RuntimeState>);
 
 impl Drop for ConnectionGuard {
@@ -1962,38 +2037,49 @@ pub(crate) async fn handle<S: ConnIo>(
     }
 
     'idle: loop {
-        if !stream
-            .idle_wait(
+        let (next, returned) = stream
+            .idle_read(
+                std::mem::take(&mut *buf),
                 &state,
                 keepalive_idle_timeout,
                 start_reload_gen,
                 &mut timers,
             )
-            .await
-        {
-            return;
-        }
+            .await;
+        *buf = returned;
+        let mut filled: usize = match next {
+            IdleRead::Close => return,
+            IdleRead::Ready => 0,
+            IdleRead::Read(n) => n,
+        };
         keepalive_idle_timeout = None;
-        header_deadline = None;
+        // The header's time starts with its first bytes, as nginx's
+        // client_header_timeout after the keep-alive read.
+        header_deadline = (filled > 0).then(|| monoio::time::Instant::now() + timeouts.header);
 
         let mut read_start: usize = 0; // first unread byte of the current request
-        let mut filled: usize = 0; // one past the last received byte
+        // The first bytes came with the idle wait: parse before reading.
+        let mut skip_read = filled > 0;
 
         loop {
-            let taken = std::mem::take(&mut *buf);
-            let slice = taken.slice_mut(filled..READ_BUF);
-            let deadline = *header_deadline
-                .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
-            let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
-            // client_header_timeout: nginx closes without a response.
-            let Some((res, returned)) = read.await else {
-                return;
-            };
-            *buf = returned.into_inner();
-            match res {
-                Ok(0) => return,
-                Ok(n) => filled += n,
-                Err(_) => return,
+            if std::mem::take(&mut skip_read) {
+                // Fall through to the parse loop with what idle_read read.
+            } else {
+                let taken = std::mem::take(&mut *buf);
+                let slice = taken.slice_mut(filled..READ_BUF);
+                let deadline = *header_deadline
+                    .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
+                let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
+                // client_header_timeout: nginx closes without a response.
+                let Some((res, returned)) = read.await else {
+                    return;
+                };
+                *buf = returned.into_inner();
+                match res {
+                    Ok(0) => return,
+                    Ok(n) => filled += n,
+                    Err(_) => return,
+                }
             }
 
             loop {
