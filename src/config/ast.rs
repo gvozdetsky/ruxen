@@ -1883,4 +1883,6 @@ pub enum ProxyPass {
         host_header: String,
         request_path: Option<String>,
     },
+    /// A URL with variables, evaluated per request (#100).
+    Variable { url: Vec<ValuePart> },
 }

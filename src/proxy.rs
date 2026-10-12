@@ -76,6 +76,9 @@ fn return_proxy_buf(mut v: Vec<u8>) {
 pub struct ProxyPlan {
     /// Pointer to the prepared upstream (owns peers + keepalive config).
     pub upstream: &'static PreparedUpstream,
+    /// `proxy_pass` with variables naming an address (#100): the one peer
+    /// to use instead of `upstream`'s, which is then a placeholder.
+    pub adhoc_peer: Option<PeerAddr>,
     /// First peer to try, leased at plan-build time. Subsequent
     /// `proxy_next_upstream` retries lease their own peers inside
     /// `run_proxy`. Wrapped in `Option` so the run loop can `.take()`
@@ -301,7 +304,7 @@ fn record_failure(
 fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
     let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
     let uri = request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/");
-    let addr = plan.upstream.peers[peer_idx].addr;
+    let addr = plan.peer_addr(peer_idx);
     // nginx puts a `:` between a socket path and the URI
     // (ngx_http_log_error_handler).
     let separator = match addr {
@@ -309,6 +312,16 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
         PeerAddr::Inet(_) => "",
     };
     format!("http://{addr}{separator}{}", String::from_utf8_lossy(uri))
+}
+
+impl ProxyPlan {
+    /// The address of `upstream.peers[peer_idx]`, or the request's own peer.
+    fn peer_addr(&self, peer_idx: usize) -> PeerAddr {
+        match self.adhoc_peer {
+            Some(addr) => addr,
+            None => self.upstream.peers[peer_idx].addr,
+        }
+    }
 }
 
 /// Run the upstream exchange, with `proxy_next_upstream` failover. Each
@@ -364,9 +377,8 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     loop {
         attempts += 1;
         let started = Instant::now();
-        let mut state = UpstreamState::new(UpstreamPeerName::Addr(
-            upstream.peers[current.peer_idx].addr,
-        ));
+        let mut state =
+            UpstreamState::new(UpstreamPeerName::Addr(plan.peer_addr(current.peer_idx)));
         // 1. Try the pool first for this peer. On any failure before the
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
@@ -1014,7 +1026,7 @@ async fn attempt(
     let from_pool = pooled.is_some();
     // Only the answering attempt's X-Accel headers count.
     *accel = None;
-    let peer_addr = plan.upstream.peers[peer_idx].addr;
+    let peer_addr = plan.peer_addr(peer_idx);
     let (mut stream, opened_at, requests_served, slot) = if let Some(c) = pooled {
         (c.stream, c.opened_at, c.requests_served, c.slot)
     } else {
