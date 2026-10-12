@@ -86,7 +86,7 @@ cargo build --release
 # the binary is target/release/ruxen
 ```
 
-Started as root, ruxen binds its ports, opens certificates and logs, then switches to the configured `user` (nginx's default `nobody`) before it accepts a connection, as nginx's workers do. ruxen's workers are threads of one process, so the whole process switches and no part of it keeps root. Two consequences differ from nginx, whose master stays root: after logrotate moves a log, the user must be able to open the new file (use logrotate's `create <mode> <user> <group>` or `copytruncate`, or a log directory the user owns), and a pid file in a directory only root can write is left behind on exit, with an `[alert]`. Started as an unprivileged user, as the service and container setups below do, ruxen ignores `user` with nginx's warning.
+Started as root, ruxen binds its ports, opens certificates and logs, then switches to the configured `user` (nginx's default `nobody`) before it accepts a connection, as nginx's workers do. ruxen's workers are threads of one process, so the whole server process switches. What nginx's master still does as root afterwards, a small helper process does: it stays root, recreates the log files logrotate moved away and gives them to the user on `SIGUSR1`, and removes the pid file when ruxen exits. It takes only fixed one-byte commands from the server and exits with it. Started as an unprivileged user, as the service and container setups below do, ruxen ignores `user` with nginx's warning.
 
 ### Run
 

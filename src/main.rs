@@ -314,6 +314,13 @@ fn real_main() -> Result<(), Failure> {
     // Fail like nginx when another process already listens on a port.
     worker::claim_addresses(&http.listens).map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
+    // Still one thread here, which the fork needs.
+    if let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0) {
+        let extra: Vec<&Path> = cli.errlog.iter().map(PathBuf::as_path).collect();
+        privileges::start_helper(creds, pid_path.as_deref(), &extra)
+            .map_err(|e| report_emerg(&e, &cli, &main_path))?;
+    }
+
     let runtime = Arc::new(worker::RuntimeState::default());
 
     let n_workers: usize = std::env::var("RUXEN_WORKERS")
@@ -356,7 +363,10 @@ fn real_main() -> Result<(), Failure> {
         && let Some(path) = &pid_path
     {
         match write_pid_file(path) {
-            Ok(()) => pid_written = true,
+            Ok(()) => {
+                pid_written = true;
+                privileges::pid_written();
+            }
             Err(e) => startup_error = Some(e.to_string()),
         }
     }
@@ -365,9 +375,6 @@ fn real_main() -> Result<(), Failure> {
     if startup_error.is_none()
         && let Some(creds) = &switch_to
     {
-        if let Some(errlog) = &cli.errlog {
-            privileges::note_file(errlog);
-        }
         if let Err(e) = privileges::switch(creds) {
             startup_error = Some(e);
         }
@@ -380,7 +387,7 @@ fn real_main() -> Result<(), Failure> {
             let _ = handle.join();
         }
         if pid_written && let Some(path) = &pid_path {
-            remove_pid_file(path);
+            privileges::remove_pid_file_on_exit(path);
         }
         return Err(Failure::Reported);
     }
@@ -410,7 +417,7 @@ fn real_main() -> Result<(), Failure> {
             if SIGTERM_SEEN.load(Ordering::SeqCst) || timed_out {
                 signal_runtime.begin_shutdown();
                 if let Some(path) = &monitor_pid_path {
-                    remove_pid_file(path);
+                    privileges::remove_pid_file_on_exit(path);
                 }
                 // Request-body temp files in flight have no names (they
                 // were unlinked at creation), so the private directory is
@@ -436,6 +443,9 @@ fn real_main() -> Result<(), Failure> {
             // access_log files before a worker's next write. error_log
             // files are opened per write already.
             if SIGUSR1_SEEN.swap(false, Ordering::SeqCst) {
+                // After a switch to `user`, the root helper recreates the
+                // files logrotate moved, for the user to open.
+                privileges::reopen_logs();
                 if let Some(path) = &reopen_stderr
                     && let Err(e) = redirect_stderr(path)
                 {
@@ -459,7 +469,7 @@ fn real_main() -> Result<(), Failure> {
     http.body_temp.remove_private_if_empty();
 
     if let Some(path) = &pid_path {
-        remove_pid_file(path);
+        privileges::remove_pid_file_on_exit(path);
     }
     Ok(())
 }
@@ -743,21 +753,6 @@ fn write_pid_file(path: &Path) -> io::Result<()> {
             format!("writing pid file {}: {e}", path.display()),
         )
     })
-}
-
-/// After a switch to `user`, the pid file's directory may be root's
-/// (nginx's master stays root and can always remove it): say so, as
-/// nginx's `ngx_delete_pidfile` does for a failed unlink.
-fn remove_pid_file(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path)
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "ruxen: [alert] unlink() \"{}\" failed ({})",
-            path.display(),
-            worker::errno_text(&e)
-        );
-    }
 }
 
 #[cfg(unix)]

@@ -1,4 +1,5 @@
-//! M94 — `user`: started as root, ruxen serves as the configured user.
+//! M94 — `user`: started as root, ruxen serves as the configured user,
+//! with a root helper for the rotated logs and the pid file.
 //!
 //! The switch needs root, so the root tests return early otherwise, as
 //! nginx-tests skips its `must be root` files. They run in a container:
@@ -242,4 +243,88 @@ fn m94_not_root_ignores_user_with_a_warning() {
         ),
         "{stderr}"
     );
+}
+
+/// Child processes of `pid`, with their real uid.
+fn children(pid: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(child) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let field = |name: &str| -> Option<u32> {
+            let line = status.lines().find(|l| l.starts_with(name))?;
+            line[name.len()..].split_whitespace().next()?.parse().ok()
+        };
+        if field("PPid:") == Some(pid) {
+            out.push((child, field("Uid:").unwrap()));
+        }
+    }
+    out
+}
+
+/// Gone, or a zombie nobody reaps (the test binary may be the
+/// container's pid 1).
+fn exited(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .trim_start()
+            .starts_with('Z'),
+    }
+}
+
+#[test]
+fn m94_root_helper_reopens_logs_and_removes_the_pid_file() {
+    if !is_root() {
+        return;
+    }
+    // The pid file and the logs are in a directory only root may write,
+    // like /run and /var/log.
+    let conf = format!("pid %%DIR%%/ruxen.pid;\n{CONF}");
+    let (mut server, port, dir) = start("helper", "user nobody nogroup;", &conf);
+    let pid = server.child.id();
+    let helpers = children(pid);
+    assert_eq!(helpers.len(), 1, "{helpers:?}");
+    let (helper, helper_uid) = helpers[0];
+    assert_eq!(helper_uid, 0);
+
+    // logrotate without `create`: the helper makes the new file for the
+    // user before the workers reopen it.
+    assert!(get(port, "/up").starts_with("HTTP/1.1 200"));
+    std::fs::rename(dir.join("access.log"), dir.join("access.log.1")).unwrap();
+    // SAFETY: signalling the child we spawned.
+    unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(get(port, "/up").starts_with("HTTP/1.1 200"));
+    std::thread::sleep(Duration::from_millis(300));
+    let log = dir.join("access.log");
+    assert_eq!(std::fs::metadata(&log).unwrap().uid(), 65534);
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+    // SAFETY: as above.
+    unsafe { libc::kill(pid as i32, libc::SIGQUIT) };
+    assert!(server.child.wait().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !exited(helper) {
+        assert!(Instant::now() < deadline, "the helper outlived the server");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!dir.join("ruxen.pid").exists());
+}
+
+#[test]
+fn m94_no_helper_without_a_switch() {
+    if !is_root() {
+        return;
+    }
+    let (server, port, _dir) = start("nohelper", "user root;", CONF);
+    assert!(get(port, "/up").starts_with("HTTP/1.1 200"));
+    assert_eq!(children(server.child.id()), vec![]);
 }
