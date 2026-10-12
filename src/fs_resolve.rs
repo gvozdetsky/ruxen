@@ -387,6 +387,12 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
     } else {
         match openat2_beneath(root_fd, rel) {
             Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) && !has_dot_dot(rel) => {
+                match open_following_symlinks(root_fd, rel) {
+                    Ok(fd) => fd,
+                    Err(e) => return open_failed(root, rel, e),
+                }
+            }
             Err(e) => return open_failed(root, rel, e),
         }
     };
@@ -710,6 +716,39 @@ fn openat2_beneath(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
+}
+
+/// `disable_symlinks off`, nginx's default: a symlink under the root is
+/// followed wherever it points, as ngx_open_file_wrapper's plain open()
+/// does (#254). `open_and_stat` tries `RESOLVE_BENEATH` first and comes
+/// here only when the path left the root (EXDEV) and has no `..`
+/// component, so a symlink took it out. A `..` that climbs out of the root
+/// (from a variable in `try_files` or `alias`, say) is still refused, where
+/// nginx would follow it. `RESOLVE_NO_MAGICLINKS` stays.
+#[cold]
+fn open_following_symlinks(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd> {
+    let c_rel = CString::new(rel).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let mut how: libc::open_how = unsafe { core::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_NO_MAGICLINKS;
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            c_rel.as_ptr(),
+            &how as *const libc::open_how,
+            core::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
+}
+
+/// Whether a relative path has a `..` component.
+fn has_dot_dot(rel: &[u8]) -> bool {
+    rel.split(|&b| b == b'/').any(|c| c == b"..")
 }
 
 /// `fcntl(F_DUPFD_CLOEXEC)` on the cached root fd — used when the alias
