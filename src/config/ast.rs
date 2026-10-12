@@ -287,6 +287,14 @@ pub enum LbAlgorithm {
     LeastConn,
 }
 
+/// Where an upstream peer listens: a TCP address, or a UNIX-domain socket
+/// (`unix:/path`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamAddr {
+    Inet(SocketAddr),
+    Unix(PathBuf),
+}
+
 /// One `server <host:port> [weight=N] [max_fails=N] [fail_timeout=Ts]
 /// [down] [backup];` entry inside an `upstream {}` block. The host+port
 /// is resolved at parse time via `to_socket_addrs` — we don't carry a
@@ -296,7 +304,7 @@ pub struct UpstreamServer {
     /// Resolved peer address. nginx allows multiple addresses per host
     /// (one server entry expands to multiple peers); we pick the first
     /// resolution and document this as a v0.1 narrowing.
-    pub addr: SocketAddr,
+    pub addr: UpstreamAddr,
     /// Original `host:port` string as written. Used for the upstream
     /// `Host:` header default and for diagnostics.
     pub display: String,
@@ -1871,7 +1879,7 @@ pub enum ProxyPass {
         request_path: Option<String>,
     },
     Direct {
-        addr: SocketAddr,
+        addr: UpstreamAddr,
         host_header: String,
         request_path: Option<String>,
     },

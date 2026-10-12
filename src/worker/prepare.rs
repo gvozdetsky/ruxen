@@ -419,7 +419,7 @@ pub(crate) fn prepare_upstreams(
         for s in u.servers {
             let display: &'static [u8] = Box::leak(s.display.into_bytes().into_boxed_slice());
             peers_vec.push(PreparedPeer {
-                addr: s.addr,
+                addr: PeerAddr::from_config(s.addr),
                 display,
                 weight: s.weight,
                 max_fails: s.max_fails,
@@ -536,7 +536,7 @@ pub(crate) fn build_proxy(
             let display: &'static [u8] =
                 Box::leak(host_header.clone().into_bytes().into_boxed_slice());
             let peer = PreparedPeer {
-                addr,
+                addr: PeerAddr::from_config(addr),
                 display,
                 weight: 1,
                 max_fails: 1,
