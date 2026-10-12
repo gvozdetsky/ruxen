@@ -313,6 +313,7 @@ fn real_main() -> Result<(), Failure> {
 
     // Fail like nginx when another process already listens on a port.
     worker::claim_addresses(&http.listens).map_err(|e| report_emerg(&e, &cli, &main_path))?;
+    worker::bind_unix_listeners(http).map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
     // Still one thread here, which the fork needs.
     if let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0) {
@@ -389,6 +390,7 @@ fn real_main() -> Result<(), Failure> {
         if pid_written && let Some(path) = &pid_path {
             privileges::remove_pid_file_on_exit(path);
         }
+        worker::remove_unix_sockets(http);
         return Err(Failure::Reported);
     }
     runtime.release_workers();
@@ -423,6 +425,7 @@ fn real_main() -> Result<(), Failure> {
                 // were unlinked at creation), so the private directory is
                 // empty unless `client_body_in_file_only on` kept some.
                 http.body_temp.remove_private_if_empty();
+                worker::remove_unix_sockets(http);
                 std::process::exit(0);
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
@@ -467,6 +470,7 @@ fn real_main() -> Result<(), Failure> {
     drop(workers_done);
     let _ = signal_monitor.join();
     http.body_temp.remove_private_if_empty();
+    worker::remove_unix_sockets(http);
 
     if let Some(path) = &pid_path {
         privileges::remove_pid_file_on_exit(path);

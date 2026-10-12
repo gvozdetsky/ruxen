@@ -1087,11 +1087,27 @@ pub fn run(
         }
 
         let mut listeners = Vec::with_capacity(http.listens.len());
-        for prepared in &http.listens {
+        // `listen unix:` sockets, bound by `main` (#263).
+        let mut unix_listeners = Vec::new();
+        for (listen_index, prepared) in http.listens.iter().enumerate() {
+            if prepared.unix.is_some() {
+                match unix_listener_for(listen_index) {
+                    Ok(listener) => unix_listeners.push((listen_index, listener)),
+                    Err(e) => {
+                        let _ = ready.send(Err(format!(
+                            "unix:{} failed ({})",
+                            prepared.unix.unwrap_or(Path::new("")).display(),
+                            errno_text(&e)
+                        )));
+                        return;
+                    }
+                }
+                continue;
+            }
             let bound = listen_socket(http, prepared)
                 .and_then(|socket| TcpListener::from_std(socket.into()));
             match bound {
-                Ok(listener) => listeners.push(listener),
+                Ok(listener) => listeners.push((listen_index, listener)),
                 Err(e) => {
                     let _ = ready.send(Err(format!(
                         "bind() to {} failed ({})",
@@ -1109,12 +1125,12 @@ pub fn run(
         // Accept only once `main` has switched to the configured `user`.
         state.wait_released();
 
-        if listeners.len() == 1 {
+        if listeners.len() == 1 && unix_listeners.is_empty() {
             // Single-listen fast path: keep the accept loop in this top-level
             // task (the pre-m36 shape) to avoid an extra scheduler hop on
             // every accepted connection.
-            let prepared = &http.listens[0];
-            let listener = listeners.pop().expect("one listener");
+            let (listen_index, listener) = listeners.pop().expect("one listener");
+            let prepared = &http.listens[listen_index];
             loop {
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
@@ -1136,7 +1152,7 @@ pub fn run(
                             prepared,
                             stream,
                             addr,
-                            0,
+                            listen_index,
                             http,
                             state.clone(),
                             connection_id,
@@ -1147,8 +1163,16 @@ pub fn run(
                 }
             }
         } else {
-            for (listen_index, listener) in listeners.into_iter().enumerate() {
+            for (listen_index, listener) in listeners {
                 monoio::spawn(run_listener(listener, listen_index, http, state.clone()));
+            }
+            for (listen_index, listener) in unix_listeners {
+                monoio::spawn(run_unix_listener(
+                    listener,
+                    listen_index,
+                    http,
+                    state.clone(),
+                ));
             }
 
             loop {
@@ -1161,6 +1185,137 @@ pub fn run(
             }
         }
     });
+}
+
+/// `listen unix:` sockets, bound once by `main` before the workers start:
+/// a unix stream socket can't be shared with `SO_REUSEPORT`, so every
+/// worker accepts on its copy of the one descriptor (nginx's workers share
+/// the inherited socket the same way). (listen index, descriptor).
+static UNIX_LISTEN_FDS: std::sync::OnceLock<Vec<(usize, std::os::fd::RawFd)>> =
+    std::sync::OnceLock::new();
+
+/// Bind every `listen unix:` socket (#263), as ngx_open_listening_sockets:
+/// a socket file left behind fails with EADDRINUSE, and the socket is
+/// made writable for everyone (0666).
+pub fn bind_unix_listeners(http: &PreparedHttp) -> Result<(), String> {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let mut fds = Vec::new();
+    for (listen_index, listen) in http.listens.iter().enumerate() {
+        let Some(path) = listen.unix else { continue };
+        let failed = |e: std::io::Error| {
+            format!(
+                "bind() to unix:{} failed ({})",
+                path.display(),
+                errno_text(&e)
+            )
+        };
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+            .map_err(failed)?;
+        socket
+            .bind(&socket2::SockAddr::unix(path).map_err(failed)?)
+            .map_err(failed)?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+        socket.listen(listen.socket.backlog).map_err(|e| {
+            format!(
+                "listen() to unix:{} failed ({})",
+                path.display(),
+                errno_text(&e)
+            )
+        })?;
+        socket.set_nonblocking(true).map_err(failed)?;
+        fds.push((listen_index, socket.into_raw_fd()));
+    }
+    let _ = UNIX_LISTEN_FDS.set(fds);
+    Ok(())
+}
+
+/// Remove the `listen unix:` socket files on exit, as
+/// ngx_close_listening_sockets does.
+pub fn remove_unix_sockets(http: &PreparedHttp) {
+    for listen in &http.listens {
+        if let Some(path) = listen.unix {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// This worker's listener for a `listen unix:` socket: its copy of the
+/// descriptor `main` bound.
+fn unix_listener_for(listen_index: usize) -> std::io::Result<monoio::net::UnixListener> {
+    use std::os::fd::FromRawFd;
+    let fd = UNIX_LISTEN_FDS
+        .get()
+        .and_then(|fds| fds.iter().find(|(i, _)| *i == listen_index))
+        .map(|(_, fd)| *fd)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    // SAFETY: `fd` is a listening unix socket in this worker's own copy of
+    // the fd table (unshared after `main` bound it); only this listener
+    // uses it here.
+    monoio::net::UnixListener::from_std(unsafe {
+        std::os::unix::net::UnixListener::from_raw_fd(fd)
+    })
+}
+
+/// The accept loop of a `listen unix:` socket (#263). A connection is
+/// carried as a `TcpStream`, as unix upstreams are (#101): its I/O is plain
+/// recv/send on the descriptor, so the connection code is the same; the
+/// listen's `unix` marks the peer as `unix:`.
+pub(crate) async fn run_unix_listener(
+    listener: monoio::net::UnixListener,
+    listen_index: usize,
+    http: &'static PreparedHttp,
+    state: Arc<RuntimeState>,
+) {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let prepared = &http.listens[listen_index];
+    loop {
+        if state.is_shutting_down() {
+            return;
+        }
+        let canceler = monoio::io::Canceller::new();
+        let accepted = {
+            let mut accept = std::pin::pin!(listener.cancelable_accept(canceler.handle()));
+            let mut tick = std::pin::pin!(monoio::time::sleep(Duration::from_millis(50)));
+            monoio::select! {
+                res = &mut accept => res.map(Some),
+                _ = &mut tick => {
+                    canceler.cancel();
+                    match accept.await {
+                        Ok(pair) => Ok(Some(pair)),
+                        Err(_) => Ok(None),
+                    }
+                }
+            }
+        };
+        match accepted {
+            Ok(Some((stream, _))) => {
+                if !admit_connection(http) {
+                    continue;
+                }
+                let fd = stream.into_raw_fd();
+                // SAFETY: a connected stream socket nothing else owns.
+                let Ok(stream) =
+                    TcpStream::from_std(unsafe { std::net::TcpStream::from_raw_fd(fd) })
+                else {
+                    continue;
+                };
+                state.connection_started();
+                let connection_id = state.next_connection_id();
+                spawn_connection(
+                    prepared,
+                    stream,
+                    SocketAddr::from(([0, 0, 0, 0], 0)),
+                    listen_index,
+                    http,
+                    state.clone(),
+                    connection_id,
+                );
+            }
+            Ok(None) => {}
+            Err(e) => accept_failed(http, &e).await,
+        }
+    }
 }
 
 pub(crate) async fn run_listener(
@@ -1985,6 +2140,7 @@ pub(crate) async fn handle_plain(
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
         peer_ip: peer_addr.ip(),
+        peer_unix: http.listens[listen_index].unix.is_some(),
         realip: None,
         proxy_protocol,
     };
@@ -2022,6 +2178,7 @@ pub(crate) async fn handle_tls(
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
         peer_ip: peer_addr.ip(),
+        peer_unix: http.listens[listen_index].unix.is_some(),
         realip: None,
         proxy_protocol,
     };
@@ -2097,8 +2254,12 @@ pub(crate) async fn handle<S: ConnIo>(
     // `$connection_requests` reads 1 on the first request, 2 on the
     // second, etc. Incrementing before rendering matches that contract.
     let connection_start = Instant::now();
-    let remote_addr = peer_addr.ip().to_string().into_bytes();
-    let remote_port = peer_addr.port();
+    // A unix-domain client is `unix:`, with no port (#263).
+    let (remote_addr, remote_port) = if http.listens[listen_index].unix.is_some() {
+        (b"unix:".to_vec(), 0)
+    } else {
+        (peer_addr.ip().to_string().into_bytes(), peer_addr.port())
+    };
     let mut request_count: u64 = 0;
     // Client timeouts come from the address's default server for the whole
     // connection: the header is read before a virtual server is chosen (as
