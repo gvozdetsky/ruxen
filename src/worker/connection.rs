@@ -120,9 +120,52 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// Wait until the socket accepts more data. Only used by the zero-copy
     /// path, which writes to the fd directly.
     async fn wait_writable(&self) -> std::io::Result<()>;
+
+    /// The keep-alive wait for the next request, which may also read its
+    /// first bytes into `buf` (from offset 0). By default the readiness
+    /// wait of `idle_wait`, after which the caller reads.
+    async fn idle_read(
+        &mut self,
+        buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        start_reload_gen: u64,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        let next = if self.idle_wait(state, idle, start_reload_gen, timers).await {
+            IdleRead::Ready
+        } else {
+            IdleRead::Close
+        };
+        (next, buf)
+    }
+}
+
+/// How a keep-alive wait ended.
+pub enum IdleRead {
+    /// Drop the connection (timeout, shutdown, reload, a slot needed, EOF).
+    Close,
+    /// A request may be there: read it.
+    Ready,
+    /// This many bytes of the next request are already in the buffer.
+    Read(usize),
 }
 
 impl ConnIo for TcpStream {
+    /// The read itself instead of a readiness poll and then a read: one
+    /// io_uring operation per keep-alive request instead of two (#145),
+    /// like nginx's `c->recv` on a read event.
+    async fn idle_read(
+        &mut self,
+        buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        start_reload_gen: u64,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        read_first_or_shutdown(self, buf, state, idle, start_reload_gen, timers).await
+    }
+
     async fn idle_wait(
         &self,
         state: &RuntimeState,
