@@ -4,6 +4,8 @@
 //! asks idle connections (waiting for a request) to close so later clients
 //! get in: idle sockets can't hold the server hostage until they time out.
 
+mod common;
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -26,6 +28,9 @@ impl Drop for Server {
 }
 
 fn start(events: &str) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()

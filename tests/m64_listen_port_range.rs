@@ -2,6 +2,8 @@
 //! nginx (`ngx_parse_inet_url`; nginx-tests' http_listen.t). It used to be
 //! `bad value for listen address`.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -34,6 +36,8 @@ fn get(port: u16) -> String {
 
 #[test]
 fn every_port_of_the_range_is_served() {
+    // Held from the port pick until ruxen listens (#230).
+    let setup = common::ports::setup_lock();
     let (port, a, b) = free_pair();
     let dir = std::env::temp_dir().join(format!("ruxen-m64-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -64,6 +68,7 @@ fn every_port_of_the_range_is_served() {
         );
         sleep(Duration::from_millis(10));
     }
+    drop(setup);
     let first = get(port);
     let second = get(port + 1);
     let _ = child.kill();

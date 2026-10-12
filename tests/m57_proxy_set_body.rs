@@ -2,6 +2,8 @@
 //! variables, and a matching Content-Length), at server or location scope.
 //! It used to be accepted and ignored.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -24,6 +26,9 @@ impl Drop for Server {
 }
 
 fn start(http_body: &str) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -55,7 +60,10 @@ fn start(http_body: &str) -> Server {
 
 /// Upstream that answers with the body it got: `[<len>]<body>`.
 fn spawn_echo_upstream() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for mut s in listener.incoming().flatten() {

@@ -5,6 +5,8 @@
 //! scripts/run_nginx_tests.sh) they name nginx/1.29.2, the version `-V`
 //! reports, because the upstream tests assert it.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -26,6 +28,9 @@ impl Drop for Server {
 }
 
 fn start(nginx_identity: bool) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let port = {

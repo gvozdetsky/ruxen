@@ -37,6 +37,9 @@ fn start(tag: &str, listen_extra: &str, server_extra: &str) -> Server {
 }
 
 fn start_with(tag: &str, events: &str, listen_extra: &str, server_extra: &str) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()

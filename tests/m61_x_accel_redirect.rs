@@ -3,6 +3,8 @@
 //! upstream's body is dropped; `proxy_ignore_headers X-Accel-Redirect`
 //! forwards the response instead. Both used to be ignored.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -25,6 +27,9 @@ impl Drop for Server {
 }
 
 fn start(http_body: &str) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -57,7 +62,10 @@ fn start(http_body: &str) -> Server {
 /// Backend: `/to-named` redirects to `@named`, `/loop/` to itself,
 /// anything else to `/internal/x?a=1`; the body is `upstream body`.
 fn spawn_backend() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for mut s in listener.incoming().flatten() {
@@ -139,7 +147,10 @@ fn x_accel_redirect_redirects_internally() {
 /// `/internal/show`, with the headers nginx carries over
 /// an X-Accel-Redirect and two it doesn't.
 fn spawn_carrying_backend() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for mut s in listener.incoming().flatten() {
@@ -294,7 +305,10 @@ fn x_accel_redirect_refuses_unsafe_uris() {
 /// with an empty body for `/empty` and a 13-byte one otherwise.
 fn spawn_keepalive_backend() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
     let port = listener.local_addr().unwrap().port();
     let accepts = std::sync::Arc::new(AtomicUsize::new(0));
     let counter = accepts.clone();
@@ -334,6 +348,9 @@ fn spawn_keepalive_backend() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUs
 fn x_accel_redirect_keeps_a_bodiless_upstream_connection() {
     use std::sync::atomic::Ordering;
     let (up, accepts) = spawn_keepalive_backend();
+    // Held from the port pick until ruxen listens (#230); after the
+    // backend, whose bind takes it too.
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -367,6 +384,7 @@ fn x_accel_redirect_keeps_a_bodiless_upstream_connection() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(20));
     }
+    drop(setup);
 
     // Without a body, nginx keeps the upstream connection
     // (ngx_http_proxy_module.c:1999): both redirects use one connection.
