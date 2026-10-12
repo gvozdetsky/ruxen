@@ -1101,6 +1101,8 @@ pub fn run(
         // Drop the sender so `main` sees a closed channel, not a hang, if
         // another worker dies before reporting.
         drop(ready);
+        // Accept only once `main` has switched to the configured `user`.
+        state.wait_released();
 
         if listeners.len() == 1 {
             // Single-listen fast path: keep the accept loop in this top-level

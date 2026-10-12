@@ -235,6 +235,10 @@ pub(crate) struct BodyTempDir {
 
 impl BodyTempDir {
     pub(crate) fn new(configured: Option<crate::config::TempPath>) -> Self {
+        if let Some(t) = &configured {
+            // Made and handed to the `user` at startup (ngx_create_paths).
+            crate::privileges::note_temp_dir(&t.path);
+        }
         BodyTempDir {
             configured: configured.map(|t| (prepare::leak_path_buf(t.path), t.levels)),
             private: std::sync::Mutex::new(None),

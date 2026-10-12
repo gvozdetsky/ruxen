@@ -19,8 +19,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim
 COPY --from=build /usr/local/bin/ruxen /usr/local/bin/ruxen
 COPY examples/minimal.conf /etc/ruxen/ruxen.conf
-# ruxen doesn't switch users (the `user` directive), and refuses to start
-# as root without `user root;`: run it as a user of its own.
+# Run as a user of its own from the start, so nothing in the container
+# runs as root (`user` only applies when ruxen starts as root).
 RUN useradd --system --no-create-home --uid 10001 ruxen
 USER ruxen
 EXPOSE 8080

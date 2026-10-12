@@ -1445,9 +1445,29 @@ pub struct RuntimeState {
     /// reload, while leaving the listener loop free to keep accepting new
     /// connections.
     reload_gen: AtomicU64,
+    /// Set by `main` once root is dropped (`privileges`); workers bind,
+    /// report ready, and wait for it before accepting.
+    released: std::sync::Mutex<bool>,
+    released_cv: std::sync::Condvar,
 }
 
 impl RuntimeState {
+    /// Lets the workers start accepting.
+    pub fn release_workers(&self) {
+        *self.released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.released_cv.notify_all();
+    }
+
+    pub(crate) fn wait_released(&self) {
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        while !*released {
+            released = self
+                .released_cv
+                .wait(released)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
     }

@@ -24,6 +24,7 @@ mod fs_resolve;
 mod http;
 mod http_date;
 mod phase;
+mod privileges;
 mod proxy;
 mod proxy_protocol;
 mod syslog;
@@ -175,36 +176,6 @@ fn report_emerg(msg: &str, cli: &Cli, main_path: &Path) -> Failure {
     Failure::Reported
 }
 
-/// nginx started as root switches its workers to `user` (default
-/// `nobody`). ruxen can't switch users yet, so running as root is allowed
-/// only when the config says so with `user root;`; anything else would
-/// quietly serve every request with root's file access.
-fn check_privileges(euid: u32, user: Option<&str>) -> Result<(), String> {
-    const UNPRIVILEGED: &str = "start ruxen as an unprivileged user instead \
-        (setcap cap_net_bind_service=+ep allows ports below 1024)";
-    match (euid, user) {
-        (0, Some("root")) => Ok(()),
-        (0, Some(user)) => Err(format!(
-            "\"user {user}\" is not supported yet, and ignoring it is unsafe: requests \
-             would be served as root; {UNPRIVILEGED}"
-        )),
-        (0, None) => Err(format!(
-            "running as root without \"user root;\": nginx would switch workers to \
-             \"nobody\", but ruxen doesn't switch users yet; add \"user root;\" to run as \
-             root on purpose, or {UNPRIVILEGED}"
-        )),
-        (_, Some(_)) => {
-            // nginx's wording (ngx_set_user) for the same situation.
-            eprintln!(
-                "ruxen: [warn] the \"user\" directive makes sense only if the master \
-                 process runs with super-user privileges, ignored"
-            );
-            Ok(())
-        }
-        (_, None) => Ok(()),
-    }
-}
-
 fn real_main() -> Result<(), Failure> {
     let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
 
@@ -263,9 +234,11 @@ fn real_main() -> Result<(), Failure> {
             main_path.display()
         );
     }
+    // `user`: resolved now, so `-t` reports an unknown user like nginx;
+    // switched to once the listeners are bound.
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
-    check_privileges(euid, cfg.runtime.user.as_deref())
+    let switch_to = privileges::resolve(euid, cfg.runtime.user.as_ref())
         .map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
     if cli.dump {
@@ -341,6 +314,13 @@ fn real_main() -> Result<(), Failure> {
     // Fail like nginx when another process already listens on a port.
     worker::claim_addresses(&http.listens).map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
+    // Still one thread here, which the fork needs.
+    if let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0) {
+        let extra: Vec<&Path> = cli.errlog.iter().map(PathBuf::as_path).collect();
+        privileges::start_helper(creds, pid_path.as_deref(), &extra)
+            .map_err(|e| report_emerg(&e, &cli, &main_path))?;
+    }
+
     let runtime = Arc::new(worker::RuntimeState::default());
 
     let n_workers: usize = std::env::var("RUXEN_WORKERS")
@@ -377,18 +357,41 @@ fn real_main() -> Result<(), Failure> {
             Err(_) => break,
         }
     }
+    // The pid file goes where root may write (/run), so before the switch.
+    let mut pid_written = false;
+    if startup_error.is_none()
+        && let Some(path) = &pid_path
+    {
+        match write_pid_file(path) {
+            Ok(()) => {
+                pid_written = true;
+                privileges::pid_written();
+            }
+            Err(e) => startup_error = Some(e.to_string()),
+        }
+    }
+    // Every listener is bound and every log open: drop root for good
+    // before a single connection is accepted.
+    if startup_error.is_none()
+        && let Some(creds) = &switch_to
+    {
+        if let Err(e) = privileges::switch(creds) {
+            startup_error = Some(e);
+        }
+    }
     if let Some(e) = startup_error {
         eprintln!("ruxen: [emerg] {e}");
         runtime.begin_shutdown();
+        runtime.release_workers();
         for handle in handles {
             let _ = handle.join();
         }
+        if pid_written && let Some(path) = &pid_path {
+            privileges::remove_pid_file_on_exit(path);
+        }
         return Err(Failure::Reported);
     }
-
-    if let Some(path) = &pid_path {
-        write_pid_file(path)?;
-    }
+    runtime.release_workers();
 
     let signal_runtime = runtime.clone();
     let reopen_stderr = cli.errlog.clone();
@@ -414,7 +417,7 @@ fn real_main() -> Result<(), Failure> {
             if SIGTERM_SEEN.load(Ordering::SeqCst) || timed_out {
                 signal_runtime.begin_shutdown();
                 if let Some(path) = &monitor_pid_path {
-                    let _ = std::fs::remove_file(path);
+                    privileges::remove_pid_file_on_exit(path);
                 }
                 // Request-body temp files in flight have no names (they
                 // were unlinked at creation), so the private directory is
@@ -440,6 +443,9 @@ fn real_main() -> Result<(), Failure> {
             // access_log files before a worker's next write. error_log
             // files are opened per write already.
             if SIGUSR1_SEEN.swap(false, Ordering::SeqCst) {
+                // After a switch to `user`, the root helper recreates the
+                // files logrotate moved, for the user to open.
+                privileges::reopen_logs();
                 if let Some(path) = &reopen_stderr
                     && let Err(e) = redirect_stderr(path)
                 {
@@ -463,7 +469,7 @@ fn real_main() -> Result<(), Failure> {
     http.body_temp.remove_private_if_empty();
 
     if let Some(path) = &pid_path {
-        let _ = std::fs::remove_file(path);
+        privileges::remove_pid_file_on_exit(path);
     }
     Ok(())
 }
@@ -819,23 +825,6 @@ fn install_signal_handlers() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn root_needs_explicit_user_root() {
-        assert!(check_privileges(0, Some("root")).is_ok());
-        let err = check_privileges(0, None).unwrap_err();
-        assert!(
-            err.starts_with("running as root without \"user root;\""),
-            "{err}"
-        );
-        let err = check_privileges(0, Some("www-data")).unwrap_err();
-        assert!(
-            err.starts_with("\"user www-data\" is not supported yet"),
-            "{err}"
-        );
-        assert!(check_privileges(1000, None).is_ok());
-        assert!(check_privileges(1000, Some("www-data")).is_ok());
-    }
 
     #[test]
     fn version_output_is_pinned() {
