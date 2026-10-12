@@ -1,0 +1,2 @@
+# Fuzz seeds are raw protocol bytes (CRLF, NUL): never convert them.
+* -text

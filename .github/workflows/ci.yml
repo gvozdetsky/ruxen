@@ -32,6 +32,28 @@ jobs:
           path: target/release/ruxen
           retention-days: 3
 
+  fuzz:
+    # Each parser fuzz target (fuzz/, #217) for 30 s, from the seeds in
+    # fuzz/seeds. Short on purpose: it catches what a change breaks. Longer
+    # runs happen privately, so a crash that might be a vulnerability is
+    # handled through SECURITY.md before it shows up in public logs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Fuzz each target
+        run: |
+          for t in request host uri proxy_protocol config; do
+            mkdir -p "fuzz/corpus/$t"
+            cargo fuzz run "$t" "fuzz/corpus/$t" "fuzz/seeds/$t" -- -max_total_time=30
+          done
+
   nginx-tests:
     # The files NGINX_TEST_PROGRESS.md lists as passing, against the
     # nginx-tests commit in scripts/nginx-tests.rev: a PR that breaks one

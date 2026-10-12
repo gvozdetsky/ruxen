@@ -23,6 +23,11 @@ include = [
     "/LICENSE",
 ]
 
+[features]
+# Builds the library view of the sources (src/lib.rs) for the fuzz targets
+# in fuzz/ (#217). Off in every normal build, where the library is empty.
+fuzzing = []
+
 [dependencies]
 bytes = "1"
 libc = "0.2"
