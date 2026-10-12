@@ -218,15 +218,15 @@ http {
 }
 "#;
     let (_g, port, dir) = spawn_server(conf);
-    std::fs::write(dir.join("big.bin"), vec![b'x'; 1100]).unwrap();
+    // As nginx: exact up to 9999 bytes, then rounded to the nearest unit.
+    std::fs::write(dir.join("small.bin"), vec![b'x'; 1100]).unwrap();
+    std::fs::write(dir.join("big.bin"), vec![b'x'; 15_000]).unwrap();
 
     let r = http_get(port, "/");
     assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
     let b = std::str::from_utf8(body(&r)).unwrap();
-    assert!(
-        b.contains("2K"),
-        "expected rounded size in K units, got: {b}"
-    );
+    assert!(b.contains("    15K\r\n"), "expected 15K, got: {b}");
+    assert!(b.contains("   1100\r\n"), "expected 1100, got: {b}");
 }
 
 #[test]
