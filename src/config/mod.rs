@@ -2456,6 +2456,36 @@ mod tests {
     }
 
     #[test]
+    fn access_log_buffer_flush_gzip() {
+        let parsed = |args: &str| {
+            let args: Vec<String> = args.split(' ').map(str::to_string).collect();
+            parse_log::parse_access_log_args(&args)
+        };
+        let Ok(parse_log::ParsedAccessLog::Entry(log)) =
+            parsed("/tmp/a.log main buffer=32k flush=5s if=$x")
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(
+            (log.buffer, log.flush_ms, log.gzip),
+            (Some(32 * 1024), Some(5000), None)
+        );
+        assert!(log.condition.is_some());
+        // `gzip` alone: level 1 and a 64k buffer.
+        let Ok(parse_log::ParsedAccessLog::Entry(log)) = parsed("/tmp/a.log main gzip") else {
+            panic!("not parsed");
+        };
+        assert_eq!((log.buffer, log.gzip), (Some(64 * 1024), Some(1)));
+        assert!(
+            parsed("/tmp/a.log main flush=1s").is_err(),
+            "flush without buffer"
+        );
+        assert!(parsed("/tmp/a.log main gzip=10").is_err());
+        assert!(parsed("/tmp/a.log main buffer=0").is_err());
+        assert!(parsed("syslog:server=127.0.0.1 main buffer=1k").is_err());
+    }
+
+    #[test]
     fn access_log_rejects_format_after_if_parameter() {
         let src = r#"
             http {
@@ -2464,10 +2494,12 @@ mod tests {
                 server { listen 80; location / { return 200 ""; } }
             }
         "#;
+        // The second argument is the format (`if=$arg_l`, as nginx reads
+        // it), and `test1` is then no parameter.
         assert!(matches!(
             parse(src),
             Err(Error::BadValue {
-                what: "access_log",
+                what: "access_log parameter",
                 ..
             })
         ));

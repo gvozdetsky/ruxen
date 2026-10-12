@@ -60,35 +60,59 @@ pub(crate) fn parse_access_log_args(args: &[String]) -> Result<ParsedAccessLog, 
         Some(raw) => Some(parse_syslog_peer(raw)?),
         None => None,
     };
-    let mut format: Option<String> = None;
+    // `path [format [buffer=size] [gzip[=level]] [flush=time] [if=cond]]`:
+    // the second argument is the format, whatever it looks like, and the
+    // parameters follow in any order (ngx_http_log_set_log).
+    let format: Option<String> = args.get(1).cloned();
     let mut condition: Option<Vec<ValuePart>> = None;
-    let mut saw_condition = false;
-    for token in &args[1..] {
-        if let Some(expr) = token.strip_prefix("if=") {
-            if condition.is_some() {
-                return Err(Error::BadValue {
-                    what: "access_log if",
-                    got: token.clone(),
-                });
-            }
-            condition = Some(parse_value_with_vars(expr)?);
-            saw_condition = true;
-            continue;
-        }
-        if saw_condition {
-            return Err(Error::BadValue {
-                what: "access_log",
-                got: token.clone(),
+    let mut buffer: Option<u64> = None;
+    let mut flush_ms: Option<u64> = None;
+    let mut gzip: Option<u32> = None;
+    let bad = |what: &'static str, got: &str| Error::BadValue {
+        what,
+        got: got.to_string(),
+    };
+    for token in args.iter().skip(2) {
+        if let Some(size) = token.strip_prefix("buffer=") {
+            buffer = Some(
+                parse_size_bytes(size)
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| bad("access_log buffer size", size))?,
+            );
+        } else if let Some(time) = token.strip_prefix("flush=") {
+            flush_ms = Some(
+                parse_duration_ms(time, "access_log flush")
+                    .ok()
+                    .filter(|&ms| ms > 0)
+                    .ok_or_else(|| bad("access_log flush time", time))?,
+            );
+        } else if token == "gzip" || token.starts_with("gzip=") {
+            buffer.get_or_insert(64 * 1024);
+            gzip = Some(match token.strip_prefix("gzip=") {
+                None => 1,
+                Some(level) => level
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|l| (1..=9).contains(l))
+                    .ok_or_else(|| bad("access_log compression level", level))?,
             });
+        } else if let Some(expr) = token.strip_prefix("if=") {
+            condition = Some(parse_value_with_vars(expr)?);
+        } else {
+            return Err(bad("access_log parameter", token));
         }
-        if format.is_none() {
-            format = Some(token.clone());
-            continue;
-        }
-        return Err(Error::BadValue {
-            what: "access_log",
-            got: token.clone(),
-        });
+    }
+    if flush_ms.is_some() && buffer.is_none() {
+        return Err(bad(
+            "access_log (no buffer is defined for access_log)",
+            &args[0],
+        ));
+    }
+    if buffer.is_some() && syslog.is_some() {
+        return Err(bad(
+            "access_log (logs to syslog cannot be buffered)",
+            &args[0],
+        ));
     }
 
     Ok(ParsedAccessLog::Entry(AccessLog {
@@ -96,6 +120,9 @@ pub(crate) fn parse_access_log_args(args: &[String]) -> Result<ParsedAccessLog, 
         syslog,
         format,
         condition,
+        buffer,
+        flush_ms,
+        gzip,
     }))
 }
 
