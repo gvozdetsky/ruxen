@@ -41,6 +41,29 @@ const DEFAULT_ERROR_LOGS: &[PreparedErrorLog] = &[PreparedErrorLog {
     level: ErrorLogLevel::Error,
 }];
 
+/// The `-e` file as the default error log, when stderr stays the real one
+/// because the configuration logs to it (`error_log stderr`, nginx's
+/// `log_use_stderr`; #309).
+static DEFAULT_FILE_LOGS: std::sync::OnceLock<&'static [PreparedErrorLog]> =
+    std::sync::OnceLock::new();
+
+/// Lines with no `error_log` of their own go to `path`, not to stderr.
+pub fn default_error_log_file(path: &std::path::Path) {
+    let path: &'static std::path::Path = Box::leak(path.to_path_buf().into_boxed_path());
+    let logs: &'static [PreparedErrorLog] = Box::leak(Box::new([PreparedErrorLog {
+        target: PreparedErrorLogTarget::File(path),
+        level: ErrorLogLevel::Error,
+    }]));
+    let _ = DEFAULT_FILE_LOGS.set(logs);
+}
+
+fn default_error_logs() -> &'static [PreparedErrorLog] {
+    DEFAULT_FILE_LOGS
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_ERROR_LOGS)
+}
+
 /// The request an error-log line is about, rendered as nginx's trailing
 /// context: `, client: …, server: …, request: "…", upstream: "…", host: "…"`.
 pub(crate) struct ErrorLogRequest<'a> {
@@ -135,7 +158,7 @@ fn log_line_prefix(level: ErrorLogLevel) -> Vec<u8> {
 /// stderr (which `-e` redirects) when there is none, like nginx's main log.
 pub(crate) fn write_worker_log(sinks: &[PreparedErrorLog], level: ErrorLogLevel, message: &str) {
     let sinks = if sinks.is_empty() {
-        DEFAULT_ERROR_LOGS
+        default_error_logs()
     } else {
         sinks
     };
@@ -178,7 +201,7 @@ pub(crate) fn write_error_log(
     upstream: Option<&str>,
 ) {
     let sinks = if sinks.is_empty() {
-        DEFAULT_ERROR_LOGS
+        default_error_logs()
     } else {
         sinks
     };

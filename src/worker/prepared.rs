@@ -1460,6 +1460,9 @@ pub struct PreparedHttp {
     /// in memory is never also written to a temp file: nothing would read
     /// it (#246).
     pub uses_request_body_file: bool,
+    /// An `error_log stderr` appears in the config: `-e` doesn't take over
+    /// stderr (nginx's `log_use_stderr`; #309).
+    pub uses_stderr_log: bool,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],
