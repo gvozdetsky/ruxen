@@ -250,7 +250,7 @@ pub(crate) fn parse_limit_except_block(
                 _ => Err(Error::UnexpectedEof),
             };
         };
-        match (name.as_str(), term) {
+        match (name.as_str(), &term) {
             ("allow" | "deny", Terminator::Semi) => {
                 parse_access_directive(&mut access, &args, lx)?;
             }
@@ -276,10 +276,7 @@ pub(crate) fn parse_limit_except_block(
                 });
             }
             _ => {
-                return Err(Error::UnknownDirective {
-                    name: name.clone(),
-                    ctx: "limit_except",
-                });
+                super::compat::unknown(lx, &args, &term, "limit_except")?;
             }
         }
     }

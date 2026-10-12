@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 mod ast;
+pub mod compat;
 mod error;
 mod lexer;
 mod parse_access;
@@ -72,6 +73,17 @@ pub fn parse_with_main(
 }
 
 pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
+    parse_lexer_inner(&mut lx).map_err(|error| match lx.position() {
+        Some(position) if !matches!(error, Error::At { .. }) => Error::At {
+            error: Box::new(error),
+            position,
+        },
+        _ => error,
+    })
+}
+
+fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
+    let mut lx = lx;
     reset_variable_registry();
     let mut runtime = RuntimeOpts::default();
     let mut http: Option<HttpConfig> = None;
@@ -211,13 +223,13 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(&mut lx)?,
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
             _ => {
-                return Err(Error::UnknownDirective {
-                    name: name.into(),
-                    ctx: "top-level",
-                });
+                compat::unknown(lx, &args, &term, "top-level")?;
             }
         }
     }
@@ -785,13 +797,13 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     .get_or_insert_with(Vec::new)
                     .push(parse_error_log_args(&args[1..])?);
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
-            (other, _) => {
-                return Err(Error::UnknownDirective {
-                    name: other.into(),
-                    ctx: "http",
-                });
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
+            (_, _) => {
+                compat::unknown(lx, &args, &term, "http")?;
             }
         }
     }
@@ -1057,7 +1069,8 @@ pub(crate) fn is_ignored_stmt(name: &str) -> bool {
 /// Validate the arguments of the allowlisted directives whose grammar is
 /// cheap to check, so that a typo still fails `-t` as in nginx. The rest of
 /// `IGNORED_STMT` is accepted with any arguments.
-pub(crate) fn check_ignored_args(args: &[String]) -> Result<(), Error> {
+pub(crate) fn check_ignored_args(lx: &Lexer, args: &[String]) -> Result<(), Error> {
+    compat::ignored(lx, args);
     let what = match args[0].as_str() {
         "proxy_temp_path" => "proxy_temp_path",
         "fastcgi_temp_path" => "fastcgi_temp_path",
@@ -2751,15 +2764,15 @@ mod tests {
             ),
             (
                 "location / { limit_except GET { satisfy any; } }",
-                "unknown directive `satisfy` in limit_except",
+                "unknown directive `satisfy` in a limit_except block",
             ),
             (
                 "location / { limit_except GET { location /x { } } }",
-                "unknown directive `location` in limit_except",
+                "unknown directive `location` in a limit_except block",
             ),
             (
                 "limit_except GET { }",
-                "unknown directive `limit_except` in server",
+                "unknown directive `limit_except` in a server block",
             ),
         ] {
             let conf = format!("http {{ server {{ listen 80; {src} }} }}");

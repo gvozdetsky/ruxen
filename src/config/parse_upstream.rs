@@ -146,13 +146,13 @@ pub(crate) fn parse_upstream_block(
                 let v = args.get(1).ok_or(Error::MissingArg("keepalive_time"))?;
                 keepalive_max_lifetime_ms = Some(parse_duration_ms(v, "keepalive_time")?);
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => {}
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
-            (other, _) => {
-                return Err(Error::UnknownDirective {
-                    name: other.into(),
-                    ctx: "upstream",
-                });
+            (n, Terminator::Semi) if is_ignored_stmt(n) => compat::ignored(lx, &args),
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
+            (_, _) => {
+                compat::unknown(lx, &args, &term, "upstream")?;
             }
         }
     }
