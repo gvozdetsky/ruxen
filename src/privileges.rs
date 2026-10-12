@@ -81,14 +81,8 @@ pub(crate) fn resolve(
     };
     let c_name = CString::new(name.as_str()).map_err(|_| bad_name("getpwnam", &name))?;
     let c_group = CString::new(group.as_str()).map_err(|_| bad_name("getgrnam", &group))?;
-    // SAFETY: NUL-terminated names; the returned records are read before
-    // any other getpw*/getgr* call. Called before the workers start.
-    let uid = unsafe { libc::getpwnam(c_name.as_ptr()).as_ref() }
-        .map(|pw| pw.pw_uid)
-        .ok_or_else(|| bad_name("getpwnam", &name))?;
-    let gid = unsafe { libc::getgrnam(c_group.as_ptr()).as_ref() }
-        .map(|gr| gr.gr_gid)
-        .ok_or_else(|| bad_name("getgrnam", &group))?;
+    let uid = user_id(&c_name).ok_or_else(|| bad_name("getpwnam", &name))?;
+    let gid = group_id(&c_group).ok_or_else(|| bad_name("getgrnam", &group))?;
     if uid == 0 && gid == 0 {
         return Ok(None);
     }
@@ -99,6 +93,46 @@ pub(crate) fn resolve(
     }))
 }
 
+/// `getpwnam_r`: the uid of a user, `None` if there is none. The `_r`
+/// forms fill a buffer of ours, where `getpwnam` returns a static record
+/// any other thread's lookup may overwrite.
+fn user_id(name: &std::ffi::CStr) -> Option<libc::uid_t> {
+    lookup(|buf, len, found| {
+        let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: NUL-terminated name, a buffer of `len` bytes, and out
+        // pointers to locals.
+        let rc = unsafe { libc::getpwnam_r(name.as_ptr(), &mut pw, buf, len, &mut result) };
+        *found = (!result.is_null()).then_some(pw.pw_uid);
+        rc
+    })
+}
+
+/// `getgrnam_r`: the gid of a group, `None` if there is none.
+fn group_id(name: &std::ffi::CStr) -> Option<libc::gid_t> {
+    lookup(|buf, len, found| {
+        let mut gr: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: as in `user_id`.
+        let rc = unsafe { libc::getgrnam_r(name.as_ptr(), &mut gr, buf, len, &mut result) };
+        *found = (!result.is_null()).then_some(gr.gr_gid);
+        rc
+    })
+}
+
+/// Runs a `get*nam_r` call with a buffer that grows on `ERANGE` (a group
+/// with many members needs more than the usual few KiB).
+fn lookup<T>(mut call: impl FnMut(*mut libc::c_char, usize, &mut Option<T>) -> i32) -> Option<T> {
+    let mut buf = vec![0 as libc::c_char; 4096];
+    loop {
+        let mut found = None;
+        match call(buf.as_mut_ptr(), buf.len(), &mut found) {
+            libc::ERANGE if buf.len() < 1 << 20 => buf.resize(buf.len() * 4, 0),
+            _ => return found,
+        }
+    }
+}
+
 fn bad_name(call: &str, name: &str) -> String {
     format!("{call}(\"{name}\") failed")
 }
@@ -107,9 +141,7 @@ fn bad_name(call: &str, name: &str) -> String {
 /// `nogroup` where the system has one (Debian, Ubuntu, Alpine), else
 /// `nobody`.
 fn default_group() -> String {
-    let nogroup = c"nogroup";
-    // SAFETY: a NUL-terminated literal; only the null check is used.
-    if unsafe { libc::getgrnam(nogroup.as_ptr()) }.is_null() {
+    if group_id(c"nogroup").is_none() {
         "nobody".to_string()
     } else {
         "nogroup".to_string()
