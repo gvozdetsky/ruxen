@@ -1,0 +1,4 @@
+GET http://h/a/../b HTTP/1.0
+X: y
+ z
+

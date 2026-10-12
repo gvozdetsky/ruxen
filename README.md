@@ -325,6 +325,24 @@ cargo test --release
 
 The HTTPS integration tests use the system `curl` binary and generate temporary certificates at runtime.
 
+### Fuzzing
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the parsers that read untrusted bytes:
+- `request`: the HTTP request parser, which must also give the same answer when its input arrives in two pieces;
+- `host`: `Host` validation;
+- `uri`: path normalization;
+- `proxy_protocol`: PROXY protocol v1/v2;
+- `config`: the configuration parser.
+
+They need a nightly toolchain:
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run request fuzz/corpus/request fuzz/seeds/request
+```
+
+CI runs each target for 30 seconds on every pull request. If a crash could be a vulnerability, report it as `SECURITY.md` describes, not in a public issue.
+
 ### nginx-tests
 
 ruxen can also run the upstream nginx Perl test suite.

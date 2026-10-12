@@ -133,6 +133,14 @@ impl Lexer {
     }
 
     fn push_include(&mut self, raw_path: &str) -> Result<(), Error> {
+        // The fuzz targets parse untrusted text: reading the files it names
+        // (`include /dev/zero`) would only test the filesystem, or hang.
+        if cfg!(feature = "fuzzing") {
+            return Err(Error::IncludeOpen {
+                path: raw_path.to_string(),
+                reason: "include is disabled for fuzzing".to_string(),
+            });
+        }
         let path = PathBuf::from(raw_path);
         let resolved = if path.is_absolute() {
             path
