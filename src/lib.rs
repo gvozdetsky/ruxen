@@ -77,6 +77,92 @@ pub mod fuzzing {
         let _ = crate::proxy_protocol::parse(data);
     }
 
+    /// The chunked request-body decoder (`read_chunked_request_body`) over
+    /// `data`: the first `initial` bytes as already read with the head,
+    /// the rest delivered `piece` bytes per read. `Ok((decoded body, raw
+    /// bytes consumed))`, or `Err` for a refused body. The decoder must not
+    /// depend on how the input was split into reads.
+    pub fn chunked_body(
+        data: &[u8],
+        initial: usize,
+        piece: usize,
+        max_body: u64,
+    ) -> Result<(Vec<u8>, u64), ()> {
+        thread_local! {
+            static RUNTIME: std::cell::RefCell<
+                monoio::Runtime<monoio::time::TimeDriver<monoio::LegacyDriver>>,
+            > =
+                std::cell::RefCell::new(
+                    monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+                        .enable_timer()
+                        .build()
+                        .expect("monoio runtime"),
+                );
+        }
+        let initial = initial.min(data.len());
+        let mut reader = Pieces {
+            data: data[initial..].to_vec(),
+            pos: 0,
+            piece: piece.max(1),
+        };
+        RUNTIME.with(|rt| {
+            rt.borrow_mut().block_on(async {
+                let temp = crate::worker::BodyTempDir::new(None);
+                let mut sink = crate::worker::BodySink::with_capacity(0, &temp, false);
+                let timer =
+                    std::pin::pin!(monoio::time::sleep(std::time::Duration::from_secs(3600)));
+                let decoded = crate::worker::read_chunked_request_body(
+                    &mut reader,
+                    &data[..initial],
+                    max_body,
+                    &mut sink,
+                    timer,
+                    std::time::Duration::from_secs(3600),
+                )
+                .await;
+                let (body, _file) = sink.finish();
+                match decoded {
+                    Ok(done) => Ok((body.to_vec(), done.raw_consumed)),
+                    Err(_) => Err(()),
+                }
+            })
+        })
+    }
+
+    /// In-memory input delivered at most `piece` bytes per read; EOF after.
+    struct Pieces {
+        data: Vec<u8>,
+        pos: usize,
+        piece: usize,
+    }
+
+    impl monoio::io::AsyncReadRent for Pieces {
+        async fn read<T: monoio::buf::IoBufMut>(
+            &mut self,
+            mut buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            let n = self
+                .piece
+                .min(self.data.len() - self.pos)
+                .min(buf.bytes_total());
+            // SAFETY: `n` is within both the source and the buffer's
+            // capacity, and the bytes are initialized by the copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data[self.pos..].as_ptr(), buf.write_ptr(), n);
+                buf.set_init(n);
+            }
+            self.pos += n;
+            (Ok(n), buf)
+        }
+
+        async fn readv<T: monoio::buf::IoVecBufMut>(
+            &mut self,
+            buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            (Err(std::io::ErrorKind::Unsupported.into()), buf)
+        }
+    }
+
     /// The configuration parser over `text`. `include` is refused under
     /// the `fuzzing` feature, so nothing outside the input is read.
     pub fn parse_config(text: &str) -> bool {

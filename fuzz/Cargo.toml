@@ -56,3 +56,10 @@ path = "fuzz_targets/config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "chunked"
+path = "fuzz_targets/chunked.rs"
+test = false
+doc = false
+bench = false
