@@ -1589,6 +1589,20 @@ fn find_config<'h, 'r>(
     (&listen.servers[listen.default_server], None)
 }
 
+/// Whether a ClientHello with this SNI name is to be refused
+/// (`ssl_reject_handshake`): the server the name selects, as nginx's
+/// servername callback finds it, else the address's TLS default server.
+pub(crate) fn rejects_handshake(listen: &PreparedListen, sni: Option<&str>) -> bool {
+    let Some((rejecting, default)) = &listen.reject_handshake else {
+        return false;
+    };
+    let index = sni
+        .and_then(|name| match_server_name(listen, name.as_bytes()))
+        .and_then(|(server, _)| listen.servers.iter().position(|s| std::ptr::eq(s, server)))
+        .unwrap_or(*default);
+    rejecting.get(index).copied().unwrap_or(false)
+}
+
 /// Run the exact / leading-wildcard / trailing-wildcard / regex ladder
 /// for one candidate hostname. Used both for the HTTP `Host` header pass
 /// and the TLS SNI fallback pass — the matching logic is identical, only

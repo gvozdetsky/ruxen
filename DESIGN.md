@@ -423,6 +423,17 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   rotation, client cert auth, OCSP stapling, 0-RTT, hot cert reload,
   password-protected keys, and `proxy_ssl_*` are out of v0.1 scope (see
   README).
+- **`ssl_reject_handshake` (#112).** On an address where a server has it
+  on, the handshake starts with rustls's `Acceptor`: the ClientHello's SNI
+  name picks the server with the HTTP routing ladder
+  (`phase::rejects_handshake`; no name or no match: the address's TLS
+  default server), and if that server rejects, a plaintext fatal
+  `unrecognized_name` alert goes out before any certificate is chosen, as
+  nginx's servername callback does. Otherwise the handshake continues
+  with the address's one `ServerConfig`. Addresses without it keep the
+  direct `ServerConnection` path. A rejecting default server needs no
+  certificate; the other servers then need one or reject too
+  (ngx_http_ssl_init).
 - **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
   rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
   When the variable is used and the listen resumes sessions, a full

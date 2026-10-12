@@ -1387,6 +1387,12 @@ pub struct PreparedListen {
     /// so a future SIGHUP reload can swap it without invalidating
     /// references handed to in-flight connections.
     pub tls: Option<Arc<crate::tls::TlsAcceptor>>,
+    /// `ssl_reject_handshake on` in a server of this address (#112): which
+    /// servers reject, by index into `servers`, and the TLS default
+    /// server's index (a ClientHello without a matching name is its).
+    /// `None` when no server rejects: the handshake needs no ClientHello
+    /// look first.
+    pub reject_handshake: Option<(Box<[bool]>, usize)>,
     /// `listen … proxy_protocol` on any server of this address: every
     /// connection starts with a PROXY protocol header.
     pub proxy_protocol: bool,

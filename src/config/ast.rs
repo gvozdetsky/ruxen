@@ -451,6 +451,8 @@ pub struct ServerSsl {
     pub session_timeout_ms: Option<u64>,
     /// `ssl_session_cache` / `ssl_session_tickets`, merged with http scope.
     pub resumption: SessionResumption,
+    /// `ssl_reject_handshake on|off` (#112), merged with http scope.
+    pub reject_handshake: Option<bool>,
 }
 
 /// How TLS sessions can be resumed. `None` fields take nginx's defaults:

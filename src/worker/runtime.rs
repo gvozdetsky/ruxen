@@ -2025,14 +2025,23 @@ pub(crate) async fn handle_tls(
         realip: None,
         proxy_protocol,
     };
-    let (mut tls_stream, info) = match crate::tls::accept_with_timeout(
-        &acceptor,
-        stream,
-        budget.saturating_sub(accepted_at.elapsed()),
-    )
-    .await
-    {
+    let budget = budget.saturating_sub(accepted_at.elapsed());
+    let accepted = if listen.reject_handshake.is_some() {
+        crate::tls::accept_or_reject_with_timeout(&acceptor, stream, budget, |sni| {
+            phase::rejects_handshake(listen, sni)
+        })
+        .await
+    } else {
+        crate::tls::accept_with_timeout(&acceptor, stream, budget).await
+    };
+    let (mut tls_stream, info) = match accepted {
         Ok(p) => p,
+        // `ssl_reject_handshake`: nginx logs nothing above debug for it.
+        Err(crate::tls::AcceptError::Tls(e))
+            if e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            return;
+        }
         Err(e) => {
             // nginx logs SSL handshake failures at info level. We don't have
             // a structured logging sink yet (m33's error_log only fires from
