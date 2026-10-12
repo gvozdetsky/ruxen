@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-07 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-12 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 68
-- **Intentionally skipped (`-V` banner excludes the module):** 391
-- **Failing — work in progress:** 46
+- **Passing in ruxen:** 69
+- **Intentionally skipped (`-V` banner excludes the module):** 389
+- **Failing — work in progress:** 47
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (68)
+## Passing in ruxen (69)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -24,6 +24,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `body.t`
 - `body_chunked.t`
 - `config_dump.t`
+- `gzip.t`
 - `headers.t`
 - `http_error_page.t`
 - `http_expect_100_continue.t`
@@ -86,12 +87,13 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (46)
+## Failing — actively being worked on (47)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
+- `access_log.t` — 19/21
 - `http_absolute_redirect.t` — 16/25
-- `http_disable_symlinks.t` — 5/30
+- `http_disable_symlinks.t` — 8/30
 - `http_listen.t` — 0/0
 - `http_resolver.t` — 0/0
 - `http_resolver_cleanup.t` — 1/3
@@ -137,7 +139,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_verify_client.t` — 14/16
 - `ssl_verify_depth.t` — 9/11
 
-## Intentionally skipped (391)
+## Intentionally skipped (389)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
@@ -470,6 +472,15 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `ssl_certificate.t`
 - `ssl_store_keys.t`
 
+### no perl available (6)
+
+- `gzip_flush.t`
+- `perl.t`
+- `perl_gzip.t`
+- `perl_sleep.t`
+- `perl_ssi.t`
+- `ssl_certificate_perl.t`
+
 ### Cache::Memcached not installed (5)
 
 - `gunzip_memcached.t`
@@ -485,14 +496,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `http_resolver_ipv4.t`
 - `proxy_implicit.t`
 - `proxy_ssl_name.t`
-
-### no perl available (5)
-
-- `perl.t`
-- `perl_gzip.t`
-- `perl_sleep.t`
-- `perl_ssi.t`
-- `ssl_certificate_perl.t`
 
 ### no charset available (4)
 
@@ -545,12 +548,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `dav.t`
 - `dav_chunked.t`
 - `dav_utf8.t`
-
-### no gzip available (3)
-
-- `access_log.t`
-- `gzip.t`
-- `gzip_flush.t`
 
 ### no limit_conn available (3)
 
