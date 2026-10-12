@@ -1492,6 +1492,8 @@ pub enum Variable {
     Arg(String),
     /// `https` for connections accepted on a TLS listener, `http` otherwise.
     Scheme,
+    /// `$https`: `on` over TLS, else empty.
+    Https,
     /// Negotiated TLS protocol version (`TLSv1.3`, `TLSv1.2`, …). Empty
     /// outside a TLS connection.
     SslProtocol,
@@ -1533,6 +1535,8 @@ pub enum Variable {
     /// Client IP address from the accepted peer socket (e.g. `127.0.0.1`,
     /// `::1`). Mirrors nginx's `$remote_addr`.
     RemoteAddr,
+    /// `$binary_remote_addr`: the client address as 4 or 16 bytes.
+    BinaryRemoteAddr,
     /// Client source port from the accepted peer socket. Mirrors nginx's
     /// `$remote_port`.
     RemotePort,

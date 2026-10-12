@@ -1622,6 +1622,7 @@ fn request_constant(parts: &[ValuePart]) -> bool {
             Variable::RequestUri
                 | Variable::Host
                 | Variable::Scheme
+                | Variable::Https
                 | Variable::Http(_)
                 | Variable::Cookie(_)
                 | Variable::ContentLength
