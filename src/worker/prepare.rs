@@ -1674,9 +1674,11 @@ fn prepare_syslog_peer(
             PreparedErrorLogSyslogServer::Udp(Box::leak(addr.clone().into_boxed_str()))
         }
     };
+    // nginx's default tag is `nginx`; ruxen's own name, unless it presents
+    // itself as nginx (RUXEN_NGINX_IDENTITY, as for `Server:`).
     let tag: &'static [u8] = match &peer.tag {
         Some(tag) => Box::leak(tag.clone().into_bytes().into_boxed_slice()),
-        None => b"ruxen",
+        None => crate::http::identity().plain,
     };
     Ok(Box::leak(Box::new(PreparedSyslogPeer {
         server,
