@@ -1603,11 +1603,14 @@ fn match_server_name<'h, 'r>(
     // already-lowercased prepared names. Hot path is the all-lowercase
     // input; falls back to a 256-byte stack buffer, then a heap Vec for
     // the rare oversized hostnames seen in pathological clients.
-    let mut host_lc_buf: [u8; 256] = [0; 256];
+    // Initialized only when used: zeroing it on every request showed in
+    // the profile.
+    let mut host_lc_buf: [u8; 256];
     let owned_lc: Vec<u8>;
     let host_lc: &[u8] = if host_raw.iter().all(|b| !b.is_ascii_uppercase()) {
         host_raw
-    } else if host_raw.len() <= host_lc_buf.len() {
+    } else if host_raw.len() <= 256 {
+        host_lc_buf = [0; 256];
         for (i, &b) in host_raw.iter().enumerate() {
             host_lc_buf[i] = b.to_ascii_lowercase();
         }
@@ -1617,13 +1620,9 @@ fn match_server_name<'h, 'r>(
         &owned_lc[..]
     };
 
-    // 1. Exact match.
-    for server in &listen.servers {
-        for name in &server.exact_names {
-            if *name == host_lc {
-                return Some((server, None));
-            }
-        }
+    // 1. Exact match: one hash lookup (nginx's server-name hash).
+    if let Some(&si) = listen.exact_names.get(host_lc) {
+        return Some((&listen.servers[si as usize], None));
     }
 
     // 2. Longest leading-wildcard. Each list is sorted by descending
@@ -1661,8 +1660,20 @@ fn match_server_name<'h, 'r>(
 
     // 4. First regex match in declaration order. Captures are surfaced
     // for `$name` rendering on the request that landed.
-    for server in &listen.servers {
-        for rn in &server.regex_names {
+    // One pass over every regex name of the listen (#248); without a set,
+    // each in turn.
+    let first = match &listen.regex_name_set {
+        Some((set, index)) => match set.matches(host_raw).iter().next() {
+            Some(i) => Some(index[i]),
+            None => return None,
+        },
+        None => None,
+    };
+    for (si, server) in listen.servers.iter().enumerate() {
+        for (ni, rn) in server.regex_names.iter().enumerate() {
+            if first.is_some_and(|(s, n)| (s as usize, n as usize) != (si, ni)) {
+                continue;
+            }
             if let Some(caps) = rn.regex.captures(host_raw) {
                 let mut names: Vec<(&'static str, Vec<u8>)> = Vec::new();
                 for &cn in &rn.capture_names {
@@ -1768,7 +1779,18 @@ pub(crate) fn match_location<'a>(
         // Going through `from_utf8` would silently skip the regex pass for
         // any non-UTF-8 sequence — nginx matches PCRE against
         // `r->uri.data` as raw bytes, and so do we.
-        for rloc in &server.regex_locations {
+        // One pass over all of them finds the first match in declaration
+        // order (#248); only that one's captures are taken.
+        let first = match &server.regex_location_set {
+            Some(set) => set.matches(path).iter().next(),
+            None => None,
+        };
+        let candidates: &[crate::worker::PreparedRegexLocation] = match first {
+            Some(i) => &server.regex_locations[i..=i],
+            None if server.regex_location_set.is_some() => &[],
+            None => &server.regex_locations,
+        };
+        for rloc in candidates {
             if let Some(captures) = rloc.regex.captures(path) {
                 rewrite_state.set_numbered_from_regex_captures(&captures, path);
                 return Some(MatchedLocation::from_regex(rloc));

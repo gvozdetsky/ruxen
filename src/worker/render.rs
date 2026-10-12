@@ -877,10 +877,21 @@ fn render_map(program: &PreparedMap, ctx: &RenderCtx<'_>, out: &mut Vec<u8>) {
         render_parts(value, ctx, out);
         return;
     }
-    for entry in program.regex {
-        if entry.regex.is_match(&key) {
-            render_parts(entry.value, ctx, out);
-            return;
+    // One pass over the regex keys (#248), else each in turn.
+    match &program.regex_set {
+        Some(set) => {
+            if let Some(i) = set.matches(&key).iter().next() {
+                render_parts(program.regex[i].value, ctx, out);
+                return;
+            }
+        }
+        None => {
+            for entry in program.regex {
+                if entry.regex.is_match(&key) {
+                    render_parts(entry.value, ctx, out);
+                    return;
+                }
+            }
         }
     }
     if let Some(default) = program.default {
