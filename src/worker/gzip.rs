@@ -11,7 +11,7 @@
 //! HTTP/1.1 and followed by a close for HTTP/1.0, since its compressed
 //! length is unknown up front. Ranges (206) are not compressed.
 
-use flate2::{Compress, Compression, FlushCompress, Status};
+use zlib_rs::{Deflate, DeflateConfig, DeflateFlush, Status};
 
 use crate::phase::Response;
 
@@ -528,8 +528,37 @@ fn rewrite_head(headers: &[u8], vary: bool, framing: Option<&[u8]>) -> Vec<u8> {
 /// than zlib's level 1 (an 8 KiB HTML page 30 % larger, a 2 MiB stylesheet
 /// 82 %); its level 2 matches zlib's level 1 in size. The other levels
 /// are close to zlib's.
-fn zlib_level(level: u32) -> Compression {
-    Compression::new(if level == 1 { 2 } else { level })
+fn zlib_level(level: u32) -> i32 {
+    if level == 1 { 2 } else { level as i32 }
+}
+
+/// A gzip deflate state sized like nginx's (`ngx_http_gzip_filter_memory`):
+/// memLevel shrinks with the window, so a short body's hash table, which
+/// every reset clears, is small too.
+fn new_deflate(level: u32, window_bits: u8) -> Deflate {
+    Deflate::new_with_config(DeflateConfig {
+        level: zlib_level(level),
+        // 16 + bits: a gzip header and trailer around the deflate data.
+        window_bits: 16 + i32::from(window_bits),
+        mem_level: (8 - (15 - i32::from(window_bits))).max(1),
+        ..DeflateConfig::default()
+    })
+}
+
+/// One `deflate` call into the spare capacity of `out`.
+fn deflate_into(
+    d: &mut Deflate,
+    input: &[u8],
+    out: &mut Vec<u8>,
+    flush: DeflateFlush,
+) -> Option<Status> {
+    let before = d.total_out();
+    let res = d.compress_uninit(input, out.spare_capacity_mut(), flush);
+    let produced = (d.total_out() - before) as usize;
+    // SAFETY: deflate initialized the `produced` bytes it wrote at the
+    // start of the spare capacity.
+    unsafe { out.set_len(out.len() + produced) };
+    res.ok()
 }
 
 thread_local! {
@@ -539,7 +568,7 @@ thread_local! {
     /// zeroing and the TLB shootdowns across worker threads cost as much
     /// as compressing (gzip_html_8k: 51 % of nginx). nginx takes the same
     /// memory from the request pool. Reused states are only reset.
-    static DEFLATE_POOL: std::cell::RefCell<Vec<(u32, u8, Compress)>> =
+    static DEFLATE_POOL: std::cell::RefCell<Vec<(u32, u8, Deflate)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Read and output buffers of `stream_file_gzip`, for the same reason:
     /// freed per response, glibc's thread arenas hand their pages back
@@ -552,7 +581,7 @@ thread_local! {
 /// the same moment, which for whole bodies is one.
 const DEFLATE_POOL_MAX: usize = 16;
 
-fn take_compress(level: u32, window_bits: u8) -> Compress {
+fn take_compress(level: u32, window_bits: u8) -> Deflate {
     let pooled = DEFLATE_POOL.with(|p| {
         let mut p = p.borrow_mut();
         let i = p
@@ -565,11 +594,11 @@ fn take_compress(level: u32, window_bits: u8) -> Compress {
             c.reset();
             c
         }
-        None => Compress::new_gzip(zlib_level(level), window_bits),
+        None => new_deflate(level, window_bits),
     }
 }
 
-fn give_compress(level: u32, window_bits: u8, c: Compress) {
+fn give_compress(level: u32, window_bits: u8, c: Deflate) {
     DEFLATE_POOL.with(|p| {
         let mut p = p.borrow_mut();
         if p.len() < DEFLATE_POOL_MAX {
@@ -584,12 +613,12 @@ pub(crate) fn compress_all(body: &[u8], level: u32, window_bits: u8) -> Vec<u8> 
     let mut out = Vec::with_capacity(body.len() / 2 + 64);
     loop {
         let consumed = c.total_in() as usize;
-        match c.compress_vec(&body[consumed..], &mut out, FlushCompress::Finish) {
-            Ok(Status::StreamEnd) => break,
-            Ok(_) => out.reserve(out.capacity().max(4096)),
+        match deflate_into(&mut c, &body[consumed..], &mut out, DeflateFlush::Finish) {
+            Some(Status::StreamEnd) => break,
+            Some(_) => out.reserve(out.capacity().max(4096)),
             // Only on misuse of the stream; an empty member would be
             // wrong, so keep what deflate made and stop.
-            Err(_) => break,
+            None => break,
         }
     }
     give_compress(level, window_bits, c);
@@ -600,7 +629,7 @@ pub(crate) fn compress_all(body: &[u8], level: u32, window_bits: u8) -> Vec<u8> 
 /// Its deflate state and its two buffers go back to the worker's pools
 /// when dropped.
 pub(crate) struct Deflater {
-    c: Option<Compress>,
+    c: Option<Deflate>,
     level: u32,
     window_bits: u8,
     /// File blocks are read into this one.
@@ -630,9 +659,9 @@ impl Deflater {
             return;
         };
         let flush = if last {
-            FlushCompress::Finish
+            DeflateFlush::Finish
         } else {
-            FlushCompress::None
+            DeflateFlush::NoFlush
         };
         let start = c.total_in();
         loop {
@@ -640,9 +669,9 @@ impl Deflater {
             if out.capacity() - out.len() < 1024 {
                 out.reserve(input.len().max(8192));
             }
-            match c.compress_vec(&input[used..], out, flush) {
-                Ok(Status::StreamEnd) => return,
-                Ok(_) => {
+            match deflate_into(c, &input[used..], out, flush) {
+                Some(Status::StreamEnd) => return,
+                Some(_) => {
                     let used = (c.total_in() - start) as usize;
                     // Not finishing: done once all input is taken and
                     // deflate had room left (it isn't holding output back).
@@ -650,7 +679,7 @@ impl Deflater {
                         return;
                     }
                 }
-                Err(_) => return,
+                None => return,
             }
         }
     }
