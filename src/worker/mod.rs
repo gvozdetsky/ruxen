@@ -461,6 +461,62 @@ pub(crate) const REQUEST_BODY_IN_MEMORY: usize = 1 << 20;
 /// nginx's default `client_max_body_size`.
 pub(crate) const DEFAULT_CLIENT_MAX_BODY_SIZE: u64 = 1 << 20;
 
+thread_local! {
+    /// This worker's spare request-body buffers. A body buffer is sized to
+    /// the Content-Length (64 KiB for a 64 KiB POST); allocated and freed
+    /// per request, glibc's thread arenas give the pages back and fault
+    /// them in again on the next one, as the gzip buffers did (#289).
+    static BODY_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Buffers kept per worker, and the largest kept: an idle worker holds at
+/// most 16 × 256 KiB.
+const BODY_POOL_MAX: usize = 16;
+const BODY_POOL_KEEP: usize = 256 * 1024;
+
+/// An empty buffer with room for `capacity` bytes, from the pool if one is
+/// there.
+pub(crate) fn take_body_buffer(capacity: usize) -> Vec<u8> {
+    let mut buf = BODY_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    buf.reserve(capacity);
+    buf
+}
+
+/// A request body held in memory (or the upstream request built around
+/// one); its buffer goes back to the worker's pool when the request is
+/// done.
+pub(crate) struct PooledBody(pub(crate) Vec<u8>);
+
+impl AsRef<[u8]> for PooledBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for PooledBody {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl Drop for PooledBody {
+    fn drop(&mut self) {
+        let mut buf = std::mem::take(&mut self.0);
+        if buf.capacity() == 0 || buf.capacity() > BODY_POOL_KEEP {
+            return;
+        }
+        buf.clear();
+        BODY_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < BODY_POOL_MAX {
+                p.push(buf);
+            }
+        });
+    }
+}
+
 /// Collects a request body: in memory up to `REQUEST_BODY_IN_MEMORY`, then
 /// in a temp file (see `SpilledBody`).
 pub(crate) struct BodySink<'t> {
@@ -475,7 +531,7 @@ pub(crate) struct BodySink<'t> {
 impl<'t> BodySink<'t> {
     pub(crate) fn with_capacity(expected: u64, temp: &'t BodyTempDir, persistent: bool) -> Self {
         BodySink {
-            mem: Vec::with_capacity(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
+            mem: take_body_buffer(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
             file: None,
             len: 0,
             temp,
@@ -518,11 +574,25 @@ impl<'t> BodySink<'t> {
     }
 
     /// The in-memory body (empty when spilled) and the file, if any.
-    pub(crate) fn finish(self) -> (Vec<u8>, Option<SpilledBody>) {
+    pub(crate) fn finish(self) -> (PooledBody, Option<SpilledBody>) {
         match self.file {
-            Some(spilled) => (Vec::new(), Some(spilled)),
-            None => (self.mem, None),
+            Some(spilled) => (PooledBody(self.mem), Some(spilled)),
+            None => (PooledBody(self.mem), None),
         }
+    }
+
+    /// The in-memory buffer to read the rest of the body into, in place:
+    /// `Some` while the body is in memory and the buffer has room. Hand it
+    /// back with `put_read_buf`.
+    pub(crate) fn take_read_buf(&mut self) -> Option<Vec<u8>> {
+        (self.file.is_none() && self.mem.capacity() > self.mem.len())
+            .then(|| std::mem::take(&mut self.mem))
+    }
+
+    /// The buffer from `take_read_buf`, `n` bytes longer.
+    pub(crate) fn put_read_buf(&mut self, buf: Vec<u8>, n: usize) {
+        self.mem = buf;
+        self.len += n as u64;
     }
 }
 

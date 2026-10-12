@@ -2390,11 +2390,39 @@ pub(crate) async fn handle<S: ConnIo>(
                                 if !sink.extend(&buf[body_start..body_start + take]) {
                                     return;
                                 }
-                                // One read buffer for the whole body; each read
-                                // stops at the body's end so a pipelined next
-                                // request isn't consumed.
-                                let mut chunk: Vec<u8> = Vec::with_capacity(64 * 1024);
+                                // Each read stops at the body's end so a
+                                // pipelined next request isn't consumed. A body
+                                // that stays in memory is read straight into
+                                // its buffer: no copy, no second buffer (#289).
+                                let mut chunk: Vec<u8> = Vec::new();
                                 while sink.len() < cl {
+                                    if let Some(mem) = sink.take_read_buf() {
+                                        let start = mem.len();
+                                        let end = (start as u64 + (cl - sink.len()))
+                                            .min(mem.capacity() as u64)
+                                            as usize;
+                                        let slice = mem.slice_mut(start..end);
+                                        // client_body_timeout between reads.
+                                        let Some((res, returned)) = with_timeout(
+                                            timers.io.as_mut(),
+                                            timeouts.body,
+                                            stream.read(slice),
+                                        )
+                                        .await
+                                        else {
+                                            return;
+                                        };
+                                        match res {
+                                            Ok(0) | Err(_) => return,
+                                            Ok(n) => sink.put_read_buf(returned.into_inner(), n),
+                                        }
+                                        continue;
+                                    }
+                                    // Past the in-memory part: through a read
+                                    // buffer into the temp file.
+                                    if chunk.capacity() == 0 {
+                                        chunk.reserve(64 * 1024);
+                                    }
                                     let want =
                                         (cl - sink.len()).min(chunk.capacity() as u64) as usize;
                                     chunk.clear();

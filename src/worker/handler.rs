@@ -688,7 +688,11 @@ pub(crate) fn run_location_handler(
             );
         }
 
-        let request = crate::proxy::build_request_bytes_with_headers(
+        // Pooled: with the body in it the buffer is as large as the body,
+        // and a fresh one per request faults its pages in each time (#289).
+        let mut request = crate::worker::take_body_buffer(0);
+        crate::proxy::write_request(
+            &mut request,
             req.method_bytes,
             request_uri,
             proxy.http_version,
@@ -718,7 +722,7 @@ pub(crate) fn run_location_handler(
         return Response::Proxy(crate::proxy::ProxyPlan {
             upstream: proxy.upstream,
             initial_peer,
-            request: bytes::Bytes::from(request),
+            request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
             method: req.method,
             server_bytes,
             connect_timeout: std::time::Duration::from_millis(proxy.connect_timeout_ms),
