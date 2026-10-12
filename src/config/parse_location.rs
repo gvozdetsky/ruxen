@@ -347,6 +347,7 @@ pub(crate) fn parse_location_block(
     let mut proxy_pass: Option<ProxyPass> = None;
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
+    let mut limit_req = LimitReqConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
@@ -467,6 +468,7 @@ pub(crate) fn parse_location_block(
                         expires: effective_expires,
                         proxy,
                         gzip,
+                        limit_req,
                         chunked_transfer_encoding,
                         alias_prefix_override,
                         inherits_root,
@@ -732,6 +734,7 @@ pub(crate) fn parse_location_block(
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
+            (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
             ("limit_rate", Terminator::Semi) => {
                 if limit_rate.is_some() {
                     return Err(Error::Duplicate("limit_rate"));

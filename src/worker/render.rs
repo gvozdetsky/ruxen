@@ -342,6 +342,11 @@ impl RenderCtx<'_> {
             Variable::SslClientVEnd => {}
             Variable::SslClientVRemain => {}
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            Variable::LimitReqStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_req::status::text(state.limit_req_status));
+                }
+            }
             Variable::RequestBody => {
                 // nginx leaves `$request_body` empty whenever the body was
                 // spilled to disk — readers consult `$request_body_file`
@@ -997,6 +1002,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::ContentType
             | Variable::RemoteUser
             | Variable::RequestBody
+            | Variable::LimitReqStatus
             | Variable::RequestBodyFile
             | Variable::ProxyHost
             | Variable::ProxyPort

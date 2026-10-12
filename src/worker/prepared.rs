@@ -231,6 +231,10 @@ pub struct RewriteState {
     /// The chosen location's (or, in the server's rewrite phase, the
     /// server's) root, for `$request_filename` / `$document_root`.
     pub(crate) doc_root: Option<&'static DocRoot>,
+    /// `$limit_req_status` (`limit_req::status`); 0 before limit_req ran.
+    /// Once set, limit_req doesn't run again for the request, as nginx's
+    /// `r->main->limit_req_status` (#94).
+    pub(crate) limit_req_status: u8,
 }
 
 impl Default for RewriteState {
@@ -241,6 +245,7 @@ impl Default for RewriteState {
             valid_location: true,
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
+            limit_req_status: 0,
         }
     }
 }
@@ -326,7 +331,7 @@ impl RewriteState {
     /// Something later rendering (the access log, a proxied response's
     /// `add_header`) needs from this state: `set` values or cached maps.
     pub(crate) fn worth_keeping(&self) -> bool {
-        self.has_user_vars() || !self.map_cache.borrow().is_empty()
+        self.has_user_vars() || !self.map_cache.borrow().is_empty() || self.limit_req_status != 0
     }
 
     /// Appends the cached result of map `slot` to `out`, if there is one.
@@ -1074,6 +1079,8 @@ pub struct PreparedLocation {
     /// chunked is off there is no chunked frame to append trailers to,
     /// so they are silently dropped (matching nginx's chunked filter).
     pub chunked_transfer_encoding: bool,
+    /// `limit_req` for requests routed here (#94); `None` without.
+    pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
 }
 
 /// A regex-mode location after prepare. The compiled
@@ -1116,6 +1123,8 @@ pub struct PreparedRegexLocation {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `limit_req` for requests routed here (#94); `None` without.
+    pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
 }
 
 /// Common view onto a matched location. The matcher hands one of these to
@@ -1153,6 +1162,8 @@ pub struct MatchedLocation<'a> {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `limit_req` for requests routed here (#94); `None` without.
+    pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
 }
 
 impl<'a> MatchedLocation<'a> {
@@ -1184,6 +1195,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            limit_req: loc.limit_req,
         }
     }
 
@@ -1233,6 +1245,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            limit_req: loc.limit_req,
         }
     }
 }

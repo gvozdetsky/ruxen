@@ -235,6 +235,9 @@ pub struct ProcessMeta {
     /// access_logs` — so location-scope `access_log` directives fire
     /// against the right format/path for the request that landed.
     pub access_logs: &'static [crate::worker::PreparedAccessLog],
+    /// `limit_req` holds the request this long before its content handler
+    /// (#94).
+    pub limit_req_delay_ms: u64,
     /// Authenticated user from HTTP Basic auth, for `$remote_user`.
     pub remote_user: Option<Vec<u8>>,
     /// The client address the realip module set, for the log lines the
@@ -311,6 +314,7 @@ impl Default for ProcessMeta {
             log: LogMeta::default(),
             server_port: 0,
             access_logs: &[],
+            limit_req_delay_ms: 0,
             remote_user: None,
             realip: None,
             proxy_add_headers: &[],
@@ -877,7 +881,37 @@ fn process_with_meta_inner(
         }
         let req = req_now.as_ref().unwrap_or(req_in);
         let mut denied = None;
-        if !answered_in_rewrite_phase {
+        // The limit_req module's pre-access handler (#94), once per
+        // request (nginx's `r->main->limit_req_status`); not again on the
+        // way to an error page.
+        if !answered_in_rewrite_phase
+            && let Some(lr) = loc.limit_req
+            && rewrite_state.limit_req_status == 0
+            && !in_error_page
+        {
+            let (rejected, delay_ms) = crate::worker::limit_req::run(
+                http,
+                server,
+                req,
+                url_scratch,
+                current_args.as_deref(),
+                &mut rewrite_state,
+                regex_captures.as_ref(),
+                lr,
+                &meta.log,
+                meta.server_name,
+                loc.server_header,
+            );
+            denied = rejected;
+            if delay_ms > 0 {
+                // The worker waits, then processes the request again
+                // (`limit_req::resume_after_delay`): nothing past this
+                // point runs now.
+                meta.limit_req_delay_ms = delay_ms;
+                return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+            }
+        }
+        if !answered_in_rewrite_phase && denied.is_none() {
             match run_access_control(http, req, loc.access, loc.server_header, &meta) {
                 AccessControl::Allow { remote_user } => {
                     meta.remote_user = remote_user;

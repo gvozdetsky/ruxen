@@ -51,6 +51,7 @@ use crate::{autoindex, file, fs_resolve, uri};
 mod connection;
 pub(crate) mod gzip;
 mod handler;
+pub(crate) mod limit_req;
 mod log;
 mod prepare;
 mod prepared;
