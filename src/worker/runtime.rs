@@ -1478,22 +1478,66 @@ fn setsockopt_int(
     }
 }
 
-/// Out of file descriptors, `accept` fails at once while the connection
-/// stays queued, so retrying immediately spins a core until fds free up.
-/// nginx logs it and stops accepting for `accept_mutex_delay` (500 ms,
-/// `ngx_event_accept.c`); do the same. Other errors (a client that reset
-/// before we accepted) are per-connection: just carry on.
+/// A failed `accept`, logged as nginx's ngx_event_accept does: `crit` when
+/// out of file descriptors, `error` for a connection the client aborted
+/// before it was accepted, `alert` for anything else. An aborted connection
+/// is just skipped. Any other error would come back on the next accept at
+/// once: io_uring has no readiness gate (nginx only calls accept again when
+/// epoll reports a pending connection), so the worker waits 500 ms, as
+/// nginx's `accept_mutex_delay` does for EMFILE, instead of spinning. A
+/// denied `IORING_OP_ACCEPT` under an io_uring restriction policy fails
+/// that way on every call with no client at all (#280).
 pub(crate) async fn accept_failed(http: &PreparedHttp, err: &std::io::Error) {
-    if matches!(
-        err.raw_os_error(),
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
-    ) {
-        write_worker_log(
-            http.error_logs,
-            ErrorLogLevel::Crit,
-            &format!("accept() failed ({})", errno_text(err)),
-        );
+    let level = match err.raw_os_error() {
+        Some(libc::EAGAIN | libc::EINTR | libc::ECANCELED) => return,
+        Some(libc::ECONNABORTED) => ErrorLogLevel::Error,
+        Some(libc::EMFILE | libc::ENFILE) => ErrorLogLevel::Crit,
+        _ => ErrorLogLevel::Alert,
+    };
+    let message = format!("accept() failed ({})", errno_text(err));
+    if level == ErrorLogLevel::Alert {
+        // The same error twice a second from every worker would flood the
+        // log: say it once a minute, with how often it happened since.
+        if let Some(message) = ACCEPT_ALERTS.with(|a| a.borrow_mut().take(Instant::now(), message))
+        {
+            write_worker_log(http.error_logs, level, &message);
+        }
+    } else {
+        write_worker_log(http.error_logs, level, &message);
+    }
+    if level != ErrorLogLevel::Error {
         monoio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+thread_local! {
+    static ACCEPT_ALERTS: std::cell::RefCell<RepeatedLine> =
+        const { std::cell::RefCell::new(RepeatedLine { last: None, since: 0 }) };
+}
+
+/// One log line that may repeat: the first goes out, then at most one a
+/// minute, which says how many were held back.
+struct RepeatedLine {
+    last: Option<Instant>,
+    since: u64,
+}
+
+impl RepeatedLine {
+    const EVERY: Duration = Duration::from_secs(60);
+
+    fn take(&mut self, now: Instant, message: String) -> Option<String> {
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Self::EVERY)
+        {
+            self.since += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(match std::mem::take(&mut self.since) {
+            0 => message,
+            n => format!("{message}, {n} more like it since the last one"),
+        })
     }
 }
 
@@ -2996,5 +3040,28 @@ pub(crate) async fn handle<S: ConnIo>(
                 read_start = 0;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_accept_error_is_logged_once_a_minute() {
+        let mut line = RepeatedLine {
+            last: None,
+            since: 0,
+        };
+        let t0 = Instant::now();
+        let msg = || "accept() failed (13: Permission denied)".to_string();
+        assert_eq!(line.take(t0, msg()).as_deref(), Some(msg().as_str()));
+        assert_eq!(line.take(t0 + Duration::from_millis(500), msg()), None);
+        assert_eq!(line.take(t0 + Duration::from_secs(59), msg()), None);
+        assert_eq!(
+            line.take(t0 + Duration::from_secs(60), msg()).as_deref(),
+            Some("accept() failed (13: Permission denied), 2 more like it since the last one")
+        );
+        assert_eq!(line.take(t0 + Duration::from_secs(61), msg()), None);
     }
 }
