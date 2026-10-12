@@ -32,7 +32,7 @@ fn m96_compat_lists_everything_with_positions() {
     std::fs::write(
         &conf,
         format!(
-            "events {{}}\nhttp {{\n    gzip on;\n    tcp_nopush on;\n    include {};\n    \
+            "events {{}}\nhttp {{\n    ssi on;\n    tcp_nopush on;\n    include {};\n    \
              include {}/conf.d/*.conf;\n    server {{\n        listen 127.0.0.1:1;\n        \
              limit_req zone=one;\n    }}\n}}\n",
             d.join("site.conf").display(),
@@ -54,7 +54,7 @@ fn m96_compat_lists_everything_with_positions() {
             d.display()
         ),
         format!("{c}:9: unsupported: limit_req zone=one — unknown directive in a server block"),
-        format!("{c}:3: differs: gzip on — responses are not compressed (#93)"),
+        format!("{c}:3: differs: ssi on — server-side includes are not processed"),
         "ignored: 1 tuning directive with no effect in ruxen: tcp_nopush".to_string(),
         "ruxen does not start with this configuration: 3 unsupported, 1 behaving differently"
             .to_string(),

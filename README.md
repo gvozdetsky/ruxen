@@ -148,13 +148,13 @@ ruxen --compat -c /etc/nginx/nginx.conf
 ruxen 0.1.2: checking /etc/nginx/nginx.conf
 /etc/nginx/nginx.conf:33: unsupported: ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3 — TLSv1, TLSv1.1 rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old names with a warning)
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
-/etc/nginx/nginx.conf:46: differs: gzip on — responses are not compressed (#93)
+/etc/nginx/nginx.conf:27: differs: default_type application/octet-stream — files of unknown types get ruxen's built-in default (#38)
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
 ruxen does not start with this configuration: 2 unsupported, 1 behaving differently
 ```
 
 - **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
-- **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `gzip off`, is not listed.
+- **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `ssi off`, is not listed.
 - **ignored:** tuning knobs with no visible effect.
 
 With nothing unsupported, the configuration is then loaded the way `-t` does it (certificates, roots, log files). The exit status is 0 when ruxen starts with the configuration. A `#N` refers to the GitHub issue that tracks the gap. `-t` errors also carry nginx's ` in file:line`.
