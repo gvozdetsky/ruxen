@@ -733,13 +733,41 @@ pub struct PreparedUpstream {
     pub lb: crate::config::LbAlgorithm,
 }
 
+/// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in
+/// nginx's `$upstream_addr` and error log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAddr {
+    Inet(SocketAddr),
+    Unix(&'static std::path::Path),
+}
+
+impl PeerAddr {
+    pub(crate) fn from_config(addr: crate::config::UpstreamAddr) -> Self {
+        match addr {
+            crate::config::UpstreamAddr::Inet(addr) => PeerAddr::Inet(addr),
+            crate::config::UpstreamAddr::Unix(path) => {
+                PeerAddr::Unix(Box::leak(path.into_boxed_path()))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerAddr::Inet(addr) => addr.fmt(f),
+            PeerAddr::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
 /// Per-server entry inside an `upstream {}` block. The runtime consumes the
 /// full peer surface for weighted/least-conn selection, backup eligibility,
 /// and `max_fails` / `fail_timeout` liveness tracking.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct PreparedPeer {
-    pub addr: SocketAddr,
+    pub addr: PeerAddr,
     pub display: &'static [u8],
     pub weight: u32,
     pub max_fails: u32,

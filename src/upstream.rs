@@ -401,7 +401,7 @@ pub struct LeasedPeer {
 
 impl LeasedPeer {
     #[allow(dead_code)]
-    pub fn addr(&self) -> std::net::SocketAddr {
+    pub fn addr(&self) -> crate::worker::PeerAddr {
         self.upstream.peers[self.peer_idx].addr
     }
     #[allow(dead_code)]
@@ -533,7 +533,7 @@ mod tests {
         let peers: Vec<PreparedPeer> = specs
             .iter()
             .map(|(w, down, backup)| PreparedPeer {
-                addr: "127.0.0.1:1".parse::<SocketAddr>().unwrap(),
+                addr: crate::worker::PeerAddr::Inet("127.0.0.1:1".parse::<SocketAddr>().unwrap()),
                 display: b"x",
                 weight: *w,
                 max_fails: 1,

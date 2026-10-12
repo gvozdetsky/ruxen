@@ -267,7 +267,7 @@ pub(crate) fn write_upstream_error_log(
         let message = failure.error.to_string();
         write_error_log(
             meta.error_logs,
-            ErrorLogLevel::Error,
+            failure.error.log_level(),
             req,
             message.as_bytes(),
             Some(&failure.upstream),

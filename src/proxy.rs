@@ -30,6 +30,7 @@ use crate::http::Method;
 use crate::phase::Response;
 use crate::upstream;
 use crate::upstream::LeasedPeer;
+use crate::worker::PeerAddr;
 use crate::worker::PreparedUpstream;
 
 // Per-worker reusable scratch buffers for proxy::attempt. The proxy hot path
@@ -300,11 +301,14 @@ fn record_failure(
 fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
     let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
     let uri = request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/");
-    format!(
-        "http://{}{}",
-        plan.upstream.peers[peer_idx].addr,
-        String::from_utf8_lossy(uri)
-    )
+    let addr = plan.upstream.peers[peer_idx].addr;
+    // nginx puts a `:` between a socket path and the URI
+    // (ngx_http_log_error_handler).
+    let separator = match addr {
+        PeerAddr::Unix(_) => ":",
+        PeerAddr::Inet(_) => "",
+    };
+    format!("http://{addr}{separator}{}", String::from_utf8_lossy(uri))
 }
 
 /// Run the upstream exchange, with `proxy_next_upstream` failover. Each
@@ -501,7 +505,9 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 upstream::report_failure(upstream, current.peer_idx);
                 let sent = !matches!(
                     *error,
-                    UpstreamError::ConnectFailed(_) | UpstreamError::TimedOut(Stage::Connecting)
+                    UpstreamError::ConnectFailed(_)
+                        | UpstreamError::UnixConnectFailed(..)
+                        | UpstreamError::TimedOut(Stage::Connecting)
                 );
                 record_failure(failures, &plan, current.peer_idx, error);
                 let triggers = match kind {
@@ -683,6 +689,9 @@ impl Stage {
 #[derive(Debug)]
 pub enum UpstreamError {
     ConnectFailed(std::io::Error),
+    /// A UNIX-domain socket refuses at once, so nginx reports it from
+    /// connect() itself, with the path (ngx_event_connect_peer).
+    UnixConnectFailed(std::io::Error, &'static std::path::Path),
     SendFailed(std::io::Error),
     RecvFailed(std::io::Error, Stage),
     TimedOut(Stage),
@@ -694,10 +703,37 @@ pub enum UpstreamError {
     InvalidChunked,
     TooBigBody,
     NoLiveUpstreams,
-    DuplicateHeader { line: String, previous: String },
+    DuplicateHeader {
+        line: String,
+        previous: String,
+    },
     LengthAndTransferEncoding,
     InvalidContentLength(String),
     UnknownTransferEncoding(String),
+}
+
+impl UpstreamError {
+    /// The error-log level nginx uses: `crit` for a UNIX-domain connect()
+    /// failing with anything but a refusal or a full backlog (a missing
+    /// socket file, say), `error` otherwise (ngx_event_connect_peer).
+    pub fn log_level(&self) -> crate::config::ErrorLogLevel {
+        use crate::config::ErrorLogLevel;
+        match self {
+            UpstreamError::UnixConnectFailed(e, _) => match e.raw_os_error() {
+                Some(
+                    libc::ECONNREFUSED
+                    | libc::EAGAIN
+                    | libc::ECONNRESET
+                    | libc::ENETDOWN
+                    | libc::ENETUNREACH
+                    | libc::EHOSTDOWN
+                    | libc::EHOSTUNREACH,
+                ) => ErrorLogLevel::Error,
+                _ => ErrorLogLevel::Crit,
+            },
+            _ => ErrorLogLevel::Error,
+        }
+    }
 }
 
 impl std::fmt::Display for UpstreamError {
@@ -708,6 +744,13 @@ impl std::fmt::Display for UpstreamError {
             ConnectFailed(e) => write!(
                 f,
                 "connect() failed ({}) while {}",
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            UnixConnectFailed(e, path) => write!(
+                f,
+                "connect() to unix:{} failed ({}) while {}",
+                path.display(),
                 errno_text(e),
                 Stage::Connecting.as_str()
             ),
@@ -893,7 +936,7 @@ pub struct UpstreamState {
 
 #[derive(Debug, Clone, Copy)]
 pub enum UpstreamPeerName {
-    Addr(std::net::SocketAddr),
+    Addr(PeerAddr),
     /// No peer could be tried (`no live upstreams`): the upstream's name.
     Group(&'static [u8]),
 }
@@ -946,6 +989,18 @@ enum AttemptOutcome {
     NoConnection,
 }
 
+/// Connect to a UNIX-domain socket, returned as a `TcpStream`: monoio's
+/// stream I/O is plain recv/send/readv/writev on the descriptor, which
+/// works the same on any stream socket, so the pool, `attempt` and the
+/// TCP path keep their one stream type. Only `set_nodelay` fails on it,
+/// and that result is ignored.
+async fn connect_unix(path: &'static std::path::Path) -> std::io::Result<TcpStream> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let fd = monoio::net::UnixStream::connect(path).await?.into_raw_fd();
+    // SAFETY: `fd` is a connected stream socket that nothing else owns.
+    TcpStream::from_std(unsafe { std::net::TcpStream::from_raw_fd(fd) })
+}
+
 async fn attempt(
     plan: &ProxyPlan,
     peer_idx: usize,
@@ -966,14 +1021,23 @@ async fn attempt(
         let Some(slot) = crate::worker::take_upstream_slot() else {
             return AttemptOutcome::NoConnection;
         };
-        let connect_fut = TcpStream::connect(peer_addr);
-        let stream = match timeout(plan.connect_timeout, connect_fut).await {
+        let stream = match peer_addr {
+            PeerAddr::Inet(addr) => timeout(plan.connect_timeout, TcpStream::connect(addr)).await,
+            PeerAddr::Unix(path) => {
+                timeout(plan.connect_timeout, Box::pin(connect_unix(path))).await
+            }
+        };
+        let stream = match stream {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
+                let error = match peer_addr {
+                    PeerAddr::Unix(path) => UpstreamError::UnixConnectFailed(e, path),
+                    PeerAddr::Inet(_) => UpstreamError::ConnectFailed(e),
+                };
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
-                    Box::new(UpstreamError::ConnectFailed(e)),
+                    Box::new(error),
                 );
             }
             Err(_) => {
