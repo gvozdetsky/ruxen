@@ -2092,7 +2092,11 @@ pub(crate) async fn handle_plain(
         realip: None,
         proxy_protocol,
     };
-    handle(
+    // Boxed: the connection's future is about 10 KiB, and the task that
+    // `spawn_connection` builds would otherwise be moved, all of it, into
+    // the runtime on every accept. Here the task stays small and the big
+    // future is placed once (#128).
+    Box::pin(handle(
         &mut stream,
         peer_addr,
         listen_index,
@@ -2102,7 +2106,7 @@ pub(crate) async fn handle_plain(
         http,
         state,
         connection_id,
-    )
+    ))
     .await;
 }
 
@@ -2156,7 +2160,8 @@ pub(crate) async fn handle_tls(
             .map(|b| b.to_ascii_lowercase())
             .collect()
     });
-    handle(
+    // Boxed, as in `handle_plain`.
+    Box::pin(handle(
         &mut tls_stream,
         peer_addr,
         listen_index,
@@ -2166,7 +2171,7 @@ pub(crate) async fn handle_tls(
         http,
         state,
         connection_id,
-    )
+    ))
     .await;
     // close_notify before TCP FIN. Best-effort: peer may already have gone
     // away; we don't have anything useful to do with the error.
