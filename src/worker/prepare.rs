@@ -206,7 +206,20 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             })
             .collect::<Result<_, _>>()?;
         let tls = build_listen_tls(addr, &tls_inputs)?;
+        let mut name_index: Vec<(u32, u32)> = Vec::new();
+        for (si, server) in servers.iter().enumerate() {
+            for ni in 0..server.regex_names.len() {
+                name_index.push((si as u32, ni as u32));
+            }
+        }
+        let regex_name_set = first_match_set(
+            servers
+                .iter()
+                .flat_map(|s| s.regex_names.iter().map(|n| n.set_pattern.as_str())),
+        )
+        .map(|set| (set, name_index));
         listens.push(PreparedListen {
+            regex_name_set,
             addr,
             addr_text: if addr.ip().is_unspecified() {
                 b""
@@ -949,6 +962,7 @@ pub(crate) fn prepare_server(
                 regex_names.push(PreparedRegexName {
                     regex,
                     capture_names,
+                    set_pattern: set_pattern(&pattern, case_insensitive),
                 });
             }
             ServerNameSpec::Empty => {
@@ -1283,6 +1297,7 @@ pub(crate) fn prepare_server(
         listen_port,
         exact_locations: exact,
         prefix_locations: prefix,
+        regex_location_set: first_match_set(regex.iter().map(|r| r.set_pattern.as_str())),
         regex_locations: regex,
         named_locations: named,
         server_default,
@@ -1534,12 +1549,14 @@ pub(crate) fn prepare_maps(
             }
         }
         let mut regex_entries: Vec<PreparedMapRegex> = Vec::with_capacity(regex.len());
+        let mut regex_set_patterns: Vec<String> = Vec::with_capacity(regex.len());
         for MapRegexEntry {
             pattern,
             case_insensitive,
             value,
         } in regex
         {
+            regex_set_patterns.push(set_pattern(&pattern, case_insensitive));
             // Already validated at parse time; a failure here is a bug.
             let compiled = regex::bytes::RegexBuilder::new(&pattern)
                 .case_insensitive(case_insensitive)
@@ -1550,7 +1567,9 @@ pub(crate) fn prepare_maps(
                 value: prepare_value_parts(value),
             });
         }
+        let regex_set = first_match_set(regex_set_patterns.iter().map(String::as_str));
         let prepared = PreparedMap {
+            regex_set,
             key: prepare_value_parts(key),
             exact: exact_map,
             hostnames,
@@ -2580,6 +2599,7 @@ pub(crate) fn build_regex_location(
         location_chunked_transfer_encoding.unwrap_or(server_chunked_transfer_encoding);
     Ok(PreparedRegexLocation {
         regex,
+        set_pattern: set_pattern(&pattern, case_insensitive),
         handler,
         rewrite_program,
         add_headers,
@@ -2705,4 +2725,28 @@ pub(crate) fn prepare_gzip(
         disable_msie6,
         disable,
     }))))
+}
+
+/// `pattern` as a `RegexSet` member, with the case flag its own `Regex`
+/// was built with.
+pub(crate) fn set_pattern(pattern: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        format!("(?i:{pattern})")
+    } else {
+        pattern.to_string()
+    }
+}
+
+/// One `RegexSet` over a list of regexes nginx tries in order: the lowest
+/// matching index is the first match, found in one pass (#248). `None`
+/// for fewer than two (a set gains nothing), or if the set doesn't build
+/// (size limits): the caller then tries the regexes one by one.
+pub(crate) fn first_match_set<'a>(
+    patterns: impl IntoIterator<Item = &'a str>,
+) -> Option<regex::bytes::RegexSet> {
+    let patterns: Vec<&str> = patterns.into_iter().collect();
+    if patterns.len() < 2 {
+        return None;
+    }
+    regex::bytes::RegexSet::new(&patterns).ok()
 }

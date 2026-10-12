@@ -204,6 +204,8 @@ pub struct PreparedMap {
     /// `mail.*` as (lowercased head, value); the longest match wins.
     pub wildcard_tail: &'static [(Vec<u8>, &'static [PreparedValuePart])],
     pub regex: &'static [PreparedMapRegex],
+    /// `regex` in one `RegexSet` (see `PreparedServer::regex_location_set`).
+    pub regex_set: Option<regex::bytes::RegexSet>,
     pub default: Option<&'static [PreparedValuePart]>,
     /// Its first result is kept for the request (`RewriteState`): not
     /// `volatile`, and its key or values can change during a request.
@@ -1053,6 +1055,8 @@ pub struct PreparedLocation {
 /// reason.
 pub struct PreparedRegexLocation {
     pub regex: regex::bytes::Regex,
+    /// `regex` as a member of the server's `regex_location_set`.
+    pub set_pattern: String,
     pub handler: PreparedHandler,
     pub rewrite_program: &'static [PreparedRewriteOp],
     pub add_headers: &'static [PreparedAddHeader],
@@ -1206,6 +1210,8 @@ impl<'a> MatchedLocation<'a> {
 pub struct PreparedRegexName {
     pub regex: regex::bytes::Regex,
     pub capture_names: Vec<&'static str>,
+    /// `regex` as a member of the listen's `regex_name_set`.
+    pub set_pattern: String,
 }
 
 /// `client_header_timeout`, `client_body_timeout`, `send_timeout`,
@@ -1282,6 +1288,10 @@ pub struct PreparedServer {
     pub exact_locations: Vec<PreparedLocation>,
     pub prefix_locations: Vec<PreparedLocation>,
     pub regex_locations: Vec<PreparedRegexLocation>,
+    /// All of `regex_locations` in one `RegexSet`: the first match in
+    /// declaration order in one pass, instead of one search per regex
+    /// (#248). `None` for fewer than two, or if the set didn't build.
+    pub regex_location_set: Option<regex::bytes::RegexSet>,
     pub named_locations: Vec<PreparedLocation>,
     /// Server-scope `return STATUS [body]`. Fires when no explicit location
     /// matches, instead of the default 404. Inherits the server-level
@@ -1347,6 +1357,10 @@ pub struct PreparedListen {
     pub proxy_protocol: bool,
     /// The listening socket's options.
     pub socket: ListenSocket,
+    /// Every regex `server_name` of `servers`, in the order they are tried
+    /// (server by server), in one `RegexSet`, with each member's (server,
+    /// name) index (#248). `None` for fewer than two.
+    pub regex_name_set: Option<(regex::bytes::RegexSet, Vec<(u32, u32)>)>,
 }
 
 /// A listening socket's `listen` options (`backlog=`, `rcvbuf=`, …), from
