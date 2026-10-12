@@ -154,6 +154,12 @@ fn read_sorted_entries(dir_path: &Path) -> std::io::Result<Vec<Entry>> {
             Err(_) => continue,
         };
         let file_name = item.file_name();
+        // nginx leaves out every name that starts with a dot (`.htpasswd`,
+        // `.git`, `.env`, and `.`/`..`): ngx_http_autoindex_handler skips
+        // `ngx_de_name(&dir)[0] == '.'`.
+        if file_name.as_os_str().as_bytes().first() == Some(&b'.') {
+            continue;
+        }
         // `fs::metadata` follows symlinks (vs. `DirEntry::metadata`,
         // which does not). nginx's autoindex follows symlinks too —
         // `ngx_http_autoindex_module.c` calls `ngx_de_info` which is
