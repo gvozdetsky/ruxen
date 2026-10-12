@@ -1052,7 +1052,7 @@ fn unshare_fd_table() {
 pub fn run(
     http: &'static PreparedHttp,
     cpu: Option<usize>,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     unshare_fd_table();
@@ -1115,32 +1115,25 @@ pub fn run(
             // every accepted connection.
             let prepared = &http.listens[0];
             let listener = listeners.pop().expect("one listener");
+            let mut tick = AcceptTick::new();
             loop {
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
                 if state.is_shutting_down() {
-                    while state.active_connections() != 0 {
+                    while worker_clients() != 0 {
                         monoio::time::sleep(Duration::from_millis(10)).await;
                     }
                     return;
                 }
-                match accept_or_tick(&listener).await {
+                match accept_or_tick(&listener, &mut tick).await {
                     Ok(Some((stream, addr))) => {
                         if !admit_connection(http) {
                             continue;
                         }
                         let _ = stream.set_nodelay(true);
-                        state.connection_started();
+                        connection_started();
                         let connection_id = state.next_connection_id();
-                        spawn_connection(
-                            prepared,
-                            stream,
-                            addr,
-                            0,
-                            http,
-                            state.clone(),
-                            connection_id,
-                        );
+                        spawn_connection(prepared, stream, addr, 0, http, state, connection_id);
                     }
                     Ok(None) => {}
                     Err(e) => accept_failed(http, &e).await,
@@ -1148,13 +1141,13 @@ pub fn run(
             }
         } else {
             for (listen_index, listener) in listeners.into_iter().enumerate() {
-                monoio::spawn(run_listener(listener, listen_index, http, state.clone()));
+                monoio::spawn(run_listener(listener, listen_index, http, state));
             }
 
             loop {
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
-                if state.is_shutting_down() && state.active_connections() == 0 {
+                if state.is_shutting_down() && worker_clients() == 0 {
                     return;
                 }
                 monoio::time::sleep(Duration::from_millis(10)).await;
@@ -1167,20 +1160,21 @@ pub(crate) async fn run_listener(
     listener: TcpListener,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
 ) {
     let prepared = &http.listens[listen_index];
+    let mut tick = AcceptTick::new();
     loop {
         if state.is_shutting_down() {
             return;
         }
-        match accept_or_tick(&listener).await {
+        match accept_or_tick(&listener, &mut tick).await {
             Ok(Some((stream, addr))) => {
                 if !admit_connection(http) {
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
-                state.connection_started();
+                connection_started();
                 let connection_id = state.next_connection_id();
                 spawn_connection(
                     prepared,
@@ -1188,7 +1182,7 @@ pub(crate) async fn run_listener(
                     addr,
                     listen_index,
                     http,
-                    state.clone(),
+                    state,
                     connection_id,
                 );
             }
@@ -1209,12 +1203,12 @@ pub(crate) fn spawn_connection(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
 ) {
     // The connection was counted on accept; whatever path it takes from
     // here, dropping the guard un-counts it.
-    let guard = ConnectionGuard(state.clone());
+    let guard = ConnectionGuard;
     if prepared.proxy_protocol {
         // Cold: `listen … proxy_protocol`.
         monoio::spawn(handle_proxy_protocol(
@@ -1270,7 +1264,7 @@ async fn handle_proxy_protocol(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     guard: ConnectionGuard,
 ) {
@@ -1548,25 +1542,49 @@ impl RepeatedLine {
 
 pub(crate) async fn accept_or_tick(
     listener: &TcpListener,
+    tick: &mut AcceptTick,
 ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
     use std::pin::pin;
 
-    let canceler = monoio::io::Canceller::new();
-    let mut accept = pin!(listener.cancelable_accept(canceler.handle()));
-    let mut tick = pin!(monoio::time::sleep(Duration::from_millis(50)));
+    let mut accept = pin!(listener.cancelable_accept(tick.canceller.handle()));
     monoio::select! {
         res = &mut accept => res.map(Some),
-        _ = &mut tick => {
+        _ = tick.timer.as_mut() => {
+            tick.timer
+                .as_mut()
+                .reset(monoio::time::Instant::now() + ACCEPT_TICK);
             // If the accept SQE completed in the same poll batch as the
             // timer, dropping it here closes the accepted fd and the client
             // sees EOF. Cancel the op, then keep whatever the kernel already
             // handed back: a real success (race with cancel) hands us the
             // connection; a genuine cancel returns the canceled-op error.
-            canceler.cancel();
+            // `cancel` hands back a fresh canceller for the next accepts.
+            tick.canceller = std::mem::take(&mut tick.canceller).cancel();
             match accept.await {
                 Ok(pair) => Ok(Some(pair)),
                 Err(_) => Ok(None),
             }
+        }
+    }
+}
+
+/// How often an accept loop wakes without a connection, to notice
+/// shutdown and reloads.
+const ACCEPT_TICK: Duration = Duration::from_millis(50);
+
+/// An accept loop's tick timer and canceller, kept across accepts: a
+/// fresh timer and canceller per accepted connection cost a timer-wheel
+/// insert and remove and an allocation each (#128).
+pub(crate) struct AcceptTick {
+    timer: std::pin::Pin<Box<monoio::time::Sleep>>,
+    canceller: monoio::io::Canceller,
+}
+
+impl AcceptTick {
+    pub(crate) fn new() -> Self {
+        AcceptTick {
+            timer: Box::pin(monoio::time::sleep(ACCEPT_TICK)),
+            canceller: monoio::io::Canceller::new(),
         }
     }
 }
@@ -1680,13 +1698,85 @@ pub(crate) async fn read_first_or_shutdown(
     }
 }
 
-pub(crate) struct ConnectionGuard(Arc<RuntimeState>);
+/// A connection's read buffer and scratch buffers (see `handle`).
+struct ConnBufs {
+    buf: Vec<u8>,
+    scratch: Vec<u8>,
+    url_scratch: Vec<u8>,
+}
+
+thread_local! {
+    /// Buffers of finished connections, for the next ones.
+    static CONN_BUFS: RefCell<Vec<ConnBufs>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Sets kept per worker; beyond that, finished connections free theirs.
+const CONN_BUFS_KEPT: usize = 64;
+/// A scratch buffer that grew past this (a large response) isn't kept.
+const CONN_SCRATCH_KEEP: usize = 64 * 1024;
+
+impl ConnBufs {
+    fn take() -> ConnBufs {
+        CONN_BUFS
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| ConnBufs {
+                buf: vec![0u8; READ_BUF],
+                scratch: Vec::with_capacity(READ_BUF),
+                url_scratch: Vec::with_capacity(256),
+            })
+    }
+}
+
+impl Drop for ConnBufs {
+    fn drop(&mut self) {
+        // A buffer still lent to an I/O operation (empty here) or grown
+        // large isn't kept.
+        if self.buf.len() != READ_BUF
+            || self.scratch.capacity() > CONN_SCRATCH_KEEP
+            || self.url_scratch.capacity() > CONN_SCRATCH_KEEP
+        {
+            return;
+        }
+        // `try_with`: the pool itself may be going away with the thread.
+        let _ = CONN_BUFS.try_with(|pool| {
+            let Ok(mut pool) = pool.try_borrow_mut() else {
+                return;
+            };
+            if pool.len() >= CONN_BUFS_KEPT {
+                return;
+            }
+            let mut kept = ConnBufs {
+                buf: std::mem::take(&mut self.buf),
+                scratch: std::mem::take(&mut self.scratch),
+                url_scratch: std::mem::take(&mut self.url_scratch),
+            };
+            kept.scratch.clear();
+            kept.url_scratch.clear();
+            pool.push(kept);
+        });
+    }
+}
+
+pub(crate) struct ConnectionGuard;
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0.connection_finished();
-        WORKER_CONNS.with(|w| w.active.set(w.active.get().saturating_sub(1)));
+        WORKER_CONNS.with(|w| {
+            w.active.set(w.active.get().saturating_sub(1));
+            w.clients.set(w.clients.get().saturating_sub(1));
+        });
     }
+}
+
+/// This worker's accepted connections that haven't finished: a shutting
+/// down worker waits for them. Per worker, so an accept touches no cache
+/// line another worker writes (#128).
+fn worker_clients() -> usize {
+    WORKER_CONNS.with(|w| w.clients.get())
+}
+
+fn connection_started() {
+    WORKER_CONNS.with(|w| w.clients.set(w.clients.get() + 1));
 }
 
 /// This worker's share of `worker_connections`, and nginx's reuse of idle
@@ -1697,6 +1787,8 @@ struct WorkerConns {
     /// connections (`UpstreamSlot`): nginx takes both from the worker's
     /// one connection table.
     active: Cell<usize>,
+    /// Accepted connections that haven't finished (`worker_clients`).
+    clients: Cell<usize>,
     /// Connections waiting for a request — nginx's "reusable" ones.
     idle: Cell<usize>,
     /// How many idle connections are asked to close to make room.
@@ -1721,6 +1813,7 @@ thread_local! {
     static WORKER_CONNS: WorkerConns = const {
         WorkerConns {
             active: Cell::new(0),
+            clients: Cell::new(0),
             idle: Cell::new(0),
             drain: Cell::new(0),
             idle_wakers: std::cell::RefCell::new(Vec::new()),
@@ -1977,7 +2070,7 @@ pub(crate) async fn handle_plain(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     _guard: ConnectionGuard,
@@ -2008,7 +2101,7 @@ pub(crate) async fn handle_tls(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     accepted_at: Instant,
@@ -2077,7 +2170,7 @@ pub(crate) async fn handle<S: ConnIo>(
     tls: Option<&crate::tls::HandshakeInfo>,
     conn: &phase::ConnInfo,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
 ) {
     // Mirrors nginx's keepalive_handler ↔ wait_request_handler dance: no
@@ -2097,7 +2190,16 @@ pub(crate) async fn handle<S: ConnIo>(
     // `$connection_requests` reads 1 on the first request, 2 on the
     // second, etc. Incrementing before rendering matches that contract.
     let connection_start = Instant::now();
-    let remote_addr = peer_addr.ip().to_string().into_bytes();
+    // `$remote_addr`, written once into the connection's own state rather
+    // than a heap string per connection (#128).
+    let mut remote_addr_buf = [0u8; 48];
+    let remote_addr: &[u8] = {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(&mut remote_addr_buf[..]);
+        let _ = write!(cursor, "{}", peer_addr.ip());
+        let n = cursor.position() as usize;
+        &remote_addr_buf[..n]
+    };
     let remote_port = peer_addr.port();
     let mut request_count: u64 = 0;
     // Client timeouts come from the address's default server for the whole
@@ -2134,15 +2236,18 @@ pub(crate) async fn handle<S: ConnIo>(
     // because non-pipelining clients (wrk, curl) drain `buf` after each
     // response and `continue 'idle`, so a per-iteration alloc here was
     // showing up as ~3% memset / ~1% calloc in the proxy bench profile.
-    let mut scratch_owned: Vec<u8> = Vec::with_capacity(READ_BUF);
-    let mut url_scratch_owned: Vec<u8> = Vec::with_capacity(256);
+    // Taken from this worker's pool and given back when the connection
+    // ends: a connection per request doesn't allocate (and zero) them each
+    // time (#128).
+    let mut bufs = ConnBufs::take();
     // Set once the zero-copy `sendfile` path has put the socket in
     // O_NONBLOCK mode; see `send_head_and_file`.
     let mut sock_nonblocking = false;
-    let mut buf_owned: Vec<u8> = vec![0u8; READ_BUF];
-    let scratch = &mut scratch_owned;
-    let url_scratch = &mut url_scratch_owned;
-    let buf = &mut buf_owned;
+    let ConnBufs {
+        buf,
+        scratch,
+        url_scratch,
+    } = &mut bufs;
 
     // Context for `reject_request`'s access-log line.
     macro_rules! conn_log {

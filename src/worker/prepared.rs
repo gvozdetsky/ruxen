@@ -1495,7 +1495,6 @@ pub struct PreparedHttp {
 #[derive(Default)]
 pub struct RuntimeState {
     shutting_down: AtomicBool,
-    active_connections: AtomicUsize,
     connection_ids: AtomicU64,
     /// Bumped each time the process receives SIGHUP. nginx's reload model
     /// re-execs new workers and tells the old workers to gracefully shut
@@ -1536,21 +1535,10 @@ impl RuntimeState {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn connection_started(&self) {
-        self.active_connections.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn connection_finished(&self) {
-        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn active_connections(&self) -> usize {
-        self.active_connections.load(Ordering::SeqCst)
-    }
-
     pub(crate) fn next_connection_id(&self) -> u64 {
+        // Only uniqueness matters (`$connection`): no ordering.
         self.connection_ids
-            .fetch_add(1, Ordering::SeqCst)
+            .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
     }
 
