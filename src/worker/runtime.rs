@@ -1031,10 +1031,15 @@ fn unshare_fd_table() {
     if matches!(std::env::var("RUXEN_UNSHARE_FILES").as_deref(), Ok("0")) {
         return;
     }
+    // Said once, not by every worker: they all fail the same way (a
+    // seccomp profile without the rule in contrib/docker, say).
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // SAFETY: plain syscall; affects only the calling thread's fd table.
-    if unsafe { libc::unshare(libc::CLONE_FILES) } != 0 {
+    if unsafe { libc::unshare(libc::CLONE_FILES) } != 0
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
         eprintln!(
-            "ruxen: unshare(CLONE_FILES) failed: {}; worker keeps the shared fd table",
+            "ruxen: unshare(CLONE_FILES) failed: {}; workers keep the shared fd table",
             std::io::Error::last_os_error()
         );
     }
