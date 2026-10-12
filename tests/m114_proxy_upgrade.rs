@@ -63,6 +63,11 @@ fn backend() -> u16 {
 }
 
 fn start(backend: u16, name: &str) -> (Server, u16) {
+    start_with(backend, name, "", "")
+}
+
+/// `listen_extra` goes on the listen line, `server_extra` into the server.
+fn start_with(backend: u16, name: &str, listen_extra: &str, server_extra: &str) -> (Server, u16) {
     let dir = std::env::temp_dir().join(format!("ruxen-m114-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -79,7 +84,7 @@ fn start(backend: u16, name: &str) -> (Server, u16) {
             "error_log {d}/error.log info;\nevents {{}}\nhttp {{\n\
              log_format t \"$status $bytes_sent $body_bytes_sent $upstream_bytes_received\";\n\
              access_log {d}/access.log t;\n\
-             server {{ listen 127.0.0.1:{port};\n\
+             server {{ listen 127.0.0.1:{port}{listen_extra}; {server_extra}\n\
              location / {{ proxy_pass http://127.0.0.1:{backend};\n\
                proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade;\n\
                proxy_set_header Connection upgrade; proxy_read_timeout 1s; }}\n\
@@ -190,4 +195,53 @@ fn m114_no_tunnel_unless_the_client_asked() {
     let _ = s.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 101"), "{out}");
     assert!(out.ends_with("\r\n\r\n"), "{out}");
+}
+
+/// The same tunnel over TLS, where a read and a write of the client
+/// stream are in flight at once (`TlsStream::begin_tunnel`): rounds of
+/// 256 KiB each way, echoed while they are still being sent.
+#[test]
+fn m114_websocket_tunnel_over_tls() {
+    use std::sync::Arc;
+    let certs = common::tls::make_ca_and_leaf("localhost");
+    let server_extra = format!(
+        "ssl_certificate {}; ssl_certificate_key {};",
+        certs.cert_path().display(),
+        certs.key_path().display()
+    );
+    let (_server, port) = start_with(backend(), "tls", " ssl", &server_extra);
+
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = std::fs::read(certs.ca_path().unwrap()).unwrap();
+    for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut s = rustls::StreamOwned::new(conn, sock);
+    s.write_all(
+        b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+          Connection: Upgrade\r\n\r\n",
+    )
+    .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.windows(9).any(|w| w == b"\r\n\r\nhello") {
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "{}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert!(got.starts_with(b"HTTP/1.1 101 "));
+    for round in 0..4u8 {
+        let chunk: Vec<u8> = (0..256 * 1024).map(|i| (i as u8) ^ round).collect();
+        s.write_all(&chunk).unwrap();
+        let mut echoed = vec![0u8; chunk.len()];
+        s.read_exact(&mut echoed).unwrap();
+        assert!(echoed == chunk, "round {round}");
+    }
 }
