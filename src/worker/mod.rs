@@ -1062,7 +1062,7 @@ mod tests {
             request_length: 0,
             epoch_secs: 0,
             epoch_ms: 0,
-            body: &[],
+            body: &crate::phase::NO_BODY,
             body_len: 0,
             body_file: None,
             tls: None,

@@ -928,7 +928,6 @@ async fn run_post_action(
     // the equivalent is structural — `run_post_action` is only invoked
     // from the main request handler, never from itself, and the inner
     // `post_meta.post_action` is intentionally discarded below.
-    let empty: &[u8] = &[];
     let post_path = if target.first() == Some(&b'/') {
         target
     } else {
@@ -936,7 +935,7 @@ async fn run_post_action(
     };
     let post_ctx = phase::RequestCtx {
         path: post_path,
-        body: empty,
+        body: &phase::NO_BODY,
         body_len: 0,
         body_file: None,
         refuse: None,
@@ -2381,7 +2380,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
                             let cl = req.content_length.unwrap_or(0);
-                            let probe = request_ctx!(&[], cl, None, req.consumed as u64 + cl, 0, 0);
+                            let probe = request_ctx!(
+                                &phase::NO_BODY,
+                                cl,
+                                None,
+                                req.consumed as u64 + cl,
+                                0,
+                                0
+                            );
                             if let Some(first) =
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
@@ -2568,6 +2574,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             sink.len()
                         };
                         let (body_vec, spooled) = sink.finish();
+                        // Shared, so a proxied request sends it from here
+                        // instead of a copy (#289); the buffer goes back to
+                        // the pool when the last holder is done.
+                        let body_vec = if body_vec.is_empty() {
+                            bytes::Bytes::new()
+                        } else {
+                            bytes::Bytes::from_owner(body_vec)
+                        };
                         // Bound to this request iteration; holds the
                         // temp-file path bytes for `$request_body_file`.
                         let request_body_file = match spooled {
@@ -2597,7 +2611,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         let epoch_ms = (now.subsec_millis() as u16) % 1000;
 
                         let ctx = request_ctx!(
-                            body_vec.as_slice(),
+                            &body_vec,
                             body_len,
                             body_file,
                             request_length,

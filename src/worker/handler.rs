@@ -688,6 +688,15 @@ pub(crate) fn run_location_handler(
             );
         }
 
+        // A large client body is sent from its own buffer, after the
+        // header block, instead of being copied into it (#289). A small
+        // one is copied: one buffer, one write.
+        let (forward_body, separate_body) =
+            if set_body.is_none() && forward_body.len() > crate::proxy::SEPARATE_BODY_MIN {
+                (&[][..], req.body.clone())
+            } else {
+                (forward_body, bytes::Bytes::new())
+            };
         // Pooled: with the body in it the buffer is as large as the body,
         // and a fresh one per request faults its pages in each time (#289).
         let mut request = crate::worker::take_body_buffer(0);
@@ -723,6 +732,7 @@ pub(crate) fn run_location_handler(
             upstream: proxy.upstream,
             initial_peer,
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
+            body: separate_body,
             method: req.method,
             server_bytes,
             connect_timeout: std::time::Duration::from_millis(proxy.connect_timeout_ms),
