@@ -419,10 +419,20 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   is off unless configured; when on, it is one in-memory
   `ServerSessionMemoryCache` (4096 entries) shared by all workers, with
   `ssl_session_timeout` enforced on lookup. `ssl_session_tickets` is on
-  by default. No persistence across restarts. Session ticket key
-  rotation, client cert auth, OCSP stapling, 0-RTT, hot cert reload,
-  password-protected keys, and `proxy_ssl_*` are out of v0.1 scope (see
-  README).
+  by default. No persistence across restarts. Client cert auth, OCSP
+  stapling, 0-RTT, hot cert reload, password-protected keys, and
+  `proxy_ssl_*` are out of v0.1 scope (see README).
+- **Session ticket keys are nginx's (#140).** `tls_ticket::NginxTicketer`
+  builds tickets in the layout OpenSSL uses for nginx's key callback
+  (`key name | IV | AES-CBC | HMAC-SHA256`), so the key name is visible.
+  Keys come from `ssl_session_ticket_key` files (48 or 80 bytes; the first
+  encrypts, all decrypt), or rotate every `ssl_session_timeout` with
+  `ssl_session_cache shared:…` (nginx ≥ 1.23.2: the previous key still
+  decrypts, `ngx_ssl_rotate_ticket_keys`), or are one random key. Workers
+  are threads, so one ticketer behind an `RwLock` replaces nginx's
+  shared-memory copy. The sealed state is rustls's session encoding:
+  tickets resume across ruxen instances sharing key files, not with nginx.
+  `ExpiringTicketer` still wraps it to enforce the ticket age.
 - **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
   rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
   When the variable is used and the listen resumes sessions, a full

@@ -401,11 +401,30 @@ pub(crate) fn build_listen_tls(
     }
 
     resolver.set_default(default_keys);
+    // `ssl_session_ticket_key` files: 48 or 80 bytes each
+    // (ngx_ssl_session_ticket_keys).
+    let ticket_keys = match &default.ssl.resumption.ticket_keys {
+        Some(paths) => {
+            let mut keys = Vec::with_capacity(paths.len());
+            for path in paths {
+                let buf = std::fs::read(path).map_err(|e| {
+                    format!("open() \"{}\" failed ({})", path.display(), errno_text(&e))
+                })?;
+                keys.push(
+                    crate::tls_ticket::TicketKey::from_file_bytes(&buf)
+                        .ok_or_else(|| format!("\"{}\" must be 48 or 80 bytes", path.display()))?,
+                );
+            }
+            Some(keys)
+        }
+        None => None,
+    };
     let cfg = crate::tls_certs::build_server_config(
         resolver,
         protocols,
         session_timeout_secs,
-        default.ssl.resumption,
+        default.ssl.resumption.clone(),
+        ticket_keys,
     )
     .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
     Ok(Some(Arc::new(crate::tls::acceptor_from_config(cfg))))
