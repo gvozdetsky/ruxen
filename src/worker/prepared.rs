@@ -1360,6 +1360,10 @@ pub struct PreparedListen {
     /// Every regex `server_name` of `servers`, in the order they are tried
     /// (server by server), in one `RegexSet`, with each member's (server,
     /// name) index (#248). `None` for fewer than two.
+    /// Every exact `server_name` of `servers` (lowercased) to the first
+    /// server that declares it, as nginx's server-name hash: one lookup
+    /// instead of comparing against every name of every server.
+    pub exact_names: std::collections::HashMap<&'static [u8], u32>,
     pub regex_name_set: Option<(regex::bytes::RegexSet, Vec<(u32, u32)>)>,
 }
 

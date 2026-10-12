@@ -218,7 +218,16 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 .flat_map(|s| s.regex_names.iter().map(|n| n.set_pattern.as_str())),
         )
         .map(|set| (set, name_index));
+        let mut exact_names = std::collections::HashMap::new();
+        for (si, server) in servers.iter().enumerate() {
+            for &name in &server.exact_names {
+                // The first server with a name keeps it (nginx warns about
+                // the conflict and does the same).
+                exact_names.entry(name).or_insert(si as u32);
+            }
+        }
         listens.push(PreparedListen {
+            exact_names,
             regex_name_set,
             addr,
             addr_text: if addr.ip().is_unspecified() {

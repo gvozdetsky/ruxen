@@ -1592,11 +1592,14 @@ fn match_server_name<'h, 'r>(
     // already-lowercased prepared names. Hot path is the all-lowercase
     // input; falls back to a 256-byte stack buffer, then a heap Vec for
     // the rare oversized hostnames seen in pathological clients.
-    let mut host_lc_buf: [u8; 256] = [0; 256];
+    // Initialized only when used: zeroing it on every request showed in
+    // the profile.
+    let mut host_lc_buf: [u8; 256];
     let owned_lc: Vec<u8>;
     let host_lc: &[u8] = if host_raw.iter().all(|b| !b.is_ascii_uppercase()) {
         host_raw
-    } else if host_raw.len() <= host_lc_buf.len() {
+    } else if host_raw.len() <= 256 {
+        host_lc_buf = [0; 256];
         for (i, &b) in host_raw.iter().enumerate() {
             host_lc_buf[i] = b.to_ascii_lowercase();
         }
@@ -1606,13 +1609,9 @@ fn match_server_name<'h, 'r>(
         &owned_lc[..]
     };
 
-    // 1. Exact match.
-    for server in &listen.servers {
-        for name in &server.exact_names {
-            if *name == host_lc {
-                return Some((server, None));
-            }
-        }
+    // 1. Exact match: one hash lookup (nginx's server-name hash).
+    if let Some(&si) = listen.exact_names.get(host_lc) {
+        return Some((&listen.servers[si as usize], None));
     }
 
     // 2. Longest leading-wildcard. Each list is sorted by descending
