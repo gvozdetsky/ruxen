@@ -1111,6 +1111,8 @@ pub fn run(
             let prepared = &http.listens[0];
             let listener = listeners.pop().expect("one listener");
             loop {
+                // Shutdown or a reload wakes the idle connections.
+                notice_runtime_events(&state);
                 if state.is_shutting_down() {
                     while state.active_connections() != 0 {
                         monoio::time::sleep(Duration::from_millis(10)).await;
@@ -1145,6 +1147,8 @@ pub fn run(
             }
 
             loop {
+                // Shutdown or a reload wakes the idle connections.
+                notice_runtime_events(&state);
                 if state.is_shutting_down() && state.active_connections() == 0 {
                     return;
                 }
@@ -1527,50 +1531,33 @@ pub(crate) async fn wait_readable_or_shutdown(
 ) -> bool {
     use std::task::Poll;
 
-    if let Some(timeout) = idle_timeout {
-        timers
-            .idle
-            .as_mut()
-            .reset(monoio::time::Instant::now() + timeout);
+    let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
+    if let Some(due) = due {
+        arm_idle(timers.idle.as_mut(), due);
     }
-
     let idle = IdleMark::new();
-    loop {
-        if state.is_shutting_down() || idle.asked_to_close() {
-            return false;
+    let mut readable = std::pin::pin!(stream.readable(false));
+    // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
+    // no per-connection tick.
+    std::future::poll_fn(|cx| {
+        if state.is_shutting_down()
+            || state.reload_gen() != start_reload_gen
+            || idle.asked_to_close()
+        {
+            return Poll::Ready(false);
         }
-        // SIGHUP-driven reload while this connection was idle: bail out so
-        // the worker can close it. New connections accepted after the
-        // reload start with the bumped generation, so they keep waiting.
-        if state.reload_gen() != start_reload_gen {
-            return false;
+        if let Poll::Ready(res) = readable.as_mut().poll(cx) {
+            return Poll::Ready(res.is_ok());
         }
-
-        // Wake every 50 ms to re-check shutdown / reload / room-making; the
-        // idle deadline
-        // ends the wait. Both are the connection's long-lived timers.
-        timers
-            .tick
-            .as_mut()
-            .reset(monoio::time::Instant::now() + Duration::from_millis(50));
-        let mut readable = std::pin::pin!(stream.readable(false));
-        let woke = std::future::poll_fn(|cx| {
-            if let Poll::Ready(res) = readable.as_mut().poll(cx) {
-                return Poll::Ready(Some(res.is_ok()));
-            }
-            if idle_timeout.is_some() && timers.idle.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Some(false));
-            }
-            if timers.tick.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(None);
-            }
-            Poll::Pending
-        })
-        .await;
-        if let Some(proceed) = woke {
-            return proceed;
+        if let Some(due) = due
+            && idle_expired(timers.idle.as_mut(), due, cx)
+        {
+            return Poll::Ready(false);
         }
-    }
+        idle.register(cx.waker());
+        Poll::Pending
+    })
+    .await
 }
 
 /// `wait_readable_or_shutdown` with the request read in place of the
@@ -1590,11 +1577,9 @@ pub(crate) async fn read_first_or_shutdown(
     use monoio::io::CancelableAsyncReadRent;
     use std::task::Poll;
 
-    if let Some(timeout) = idle_timeout {
-        timers
-            .idle
-            .as_mut()
-            .reset(monoio::time::Instant::now() + timeout);
+    let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
+    if let Some(due) = due {
+        arm_idle(timers.idle.as_mut(), due);
     }
     let idle = IdleMark::new();
     let canceller = monoio::io::Canceller::new();
@@ -1607,43 +1592,41 @@ pub(crate) async fn read_first_or_shutdown(
     };
     enum Woke<T> {
         Read(T),
+        Close,
         Timeout,
-        Tick,
     }
-    loop {
-        let closing = state.is_shutting_down()
+    // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
+    // no per-connection tick.
+    let woke = std::future::poll_fn(|cx| {
+        if state.is_shutting_down()
+            || state.reload_gen() != start_reload_gen
             || idle.asked_to_close()
-            || state.reload_gen() != start_reload_gen;
-        if closing {
+        {
+            return Poll::Ready(Woke::Close);
+        }
+        if let Poll::Ready(done) = read.as_mut().poll(cx) {
+            return Poll::Ready(Woke::Read(done));
+        }
+        if let Some(due) = due
+            && idle_expired(timers.idle.as_mut(), due, cx)
+        {
+            return Poll::Ready(Woke::Timeout);
+        }
+        idle.register(cx.waker());
+        Poll::Pending
+    })
+    .await;
+    match woke {
+        Woke::Read((res, returned)) => (outcome(res), returned.into_inner()),
+        Woke::Close => {
             canceller.cancel();
             let (_, returned) = read.as_mut().await;
-            return (IdleRead::Close, returned.into_inner());
+            (IdleRead::Close, returned.into_inner())
         }
-        timers
-            .tick
-            .as_mut()
-            .reset(monoio::time::Instant::now() + Duration::from_millis(50));
-        let woke = std::future::poll_fn(|cx| {
-            if let Poll::Ready(done) = read.as_mut().poll(cx) {
-                return Poll::Ready(Woke::Read(done));
-            }
-            if idle_timeout.is_some() && timers.idle.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Woke::Timeout);
-            }
-            if timers.tick.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Woke::Tick);
-            }
-            Poll::Pending
-        })
-        .await;
-        match woke {
-            Woke::Read((res, returned)) => return (outcome(res), returned.into_inner()),
-            Woke::Timeout => {
-                canceller.cancel();
-                let (res, returned) = read.as_mut().await;
-                return (outcome(res), returned.into_inner());
-            }
-            Woke::Tick => {}
+        Woke::Timeout => {
+            canceller.cancel();
+            let (res, returned) = read.as_mut().await;
+            (outcome(res), returned.into_inner())
         }
     }
 }
@@ -1669,6 +1652,15 @@ struct WorkerConns {
     idle: Cell<usize>,
     /// How many idle connections are asked to close to make room.
     drain: Cell<usize>,
+    /// The wakers of the idle connections (`IdleMark` slots), woken when
+    /// one of the events they wait for happens: a drain, shutdown or a
+    /// reload. Pushed to them like nginx's ngx_drain_connections /
+    /// ngx_close_idle_connections, instead of each one polling (#127).
+    idle_wakers: std::cell::RefCell<Vec<Option<std::task::Waker>>>,
+    idle_free: std::cell::RefCell<Vec<usize>>,
+    /// Shutdown and the reload generation as this worker last saw them.
+    seen_shutdown: Cell<bool>,
+    seen_reload_gen: Cell<u64>,
     /// UNIX second of the last "not enough" line: log once a second.
     logged_at: Cell<u64>,
     /// This worker's configuration, for upstream connections, which are
@@ -1682,6 +1674,10 @@ thread_local! {
             active: Cell::new(0),
             idle: Cell::new(0),
             drain: Cell::new(0),
+            idle_wakers: std::cell::RefCell::new(Vec::new()),
+            idle_free: std::cell::RefCell::new(Vec::new()),
+            seen_shutdown: Cell::new(false),
+            seen_reload_gen: Cell::new(0),
             logged_at: Cell::new(0),
             http: Cell::new(None),
         }
@@ -1718,6 +1714,7 @@ pub(crate) fn take_upstream_slot() -> Option<UpstreamSlot> {
             let idle = w.idle.get();
             if idle > 0 {
                 w.drain.set(w.drain.get().max((idle / 8).clamp(1, 32)));
+                wake_idle_in(w);
             }
             log_connections_not_enough(w, http, ErrorLogLevel::Alert, "");
             return None;
@@ -1758,6 +1755,7 @@ pub(crate) fn admit_connection(http: &PreparedHttp) -> bool {
         let full = active >= slots;
         if slots - active.min(slots) <= slots / 16 && idle > 0 {
             w.drain.set(w.drain.get().max((idle / 8).clamp(1, 32)));
+            wake_idle_in(w);
             if !full {
                 log_connections_not_enough(w, http, ErrorLogLevel::Warn, ", reusing connections");
             }
@@ -1793,14 +1791,61 @@ fn log_connections_not_enough(
     }
 }
 
+/// Wakes this worker's idle connections, to look at what changed.
+fn wake_idle_in(w: &WorkerConns) {
+    for waker in w.idle_wakers.borrow().iter().flatten() {
+        waker.wake_by_ref();
+    }
+}
+
+/// Called by the accept loops on every turn (they wake at least every
+/// 50 ms): when shutdown began or a reload came since this worker last
+/// looked, its idle connections are woken to close. Two atomic loads when
+/// nothing changed.
+pub(crate) fn notice_runtime_events(state: &RuntimeState) {
+    WORKER_CONNS.with(|w| {
+        let shutdown = state.is_shutting_down();
+        let generation = state.reload_gen();
+        if shutdown != w.seen_shutdown.get() || generation != w.seen_reload_gen.get() {
+            w.seen_shutdown.set(shutdown);
+            w.seen_reload_gen.set(generation);
+            wake_idle_in(w);
+        }
+    })
+}
+
 /// Marks a connection idle (waiting for a request) while alive, so
-/// `admit_connection` can ask it to make room.
-struct IdleMark;
+/// `admit_connection` can ask it to make room, and holds its slot in the
+/// worker's list of idle wakers.
+struct IdleMark {
+    slot: usize,
+}
 
 impl IdleMark {
     fn new() -> Self {
-        WORKER_CONNS.with(|w| w.idle.set(w.idle.get() + 1));
-        IdleMark
+        WORKER_CONNS.with(|w| {
+            w.idle.set(w.idle.get() + 1);
+            let slot = match w.idle_free.borrow_mut().pop() {
+                Some(slot) => slot,
+                None => {
+                    let mut wakers = w.idle_wakers.borrow_mut();
+                    wakers.push(None);
+                    wakers.len() - 1
+                }
+            };
+            IdleMark { slot }
+        })
+    }
+
+    /// The waker the events above wake.
+    fn register(&self, waker: &std::task::Waker) {
+        WORKER_CONNS.with(|w| {
+            let mut wakers = w.idle_wakers.borrow_mut();
+            match &mut wakers[self.slot] {
+                Some(old) if old.will_wake(waker) => {}
+                slot => *slot = Some(waker.clone()),
+            }
+        })
     }
 
     /// Whether this idle connection should close to free a slot.
@@ -1818,8 +1863,39 @@ impl IdleMark {
 
 impl Drop for IdleMark {
     fn drop(&mut self) {
-        WORKER_CONNS.with(|w| w.idle.set(w.idle.get().saturating_sub(1)));
+        WORKER_CONNS.with(|w| {
+            w.idle.set(w.idle.get().saturating_sub(1));
+            w.idle_wakers.borrow_mut()[self.slot] = None;
+            w.idle_free.borrow_mut().push(self.slot);
+        });
     }
+}
+
+/// Arms the idle timer for `due` without moving it on every request: a
+/// timer already set for earlier stays, and when it fires early the wait
+/// moves it to `due` (`idle_expired`). Moving a timer per keep-alive
+/// request cost several percent (#127, #272).
+fn arm_idle(mut timer: std::pin::Pin<&mut monoio::time::Sleep>, due: monoio::time::Instant) {
+    if timer.is_elapsed() || timer.deadline() > due {
+        timer.as_mut().reset(due);
+    }
+}
+
+/// Whether the idle deadline `due` has passed; a timer that fired before
+/// it is moved to it and polled again.
+fn idle_expired(
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    due: monoio::time::Instant,
+    cx: &mut std::task::Context<'_>,
+) -> bool {
+    if timer.as_mut().poll(cx).is_pending() {
+        return false;
+    }
+    if monoio::time::Instant::now() < due {
+        timer.as_mut().reset(due);
+        return timer.as_mut().poll(cx).is_ready();
+    }
+    true
 }
 
 /// `$server_addr` for a connection: the listen address, formatted at
@@ -1994,7 +2070,6 @@ pub(crate) async fn handle<S: ConnIo>(
     let mut timers = ConnTimers {
         io: std::pin::pin!(monoio::time::sleep(far)),
         idle: std::pin::pin!(monoio::time::sleep(far)),
-        tick: std::pin::pin!(monoio::time::sleep(far)),
     };
     // Snapshot the reload generation at accept time. SIGHUP bumps the
     // counter; idle keepalive waits and post-request keepalive checks both

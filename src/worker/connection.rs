@@ -311,16 +311,15 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
 /// A connection's long-lived timers. monoio extends a registered timer
 /// lazily when it is moved to a later deadline, so re-arming one of these
 /// costs a clock read, where a fresh `sleep`/`timeout` per operation costs
-/// a timer-wheel insert and remove. Each is only ever moved forward on the
-/// hot path: `io` by the same client timeouts, `idle` by keepalive_timeout,
-/// `tick` by 50 ms.
+/// a timer-wheel insert and remove. `io` is only ever moved forward on the
+/// hot path, by the same client timeouts; `idle` is moved only when it
+/// fires before the keep-alive deadline (`arm_idle`). Shutdown, reload and
+/// drains wake idle connections directly (#127), so there is no tick.
 pub(crate) struct ConnTimers<'a> {
     /// client_header_timeout / client_body_timeout / send_timeout.
     pub io: std::pin::Pin<&'a mut monoio::time::Sleep>,
     /// The keep-alive (or first-request) deadline while idle.
     pub idle: std::pin::Pin<&'a mut monoio::time::Sleep>,
-    /// The 50 ms poll for shutdown / reload while idle.
-    pub tick: std::pin::Pin<&'a mut monoio::time::Sleep>,
 }
 
 /// Run `fut` unless `deadline` passes first, using `timer` (see
