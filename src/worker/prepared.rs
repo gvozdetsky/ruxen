@@ -1027,6 +1027,8 @@ pub struct PreparedLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// Effective gzip settings; `None` when `gzip` is off.
+    pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     /// Effective `post_action` target, if any. A leading `/` is an
     /// internal URI redirect; a leading `@` is a named-location jump.
@@ -1072,6 +1074,8 @@ pub struct PreparedRegexLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// Effective gzip settings; `None` when `gzip` is off.
+    pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
@@ -1106,6 +1110,8 @@ pub struct MatchedLocation<'a> {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// Effective gzip settings; `None` when `gzip` is off.
+    pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
@@ -1135,6 +1141,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,
@@ -1182,6 +1189,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,
@@ -1473,4 +1481,23 @@ impl RuntimeState {
     pub(crate) fn reload_gen(&self) -> u64 {
         self.reload_gen.load(Ordering::SeqCst)
     }
+}
+
+/// A location's effective gzip settings (`gzip on`), see `worker::gzip`.
+#[derive(Debug)]
+pub struct PreparedGzip {
+    /// `gzip_types *`.
+    pub any_type: bool,
+    /// Lowercased MIME types, `text/html` always among them.
+    pub types: &'static [&'static str],
+    pub min_length: u64,
+    pub comp_level: u32,
+    pub vary: bool,
+    /// `gzip_http_version 1.0`: HTTP/1.0 clients get gzip too.
+    pub http_10: bool,
+    /// `gzip_proxied` flags (`config::gzip_proxied`).
+    pub proxied: u16,
+    pub disable_msie6: bool,
+    /// `gzip_disable` User-Agent patterns, case-insensitive.
+    pub disable: Option<regex::RegexSet>,
 }

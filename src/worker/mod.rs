@@ -49,6 +49,7 @@ use crate::phase::{self, Response};
 use crate::{autoindex, file, fs_resolve, uri};
 
 mod connection;
+pub(crate) mod gzip;
 mod handler;
 mod log;
 mod prepare;

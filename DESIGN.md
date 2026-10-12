@@ -307,6 +307,16 @@ The last arg is the fallback:
 - `is_idempotent_method_bytes` lives in worker.rs because it reads raw method bytes; the `Method` enum's coarse classification (Get/Head/Trace/Connect/Other) loses PUT/DELETE/OPTIONS distinction needed for the gate.
 - `proxy_intercept_errors` and `proxy_next_upstream*` stay in `IGNORED_STMT` so http-scope occurrences (TEST_GLOBALS_HTTP preambles) keep loading; the explicit handlers at server/location scope take precedence via match-arm ordering.
 
+## gzip (#93)
+
+`worker::gzip` is nginx's `ngx_http_gzip_filter_module` plus the core module's `ngx_http_gzip_ok`. It runs once per response in the worker, after the location, `error_page` and the proxy have settled it, and only where `gzip on` (`ProcessMeta::gzip`, `None` otherwise: one check per response).
+
+- **Decision:** the order of nginx's header filter. Status 200/403/404, no `Content-Encoding`, `Content-Length` ≥ `gzip_min_length`, a type in `gzip_types` (`text/html` always). Then `Vary` is set, and `ngx_http_gzip_ok` decides: `Accept-Encoding` with nginx's token and q-value rules, `gzip_http_version`, `gzip_proxied` for requests with `Via`, and `gzip_disable`.
+- **Bodies in memory** (`return`, error pages, proxied responses, small files) are compressed whole and keep a `Content-Length`. nginx sends them chunked; a length is equally valid, and it lets HTTP/1.0 clients keep the connection.
+- **Files** are compressed as they are sent (`stream_file_gzip`, 64 KiB blocks): chunked for HTTP/1.1, and with a close after the body for HTTP/1.0. They leave the `sendfile` path, as in nginx.
+- **Ranges:** nginx's range filter runs after gzip and finds no length. So a file gzip would compress is sent whole, with a 200, whatever the `Range`; the static handler asks `gzip::would_compress` before it cuts one.
+- **Compression:** zlib-rs through `flate2`, pure Rust like rustls. The window is shrunk for short known lengths as `ngx_http_gzip_filter_memory` does. zlib-rs runs level 1 as `deflate_quick`, whose output is far larger than zlib's level 1 (8 KiB HTML +30 %, 2 MiB CSS +82 %). nginx's `gzip_comp_level 1` therefore maps to zlib-rs level 2, which matches zlib's level 1 in size.
+
 ## Static file bodies and `sendfile`
 
 `sendfile on|off` (http / server / location, default off as in nginx) picks how file bodies leave the process. Measured on static_8k (8 KiB, `wrk -t16 -c512`): the copying path was at 89% of nginx; with sendfile on both servers ruxen is at ~96.5%.

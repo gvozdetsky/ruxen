@@ -195,6 +195,7 @@ docker run --rm -p 8080:8080 \
 - `worker_connections`, `client_header_timeout`, `client_body_timeout`, `send_timeout`
 - request bodies of any `client_max_body_size`, spilled to private temp files (`client_body_temp_path`), with an early 413
 - `limit_rate`, `limit_rate_after` and `$limit_rate`
+- gzip compression (`gzip`, `gzip_types`, `gzip_min_length`, `gzip_comp_level`, `gzip_vary`, `gzip_http_version`, `gzip_proxied`, `gzip_disable`) of static files, `return`, error pages and proxied responses, as nginx decides it: the same statuses, types, `Accept-Encoding` q-values, weak `ETag`, no `Accept-Ranges`. A file gzip compresses is sent whole even for a `Range` request, as from nginx. Not yet: `gzip_static`, `gunzip`, `$gzip_ratio`, and gzip under `limit_rate` (such a response goes out unpaced).
 
 ### Static files
 

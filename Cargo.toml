@@ -28,6 +28,8 @@ bytes = "1"
 libc = "0.2"
 monoio = "0.2.4"
 regex = "1"
+# gzip filter (#93): zlib-rs is pure Rust, no C dependency, like rustls.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 socket2 = "0.5"
 rustls = "0.23"
 rustls-pemfile = "2"

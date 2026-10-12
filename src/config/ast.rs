@@ -3,6 +3,7 @@
 //! a handful of small helpers on `Listen`, `ServerNameSpec`, and
 //! `ProxyNextUpstream`.
 
+use super::parse_gzip::GzipConf;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -607,6 +608,8 @@ pub struct Server {
     pub expires: Option<ExpiresDirective>,
     /// Server-scope `proxy_*` settings; unset ones inherit from http.
     pub proxy: ProxyConf,
+    /// Server-scope `gzip*` settings, http's merged in.
+    pub gzip: GzipConf,
     /// Server-scope `chunked_transfer_encoding on|off;`. `None` inherits the
     /// nginx default (`on`). When `false`, response bodies stay framed by
     /// `Content-Length` and `add_trailer` directives are silently dropped
@@ -745,6 +748,8 @@ pub struct Location {
     pub expires: Option<ExpiresDirective>,
     /// Location-scope `proxy_*` settings; unset ones inherit from server.
     pub proxy: ProxyConf,
+    /// Location-scope `gzip*` settings; unset ones inherit from server.
+    pub gzip: GzipConf,
     /// Location-scope `chunked_transfer_encoding on|off;`. `None` inherits
     /// from server scope, which itself defaults to nginx's `on`. When
     /// `false`, the response body uses `Content-Length` framing and any
