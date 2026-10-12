@@ -24,6 +24,7 @@ mod error;
 mod lexer;
 mod parse_access;
 mod parse_gzip;
+mod parse_limit_conn;
 mod parse_limit_req;
 mod parse_location;
 mod parse_log;
@@ -36,6 +37,7 @@ mod values;
 pub use ast::*;
 pub use error::*;
 pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
 pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
@@ -263,6 +265,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut gzip = GzipConf::default();
     let mut limit_req = LimitReqConf::default();
     let mut limit_req_zones: Vec<LimitReqZoneDef> = Vec::new();
+    let mut limit_conn = LimitConnConf::default();
+    let mut limit_conn_zones: Vec<LimitConnZoneDef> = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut log_formats: Vec<LogFormatDef> = Vec::new();
     let mut access_logs: Vec<AccessLog> = Vec::new();
@@ -323,6 +327,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         server.gzip = std::mem::take(&mut server.gzip).inherit(&gzip);
                         server.limit_req =
                             std::mem::take(&mut server.limit_req).inherit(&limit_req);
+                        server.limit_conn =
+                            std::mem::take(&mut server.limit_conn).inherit(&limit_conn);
                         if server.index.is_none() {
                             server.index.clone_from(&index);
                         }
@@ -395,6 +401,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         underscores_in_headers,
                         upstreams,
                         limit_req_zones,
+                        limit_conn_zones,
                         warnings: warn_ssl_without_ssl_listen(&servers, warnings),
                         servers,
                         dump_files: Vec::new(),
@@ -825,6 +832,17 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
+            (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,
+            ("limit_conn_zone", Terminator::Semi) => {
+                let zone = parse_limit_conn::parse_limit_conn_zone(&args[1..])?;
+                if let Some(known) = limit_conn_zones.iter().find(|z| z.name == zone.name) {
+                    return Err(Error::BadValue {
+                        what: "limit_conn_zone (is already bound to key)",
+                        got: format!("\"{}\" bound to \"{}\"", zone.name, known.key_text),
+                    });
+                }
+                limit_conn_zones.push(zone);
+            }
             ("limit_req_zone", Terminator::Semi) => {
                 let zone = parse_limit_req::parse_limit_req_zone(&args[1..])?;
                 // ngx_http_limit_req_zone: one key per zone name.

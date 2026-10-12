@@ -58,6 +58,7 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         limit_req_zones,
+        limit_conn_zones,
         uses_request_body_file,
         runtime,
         error_logs: http_error_logs,
@@ -155,6 +156,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
     prepare_limit_req_zones(limit_req_zones);
+    prepare_limit_conn_zones(limit_conn_zones);
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
         prepare_upstreams(upstreams);
 
@@ -506,6 +508,58 @@ fn prepare_limit_req(
             ErrorLogLevel::Warn => ErrorLogLevel::Notice,
             _ => ErrorLogLevel::Warn,
         },
+        dry_run: conf.dry_run.unwrap_or(false),
+    }))))
+}
+
+thread_local! {
+    /// The http block's `limit_conn_zone`s by name while a config is
+    /// prepared (#95).
+    static LIMIT_CONN_ZONES: std::cell::RefCell<
+        std::collections::HashMap<String, &'static super::limit_conn::LimitConnZone>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Build the zones of `limit_conn_zone` (#95).
+fn prepare_limit_conn_zones(zones: Vec<crate::config::LimitConnZoneDef>) {
+    let built = zones
+        .into_iter()
+        .map(|z| {
+            let name: &'static str = Box::leak(z.name.into_boxed_str());
+            let zone: &'static super::limit_conn::LimitConnZone =
+                Box::leak(Box::new(super::limit_conn::LimitConnZone::new(
+                    name,
+                    prepare_value_parts(z.key),
+                    Box::leak(z.key_text.into_boxed_str()),
+                    z.size,
+                )));
+            (name.to_string(), zone)
+        })
+        .collect();
+    LIMIT_CONN_ZONES.with(|m| *m.borrow_mut() = built);
+}
+
+/// A location's resolved `limit_conn*` (`None` without `limit_conn`).
+fn prepare_limit_conn(
+    conf: crate::config::LimitConnConf,
+) -> Result<Option<&'static super::limit_conn::PreparedLimitConns>, String> {
+    use super::limit_conn::{PreparedLimitConn, PreparedLimitConns};
+    let Some(limits) = conf.limits.filter(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let limits = limits
+        .into_iter()
+        .map(|l| {
+            let zone = LIMIT_CONN_ZONES
+                .with(|m| m.borrow().get(&l.zone).copied())
+                .ok_or_else(|| format!("zero size shared memory zone \"{}\"", l.zone))?;
+            Ok(PreparedLimitConn { zone, conn: l.conn })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(Box::leak(Box::new(PreparedLimitConns {
+        limits: Box::leak(limits.into_boxed_slice()),
+        status: conf.status.unwrap_or(503),
+        log_level: conf.log_level.unwrap_or(ErrorLogLevel::Error),
         dry_run: conf.dry_run.unwrap_or(false),
     }))))
 }
@@ -1187,6 +1241,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                &server.limit_conn,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1219,6 +1274,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                &server.limit_conn,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1251,6 +1307,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                &server.limit_conn,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1284,6 +1341,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                &server.limit_conn,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1375,6 +1433,7 @@ pub(crate) fn prepare_server(
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
             limit_req: prepare_limit_req(server.limit_req.clone())?,
+            limit_conn: prepare_limit_conn(server.limit_conn.clone())?,
         })
     } else {
         None
@@ -2292,6 +2351,7 @@ pub(crate) fn build_prefix_or_exact(
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
     server_limit_req: &crate::config::LimitReqConf,
+    server_limit_conn: &crate::config::LimitConnConf,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2335,6 +2395,7 @@ pub(crate) fn build_prefix_or_exact(
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
         limit_req: location_limit_req,
+        limit_conn: location_limit_conn,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2494,6 +2555,7 @@ pub(crate) fn build_prefix_or_exact(
         expires,
         chunked_transfer_encoding,
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
+        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
     })
 }
 
@@ -2525,6 +2587,7 @@ pub(crate) fn build_regex_location(
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
     server_limit_req: &crate::config::LimitReqConf,
+    server_limit_conn: &crate::config::LimitConnConf,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2568,6 +2631,7 @@ pub(crate) fn build_regex_location(
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
         limit_req: location_limit_req,
+        limit_conn: location_limit_conn,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2737,6 +2801,7 @@ pub(crate) fn build_regex_location(
         expires,
         chunked_transfer_encoding,
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
+        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
     })
 }
 

@@ -235,6 +235,8 @@ pub struct RewriteState {
     /// Once set, limit_req doesn't run again for the request, as nginx's
     /// `r->main->limit_req_status` (#94).
     pub(crate) limit_req_status: u8,
+    /// `$limit_conn_status` (`limit_conn::status`), likewise (#95).
+    pub(crate) limit_conn_status: u8,
 }
 
 impl Default for RewriteState {
@@ -246,6 +248,7 @@ impl Default for RewriteState {
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
             limit_req_status: 0,
+            limit_conn_status: 0,
         }
     }
 }
@@ -331,7 +334,10 @@ impl RewriteState {
     /// Something later rendering (the access log, a proxied response's
     /// `add_header`) needs from this state: `set` values or cached maps.
     pub(crate) fn worth_keeping(&self) -> bool {
-        self.has_user_vars() || !self.map_cache.borrow().is_empty() || self.limit_req_status != 0
+        self.has_user_vars()
+            || !self.map_cache.borrow().is_empty()
+            || self.limit_req_status != 0
+            || self.limit_conn_status != 0
     }
 
     /// Appends the cached result of map `slot` to `out`, if there is one.
@@ -1081,6 +1087,8 @@ pub struct PreparedLocation {
     pub chunked_transfer_encoding: bool,
     /// `limit_req` for requests routed here (#94); `None` without.
     pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
+    /// `limit_conn` for requests routed here (#95); `None` without.
+    pub limit_conn: Option<&'static super::limit_conn::PreparedLimitConns>,
 }
 
 /// A regex-mode location after prepare. The compiled
@@ -1125,6 +1133,8 @@ pub struct PreparedRegexLocation {
     pub chunked_transfer_encoding: bool,
     /// `limit_req` for requests routed here (#94); `None` without.
     pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
+    /// `limit_conn` for requests routed here (#95); `None` without.
+    pub limit_conn: Option<&'static super::limit_conn::PreparedLimitConns>,
 }
 
 /// Common view onto a matched location. The matcher hands one of these to
@@ -1164,6 +1174,8 @@ pub struct MatchedLocation<'a> {
     pub chunked_transfer_encoding: bool,
     /// `limit_req` for requests routed here (#94); `None` without.
     pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
+    /// `limit_conn` for requests routed here (#95); `None` without.
+    pub limit_conn: Option<&'static super::limit_conn::PreparedLimitConns>,
 }
 
 impl<'a> MatchedLocation<'a> {
@@ -1196,6 +1208,7 @@ impl<'a> MatchedLocation<'a> {
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
             limit_req: loc.limit_req,
+            limit_conn: loc.limit_conn,
         }
     }
 
@@ -1246,6 +1259,7 @@ impl<'a> MatchedLocation<'a> {
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
             limit_req: loc.limit_req,
+            limit_conn: loc.limit_conn,
         }
     }
 }

@@ -159,6 +159,8 @@ pub struct HttpConfig {
     pub runtime: RuntimeOpts,
     /// `limit_req_zone` declarations (#94).
     pub limit_req_zones: Vec<super::LimitReqZoneDef>,
+    /// `limit_conn_zone` declarations (#95).
+    pub limit_conn_zones: Vec<super::LimitConnZoneDef>,
     /// http-scope `error_log` lines; `None` inherits the top-level ones.
     pub error_logs: Option<Vec<ErrorLog>>,
     /// `log_format name <format...>;` definitions declared at http scope.
@@ -636,6 +638,8 @@ pub struct Server {
     pub gzip: GzipConf,
     /// Server-scope `limit_req*`, http's merged in (#94).
     pub limit_req: super::LimitReqConf,
+    /// Server-scope `limit_conn*`, http's merged in (#95).
+    pub limit_conn: super::LimitConnConf,
     /// Server-scope `chunked_transfer_encoding on|off;`. `None` inherits the
     /// nginx default (`on`). When `false`, response bodies stay framed by
     /// `Content-Length` and `add_trailer` directives are silently dropped
@@ -781,6 +785,8 @@ pub struct Location {
     pub gzip: GzipConf,
     /// Location-scope `limit_req*`; unset ones inherit from server.
     pub limit_req: super::LimitReqConf,
+    /// Location-scope `limit_conn*`; unset ones inherit from server.
+    pub limit_conn: super::LimitConnConf,
     /// Location-scope `chunked_transfer_encoding on|off;`. `None` inherits
     /// from server scope, which itself defaults to nginx's `on`. When
     /// `false`, the response body uses `Content-Length` framing and any
@@ -1538,6 +1544,8 @@ pub enum Variable {
     RequestBody,
     /// `$limit_req_status` (#94).
     LimitReqStatus,
+    /// `$limit_conn_status` (#95).
+    LimitConnStatus,
     /// Path to the spilled request body temp file, when one was created.
     RequestBodyFile,
     /// Client IP address from the accepted peer socket (e.g. `127.0.0.1`,

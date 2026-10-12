@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn collects_every_unknown_directive_and_skips_blocks() {
         let (found, res) = findings(
-            "http { server { fastcgi_pass 127.0.0.1:9000; limit_conn one 10; \
+            "http { server { fastcgi_pass 127.0.0.1:9000; secure_link $arg_s; \
              location / { uwsgi_pass x; } } map_x { a b; } }",
         );
         let names: Vec<&str> = found.iter().map(|f| f.directive.as_str()).collect();
@@ -402,7 +402,7 @@ mod tests {
             names,
             [
                 "fastcgi_pass 127.0.0.1:9000",
-                "limit_conn one 10",
+                "secure_link $arg_s",
                 "uwsgi_pass x",
                 "map_x"
             ]
