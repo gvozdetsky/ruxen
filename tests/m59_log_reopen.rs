@@ -3,6 +3,8 @@
 //! `access.log` (and the `-e` error log is reopened too). ruxen used to
 //! ignore SIGUSR1 and keep writing into the rotated file.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -25,6 +27,9 @@ impl Drop for Server {
 }
 
 fn start() -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()

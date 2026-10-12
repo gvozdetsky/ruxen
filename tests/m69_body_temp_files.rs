@@ -4,6 +4,8 @@
 //! `0644` files with predictable names straight in the system temp
 //! directory, readable by every local user.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -27,6 +29,9 @@ impl Drop for Server {
 }
 
 fn start(tag: &str, http_extra: &str) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()

@@ -3,6 +3,8 @@
 //! refused (ruxen can't re-read its config); unknown names are nginx's
 //! `invalid option`. It used to be "not supported yet" for every name.
 
+mod common;
+
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -18,7 +20,10 @@ impl Drop for Dir {
     }
 }
 
-fn setup(tag: &str) -> (Dir, u16) {
+/// The test's directory and port. The guard (`setup_lock`, #230) keeps
+/// the port from a parallel test's backend until `start` has ruxen on it.
+fn setup(tag: &str) -> (Dir, u16, std::sync::MutexGuard<'static, ()>) {
+    let guard = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -35,7 +40,7 @@ fn setup(tag: &str) -> (Dir, u16) {
         ),
     )
     .unwrap();
-    (Dir(dir), port)
+    (Dir(dir), port, guard)
 }
 
 fn ruxen(dir: &Dir, args: &[&str]) -> Command {
@@ -64,8 +69,9 @@ fn start(dir: &Dir, port: u16) -> Child {
 
 #[test]
 fn quit_signals_the_running_instance() {
-    let (dir, port) = setup("quit");
+    let (dir, port, setup) = setup("quit");
     let mut child = start(&dir, port);
+    drop(setup);
 
     let out = run(&dir, &["-s", "reopen"]);
     assert!(out.status.success(), "{out:?}");
@@ -104,8 +110,9 @@ fn hold_a_request(port: u16) -> TcpStream {
 
 #[test]
 fn stop_is_a_fast_shutdown() {
-    let (dir, port) = setup("stop");
+    let (dir, port, setup) = setup("stop");
     let mut child = start(&dir, port);
+    drop(setup);
     let _held = hold_a_request(port);
 
     let out = run(&dir, &["-s", "stop"]);
@@ -121,8 +128,9 @@ fn stop_is_a_fast_shutdown() {
 
 #[test]
 fn sigint_is_a_fast_shutdown() {
-    let (dir, port) = setup("int");
+    let (dir, port, setup) = setup("int");
     let mut child = start(&dir, port);
+    drop(setup);
     let _held = hold_a_request(port);
 
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
@@ -137,8 +145,9 @@ fn sigint_is_a_fast_shutdown() {
 /// turns it into a fast one, as in nginx.
 #[test]
 fn stop_cuts_a_graceful_shutdown_short() {
-    let (dir, port) = setup("quit-then-stop");
+    let (dir, port, setup) = setup("quit-then-stop");
     let mut child = start(&dir, port);
+    drop(setup);
     let _held = hold_a_request(port);
 
     let out = run(&dir, &["-s", "quit"]);
@@ -159,7 +168,7 @@ fn stop_cuts_a_graceful_shutdown_short() {
 
 #[test]
 fn errors_like_nginx() {
-    let (dir, _port) = setup("errors");
+    let (dir, _port, _setup) = setup("errors");
     // Nothing running: no pid file.
     let out = run(&dir, &["-s", "stop"]);
     assert_eq!(out.status.code(), Some(1));

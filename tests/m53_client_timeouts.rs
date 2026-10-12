@@ -4,6 +4,8 @@
 //! disconnected after the timeout (nginx's default is 60 s; the tests set
 //! 1 s). Before, such connections stayed open indefinitely.
 
+mod common;
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -28,6 +30,9 @@ impl Drop for Server {
 const BIG: usize = 64 * 1024 * 1024;
 
 fn start(tag: &str, sendfile: bool) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let _setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()

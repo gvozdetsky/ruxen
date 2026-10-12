@@ -3,6 +3,8 @@
 //! access log (nginx's `r->variables` live as long as the request). They
 //! used to render empty there, so `add_header X $v` vanished.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -31,6 +33,8 @@ fn header<'a>(resp: &'a str, name: &str) -> Option<&'a str> {
 
 #[test]
 fn set_variables_reach_the_proxied_response_and_the_log() {
+    // Held from the port pick until ruxen listens (#230).
+    let setup = common::ports::setup_lock();
     let ports: Vec<TcpListener> = (0..2)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -74,6 +78,7 @@ fn set_variables_reach_the_proxied_response_and_the_log() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(10));
     }
+    drop(setup);
 
     let ok = get(front, "/ok");
     let first = get(front, "/a/x");

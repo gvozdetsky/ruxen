@@ -4,6 +4,8 @@
 //! Like nginx it now logs `accept() failed (24: …)` at `crit` and pauses
 //! accepting for 500 ms, and serves again once descriptors free up.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
@@ -32,6 +34,8 @@ fn get(port: u16) -> Option<String> {
 
 #[test]
 fn fd_exhaustion_backs_off_instead_of_spinning() {
+    // Held from the port pick until ruxen listens (#230).
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -78,6 +82,7 @@ fn fd_exhaustion_backs_off_instead_of_spinning() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(20));
     }
+    drop(setup);
 
     // Hold more idle connections than ruxen has descriptors.
     let held: Vec<TcpStream> = (0..100)
