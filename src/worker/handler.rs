@@ -74,6 +74,7 @@ pub(crate) fn finalize_location_response(
         // is defensive: passing the plan through unchanged keeps the
         // type system happy.
         Response::Proxy(plan) => Response::Proxy(plan),
+        Response::Upgrade(upgraded) => Response::Upgrade(upgraded),
         Response::Prebuilt(bytes) => {
             let base_status = response_status(bytes);
             let status = effective_error_page_status(base_status, forced_status);
@@ -261,7 +262,9 @@ pub(crate) fn forward_client_headers<'a>(
     out: &mut Vec<crate::proxy::ProxyHeader<'a>>,
     ignore_invalid_headers: bool,
     underscores_in_headers: bool,
-) {
+) -> bool {
+    // Whether the client sent `Upgrade` (not forwarded: hop-by-hop).
+    let mut upgrade = false;
     let mut block = headers_raw;
     while !block.is_empty() {
         let line_end = match block.iter().position(|&b| b == b'\n') {
@@ -285,6 +288,7 @@ pub(crate) fn forward_client_headers<'a>(
             HeaderNamePolicy::Valid | HeaderNamePolicy::InvalidButIgnorable => {}
         }
         if crate::proxy::is_hop_by_hop_name(name) {
+            upgrade |= name.eq_ignore_ascii_case(b"upgrade");
             continue;
         }
         // Skip headers that we recompute or that an override already
@@ -311,6 +315,7 @@ pub(crate) fn forward_client_headers<'a>(
         }
         out.push(crate::proxy::ProxyHeader { name, value: v });
     }
+    upgrade
 }
 
 /// Dispatch a location's matched handler for a given URL path. Called from
@@ -671,7 +676,7 @@ pub(crate) fn run_location_handler(
                 value: value.as_slice(),
             });
         }
-        if proxy.pass_request_headers {
+        let client_upgrade = if proxy.pass_request_headers {
             // Forward client headers that aren't hop-by-hop, aren't
             // explicitly overridden, and aren't Content-Length / Host
             // (recomputed above). Iterate the raw header block; the
@@ -685,8 +690,10 @@ pub(crate) fn run_location_handler(
                 &mut headers,
                 proxy.ignore_invalid_headers,
                 proxy.underscores_in_headers,
-            );
-        }
+            )
+        } else {
+            lookup_request_header(req.headers_raw, b"upgrade").is_some()
+        };
 
         // Pooled: with the body in it the buffer is as large as the body,
         // and a fresh one per request faults its pages in each time (#289).
@@ -743,6 +750,7 @@ pub(crate) fn run_location_handler(
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
             intercept,
+            upgrade: client_upgrade,
         });
     }
     let inner = match loc.handler {

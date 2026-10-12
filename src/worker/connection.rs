@@ -121,6 +121,11 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// path, which writes to the fd directly.
     async fn wait_writable(&self) -> std::io::Result<()>;
 
+    /// The connection is about to carry a tunnel (#87), where one read and
+    /// one write are in flight at once; after this, `read` must not write
+    /// to the socket itself.
+    fn begin_tunnel(&mut self) {}
+
     /// The keep-alive wait for the next request, which may also read its
     /// first bytes into `buf` (from offset 0). By default the readiness
     /// wait of `idle_wait`, after which the caller reads.
@@ -206,6 +211,10 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
 
     async fn wait_writable(&self) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    fn begin_tunnel(&mut self) {
+        crate::tls_stream::TlsStream::begin_tunnel(self);
     }
 }
 

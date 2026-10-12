@@ -91,6 +91,7 @@ impl TlsAcceptor {
             rpos: 0,
             wbuf: Vec::new(),
             session_id,
+            tunnel: false,
         };
         stream.handshake().await?;
         Ok(stream)
@@ -110,6 +111,9 @@ pub struct TlsStream<IO> {
     wbuf: Vec<u8>,
     /// The session's `$ssl_session_id` bytes, with `with_session_ids`.
     session_id: Option<[u8; 32]>,
+    /// Carrying a tunnel: a read and a write may be in flight at once, so
+    /// only writes put records on the socket (`begin_tunnel`).
+    tunnel: bool,
 }
 
 impl<IO> TlsStream<IO> {
@@ -128,6 +132,16 @@ impl<IO> TlsStream<IO> {
             return None;
         }
         self.session_id.as_ref()
+    }
+
+    /// From now on a read may run while a write is in flight (the tunnel
+    /// after a proxied 101). Both touch the session only between awaits;
+    /// the socket write is the one thing that can't happen twice at once.
+    /// So a read no longer flushes what rustls queued in answer (an alert,
+    /// a KeyUpdate): the next write sends it, as `write_tls` drains the
+    /// queue until it is empty.
+    pub fn begin_tunnel(&mut self) {
+        self.tunnel = true;
     }
 
     /// The underlying transport, for waiting on the socket directly.
@@ -197,7 +211,9 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
         self.rpos += n;
         if let Err(e) = self.conn.process_new_packets() {
             // Best effort: get the alert rustls queued out to the peer.
-            let _ = self.write_tls().await;
+            if !self.tunnel {
+                let _ = self.write_tls().await;
+            }
             return Err(io::Error::new(io::ErrorKind::InvalidData, e));
         }
         // What rustls queued in answer (the `no_renegotiation` alert for a
@@ -206,7 +222,7 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
         // waiting for request bytes and not write anything else. OpenSSL
         // writes these from inside SSL_read. The handshake loop flushes on
         // its own.
-        if self.conn.wants_write() && !self.conn.is_handshaking() {
+        if self.conn.wants_write() && !self.conn.is_handshaking() && !self.tunnel {
             self.write_tls().await?;
         }
         Ok(n)
@@ -214,20 +230,22 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
 
     /// Move everything rustls has queued for the peer onto the socket.
     async fn write_tls(&mut self) -> io::Result<()> {
-        if !self.conn.wants_write() {
-            return Ok(());
-        }
-        let mut buf = mem::take(&mut self.wbuf);
-        buf.clear();
-        // A `Vec` sink never pushes back, so this drains the whole queue.
+        // Again after each write: in a tunnel, a read may queue records
+        // while the write is in flight.
         while self.conn.wants_write() {
-            self.conn.write_tls(&mut buf)?;
+            let mut buf = mem::take(&mut self.wbuf);
+            buf.clear();
+            // A `Vec` sink never pushes back, so this drains the whole queue.
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut buf)?;
+            }
+            let (res, buf) = self.io.write_all(buf).await;
+            if buf.capacity() <= WRITE_BUF_KEEP {
+                self.wbuf = buf;
+            }
+            res?;
         }
-        let (res, buf) = self.io.write_all(buf).await;
-        if buf.capacity() <= WRITE_BUF_KEEP {
-            self.wbuf = buf;
-        }
-        res.map(drop)
+        Ok(())
     }
 
     /// Encrypt as much of `bufs` as rustls accepts (its outgoing limit is

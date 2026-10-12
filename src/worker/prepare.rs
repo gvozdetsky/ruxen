@@ -271,6 +271,10 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         internal_error: Prebuilt::leak(500, "Internal Server Error\n", http_server_bytes),
         upstreams: prepared_upstreams,
         conf_prefix: conf_prefix.map(leak_path_buf),
+        shutdown_timeout: runtime
+            .worker_shutdown_timeout_ms
+            .filter(|&ms| ms != 0)
+            .map(Duration::from_millis),
     })))
 }
 

@@ -1490,6 +1490,9 @@ pub struct PreparedHttp {
     /// Directory of the main config file, for resolving relative paths that
     /// are only known per request (e.g. `auth_basic_user_file $var`).
     pub conf_prefix: Option<&'static Path>,
+    /// `worker_shutdown_timeout` (unset or 0: none). Bounds an upgraded
+    /// connection's life after a reload.
+    pub shutdown_timeout: Option<Duration>,
 }
 
 #[derive(Default)]

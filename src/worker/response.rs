@@ -689,6 +689,12 @@ pub(crate) fn apply_proxy_add_headers(
         // A 502/504 the proxy produced itself: `add_header ... always`
         // applies to it too.
         Response::Prebuilt(bytes) => bytes.to_vec(),
+        // A 101's head: `add_header ... always`.
+        Response::Upgrade(mut upgraded) => {
+            let render_ctx = proxy_render_ctx(http, ctx, meta, 101, upstream_headers);
+            upgraded.head = inject_add_headers(upgraded.head, meta.proxy_add_headers, &render_ctx);
+            return Response::Upgrade(upgraded);
+        }
         other => return other,
     };
     // `$upstream_http_*` read the upstream's own header lines, which still
@@ -1242,6 +1248,8 @@ pub(crate) fn maybe_intercept_error_page(
         // Proxy intercept is handled inside `proxy::run_proxy` from
         // pre-rendered plan rules; unresolved proxy plans pass through here.
         Response::Proxy(_) => return response,
+        // A 101 isn't an error.
+        Response::Upgrade(_) => return response,
     };
     let Some(rule) = error_pages.iter().find(|rule| rule.status == status) else {
         return response;
