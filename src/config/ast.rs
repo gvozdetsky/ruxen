@@ -1004,6 +1004,8 @@ pub struct AccessLog {
     pub flush_ms: Option<u64>,
     /// `gzip[=level]`: each flushed buffer is written as a gzip member.
     pub gzip: Option<u32>,
+    /// The path has variables: rendered per request (#303).
+    pub path_vars: Option<Vec<ValuePart>>,
 }
 
 /// Parsed `auth_basic` value. `off` explicitly disables inherited auth.

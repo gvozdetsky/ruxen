@@ -1729,6 +1729,8 @@ impl<'a> AccessLogPrep<'a> {
         // the log don't hit ENOENT when no request matches `if=...`.
         let syslog = match &log.syslog {
             Some(peer) => Some(prepare_syslog_peer(peer)?),
+            // Opened per line, under a name only a request gives.
+            None if log.path_vars.is_some() => None,
             None => {
                 open_log_file(&log.path)?;
                 None
@@ -1764,6 +1766,7 @@ impl<'a> AccessLogPrep<'a> {
         let file_index = self.canonical.len();
         let prepared = PreparedAccessLog {
             buffer,
+            path_vars: log.path_vars.clone().map(prepare_value_parts),
             path: Box::leak(log.path.clone().into_boxed_path()),
             format,
             escape,
