@@ -893,13 +893,13 @@ pub(crate) fn parse_location_block(
                     ctx: "location",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
-            (other, _) => {
-                return Err(Error::UnknownDirective {
-                    name: other.into(),
-                    ctx: "location",
-                });
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
+            (_, _) => {
+                compat::unknown(lx, &args, &term, "location")?;
             }
         }
     }

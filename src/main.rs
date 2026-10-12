@@ -104,6 +104,9 @@ struct Cli {
     dump: bool,
     show_version: bool,
     signal: Option<String>,
+    /// `--compat`: report everything in the configuration ruxen doesn't
+    /// do as nginx (#278).
+    compat: bool,
 }
 
 impl Default for Cli {
@@ -117,6 +120,7 @@ impl Default for Cli {
             quiet: false,
             dump: false,
             show_version: false,
+            compat: false,
             signal: None,
         }
     }
@@ -236,6 +240,10 @@ fn real_main() -> Result<(), Failure> {
         }
         Some(merged)
     };
+
+    if cli.compat {
+        return check_compat(main_path, file_src, globals_src);
+    }
 
     let cfg = config::parse_with_main(main_path.clone(), file_src, globals_src)
         .map_err(|e| report_emerg(&e.to_string(), &cli, &main_path))?;
@@ -457,6 +465,53 @@ fn real_main() -> Result<(), Failure> {
     Ok(())
 }
 
+/// `ruxen --compat`: parse the whole configuration, collecting what ruxen
+/// doesn't support or does differently instead of stopping at the first
+/// unknown directive, then load it as `-t` does (certificates, roots,
+/// logs) if nothing unsupported was found. The report goes to stdout;
+/// the exit status is 0 when ruxen starts with the configuration.
+fn check_compat(
+    main_path: PathBuf,
+    file_src: String,
+    globals_src: Option<String>,
+) -> Result<(), Failure> {
+    println!(
+        "ruxen {}: checking {}",
+        env!("CARGO_PKG_VERSION"),
+        main_path.display()
+    );
+    config::compat::begin();
+    let parsed = config::parse_with_main(main_path, file_src, globals_src);
+    let findings = config::compat::finish();
+    let cfg = match parsed {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            print!(
+                "{}",
+                config::compat::report(&findings, &[], Some(&e.to_string()), None)
+            );
+            return Err(Failure::Reported);
+        }
+    };
+    let warnings = cfg.warnings.clone();
+    let unsupported = findings
+        .iter()
+        .any(|f| f.severity == config::compat::Severity::Unsupported);
+    let prepare_error = if unsupported {
+        None
+    } else {
+        worker::prepare(cfg).err()
+    };
+    print!(
+        "{}",
+        config::compat::report(&findings, &warnings, None, prepare_error.as_deref())
+    );
+    if unsupported || prepare_error.is_some() {
+        return Err(Failure::Reported);
+    }
+    Ok(())
+}
+
 fn parse_cli<I>(args: I) -> Result<Cli, String>
 where
     I: IntoIterator<Item = String>,
@@ -491,6 +546,10 @@ where
                 cli.dump = true;
             }
             "-V" => cli.show_version = true,
+            "--compat" => {
+                cli.compat = true;
+                cli.test_only = true;
+            }
             "-s" => {
                 let value = args.next().ok_or("option `-s` requires a signal name")?;
                 cli.signal = Some(value);

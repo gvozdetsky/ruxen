@@ -214,7 +214,7 @@ fn bad_access_directives_fail_to_load() {
         ),
         (
             "location / { limit_except GET { proxy_pass http://127.0.0.1:1; } }",
-            "unknown directive `proxy_pass` in limit_except",
+            "unknown directive `proxy_pass` in a limit_except block",
         ),
         (
             "location / { limit_except GET { deny all; } limit_except POST { deny all; } }",

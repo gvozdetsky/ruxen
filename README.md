@@ -136,6 +136,29 @@ hello from ruxen
 
 You are now serving an nginx-style configuration with ruxen.
 
+### Check your nginx configuration
+
+`--compat` reads a whole configuration and lists everything ruxen doesn't do as nginx, with the file and line, instead of stopping at the first problem the way `-t` does:
+
+```bash
+ruxen --compat -c /etc/nginx/nginx.conf
+```
+
+```text
+ruxen 0.1.2: checking /etc/nginx/nginx.conf
+/etc/nginx/nginx.conf:33: unsupported: ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3 — TLSv1, TLSv1.1 rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old names with a warning)
+/etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
+/etc/nginx/nginx.conf:46: differs: gzip on — responses are not compressed (#93)
+ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
+ruxen does not start with this configuration: 2 unsupported, 1 behaving differently
+```
+
+- **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
+- **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `gzip off`, is not listed.
+- **ignored:** tuning knobs with no visible effect.
+
+With nothing unsupported, the configuration is then loaded the way `-t` does it (certificates, roots, log files). The exit status is 0 when ruxen starts with the configuration. A `#N` refers to the GitHub issue that tracks the gap. `-t` errors also carry nginx's ` in file:line`.
+
 ### Run as a service
 
 ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it gracefully, `SIGTERM` at once, `SIGUSR1` reopens the log files; it can't re-read its configuration yet, so restart it to apply a change.
@@ -266,6 +289,8 @@ The currently implemented nginx-style command-line surface includes:
 -V
 -s stop | quit | reopen
 ```
+
+and one option nginx doesn't have: `--compat`, the configuration check described in [Check your nginx configuration](#check-your-nginx-configuration).
 
 `-V` starts with `nginx version: nginx/1.29.2`, followed by `ruxen version: ruxen/<version>`. The nginx line and the `configure arguments` list are what the nginx-tests harness reads to decide which tests apply, so they describe ruxen as an nginx build: the arguments list only the modules ruxen actually implements.
 
