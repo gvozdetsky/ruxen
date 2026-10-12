@@ -82,6 +82,19 @@ pub struct ProxyConf {
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
+    /// `proxy_bind` (#135); `Some(ProxyBind::Off)` turns an inherited one off.
+    pub bind: Option<ProxyBind>,
+}
+
+/// `proxy_bind address [transparent] | off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyBind {
+    Off,
+    /// The local address, `ip[:port]`, possibly with variables.
+    Addr {
+        value: Vec<ValuePart>,
+        transparent: bool,
+    },
 }
 
 impl ProxyConf {
@@ -109,6 +122,7 @@ impl ProxyConf {
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
+            bind: self.bind.or_else(|| parent.bind.clone()),
         }
     }
 }

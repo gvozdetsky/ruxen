@@ -632,6 +632,18 @@ pub struct PreparedProxy {
     pub request_path: &'static [u8],
     /// What to do with the upstream's response headers.
     pub response: &'static ProxyResponseRules,
+    /// Inheritance-resolved `proxy_bind`; `None` when unset or `off`.
+    pub bind: Option<&'static PreparedBind>,
+}
+
+/// `proxy_bind` (#135): the local address of upstream connections.
+#[derive(Debug)]
+pub struct PreparedBind {
+    /// A literal address, parsed once; otherwise `value` is rendered per
+    /// request.
+    pub addr: Option<SocketAddr>,
+    pub value: &'static [PreparedValuePart],
+    pub transparent: bool,
 }
 
 /// One prepared `proxy_set_header NAME VALUE;` entry. Name is a static
@@ -675,6 +687,8 @@ pub(crate) struct ProxyEffective {
     /// (each list inherits on its own, as in nginx).
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    /// `proxy_bind`; `None` when unset or `off`.
+    pub bind: Option<&'static PreparedBind>,
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
     pub recursive_error_pages: bool,
@@ -705,6 +719,7 @@ impl ProxyEffective {
             redirect: None,
             hide_headers: None,
             pass_headers: None,
+            bind: None,
             error_pages: &[],
             recursive_error_pages: false,
         }

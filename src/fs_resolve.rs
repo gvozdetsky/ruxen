@@ -218,7 +218,7 @@ fn note_failed_lookup(message: String, not_found: bool) {
 }
 
 #[cold]
-fn note_failed_lookup_at(message: String, not_found: bool, level: ErrorLogLevel) {
+pub(crate) fn note_failed_lookup_at(message: String, not_found: bool, level: ErrorLogLevel) {
     FAILED_LOOKUP.with(|f| *f.borrow_mut() = Some((message.into_bytes(), not_found, level)));
 }
 
