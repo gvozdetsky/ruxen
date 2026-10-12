@@ -767,7 +767,7 @@ pub(crate) fn format_http_date(secs: u64) -> [u8; 29] {
 /// calendar, restricted to non-negative day counts (`days` is unsigned).
 /// Replaces a year-by-year walk from 1970 that ran on every response
 /// (`format_http_date` was ~1.3% of CPU on the 304 bench).
-fn civil_from_days(days: u64) -> (u32, usize, u8) {
+pub(crate) fn civil_from_days(days: u64) -> (u32, usize, u8) {
     // Shift the epoch to 0000-03-01 so leap days fall at the end of each
     // 400-year era.
     let z = days + 719_468;
