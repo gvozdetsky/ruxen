@@ -165,7 +165,7 @@ ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it graceful
 
 **systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to the log reopen. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` with it.
 
-**Docker:** the default seccomp profile denies `io_uring`, which ruxen runs on. [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json) is Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`; use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
+**Docker:** the default seccomp profile denies `io_uring`, which ruxen runs on. [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json) is Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`, and `unshare` with `CLONE_FILES` alone (each worker's own fd table; no namespaces); use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
 
 ```bash
 docker build -f contrib/docker/Dockerfile -t ruxen .
