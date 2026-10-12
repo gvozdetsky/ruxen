@@ -73,6 +73,8 @@ proxy_post_64k|POST 64 KiB body through proxy_pass|8135|/proxy|16|512|30s|5s|20|
 proxy_no_upstream_keepalive|proxy_pass to an address, new upstream connection per request|8140|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
 proxy_rr4|proxy_pass round robin over 4 servers, keep-alive|8141|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
 proxy_least_conn4|proxy_pass least_conn over 4 servers, keep-alive|8142|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_hash4|proxy_pass hash $request_uri consistent over 4 servers, keep-alive|8145|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
+proxy_ip_hash4|proxy_pass ip_hash over 4 servers, keep-alive|8146|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
 proxy_headers_vars|proxy_pass + 5 proxy_set_header with variables|8143|/|16|512|30s|5s|20|bench/proxy2/nginx.conf||none||http
 proxy_64k|proxy_pass, 64 KiB upstream response|8144|/64k.bin|16|512|30s|5s|20|bench/proxy2/nginx.conf|bench/proxy2/generate.sh|none||http
 proxy_1m|proxy_pass, 1 MiB upstream response|8144|/1M.bin|16|512|30s|5s|20|bench/proxy2/nginx.conf|bench/proxy2/generate.sh|none||http

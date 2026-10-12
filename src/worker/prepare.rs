@@ -438,7 +438,7 @@ pub(crate) fn prepare_upstreams(
             keepalive_requests: u.keepalive_requests.unwrap_or(1000),
             keepalive_idle_timeout_ms: u.keepalive_idle_timeout_ms.unwrap_or(60_000),
             keepalive_max_lifetime_ms: u.keepalive_max_lifetime_ms.unwrap_or(3_600_000),
-            lb: u.lb,
+            lb: crate::upstream::Lb::prepare(u.lb, peers),
         }));
         out.insert(name_static, &*prepared);
     }
@@ -556,7 +556,7 @@ pub(crate) fn build_proxy(
                 keepalive_requests: 1000,
                 keepalive_idle_timeout_ms: 60_000,
                 keepalive_max_lifetime_ms: 3_600_000,
-                lb: crate::config::LbAlgorithm::RoundRobin,
+                lb: crate::upstream::Lb::RoundRobin,
             }));
             PreparedProxy {
                 upstream,

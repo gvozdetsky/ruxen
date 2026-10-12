@@ -84,7 +84,14 @@ pub(crate) fn parse_upstream_block(
         }
         match (args[0].as_str(), &term) {
             ("server", Terminator::Semi) => {
-                servers.push(parse_upstream_server_args(&args[1..])?);
+                let server = parse_upstream_server_args(&args[1..])?;
+                if server.backup && matches!(lb, LbAlgorithm::Hash { .. } | LbAlgorithm::IpHash) {
+                    return Err(Error::BadValue {
+                        what: "upstream server param (balancing method does not support it)",
+                        got: "backup".into(),
+                    });
+                }
+                servers.push(server);
             }
             ("server", _) => {
                 return Err(Error::WrongTerminator {
@@ -93,16 +100,58 @@ pub(crate) fn parse_upstream_block(
                 });
             }
             ("least_conn", Terminator::Semi) => {
-                if !matches!(lb, LbAlgorithm::RoundRobin) {
-                    return Err(Error::Duplicate("least_conn"));
-                }
                 if args.len() != 1 {
                     return Err(Error::BadValue {
                         what: "least_conn",
                         got: args[1..].join(" "),
                     });
                 }
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
                 lb = LbAlgorithm::LeastConn;
+            }
+            // ngx_http_upstream_hash / ngx_http_upstream_ip_hash: a method
+            // set before is replaced with a warning. Neither takes `backup`
+            // servers after it; ones listed before stay out of the hash and
+            // serve only its round-robin fallback, as in nginx.
+            ("hash", Terminator::Semi) => {
+                let consistent = match &args[1..] {
+                    [_] => false,
+                    [_, c] if c == "consistent" => true,
+                    [_, other] => {
+                        return Err(Error::BadValue {
+                            what: "hash parameter",
+                            got: other.clone(),
+                        });
+                    }
+                    [] => return Err(Error::MissingArg("hash key")),
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "hash",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                };
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
+                lb = LbAlgorithm::Hash {
+                    key: parse_value_with_vars(&args[1])?,
+                    consistent,
+                };
+            }
+            ("ip_hash", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::BadValue {
+                        what: "ip_hash",
+                        got: args[1..].join(" "),
+                    });
+                }
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
+                lb = LbAlgorithm::IpHash;
             }
             ("keepalive", Terminator::Semi) => {
                 if keepalive_max_idle.is_some() {
@@ -725,5 +774,37 @@ mod tests {
         assert!(parse_upstream_server_args(&[too_long]).is_err());
         let fits = format!("unix:/{}", "a".repeat(106));
         assert!(parse_upstream_server_args(&[fits]).is_ok());
+    }
+
+    #[test]
+    fn hash_and_ip_hash_directives() {
+        let upstream = |body: &str| {
+            crate::config::parse(&format!(
+                "http {{ upstream u {{ {body} }} server {{ listen 80; location / {{ proxy_pass http://u; }} }} }}"
+            ))
+        };
+        let cfg = upstream("hash $arg_k consistent; server 127.0.0.1:1;").unwrap();
+        assert!(matches!(
+            cfg.upstreams[0].lb,
+            LbAlgorithm::Hash {
+                consistent: true,
+                ..
+            }
+        ));
+        // A method set before is replaced, with nginx's warning.
+        let cfg = upstream("least_conn; ip_hash; server 127.0.0.1:1;").unwrap();
+        assert_eq!(cfg.upstreams[0].lb, LbAlgorithm::IpHash);
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("load balancing method redefined")),
+            "{:?}",
+            cfg.warnings
+        );
+        // `backup` after a hash method is refused; before, it is kept.
+        assert!(upstream("hash $arg_k; server 127.0.0.1:1 backup;").is_err());
+        assert!(upstream("server 127.0.0.1:1 backup; ip_hash; server 127.0.0.1:2;").is_ok());
+        assert!(upstream("hash $arg_k foo; server 127.0.0.1:1;").is_err());
+        assert!(upstream("hash; server 127.0.0.1:1;").is_err());
     }
 }
