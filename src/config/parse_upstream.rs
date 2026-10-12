@@ -60,6 +60,7 @@ pub(crate) fn parse_upstream_block(
     let mut keepalive_idle_timeout_ms: Option<u64> = None;
     let mut keepalive_max_lifetime_ms: Option<u64> = None;
     let mut lb: LbAlgorithm = LbAlgorithm::RoundRobin;
+    let mut zone: Option<String> = None;
     loop {
         let (args, term) = lx.read_directive()?;
         if args.is_empty() {
@@ -76,6 +77,7 @@ pub(crate) fn parse_upstream_block(
                         keepalive_idle_timeout_ms,
                         keepalive_max_lifetime_ms,
                         lb,
+                        zone,
                     })
                 }
                 Terminator::Eof => Err(Error::UnclosedBlock),
@@ -153,6 +155,43 @@ pub(crate) fn parse_upstream_block(
                 }
                 lb = LbAlgorithm::IpHash;
             }
+            // ngx_http_upstream_zone: `zone name [size]`. Workers are
+            // threads, so the size bounds nothing; it is checked as nginx
+            // checks it.
+            ("zone", Terminator::Semi) => {
+                if zone.is_some() {
+                    return Err(Error::Duplicate("zone"));
+                }
+                let (name, size) = match &args[1..] {
+                    [name] => (name, None),
+                    [name, size] => (name, Some(size)),
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "zone",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                };
+                if name.is_empty() {
+                    return Err(Error::BadValue {
+                        what: "zone name",
+                        got: name.clone(),
+                    });
+                }
+                if let Some(size) = size {
+                    let bytes = parse_size_bytes(size).ok_or_else(|| Error::BadValue {
+                        what: "zone size",
+                        got: size.clone(),
+                    })?;
+                    if bytes < 8 * 4096 {
+                        return Err(Error::BadValue {
+                            what: "zone (zone is too small)",
+                            got: size.clone(),
+                        });
+                    }
+                }
+                zone = Some(name.clone());
+            }
             ("keepalive", Terminator::Semi) => {
                 if keepalive_max_idle.is_some() {
                     return Err(Error::Duplicate("keepalive"));
@@ -224,6 +263,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
     let mut weight: u32 = 1;
     let mut max_fails: u32 = 1;
     let mut fail_timeout_secs: u32 = 10;
+    let mut max_conns: u32 = 0;
     let mut down = false;
     let mut backup = false;
     for tok in &args[1..] {
@@ -248,6 +288,11 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
                 what: "upstream fail_timeout",
                 got: tok.clone(),
             })?;
+        } else if let Some(v) = tok.strip_prefix("max_conns=") {
+            max_conns = v.parse::<u32>().map_err(|_| Error::BadValue {
+                what: "upstream max_conns",
+                got: tok.clone(),
+            })?;
         } else if tok == "down" {
             down = true;
         } else if tok == "backup" {
@@ -265,6 +310,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
         weight,
         max_fails,
         fail_timeout_secs,
+        max_conns,
         down,
         backup,
     })
