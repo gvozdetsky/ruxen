@@ -73,6 +73,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         auth_delay_ms,
         access,
         client_max_body_size,
+        client_body_buffer_size,
         client_body_temp_path,
         sendfile,
         disable_symlinks,
@@ -119,6 +120,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         PreparedAccess::NONE,
     );
     let http_client_max_body_size = client_max_body_size;
+    let http_client_body_buffer_size = client_body_buffer_size;
     let http_sendfile = sendfile;
     let http_disable_symlinks = disable_symlinks;
     let http_limit_rate =
@@ -193,6 +195,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                     http_autoindex_format,
                     http_access,
                     http_client_max_body_size,
+                    http_client_body_buffer_size,
                     http_sendfile,
                     http_disable_symlinks.clone(),
                     http_limit_rate,
@@ -875,6 +878,7 @@ pub(crate) fn prepare_server(
     http_autoindex_format: AutoindexFormat,
     http_access: PreparedAccess,
     http_client_max_body_size: Option<u64>,
+    http_client_body_buffer_size: Option<u64>,
     http_sendfile: Option<bool>,
     http_disable_symlinks: Option<crate::config::DisableSymlinks>,
     http_limit_rate: PreparedLimitRate,
@@ -1008,6 +1012,9 @@ pub(crate) fn prepare_server(
         http_access,
     );
     let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
+    let server_client_body_buffer_size = server
+        .client_body_buffer_size
+        .or(http_client_body_buffer_size);
     let server_sendfile = server.sendfile.or(http_sendfile).unwrap_or(false);
     // A server's own `client_body_temp_path`; without one its locations
     // use the http-level directory (`PreparedHttp::body_temp`).
@@ -1079,6 +1086,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1109,6 +1117,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1139,6 +1148,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1170,6 +1180,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1257,6 +1268,7 @@ pub(crate) fn prepare_server(
             access: server_access,
             limit_except: None,
             client_max_body_size: server_client_max_body_size,
+            client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
             gzip: prepare_gzip(server_gzip.clone())?,
             limit_rate: server_limit_rate.for_location(),
@@ -2168,6 +2180,7 @@ pub(crate) fn build_prefix_or_exact(
     server_access_logs: &'static [PreparedAccessLog],
     server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
+    server_client_body_buffer_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
     server_disable_symlinks: Option<crate::config::DisableSymlinks>,
@@ -2211,6 +2224,7 @@ pub(crate) fn build_prefix_or_exact(
         access: location_access,
         limit_except,
         client_max_body_size: location_client_max_body_size,
+        client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
         document_root,
         client_body_temp_path: location_client_body_temp_path,
@@ -2325,6 +2339,8 @@ pub(crate) fn build_prefix_or_exact(
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let client_body_buffer_size =
+        location_client_body_buffer_size.or(server_client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
@@ -2361,6 +2377,7 @@ pub(crate) fn build_prefix_or_exact(
         access,
         limit_except,
         client_max_body_size,
+        client_body_buffer_size,
         sendfile,
         gzip,
         limit_rate: limit_rate.for_location(),
@@ -2393,6 +2410,7 @@ pub(crate) fn build_regex_location(
     server_access_logs: &'static [PreparedAccessLog],
     server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
+    server_client_body_buffer_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
     server_disable_symlinks: Option<crate::config::DisableSymlinks>,
@@ -2436,6 +2454,7 @@ pub(crate) fn build_regex_location(
         access: location_access,
         limit_except,
         client_max_body_size: location_client_max_body_size,
+        client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
         document_root,
         client_body_temp_path: location_client_body_temp_path,
@@ -2561,6 +2580,8 @@ pub(crate) fn build_regex_location(
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let client_body_buffer_size =
+        location_client_body_buffer_size.or(server_client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
@@ -2595,6 +2616,7 @@ pub(crate) fn build_regex_location(
         access,
         limit_except,
         client_max_body_size,
+        client_body_buffer_size,
         sendfile,
         gzip,
         limit_rate: limit_rate.for_location(),

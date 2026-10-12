@@ -292,6 +292,7 @@ pub(crate) fn parse_location_block(
     inherited_auth_delay_ms: Option<u64>,
     inherited_access: &AccessConf,
     inherited_client_max_body_size: Option<u64>,
+    inherited_client_body_buffer_size: Option<u64>,
     inherited_post_action: Option<String>,
     inherited_expires: Option<ExpiresDirective>,
     inherited_sendfile: Option<bool>,
@@ -339,6 +340,7 @@ pub(crate) fn parse_location_block(
     let mut access = AccessConf::default();
     let mut limit_except: Option<LimitExcept> = None;
     let mut client_max_body_size: Option<u64> = None;
+    let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_in_file_only: Option<ClientBodyInFileOnly> = None;
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
@@ -411,6 +413,8 @@ pub(crate) fn parse_location_block(
                     let effective_access = access.inherit(inherited_access);
                     let effective_client_max_body_size =
                         client_max_body_size.or(inherited_client_max_body_size);
+                    let effective_client_body_buffer_size =
+                        client_body_buffer_size.or(inherited_client_body_buffer_size);
                     let effective_post_action = post_action.or(inherited_post_action);
                     let effective_expires = expires.or(inherited_expires);
                     let effective_sendfile = sendfile.or(inherited_sendfile);
@@ -451,6 +455,7 @@ pub(crate) fn parse_location_block(
                         access: effective_access,
                         limit_except,
                         client_max_body_size: effective_client_max_body_size,
+                        client_body_buffer_size: effective_client_body_buffer_size,
                         sendfile: effective_sendfile,
                         document_root,
                         client_body_temp_path: effective_client_body_temp_path,
@@ -633,6 +638,12 @@ pub(crate) fn parse_location_block(
                 }
                 limit_except = Some(parse_limit_except_block(&args, lx)?);
             }
+            ("client_body_buffer_size", Terminator::Semi) => {
+                if client_body_buffer_size.is_some() {
+                    return Err(Error::Duplicate("client_body_buffer_size"));
+                }
+                client_body_buffer_size = Some(parse_client_body_buffer_size_args(&args[1..])?);
+            }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
                     return Err(Error::Duplicate("client_max_body_size"));
@@ -779,6 +790,8 @@ pub(crate) fn parse_location_block(
                 let pass_access = access.inherit(inherited_access);
                 let pass_client_max_body_size =
                     client_max_body_size.or(inherited_client_max_body_size);
+                let pass_client_body_buffer_size =
+                    client_body_buffer_size.or(inherited_client_body_buffer_size);
                 let pass_post_action = post_action.clone().or(inherited_post_action.clone());
                 let pass_expires = expires.clone().or(inherited_expires.clone());
                 let pass_sendfile = sendfile.or(inherited_sendfile);
@@ -820,6 +833,7 @@ pub(crate) fn parse_location_block(
                     pass_auth_delay_ms,
                     &pass_access,
                     pass_client_max_body_size,
+                    pass_client_body_buffer_size,
                     pass_post_action,
                     pass_expires,
                     pass_sendfile,

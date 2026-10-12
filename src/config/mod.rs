@@ -273,6 +273,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_delay_ms: Option<u64> = None;
     let mut access = AccessConf::default();
     let mut client_max_body_size: Option<u64> = None;
+    let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
@@ -373,6 +374,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         auth_delay_ms,
                         access,
                         client_max_body_size,
+                        client_body_buffer_size,
                         client_body_temp_path,
                         sendfile,
                         disable_symlinks,
@@ -675,6 +677,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ctx: "http",
                 });
             }
+            ("client_body_buffer_size", Terminator::Semi) => {
+                if client_body_buffer_size.is_some() {
+                    return Err(Error::Duplicate("client_body_buffer_size"));
+                }
+                client_body_buffer_size = Some(parse_client_body_buffer_size_args(&args[1..])?);
+            }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
                     return Err(Error::Duplicate("client_max_body_size"));
@@ -853,7 +861,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "log_subrequest",
     "rewrite_log",
     // Body / header buffer tuning
-    "client_body_buffer_size",
     "client_body_timeout",
     "client_body_in_file_only",
     "client_body_in_single_buffer",

@@ -1015,6 +1015,9 @@ pub struct PreparedLocation {
     /// `None` means "unlimited"; `Some(0)` also disables the limit to
     /// mirror nginx's directive semantics.
     pub client_max_body_size: Option<u64>,
+    /// Effective `client_body_buffer_size`: bodies up to this size stay in
+    /// memory. `None` is nginx's default, 16k.
+    pub client_body_buffer_size: Option<u64>,
     /// Effective `client_body_in_file_only` for this location. `On` keeps
     /// the spilled body file after the request; `Clean` and `Off` unlink
     /// at end-of-request.
@@ -1068,6 +1071,7 @@ pub struct PreparedRegexLocation {
     pub access: PreparedAccess,
     pub limit_except: Option<&'static PreparedLimitExcept>,
     pub client_max_body_size: Option<u64>,
+    pub client_body_buffer_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
     pub doc_root: &'static DocRoot,
@@ -1104,6 +1108,7 @@ pub struct MatchedLocation<'a> {
     pub access: &'a PreparedAccess,
     pub limit_except: Option<&'static PreparedLimitExcept>,
     pub client_max_body_size: Option<u64>,
+    pub client_body_buffer_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
     pub doc_root: &'static DocRoot,
@@ -1137,6 +1142,7 @@ impl<'a> MatchedLocation<'a> {
             access: &loc.access,
             limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
+            client_body_buffer_size: loc.client_body_buffer_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
@@ -1185,6 +1191,7 @@ impl<'a> MatchedLocation<'a> {
             access: &loc.access,
             limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
+            client_body_buffer_size: loc.client_body_buffer_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,

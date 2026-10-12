@@ -210,9 +210,11 @@ pub(crate) fn hostname() -> &'static [u8] {
         .as_slice()
 }
 
-/// Body size above which we spill to a temp file so `$request_body_file`
-/// can be populated for nginx-tests cases.
-pub(crate) const REQUEST_BODY_FILE_THRESHOLD: usize = 2 * 1024;
+/// nginx's default `client_body_buffer_size` on 64-bit platforms (two
+/// pages): bodies up to this size stay in memory, larger ones go to a temp
+/// file (`$request_body_file`), as `ngx_http_write_request_body` does once
+/// the buffer is full.
+pub(crate) const DEFAULT_CLIENT_BODY_BUFFER_SIZE: u64 = 16 * 1024;
 
 /// Next request-body temp file number, nginx's `ngx_temp_number`: seeded
 /// once per process, bumped by a jump when a name is taken.
@@ -231,6 +233,9 @@ pub(crate) struct BodyTempDir {
     /// away (a temp-directory cleaner): a new one, never the old name,
     /// which someone else could have taken by then.
     private: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// The configured directory exists (made, or found, once): a `mkdir`
+    /// per request body was most of the spill cost (#246).
+    made: std::sync::atomic::AtomicBool,
 }
 
 impl BodyTempDir {
@@ -242,6 +247,7 @@ impl BodyTempDir {
         BodyTempDir {
             configured: configured.map(|t| (prepare::leak_path_buf(t.path), t.levels)),
             private: std::sync::Mutex::new(None),
+            made: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -276,11 +282,15 @@ impl BodyTempDir {
         use std::os::unix::fs::DirBuilderExt;
         if let Some((dir, _)) = self.configured {
             // nginx's ngx_create_paths: one level, 0700; an existing
-            // directory is fine.
-            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
+            // directory is fine. Once it exists, only a missing directory
+            // (`gone`) makes it again.
+            if gone || !self.made.load(Ordering::Relaxed) {
+                match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return None,
+                }
+                self.made.store(true, Ordering::Relaxed);
             }
             return Some(dir.to_path_buf());
         }
@@ -430,8 +440,9 @@ pub(crate) fn maybe_spill_request_body_to_file(
     body: &[u8],
     temp: &BodyTempDir,
     persistent: bool,
+    buffer_size: u64,
 ) -> Option<SpilledBody> {
-    if body.len() <= REQUEST_BODY_FILE_THRESHOLD {
+    if body.len() as u64 <= buffer_size {
         return None;
     }
     let spilled = new_body_file(temp, persistent)?;
