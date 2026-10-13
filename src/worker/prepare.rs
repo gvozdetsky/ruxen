@@ -1188,6 +1188,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1219,6 +1220,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1250,6 +1252,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1282,6 +1285,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1372,6 +1376,9 @@ pub(crate) fn prepare_server(
             post_action: server_post_action,
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
+            timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+                server.client_timeouts,
+            ))),
         })
     } else {
         None
@@ -2291,6 +2298,7 @@ pub(crate) fn build_prefix_or_exact(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2333,6 +2341,7 @@ pub(crate) fn build_prefix_or_exact(
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2491,6 +2500,9 @@ pub(crate) fn build_prefix_or_exact(
         post_action,
         expires,
         chunked_transfer_encoding,
+        timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 
@@ -2521,6 +2533,7 @@ pub(crate) fn build_regex_location(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2563,6 +2576,7 @@ pub(crate) fn build_regex_location(
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2731,6 +2745,9 @@ pub(crate) fn build_regex_location(
         post_action,
         expires,
         chunked_transfer_encoding,
+        timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 

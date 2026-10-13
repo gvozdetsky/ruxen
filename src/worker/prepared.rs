@@ -1091,6 +1091,9 @@ pub struct PreparedLocation {
     /// chunked is off there is no chunked frame to append trailers to,
     /// so they are silently dropped (matching nginx's chunked filter).
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// A regex-mode location after prepare. The compiled
@@ -1133,6 +1136,9 @@ pub struct PreparedRegexLocation {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// Common view onto a matched location. The matcher hands one of these to
@@ -1170,6 +1176,9 @@ pub struct MatchedLocation<'a> {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 impl<'a> MatchedLocation<'a> {
@@ -1201,6 +1210,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            timeouts: loc.timeouts,
         }
     }
 
@@ -1250,6 +1260,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            timeouts: loc.timeouts,
         }
     }
 }
