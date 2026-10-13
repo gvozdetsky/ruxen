@@ -25,6 +25,9 @@ jobs:
         run: cargo build --release --all-targets --locked
       - name: Test
         run: cargo test --release --locked
+      - name: Test on the epoll driver
+        # monoio's legacy driver, used where io_uring is unavailable (#215).
+        run: RUXEN_DRIVER=epoll cargo test --release --locked
       - name: Keep the binary for nginx-tests
         uses: actions/upload-artifact@v4
         with:
@@ -94,7 +97,8 @@ jobs:
 
   container:
     # contrib/docker: the image builds, and serves under the io_uring
-    # seccomp profile it ships with.
+    # seccomp profile it ships with, and under Docker's default profile
+    # (epoll, #215).
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -108,6 +112,13 @@ jobs:
             | grep -q "hello from ruxen"
           docker stop ruxen
           test "$(docker inspect ruxen --format '{{.State.ExitCode}}')" = 0
+      - name: Smoke test, default seccomp profile
+        run: |
+          docker run -d --name ruxen-epoll -p 8081:8080 ruxen:ci
+          for i in $(seq 50); do curl -sf http://127.0.0.1:8081/ && break; sleep 0.2; done \
+            | grep -q "hello from ruxen"
+          docker stop ruxen-epoll
+          test "$(docker inspect ruxen-epoll --format '{{.State.ExitCode}}')" = 0
 
   msrv:
     # Keeps `rust-version` in Cargo.toml honest.

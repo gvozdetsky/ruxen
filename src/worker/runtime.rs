@@ -1198,19 +1198,9 @@ pub fn run(
         }
     }
 
-    let mut rt = match RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .with_entries(4096)
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = ready.send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
-            return;
-        }
-    };
-
-    rt.block_on(async move {
+    // The worker's whole life; it runs on whichever driver `main` chose.
+    let ready_on_failure = ready.clone();
+    let body = async move {
         WORKER_CONNS.with(|w| w.http.set(Some(http)));
         // Open one fd per configured access_log for this worker. Kept in a
         // thread-local so `write_access_logs` can do io_uring writes without
@@ -1323,7 +1313,57 @@ pub fn run(
                 monoio::time::sleep(Duration::from_millis(10)).await;
             }
         }
-    });
+    };
+
+    match driver() {
+        Driver::IoUring => match RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .with_entries(4096)
+            .build()
+        {
+            Ok(mut rt) => rt.block_on(body),
+            Err(e) => {
+                let _ = ready_on_failure
+                    .send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
+            }
+        },
+        Driver::Epoll => match RuntimeBuilder::<monoio::LegacyDriver>::new()
+            .enable_timer()
+            .build()
+        {
+            Ok(mut rt) => rt.block_on(body),
+            Err(e) => {
+                let _ = ready_on_failure
+                    .send(Err(format!("epoll_create() failed ({})", errno_text(&e))));
+            }
+        },
+    }
+}
+
+/// The I/O driver every worker runs on, chosen once by `main` (#215).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Driver {
+    IoUring,
+    /// monoio's legacy driver: epoll, for where io_uring is unavailable.
+    Epoll,
+}
+
+static EPOLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set before the workers start.
+pub fn set_driver(driver: Driver) {
+    EPOLL.store(
+        driver == Driver::Epoll,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn driver() -> Driver {
+    if EPOLL.load(std::sync::atomic::Ordering::Relaxed) {
+        Driver::Epoll
+    } else {
+        Driver::IoUring
+    }
 }
 
 /// `listen unix:` sockets, bound once by `main` before the workers start:
