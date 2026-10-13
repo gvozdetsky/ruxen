@@ -148,28 +148,71 @@ async fn drive<IO>(
     let max_time = Duration::from_millis(keepalive.max_time_ms);
     let started = std::time::Instant::now();
     let mut requests: u64 = 0;
-    let active = Rc::new(Cell::new(0usize));
-    let mut idle_since = Some(monoio::time::Instant::now());
+    // Streams in progress; the last to end wakes the loop, for the idle
+    // timer.
+    let streams = Rc::new(Streams::default());
+    let mut idle_since = monoio::time::Instant::now();
     let mut going_away = false;
     // Gone away with nothing left to send: closed shortly after, also for a
     // client that doesn't answer the GOAWAY's PING.
     let mut drained_at: Option<monoio::time::Instant> = None;
+    // Shutdown and reload wake the loop, as they wake idle HTTP/1.1
+    // connections: no per-connection tick (#127).
+    let watch = super::EventWatch::new();
     loop {
-        let accepted = monoio::time::timeout(Duration::from_millis(50), conn.accept()).await;
         let now = monoio::time::Instant::now();
+        // What the loop waits for besides the connection: the idle
+        // deadline, or, while going away, the next look at the drain.
+        let wake_at = if going_away {
+            Some(now + Duration::from_millis(50))
+        } else if streams.active.get() == 0 {
+            Some(if !keepalive.allow && requests > 0 {
+                now
+            } else {
+                idle_since + idle
+            })
+        } else {
+            None
+        };
+        let timer = async {
+            match wake_at {
+                Some(at) => monoio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        let event = std::future::poll_fn(|cx| {
+            if !going_away && ctx.state.is_shutting_down() {
+                return std::task::Poll::Ready(());
+            }
+            if streams.ended_at.get().is_some() {
+                return std::task::Poll::Ready(());
+            }
+            watch.register(cx.waker());
+            streams.waker.set(Some(cx.waker().clone()));
+            std::task::Poll::Pending
+        });
+        let accepted = monoio::select! {
+            accepted = conn.accept() => Some(accepted),
+            _ = timer => None,
+            _ = event => None,
+        };
+        let now = monoio::time::Instant::now();
+        // The connection is idle from when its last stream ended.
+        if let Some(at) = streams.ended_at.take() {
+            idle_since = at;
+        }
         match accepted {
-            Ok(Some(Ok((request, respond)))) => {
-                idle_since = None;
-                active.set(active.get() + 1);
+            Some(Some(Ok((request, respond)))) => {
+                streams.active.set(streams.active.get() + 1);
                 let counters = (started, requests);
                 requests += 1;
                 let (http, connection_id, peer_addr) = (ctx.http, ctx.connection_id, ctx.peer_addr);
                 let ctx = ctx.clone();
-                let active = active.clone();
+                let streams = streams.clone();
                 monoio::spawn(Contained::new(
                     async move {
                         serve_stream(request, respond, &ctx, counters).await;
-                        active.set(active.get() - 1);
+                        streams.end();
                     },
                     http,
                     connection_id,
@@ -186,8 +229,8 @@ async fn drive<IO>(
                 }
             }
             // The client went away, or the connection failed.
-            Ok(Some(Err(_))) | Ok(None) => break,
-            Err(_) => {}
+            Some(Some(Err(_))) | Some(None) => break,
+            None => {}
         }
         if going_away {
             // Done once the streams are and what they sent is written, or
@@ -195,7 +238,7 @@ async fn drive<IO>(
             let stuck = writing_since
                 .get()
                 .is_some_and(|since| since.elapsed() >= timeouts.send);
-            if active.get() == 0 && !conn.has_streams() && writing_since.get().is_none() {
+            if streams.active.get() == 0 && !conn.has_streams() && writing_since.get().is_none() {
                 let at = *drained_at.get_or_insert(now);
                 if now.duration_since(at) >= Duration::from_millis(200) {
                     break;
@@ -208,20 +251,35 @@ async fn drive<IO>(
             }
             continue;
         }
-        if active.get() > 0 {
-            idle_since = None;
-        } else if idle_since.is_none() {
-            idle_since = Some(now);
-        }
         // keepalive_timeout bounds a connection without streams (0: closed
         // after its streams), as nginx (http2_idle_timeout is obsolete); a
         // shutdown or reload sends GOAWAY and lets the open streams finish.
-        let idle_expired = idle_since.is_some_and(|since| {
-            (!keepalive.allow && requests > 0) || now.duration_since(since) >= idle
-        });
+        let idle_expired = streams.active.get() == 0
+            && ((!keepalive.allow && requests > 0) || now.duration_since(idle_since) >= idle);
         if ctx.state.is_shutting_down() || idle_expired {
             conn.graceful_shutdown();
             going_away = true;
+        }
+    }
+}
+
+/// A connection's streams in progress, shared with their tasks.
+#[derive(Default)]
+struct Streams {
+    active: Cell<usize>,
+    /// When the last one ended, until the loop looks.
+    ended_at: Cell<Option<monoio::time::Instant>>,
+    waker: Cell<Option<std::task::Waker>>,
+}
+
+impl Streams {
+    fn end(&self) {
+        self.active.set(self.active.get() - 1);
+        if self.active.get() == 0 {
+            self.ended_at.set(Some(monoio::time::Instant::now()));
+            if let Some(waker) = self.waker.take() {
+                waker.wake();
+            }
         }
     }
 }
