@@ -142,12 +142,12 @@ http {
 
         location = /error {
             error_page 404 =200 @named_404;
-            return 404 "first";
+            return 404;
         }
 
         location = /error-preserve {
             error_page 404 @named_404;
-            return 404 "first";
+            return 404;
         }
 
         location @fallback {

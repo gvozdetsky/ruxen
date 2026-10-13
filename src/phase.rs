@@ -904,7 +904,7 @@ fn process_with_meta_inner(
         // the `return` and does run access control.
         meta.remote_user = None;
         let answered_in_rewrite_phase =
-            !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
+            !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(..));
         // The realip module's pre-access handler, with the location's
         // settings, unless the post-read one already set the address.
         if !answered_in_rewrite_phase
@@ -1662,7 +1662,7 @@ pub(crate) fn first_body_limit(
         body_temp: loc.body_temp,
         discard: !http.uses_request_body
             && !http.uses_request_body_file
-            && matches!(loc.handler, crate::worker::PreparedHandler::Return(_))
+            && matches!(loc.handler, crate::worker::PreparedHandler::Return(..))
             && loc.rewrite_program.is_empty()
             && loc.error_pages.is_empty()
             && loc.post_action.is_none()

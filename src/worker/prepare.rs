@@ -2554,7 +2554,8 @@ pub(crate) fn build_handler(
 ) -> Result<PreparedHandler, String> {
     Ok(match handler {
         Handler::Return { status, body } => {
-            PreparedHandler::Return(prepare_return(status, body, tokens))
+            let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
+            PreparedHandler::Return(prepare_return(status, body, tokens), finalized)
         }
         Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(

@@ -1046,10 +1046,10 @@ pub(crate) fn run_location_handler(
         }));
     }
     let inner = match loc.handler {
-        PreparedHandler::Return(PreparedReturn::Static(response)) => {
+        PreparedHandler::Return(PreparedReturn::Static(response), _) => {
             Response::Prebuilt(response.pick(req.method))
         }
-        PreparedHandler::Return(PreparedReturn::Template { status, parts }) => Response::Owned(
+        PreparedHandler::Return(PreparedReturn::Template { status, parts }, _) => Response::Owned(
             build_templated_return(*status, parts, &render_ctx_base, req.method, server_bytes),
         ),
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
@@ -1291,15 +1291,19 @@ pub(crate) fn run_location_handler(
             }
         }
     };
-    let intercepted = maybe_intercept_error_page(
-        inner,
-        loc.error_pages,
-        req,
-        &render_ctx_base,
-        in_error_page,
-        loc.recursive_error_pages,
-        server_bytes,
-    );
+    let intercepted = if matches!(loc.handler, PreparedHandler::Return(_, false)) {
+        inner
+    } else {
+        maybe_intercept_error_page(
+            inner,
+            loc.error_pages,
+            req,
+            &render_ctx_base,
+            in_error_page,
+            loc.recursive_error_pages,
+            server_bytes,
+        )
+    };
     let trailers_allowed =
         req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
     finalize_location_response(

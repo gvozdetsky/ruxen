@@ -553,7 +553,10 @@ pub struct PreparedErrorPage {
 }
 
 pub enum PreparedHandler {
-    Return(PreparedReturn),
+    /// The `return`, and whether `error_page` can take its response: not
+    /// for one with text (other than a redirect URL), which nginx's
+    /// `ngx_http_script_return_code` sends as it is (#372).
+    Return(PreparedReturn, bool),
     Root(PreparedRoot),
     Proxy(PreparedProxy),
     /// `stub_status` (#96).
