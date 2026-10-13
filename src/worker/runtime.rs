@@ -161,6 +161,19 @@ pub(crate) async fn write_access_logs(
         }
         line.push(b'\n');
 
+        // A path with variables: render, open, write, close (#303).
+        if let Some(path) = log.path_vars {
+            let error_logs = meta.map_or(&[][..], |m| m.log.error_logs);
+            write_access_line_by_path(path, meta.and_then(|m| m.doc_root), error_logs, &ctx, line)
+                .await;
+            continue;
+        }
+        // `buffer=`: into this worker's buffer for the file (#151).
+        if let Some(buffer) = log.buffer {
+            write_buffered_access_line(http, &files, log, buffer, &line).await;
+            continue;
+        }
+
         // `write_at(_, 0)` is safe because the fd was opened with
         // `O_APPEND`: on Linux, pwrite ignores the offset for O_APPEND fds
         // and performs an atomic append under the inode lock (see
@@ -173,6 +186,109 @@ pub(crate) async fn write_access_logs(
             continue;
         };
         let (res, _buf) = file.write_all_at(line, 0).await;
+        if let Err(e) = res {
+            eprintln!(
+                "ruxen: access_log write to {} failed: {e}",
+                log.path.display()
+            );
+        }
+    }
+}
+
+/// An access_log line for a path with variables, as nginx's
+/// ngx_http_log_script_write: only when the location's root exists (so a
+/// bogus `Host` can't make files), then to the rendered path, opened for
+/// this line and closed after it.
+#[cold]
+#[inline(never)]
+async fn write_access_line_by_path(
+    path: &'static [PreparedValuePart],
+    doc_root: Option<&'static DocRoot>,
+    error_logs: &'static [PreparedErrorLog],
+    ctx: &RenderCtx<'_>,
+    line: Vec<u8>,
+) {
+    if let Some(root) = doc_root
+        && let Err(e) = std::fs::metadata(root.path)
+    {
+        write_worker_log(
+            error_logs,
+            ErrorLogLevel::Error,
+            &format!(
+                "testing \"{}\" existence failed ({}) while logging request",
+                root.path.display(),
+                errno_text(&e)
+            ),
+        );
+        return;
+    }
+    let mut rendered = Vec::with_capacity(64);
+    render_parts(path, ctx, &mut rendered);
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&rendered));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(AsyncFile::from_std);
+    let file = match file {
+        Ok(file) => file,
+        Err(e) => {
+            write_worker_log(
+                error_logs,
+                ErrorLogLevel::Error,
+                &format!(
+                    "open() \"{}\" failed ({}) while logging request",
+                    path.display(),
+                    errno_text(&e)
+                ),
+            );
+            return;
+        }
+    };
+    let (res, _) = file.write_all_at(line, 0).await;
+    if let Err(e) = res {
+        eprintln!("ruxen: access_log write to {} failed: {e}", path.display());
+    }
+}
+
+/// A line for a buffered access_log: into the buffer, and whatever has to
+/// go out now (a full buffer, a line larger than it). Cold: buffered logs
+/// write rarely.
+#[cold]
+#[inline(never)]
+async fn write_buffered_access_line(
+    http: &'static PreparedHttp,
+    files: &[AccessLogSink],
+    log: &PreparedAccessLog,
+    buffer: &'static PreparedLogBuffer,
+    line: &[u8],
+) {
+    let appended = super::logbuf::append(buffer, log.file_index, line);
+    if appended.arm_timer
+        && let Some(ms) = buffer.flush_ms
+    {
+        monoio::spawn(async move {
+            monoio::time::sleep(Duration::from_millis(ms)).await;
+            if let Some((file_index, data)) = super::logbuf::take_for_timer(buffer)
+                && let Some(files) = access_log_files(http.access_logs)
+                && let Some(AccessLogSink::File(file)) = files.get(file_index)
+            {
+                let (res, _) = file.write_all_at(data, 0).await;
+                if let Err(e) = res {
+                    eprintln!(
+                        "ruxen: access_log write to {} failed: {e}",
+                        buffer.path.display()
+                    );
+                }
+            }
+        });
+    }
+    let Some(AccessLogSink::File(file)) = files.get(log.file_index) else {
+        return;
+    };
+    for data in appended.write {
+        let (res, _) = file.write_all_at(data, 0).await;
         if let Err(e) = res {
             eprintln!(
                 "ruxen: access_log write to {} failed: {e}",
@@ -1141,6 +1257,7 @@ pub fn run(
                     while worker_clients() != 0 {
                         monoio::time::sleep(Duration::from_millis(10)).await;
                     }
+                    flush_access_log_buffers();
                     return;
                 }
                 match accept_or_tick(&listener, &mut tick, state).await {
@@ -1181,6 +1298,7 @@ pub fn run(
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
                 if state.is_shutting_down() && worker_clients() == 0 {
+                    flush_access_log_buffers();
                     return;
                 }
                 monoio::time::sleep(Duration::from_millis(10)).await;

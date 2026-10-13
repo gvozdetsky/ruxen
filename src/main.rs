@@ -443,6 +443,9 @@ fn real_main() -> Result<(), Failure> {
                 // were unlinked at creation), so the private directory is
                 // empty unless `client_body_in_file_only on` kept some.
                 http.body_temp.remove_private_if_empty();
+                // Buffered access_log lines (#151): nginx's workers write
+                // them on their way out.
+                worker::logbuf::flush_at_exit();
                 worker::remove_unix_sockets(http);
                 std::process::exit(0);
             }

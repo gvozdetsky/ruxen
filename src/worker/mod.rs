@@ -53,6 +53,7 @@ pub(crate) mod gzip;
 mod handler;
 pub(crate) mod limit_req;
 mod log;
+pub(crate) mod logbuf;
 mod panics;
 mod prepare;
 mod prepared;
@@ -127,11 +128,17 @@ thread_local! {
 pub(crate) enum AccessLogSink {
     File(AsyncFile),
     Syslog(crate::syslog::SyslogSocket),
+    /// A path with variables: opened per line (#303).
+    PerLine,
 }
 
 fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AccessLogSink]>, String> {
     let mut opened: Vec<AccessLogSink> = Vec::with_capacity(logs.len());
     for log in logs {
+        if log.path_vars.is_some() {
+            opened.push(AccessLogSink::PerLine);
+            continue;
+        }
         if let Some(peer) = log.syslog {
             let sock = crate::syslog::SyslogSocket::open(peer).map_err(|e| {
                 format!(
@@ -183,6 +190,10 @@ pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc
         let mut cell = cell.borrow_mut();
         if cell.1.is_some() && cell.0 != generation {
             cell.0 = generation;
+            // The buffered lines belong to the files being rotated away.
+            if let Some(old) = &cell.1 {
+                logbuf::flush_all(old);
+            }
             match open_access_logs(logs) {
                 Ok(files) => cell.1 = Some(files),
                 // nginx keeps writing to the old file when a reopen fails.
@@ -191,6 +202,15 @@ pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc
         }
         cell.1.clone()
     })
+}
+
+/// The worker is stopping: write its access_log buffers out.
+pub(crate) fn flush_access_log_buffers() {
+    ACCESS_LOG_FILES.with(|cell| {
+        if let Some(files) = &cell.borrow().1 {
+            logbuf::flush_all(files);
+        }
+    });
 }
 
 /// Machine hostname, resolved once at startup for `$hostname` expansion.

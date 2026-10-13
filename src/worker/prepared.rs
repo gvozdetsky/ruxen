@@ -391,6 +391,23 @@ pub struct PreparedAccessLog {
     pub file_index: usize,
     /// `access_log syslog:…`: lines go to this peer, not to `path`.
     pub syslog: Option<&'static PreparedSyslogPeer>,
+    /// `buffer=` / `flush=` / `gzip`: lines collect in a per-worker buffer
+    /// for this file (#151).
+    pub buffer: Option<&'static PreparedLogBuffer>,
+    /// The path has variables: rendered, opened and closed per line (#303).
+    pub path_vars: Option<&'static [PreparedValuePart]>,
+}
+
+/// A buffered access_log file, shared by every `access_log` with buffer
+/// parameters for the same path, as nginx attaches the buffer to the file.
+#[derive(Debug)]
+pub struct PreparedLogBuffer {
+    /// Index into the worker's buffers.
+    pub slot: usize,
+    pub size: usize,
+    pub flush_ms: Option<u64>,
+    pub gzip: Option<u32>,
+    pub path: &'static Path,
 }
 
 /// A prepared `syslog:` peer (see `crate::syslog`).
