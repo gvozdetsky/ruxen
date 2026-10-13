@@ -25,39 +25,48 @@ impl Drop for Server {
 }
 
 /// A backend answering with the request line and the Host header.
+/// Answers with the request line and `Host`. It listens on `[::1]` too,
+/// with the same port: `localhost` resolves to `::1` first on some
+/// systems (GitHub's runners), and ruxen takes the first address.
 fn backend() -> u16 {
-    let listener = {
+    let (listener, v6) = {
         let _setup = common::ports::setup_lock();
-        TcpListener::bind("127.0.0.1:0").unwrap()
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, TcpListener::bind(("::1", port)).ok())
     };
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for conn in listener.incoming().flatten() {
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(conn.try_clone().unwrap());
-                let mut conn = conn;
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).unwrap();
-                let mut host = String::from("-");
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    if let Some(v) = line.strip_prefix("Host: ") {
-                        host = v.trim_end().to_string();
-                    }
-                }
-                let body = format!("{} | {host}", request_line.trim_end());
-                let _ = write!(
-                    conn,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            });
-        }
-    });
+    for listener in std::iter::once(listener).chain(v6) {
+        std::thread::spawn(move || serve(listener));
+    }
     port
+}
+
+fn serve(listener: TcpListener) {
+    for conn in listener.incoming().flatten() {
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut conn = conn;
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut host = String::from("-");
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.strip_prefix("Host: ") {
+                    host = v.trim_end().to_string();
+                }
+            }
+            let body = format!("{} | {host}", request_line.trim_end());
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+    }
 }
 
 fn start(conf: impl FnOnce(&str, u16) -> String) -> (Server, u16) {
