@@ -177,7 +177,9 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
         });
     }
     let key = parse_value_without_captures(&args[0])?;
-    reject_sent_http_parts(&key, "map key ($sent_http_* unavailable)")?;
+    // `$sent_http_*` is allowed, as in nginx: a map is evaluated when its
+    // variable is first read, and read from `add_header` or `expires` it
+    // sees the response's headers (`map $sent_http_content_type $expires`).
     let variable = parse_rewrite_variable_name(&args[1], "map variable")?;
 
     let mut exact: Vec<MapExactEntry> = Vec::new();
@@ -221,7 +223,6 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
         }
         let (lhs, rhs) = (&line_args[0], &line_args[1]);
         let value = parse_value_without_captures(rhs)?;
-        reject_sent_http_parts(&value, "map value ($sent_http_* unavailable)")?;
 
         if lhs == "default" {
             if default.is_some() {

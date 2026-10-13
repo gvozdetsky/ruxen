@@ -604,6 +604,7 @@ dependencies = [
 name = "ruxen"
 version = "0.1.2"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "flate2",
  "libc",

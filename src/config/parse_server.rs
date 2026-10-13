@@ -25,6 +25,7 @@ pub(crate) fn parse_server_block(
     let mut ssl_ciphers: Option<String> = None;
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
+    let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
@@ -100,6 +101,7 @@ pub(crate) fn parse_server_block(
                         ciphers: ssl_ciphers,
                         prefer_server_ciphers: ssl_prefer_server_ciphers,
                         session_timeout_ms: ssl_session_timeout_ms,
+                        reject_handshake: ssl_reject_handshake,
                         resumption,
                     };
                     let mut listens_iter = listens.into_iter();
@@ -257,6 +259,13 @@ pub(crate) fn parse_server_block(
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
                 ssl_session_timeout_ms = Some(ssl_session_timeout_ms_arg(v)?);
             }
+            ("ssl_reject_handshake", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                if ssl_reject_handshake.is_some() {
+                    return Err(Error::Duplicate("ssl_reject_handshake"));
+                }
+                ssl_reject_handshake = Some(parse_on_off_args(&args[1..], "ssl_reject_handshake")?);
+            }
             // SSL directives we accept-and-ignore at server scope. Matched
             // here (rather than via the global IGNORED_STMT allowlist) so
             // that `saw_any_ssl_directive`
@@ -267,9 +276,15 @@ pub(crate) fn parse_server_block(
                 saw_any_ssl_directive = true;
                 resumption.parse(name, &args)?;
             }
+            ("ssl_session_ticket_key", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_session_ticket_key"));
+                };
+                resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
+            }
             (
-                "ssl_session_ticket_key"
-                | "ssl_buffer_size"
+                "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"
                 | "ssl_stapling"
@@ -283,7 +298,6 @@ pub(crate) fn parse_server_block(
                 | "ssl_crl"
                 | "ssl_password_file"
                 | "ssl_early_data"
-                | "ssl_reject_handshake"
                 | "ssl_conf_command",
                 Terminator::Semi,
             ) => {
@@ -858,6 +872,9 @@ pub(crate) fn parse_listen(s: &str) -> Result<SocketAddr, Error> {
 /// `ngx_parse_inet_url`. A single port is one listen.
 pub(crate) fn parse_listen_range_args(args: &[String]) -> Result<Vec<Listen>, Error> {
     let addr_s = args.first().ok_or(Error::MissingArg("listen"))?;
+    if addr_s.starts_with("unix:") {
+        return Ok(vec![parse_listen_args(args)?]);
+    }
     let bad = || Error::BadValue {
         what: "listen address",
         got: addr_s.to_string(),
@@ -892,7 +909,21 @@ pub(crate) fn parse_listen_range_args(args: &[String]) -> Result<Vec<Listen>, Er
 /// significant. nginx's parser is permissive in the same way.
 pub(crate) fn parse_listen_args(args: &[String]) -> Result<Listen, Error> {
     let addr_s = args.first().ok_or(Error::MissingArg("listen"))?;
-    let mut listen = Listen::from_addr(parse_listen(addr_s)?);
+    let mut listen = match addr_s.strip_prefix("unix:") {
+        // ngx_parse_unix_domain_url: a path that fits `sun_path`.
+        Some(path) => {
+            if path.is_empty() || path.len() + 1 > 108 {
+                return Err(Error::BadValue {
+                    what: "listen address",
+                    got: addr_s.clone(),
+                });
+            }
+            let mut listen = Listen::from_addr(SocketAddr::from(([0, 0, 0, 0], 0)));
+            listen.unix = Some(PathBuf::from(path));
+            listen
+        }
+        None => Listen::from_addr(parse_listen(addr_s)?),
+    };
     for raw in &args[1..] {
         let (name, value) = match raw.split_once('=') {
             Some((n, v)) => (n, Some(v)),
