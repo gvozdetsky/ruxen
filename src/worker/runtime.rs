@@ -556,7 +556,9 @@ async fn settle_proxy_response(
         states: report.states,
         headers: report.upstream_headers,
     };
-    Box::pin(settle_redirected(
+    // The counts limit_conn took stay held through the redirect (#95).
+    let held = process_meta.limit_conn_held.clone();
+    let (response, mut meta) = Box::pin(settle_redirected(
         http,
         ctx,
         url_scratch,
@@ -566,7 +568,11 @@ async fn settle_proxy_response(
         as_get,
         limit_rate,
     ))
-    .await
+    .await;
+    if meta.limit_conn_held.is_none() {
+        meta.limit_conn_held = held;
+    }
+    (response, meta)
 }
 
 /// `intercept_proxy_error` with this pass's attempts and upstream headers

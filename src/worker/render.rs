@@ -342,6 +342,11 @@ impl RenderCtx<'_> {
             Variable::SslClientVEnd => {}
             Variable::SslClientVRemain => {}
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            Variable::LimitConnStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_conn::status::text(state.limit_conn_status));
+                }
+            }
             Variable::LimitReqStatus => {
                 if let Some(state) = self.rewrite_state {
                     out.extend_from_slice(super::limit_req::status::text(state.limit_req_status));
@@ -1013,6 +1018,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::RemoteUser
             | Variable::RequestBody
             | Variable::LimitReqStatus
+            | Variable::LimitConnStatus
             | Variable::RequestBodyFile
             | Variable::ProxyHost
             | Variable::ProxyPort

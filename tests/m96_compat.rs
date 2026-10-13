@@ -34,7 +34,7 @@ fn m96_compat_lists_everything_with_positions() {
         format!(
             "events {{}}\nhttp {{\n    ssi on;\n    tcp_nopush on;\n    include {};\n    \
              include {}/conf.d/*.conf;\n    server {{\n        listen 127.0.0.1:1;\n        \
-             limit_conn one 10;\n    }}\n}}\n",
+             secure_link $arg_s;\n    }}\n}}\n",
             d.join("site.conf").display(),
             d.display()
         ),
@@ -53,7 +53,7 @@ fn m96_compat_lists_everything_with_positions() {
             "{c}:6: unsupported: include {}/conf.d/*.conf — wildcards in include",
             d.display()
         ),
-        format!("{c}:9: unsupported: limit_conn one 10 — unknown directive in a server block"),
+        format!("{c}:9: unsupported: secure_link $arg_s — unknown directive in a server block"),
         format!("{c}:3: differs: ssi on — server-side includes are not processed"),
         "ignored: 1 tuning directive with no effect in ruxen: tcp_nopush".to_string(),
         "ruxen does not start with this configuration: 3 unsupported, 1 behaving differently"

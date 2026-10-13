@@ -246,6 +246,9 @@ pub struct ProcessMeta {
     /// `limit_req` holds the request this long before its content handler
     /// (#94).
     pub limit_req_delay_ms: u64,
+    /// The counts `limit_conn` took for this request, given back when the
+    /// last copy of the meta goes, after the response is written (#95).
+    pub limit_conn_held: Option<std::rc::Rc<crate::worker::limit_conn::Held>>,
     /// The location's root, which an access_log path with variables
     /// checks before it writes (#303).
     pub doc_root: Option<&'static crate::worker::DocRoot>,
@@ -329,6 +332,7 @@ impl Default for ProcessMeta {
             server_port: 0,
             access_logs: &[],
             limit_req_delay_ms: 0,
+            limit_conn_held: None,
             doc_root: None,
             timeouts: None,
             remote_user: None,
@@ -933,6 +937,30 @@ fn process_with_meta_inner(
                 meta.limit_req_delay_ms = delay_ms;
                 return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
             }
+        }
+        // limit_conn's handler, after limit_req's as nginx runs them (#95),
+        // once per request.
+        if !answered_in_rewrite_phase
+            && denied.is_none()
+            && let Some(lc) = loc.limit_conn
+            && rewrite_state.limit_conn_status == 0
+            && !in_error_page
+        {
+            let (rejected, held) = crate::worker::limit_conn::run(
+                http,
+                server,
+                req,
+                url_scratch,
+                current_args.as_deref(),
+                &mut rewrite_state,
+                regex_captures.as_ref(),
+                lc,
+                &meta.log,
+                meta.server_name,
+                loc.server_header,
+            );
+            meta.limit_conn_held = Some(std::rc::Rc::new(held));
+            denied = rejected;
         }
         if !answered_in_rewrite_phase && denied.is_none() {
             match run_access_control(http, req, loc.access, loc.server_header, &meta) {
