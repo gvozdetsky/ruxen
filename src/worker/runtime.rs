@@ -629,6 +629,7 @@ fn finish_proxy_response(
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
     process_meta.upstream_cache_status = report.cache_status;
+    process_meta.keep_upstream_date = report.passes_date;
     // A relayed body (#88): the head is filtered as an `Owned` response
     // with no body, then goes back with the upstream connection.
     let (upstream_resp, relayed) = match upstream_resp {
@@ -3547,7 +3548,9 @@ pub(crate) async fn handle<S: ConnIo>(
                             Some(bytes) => cached_scan_response_headers(bytes),
                             None => {
                                 let mut scan = scan_response_headers(&scratch).unwrap_or_default();
-                                stamp_date(&mut *scratch, &mut scan);
+                                if !process_meta.keep_upstream_date {
+                                    stamp_date(&mut *scratch, &mut scan);
+                                }
                                 scan
                             }
                         };

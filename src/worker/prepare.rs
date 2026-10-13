@@ -1061,6 +1061,8 @@ fn prepare_response_rules(
         ignore_accel_redirect,
         ignore_accel_limit_rate,
         hide: Box::leak(hide.into_boxed_slice()),
+        passes_date: crate::proxy::default_hidden_bit(b"date")
+            .is_some_and(|bit| pass_mask & bit != 0),
         pass_mask,
     }))
 }

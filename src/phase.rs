@@ -295,6 +295,10 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// A proxied response under `proxy_pass_header Date`: its `Date` is
+    /// the upstream's, or there is none, and the worker doesn't stamp one
+    /// (#360).
+    pub keep_upstream_date: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// `limit_rate` / `limit_rate_after` for this response. Boxed: `None`
@@ -348,6 +352,7 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            keep_upstream_date: false,
             gzip: None,
             limit_rate: None,
             post_action: None,

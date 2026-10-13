@@ -572,6 +572,9 @@ pub struct ProxyResponseRules {
     /// Default-hidden headers let through by `proxy_pass_header`, as
     /// `proxy::default_hidden_bit` bits.
     pub pass_mask: u16,
+    /// `proxy_pass_header Date`: the upstream's `Date` goes out as it is,
+    /// and none when it sent none (#360).
+    pub passes_date: bool,
     /// The location's `error_page` list, for a 502/504 the proxy itself
     /// produces (nginx applies it without `proxy_intercept_errors`).
     pub error_pages: &'static [PreparedErrorPage],
