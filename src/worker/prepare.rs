@@ -58,6 +58,8 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         uses_request_body_file,
+        uses_stderr_log,
+        uses_stats,
         runtime,
         error_logs: http_error_logs,
         log_formats,
@@ -255,6 +257,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         error_logs: main_error_logs,
         max_request_body,
         uses_request_body_file,
+        uses_stderr_log,
+        stats: uses_stats,
         body_temp: BodyTempDir::new(client_body_temp_path),
         listens,
         access_logs: canonical_access_logs,
@@ -399,11 +403,30 @@ pub(crate) fn build_listen_tls(
     }
 
     resolver.set_default(default_keys);
+    // `ssl_session_ticket_key` files: 48 or 80 bytes each
+    // (ngx_ssl_session_ticket_keys).
+    let ticket_keys = match &default.ssl.resumption.ticket_keys {
+        Some(paths) => {
+            let mut keys = Vec::with_capacity(paths.len());
+            for path in paths {
+                let buf = std::fs::read(path).map_err(|e| {
+                    format!("open() \"{}\" failed ({})", path.display(), errno_text(&e))
+                })?;
+                keys.push(
+                    crate::tls_ticket::TicketKey::from_file_bytes(&buf)
+                        .ok_or_else(|| format!("\"{}\" must be 48 or 80 bytes", path.display()))?,
+                );
+            }
+            Some(keys)
+        }
+        None => None,
+    };
     let cfg = crate::tls_certs::build_server_config(
         resolver,
         protocols,
         session_timeout_secs,
-        default.ssl.resumption,
+        default.ssl.resumption.clone(),
+        ticket_keys,
     )
     .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
     Ok(Some(Arc::new(crate::tls::acceptor_from_config(cfg))))
@@ -577,6 +600,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                bind: eff.bind,
             }
         }
         ProxyPass::UpstreamRef {
@@ -611,6 +635,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                bind: eff.bind,
             }
         }
     })
@@ -757,6 +782,7 @@ pub(crate) struct ServerProxyDefaults {
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    pub bind: Option<&'static PreparedBind>,
 }
 
 /// `proxy_ignore_headers` as set at one scope: whether it lists `field`
@@ -812,8 +838,26 @@ impl ServerProxyDefaults {
             redirect: conf.redirect.map(|r| &*Box::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
+            bind: conf.bind.and_then(prepare_bind),
         }
     }
+}
+
+/// `proxy_bind`, `None` for `off`. A literal address was checked by the
+/// parser.
+fn prepare_bind(bind: crate::config::ProxyBind) -> Option<&'static PreparedBind> {
+    let crate::config::ProxyBind::Addr { value, transparent } = bind else {
+        return None;
+    };
+    let addr = match value.as_slice() {
+        [ValuePart::Literal(text)] => crate::config::parse_bind_addr(text),
+        _ => None,
+    };
+    Some(Box::leak(Box::new(PreparedBind {
+        addr,
+        value: prepare_value_parts(value),
+        transparent,
+    })))
 }
 
 pub(crate) fn prepare_proxy_set_headers(
@@ -885,6 +929,10 @@ pub(crate) fn resolve_proxy_effective(
         },
         hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
+        bind: match location.bind {
+            Some(bind) => prepare_bind(bind),
+            None => server_defaults.bind,
+        },
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
@@ -1629,6 +1677,7 @@ fn request_constant(parts: &[ValuePart]) -> bool {
             Variable::RequestUri
                 | Variable::Host
                 | Variable::Scheme
+                | Variable::Https
                 | Variable::Http(_)
                 | Variable::Cookie(_)
                 | Variable::ContentLength
@@ -1680,9 +1729,11 @@ fn prepare_syslog_peer(
             PreparedErrorLogSyslogServer::Udp(Box::leak(addr.clone().into_boxed_str()))
         }
     };
+    // nginx's default tag is `nginx`; ruxen's own name, unless it presents
+    // itself as nginx (RUXEN_NGINX_IDENTITY, as for `Server:`).
     let tag: &'static [u8] = match &peer.tag {
         Some(tag) => Box::leak(tag.clone().into_bytes().into_boxed_slice()),
-        None => b"ruxen",
+        None => crate::http::identity().plain,
     };
     Ok(Box::leak(Box::new(PreparedSyslogPeer {
         server,
@@ -2015,7 +2066,7 @@ fn resolve_access(
 /// the static handler, or with the location's `proxy_pass`.
 fn limit_except_rebuilds_handler(handler: &Handler, try_files: &Option<TryFiles>) -> bool {
     match handler {
-        Handler::Proxy(_) => false,
+        Handler::Proxy(_) | Handler::StubStatus => false,
         Handler::Root { .. } => try_files.is_some(),
         Handler::Return { .. } => true,
     }
@@ -2069,6 +2120,7 @@ pub(crate) fn build_handler(
         Handler::Return { status, body } => {
             PreparedHandler::Return(prepare_return(status, body, tokens))
         }
+        Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
             pp,
             upstreams,

@@ -211,6 +211,18 @@ impl RenderCtx<'_> {
             Variable::ServerProtocol => out.extend_from_slice(server_protocol(self.request_line)),
             Variable::Host => out.extend_from_slice(self.host),
             Variable::RemoteAddr => out.extend_from_slice(self.remote_addr),
+            // ngx_http_variable_binary_remote_addr: the address bytes; a
+            // unix-domain peer gives its text (`unix:`).
+            Variable::BinaryRemoteAddr => {
+                match std::str::from_utf8(self.remote_addr)
+                    .ok()
+                    .and_then(|a| a.parse::<std::net::IpAddr>().ok())
+                {
+                    Some(std::net::IpAddr::V4(ip)) => out.extend_from_slice(&ip.octets()),
+                    Some(std::net::IpAddr::V6(ip)) => out.extend_from_slice(&ip.octets()),
+                    None => out.extend_from_slice(self.remote_addr),
+                }
+            }
             // Empty when the realip module took an address without a port.
             Variable::RemotePort if self.remote_port == 0 => {}
             Variable::RemotePort => write_u16_decimal(out, self.remote_port),
@@ -252,6 +264,11 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::Scheme => out.extend_from_slice(self.scheme),
+            Variable::Https => {
+                if self.tls.is_some() {
+                    out.extend_from_slice(b"on");
+                }
+            }
             Variable::SslProtocol => {
                 if let Some(info) = self.tls
                     && let Some(v) = info.protocol_version
@@ -325,6 +342,16 @@ impl RenderCtx<'_> {
             Variable::SslClientVEnd => {}
             Variable::SslClientVRemain => {}
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            Variable::Connections(gauge) => {
+                let t = super::stats::totals();
+                let n = match gauge {
+                    crate::config::ConnectionsGauge::Active => t.active,
+                    crate::config::ConnectionsGauge::Reading => t.reading,
+                    crate::config::ConnectionsGauge::Writing => t.writing,
+                    crate::config::ConnectionsGauge::Waiting => t.waiting,
+                };
+                write_u64_decimal(out, n);
+            }
             Variable::RequestBody => {
                 // nginx leaves `$request_body` empty whenever the body was
                 // spilled to disk — readers consult `$request_body_file`

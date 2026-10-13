@@ -248,6 +248,8 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut http = http.ok_or(Error::UnexpectedEof)?;
     http.warnings.extend(lx.take_warnings());
     http.uses_request_body_file = values::request_body_file_used();
+    http.uses_stderr_log = values::stderr_log_used();
+    http.uses_stats = values::stats_used();
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -356,7 +358,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ssl.prefer_server_ciphers =
                             ssl.prefer_server_ciphers.or(ssl_prefer_server_ciphers);
                         ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
-                        ssl.resumption = ssl.resumption.inherit(resumption);
+                        ssl.resumption = std::mem::take(&mut ssl.resumption).inherit(&resumption);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -378,6 +380,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         client_body_buffer_size,
                         // Set once the whole config is read.
                         uses_request_body_file: false,
+                        uses_stderr_log: false,
+                        uses_stats: false,
                         client_body_temp_path,
                         sendfile,
                         disable_symlinks,
@@ -580,9 +584,14 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
                 resumption.parse(name, &args)?;
             }
+            ("ssl_session_ticket_key", Terminator::Semi) => {
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_session_ticket_key"));
+                };
+                resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
+            }
             (
-                "ssl_session_ticket_key"
-                | "ssl_buffer_size"
+                "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"
                 | "ssl_stapling"
@@ -944,7 +953,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_cookie_path",
     "proxy_cookie_flags",
     "proxy_socket_keepalive",
-    "proxy_bind",
     "proxy_store",
     "proxy_store_access",
     // File I/O knobs (we use std::fs; these are nginx-only tuning)
@@ -2113,13 +2121,39 @@ mod tests {
             cfg.servers[0].ssl.resumption,
             SessionResumption {
                 cache: Some(true),
-                tickets: Some(false)
+                shared: true,
+                tickets: Some(false),
+                ticket_keys: None,
             }
         );
         assert_eq!(cfg.servers[1].ssl.resumption.cache, Some(false));
         assert_eq!(cfg.servers[1].ssl.resumption.tickets, Some(false));
         assert!(parse("http { ssl_session_cache bogus; }").is_err());
         assert!(parse("http { ssl_session_tickets maybe; }").is_err());
+    }
+
+    #[test]
+    fn ssl_session_ticket_keys_parse_and_inherit() {
+        let cfg = parse(
+            "http { ssl_session_ticket_key /k/a.key; ssl_session_ticket_key /k/b.key;
+                    ssl_session_cache builtin;
+                    server { listen 443 ssl; ssl_certificate c; ssl_certificate_key k; }
+                    server { listen 444 ssl; ssl_certificate c; ssl_certificate_key k;
+                             ssl_session_ticket_key /k/c.key;
+                             ssl_session_cache shared:SSL:1m; } }",
+        )
+        .unwrap();
+        let first = &cfg.servers[0].ssl.resumption;
+        assert_eq!(
+            first.ticket_keys,
+            Some(vec![PathBuf::from("/k/a.key"), PathBuf::from("/k/b.key")])
+        );
+        assert!(!first.shared);
+        // A server's own lines replace the inherited list.
+        let second = &cfg.servers[1].ssl.resumption;
+        assert_eq!(second.ticket_keys, Some(vec![PathBuf::from("/k/c.key")]));
+        assert!(second.shared);
+        assert!(parse("http { ssl_session_ticket_key; }").is_err());
     }
 
     #[test]

@@ -345,6 +345,7 @@ pub(crate) fn parse_location_block(
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
+    let mut stub_status = false;
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
@@ -374,6 +375,8 @@ pub(crate) fn parse_location_block(
                         .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
                     let handler = if let Some((status, body)) = ret {
                         Handler::Return { status, body }
+                    } else if stub_status {
+                        Handler::StubStatus
                     } else if let Some(pp) = proxy_pass {
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
@@ -729,6 +732,12 @@ pub(crate) fn parse_location_block(
             // Location settings in nginx; `client_header_timeout` is not.
             (name @ ("client_body_timeout" | "send_timeout"), Terminator::Semi) => {
                 client_timeouts.parse(name, &args)?;
+            }
+            // An optional argument is ignored, as nginx does for old
+            // configurations (`stub_status on;`).
+            ("stub_status", Terminator::Semi) if args.len() <= 2 => {
+                stub_status = true;
+                crate::config::values::note_stats_used();
             }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {
