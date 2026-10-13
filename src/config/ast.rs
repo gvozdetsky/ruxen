@@ -1889,8 +1889,11 @@ pub enum Variable {
     /// `$proxy_protocol_tlv_<name>`: a TLV of the connection's PROXY
     /// protocol v2 header.
     ProxyProtocolTlv(ProxyProtocolTlv),
-    /// `$server_protocol` — `HTTP/1.0` or `HTTP/1.1` from the request line.
+    /// `$server_protocol` — `HTTP/1.0` or `HTTP/1.1` from the request line
+    /// (`HTTP/2.0` on an HTTP/2 stream).
     ServerProtocol,
+    /// `$http2`: `h2` for HTTP/2 over TLS, `h2c` over plain TCP, else empty.
+    Http2,
     /// Unrecognized `$name`. Renders empty at runtime, matching nginx's
     /// lenient lookup: unknown variables don't fail the config.
     Unknown(String),

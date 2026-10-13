@@ -41,13 +41,27 @@ const WRITE_BUF_KEEP: usize = 32 * 1024;
 #[derive(Clone)]
 pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
+    /// `config` without `h2` in ALPN, for the servers of an address that
+    /// have HTTP/2 off when others have it on (#144).
+    without_h2: Option<Arc<ServerConfig>>,
     session_ids: bool,
+}
+
+/// What `accept_choosing` does after the ClientHello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// `ssl_reject_handshake`: an `unrecognized_name` alert.
+    Reject,
+    Accept,
+    /// Accept, without offering HTTP/2 through ALPN.
+    AcceptWithoutH2,
 }
 
 impl From<Arc<ServerConfig>> for TlsAcceptor {
     fn from(config: Arc<ServerConfig>) -> Self {
         Self {
             config,
+            without_h2: None,
             session_ids: false,
         }
     }
@@ -59,6 +73,15 @@ impl TlsAcceptor {
     /// ID nor the TLS 1.3 ticket, so a full handshake draws 32 random bytes
     /// and stores them in the session as its resumption data (see
     /// `TlsStream::session_id`).
+    /// Keep `config` without `h2` in its ALPN list too, for
+    /// `Choice::AcceptWithoutH2`.
+    pub fn with_choice_of_h2(mut self) -> Self {
+        let mut config = (*self.config).clone();
+        config.alpn_protocols.retain(|p| p != b"h2");
+        self.without_h2 = Some(Arc::new(config));
+        self
+    }
+
     pub fn with_session_ids(mut self) -> Self {
         self.session_ids =
             self.config.session_storage.can_cache() || self.config.ticketer.enabled();
@@ -75,15 +98,16 @@ impl TlsAcceptor {
         self.handshake_with(io, conn).await
     }
 
-    /// `accept`, but the ClientHello is read first and `reject` sees its
-    /// SNI name (nginx's servername callback): when it says so, the
-    /// handshake ends with a fatal `unrecognized_name` alert before any
-    /// certificate is chosen (`ssl_reject_handshake`, #112). The error is
-    /// `ConnectionRefused`.
-    pub async fn accept_or_reject<IO>(
+    /// `accept`, but the ClientHello is read first and `choose` sees its
+    /// SNI name (nginx's servername callback). `Choice::Reject` ends the
+    /// handshake with a fatal `unrecognized_name` alert before any
+    /// certificate is chosen (`ssl_reject_handshake`, #112), and the error
+    /// is `ConnectionRefused`; `Choice::AcceptWithoutH2` doesn't offer
+    /// `h2` (the server the name selects has HTTP/2 off, #144).
+    pub async fn accept_choosing<IO>(
         &self,
         mut io: IO,
-        reject: impl FnOnce(Option<&str>) -> bool,
+        choose: impl FnOnce(Option<&str>) -> Choice,
     ) -> io::Result<TlsStream<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
@@ -115,7 +139,8 @@ impl TlsAcceptor {
                 }
             }
         };
-        if reject(accepted.client_hello().server_name()) {
+        let choice = choose(accepted.client_hello().server_name());
+        if choice == Choice::Reject {
             // A plaintext fatal alert record, unrecognized_name (112): no
             // keys exist yet, for TLS 1.2 and 1.3 alike.
             let _ = io
@@ -126,7 +151,11 @@ impl TlsAcceptor {
                 "handshake rejected (ssl_reject_handshake)",
             ));
         }
-        let conn = match accepted.into_connection(self.config.clone()) {
+        let config = match (choice, &self.without_h2) {
+            (Choice::AcceptWithoutH2, Some(config)) => config.clone(),
+            _ => self.config.clone(),
+        };
+        let conn = match accepted.into_connection(config) {
             Ok(conn) => conn,
             Err((e, mut alert)) => {
                 let mut out = Vec::new();

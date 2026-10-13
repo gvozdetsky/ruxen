@@ -2572,7 +2572,7 @@ pub(crate) async fn handle_plain(
         proxy_protocol,
     };
     let listen = &http.listens[listen_index];
-    if listen.http2 {
+    if listen.h2_plain {
         let wait = listen.servers[listen.default_server].timeouts.header;
         if super::h2::starts_with_preface(&stream, wait).await {
             return serve_h2(
@@ -2632,9 +2632,9 @@ pub(crate) async fn handle_tls(
         proxy_protocol,
     };
     let budget = budget.saturating_sub(accepted_at.elapsed());
-    let accepted = if listen.reject_handshake.is_some() {
-        crate::tls::accept_or_reject_with_timeout(&acceptor, stream, budget, |sni| {
-            phase::rejects_handshake(listen, sni)
+    let accepted = if listen.reject_handshake.is_some() || listen.h2_by_sni {
+        crate::tls::accept_choosing_with_timeout(&acceptor, stream, budget, |sni| {
+            phase::tls_choice(listen, sni)
         })
         .await
     } else {

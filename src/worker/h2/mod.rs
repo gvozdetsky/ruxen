@@ -156,12 +156,61 @@ where
     }
 }
 
+/// Whether the server the request goes to has HTTP/2 on. A request for
+/// one that doesn't is answered 421, as nginx does when the `Host` names a
+/// server other than the one ALPN was negotiated for
+/// (ngx_http_set_virtual_server: "client attempted to request the server
+/// name different from the one that was negotiated").
+fn h2_server(
+    listen: &'static super::PreparedListen,
+    parts: &http::request::Parts,
+    sni: Option<&[u8]>,
+) -> bool {
+    let host = parts
+        .uri
+        .authority()
+        .map(|a| a.host().as_bytes())
+        .or_else(|| {
+            parts
+                .headers
+                .get(http::header::HOST)
+                .map(|v| strip_port(v.as_bytes()))
+        });
+    phase::server_for(listen, host, sni).http2
+}
+
+/// `host[:port]` → `host`, brackets of an IPv6 literal kept.
+fn strip_port(host: &[u8]) -> &[u8] {
+    match host.iter().rposition(|&b| b == b':') {
+        Some(i) if !host[i..].contains(&b']') && host[i + 1..].iter().all(u8::is_ascii_digit) => {
+            &host[..i]
+        }
+        _ => host,
+    }
+}
+
+fn misdirected(mut respond: h2::server::SendResponse<Bytes>) {
+    let mut response = http::Response::new(());
+    *response.status_mut() = http::StatusCode::MISDIRECTED_REQUEST;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain"),
+    );
+    if let Ok(mut send) = respond.send_response(response, false) {
+        let _ = send.send_data(Bytes::from_static(b"Misdirected Request\n"), true);
+    }
+}
+
 async fn serve_stream(
     request: http::Request<h2::RecvStream>,
     respond: h2::server::SendResponse<Bytes>,
     ctx: &ConnCtx,
 ) {
     let (parts, body) = request.into_parts();
+    let listen = &ctx.http.listens[ctx.listen_index];
+    if !listen.http2_listen && !h2_server(listen, &parts, ctx.sni.as_deref()) {
+        return misdirected(respond);
+    }
     let mut io = stream::StreamIo::new(&parts, body, respond);
     super::handle(
         &mut io,
