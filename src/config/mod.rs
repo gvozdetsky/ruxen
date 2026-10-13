@@ -2644,6 +2644,72 @@ mod tests {
     }
 
     #[test]
+    fn location_if_blocks_with_settings_are_anonymous_locations() {
+        // #137: `proxy_pass`, `add_header` and the like make the block an
+        // anonymous location that inherits the enclosing one; rewrite-only
+        // blocks stay as they were.
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    location /a {
+                        proxy_pass http://127.0.0.1:8081/outer;
+                        add_header X-Loc yes;
+                        if ($arg_p) { proxy_pass http://127.0.0.1:8081; }
+                        if ($arg_h) { add_header X-If yes; }
+                        if ($arg_r) { rewrite ^ /b; }
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let loc = &cfg.servers[0].locations[0];
+        let ifs: Vec<_> = loc
+            .rewrite_ops
+            .iter()
+            .map(|op| match op {
+                RewriteOp::If { location, .. } => location.clone(),
+                _ => panic!("{op:?}"),
+            })
+            .collect();
+        let Some(IfLocation::Parsed {
+            location: own,
+            own_handler: true,
+        }) = &ifs[0]
+        else {
+            panic!("{:?}", ifs[0])
+        };
+        assert!(matches!(own.handler, Handler::Proxy(_)));
+        assert!(own.pattern.starts_with('@'), "{}", own.pattern);
+        assert_eq!(own.add_headers.as_ref().unwrap()[0].name, "X-Loc");
+        let Some(IfLocation::Parsed {
+            location: inherited,
+            own_handler: false,
+        }) = &ifs[1]
+        else {
+            panic!("{:?}", ifs[1])
+        };
+        assert_eq!(inherited.pattern, "/a");
+        assert!(
+            matches!(&inherited.handler, Handler::Proxy(p) if format!("{p:?}").contains("/outer"))
+        );
+        assert_eq!(inherited.add_headers.as_ref().unwrap()[0].name, "X-If");
+        assert!(ifs[2].is_none());
+
+        for bad in [
+            "http { server { listen 80; location / { if ($a) { proxy_redirect off; } } } }",
+            "http { server { listen 80; location / { if ($a) { location /x { } } } } }",
+            "http { server { listen 80; location / { if ($a) { proxy_pass http://u/x; } } } }",
+        ] {
+            let parsed = parse(bad);
+            assert!(
+                parsed.is_err() || crate::worker::prepare(parsed.unwrap()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn nested_locations_inherit_the_parents_final_settings() {
         // #106: everything nginx merges from the parent location, also
         // what the parent sets after the nested block; lists as a whole.

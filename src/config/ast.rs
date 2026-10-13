@@ -1566,6 +1566,12 @@ pub enum RewriteOp {
     If {
         guard: IfGuard,
         body: Vec<RewriteOp>,
+        /// A location-level `if` whose block sets more than rewrite
+        /// directives (`proxy_pass`, `add_header`, …): nginx's anonymous
+        /// location (`ngx_http_rewrite_if`, `noname`), which the request
+        /// switches to when the condition holds (#137). `None` for a block
+        /// of rewrite directives only, and in server context.
+        location: Option<IfLocation>,
     },
     Rewrite(RewriteRule),
     Return {
@@ -1574,6 +1580,36 @@ pub enum RewriteOp {
     },
     Break,
 }
+
+/// The anonymous location of an `if` block (#137): parsed, then, once
+/// `worker::prepare` moved it into the server's list of them, its index
+/// there.
+#[derive(Debug, Clone)]
+pub enum IfLocation {
+    Parsed {
+        location: Box<Location>,
+        /// `proxy_pass` or `root` in the block: it doesn't take the
+        /// enclosing location's content handler.
+        own_handler: bool,
+    },
+    Slot(usize),
+}
+
+impl PartialEq for IfLocation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (IfLocation::Slot(a), IfLocation::Slot(b)) => a == b,
+            // `Location` has no equality of its own: compared as printed,
+            // which is enough for the parser's tests.
+            (IfLocation::Parsed { location: a, .. }, IfLocation::Parsed { location: b, .. }) => {
+                format!("{a:?}") == format!("{b:?}")
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for IfLocation {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteRule {

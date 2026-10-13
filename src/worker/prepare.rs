@@ -1532,7 +1532,52 @@ pub(crate) fn prepare_server(
     let mut prefix: Vec<PreparedLocation> = Vec::new();
     let mut regex: Vec<PreparedRegexLocation> = Vec::new();
     let mut named: Vec<PreparedLocation> = Vec::new();
-    for l in server.locations {
+    // The anonymous locations of location-level `if` blocks (#137), into
+    // a list of their own: no request finds them by URI, the `if` that
+    // holds switches to one by index.
+    let mut locations = server.locations;
+    let mut if_parsed: Vec<Location> = Vec::new();
+    for l in &mut locations {
+        take_if_locations(&mut l.rewrite_ops, &mut if_parsed);
+    }
+    let mut if_locations: Vec<PreparedLocation> = Vec::with_capacity(if_parsed.len());
+    for l in if_parsed {
+        if_locations.push(build_prefix_or_exact(
+            l,
+            server_index,
+            server_add_headers,
+            server_add_trailers,
+            server_error_pages,
+            server_keepalive,
+            server_error_logs,
+            server_log_not_found,
+            server_recursive_error_pages,
+            server_tokens_value,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            server_access_logs,
+            server_access,
+            server_client_max_body_size,
+            server_client_body_buffer_size,
+            server_sendfile,
+            server_body_temp,
+            server_disable_symlinks.clone(),
+            server_limit_rate,
+            server_post_action,
+            server_expires,
+            server_chunked_transfer_encoding,
+            &server.limit_req,
+            &server.limit_conn,
+            server.client_timeouts,
+            server_proxy_defaults,
+            &server_gzip,
+            upstreams,
+            alp,
+        )?);
+    }
+    for l in locations {
         match l.mode {
             MatchMode::Exact => exact.push(build_prefix_or_exact(
                 l,
@@ -1781,6 +1826,7 @@ pub(crate) fn prepare_server(
         regex_location_set: first_match_set(regex.iter().map(|r| r.set_pattern.as_str())),
         regex_locations: regex,
         named_locations: named,
+        if_locations,
         server_default,
         error_logs: server_error_logs,
         log_not_found: server_log_not_found,
@@ -1903,6 +1949,25 @@ pub(crate) fn prepare_guard(guard: IfGuard) -> PreparedGuard {
     }
 }
 
+/// Move the anonymous locations of `ops`' `if` blocks (nested ones too)
+/// into `out`, leaving their index there (#137).
+fn take_if_locations(ops: &mut [RewriteOp], out: &mut Vec<Location>) {
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            if let Some(crate::config::IfLocation::Parsed { .. }) = location {
+                let Some(crate::config::IfLocation::Parsed {
+                    location: parsed, ..
+                }) = location.replace(crate::config::IfLocation::Slot(out.len()))
+                else {
+                    unreachable!("matched above")
+                };
+                out.push(*parsed);
+            }
+            take_if_locations(body, out);
+        }
+    }
+}
+
 pub(crate) fn prepare_rewrite_ops(
     ops: Vec<RewriteOp>,
     tokens: crate::config::ServerTokens,
@@ -1917,9 +1982,19 @@ pub(crate) fn prepare_rewrite_ops(
                 name: leak_bytes(name.as_bytes()),
                 value: prepare_value_parts(value),
             },
-            RewriteOp::If { guard, body } => PreparedRewriteOp::If {
+            RewriteOp::If {
+                guard,
+                body,
+                location,
+            } => PreparedRewriteOp::If {
                 guard: prepare_guard(guard),
                 body: prepare_rewrite_ops(body, tokens),
+                // `prepare_server` moved every parsed one into the server's
+                // list first.
+                location: match location {
+                    Some(crate::config::IfLocation::Slot(n)) => Some(n as u32),
+                    _ => None,
+                },
             },
             RewriteOp::Rewrite(RewriteRule {
                 regex,

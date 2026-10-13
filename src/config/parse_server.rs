@@ -577,6 +577,7 @@ pub(crate) fn parse_server_block(
                     None,
                     None,
                     &mut locations,
+                    None,
                 )?;
             }
             ("add_header", Terminator::Semi) => {

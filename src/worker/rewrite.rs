@@ -367,7 +367,11 @@ pub(crate) fn execute_rewrite_ops(
                 render_parts(value, &ctx, &mut rendered);
                 rewrite_state.set_user_var(name, rendered);
             }
-            PreparedRewriteOp::If { guard, body } => {
+            PreparedRewriteOp::If {
+                guard,
+                body,
+                location,
+            } => {
                 let args = current_args
                     .as_deref()
                     .unwrap_or_else(|| request_args(request_uri));
@@ -389,6 +393,9 @@ pub(crate) fn execute_rewrite_ops(
                     }
                 }
                 if holds {
+                    if location.is_some() {
+                        rewrite_state.if_location = *location;
+                    }
                     match execute_rewrite_ops(
                         body,
                         http,
