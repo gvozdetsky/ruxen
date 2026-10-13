@@ -9,3 +9,13 @@
 
 pub mod ports;
 pub mod tls;
+
+/// An errno as ruxen (and nginx) print it, `98: Address already in use`,
+/// in this libc's words: musl says `Address in use`.
+pub fn errno_text(code: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    let reason = text
+        .strip_suffix(&format!(" (os error {code})"))
+        .unwrap_or(&text);
+    format!("{code}: {reason}")
+}

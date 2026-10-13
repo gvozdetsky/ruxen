@@ -75,7 +75,8 @@ fn m108_http_over_a_unix_socket() {
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(
         stderr.contains(&format!(
-            "bind() to unix:{d}/http.sock failed (98: Address already in use)"
+            "bind() to unix:{d}/http.sock failed ({})",
+            common::errno_text(98)
         )),
         "{stderr}"
     );
