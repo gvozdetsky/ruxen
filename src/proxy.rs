@@ -185,6 +185,25 @@ pub struct CachePlan {
     /// A HEAD request went upstream as a GET, so the body can be stored
     /// (`proxy_cache_convert_head`).
     pub head_as_get: bool,
+    /// This request fetches the response for everyone (nginx's
+    /// `updating`: a stale entry's update, or `proxy_cache_lock`); the
+    /// zone forgets it when the plan is dropped.
+    pub token: Option<u64>,
+    /// Another request holds `proxy_cache_lock`: wait for it until then.
+    pub wait_until: Option<Instant>,
+    /// `hit` is a stale response: send it, then update it in the
+    /// background (`proxy_cache_background_update`).
+    pub background: bool,
+    /// The stale response's `stale-if-error` still covers it.
+    pub stale_error: bool,
+}
+
+impl Drop for CachePlan {
+    fn drop(&mut self) {
+        if let Some(token) = self.token {
+            self.zone.release(&self.hash, token);
+        }
+    }
 }
 
 pub enum CacheHit {
@@ -199,6 +218,8 @@ pub enum CacheHit {
 struct Storable {
     head: Vec<u8>,
     valid_sec: i64,
+    updating_sec: i64,
+    error_sec: i64,
     vary: Vec<u8>,
     client_head_len: usize,
 }
@@ -471,9 +492,16 @@ impl ProxyPlan {
 /// caller's empty `Vec` never allocates.
 pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Response {
     if let Some(cache) = plan.cache.as_deref_mut() {
+        if cache.wait_until.is_some() {
+            Box::pin(wait_for_lock(cache)).await;
+        }
         report.cache_status = Some(cache.status);
         if let Some(hit) = cache.hit.take() {
-            return cached_response(&plan, hit, report);
+            let response = cached_response(&plan, hit, report);
+            if plan.cache.as_ref().is_some_and(|c| c.background) {
+                monoio::spawn(background_update(plan));
+            }
+            return response;
         }
     }
     let mut storable: Option<Storable> = None;
@@ -498,7 +526,13 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     // No initial peer: every peer is `down` or cooling off after
     // `max_fails`.
     let Some(mut current) = plan.initial_peer.take() else {
-        return no_live_upstreams(&plan, states, failures);
+        // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
+        // covers (ngx_http_proxy_merge_loc_conf).
+        let resp = no_live_upstreams(&plan, states, failures);
+        if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Failed(FailKind::Error)) {
+            return stale;
+        }
+        return resp;
     };
     let mut tried = upstream::Tried::default();
     tried.insert(current.peer_idx);
@@ -620,7 +654,15 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     let Some(next) =
                         upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
                     else {
-                        return no_live_upstreams(&plan, states, failures);
+                        // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
+                        // covers (ngx_http_proxy_merge_loc_conf).
+                        let resp = no_live_upstreams(&plan, states, failures);
+                        if let Some(stale) =
+                            stale_answer(&mut plan, report, StaleCase::Failed(FailKind::Error))
+                        {
+                            return stale;
+                        }
+                        return resp;
                     };
                     tried.insert(next.peer_idx);
                     drop(current);
@@ -632,8 +674,14 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 // matches a configured `error_page` rule turns into a
                 // Reroute instead of being forwarded.
                 upstream::report_success(upstream, current.peer_idx);
+                // ngx_http_upstream_test_next: a status
+                // proxy_cache_use_stale lists is answered from the cache.
+                if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Status(status)) {
+                    return stale;
+                }
                 if status == 304
                     && let Some(cache) = plan.cache.as_deref_mut()
+                    && cache.conf.revalidate
                     && let Some(stale) = cache.stale.take()
                 {
                     revalidate(cache, &stale, storable.take());
@@ -666,7 +714,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 // This try is still in flight while the response header is
                 // filtered: nginx's response_time is -1 (`-`) until the
                 // upstream request is finalized.
-                if let Some(state) = states.last_mut() {
+                if let Some(state) = report.states.last_mut() {
                     state.in_flight = true;
                 }
                 return resp;
@@ -703,12 +751,23 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     || (sent && !sent_may_retry)
                     || deadline_exceeded(overall_deadline)
                 {
+                    if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Failed(kind)) {
+                        return stale;
+                    }
                     return last_failure
                         .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
                 }
                 let Some(next) = upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
                 else {
-                    return no_live_upstreams(&plan, states, failures);
+                    // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
+                    // covers (ngx_http_proxy_merge_loc_conf).
+                    let resp = no_live_upstreams(&plan, states, failures);
+                    if let Some(stale) =
+                        stale_answer(&mut plan, report, StaleCase::Failed(FailKind::Error))
+                    {
+                        return stale;
+                    }
+                    return resp;
                 };
                 tried.insert(next.peer_idx);
                 drop(current);
@@ -1867,11 +1926,13 @@ async fn attempt(
         out.extend_from_slice(&accum[body_start..body_start + body_len_in_accum]);
     }
     if !skip_body && let Some(cache) = plan.cache.as_deref() {
-        *storable = if status_code == 304 && cache.stale.is_some() {
+        *storable = if status_code == 304 && cache.conf.revalidate && cache.stale.is_some() {
             // A revalidation: the 304's own header is what renews the entry.
             Some(Storable {
                 head: accum[..head_end].to_vec(),
                 valid_sec: 0,
+                updating_sec: 0,
+                error_sec: 0,
                 vary: Vec::new(),
                 client_head_len,
             })
@@ -2070,6 +2131,8 @@ fn storable_response(
     Some(Storable {
         head: head.to_vec(),
         valid_sec,
+        updating_sec: fresh.updating_sec,
+        error_sec: fresh.error_sec,
         vary: fresh.vary.to_vec(),
         client_head_len,
     })
@@ -2101,6 +2164,8 @@ fn store_response(
     };
     let entry = crate::proxy_cache::EntryParts {
         valid_sec: storable.valid_sec,
+        updating_sec: storable.updating_sec,
+        error_sec: storable.error_sec,
         key: &cache.key,
         vary: &storable.vary,
         variant,
@@ -2132,6 +2197,99 @@ fn revalidate(cache: &CachePlan, stale: &crate::proxy_cache::Entry, reply: Optio
         };
     }
     cache.zone.refresh(&cache.hash, valid);
+}
+
+/// What a stale response may stand in for (proxy_cache_use_stale).
+enum StaleCase {
+    Failed(FailKind),
+    Status(u16),
+}
+
+/// The stale response instead of the upstream's failure, when
+/// `proxy_cache_use_stale` lists it, or (for errors) the response's own
+/// `stale-if-error` still covers it: ngx_http_upstream_next and
+/// ngx_http_upstream_test_next.
+#[cold]
+fn stale_answer(
+    plan: &mut ProxyPlan,
+    report: &mut ProxyReport,
+    case: StaleCase,
+) -> Option<Response> {
+    let stale = {
+        let cache = plan.cache.as_deref_mut()?;
+        if cache.status != crate::proxy_cache::CacheStatus::Expired {
+            return None;
+        }
+        let use_stale = cache.conf.use_stale;
+        let wanted = match case {
+            StaleCase::Status(status) => use_stale.status(status),
+            StaleCase::Failed(kind) => {
+                cache.stale_error
+                    || match kind {
+                        FailKind::Error => use_stale.error,
+                        FailKind::Timeout => use_stale.timeout,
+                        FailKind::InvalidHeader => use_stale.invalid_header,
+                    }
+            }
+        };
+        if !wanted {
+            return None;
+        }
+        cache.stale.take()?
+    };
+    report.cache_status = Some(crate::proxy_cache::CacheStatus::Stale);
+    Some(cached_response(plan, CacheHit::Entry(stale), report))
+}
+
+/// Another request holds `proxy_cache_lock`: look again every half
+/// second at most (ngx_http_file_cache_lock_wait) until the response is
+/// cached, the lock is free or aged, or `proxy_cache_lock_timeout` ends;
+/// then the response isn't stored.
+async fn wait_for_lock(cache: &mut CachePlan) {
+    use crate::proxy_cache::{CacheStatus, Entry, now_ms, now_secs};
+    let Some(deadline) = cache.wait_until.take() else {
+        return;
+    };
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            cache.store = false;
+            return;
+        }
+        let mut pause = (deadline - now).min(Duration::from_millis(500));
+        if let Some(until) = cache.zone.locked_until(&cache.hash) {
+            pause = pause.min(Duration::from_millis(until.saturating_sub(now_ms()).max(1)));
+        }
+        monoio::time::sleep(pause).await;
+        if cache.zone.is_fresh(&cache.hash, now_secs())
+            && let Some(entry) = Entry::read(&cache.zone.file_path(&cache.hash), &cache.key)
+            && entry.matches_variant(&cache.request_headers)
+        {
+            cache.status = CacheStatus::Hit;
+            cache.hit = Some(CacheHit::Entry(entry));
+            return;
+        }
+        if let Some(token) = cache.zone.try_lock(&cache.hash, cache.conf.lock_age_ms) {
+            cache.token = Some(token);
+            return;
+        }
+    }
+}
+
+/// `proxy_cache_background_update`: the stale response went to the
+/// client; this fetches the new one and stores it, as nginx's background
+/// subrequest does. Boxed: `run_proxy` spawns it.
+fn background_update(
+    mut plan: ProxyPlan,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    if let Some(cache) = plan.cache.as_deref_mut() {
+        cache.background = false;
+        cache.status = crate::proxy_cache::CacheStatus::Expired;
+    }
+    Box::pin(async move {
+        let mut report = ProxyReport::default();
+        let _ = run_proxy(plan, &mut report).await;
+    })
 }
 
 /// The client asked with HEAD and the upstream got a GET: keep the header

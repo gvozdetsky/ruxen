@@ -3561,6 +3561,9 @@ mod tests {
                         proxy_cache_key $uri; proxy_cache_methods GET POST;
                         proxy_cache_min_uses 2; proxy_cache_convert_head off;
                         proxy_cache_revalidate on;
+                        proxy_cache_use_stale error timeout updating http_500 http_429;
+                        proxy_cache_background_update on; proxy_cache_lock on;
+                        proxy_cache_lock_timeout 200ms; proxy_cache_lock_age 1s;
                         proxy_ignore_headers Expires; proxy_ignore_headers Vary; }
                     location /v { proxy_pass http://127.0.0.1:8080; proxy_cache $arg_c; }
                     location /off { proxy_pass http://127.0.0.1:8080; proxy_cache off; }
@@ -3585,6 +3588,9 @@ mod tests {
             "proxy_cache_valid 999 1m;",
             "proxy_cache_valid 200 soon;",
             "proxy_cache_methods PUT;",
+            "proxy_cache_use_stale http_418;",
+            "proxy_cache_use_stale bogus;",
+            "proxy_cache_lock maybe;",
             "proxy_cache one; proxy_cache two;",
         ] {
             let src = format!("http {{ {bad} server {{ listen 80; }} }}");

@@ -103,6 +103,44 @@ pub struct ProxyCacheConf {
     pub no_cache: Option<Vec<Vec<ValuePart>>>,
     pub convert_head: Option<bool>,
     pub revalidate: Option<bool>,
+    pub use_stale: Option<UseStale>,
+    pub background_update: Option<bool>,
+    pub lock: Option<bool>,
+    pub lock_timeout_ms: Option<u64>,
+    pub lock_age_ms: Option<u64>,
+}
+
+/// `proxy_cache_use_stale`: when a stale cached response answers instead
+/// of the upstream's error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UseStale {
+    pub error: bool,
+    pub timeout: bool,
+    pub invalid_header: bool,
+    /// While another request updates the entry.
+    pub updating: bool,
+    /// `http_500` … `http_429`, as the statuses themselves.
+    pub statuses: [bool; 7],
+}
+
+impl UseStale {
+    pub const STATUSES: [u16; 7] = [500, 502, 503, 504, 403, 404, 429];
+
+    /// Any case at all is on.
+    pub fn any(&self) -> bool {
+        self.error
+            || self.timeout
+            || self.invalid_header
+            || self.updating
+            || self.statuses.contains(&true)
+    }
+
+    pub fn status(&self, status: u16) -> bool {
+        Self::STATUSES
+            .iter()
+            .zip(self.statuses)
+            .any(|(&s, on)| on && s == status)
+    }
 }
 
 impl ProxyCacheConf {
@@ -118,6 +156,11 @@ impl ProxyCacheConf {
             no_cache: self.no_cache.or_else(|| parent.no_cache.clone()),
             convert_head: self.convert_head.or(parent.convert_head),
             revalidate: self.revalidate.or(parent.revalidate),
+            use_stale: self.use_stale.or(parent.use_stale),
+            background_update: self.background_update.or(parent.background_update),
+            lock: self.lock.or(parent.lock),
+            lock_timeout_ms: self.lock_timeout_ms.or(parent.lock_timeout_ms),
+            lock_age_ms: self.lock_age_ms.or(parent.lock_age_ms),
         }
     }
 }

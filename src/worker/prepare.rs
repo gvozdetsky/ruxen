@@ -600,6 +600,12 @@ fn prepare_proxy_cache(
         no_cache: conditions(&conf.no_cache),
         convert_head: conf.convert_head.unwrap_or(true),
         revalidate: conf.revalidate.unwrap_or(false),
+        // ngx_http_proxy_merge_loc_conf: `error` covers "no live upstreams".
+        use_stale: conf.use_stale.unwrap_or_default(),
+        background_update: conf.background_update.unwrap_or(false),
+        lock: conf.lock.unwrap_or(false),
+        lock_timeout_ms: conf.lock_timeout_ms.unwrap_or(5000),
+        lock_age_ms: conf.lock_age_ms.unwrap_or(5000),
         ignore,
     }))))
 }

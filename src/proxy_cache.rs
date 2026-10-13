@@ -30,6 +30,8 @@ pub enum CacheStatus {
     Miss,
     Bypass,
     Expired,
+    Stale,
+    Updating,
     Revalidated,
     Hit,
 }
@@ -40,10 +42,21 @@ impl CacheStatus {
             CacheStatus::Miss => b"MISS",
             CacheStatus::Bypass => b"BYPASS",
             CacheStatus::Expired => b"EXPIRED",
+            CacheStatus::Stale => b"STALE",
+            CacheStatus::Updating => b"UPDATING",
             CacheStatus::Revalidated => b"REVALIDATED",
             CacheStatus::Hit => b"HIT",
         }
     }
+}
+
+/// Milliseconds on a process-wide monotonic clock, for cache locks.
+pub fn now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Seconds since the epoch (nginx's `ngx_time()`).
@@ -79,6 +92,17 @@ struct Node {
     uses: u32,
     /// Until when (seconds since the epoch) the entry is fresh.
     valid_sec: i64,
+    /// `stale-while-revalidate` / `stale-if-error` seconds past
+    /// `valid_sec` when a stale response may still answer.
+    updating_sec: i64,
+    error_sec: i64,
+    /// A request is fetching the response (nginx's `updating`): an update
+    /// of a stale entry, or the holder of `proxy_cache_lock`.
+    updating: bool,
+    /// Which request holds `updating`, and until when a lock counts
+    /// (`proxy_cache_lock_age`, `now_ms`).
+    lock_token: u64,
+    lock_until_ms: u64,
     /// The status of a cached intercepted error, which has no file.
     error: u16,
     /// A file holds the response.
@@ -146,6 +170,11 @@ impl Shard {
             hash,
             uses: 0,
             valid_sec: 0,
+            updating_sec: 0,
+            error_sec: 0,
+            updating: false,
+            lock_token: 0,
+            lock_until_ms: 0,
             error: 0,
             exists: false,
             fs_size: 0,
@@ -176,8 +205,15 @@ pub enum Lookup {
     Hit,
     /// A cached intercepted error with this status.
     Error(u16),
-    /// The response on disk is stale: fetch it again (`EXPIRED`).
-    Expired,
+    /// The response on disk is stale. `token`: this request now updates
+    /// it (nginx's STALE); `None`: another request already does
+    /// (UPDATING). `stale_updating` / `stale_error`: the response's own
+    /// `stale-while-revalidate` / `stale-if-error` still cover it.
+    Stale {
+        token: Option<u64>,
+        stale_updating: bool,
+        stale_error: bool,
+    },
     /// Nothing usable is cached. `store`: the key was asked for often
     /// enough (`proxy_cache_min_uses`) for the response to be stored.
     /// `probe`: the index doesn't know the key, so a file from before a
@@ -202,6 +238,7 @@ pub struct CacheZone {
     /// Bytes of the files the index knows.
     size: AtomicU64,
     temp_seq: AtomicU64,
+    lock_seq: AtomicU64,
 }
 
 /// A `proxy_cache_path` as configured.
@@ -242,6 +279,7 @@ impl CacheZone {
             shards,
             size: AtomicU64::new(0),
             temp_seq: AtomicU64::new(0),
+            lock_seq: AtomicU64::new(1),
         }
     }
 
@@ -302,7 +340,22 @@ impl CacheZone {
                     } else if node.exists && node.valid_sec >= now {
                         Lookup::Hit
                     } else if node.exists {
-                        Lookup::Expired
+                        let stale_updating =
+                            node.valid_sec.saturating_add(node.updating_sec) >= now;
+                        let stale_error = node.valid_sec.saturating_add(node.error_sec) >= now;
+                        let token = if node.updating {
+                            None
+                        } else {
+                            let token = self.lock_seq.fetch_add(1, Ordering::Relaxed);
+                            node.updating = true;
+                            node.lock_token = token;
+                            Some(token)
+                        };
+                        Lookup::Stale {
+                            token,
+                            stale_updating,
+                            stale_error,
+                        }
                     } else {
                         Lookup::Miss {
                             store: node.uses >= min_uses,
@@ -330,7 +383,7 @@ impl CacheZone {
     }
 
     /// A file from before a restart holds the key: the index learns it.
-    pub fn adopt(&self, hash: &CacheHash, valid_sec: i64, fs_size: u64) {
+    pub fn adopt(&self, hash: &CacheHash, entry: &Entry) {
         let mut shard = self.lock(hash);
         let Some(&i) = shard.map.get(hash) else {
             return;
@@ -338,10 +391,59 @@ impl CacheZone {
         let node = &mut shard.nodes[i];
         if !node.exists {
             node.exists = true;
-            node.valid_sec = valid_sec;
-            node.fs_size = fs_size;
-            self.size.fetch_add(fs_size, Ordering::Relaxed);
+            node.valid_sec = entry.valid_sec;
+            node.updating_sec = entry.updating_sec;
+            node.error_sec = entry.error_sec;
+            node.fs_size = entry.len();
+            self.size.fetch_add(node.fs_size, Ordering::Relaxed);
         }
+    }
+
+    /// ngx_http_file_cache_lock: become the one request that fetches a
+    /// missing response, unless another holds the lock and it is younger
+    /// than `age_ms`. The token releases it.
+    pub fn try_lock(&self, hash: &CacheHash, age_ms: u64) -> Option<u64> {
+        let now = now_ms();
+        let mut shard = self.lock(hash);
+        let &i = shard.map.get(hash)?;
+        let node = &mut shard.nodes[i];
+        if node.updating && node.lock_until_ms > now {
+            return None;
+        }
+        let token = self.lock_seq.fetch_add(1, Ordering::Relaxed);
+        node.updating = true;
+        node.lock_token = token;
+        node.lock_until_ms = now + age_ms;
+        Some(token)
+    }
+
+    /// When the lock on `hash` stops counting, or `None` when nobody holds
+    /// it (or the key is gone).
+    pub fn locked_until(&self, hash: &CacheHash) -> Option<u64> {
+        let shard = self.lock(hash);
+        let &i = shard.map.get(hash)?;
+        let node = &shard.nodes[i];
+        node.updating.then_some(node.lock_until_ms)
+    }
+
+    /// The request holding `token` is done (ngx_http_file_cache_free).
+    pub fn release(&self, hash: &CacheHash, token: u64) {
+        let mut shard = self.lock(hash);
+        if let Some(&i) = shard.map.get(hash) {
+            let node = &mut shard.nodes[i];
+            if node.updating && node.lock_token == token {
+                node.updating = false;
+            }
+        }
+    }
+
+    /// A fresh response is on disk for `hash`.
+    pub fn is_fresh(&self, hash: &CacheHash, now: i64) -> bool {
+        let shard = self.lock(hash);
+        shard
+            .map
+            .get(hash)
+            .is_some_and(|&i| shard.nodes[i].exists && shard.nodes[i].valid_sec >= now)
     }
 
     /// A stale response was revalidated (a 304): fresh again until
@@ -438,6 +540,8 @@ impl CacheZone {
                     node.exists = true;
                     node.error = 0;
                     node.valid_sec = entry.valid_sec;
+                    node.updating_sec = entry.updating_sec;
+                    node.error_sec = entry.error_sec;
                     node.fs_size = fs_size;
                     self.size.fetch_add(fs_size, Ordering::Relaxed);
                 }
@@ -469,12 +573,16 @@ impl CacheZone {
     /// _forced_expire): entries not asked for in `inactive` go, then the
     /// least recently used while the files are over `max_size` or the file
     /// system has less than `min_free`.
+    /// Entries a request is updating stay.
     pub fn manage(&self, now: i64) {
         let mut freed = Vec::new();
         for shard in self.shards.iter() {
             let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
             let mut i = shard.tail;
-            while i != NIL && now - shard.nodes[i].accessed > self.inactive {
+            while i != NIL
+                && now - shard.nodes[i].accessed > self.inactive
+                && !shard.nodes[i].updating
+            {
                 let prev = shard.nodes[i].prev;
                 freed.extend(shard.remove(i, &self.size));
                 i = prev;
@@ -495,7 +603,7 @@ impl CacheZone {
             let mut shard = self.shards[next].lock().unwrap_or_else(|e| e.into_inner());
             next = (next + 1) % self.shards.len();
             let mut i = shard.tail;
-            while i != NIL && !shard.nodes[i].exists {
+            while i != NIL && (!shard.nodes[i].exists || shard.nodes[i].updating) {
                 i = shard.nodes[i].prev;
             }
             if i == NIL {
@@ -547,7 +655,7 @@ impl CacheZone {
                 let Some(hash) = unhex(name) else {
                     continue;
                 };
-                let Some(valid_sec) = read_valid_sec(&path) else {
+                let Some((valid_sec, updating_sec, error_sec)) = read_lifetimes(&path) else {
                     continue;
                 };
                 let mut shard = self.lock(&hash);
@@ -559,6 +667,8 @@ impl CacheZone {
                 node.uses = 1;
                 node.exists = true;
                 node.valid_sec = valid_sec;
+                node.updating_sec = updating_sec;
+                node.error_sec = error_sec;
                 node.fs_size = meta.len();
                 self.size.fetch_add(meta.len(), Ordering::Relaxed);
             }
@@ -610,10 +720,11 @@ fn unhex(name: &str) -> Option<CacheHash> {
     Some(hash)
 }
 
-/// The `valid_sec` in a cache file's fixed header.
-fn read_valid_sec(path: &Path) -> Option<i64> {
+/// `valid_sec`, `updating_sec` and `error_sec` from a cache file's fixed
+/// header.
+fn read_lifetimes(path: &Path) -> Option<(i64, i64, i64)> {
     use std::io::Read;
-    let mut fixed = [0u8; 12];
+    let mut fixed = [0u8; 28];
     std::fs::File::open(path)
         .ok()?
         .read_exact(&mut fixed)
@@ -621,15 +732,20 @@ fn read_valid_sec(path: &Path) -> Option<i64> {
     if &fixed[..4] != MAGIC {
         return None;
     }
-    Some(i64::from_le_bytes(fixed[4..12].try_into().unwrap()))
+    let at = |i: usize| i64::from_le_bytes(fixed[i..i + 8].try_into().unwrap());
+    Some((at(4), at(12), at(20)))
 }
 
 const MAGIC: &[u8; 4] = b"RXC1";
-const FIXED: usize = 4 + 8 + 8 + 4 + 4 + 4;
+/// Magic, valid_sec, updating_sec, error_sec, the key's, Vary's and the
+/// head's lengths, the body's length.
+const FIXED: usize = 4 + 8 + 8 + 8 + 4 + 4 + 4 + 8;
 
 /// A response to store.
 pub struct EntryParts<'a> {
     pub valid_sec: i64,
+    pub updating_sec: i64,
+    pub error_sec: i64,
     pub key: &'a [u8],
     /// The `Vary` header the response came with, and the request's digest
     /// over the headers it names (`vary_digest`).
@@ -650,6 +766,8 @@ impl EntryParts<'_> {
         let mut fixed = Vec::with_capacity(FIXED + 16 + self.key.len() + self.vary.len());
         fixed.extend_from_slice(MAGIC);
         fixed.extend_from_slice(&self.valid_sec.to_le_bytes());
+        fixed.extend_from_slice(&self.updating_sec.to_le_bytes());
+        fixed.extend_from_slice(&self.error_sec.to_le_bytes());
         fixed.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
         fixed.extend_from_slice(&(self.vary.len() as u32).to_le_bytes());
         fixed.extend_from_slice(&(self.head.len() as u32).to_le_bytes());
@@ -666,6 +784,8 @@ impl EntryParts<'_> {
 /// A cached response read back.
 pub struct Entry {
     pub valid_sec: i64,
+    pub updating_sec: i64,
+    pub error_sec: i64,
     bytes: Vec<u8>,
     variant: CacheHash,
     vary: (usize, usize),
@@ -681,13 +801,16 @@ impl Entry {
             return None;
         }
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        let valid_sec = i64::from_le_bytes(bytes[4..12].try_into().unwrap());
-        let key_len = u32_at(12);
-        let vary_len = u32_at(16);
-        let head_len = u32_at(20);
-        let body_len = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        let i64_at = |at: usize| i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let valid_sec = i64_at(4);
+        let updating_sec = i64_at(12);
+        let error_sec = i64_at(20);
+        let key_len = u32_at(28);
+        let vary_len = u32_at(32);
+        let head_len = u32_at(36);
+        let body_len = i64_at(40) as usize;
         let mut variant = [0u8; 16];
-        variant.copy_from_slice(&bytes[32..48]);
+        variant.copy_from_slice(&bytes[FIXED..FIXED + 16]);
         let key_at = FIXED + 16;
         let vary_at = key_at.checked_add(key_len)?;
         let head_at = vary_at.checked_add(vary_len)?;
@@ -697,6 +820,8 @@ impl Entry {
         }
         Some(Entry {
             valid_sec,
+            updating_sec,
+            error_sec,
             variant,
             vary: (vary_at, head_at),
             head: (head_at, body_at),
@@ -810,6 +935,9 @@ pub struct Ignore {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Freshness<'a> {
     pub valid_sec: i64,
+    /// `stale-while-revalidate` / `stale-if-error`.
+    pub updating_sec: i64,
+    pub error_sec: i64,
     pub vary: &'a [u8],
 }
 
@@ -825,6 +953,8 @@ pub fn freshness<'a>(
     let read = read_headers(header_lines, ignore, now);
     (read.cacheable && !read.no_cache && !read.expired).then_some(Freshness {
         valid_sec: read.valid_sec,
+        updating_sec: read.updating_sec,
+        error_sec: read.error_sec,
         vary: read.vary,
     })
 }
@@ -842,6 +972,8 @@ pub fn header_valid_sec<'a>(
 
 struct HeaderRead<'a> {
     valid_sec: i64,
+    updating_sec: i64,
+    error_sec: i64,
     no_cache: bool,
     expired: bool,
     cacheable: bool,
@@ -854,6 +986,7 @@ fn read_headers<'a>(
     now: i64,
 ) -> HeaderRead<'a> {
     let mut valid_sec: i64 = 0;
+    let mut stale = (0, 0);
     let mut no_cache = false;
     let mut expired = false;
     let mut cacheable = true;
@@ -869,7 +1002,7 @@ fn read_headers<'a>(
             if ignore.cache_control {
                 continue;
             }
-            match cache_control(value, valid_sec != 0 && accel_seen, now) {
+            match cache_control(value, valid_sec != 0 && accel_seen, now, &mut stale) {
                 CacheControl::NotCacheable => cacheable = false,
                 CacheControl::NoCache => no_cache = true,
                 CacheControl::Valid(until) => {
@@ -926,6 +1059,8 @@ fn read_headers<'a>(
     }
     HeaderRead {
         valid_sec,
+        updating_sec: stale.0,
+        error_sec: stale.1,
         no_cache,
         expired,
         cacheable,
@@ -941,8 +1076,14 @@ enum CacheControl {
 }
 
 /// One Cache-Control line. `after_accel`: an X-Accel-Expires already set
-/// the validity, so only the extensions are read.
-fn cache_control(value: &[u8], after_accel: bool, now: i64) -> CacheControl {
+/// the validity, so only the extensions are read. `stale`: the
+/// `stale-while-revalidate` and `stale-if-error` seconds.
+fn cache_control(
+    value: &[u8],
+    after_accel: bool,
+    now: i64,
+    stale: &mut (i64, i64),
+) -> CacheControl {
     let mut out = CacheControl::Silent;
     if !after_accel {
         if find(value, b"no-cache").is_some()
@@ -964,15 +1105,20 @@ fn cache_control(value: &[u8], after_accel: bool, now: i64) -> CacheControl {
             out = CacheControl::Valid(now.saturating_add(n));
         }
     }
-    // stale-while-revalidate / stale-if-error are kept by nginx for
-    // `proxy_cache_use_stale`; a malformed one makes the response
-    // uncacheable all the same.
-    for ext in [&b"stale-while-revalidate="[..], b"stale-if-error="] {
-        if let Some(p) = find(value, ext)
-            && directive_number(&value[p + ext.len()..]).is_none()
-        {
+    // A malformed extension makes the response uncacheable.
+    const SWR: &[u8] = b"stale-while-revalidate=";
+    const SIE: &[u8] = b"stale-if-error=";
+    if let Some(p) = find(value, SWR) {
+        let Some(n) = directive_number(&value[p + SWR.len()..]) else {
             return CacheControl::NotCacheable;
-        }
+        };
+        *stale = (n, n);
+    }
+    if let Some(p) = find(value, SIE) {
+        let Some(n) = directive_number(&value[p + SIE.len()..]) else {
+            return CacheControl::NotCacheable;
+        };
+        stale.1 = n;
     }
     out
 }
@@ -1131,6 +1277,8 @@ mod tests {
     fn parts<'a>(key: &'a [u8], body: &'a [u8]) -> EntryParts<'a> {
         EntryParts {
             valid_sec: NOW + 60,
+            updating_sec: 0,
+            error_sec: 0,
             key,
             vary: b"",
             variant: [0; 16],
@@ -1163,7 +1311,19 @@ mod tests {
         assert_eq!(entry.head(), b"HTTP/1.1 200 OK\r\nX-A: 1");
         assert_eq!(entry.body(), b"body");
         assert!(Entry::read(&path, b"other").is_none());
-        assert_eq!(z.lookup(&hash, 1, NOW + 61), Lookup::Expired);
+        let stale = z.lookup(&hash, 1, NOW + 61);
+        let Lookup::Stale {
+            token: Some(token), ..
+        } = stale
+        else {
+            panic!("{stale:?}");
+        };
+        // A second request finds it being updated.
+        assert!(matches!(
+            z.lookup(&hash, 1, NOW + 61),
+            Lookup::Stale { token: None, .. }
+        ));
+        z.release(&hash, token);
         // An error replaces the file.
         z.store_error(&hash, 404, NOW + 100);
         assert_eq!(z.lookup(&hash, 1, NOW + 62), Lookup::Error(404));
@@ -1230,6 +1390,41 @@ mod tests {
         assert!(!z.file_path(&a).exists());
         assert!(z.file_path(&b).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_extensions_are_kept() {
+        let f = freshness(
+            [(
+                &b"Cache-Control"[..],
+                &b"max-age=10, stale-while-revalidate=5, stale-if-error=7"[..],
+            )]
+            .into_iter(),
+            Ignore::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!((f.valid_sec, f.updating_sec, f.error_sec), (NOW + 10, 5, 7));
+        assert_eq!(
+            verdict(&[("Cache-Control", "max-age=10, stale-if-error=x")]),
+            None
+        );
+    }
+
+    #[test]
+    fn locks_go_to_one_request_until_released_or_aged() {
+        let dir = std::env::temp_dir().join(format!("ruxen-cache-unit3-{}", std::process::id()));
+        let z = zone(&dir, 1 << 20, None);
+        let hash = hash_key(b"k");
+        z.lookup(&hash, 1, NOW);
+        let token = z.try_lock(&hash, 60_000).unwrap();
+        assert_eq!(z.try_lock(&hash, 60_000), None);
+        assert!(z.locked_until(&hash).is_some());
+        z.release(&hash, token);
+        assert_eq!(z.locked_until(&hash), None);
+        let _ = z.try_lock(&hash, 0).unwrap();
+        // An aged lock is taken over.
+        assert!(z.try_lock(&hash, 0).is_some());
     }
 
     #[test]

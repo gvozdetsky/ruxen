@@ -617,6 +617,11 @@ impl ProxyConf {
         "proxy_no_cache",
         "proxy_cache_convert_head",
         "proxy_cache_revalidate",
+        "proxy_cache_use_stale",
+        "proxy_cache_background_update",
+        "proxy_cache_lock",
+        "proxy_cache_lock_timeout",
+        "proxy_cache_lock_age",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -881,6 +886,38 @@ impl ProxyConf {
                 self.cache.revalidate =
                     Some(parse_on_off_args(&args[1..], "proxy_cache_revalidate")?);
             }
+            "proxy_cache_use_stale" => {
+                if self.cache.use_stale.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_use_stale"));
+                }
+                self.cache.use_stale = Some(parse_proxy_cache_use_stale(&args[1..])?);
+            }
+            "proxy_cache_background_update" => {
+                if self.cache.background_update.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_background_update"));
+                }
+                self.cache.background_update = Some(parse_on_off_args(
+                    &args[1..],
+                    "proxy_cache_background_update",
+                )?);
+            }
+            "proxy_cache_lock" => {
+                if self.cache.lock.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_lock"));
+                }
+                self.cache.lock = Some(parse_on_off_args(&args[1..], "proxy_cache_lock")?);
+            }
+            name @ ("proxy_cache_lock_timeout" | "proxy_cache_lock_age") => {
+                let (slot, what) = if name == "proxy_cache_lock_age" {
+                    (&mut self.cache.lock_age_ms, "proxy_cache_lock_age")
+                } else {
+                    (&mut self.cache.lock_timeout_ms, "proxy_cache_lock_timeout")
+                };
+                if slot.is_some() {
+                    return Err(Error::Duplicate(what));
+                }
+                *slot = Some(parse_proxy_timeout_args(&args[1..], what)?);
+            }
             other => unreachable!("not a ProxyConf directive: {other}"),
         }
         Ok(())
@@ -917,6 +954,40 @@ pub(crate) fn parse_proxy_cache_valid(args: &[String]) -> Result<Vec<CacheValid>
             Ok(CacheValid { status, secs })
         })
         .collect()
+}
+
+/// `proxy_cache_use_stale` (ngx_http_proxy_next_upstream_masks plus
+/// `updating`); `off` alone turns every case off.
+pub(crate) fn parse_proxy_cache_use_stale(args: &[String]) -> Result<UseStale, Error> {
+    if args.is_empty() {
+        return Err(Error::MissingArg("proxy_cache_use_stale"));
+    }
+    let mut stale = UseStale::default();
+    if let [only] = args
+        && only == "off"
+    {
+        return Ok(stale);
+    }
+    for arg in args {
+        match arg.as_str() {
+            "error" => stale.error = true,
+            "timeout" => stale.timeout = true,
+            "invalid_header" => stale.invalid_header = true,
+            "updating" => stale.updating = true,
+            other => {
+                let slot = other
+                    .strip_prefix("http_")
+                    .and_then(|code| code.parse::<u16>().ok())
+                    .and_then(|code| UseStale::STATUSES.iter().position(|&s| s == code))
+                    .ok_or_else(|| Error::BadValue {
+                        what: "proxy_cache_use_stale",
+                        got: arg.clone(),
+                    })?;
+                stale.statuses[slot] = true;
+            }
+        }
+    }
+    Ok(stale)
 }
 
 /// `proxy_cache_path` (ngx_http_file_cache_set_slot). The loader and
