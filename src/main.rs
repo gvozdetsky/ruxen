@@ -538,6 +538,7 @@ impl Master {
             // ruxen exits 1 for a supervisor to restart it (#130; see
             // worker/panics.rs).
             match exited_rx.recv_timeout(Duration::from_millis(10)) {
+                // A generation that failed to start was joined already.
                 Ok((id, i, panicked)) => {
                     let Some(generation) = self.generation(id) else {
                         continue;
