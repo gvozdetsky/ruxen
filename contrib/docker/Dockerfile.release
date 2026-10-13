@@ -1,0 +1,22 @@
+# The image the release workflow publishes (ghcr.io/gvozdetsky/ruxen): the
+# tested release binaries, one per architecture, in a slim base. The
+# workflow puts them at bin/ruxen-amd64 and bin/ruxen-arm64 in the build
+# context. To build an image from source instead, use the Dockerfile next
+# to this one.
+#
+# Under Docker's default seccomp profile ruxen runs on epoll; with
+# --security-opt seccomp=seccomp-io_uring.json it runs on io_uring.
+
+FROM debian:bookworm-slim
+ARG TARGETARCH
+COPY bin/ruxen-${TARGETARCH} /usr/local/bin/ruxen
+COPY examples/minimal.conf /etc/ruxen/ruxen.conf
+# Run as a user of its own from the start, so nothing in the container
+# runs as root (`user` only applies when ruxen starts as root).
+RUN useradd --system --no-create-home --uid 10001 ruxen
+USER ruxen
+EXPOSE 8080
+# SIGQUIT is the graceful stop (requests in flight finish); `docker stop`
+# sends SIGKILL after its timeout.
+STOPSIGNAL SIGQUIT
+CMD ["ruxen", "-c", "/etc/ruxen/ruxen.conf"]
