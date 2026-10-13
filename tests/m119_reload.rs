@@ -231,6 +231,24 @@ fn reload_moves_listen_addresses() {
         std::io::ErrorKind::ConnectionRefused
     );
     assert!(!unix.exists(), "the removed unix socket's file is left");
+
+    // A port someone else holds fails the reload, after nginx's retries;
+    // the running configuration stays, with its sockets.
+    let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let c = busy.local_addr().unwrap().port();
+    s.write_conf(
+        "worker_processes 2;",
+        &format!("{}\n{}", returning(b, "b3"), returning(c, "c")),
+    );
+    s.hup();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !s.error_log().contains("still could not bind()") {
+        assert!(Instant::now() < deadline, "{}", s.error_log());
+        sleep(Duration::from_millis(50));
+    }
+    assert!(s.error_log().contains("[emerg] "), "{}", s.error_log());
+    assert_eq!(body(b), "b2\n");
+    s.wait_threads(3);
 }
 
 /// A download in flight when the reload comes: the old worker finishes it,

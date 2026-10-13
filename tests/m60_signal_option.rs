@@ -1,7 +1,7 @@
 //! M60 — `-s stop|quit|reopen` signal the running instance through the
-//! config's `pid` file, as nginx's `ngx_signal_process`. `-s reload` is
-//! refused (ruxen can't re-read its config); unknown names are nginx's
-//! `invalid option`. It used to be "not supported yet" for every name.
+//! config's `pid` file, as nginx's `ngx_signal_process` (`-s reload`: see
+//! m119); unknown names are nginx's `invalid option`. It used to be "not
+//! supported yet" for every name.
 
 mod common;
 
@@ -181,9 +181,13 @@ fn errors_like_nginx() {
         "{stderr}"
     );
 
+    // `reload` has no process to signal either.
     let out = run(&dir, &["-s", "reload"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("`-s reload` is not supported yet"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("[error] open() \""),
+        "{out:?}"
+    );
 
     let out = run(&dir, &["-s", "bogus"]);
     assert_eq!(out.status.code(), Some(1));
