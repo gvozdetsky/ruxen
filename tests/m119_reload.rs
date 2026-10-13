@@ -373,3 +373,48 @@ fn no_connection_fails_across_reloads() {
         assert_eq!(kill(s.child.id() as i32, SIGQUIT), 0);
     }
 }
+
+/// `limit_req` zones keep their state across a reload when declared the
+/// same way, as nginx keeps a shared zone of the same name and size (#342);
+/// another key for the zone fails the reload, as in nginx.
+#[test]
+fn limit_req_state_survives_a_reload() {
+    let port = free_port();
+    let s = start("limitreq", "", "");
+    std::fs::write(s.dir.join("index.html"), "x").unwrap();
+    let conf = |key: &str, text: &str| {
+        format!(
+            "limit_req_zone {key} zone=one:1m rate=1r/m;\n\
+             server {{ listen 127.0.0.1:{port}; root {d};\n\
+               location / {{ limit_req zone=one; add_header X-T {text} always; }} }}",
+            d = s.dir.display()
+        )
+    };
+    let status = || get(port, "/").unwrap()[9..12].to_string();
+    s.write_conf("", &conf("$binary_remote_addr", "a"));
+    s.reload();
+    s.wait_threads(2);
+    assert_eq!(status(), "200");
+    assert_eq!(status(), "503");
+
+    s.write_conf("", &conf("$binary_remote_addr", "b"));
+    s.reload();
+    assert!(
+        get(port, "/").unwrap().contains("503"),
+        "the bucket was reset"
+    );
+
+    s.write_conf("", &conf("$remote_addr", "c"));
+    s.hup();
+    assert!(
+        s.error_log()
+            .contains("limit_req \"one\" uses the \"$remote_addr\" key while previously it used the \"$binary_remote_addr\" key"),
+        "{}",
+        s.error_log()
+    );
+    let response = get(port, "/").unwrap();
+    assert!(
+        response.contains("503") && response.contains("X-T: b"),
+        "{response}"
+    );
+}

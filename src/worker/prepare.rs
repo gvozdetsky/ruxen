@@ -161,8 +161,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
     prepare_cache_zones(proxy_cache_paths)?;
-    prepare_limit_req_zones(limit_req_zones);
-    prepare_limit_conn_zones(limit_conn_zones);
+    prepare_limit_req_zones(limit_req_zones)?;
+    prepare_limit_conn_zones(limit_conn_zones)?;
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
         prepare_upstreams(upstreams);
 
@@ -618,22 +618,24 @@ fn prepare_proxy_cache(
 }
 
 /// Build the zones of `limit_req_zone` (#94).
-fn prepare_limit_req_zones(zones: Vec<crate::config::LimitReqZoneDef>) {
+fn prepare_limit_req_zones(zones: Vec<crate::config::LimitReqZoneDef>) -> Result<(), String> {
     let built = zones
         .into_iter()
         .map(|z| {
             let name: &'static str = Box::leak(z.name.into_boxed_str());
             let zone: &'static super::limit_req::LimitReqZone =
-                Box::leak(Box::new(super::limit_req::LimitReqZone::new(
+                Box::leak(Box::new(super::limit_req::LimitReqZone::declare(
                     name,
                     prepare_value_parts(z.key),
+                    &z.key_text,
                     z.size,
                     z.rate,
-                )));
-            (name.to_string(), zone)
+                )?));
+            Ok((name.to_string(), zone))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     LIMIT_REQ_ZONES.with(|m| *m.borrow_mut() = built);
+    Ok(())
 }
 
 /// A location's resolved `limit_req*` (`None` without `limit_req`). A zone
@@ -683,22 +685,23 @@ thread_local! {
 }
 
 /// Build the zones of `limit_conn_zone` (#95).
-fn prepare_limit_conn_zones(zones: Vec<crate::config::LimitConnZoneDef>) {
+fn prepare_limit_conn_zones(zones: Vec<crate::config::LimitConnZoneDef>) -> Result<(), String> {
     let built = zones
         .into_iter()
         .map(|z| {
             let name: &'static str = Box::leak(z.name.into_boxed_str());
             let zone: &'static super::limit_conn::LimitConnZone =
-                Box::leak(Box::new(super::limit_conn::LimitConnZone::new(
+                Box::leak(Box::new(super::limit_conn::LimitConnZone::declare(
                     name,
                     prepare_value_parts(z.key),
                     Box::leak(z.key_text.into_boxed_str()),
                     z.size,
-                )));
-            (name.to_string(), zone)
+                )?));
+            Ok((name.to_string(), zone))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     LIMIT_CONN_ZONES.with(|m| *m.borrow_mut() = built);
+    Ok(())
 }
 
 /// A location's resolved `limit_conn*` (`None` without `limit_conn`).
