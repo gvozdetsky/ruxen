@@ -89,6 +89,9 @@ pub struct ProxyPlan {
     /// matters because retries hold the original while the in-flight
     /// `write_all` consumes a clone.
     pub request: bytes::Bytes,
+    /// A large client body, sent after `request` from the request's own
+    /// buffer (shared, not copied); empty when the body is in `request`.
+    pub body: bytes::Bytes,
     /// Method of the *client* request — needed to strip the body for
     /// HEAD responses on the way back when the upstream sends one
     /// anyway.
@@ -144,6 +147,89 @@ pub struct ProxyPlan {
     /// worker when `ProxyReport::redirect_header` is set), and the hide /
     /// pass lists.
     pub response: &'static crate::worker::ProxyResponseRules,
+}
+
+/// Bodies up to this size are copied into the upstream request buffer
+/// (one buffer, one write); larger ones are sent from their own buffer with
+/// one writev, which keeps a body-sized copy per request out of the cache.
+pub const SEPARATE_BODY_MIN: usize = 16 * 1024;
+
+/// The upstream request header block and a body, owned by the writev
+/// operation (monoio keeps it until the kernel is done, also when the
+/// attempt is cancelled by a timeout, so the pooled buffers can't be
+/// reused while they are being sent).
+struct RequestParts {
+    head: bytes::Bytes,
+    body: bytes::Bytes,
+    /// Boxed so its address stays put while the value moves around.
+    iov: Box<[libc::iovec; 2]>,
+}
+
+impl RequestParts {
+    fn new(head: bytes::Bytes, body: bytes::Bytes) -> Self {
+        let empty = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        let mut parts = RequestParts {
+            head,
+            body,
+            iov: Box::new([empty, empty]),
+        };
+        parts.set_iov();
+        parts
+    }
+
+    fn set_iov(&mut self) {
+        for (iov, part) in self.iov.iter_mut().zip([&self.head, &self.body]) {
+            iov.iov_base = part.as_ptr() as *mut libc::c_void;
+            iov.iov_len = part.len();
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.head.len() + self.body.len()
+    }
+
+    /// Drop the first `n` bytes, which were written.
+    fn advance(&mut self, n: usize) {
+        let from_head = n.min(self.head.len());
+        bytes::Buf::advance(&mut self.head, from_head);
+        bytes::Buf::advance(&mut self.body, n - from_head);
+        self.set_iov();
+    }
+}
+
+// SAFETY: the iovecs point into `head` and `body`, which the value owns
+// and doesn't change while the runtime holds it; the boxed array keeps its
+// address when the value moves.
+unsafe impl monoio::buf::IoVecBuf for RequestParts {
+    fn read_iovec_ptr(&self) -> *const libc::iovec {
+        self.iov.as_ptr()
+    }
+    fn read_iovec_len(&self) -> usize {
+        2
+    }
+}
+
+/// Write the header block and the body with writev until both are sent.
+async fn write_request_parts(
+    stream: &mut TcpStream,
+    head: bytes::Bytes,
+    body: bytes::Bytes,
+) -> std::io::Result<()> {
+    let mut parts = RequestParts::new(head, body);
+    while parts.len() > 0 {
+        let (res, returned) = monoio::io::AsyncWriteRent::writev(stream, parts).await;
+        parts = returned;
+        match res {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => parts.advance(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// The temp file holding a large request body (an open descriptor: the
@@ -1060,10 +1146,16 @@ async fn attempt(
     // the original on `plan.request` is the only way to recover. With
     // `Bytes` the clone is just an Arc bump; the underlying request bytes
     // are never copied per attempt.
-    let req = plan.request.clone();
-    let send_fut = stream.write_all(req);
-    let (res, _returned) = match timeout(plan.send_timeout, send_fut).await {
-        Ok(pair) => pair,
+    let res = if plan.body.is_empty() {
+        timeout(plan.send_timeout, stream.write_all(plan.request.clone()))
+            .await
+            .map(|(res, _)| res.map(drop))
+    } else {
+        let parts = write_request_parts(&mut stream, plan.request.clone(), plan.body.clone());
+        timeout(plan.send_timeout, Box::pin(parts)).await
+    };
+    let res = match res {
+        Ok(res) => res,
         Err(_) => {
             return AttemptOutcome::Failed(
                 Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
@@ -1082,7 +1174,7 @@ async fn attempt(
             Box::new(UpstreamError::SendFailed(e)),
         );
     }
-    state.bytes_sent = plan.request.len() as u64;
+    state.bytes_sent = (plan.request.len() + plan.body.len()) as u64;
     if let Some(file) = &plan.body_file
         && let Err(error) = send_body_file(&mut stream, file, plan.send_timeout).await
     {
@@ -2034,6 +2126,38 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_parts_advance_across_head_and_body() {
+        fn sent(parts: &RequestParts) -> Vec<u8> {
+            use monoio::buf::IoVecBuf;
+            let iov = parts.read_iovec_ptr();
+            let mut out = Vec::new();
+            for i in 0..parts.read_iovec_len() {
+                // SAFETY: the iovecs point into `parts`' own buffers.
+                let v = unsafe { *iov.add(i) };
+                if v.iov_len > 0 {
+                    out.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len)
+                    });
+                }
+            }
+            out
+        }
+        let mut parts = RequestParts::new(
+            bytes::Bytes::from_static(b"HEAD\r\n"),
+            bytes::Bytes::from_static(b"body"),
+        );
+        assert_eq!(sent(&parts), b"HEAD\r\nbody");
+        parts.advance(3);
+        assert_eq!(sent(&parts), b"D\r\nbody");
+        parts.advance(4);
+        assert_eq!(sent(&parts), b"ody");
+        assert_eq!(parts.len(), 3);
+        parts.advance(3);
+        assert_eq!(parts.len(), 0);
+        assert_eq!(sent(&parts), b"");
+    }
 
     #[test]
     fn build_request_minimal() {
