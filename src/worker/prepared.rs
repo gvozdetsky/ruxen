@@ -1108,6 +1108,9 @@ pub struct PreparedLocation {
     /// chunked is off there is no chunked frame to append trailers to,
     /// so they are silently dropped (matching nginx's chunked filter).
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// A regex-mode location after prepare. The compiled
@@ -1150,6 +1153,9 @@ pub struct PreparedRegexLocation {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// Common view onto a matched location. The matcher hands one of these to
@@ -1187,6 +1193,9 @@ pub struct MatchedLocation<'a> {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 impl<'a> MatchedLocation<'a> {
@@ -1218,6 +1227,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            timeouts: loc.timeouts,
         }
     }
 
@@ -1267,6 +1277,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            timeouts: loc.timeouts,
         }
     }
 }
@@ -1407,7 +1418,11 @@ pub struct PreparedServer {
 /// Server-name matching and default-server fallback are evaluated inside
 /// this bucket only.
 pub struct PreparedListen {
+    /// `0.0.0.0:0` for a `unix:` socket.
     pub addr: SocketAddr,
+    /// `listen unix:/path` (#263): bound once by `main` before the workers
+    /// start, accepted on by each through its copy of the descriptor.
+    pub unix: Option<&'static Path>,
     /// `addr`'s IP as `$server_addr` shows it (no brackets for IPv6); empty
     /// for a wildcard address, where each connection's own is used.
     pub addr_text: &'static [u8],

@@ -872,6 +872,9 @@ pub(crate) fn parse_listen(s: &str) -> Result<SocketAddr, Error> {
 /// `ngx_parse_inet_url`. A single port is one listen.
 pub(crate) fn parse_listen_range_args(args: &[String]) -> Result<Vec<Listen>, Error> {
     let addr_s = args.first().ok_or(Error::MissingArg("listen"))?;
+    if addr_s.starts_with("unix:") {
+        return Ok(vec![parse_listen_args(args)?]);
+    }
     let bad = || Error::BadValue {
         what: "listen address",
         got: addr_s.to_string(),
@@ -906,7 +909,21 @@ pub(crate) fn parse_listen_range_args(args: &[String]) -> Result<Vec<Listen>, Er
 /// significant. nginx's parser is permissive in the same way.
 pub(crate) fn parse_listen_args(args: &[String]) -> Result<Listen, Error> {
     let addr_s = args.first().ok_or(Error::MissingArg("listen"))?;
-    let mut listen = Listen::from_addr(parse_listen(addr_s)?);
+    let mut listen = match addr_s.strip_prefix("unix:") {
+        // ngx_parse_unix_domain_url: a path that fits `sun_path`.
+        Some(path) => {
+            if path.is_empty() || path.len() + 1 > 108 {
+                return Err(Error::BadValue {
+                    what: "listen address",
+                    got: addr_s.clone(),
+                });
+            }
+            let mut listen = Listen::from_addr(SocketAddr::from(([0, 0, 0, 0], 0)));
+            listen.unix = Some(PathBuf::from(path));
+            listen
+        }
+        None => Listen::from_addr(parse_listen(addr_s)?),
+    };
     for raw in &args[1..] {
         let (name, value) = match raw.split_once('=') {
             Some((n, v)) => (n, Some(v)),
