@@ -1044,6 +1044,12 @@ pub struct AccessLog {
     pub syslog: Option<SyslogPeer>,
     pub format: Option<String>,
     pub condition: Option<Vec<ValuePart>>,
+    /// `buffer=size` (`gzip` alone means 64k), in bytes (#151).
+    pub buffer: Option<u64>,
+    /// `flush=time`, in milliseconds.
+    pub flush_ms: Option<u64>,
+    /// `gzip[=level]`: each flushed buffer is written as a gzip member.
+    pub gzip: Option<u32>,
 }
 
 /// Parsed `auth_basic` value. `off` explicitly disables inherited auth.

@@ -52,6 +52,7 @@ mod connection;
 pub(crate) mod gzip;
 mod handler;
 mod log;
+pub(crate) mod logbuf;
 mod panics;
 mod prepare;
 mod prepared;
@@ -182,6 +183,10 @@ pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc
         let mut cell = cell.borrow_mut();
         if cell.1.is_some() && cell.0 != generation {
             cell.0 = generation;
+            // The buffered lines belong to the files being rotated away.
+            if let Some(old) = &cell.1 {
+                logbuf::flush_all(old);
+            }
             match open_access_logs(logs) {
                 Ok(files) => cell.1 = Some(files),
                 // nginx keeps writing to the old file when a reopen fails.
@@ -190,6 +195,15 @@ pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc
         }
         cell.1.clone()
     })
+}
+
+/// The worker is stopping: write its access_log buffers out.
+pub(crate) fn flush_access_log_buffers() {
+    ACCESS_LOG_FILES.with(|cell| {
+        if let Some(files) = &cell.borrow().1 {
+            logbuf::flush_all(files);
+        }
+    });
 }
 
 /// Machine hostname, resolved once at startup for `$hostname` expansion.

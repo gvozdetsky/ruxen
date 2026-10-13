@@ -1775,6 +1775,8 @@ fn prepare_syslog_peer(
 pub(crate) struct AccessLogPrep<'a> {
     format_map: std::collections::HashMap<&'a str, &'a LogFormatDef>,
     canonical: Vec<PreparedAccessLog>,
+    /// Buffered files by path.
+    buffers: std::collections::HashMap<std::path::PathBuf, &'static PreparedLogBuffer>,
 }
 
 impl<'a> AccessLogPrep<'a> {
@@ -1787,6 +1789,7 @@ impl<'a> AccessLogPrep<'a> {
         Self {
             format_map,
             canonical: Vec::new(),
+            buffers: std::collections::HashMap::new(),
         }
     }
 
@@ -1818,8 +1821,35 @@ impl<'a> AccessLogPrep<'a> {
             }
         };
 
+        let buffer = match log.buffer {
+            None => None,
+            Some(size) => {
+                let wanted = (size as usize, log.flush_ms, log.gzip);
+                if let Some(known) = self.buffers.get(&log.path) {
+                    if (known.size, known.flush_ms, known.gzip) != wanted {
+                        return Err(format!(
+                            "access_log \"{}\" already defined with conflicting parameters",
+                            log.path.display()
+                        ));
+                    }
+                    Some(*known)
+                } else {
+                    let buffer: &'static PreparedLogBuffer =
+                        Box::leak(Box::new(PreparedLogBuffer {
+                            slot: self.buffers.len(),
+                            size: wanted.0,
+                            flush_ms: wanted.1,
+                            gzip: wanted.2,
+                            path: Box::leak(log.path.clone().into_boxed_path()),
+                        }));
+                    self.buffers.insert(log.path.clone(), buffer);
+                    Some(buffer)
+                }
+            }
+        };
         let file_index = self.canonical.len();
         let prepared = PreparedAccessLog {
+            buffer,
             path: Box::leak(log.path.clone().into_boxed_path()),
             format,
             escape,
