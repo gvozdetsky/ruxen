@@ -95,14 +95,16 @@ where
     let io = compat::PollIo::new(stream);
     let writing_since = io.writing_since();
     let stream = io.stream_handle();
-    // What nginx announces (ngx_http_v2_send_settings): 128 concurrent
-    // streams (http2_max_concurrent_streams), a 64 KiB stream window
-    // (http2_body_preread_size) and the largest frame size; then it opens
+    // What nginx announces (ngx_http_v2_send_settings), from the default
+    // server's settings: http2_max_concurrent_streams (128), a stream
+    // window of http2_body_preread_size (64k), the largest frame size; then
+    // it opens
     // the connection window to the maximum with a WINDOW_UPDATE
     // (ngx_http_v2_init). Clients such as Test::Nginx wait for both.
+    let h2conf = listen.servers[listen.default_server].h2;
     let handshake = h2::server::Builder::new()
-        .max_concurrent_streams(128)
-        .initial_window_size(64 * 1024)
+        .max_concurrent_streams(h2conf.max_concurrent_streams.unwrap_or(128))
+        .initial_window_size(h2conf.body_preread_size.unwrap_or(64 * 1024))
         .max_frame_size((1 << 24) - 1)
         .initial_connection_window_size((1 << 31) - 1)
         // The decoded request head is held whole before `handle` sees it:
@@ -340,7 +342,13 @@ async fn serve_stream(
     if !listen.http2_listen && !h2_server(listen, &parts, ctx.sni.as_deref()) {
         return misdirected(respond);
     }
-    let mut io = stream::StreamIo::new(&parts, body, respond, counters);
+    let listen = &ctx.http.listens[ctx.listen_index];
+    // nginx's default http2_chunk_size: DATA frames of at most 8 KiB.
+    let chunk = listen.servers[listen.default_server]
+        .h2
+        .chunk_size
+        .unwrap_or(8 * 1024) as usize;
+    let mut io = stream::StreamIo::new(&parts, body, respond, counters, chunk);
     super::handle(
         &mut io,
         ctx.peer_addr,

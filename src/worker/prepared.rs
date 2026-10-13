@@ -1461,6 +1461,8 @@ pub struct PreparedServer {
     /// HTTP/2 for this server: `http2 on` (server, else http) or
     /// `listen … http2` (#144).
     pub http2: bool,
+    /// Its `http2_*` settings, http's inherited (#346).
+    pub h2: crate::config::Http2Conf,
     /// The server-level keep-alive settings, which an HTTP/2 connection
     /// follows (`keepalive_requests` per connection, as nginx does with
     /// its default server's).

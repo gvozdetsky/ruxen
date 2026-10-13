@@ -52,6 +52,8 @@ pub(crate) struct StreamIo {
     head: Vec<u8>,
     /// The connection's start and the streams it carried before this one.
     counters: (std::time::Instant, u64),
+    /// `http2_chunk_size`: the largest DATA frame sent.
+    chunk: usize,
 }
 
 enum Out {
@@ -86,6 +88,7 @@ impl StreamIo {
         body: RecvStream,
         respond: SendResponse<Bytes>,
         counters: (std::time::Instant, u64),
+        chunk: usize,
     ) -> Self {
         let has_body = !body.is_end_stream();
         let length = parts.headers.contains_key(http::header::CONTENT_LENGTH);
@@ -104,6 +107,7 @@ impl StreamIo {
             out: Out::Head,
             head: Vec::new(),
             counters,
+            chunk: chunk.max(1),
         }
     }
 
@@ -351,15 +355,20 @@ impl StreamIo {
         let broken = |e: h2::Error| io::Error::new(io::ErrorKind::BrokenPipe, e);
         while !data.is_empty() {
             send.reserve_capacity(data.len());
-            let granted = match poll_fn(|cx| send.poll_capacity(cx)).await {
-                Some(Ok(n)) => n,
-                Some(Err(e)) => return Err(broken(e)),
-                None => return Err(io::ErrorKind::BrokenPipe.into()),
+            // What is left of the window first: `poll_capacity` reports
+            // only increases, and a chunk may use part of one.
+            let granted = match send.capacity() {
+                0 => match poll_fn(|cx| send.poll_capacity(cx)).await {
+                    Some(Ok(n)) => n,
+                    Some(Err(e)) => return Err(broken(e)),
+                    None => return Err(io::ErrorKind::BrokenPipe.into()),
+                },
+                n => n,
             };
             if granted == 0 {
                 continue;
             }
-            let k = granted.min(data.len());
+            let k = granted.min(data.len()).min(self.chunk);
             let last = end && k == data.len();
             send.send_data(Bytes::copy_from_slice(&data[..k]), last)
                 .map_err(broken)?;

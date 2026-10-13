@@ -83,6 +83,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         client_body_temp_path,
         sendfile,
         http2,
+        http2_conf,
         disable_symlinks,
         limit_rate,
         limit_rate_after,
@@ -192,6 +193,10 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             .map(|s| http2_listen || s.http2.or(http_http2).unwrap_or(false))
             .collect();
         let http2 = server_http2.iter().any(|&on| on);
+        let server_h2: Vec<crate::config::Http2Conf> = servers_for_addr
+            .iter()
+            .map(|s| s.http2_conf.inherit(&http2_conf))
+            .collect();
         let tls_default_server = servers_for_addr
             .iter()
             .position(|s| s.listen.default_server)
@@ -234,8 +239,9 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 )
             })
             .collect::<Result<_, _>>()?;
-        for (server, on) in servers.iter_mut().zip(&server_http2) {
+        for ((server, on), h2) in servers.iter_mut().zip(&server_http2).zip(&server_h2) {
             server.http2 = *on;
+            server.h2 = *h2;
         }
         let h2_by_sni = server_http2.iter().any(|&on| on != http2);
         let tls = build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)?;
@@ -1803,6 +1809,7 @@ pub(crate) fn prepare_server(
         doc_root: server_doc_root,
         // Set by the caller, which knows the http scope.
         http2: false,
+        h2: Default::default(),
         keepalive: server_keepalive,
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
         exact_names,

@@ -343,6 +343,8 @@ pub struct HttpConfig {
     pub sendfile: Option<bool>,
     /// http-scope `http2 on|off` (nginx 1.25.1+). `None`: not set (off).
     pub http2: Option<bool>,
+    /// http-scope `http2_*` settings (#346).
+    pub http2_conf: super::Http2Conf,
     /// http-scope `disable_symlinks`. `None`: off.
     pub disable_symlinks: Option<DisableSymlinks>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
@@ -797,6 +799,8 @@ pub struct Server {
     pub sendfile: Option<bool>,
     /// Server-scope `http2 on|off`. `None` inherits from http.
     pub http2: Option<bool>,
+    /// Server-scope `http2_*` settings; unset ones inherit from http.
+    pub http2_conf: super::Http2Conf,
     /// Server-scope `disable_symlinks`. `None` inherits from http.
     pub disable_symlinks: Option<DisableSymlinks>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).

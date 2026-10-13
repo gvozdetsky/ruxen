@@ -60,6 +60,7 @@ pub(crate) fn parse_server_block(
     let mut client_body_buffer_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
     let mut http2: Option<bool> = None;
+    let mut http2_conf = Http2Conf::default();
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
@@ -148,6 +149,7 @@ pub(crate) fn parse_server_block(
                         client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
                         http2,
+                        http2_conf,
                         disable_symlinks: disable_symlinks.clone(),
                         limit_rate,
                         limit_rate_after,
@@ -523,6 +525,9 @@ pub(crate) fn parse_server_block(
                     return Err(Error::Duplicate("disable_symlinks"));
                 }
                 disable_symlinks = Some(parse_disable_symlinks_args(&args[1..])?);
+            }
+            (name, Terminator::Semi) if Http2Conf::takes(name) => {
+                http2_conf.parse(&args, warnings)?
             }
             ("http2", Terminator::Semi) => {
                 if http2.is_some() {
