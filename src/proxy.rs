@@ -1176,17 +1176,9 @@ async fn attempt(
     let term_len = head_end_terminator.1;
     let body_start = head_end + term_len;
 
-    // 4. Parse the status line.
-    let first_line_end = match find_line_end(&accum[..head_end]) {
-        Some(p) => p.0,
-        None => {
-            return AttemptOutcome::Failed(
-                Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                FailKind::InvalidHeader,
-                Box::new(UpstreamError::InvalidStatusLine),
-            );
-        }
-    };
+    // 4. Parse the status line. Without header fields, its CRLF is part
+    // of the terminator and the whole head is the status line (#323).
+    let first_line_end = find_line_end(&accum[..head_end]).map_or(head_end, |p| p.0);
     // `status_line` is `accum[..first_line_end]`, but binding it as a
     // slice would hold an immutable borrow across the body-pull loop
     // (which mutates accum). Re-borrow on each use instead.
@@ -1221,8 +1213,7 @@ async fn attempt(
     }
 
     // 5. Parse framing-relevant headers.
-    let head_after_status =
-        &accum[first_line_end + first_line_terminator_len(&accum, first_line_end)..head_end];
+    let head_after_status = &accum[headers_start(&accum, first_line_end, head_end)..head_end];
     let mut content_length: Option<u64> = None;
     let mut chunked = false;
     let mut upstream_close = !upstream_is_11; // HTTP/1.0 closes by default
@@ -1520,7 +1511,7 @@ async fn attempt(
     if keep_upstream_headers {
         upstream_headers.clear();
     }
-    let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
+    let mut cursor = headers_start(&accum, first_line_end, head_end);
     let mut have_content_length = false;
     let mut seen_single: u16 = 0;
     while cursor < head_end {
@@ -1984,6 +1975,12 @@ fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Where the header fields start: past the status line's terminator, or
+/// at `head_end` when there are none.
+fn headers_start(buf: &[u8], first_line_end: usize, head_end: usize) -> usize {
+    (first_line_end + first_line_terminator_len(buf, first_line_end)).min(head_end)
 }
 
 fn first_line_terminator_len(buf: &[u8], line_end: usize) -> usize {
