@@ -67,7 +67,10 @@ fn m95_second_instance_fails_with_address_in_use() {
         .unwrap();
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
-    let busy = format!("[emerg] bind() to 127.0.0.1:{port} failed (98: Address already in use)");
+    let busy = format!(
+        "[emerg] bind() to 127.0.0.1:{port} failed ({})",
+        common::errno_text(98)
+    );
     // nginx's five tries, 500 ms apart.
     assert_eq!(stderr.matches(&busy).count(), 5, "{stderr}");
     assert!(
