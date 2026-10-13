@@ -97,13 +97,14 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     // to listen on and idle until shutdown.
     // Group server blocks by listen address while preserving declaration
     // order both across listen buckets and within each bucket.
-    let mut grouped: Vec<(SocketAddr, Vec<Server>)> = Vec::new();
+    // A `unix:` socket is its own address (#263).
+    let mut grouped: Vec<((SocketAddr, Option<std::path::PathBuf>), Vec<Server>)> = Vec::new();
     for server in servers {
-        let addr = server.listen.addr;
-        if let Some((_, bucket)) = grouped.iter_mut().find(|(a, _)| *a == addr) {
+        let key = (server.listen.addr, server.listen.unix.clone());
+        if let Some((_, bucket)) = grouped.iter_mut().find(|(k, _)| *k == key) {
             bucket.push(server);
         } else {
-            grouped.push((addr, vec![server]));
+            grouped.push((key, vec![server]));
         }
     }
 
@@ -159,7 +160,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         prepare_upstreams(upstreams);
 
     let mut listens: Vec<PreparedListen> = Vec::with_capacity(grouped.len());
-    for (addr, servers_for_addr) in grouped {
+    for ((addr, unix), servers_for_addr) in grouped {
+        let unix: Option<&'static Path> = unix.map(|p| &*Box::leak(p.into_boxed_path()));
         // Snapshot the TLS-relevant fields up front: prepare_server consumes
         // each `Server`, and we want to feed the SNI resolver in the same
         // declaration order.
@@ -251,7 +253,12 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             exact_names,
             regex_name_set,
             addr,
-            addr_text: if addr.ip().is_unspecified() {
+            unix,
+            // nginx shows a unix socket's address as `unix:` (the client
+            // side has no path).
+            addr_text: if unix.is_some() {
+                b"unix:"
+            } else if addr.ip().is_unspecified() {
                 b""
             } else {
                 Box::leak(addr.ip().to_string().into_bytes().into_boxed_slice())

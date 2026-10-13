@@ -1401,7 +1401,11 @@ pub struct PreparedServer {
 /// Server-name matching and default-server fallback are evaluated inside
 /// this bucket only.
 pub struct PreparedListen {
+    /// `0.0.0.0:0` for a `unix:` socket.
     pub addr: SocketAddr,
+    /// `listen unix:/path` (#263): bound once by `main` before the workers
+    /// start, accepted on by each through its copy of the descriptor.
+    pub unix: Option<&'static Path>,
     /// `addr`'s IP as `$server_addr` shows it (no brackets for IPv6); empty
     /// for a wildcard address, where each connection's own is used.
     pub addr_text: &'static [u8],

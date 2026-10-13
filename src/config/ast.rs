@@ -341,7 +341,10 @@ pub struct UpstreamServer {
 /// against `default_server` / `reuseport` etc. is not significant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listen {
+    /// `0.0.0.0:0` for a `unix:` socket.
     pub addr: SocketAddr,
+    /// `listen unix:/path` (#263).
+    pub unix: Option<PathBuf>,
     /// `listen … ssl;` — terminate TLS on this socket.
     pub ssl: bool,
     /// `default_server` — server block becomes the catch-all for its addr.
@@ -392,6 +395,7 @@ impl Listen {
     pub(crate) fn from_addr(addr: SocketAddr) -> Self {
         Self {
             addr,
+            unix: None,
             ssl: false,
             default_server: false,
             reuseport: false,
