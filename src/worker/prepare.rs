@@ -306,6 +306,10 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         cache_zones: CACHE_ZONES.with(|z| &*Box::leak(z.borrow().clone().into_boxed_slice())),
         implicit_upstreams: IMPLICIT_UPSTREAMS.with(|i| i.take().leak()),
         conf_prefix: conf_prefix.map(leak_path_buf),
+        shutdown_timeout: runtime
+            .worker_shutdown_timeout_ms
+            .filter(|&ms| ms != 0)
+            .map(Duration::from_millis),
     })))
 }
 

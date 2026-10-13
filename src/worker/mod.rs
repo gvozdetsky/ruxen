@@ -63,6 +63,7 @@ mod response;
 mod rewrite;
 mod runtime;
 pub(crate) mod stats;
+mod tunnel;
 
 pub(crate) use connection::*;
 pub(crate) use handler::*;
@@ -74,6 +75,7 @@ pub(crate) use render::*;
 pub(crate) use response::*;
 pub(crate) use rewrite::*;
 pub(crate) use runtime::*;
+pub(crate) use tunnel::*;
 
 /// Bumped on SIGUSR1; each worker reopens its access_log files before the
 /// next write once it sees a new value (logrotate's `kill -USR1`).
@@ -1116,7 +1118,7 @@ mod tests {
             Response::Prebuilt(bytes) => bytes.to_vec(),
             Response::File { .. } => panic!("error path should not return streamed file body"),
             Response::Reroute(_) => panic!("root handler should not reroute on metadata failure"),
-            Response::Proxy(_) | Response::ProxyStream(_) => {
+            Response::Proxy(_) | Response::Upgrade(_) | Response::ProxyStream(_) => {
                 panic!("root handler should not return proxy plan")
             }
         };

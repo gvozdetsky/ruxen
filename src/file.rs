@@ -1094,6 +1094,7 @@ mod tests {
             | Response::Prebuilt(_)
             | Response::Reroute(_)
             | Response::Proxy(_)
+            | Response::Upgrade(_)
             | Response::ProxyStream(_) => {
                 panic!("expected streamed file response")
             }
@@ -1126,6 +1127,7 @@ mod tests {
             | Response::Prebuilt(_)
             | Response::Reroute(_)
             | Response::Proxy(_)
+            | Response::Upgrade(_)
             | Response::ProxyStream(_) => {
                 panic!("expected buffered headers-only response")
             }
@@ -1158,6 +1160,7 @@ mod tests {
             | Response::Prebuilt(_)
             | Response::Reroute(_)
             | Response::Proxy(_)
+            | Response::Upgrade(_)
             | Response::ProxyStream(_) => {
                 panic!("expected inlined small response")
             }
@@ -1190,6 +1193,7 @@ mod tests {
             | Response::Prebuilt(_)
             | Response::Reroute(_)
             | Response::Proxy(_)
+            | Response::Upgrade(_)
             | Response::ProxyStream(_) => {
                 panic!("expected buffered headers-only response for zero-length file")
             }

@@ -1126,7 +1126,8 @@ async fn run_post_action(
         Response::File { headers, body: _ } => owned_response = headers,
         // post_action's answer isn't sent: the upstream connection closes.
         Response::ProxyStream(s) => owned_response = s.head,
-        Response::Reroute(_) | Response::Proxy(_) => return,
+        // nginx refuses an upgrade in a subrequest.
+        Response::Reroute(_) | Response::Proxy(_) | Response::Upgrade(_) => return,
     }
     let response_for_logs = static_response.unwrap_or(owned_response.as_slice());
     let log_request_uri = post_path;
@@ -2439,6 +2440,48 @@ impl IdleMark {
     }
 }
 
+/// Wakes a task on shutdown or reload like an idle connection, without
+/// counting it as idle: an upgraded connection is busy, and isn't one to
+/// close to make room.
+pub(crate) struct EventWatch {
+    slot: usize,
+}
+
+impl EventWatch {
+    pub(crate) fn new() -> Self {
+        WORKER_CONNS.with(|w| {
+            let slot = match w.idle_free.borrow_mut().pop() {
+                Some(slot) => slot,
+                None => {
+                    let mut wakers = w.idle_wakers.borrow_mut();
+                    wakers.push(None);
+                    wakers.len() - 1
+                }
+            };
+            EventWatch { slot }
+        })
+    }
+
+    pub(crate) fn register(&self, waker: &std::task::Waker) {
+        WORKER_CONNS.with(|w| {
+            let mut wakers = w.idle_wakers.borrow_mut();
+            match &mut wakers[self.slot] {
+                Some(old) if old.will_wake(waker) => {}
+                slot => *slot = Some(waker.clone()),
+            }
+        })
+    }
+}
+
+impl Drop for EventWatch {
+    fn drop(&mut self) {
+        WORKER_CONNS.with(|w| {
+            w.idle_wakers.borrow_mut()[self.slot] = None;
+            w.idle_free.borrow_mut().push(self.slot);
+        });
+    }
+}
+
 impl Drop for IdleMark {
     fn drop(&mut self) {
         WORKER_CONNS.with(|w| {
@@ -2610,8 +2653,14 @@ pub(crate) async fn handle_tls(
     ))
     .await;
     // close_notify before TCP FIN. Best-effort: peer may already have gone
-    // away; we don't have anything useful to do with the error.
-    let _ = monoio::io::AsyncWriteRent::shutdown(&mut tls_stream).await;
+    // away; we don't have anything useful to do with the error. A client
+    // that doesn't read (a tunnel that ended on send_timeout) gets 3 s, as
+    // ngx_ssl_shutdown gives it.
+    let _ = monoio::time::timeout(
+        Duration::from_secs(3),
+        monoio::io::AsyncWriteRent::shutdown(&mut tls_stream),
+    )
+    .await;
 }
 
 pub(crate) async fn handle<S: ConnIo>(
@@ -3288,6 +3337,119 @@ pub(crate) async fn handle<S: ConnIo>(
                         // server's values again, as in nginx.
                         let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
 
+                        // An upstream 101 to a client that asked to upgrade:
+                        // the head goes out, then the connection is a tunnel
+                        // until either side closes, and then it closes.
+                        if let Response::Upgrade(upgraded) = response {
+                            let crate::proxy::Upgraded {
+                                head,
+                                upstream,
+                                leftover,
+                                slot,
+                                read_timeout,
+                                send_timeout,
+                                upstream_url,
+                                lease,
+                            } = *upgraded;
+                            let head_len = head.len();
+                            let (res, head) = write_all_timed(
+                                stream,
+                                head,
+                                head_len,
+                                timers.io.as_mut(),
+                                timeouts.send,
+                            )
+                            .await;
+                            if res.is_err() {
+                                return;
+                            }
+                            let early: &[u8] = if pipelined_tail.is_empty() {
+                                &buf[read_start + request_total_consumed..filled]
+                            } else {
+                                &pipelined_tail
+                            };
+                            let tunnelled = Box::pin(run_tunnel(
+                                stream,
+                                upstream,
+                                early,
+                                leftover,
+                                TunnelConf {
+                                    read_timeout,
+                                    upstream_send_timeout: send_timeout,
+                                    client_send_timeout: timeouts.send,
+                                    http,
+                                    state: &state,
+                                    start_reload_gen,
+                                },
+                            ))
+                            .await;
+                            drop(slot);
+                            drop(lease);
+                            if tunnelled.end == TunnelEnd::ClientTimedOut {
+                                // ngx_http_upstream_process_upgraded, at info.
+                                write_error_log(
+                                    process_meta.log.error_logs,
+                                    ErrorLogLevel::Info,
+                                    &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                        .with_realip(&process_meta),
+                                    b"client timed out (110: Connection timed out) while proxying upgraded connection",
+                                    Some(&upstream_url),
+                                );
+                            }
+                            if tunnelled.end == TunnelEnd::UpstreamTimedOut {
+                                write_upstream_error_log(
+                                    &process_meta.log,
+                                    &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                        .with_realip(&process_meta),
+                                    &[crate::proxy::AttemptFailure {
+                                        error: crate::proxy::UpstreamError::TimedOut(
+                                            crate::proxy::Stage::Upgraded,
+                                        ),
+                                        upstream: upstream_url,
+                                    }],
+                                );
+                            }
+                            if let Some(last) = process_meta.upstream_states.last_mut() {
+                                last.bytes_received += tunnelled.from_upstream;
+                                last.bytes_sent += tunnelled.to_upstream;
+                            }
+                            if !process_meta.access_logs.is_empty() {
+                                let request_time_us = request_start.elapsed().as_micros() as u64;
+                                let bytes_sent = head_len as u64 + tunnelled.to_client;
+                                write_access_logs(
+                                    process_meta.access_logs,
+                                    path,
+                                    method_bytes,
+                                    request_line,
+                                    host,
+                                    &remote_addr,
+                                    remote_port,
+                                    process_meta.remote_user.as_deref(),
+                                    headers_raw,
+                                    &head,
+                                    connection_id,
+                                    request_count,
+                                    connection_time_us,
+                                    request_time_us,
+                                    process_meta.server_port,
+                                    request_port,
+                                    pipe_byte,
+                                    request_length,
+                                    bytes_sent,
+                                    tunnelled.to_client,
+                                    epoch_secs,
+                                    epoch_ms,
+                                    tls,
+                                    conn,
+                                    http,
+                                    Some(&process_meta),
+                                    final_uri(&process_meta, url_scratch),
+                                )
+                                .await;
+                            }
+                            return;
+                        }
+
                         // Defer the response write per `auth_delay`. We
                         // sleep on the runtime, not the OS thread, so other
                         // connections on this worker keep progressing.
@@ -3362,6 +3524,8 @@ pub(crate) async fn handle<S: ConnIo>(
                             // `run_proxy` before this match runs; reaching
                             // here is a logic bug.
                             Response::Proxy(_) => return,
+                            // Tunnelled above.
+                            Response::Upgrade(_) => return,
                         };
                         // Single walk over the response header block replaces
                         // what used to be three separate scans. For static

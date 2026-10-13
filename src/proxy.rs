@@ -154,6 +154,10 @@ pub struct ProxyPlan {
     /// worker when `ProxyReport::redirect_header` is set), and the hide /
     /// pass lists.
     pub response: &'static crate::worker::ProxyResponseRules,
+    /// The client asked for a protocol switch (an `Upgrade` header): an
+    /// upstream 101 then turns the connection into a tunnel
+    /// (ngx_http_proxy_process_header, `u->upgrade`).
+    pub upgrade: bool,
     /// `proxy_cache` (#233): `None` unless the location has one and the
     /// request may use it.
     pub cache: Option<Box<CachePlan>>,
@@ -167,6 +171,25 @@ pub struct ProxyPlan {
     /// comes (#88): nothing on this location needs it whole (no cache,
     /// gzip or `add_trailer`), and this is the request's first pass.
     pub stream: bool,
+}
+
+/// An upstream that answered 101 to a client asking to upgrade: the
+/// response head for the client and the connection to tunnel to.
+pub struct Upgraded {
+    pub head: Vec<u8>,
+    pub upstream: TcpStream,
+    /// Bytes the upstream sent past its head, already read.
+    pub leftover: Vec<u8>,
+    /// The worker_connections slot the upstream connection holds.
+    pub slot: crate::worker::UpstreamSlot,
+    /// `proxy_read_timeout` / `proxy_send_timeout`.
+    pub read_timeout: Duration,
+    pub send_timeout: Duration,
+    /// `upstream: "…"` for the error log.
+    pub upstream_url: String,
+    /// The peer stays leased while the tunnel is open, so `least_conn`
+    /// counts it, as nginx frees the peer only when the request ends.
+    pub lease: Option<LeasedPeer>,
 }
 
 /// A request's view of its `proxy_cache`: what the lookup found, and what
@@ -723,7 +746,9 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 if let Some(state) = report.states.last_mut() {
                     state.in_flight = true;
                 }
-                if let Response::ProxyStream(body) = &mut resp {
+                if let Response::Upgrade(upgraded) = &mut resp {
+                    upgraded.lease = Some(current);
+                } else if let Response::ProxyStream(body) = &mut resp {
                     body.lease = Some(current);
                 }
                 return resp;
@@ -949,6 +974,7 @@ pub enum Stage {
     SendingRequest,
     ReadingHeader,
     ReadingBody,
+    Upgraded,
 }
 
 impl Stage {
@@ -958,6 +984,7 @@ impl Stage {
             Stage::SendingRequest => "sending request to upstream",
             Stage::ReadingHeader => "reading response header from upstream",
             Stage::ReadingBody => "reading upstream",
+            Stage::Upgraded => "proxying upgraded connection",
         }
     }
 }
@@ -1647,6 +1674,20 @@ async fn attempt(
         );
     }
 
+    if status_code == 101 && plan.upgrade {
+        state.response_length = 0;
+        return upgraded(
+            plan,
+            peer_idx,
+            stream,
+            accum,
+            first_line_end,
+            head_end,
+            body_start,
+            slot,
+        );
+    }
+
     // 5. Parse framing-relevant headers.
     let head_after_status = &accum[headers_start(&accum, first_line_end, head_end)..head_end];
     let mut content_length: Option<u64> = None;
@@ -1831,7 +1872,13 @@ async fn attempt(
         )));
     }
     if !body_has_content {
-        // Body length is whatever already came in with the header read.
+        // No body to forward, whatever came in with the header (nginx
+        // sends a 1xx not upgraded, a 204 or a 304 without one). Bytes
+        // past the head leave the connection unusable for the pool.
+        if body_len_in_accum > 0 && !skip_body {
+            upstream_close = true;
+        }
+        body_len_in_accum = 0;
     } else if chunked {
         let mut body = Vec::with_capacity(body_len_in_accum + 4096);
         body.extend_from_slice(&accum[body_start..]);
@@ -2456,6 +2503,73 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         out.extend_from_slice(body);
     }
     Response::Owned(out)
+}
+
+/// The 101 to a client that asked to upgrade (ngx_http_upstream_upgrade):
+/// the head goes out as nginx's header filter writes it, with the
+/// upstream's `Upgrade` kept and `Connection: upgrade`, and the connection
+/// is handed over for the tunnel instead of reading a body.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn upgraded(
+    plan: &ProxyPlan,
+    peer_idx: usize,
+    stream: TcpStream,
+    accum: Vec<u8>,
+    first_line_end: usize,
+    head_end: usize,
+    body_start: usize,
+    slot: crate::worker::UpstreamSlot,
+) -> AttemptOutcome {
+    let mut head = Vec::with_capacity(head_end + 64);
+    head.extend_from_slice(b"HTTP/1.1");
+    head.extend_from_slice(&accum[8..first_line_end]);
+    crate::http::write_server_and_date(&mut head, plan.server_bytes);
+    head.extend_from_slice(b"\r\nConnection: upgrade\r\n");
+    let rules = plan.response;
+    let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
+    while cursor < head_end {
+        let (line_len, t) = match find_line_end(&accum[cursor..head_end]) {
+            Some(v) => v,
+            None => (head_end - cursor, 0),
+        };
+        let line = &accum[cursor..cursor + line_len];
+        cursor += line_len + t;
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            if line.is_empty() {
+                break;
+            }
+            continue;
+        };
+        let name = trim_ascii(&line[..colon]);
+        let keep = name.eq_ignore_ascii_case(b"upgrade")
+            || match classify_upstream_header(name) {
+                UpstreamHeader::HopByHop => false,
+                UpstreamHeader::Hidden(bit) => rules.pass_mask & bit != 0,
+                _ => !rules.hide.iter().any(|h| h.eq_ignore_ascii_case(name)),
+            };
+        if keep {
+            head.extend_from_slice(line);
+            head.extend_from_slice(b"\r\n");
+        }
+        if t == 0 {
+            break;
+        }
+    }
+    head.extend_from_slice(b"\r\n");
+    let leftover = accum[body_start.min(accum.len())..].to_vec();
+    return_proxy_buf(accum);
+    AttemptOutcome::Ok(Response::Upgrade(Box::new(Upgraded {
+        head,
+        upstream: stream,
+        leftover,
+        slot,
+        read_timeout: plan.read_timeout,
+        send_timeout: plan.send_timeout,
+        upstream_url: upstream_url(plan, peer_idx),
+        lease: None,
+    })))
 }
 
 /// Stream a request body that was too large to keep in memory from its

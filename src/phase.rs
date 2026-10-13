@@ -457,6 +457,9 @@ pub enum Response {
     /// then re-enters the existing write path with `Owned` / `Prebuilt`
     /// bytes. Mirrors how `File` carries an fd that the worker streams.
     Proxy(Box<crate::proxy::ProxyPlan>),
+    /// An upstream 101 to a client that asked to upgrade: the head to
+    /// send, then the connection becomes a tunnel (#87).
+    Upgrade(Box<crate::proxy::Upgraded>),
     /// An upstream response whose body is relayed as it arrives (#88): the
     /// head is filtered like `Owned`, then the worker writes it and relays
     /// the body.
@@ -2084,7 +2087,7 @@ mod tests {
                 panic!("phase::process test helper expected buffered response")
             }
             Response::Reroute(_) => panic!("phase::process must consume Reroute"),
-            Response::Proxy(_) | Response::ProxyStream(_) => {
+            Response::Proxy(_) | Response::Upgrade(_) | Response::ProxyStream(_) => {
                 panic!("phase::process test helper expected buffered response")
             }
         }
