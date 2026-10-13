@@ -587,6 +587,11 @@ fn process_with_meta_inner(
             return refuse(http, req, url_scratch, server, response, true, false);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if req.method == Method::Trace
+                && crate::worker::test_panic() == crate::worker::TestPanic::Trace
+            {
+                panic!("{}=trace", crate::worker::TEST_PANIC_ENV);
+            }
             let response = Response::Owned(crate::file::method_not_allowed(
                 req.method,
                 server.server_header,

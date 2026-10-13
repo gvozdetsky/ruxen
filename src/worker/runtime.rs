@@ -1108,6 +1108,9 @@ pub fn run(
         drop(ready);
         // Accept only once `main` has switched to the configured `user`.
         state.wait_released();
+        if test_panic() == TestPanic::Worker {
+            panic!("{TEST_PANIC_ENV}=worker");
+        }
 
         if listeners.len() == 1 {
             // Single-listen fast path: keep the accept loop in this top-level
@@ -1225,44 +1228,60 @@ pub(crate) fn spawn_connection(
     let guard = ConnectionGuard(state.clone());
     if prepared.proxy_protocol {
         // Cold: `listen … proxy_protocol`.
-        monoio::spawn(handle_proxy_protocol(
-            prepared,
-            stream,
-            peer_addr,
-            listen_index,
+        monoio::spawn(Contained::new(
+            handle_proxy_protocol(
+                prepared,
+                stream,
+                peer_addr,
+                listen_index,
+                http,
+                state,
+                connection_id,
+                guard,
+            ),
             http,
-            state,
             connection_id,
-            guard,
+            peer_addr,
         ));
         return;
     }
     match &prepared.tls {
         None => {
-            monoio::spawn(handle_plain(
-                stream,
-                peer_addr,
-                listen_index,
+            // A panic ends this connection only (#130).
+            monoio::spawn(Contained::new(
+                handle_plain(
+                    stream,
+                    peer_addr,
+                    listen_index,
+                    http,
+                    state,
+                    connection_id,
+                    None,
+                    guard,
+                ),
                 http,
-                state,
                 connection_id,
-                None,
-                guard,
+                peer_addr,
             ));
         }
         Some(acceptor) => {
             let acceptor = acceptor.clone();
-            monoio::spawn(handle_tls(
-                stream,
-                acceptor,
-                peer_addr,
-                listen_index,
+            monoio::spawn(Contained::new(
+                handle_tls(
+                    stream,
+                    acceptor,
+                    peer_addr,
+                    listen_index,
+                    http,
+                    state,
+                    connection_id,
+                    None,
+                    Instant::now(),
+                    guard,
+                ),
                 http,
-                state,
                 connection_id,
-                None,
-                Instant::now(),
-                guard,
+                peer_addr,
             ));
         }
     }
