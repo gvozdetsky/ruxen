@@ -62,6 +62,9 @@ pub struct ConnInfo {
     pub server_addr: std::borrow::Cow<'static, [u8]>,
     /// The client's address, which `allow` / `deny` match.
     pub peer_ip: IpAddr,
+    /// The client came over a `listen unix:` socket (#263): `peer_ip` is a
+    /// placeholder, and only `all` / `unix:` rules match it.
+    pub peer_unix: bool,
     /// The connection's own peer, once the realip module replaced
     /// `peer_ip` for a request (`$realip_remote_addr`, `$realip_remote_port`).
     pub realip: Option<Box<RealIpPeer>>,
@@ -80,6 +83,7 @@ impl ConnInfo {
         proxy_protocol: None,
         server_addr: std::borrow::Cow::Borrowed(b""),
         peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        peer_unix: false,
         realip: None,
     };
 }
@@ -1099,7 +1103,7 @@ fn real_ip(req: &RequestCtx<'_>, conf: &crate::worker::PreparedRealIp) -> Option
     let (ip, port) = match conf.header {
         H::ProxyProtocol => {
             let source = req.conn.proxy_protocol.as_ref()?.source?;
-            if !real_ip_trusted(conf.from, req.conn.peer_ip) {
+            if !peer_trusted(conf.from, req.conn) {
                 return None;
             }
             (source.ip(), source.port())
@@ -1118,11 +1122,12 @@ fn real_ip(req: &RequestCtx<'_>, conf: &crate::worker::PreparedRealIp) -> Option
                     &joined
                 }
             };
-            forwarded_addr(req.conn.peer_ip, value, conf.from, conf.recursive)?
+            forwarded_addr(req.conn, value, conf.from, conf.recursive)?
         }
     };
     let mut conn = req.conn.clone();
     conn.peer_ip = ip;
+    conn.peer_unix = false;
     conn.realip = Some(Box::new(RealIpPeer {
         addr: req.remote_addr.to_vec(),
         port: req.remote_port,
@@ -1150,17 +1155,24 @@ fn with_real_ip<'a>(req: &RequestCtx<'a>, state: &'a RealIpState) -> RequestCtx<
 /// `recursive`, only the last entry is taken. `None` when the peer isn't
 /// trusted or the last entry doesn't parse.
 fn forwarded_addr(
-    peer: IpAddr,
+    peer: &ConnInfo,
     list: &[u8],
     from: &[AccessAddr],
     recursive: bool,
 ) -> Option<(IpAddr, u16)> {
     let is_sep = |b: u8| b == b' ' || b == b',';
-    let mut current = peer;
+    let mut current = peer.peer_ip;
+    // The connection's own peer may be a unix-domain one.
+    let mut first = true;
     let mut found = None;
     let mut len = list.len();
     loop {
-        if !real_ip_trusted(from, current) || len == 0 {
+        let trusted = if std::mem::take(&mut first) {
+            peer_trusted(from, peer)
+        } else {
+            real_ip_trusted(from, current)
+        };
+        if !trusted || len == 0 {
             return found;
         }
         let mut p = len - 1;
@@ -1211,6 +1223,16 @@ fn parse_addr_port(text: &[u8]) -> Option<(IpAddr, u16)> {
     }
     let port: u16 = port.parse().ok().filter(|&p| p > 0)?;
     Some((addr(host)?, port))
+}
+
+/// The connection's peer against `set_real_ip_from`: `unix:` for a
+/// unix-domain client, the address otherwise.
+fn peer_trusted(from: &[AccessAddr], conn: &ConnInfo) -> bool {
+    if conn.peer_unix {
+        from.iter().any(|a| matches!(a, AccessAddr::Unix))
+    } else {
+        real_ip_trusted(from, conn.peer_ip)
+    }
 }
 
 /// `ngx_cidr_match` against `set_real_ip_from`; IPv4-mapped addresses
@@ -1288,7 +1310,7 @@ fn check_access(
     // The access module's handler runs before auth_basic's. With `satisfy
     // all` a deny answers at once; with `any` an allow does, and a deny
     // only counts if auth_basic doesn't pass either.
-    let forbidden = match match_access_rules(access.rules, req.conn.peer_ip) {
+    let forbidden = match match_access_rules(access.rules, req.conn.peer_ip, req.conn.peer_unix) {
         Some(false) if access.satisfy_any => return AccessControl::Allow { remote_user: None },
         Some(true) if !access.satisfy_any => return access_forbidden(http, req, meta),
         found => found == Some(true),
@@ -1305,7 +1327,14 @@ fn check_access(
 /// The first `allow` / `deny` rule matching `peer`: `Some(deny)`, or
 /// `None` when none does (`ngx_http_access_handler`). An IPv4-mapped IPv6
 /// peer is matched as IPv4.
-fn match_access_rules(rules: &[AccessRule], peer: IpAddr) -> Option<bool> {
+fn match_access_rules(rules: &[AccessRule], peer: IpAddr, unix: bool) -> Option<bool> {
+    // A unix-domain client matches only `all` and `unix:`
+    // (ngx_http_access_handler by address family).
+    if unix {
+        return rules.iter().find_map(|rule| {
+            matches!(rule.addr, AccessAddr::All | AccessAddr::Unix).then_some(rule.deny)
+        });
+    }
     let peer = match peer {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
         v4 => v4,
@@ -2086,8 +2115,12 @@ mod tests {
                 mask: 0xffff_ff00,
             },
         ];
-        let peer = ip("127.0.0.1");
-        let get = |list: &str, recursive| forwarded_addr(peer, list.as_bytes(), &from, recursive);
+        let conn = |peer| ConnInfo {
+            peer_ip: peer,
+            ..ConnInfo::NONE
+        };
+        let peer = conn(ip("127.0.0.1"));
+        let get = |list: &str, recursive| forwarded_addr(&peer, list.as_bytes(), &from, recursive);
         // Off: the last entry, trusted or not.
         assert_eq!(
             get("10.0.0.1, 192.0.2.7", false),
@@ -2111,12 +2144,23 @@ mod tests {
         assert_eq!(get("", false), None);
         // An untrusted peer: the header is ignored.
         assert_eq!(
-            forwarded_addr(ip("10.9.9.9"), b"1.2.3.4", &from, false),
+            forwarded_addr(&conn(ip("10.9.9.9")), b"1.2.3.4", &from, false),
             None
         );
         // An IPv4-mapped peer matches the IPv4 entries.
         assert_eq!(
-            forwarded_addr(ip("::ffff:127.0.0.1"), b"1.2.3.4", &from, false),
+            forwarded_addr(&conn(ip("::ffff:127.0.0.1")), b"1.2.3.4", &from, false),
+            Some((ip("1.2.3.4"), 0))
+        );
+        // A unix-domain peer is trusted only by `unix:`.
+        let unix_peer = ConnInfo {
+            peer_unix: true,
+            ..ConnInfo::NONE
+        };
+        assert_eq!(forwarded_addr(&unix_peer, b"1.2.3.4", &from, false), None);
+        let with_unix = [crate::config::AccessAddr::Unix];
+        assert_eq!(
+            forwarded_addr(&unix_peer, b"1.2.3.4", &with_unix, false),
             Some((ip("1.2.3.4"), 0))
         );
     }
@@ -2145,21 +2189,37 @@ mod tests {
             rule(true, V4 { addr: 0, mask: 0 }),
         ];
         // `unix:` never matches a TCP peer; the first matching rule wins.
-        assert_eq!(match_access_rules(&rules, ip("127.0.0.2")), Some(false));
-        assert_eq!(match_access_rules(&rules, ip("10.0.0.1")), Some(true));
-        assert_eq!(match_access_rules(&rules, ip("::1")), Some(true));
-        // IPv4 rules don't match IPv6 peers…
-        assert_eq!(match_access_rules(&rules, ip("::2")), None);
-        // …but IPv4-mapped peers are matched as IPv4.
         assert_eq!(
-            match_access_rules(&rules, ip("::ffff:127.0.0.1")),
+            match_access_rules(&rules, ip("127.0.0.2"), false),
             Some(false)
         );
         assert_eq!(
-            match_access_rules(&[rule(true, All)], ip("::2")),
+            match_access_rules(&rules, ip("10.0.0.1"), false),
             Some(true)
         );
-        assert_eq!(match_access_rules(&[], ip("127.0.0.1")), None);
+        assert_eq!(match_access_rules(&rules, ip("::1"), false), Some(true));
+        // IPv4 rules don't match IPv6 peers…
+        assert_eq!(match_access_rules(&rules, ip("::2"), false), None);
+        // …but IPv4-mapped peers are matched as IPv4.
+        assert_eq!(
+            match_access_rules(&rules, ip("::ffff:127.0.0.1"), false),
+            Some(false)
+        );
+        assert_eq!(
+            match_access_rules(&[rule(true, All)], ip("::2"), false),
+            Some(true)
+        );
+        assert_eq!(match_access_rules(&[], ip("127.0.0.1"), false), None);
+        // A unix-domain client: only `all` and `unix:` rules apply.
+        let rules = [rule(false, V4 { addr: 0, mask: 0 }), rule(true, Unix)];
+        assert_eq!(
+            match_access_rules(&rules, ip("127.0.0.1"), true),
+            Some(true)
+        );
+        assert_eq!(
+            match_access_rules(&[rule(false, All)], ip("127.0.0.1"), true),
+            Some(false)
+        );
     }
 
     #[test]
