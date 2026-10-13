@@ -277,6 +277,80 @@ pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<()
 /// children beyond what the explicit inherited arguments propagate — that's
 /// a deliberate scope limit; if a test needs fuller nested inheritance,
 /// revisit here.
+/// What a nested location takes from its parent where it sets nothing
+/// itself (#106), as nginx's `merge_loc_conf` of each module: a list
+/// directive (`add_header`, `error_page`, `proxy_set_header`, …) comes as a
+/// whole. The content handler, rewrites, `try_files`, `internal` and
+/// `limit_except` belong to the location itself.
+fn inherit_from_parent(child: &mut Location, parent: &Location) {
+    fn or<T: Clone>(child: &mut Option<T>, parent: &Option<T>) {
+        if child.is_none() {
+            child.clone_from(parent);
+        }
+    }
+    or(&mut child.index, &parent.index);
+    or(&mut child.add_headers, &parent.add_headers);
+    or(&mut child.add_trailers, &parent.add_trailers);
+    or(&mut child.error_pages, &parent.error_pages);
+    or(&mut child.keepalive_timeout, &parent.keepalive_timeout);
+    or(&mut child.keepalive_requests, &parent.keepalive_requests);
+    or(&mut child.keepalive_time_ms, &parent.keepalive_time_ms);
+    or(&mut child.keepalive_disable, &parent.keepalive_disable);
+    or(&mut child.error_logs, &parent.error_logs);
+    or(&mut child.log_not_found, &parent.log_not_found);
+    or(
+        &mut child.recursive_error_pages,
+        &parent.recursive_error_pages,
+    );
+    or(&mut child.server_tokens, &parent.server_tokens);
+    or(&mut child.autoindex, &parent.autoindex);
+    or(
+        &mut child.autoindex_exact_size,
+        &parent.autoindex_exact_size,
+    );
+    or(&mut child.autoindex_localtime, &parent.autoindex_localtime);
+    or(&mut child.autoindex_format, &parent.autoindex_format);
+    or(&mut child.access_logs, &parent.access_logs);
+    or(&mut child.auth_basic, &parent.auth_basic);
+    or(
+        &mut child.auth_basic_user_file,
+        &parent.auth_basic_user_file,
+    );
+    or(&mut child.auth_delay_ms, &parent.auth_delay_ms);
+    or(
+        &mut child.client_max_body_size,
+        &parent.client_max_body_size,
+    );
+    or(
+        &mut child.client_body_buffer_size,
+        &parent.client_body_buffer_size,
+    );
+    or(&mut child.sendfile, &parent.sendfile);
+    or(
+        &mut child.client_body_temp_path,
+        &parent.client_body_temp_path,
+    );
+    or(&mut child.disable_symlinks, &parent.disable_symlinks);
+    or(&mut child.limit_rate, &parent.limit_rate);
+    or(&mut child.limit_rate_after, &parent.limit_rate_after);
+    or(
+        &mut child.client_body_in_file_only,
+        &parent.client_body_in_file_only,
+    );
+    or(&mut child.post_action, &parent.post_action);
+    or(&mut child.expires, &parent.expires);
+    or(
+        &mut child.chunked_transfer_encoding,
+        &parent.chunked_transfer_encoding,
+    );
+    child.access = child.access.inherit(&parent.access);
+    child.proxy = std::mem::take(&mut child.proxy).inherit(&parent.proxy);
+    child.gzip = std::mem::take(&mut child.gzip).inherit(&parent.gzip);
+    child.limit_req = std::mem::take(&mut child.limit_req).inherit(&parent.limit_req);
+    child.limit_conn = std::mem::take(&mut child.limit_conn).inherit(&parent.limit_conn);
+    child.client_timeouts = child.client_timeouts.inherit(parent.client_timeouts);
+}
+
 pub(crate) fn parse_location_block(
     spec: LocationSpec,
     lx: &mut Lexer,
@@ -430,7 +504,7 @@ pub(crate) fn parse_location_block(
                     let effective_disable_symlinks = disable_symlinks
                         .clone()
                         .or_else(|| inherited_disable_symlinks.clone());
-                    sink.push(Location {
+                    let location = Location {
                         mode: spec.mode,
                         pattern: spec.pattern,
                         noregex: spec.noregex,
@@ -479,7 +553,15 @@ pub(crate) fn parse_location_block(
                         client_timeouts,
                         alias_prefix_override,
                         inherits_root,
-                    });
+                    };
+                    // nginx merges each nested location with its parent's
+                    // final configuration (ngx_http_merge_locations), so a
+                    // directive after the nested block counts too. The
+                    // children already hold their own descendants' merge.
+                    for child in &mut children {
+                        inherit_from_parent(child, &location);
+                    }
+                    sink.push(location);
                     sink.extend(children);
                     Ok(())
                 }

@@ -2644,6 +2644,59 @@ mod tests {
     }
 
     #[test]
+    fn nested_locations_inherit_the_parents_final_settings() {
+        // #106: everything nginx merges from the parent location, also
+        // what the parent sets after the nested block; lists as a whole.
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    add_header X-Server s;
+                    location /p/ {
+                        proxy_set_header X-Up parent;
+                        add_header X-Parent yes;
+                        location /p/c/ { proxy_pass http://127.0.0.1:8081; }
+                        location /p/own/ {
+                            add_header X-Own yes;
+                            location /p/own/g/ { return 200; }
+                        }
+                        error_page 404 /nf;
+                        proxy_read_timeout 7s;
+                        gzip on;
+                        keepalive_requests 5;
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let loc = |p: &str| {
+            cfg.servers[0]
+                .locations
+                .iter()
+                .find(|l| l.pattern == p)
+                .unwrap_or_else(|| panic!("{p}"))
+        };
+        let names = |l: &Location| -> Vec<String> {
+            l.add_headers
+                .iter()
+                .flatten()
+                .map(|h| h.name.clone())
+                .collect()
+        };
+        let c = loc("/p/c/");
+        assert_eq!(names(c), ["X-Parent"]);
+        assert!(c.proxy.set_headers.is_some());
+        assert!(c.error_pages.is_some(), "after the nested block");
+        assert_eq!(c.proxy.read_timeout_ms, Some(7000));
+        assert_eq!(c.gzip.enable, Some(true));
+        assert_eq!(c.keepalive_requests, Some(5));
+        // A child's own list replaces the parent's, for its children too.
+        assert_eq!(names(loc("/p/own/")), ["X-Own"]);
+        assert_eq!(names(loc("/p/own/g/")), ["X-Own"]);
+        assert_eq!(loc("/p/own/g/").keepalive_requests, Some(5));
+    }
+
+    #[test]
     fn nested_location_inherits_parent_auth_basic_and_user_file() {
         let src = r#"
             http {
