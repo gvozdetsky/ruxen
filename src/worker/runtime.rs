@@ -629,7 +629,10 @@ fn finish_proxy_response(
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
     process_meta.upstream_cache_status = report.cache_status;
-    process_meta.keep_upstream_date = report.passes_date;
+    // Not for the proxy's own 502/504 (prebuilt at startup, so its `Date`
+    // is old): nginx writes its own `Date` there.
+    process_meta.keep_upstream_date =
+        report.passes_date && !matches!(upstream_resp, Response::Prebuilt(_));
     // A relayed body (#88): the head is filtered as an `Owned` response
     // with no body, then goes back with the upstream connection.
     let (upstream_resp, relayed) = match upstream_resp {

@@ -863,6 +863,11 @@ http {{
         location /dated/ {{ proxy_pass http://127.0.0.1:{d}; proxy_pass_header Date; }}
         location /undated/ {{ proxy_pass http://127.0.0.1:{u}; proxy_pass_header Date; }}
         location /hidden/ {{ proxy_pass http://127.0.0.1:{d}; }}
+        location /down/ {{
+            proxy_pass http://127.0.0.1:1;
+            proxy_pass_header Date;
+            add_header X-A a;
+        }}
     }}
 }}
 "#,
@@ -883,4 +888,11 @@ http {{
     let own = dates("/hidden/");
     assert_eq!(own.len(), 1);
     assert_ne!(own[0], "Date: Mon, 01 Jan 2001 00:00:00 GMT");
+    // The proxy's own 502 is not the upstream's: it gets a current Date,
+    // not the one from when its page was built at startup.
+    let first = dates("/down/");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = dates("/down/");
+    assert_eq!((first.len(), second.len()), (1, 1));
+    assert_ne!(first, second);
 }
