@@ -1543,6 +1543,7 @@ async fn attempt(
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
     let head_end_terminator: (usize, usize); // (head_end, terminator_len)
+    let mut scanned = 0;
     loop {
         let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
             Ok(pair) => pair,
@@ -1581,10 +1582,12 @@ async fn attempt(
                 );
             }
         }
-        if let Some(p) = find_head_end(&accum) {
+        if let Some(p) = find_head_end(&accum, scanned) {
             head_end_terminator = p;
             break;
         }
+        // A terminator can start in the last 3 bytes and end in the next read.
+        scanned = accum.len().saturating_sub(3);
         // Sanity bound on header block size — refuse 64 KiB+ headers.
         if accum.len() > 64 * 1024 {
             return AttemptOutcome::Failed(
@@ -2296,7 +2299,7 @@ fn background_update(
 /// block, with the body's length, and drop the body.
 fn strip_body(resp: &mut Response) {
     if let Response::Owned(out) = resp
-        && let Some((end, terminator)) = find_head_end(out)
+        && let Some((end, terminator)) = find_head_end(out, 0)
     {
         out.truncate(end + terminator);
     }
@@ -2683,18 +2686,26 @@ fn u64_to_decimal(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[..len]
 }
 
-/// Find the head/body boundary (`\r\n\r\n` or `\n\n`). Returns
-/// `(position, terminator_len)`. nginx tolerates the LF-only form.
-fn find_head_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    let lflf = buf.windows(2).position(|w| w == b"\n\n");
-    match (crlf, lflf) {
-        (Some(a), Some(b)) if a < b => Some((a, 4)),
-        (Some(_), Some(b)) => Some((b, 2)),
-        (Some(a), None) => Some((a, 4)),
-        (None, Some(b)) => Some((b, 2)),
-        (None, None) => None,
+/// Find the head/body boundary (`\r\n\r\n` or `\n\n`, whichever comes
+/// first). Returns `(position, terminator_len)`. nginx tolerates the
+/// LF-only form. One pass over the line feeds from `from`, which both
+/// terminators contain, stopping at the first that ends the head: the body
+/// bytes read along with the head aren't scanned, nor the bytes an earlier
+/// read already looked at.
+fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while let Some(p) = buf[i..].iter().position(|&b| b == b'\n') {
+        let lf = i + p;
+        match buf.get(lf + 1) {
+            Some(b'\n') => return Some((lf, 2)),
+            Some(b'\r') if lf > 0 && buf[lf - 1] == b'\r' && buf.get(lf + 2) == Some(&b'\n') => {
+                return Some((lf - 1, 4));
+            }
+            _ => {}
+        }
+        i = lf + 1;
     }
+    None
 }
 
 /// Find the next line terminator (`\r\n` or `\n`). Returns
@@ -2765,6 +2776,42 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The single pass finds what the two whole-buffer searches it replaced
+    /// found, on every string of `\r`, `\n` and `a` up to 9 bytes, and also
+    /// when the bytes arrive split in two reads.
+    #[test]
+    fn find_head_end_matches_two_scans() {
+        fn two_scans(buf: &[u8]) -> Option<(usize, usize)> {
+            let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+            let lflf = buf.windows(2).position(|w| w == b"\n\n");
+            match (crlf, lflf) {
+                (Some(a), Some(b)) if a < b => Some((a, 4)),
+                (Some(_), Some(b)) => Some((b, 2)),
+                (Some(a), None) => Some((a, 4)),
+                (None, Some(b)) => Some((b, 2)),
+                (None, None) => None,
+            }
+        }
+        for len in 0..=9u32 {
+            for mut n in 0..3usize.pow(len) {
+                let buf: Vec<u8> = (0..len)
+                    .map(|_| {
+                        let b = [b'\r', b'\n', b'a'][n % 3];
+                        n /= 3;
+                        b
+                    })
+                    .collect();
+                let want = two_scans(&buf);
+                assert_eq!(find_head_end(&buf, 0), want, "{buf:?}");
+                for split in 0..=buf.len() {
+                    let first = two_scans(&buf[..split]);
+                    let got = first.or_else(|| find_head_end(&buf, split.saturating_sub(3)));
+                    assert_eq!(got, want, "{buf:?} split at {split}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn request_parts_advance_across_head_and_body() {
