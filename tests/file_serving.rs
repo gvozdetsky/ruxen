@@ -911,24 +911,53 @@ fn m6_symlink_under_root_is_served() {
 }
 
 #[test]
-fn m6_symlink_escaping_root_is_403() {
-    // Create an outside target and a symlink inside root that points to it.
-    // Containment check must catch it even though the file exists.
+fn m6_symlink_out_of_root_is_followed_unless_disable_symlinks() {
+    // nginx's default, `disable_symlinks off`, follows a symlink under the
+    // root wherever it points (#254): a file or a whole directory, as in
+    // `html/phpmyadmin -> /usr/share/phpmyadmin`. `disable_symlinks on`
+    // refuses it.
     let outside = unique_dir();
-    std::fs::write(outside.join("secret.txt"), b"pwned").unwrap();
-    let outside_secret = outside.join("secret.txt").clone();
+    std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+    let outside_dir = outside.clone();
+    let outside_name = outside.file_name().unwrap().to_str().unwrap().to_string();
 
     let (_guard, port) = setup_m6(
         move |d| {
-            std::os::unix::fs::symlink(&outside_secret, d.join("escape.txt")).unwrap();
+            std::os::unix::fs::symlink(outside_dir.join("secret.txt"), d.join("escape.txt"))
+                .unwrap();
+            std::os::unix::fs::symlink(&outside_dir, d.join("shared")).unwrap();
         },
         |port, root| {
-            format!("http {{ server {{ listen {port}; location / {{ root {root}; }} }} }}\n")
+            format!(
+                "http {{ server {{ listen {port};\n\
+                 location / {{ root {root}; }}\n\
+                 location /strict/ {{ alias {root}/; disable_symlinks on; }}\n\
+                 location /v/ {{ root {root}; try_files /$arg_f =404; }}\n\
+                 }} }}\n"
+            )
         },
     );
+    for path in ["/escape.txt", "/shared/secret.txt"] {
+        let r = request(
+            port,
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(status_line(&r), "HTTP/1.1 200 OK", "{path}");
+        assert_eq!(body(&r), b"outside", "{path}");
+    }
     let r = request(
         port,
-        b"GET /escape.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"GET /strict/escape.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden");
+    // A `..` out of the root (here from a variable, which the URI's own
+    // normalisation doesn't touch) is still refused: only symlinks lead out.
+    let r = request(
+        port,
+        format!(
+            "GET /v/?f=../{outside_name}/secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
     );
     assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden");
     std::fs::remove_dir_all(&outside).ok();

@@ -928,7 +928,6 @@ async fn run_post_action(
     // the equivalent is structural — `run_post_action` is only invoked
     // from the main request handler, never from itself, and the inner
     // `post_meta.post_action` is intentionally discarded below.
-    let empty: &[u8] = &[];
     let post_path = if target.first() == Some(&b'/') {
         target
     } else {
@@ -936,7 +935,7 @@ async fn run_post_action(
     };
     let post_ctx = phase::RequestCtx {
         path: post_path,
-        body: empty,
+        body: &phase::NO_BODY,
         body_len: 0,
         body_file: None,
         refuse: None,
@@ -1052,7 +1051,7 @@ fn unshare_fd_table() {
 pub fn run(
     http: &'static PreparedHttp,
     cpu: Option<usize>,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     unshare_fd_table();
@@ -1124,6 +1123,9 @@ pub fn run(
         drop(ready);
         // Accept only once `main` has switched to the configured `user`.
         state.wait_released();
+        if test_panic() == TestPanic::Worker {
+            panic!("{TEST_PANIC_ENV}=worker");
+        }
 
         if listeners.len() == 1 && unix_listeners.is_empty() {
             // Single-listen fast path: keep the accept loop in this top-level
@@ -1131,22 +1133,27 @@ pub fn run(
             // every accepted connection.
             let (listen_index, listener) = listeners.pop().expect("one listener");
             let prepared = &http.listens[listen_index];
+            let mut tick = AcceptTick::new();
             loop {
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
                 if state.is_shutting_down() {
-                    while state.active_connections() != 0 {
+                    while worker_clients() != 0 {
                         monoio::time::sleep(Duration::from_millis(10)).await;
                     }
                     return;
                 }
-                match accept_or_tick(&listener).await {
+                match accept_or_tick(&listener, &mut tick, state).await {
                     Ok(Some((stream, addr))) => {
-                        if !admit_connection(http) {
+                        let admitted = admit_connection(http);
+                        if http.stats {
+                            super::stats::accepted(admitted);
+                        }
+                        if !admitted {
                             continue;
                         }
                         let _ = stream.set_nodelay(true);
-                        state.connection_started();
+                        connection_started();
                         let connection_id = state.next_connection_id();
                         spawn_connection(
                             prepared,
@@ -1154,7 +1161,7 @@ pub fn run(
                             addr,
                             listen_index,
                             http,
-                            state.clone(),
+                            state,
                             connection_id,
                         );
                     }
@@ -1164,21 +1171,16 @@ pub fn run(
             }
         } else {
             for (listen_index, listener) in listeners {
-                monoio::spawn(run_listener(listener, listen_index, http, state.clone()));
+                monoio::spawn(run_listener(listener, listen_index, http, state));
             }
             for (listen_index, listener) in unix_listeners {
-                monoio::spawn(run_unix_listener(
-                    listener,
-                    listen_index,
-                    http,
-                    state.clone(),
-                ));
+                monoio::spawn(run_unix_listener(listener, listen_index, http, state));
             }
 
             loop {
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
-                if state.is_shutting_down() && state.active_connections() == 0 {
+                if state.is_shutting_down() && worker_clients() == 0 {
                     return;
                 }
                 monoio::time::sleep(Duration::from_millis(10)).await;
@@ -1265,32 +1267,22 @@ pub(crate) async fn run_unix_listener(
     listener: monoio::net::UnixListener,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
 ) {
     use std::os::fd::{FromRawFd, IntoRawFd};
     let prepared = &http.listens[listen_index];
+    let mut tick = AcceptTick::new();
     loop {
         if state.is_shutting_down() {
             return;
         }
-        let canceler = monoio::io::Canceller::new();
-        let accepted = {
-            let mut accept = std::pin::pin!(listener.cancelable_accept(canceler.handle()));
-            let mut tick = std::pin::pin!(monoio::time::sleep(Duration::from_millis(50)));
-            monoio::select! {
-                res = &mut accept => res.map(Some),
-                _ = &mut tick => {
-                    canceler.cancel();
-                    match accept.await {
-                        Ok(pair) => Ok(Some(pair)),
-                        Err(_) => Ok(None),
-                    }
+        match unix_accept_or_tick(&listener, &mut tick, state).await {
+            Ok(Some(stream)) => {
+                let admitted = admit_connection(http);
+                if http.stats {
+                    super::stats::accepted(admitted);
                 }
-            }
-        };
-        match accepted {
-            Ok(Some((stream, _))) => {
-                if !admit_connection(http) {
+                if !admitted {
                     continue;
                 }
                 let fd = stream.into_raw_fd();
@@ -1300,7 +1292,7 @@ pub(crate) async fn run_unix_listener(
                 else {
                     continue;
                 };
-                state.connection_started();
+                connection_started();
                 let connection_id = state.next_connection_id();
                 spawn_connection(
                     prepared,
@@ -1308,7 +1300,7 @@ pub(crate) async fn run_unix_listener(
                     SocketAddr::from(([0, 0, 0, 0], 0)),
                     listen_index,
                     http,
-                    state.clone(),
+                    state,
                     connection_id,
                 );
             }
@@ -1318,24 +1310,60 @@ pub(crate) async fn run_unix_listener(
     }
 }
 
+/// `accept_or_tick` for a `listen unix:` socket: the same tick, and the
+/// same cancel on shutdown.
+async fn unix_accept_or_tick(
+    listener: &monoio::net::UnixListener,
+    tick: &mut AcceptTick,
+    state: &RuntimeState,
+) -> std::io::Result<Option<monoio::net::UnixStream>> {
+    use std::pin::pin;
+
+    let mut accept = pin!(listener.cancelable_accept(tick.canceller.handle()));
+    loop {
+        monoio::select! {
+            res = &mut accept => return res.map(|(stream, _)| Some(stream)),
+            _ = tick.timer.as_mut() => {
+                tick.timer
+                    .as_mut()
+                    .reset(monoio::time::Instant::now() + ACCEPT_TICK);
+                notice_runtime_events(state);
+                if !state.is_shutting_down() {
+                    continue;
+                }
+                tick.canceller = std::mem::take(&mut tick.canceller).cancel();
+                return match accept.await {
+                    Ok((stream, _)) => Ok(Some(stream)),
+                    Err(_) => Ok(None),
+                };
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_listener(
     listener: TcpListener,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
 ) {
     let prepared = &http.listens[listen_index];
+    let mut tick = AcceptTick::new();
     loop {
         if state.is_shutting_down() {
             return;
         }
-        match accept_or_tick(&listener).await {
+        match accept_or_tick(&listener, &mut tick, state).await {
             Ok(Some((stream, addr))) => {
-                if !admit_connection(http) {
+                let admitted = admit_connection(http);
+                if http.stats {
+                    super::stats::accepted(admitted);
+                }
+                if !admitted {
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
-                state.connection_started();
+                connection_started();
                 let connection_id = state.next_connection_id();
                 spawn_connection(
                     prepared,
@@ -1343,7 +1371,7 @@ pub(crate) async fn run_listener(
                     addr,
                     listen_index,
                     http,
-                    state.clone(),
+                    state,
                     connection_id,
                 );
             }
@@ -1364,52 +1392,68 @@ pub(crate) fn spawn_connection(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
 ) {
     // The connection was counted on accept; whatever path it takes from
     // here, dropping the guard un-counts it.
-    let guard = ConnectionGuard(state.clone());
+    let guard = ConnectionGuard;
     if prepared.proxy_protocol {
         // Cold: `listen … proxy_protocol`.
-        monoio::spawn(handle_proxy_protocol(
-            prepared,
-            stream,
-            peer_addr,
-            listen_index,
+        monoio::spawn(Contained::new(
+            handle_proxy_protocol(
+                prepared,
+                stream,
+                peer_addr,
+                listen_index,
+                http,
+                state,
+                connection_id,
+                guard,
+            ),
             http,
-            state,
             connection_id,
-            guard,
+            peer_addr,
         ));
         return;
     }
     match &prepared.tls {
         None => {
-            monoio::spawn(handle_plain(
-                stream,
-                peer_addr,
-                listen_index,
+            // A panic ends this connection only (#130).
+            monoio::spawn(Contained::new(
+                handle_plain(
+                    stream,
+                    peer_addr,
+                    listen_index,
+                    http,
+                    state,
+                    connection_id,
+                    None,
+                    guard,
+                ),
                 http,
-                state,
                 connection_id,
-                None,
-                guard,
+                peer_addr,
             ));
         }
         Some(acceptor) => {
             let acceptor = acceptor.clone();
-            monoio::spawn(handle_tls(
-                stream,
-                acceptor,
-                peer_addr,
-                listen_index,
+            monoio::spawn(Contained::new(
+                handle_tls(
+                    stream,
+                    acceptor,
+                    peer_addr,
+                    listen_index,
+                    http,
+                    state,
+                    connection_id,
+                    None,
+                    Instant::now(),
+                    guard,
+                ),
                 http,
-                state,
                 connection_id,
-                None,
-                Instant::now(),
-                guard,
+                peer_addr,
             ));
         }
     }
@@ -1425,7 +1469,7 @@ async fn handle_proxy_protocol(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     guard: ConnectionGuard,
 ) {
@@ -1703,25 +1747,60 @@ impl RepeatedLine {
 
 pub(crate) async fn accept_or_tick(
     listener: &TcpListener,
+    tick: &mut AcceptTick,
+    state: &RuntimeState,
 ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
     use std::pin::pin;
 
-    let canceler = monoio::io::Canceller::new();
-    let mut accept = pin!(listener.cancelable_accept(canceler.handle()));
-    let mut tick = pin!(monoio::time::sleep(Duration::from_millis(50)));
-    monoio::select! {
-        res = &mut accept => res.map(Some),
-        _ = &mut tick => {
-            // If the accept SQE completed in the same poll batch as the
-            // timer, dropping it here closes the accepted fd and the client
-            // sees EOF. Cancel the op, then keep whatever the kernel already
-            // handed back: a real success (race with cancel) hands us the
-            // connection; a genuine cancel returns the canceled-op error.
-            canceler.cancel();
-            match accept.await {
-                Ok(pair) => Ok(Some(pair)),
-                Err(_) => Ok(None),
+    let mut accept = pin!(listener.cancelable_accept(tick.canceller.handle()));
+    loop {
+        monoio::select! {
+            res = &mut accept => return res.map(Some),
+            _ = tick.timer.as_mut() => {
+                tick.timer
+                    .as_mut()
+                    .reset(monoio::time::Instant::now() + ACCEPT_TICK);
+                // Shutdown or a reload wakes the idle connections.
+                notice_runtime_events(state);
+                if !state.is_shutting_down() {
+                    // The accept stays in flight: cancelling and submitting
+                    // it again on every tick cost each idle worker CPU.
+                    continue;
+                }
+                // If the accept SQE completed in the same poll batch as the
+                // timer, dropping it here closes the accepted fd and the
+                // client sees EOF. Cancel the op, then keep whatever the
+                // kernel already handed back: a real success (race with
+                // cancel) hands us the connection; a genuine cancel returns
+                // the canceled-op error. `cancel` hands back a fresh
+                // canceller.
+                tick.canceller = std::mem::take(&mut tick.canceller).cancel();
+                return match accept.await {
+                    Ok(pair) => Ok(Some(pair)),
+                    Err(_) => Ok(None),
+                };
             }
+        }
+    }
+}
+
+/// How often an accept loop wakes without a connection, to notice
+/// shutdown and reloads.
+const ACCEPT_TICK: Duration = Duration::from_millis(50);
+
+/// An accept loop's tick timer and canceller, kept across accepts: a
+/// fresh timer and canceller per accepted connection cost a timer-wheel
+/// insert and remove and an allocation each (#128).
+pub(crate) struct AcceptTick {
+    timer: std::pin::Pin<Box<monoio::time::Sleep>>,
+    canceller: monoio::io::Canceller,
+}
+
+impl AcceptTick {
+    pub(crate) fn new() -> Self {
+        AcceptTick {
+            timer: Box::pin(monoio::time::sleep(ACCEPT_TICK)),
+            canceller: monoio::io::Canceller::new(),
         }
     }
 }
@@ -1835,13 +1914,85 @@ pub(crate) async fn read_first_or_shutdown(
     }
 }
 
-pub(crate) struct ConnectionGuard(Arc<RuntimeState>);
+/// A connection's read buffer and scratch buffers (see `handle`).
+struct ConnBufs {
+    buf: Vec<u8>,
+    scratch: Vec<u8>,
+    url_scratch: Vec<u8>,
+}
+
+thread_local! {
+    /// Buffers of finished connections, for the next ones.
+    static CONN_BUFS: RefCell<Vec<ConnBufs>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Sets kept per worker; beyond that, finished connections free theirs.
+const CONN_BUFS_KEPT: usize = 64;
+/// A scratch buffer that grew past this (a large response) isn't kept.
+const CONN_SCRATCH_KEEP: usize = 64 * 1024;
+
+impl ConnBufs {
+    fn take() -> ConnBufs {
+        CONN_BUFS
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| ConnBufs {
+                buf: vec![0u8; READ_BUF],
+                scratch: Vec::with_capacity(READ_BUF),
+                url_scratch: Vec::with_capacity(256),
+            })
+    }
+}
+
+impl Drop for ConnBufs {
+    fn drop(&mut self) {
+        // A buffer still lent to an I/O operation (empty here) or grown
+        // large isn't kept.
+        if self.buf.len() != READ_BUF
+            || !(READ_BUF..=CONN_SCRATCH_KEEP).contains(&self.scratch.capacity())
+            || self.url_scratch.capacity() > CONN_SCRATCH_KEEP
+        {
+            return;
+        }
+        // `try_with`: the pool itself may be going away with the thread.
+        let _ = CONN_BUFS.try_with(|pool| {
+            let Ok(mut pool) = pool.try_borrow_mut() else {
+                return;
+            };
+            if pool.len() >= CONN_BUFS_KEPT {
+                return;
+            }
+            let mut kept = ConnBufs {
+                buf: std::mem::take(&mut self.buf),
+                scratch: std::mem::take(&mut self.scratch),
+                url_scratch: std::mem::take(&mut self.url_scratch),
+            };
+            kept.scratch.clear();
+            kept.url_scratch.clear();
+            pool.push(kept);
+        });
+    }
+}
+
+pub(crate) struct ConnectionGuard;
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0.connection_finished();
-        WORKER_CONNS.with(|w| w.active.set(w.active.get().saturating_sub(1)));
+        WORKER_CONNS.with(|w| {
+            w.active.set(w.active.get().saturating_sub(1));
+            w.clients.set(w.clients.get().saturating_sub(1));
+        });
     }
+}
+
+/// This worker's accepted connections that haven't finished: a shutting
+/// down worker waits for them. Per worker, so an accept touches no cache
+/// line another worker writes (#128).
+fn worker_clients() -> usize {
+    WORKER_CONNS.with(|w| w.clients.get())
+}
+
+fn connection_started() {
+    WORKER_CONNS.with(|w| w.clients.set(w.clients.get() + 1));
 }
 
 /// This worker's share of `worker_connections`, and nginx's reuse of idle
@@ -1852,6 +2003,8 @@ struct WorkerConns {
     /// connections (`UpstreamSlot`): nginx takes both from the worker's
     /// one connection table.
     active: Cell<usize>,
+    /// Accepted connections that haven't finished (`worker_clients`).
+    clients: Cell<usize>,
     /// Connections waiting for a request — nginx's "reusable" ones.
     idle: Cell<usize>,
     /// How many idle connections are asked to close to make room.
@@ -1876,6 +2029,7 @@ thread_local! {
     static WORKER_CONNS: WorkerConns = const {
         WorkerConns {
             active: Cell::new(0),
+            clients: Cell::new(0),
             idle: Cell::new(0),
             drain: Cell::new(0),
             idle_wakers: std::cell::RefCell::new(Vec::new()),
@@ -2132,7 +2286,7 @@ pub(crate) async fn handle_plain(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     _guard: ConnectionGuard,
@@ -2144,7 +2298,11 @@ pub(crate) async fn handle_plain(
         realip: None,
         proxy_protocol,
     };
-    handle(
+    // Boxed: the connection's future is about 10 KiB, and the task that
+    // `spawn_connection` builds would otherwise be moved, all of it, into
+    // the runtime on every accept. Here the task stays small and the big
+    // future is placed once (#128).
+    Box::pin(handle(
         &mut stream,
         peer_addr,
         listen_index,
@@ -2154,7 +2312,7 @@ pub(crate) async fn handle_plain(
         http,
         state,
         connection_id,
-    )
+    ))
     .await;
 }
 
@@ -2164,7 +2322,7 @@ pub(crate) async fn handle_tls(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     accepted_at: Instant,
@@ -2209,7 +2367,8 @@ pub(crate) async fn handle_tls(
             .map(|b| b.to_ascii_lowercase())
             .collect()
     });
-    handle(
+    // Boxed, as in `handle_plain`.
+    Box::pin(handle(
         &mut tls_stream,
         peer_addr,
         listen_index,
@@ -2219,7 +2378,7 @@ pub(crate) async fn handle_tls(
         http,
         state,
         connection_id,
-    )
+    ))
     .await;
     // close_notify before TCP FIN. Best-effort: peer may already have gone
     // away; we don't have anything useful to do with the error.
@@ -2234,7 +2393,7 @@ pub(crate) async fn handle<S: ConnIo>(
     tls: Option<&crate::tls::HandshakeInfo>,
     conn: &phase::ConnInfo,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
 ) {
     // Mirrors nginx's keepalive_handler ↔ wait_request_handler dance: no
@@ -2254,11 +2413,18 @@ pub(crate) async fn handle<S: ConnIo>(
     // `$connection_requests` reads 1 on the first request, 2 on the
     // second, etc. Incrementing before rendering matches that contract.
     let connection_start = Instant::now();
-    // A unix-domain client is `unix:`, with no port (#263).
-    let (remote_addr, remote_port) = if http.listens[listen_index].unix.is_some() {
-        (b"unix:".to_vec(), 0)
+    let mut remote_addr_buf = [0u8; 48];
+    let (remote_addr, remote_port): (&[u8], u16) = if http.listens[listen_index].unix.is_some() {
+        // A unix-domain client is `unix:`, with no port (#263).
+        (b"unix:", 0)
     } else {
-        (peer_addr.ip().to_string().into_bytes(), peer_addr.port())
+        // `$remote_addr`, written once into the connection's own state
+        // rather than a heap string per connection (#128).
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(&mut remote_addr_buf[..]);
+        let _ = write!(cursor, "{}", peer_addr.ip());
+        let n = cursor.position() as usize;
+        (&remote_addr_buf[..n], peer_addr.port())
     };
     let mut request_count: u64 = 0;
     // Client timeouts come from the address's default server for the whole
@@ -2295,15 +2461,18 @@ pub(crate) async fn handle<S: ConnIo>(
     // because non-pipelining clients (wrk, curl) drain `buf` after each
     // response and `continue 'idle`, so a per-iteration alloc here was
     // showing up as ~3% memset / ~1% calloc in the proxy bench profile.
-    let mut scratch_owned: Vec<u8> = Vec::with_capacity(READ_BUF);
-    let mut url_scratch_owned: Vec<u8> = Vec::with_capacity(256);
+    // Taken from this worker's pool and given back when the connection
+    // ends: a connection per request doesn't allocate (and zero) them each
+    // time (#128).
+    let mut bufs = ConnBufs::take();
     // Set once the zero-copy `sendfile` path has put the socket in
     // O_NONBLOCK mode; see `send_head_and_file`.
     let mut sock_nonblocking = false;
-    let mut buf_owned: Vec<u8> = vec![0u8; READ_BUF];
-    let scratch = &mut scratch_owned;
-    let url_scratch = &mut url_scratch_owned;
-    let buf = &mut buf_owned;
+    let ConnBufs {
+        buf,
+        scratch,
+        url_scratch,
+    } = &mut bufs;
 
     // Context for `reject_request`'s access-log line.
     macro_rules! conn_log {
@@ -2321,7 +2490,11 @@ pub(crate) async fn handle<S: ConnIo>(
         };
     }
 
+    // stub_status / $connections_* (#96); inert unless the config reads them.
+    let mut conn_stats = super::stats::ConnStats::new(http.stats);
+
     'idle: loop {
+        conn_stats.set(super::stats::Phase::Waiting);
         let (next, returned) = stream
             .idle_read(
                 std::mem::take(&mut *buf),
@@ -2337,6 +2510,7 @@ pub(crate) async fn handle<S: ConnIo>(
             IdleRead::Ready => 0,
             IdleRead::Read(n) => n,
         };
+        conn_stats.set(super::stats::Phase::Reading);
         keepalive_idle_timeout = None;
         // The header's time starts with its first bytes, as nginx's
         // client_header_timeout after the keep-alive read.
@@ -2371,6 +2545,7 @@ pub(crate) async fn handle<S: ConnIo>(
                 let view = &buf[read_start..filled];
                 match http::parse_request(view, &mut parse_state) {
                     Parse::Complete(req) => {
+                        conn_stats.request();
                         let request_start = Instant::now();
                         // Counted up front so a request refused below logs
                         // `$connection_requests` as nginx does.
@@ -2591,7 +2766,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
                             let cl = req.content_length.unwrap_or(0);
-                            let probe = request_ctx!(&[], cl, None, req.consumed as u64 + cl, 0, 0);
+                            let probe = request_ctx!(
+                                &phase::NO_BODY,
+                                cl,
+                                None,
+                                req.consumed as u64 + cl,
+                                0,
+                                0
+                            );
                             if let Some(first) =
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
@@ -2778,6 +2960,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             sink.len()
                         };
                         let (body_vec, spooled) = sink.finish();
+                        // Shared, so a proxied request sends it from here
+                        // instead of a copy (#289); the buffer goes back to
+                        // the pool when the last holder is done.
+                        let body_vec = if body_vec.is_empty() {
+                            bytes::Bytes::new()
+                        } else {
+                            bytes::Bytes::from_owner(body_vec)
+                        };
                         // Bound to this request iteration; holds the
                         // temp-file path bytes for `$request_body_file`.
                         let request_body_file = match spooled {
@@ -2807,7 +2997,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         let epoch_ms = (now.subsec_millis() as u16) % 1000;
 
                         let ctx = request_ctx!(
-                            body_vec.as_slice(),
+                            &body_vec,
                             body_len,
                             body_file,
                             request_length,
