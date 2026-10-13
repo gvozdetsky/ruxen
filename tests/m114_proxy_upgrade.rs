@@ -245,3 +245,105 @@ fn m114_websocket_tunnel_over_tls() {
         assert!(echoed == chunk, "round {round}");
     }
 }
+
+/// Answers `/ws` with a 101 and `ws<tag>` and then holds the connection;
+/// anything else with a 200 and `<tag>`.
+fn tagged_backend(tag: char) -> u16 {
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if conn.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                if head.starts_with(b"GET /ws ") {
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                         Connection: Upgrade\r\n\r\nws{tag}"
+                    );
+                    let _ = conn.read(&mut [0u8; 16]);
+                } else {
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{tag}"
+                    );
+                }
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn m114_least_conn_counts_open_tunnels() {
+    let (a, b) = (tagged_backend('A'), tagged_backend('B'));
+    let dir = std::env::temp_dir().join(format!("ruxen-m114-lc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let setup = common::ports::setup_lock();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "events {{}}\nhttp {{ access_log off;\n\
+             upstream u {{ least_conn; server 127.0.0.1:{a}; server 127.0.0.1:{b}; }}\n\
+             server {{ listen 127.0.0.1:{port};\n\
+             location / {{ proxy_pass http://u; proxy_http_version 1.1;\n\
+               proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $http_connection; }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+        .arg("-c")
+        .arg(dir.join("nginx.conf"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = Server(child, dir);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "ruxen did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(setup);
+
+    let mut ws = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ws.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    ws.write_all(
+        b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    .unwrap();
+    let (head, body) = read_head_and(&mut ws, 3);
+    assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+    let busy = body[2] as char;
+
+    // The open tunnel counts as a connection to its peer, as in nginx:
+    // every plain request goes to the other one.
+    for _ in 0..4 {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"GET /plain HTTP/1.0\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        assert_ne!(out.chars().last(), Some(busy), "{out}");
+    }
+    drop(ws);
+}
