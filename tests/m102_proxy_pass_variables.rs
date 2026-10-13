@@ -26,8 +26,8 @@ impl Drop for Server {
 
 /// A backend answering with the request line and the Host header.
 /// Answers with the request line and `Host`. It listens on `[::1]` too,
-/// with the same port: `localhost` resolves to `::1` first on some
-/// systems (GitHub's runners), and ruxen takes the first address.
+/// with the same port: `localhost` resolves to `::1` and `127.0.0.1` on
+/// some systems (GitHub's runners), and each address is a peer (#330).
 fn backend() -> u16 {
     let (listener, v6) = {
         let _setup = common::ports::setup_lock();
@@ -168,7 +168,8 @@ fn m102_upstream_name_or_ip_literal() {
     );
     let log = std::fs::read_to_string(server.1.join("access.log")).unwrap();
     let v4 = format!("127.0.0.1:{backend}");
-    // `localhost` is the first address it resolves to.
+    // `localhost` is the first address it resolves to: a worker's
+    // round-robin starts with the first peer.
     let localhost = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", backend))
         .unwrap()
         .next()

@@ -847,22 +847,27 @@ pub(crate) fn build_proxy(
     );
     Ok(match pp {
         ProxyPass::Direct {
-            addr, host_header, ..
+            addrs, host_header, ..
         } => {
-            let inet = matches!(addr, crate::config::UpstreamAddr::Inet(_));
+            let inet = matches!(addrs.first(), Some(crate::config::UpstreamAddr::Inet(_)));
             let display: &'static [u8] =
                 Box::leak(host_header.clone().into_bytes().into_boxed_slice());
-            let peer = PreparedPeer {
-                addr: PeerAddr::from_config(addr),
-                display,
-                weight: 1,
-                max_fails: 1,
-                fail_timeout_ms: 10_000,
-                max_conns: 0,
-                down: false,
-                backup: false,
-            };
-            let peers: &'static [PreparedPeer] = Box::leak(Box::new([peer]));
+            // A peer per address, as nginx's implicit upstream
+            // (ngx_http_upstream_init_round_robin, `u.naddrs`; #330).
+            let peers: &'static [PreparedPeer] = addrs
+                .into_iter()
+                .map(|addr| PreparedPeer {
+                    addr: PeerAddr::from_config(addr),
+                    display,
+                    weight: 1,
+                    max_fails: 1,
+                    fail_timeout_ms: 10_000,
+                    max_conns: 0,
+                    down: false,
+                    backup: false,
+                })
+                .collect::<Vec<_>>()
+                .leak();
             let host_header_static: &'static [u8] =
                 Box::leak(host_header.into_bytes().into_boxed_slice());
             let upstream: &'static PreparedUpstream = Box::leak(Box::new(PreparedUpstream {

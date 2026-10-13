@@ -31,7 +31,7 @@ The v0.1 scope is deliberately limited:
 - HTTP/1.1 only
 - hand-written HTTP parser
 - thread-per-core workers
-- `io_uring` via monoio
+- `io_uring` via monoio (epoll where `io_uring` is unavailable)
 - nginx-style configuration
 - static file serving
 - reverse proxying and upstreams
@@ -48,7 +48,7 @@ See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, 
 
 ### Requirements
 
-- Linux on x86_64 with `io_uring` available. ruxen is developed and tested on kernels 6.x–7.0. `io_uring` must not be turned off with the `kernel.io_uring_disabled` sysctl.
+- Linux on x86_64 or aarch64. ruxen runs on `io_uring` and is developed and tested on kernels 6.x–7.0. Where `io_uring` is unavailable (denied by a seccomp profile, turned off with the `kernel.io_uring_disabled` sysctl, or an old kernel), it runs on epoll instead, which is slower, and says so once in the error log at `notice`. `RUXEN_DRIVER=epoll` picks epoll anyway; `RUXEN_DRIVER=io_uring` refuses to start without `io_uring`.
 - To build from source (including `cargo install`): Rust 1.88 or newer, plus `cmake` and a C compiler for the `aws-lc-rs` crypto backend that rustls uses. aws-lc refuses GCC 9 (`Your compiler (cc) is not supported due to a memcmp related bug`); on Ubuntu 20.04, install `gcc-10 g++-10` and build with `CC=gcc-10 CXX=g++-10`.
 - `curl` to try the server.
 
@@ -70,6 +70,17 @@ cd ruxen-v*-x86_64-linux-gnu
 ```
 
 On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`) and a `SHA256SUMS` file.
+
+**Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), published with every release after 0.1.2:
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/gvozdetsky/ruxen
+curl http://127.0.0.1:8080/      # hello from ruxen
+# your configuration (listen on a port above 1024):
+docker run --rm -p 8080:8080 -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ghcr.io/gvozdetsky/ruxen
+```
+
+Under Docker's default seccomp profile ruxen runs on epoll; for `io_uring`, see Docker under [Run as a service](#run-as-a-service).
 
 **From crates.io:**
 
@@ -165,16 +176,18 @@ ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it graceful
 
 **systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to the log reopen. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` with it.
 
-**Docker:** the default seccomp profile denies `io_uring`, which ruxen runs on. [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json) is Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`, and `unshare` with `CLONE_FILES` alone (each worker's own fd table; no namespaces); use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
+**Docker:** the default seccomp profile denies `io_uring`, so there ruxen runs on epoll. For `io_uring`, use [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json): Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`, and `unshare` with `CLONE_FILES` alone (each worker's own fd table; no namespaces); use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
 
 ```bash
 docker build -f contrib/docker/Dockerfile -t ruxen .
+docker run --rm -p 8080:8080 ruxen       # epoll
+curl http://127.0.0.1:8080/              # hello from ruxen
 docker run --rm -p 8080:8080 \
     --security-opt seccomp=contrib/docker/seccomp-io_uring.json \
-    -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ruxen
+    -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ruxen    # io_uring, your config
 ```
 
-**Kubernetes:** the `RuntimeDefault` seccomp profile denies `io_uring` too. Install `seccomp-io_uring.json` on the nodes (under the kubelet's `seccomp/` directory) and refer to it with `securityContext.seccompProfile: {type: Localhost, localhostProfile: seccomp-io_uring.json}`.
+**Kubernetes:** the `RuntimeDefault` seccomp profile denies `io_uring` too, so ruxen runs on epoll there. For `io_uring`, install `seccomp-io_uring.json` on the nodes (under the kubelet's `seccomp/` directory) and refer to it with `securityContext.seccompProfile: {type: Localhost, localhostProfile: seccomp-io_uring.json}`.
 
 ## What works
 

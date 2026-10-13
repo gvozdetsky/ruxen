@@ -1004,7 +1004,7 @@ pub(crate) fn run_location_handler(
         let bind = proxy
             .bind
             .and_then(|bind| resolve_bind(bind, &proxy_render_ctx));
-        return Response::Proxy(crate::proxy::ProxyPlan {
+        return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             adhoc_peer: variable.as_ref().and_then(|v| v.adhoc_peer).map(Box::new),
             initial_peer,
@@ -1034,7 +1034,7 @@ pub(crate) fn run_location_handler(
             cache,
             hash,
             bind,
-        });
+        }));
     }
     let inner = match loc.handler {
         PreparedHandler::Return(PreparedReturn::Static(response)) => {
