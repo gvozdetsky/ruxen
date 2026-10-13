@@ -316,6 +316,8 @@ The last arg is the fallback:
 - `is_idempotent_method_bytes` lives in worker.rs because it reads raw method bytes; the `Method` enum's coarse classification (Get/Head/Trace/Connect/Other) loses PUT/DELETE/OPTIONS distinction needed for the gate.
 - `proxy_intercept_errors` and `proxy_next_upstream*` stay in `IGNORED_STMT` so http-scope occurrences (TEST_GLOBALS_HTTP preambles) keep loading; the explicit handlers at server/location scope take precedence via match-arm ordering.
 
+**`proxy_bind` (#135).** A request's local address is resolved in the handler (`resolve_bind`: literal parsed at prepare, otherwise rendered; empty binds nothing, garbage is nginx's `invalid local address` and binds nothing) and rides on `ProxyPlan.bind`. A fresh connection with a bind goes through `proxy::connect_bound` instead of monoio's io_uring connect: a socket2 socket gets `IP_TRANSPARENT` when asked and `IP_BIND_ADDRESS_NO_PORT` when no port is given, is bound, connects non-blocking and is handed to monoio, which waits for it to become writable and reads `SO_ERROR`. Failures before connect() are the request's, as in `ngx_event_connect_peer`: a 500 with nginx's `[crit] bind(…) failed` / `[alert] setsockopt(IP_TRANSPARENT) failed`, the peer not blamed. A UNIX-domain peer with a bind fails the same way (nginx's bind() gets EINVAL there). Pooled connections are reused whatever address they were bound to, as nginx's keepalive cache does.
+
 ## gzip (#93)
 
 `worker::gzip` is nginx's `ngx_http_gzip_filter_module` plus the core module's `ngx_http_gzip_ok`. It runs once per response in the worker, after the location, `error_page` and the proxy have settled it, and only where `gzip on` (`ProcessMeta::gzip`, `None` otherwise: one check per response).

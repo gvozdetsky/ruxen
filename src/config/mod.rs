@@ -953,7 +953,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_cookie_path",
     "proxy_cookie_flags",
     "proxy_socket_keepalive",
-    "proxy_bind",
     "proxy_store",
     "proxy_store_access",
     // File I/O knobs (we use std::fs; these are nginx-only tuning)

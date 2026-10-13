@@ -508,6 +508,7 @@ impl ProxyConf {
         "proxy_next_upstream_tries",
         "proxy_next_upstream_timeout",
         "proxy_intercept_errors",
+        "proxy_bind",
         "proxy_redirect",
         "proxy_hide_header",
         "proxy_pass_header",
@@ -636,6 +637,44 @@ impl ProxyConf {
                     .get_or_insert_with(Vec::new)
                     .push(name.clone());
             }
+            // ngx_http_upstream_bind_set_slot: `off`, or an address with an
+            // optional `transparent`; a literal one must parse now.
+            "proxy_bind" => {
+                if self.bind.is_some() {
+                    return Err(Error::Duplicate("proxy_bind"));
+                }
+                self.bind = Some(match &args[1..] {
+                    [off] if off == "off" => ProxyBind::Off,
+                    [addr] | [addr, _] => {
+                        let transparent = match args.get(2).map(String::as_str) {
+                            None => false,
+                            Some("transparent") => true,
+                            Some(other) => {
+                                return Err(Error::BadValue {
+                                    what: "proxy_bind parameter",
+                                    got: other.to_string(),
+                                });
+                            }
+                        };
+                        if !addr.contains('$') && parse_bind_addr(addr).is_none() {
+                            return Err(Error::BadValue {
+                                what: "proxy_bind (invalid address)",
+                                got: addr.clone(),
+                            });
+                        }
+                        ProxyBind::Addr {
+                            value: parse_value_with_vars(addr)?,
+                            transparent,
+                        }
+                    }
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "proxy_bind",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                });
+            }
             "proxy_intercept_errors" => {
                 if self.intercept_errors.is_some() {
                     return Err(Error::Duplicate("proxy_intercept_errors"));
@@ -685,6 +724,21 @@ pub(crate) fn parse_proxy_http_version_args(args: &[String]) -> Result<u8, Error
     }
 }
 
+/// `ip[:port]` or `[ipv6][:port]` (ngx_parse_addr_port), as `proxy_bind`
+/// takes it; port 0 when none.
+pub(crate) fn parse_bind_addr(s: &str) -> Option<SocketAddr> {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    let ip = s
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .unwrap_or(s)
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    Some(SocketAddr::new(ip, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,5 +779,35 @@ mod tests {
         assert!(parse_upstream_server_args(&[too_long]).is_err());
         let fits = format!("unix:/{}", "a".repeat(106));
         assert!(parse_upstream_server_args(&[fits]).is_ok());
+    }
+
+    #[test]
+    fn proxy_bind_addresses() {
+        use std::net::SocketAddr;
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(parse_bind_addr("127.0.0.2"), Some(addr("127.0.0.2:0")));
+        assert_eq!(parse_bind_addr("127.0.0.2:81"), Some(addr("127.0.0.2:81")));
+        assert_eq!(parse_bind_addr("[::1]"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("::1"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("[::1]:81"), Some(addr("[::1]:81")));
+        assert_eq!(parse_bind_addr("localhost"), None);
+        assert_eq!(parse_bind_addr("127.0.0.2:x"), None);
+
+        let parse = |args: &[&str]| {
+            let mut conf = ProxyConf::default();
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            conf.parse(&args).map(|()| conf.bind.unwrap())
+        };
+        assert_eq!(parse(&["proxy_bind", "off"]).unwrap(), ProxyBind::Off);
+        assert!(matches!(
+            parse(&["proxy_bind", "127.0.0.2", "transparent"]).unwrap(),
+            ProxyBind::Addr {
+                transparent: true,
+                ..
+            }
+        ));
+        assert!(parse(&["proxy_bind", "$arg_b"]).is_ok());
+        assert!(parse(&["proxy_bind", "bogus"]).is_err());
+        assert!(parse(&["proxy_bind", "127.0.0.2", "foo"]).is_err());
     }
 }

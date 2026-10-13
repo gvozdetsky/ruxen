@@ -600,6 +600,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                bind: eff.bind,
             }
         }
         ProxyPass::UpstreamRef {
@@ -634,6 +635,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                bind: eff.bind,
             }
         }
     })
@@ -780,6 +782,7 @@ pub(crate) struct ServerProxyDefaults {
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    pub bind: Option<&'static PreparedBind>,
 }
 
 /// `proxy_ignore_headers` as set at one scope: whether it lists `field`
@@ -835,8 +838,26 @@ impl ServerProxyDefaults {
             redirect: conf.redirect.map(|r| &*Box::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
+            bind: conf.bind.and_then(prepare_bind),
         }
     }
+}
+
+/// `proxy_bind`, `None` for `off`. A literal address was checked by the
+/// parser.
+fn prepare_bind(bind: crate::config::ProxyBind) -> Option<&'static PreparedBind> {
+    let crate::config::ProxyBind::Addr { value, transparent } = bind else {
+        return None;
+    };
+    let addr = match value.as_slice() {
+        [ValuePart::Literal(text)] => crate::config::parse_bind_addr(text),
+        _ => None,
+    };
+    Some(Box::leak(Box::new(PreparedBind {
+        addr,
+        value: prepare_value_parts(value),
+        transparent,
+    })))
 }
 
 pub(crate) fn prepare_proxy_set_headers(
@@ -908,6 +929,10 @@ pub(crate) fn resolve_proxy_effective(
         },
         hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
+        bind: match location.bind {
+            Some(bind) => prepare_bind(bind),
+            None => server_defaults.bind,
+        },
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,

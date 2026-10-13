@@ -147,6 +147,9 @@ pub struct ProxyPlan {
     /// worker when `ProxyReport::redirect_header` is set), and the hide /
     /// pass lists.
     pub response: &'static crate::worker::ProxyResponseRules,
+    /// `proxy_bind` for this request: the local address new upstream
+    /// connections are bound to. Pooled ones are reused as they are.
+    pub bind: Option<LocalBind>,
 }
 
 /// Bodies up to this size are copied into the upstream request buffer
@@ -582,6 +585,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
             AttemptOutcome::NoConnection => {
                 return crate::worker::internal_error_response(plan.method);
             }
+            AttemptOutcome::LocalError(error) => {
+                record_failure(failures, &plan, current.peer_idx, error);
+                return crate::worker::internal_error_response(plan.method);
+            }
             AttemptOutcome::PooledStale => {
                 // The pre-match collapses PooledStale into either a fresh
                 // retry or a Failed; reaching here is a logic bug.
@@ -778,6 +785,10 @@ pub enum UpstreamError {
     /// A UNIX-domain socket refuses at once, so nginx reports it from
     /// connect() itself, with the path (ngx_event_connect_peer).
     UnixConnectFailed(std::io::Error, &'static std::path::Path),
+    /// `proxy_bind`: socket(), setsockopt(IP_TRANSPARENT) or bind() failed.
+    SocketFailed(std::io::Error),
+    TransparentFailed(std::io::Error, &'static str),
+    BindFailed(std::io::Error, std::net::SocketAddr),
     SendFailed(std::io::Error),
     RecvFailed(std::io::Error, Stage),
     TimedOut(Stage),
@@ -817,6 +828,10 @@ impl UpstreamError {
                 ) => ErrorLogLevel::Error,
                 _ => ErrorLogLevel::Crit,
             },
+            UpstreamError::SocketFailed(_) | UpstreamError::TransparentFailed(..) => {
+                ErrorLogLevel::Alert
+            }
+            UpstreamError::BindFailed(..) => ErrorLogLevel::Crit,
             _ => ErrorLogLevel::Error,
         }
     }
@@ -837,6 +852,32 @@ impl std::fmt::Display for UpstreamError {
                 f,
                 "connect() to unix:{} failed ({}) while {}",
                 path.display(),
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            SocketFailed(e) => write!(
+                f,
+                "socket() failed ({}) while {}",
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            TransparentFailed(e, option) => write!(
+                f,
+                "setsockopt({option}_TRANSPARENT) failed ({}) while {}",
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            // nginx names the address as given: no port when none was.
+            BindFailed(e, addr) if addr.port() == 0 => write!(
+                f,
+                "bind({}) failed ({}) while {}",
+                addr.ip(),
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            BindFailed(e, addr) => write!(
+                f,
+                "bind({addr}) failed ({}) while {}",
                 errno_text(e),
                 Stage::Connecting.as_str()
             ),
@@ -1073,6 +1114,90 @@ enum AttemptOutcome {
     /// with a 500, without trying another peer or blaming this one
     /// (ngx_http_upstream_connect on NGX_ERROR).
     NoConnection,
+    /// Setting up the connection failed before connect(), on our side
+    /// (`proxy_bind`): the request ends with a 500, the peer not blamed
+    /// (ngx_http_upstream_connect on NGX_ERROR).
+    LocalError(Box<UpstreamError>),
+}
+
+/// A `proxy_bind` address, resolved for one request.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalBind {
+    pub addr: std::net::SocketAddr,
+    pub transparent: bool,
+}
+
+/// Connect to `addr` from `bind`, as ngx_event_connect_peer does with a
+/// local address: IP_TRANSPARENT first if asked, IP_BIND_ADDRESS_NO_PORT
+/// when no port is given (the port is then picked at connect time, so
+/// many connections can share the address), then bind(). A failure
+/// before connect() is the request's (500), not the peer's.
+#[cold]
+#[inline(never)]
+async fn connect_bound(
+    addr: std::net::SocketAddr,
+    bind: LocalBind,
+) -> Result<std::io::Result<TcpStream>, UpstreamError> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::fd::AsRawFd;
+    let socket = Socket::new(
+        Domain::for_address(addr),
+        Type::STREAM.nonblocking().cloexec(),
+        None,
+    )
+    .map_err(UpstreamError::SocketFailed)?;
+    let fd = socket.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int| -> std::io::Result<()> {
+        let one: libc::c_int = 1;
+        // SAFETY: an int option on a socket this function owns.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    if bind.transparent {
+        let (level, name, option) = match bind.addr {
+            std::net::SocketAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_TRANSPARENT, "IP"),
+            std::net::SocketAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, "IPV6"),
+        };
+        set(level, name).map_err(|e| UpstreamError::TransparentFailed(e, option))?;
+    }
+    if bind.addr.port() == 0 {
+        // nginx goes on without it when the kernel lacks it.
+        let _ = set(libc::IPPROTO_IP, libc::IP_BIND_ADDRESS_NO_PORT);
+    }
+    socket
+        .bind(&SockAddr::from(bind.addr))
+        .map_err(|e| UpstreamError::BindFailed(e, bind.addr))?;
+    Ok(async {
+        match socket.connect(&SockAddr::from(addr)) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) => return Err(e),
+        }
+        let stream = TcpStream::from_std(socket.into())?;
+        stream.writable(false).await?;
+        let fd = stream.as_raw_fd();
+        // SAFETY: borrowed for getsockopt only; `stream` keeps the fd.
+        let sock = std::mem::ManuallyDrop::new(unsafe {
+            <Socket as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        });
+        match sock.take_error()? {
+            Some(e) => Err(e),
+            None => Ok(stream),
+        }
+    }
+    .await)
 }
 
 /// Connect to a UNIX-domain socket, returned as a `TcpStream`: monoio's
@@ -1108,10 +1233,27 @@ async fn attempt(
             return AttemptOutcome::NoConnection;
         };
         let stream = match peer_addr {
-            PeerAddr::Inet(addr) => timeout(plan.connect_timeout, TcpStream::connect(addr)).await,
-            PeerAddr::Unix(path) => {
-                timeout(plan.connect_timeout, Box::pin(connect_unix(path))).await
-            }
+            PeerAddr::Inet(addr) => match plan.bind {
+                None => timeout(plan.connect_timeout, TcpStream::connect(addr)).await,
+                Some(bind) => {
+                    match timeout(plan.connect_timeout, Box::pin(connect_bound(addr, bind))).await {
+                        Ok(Ok(connected)) => Ok(connected),
+                        Ok(Err(error)) => return AttemptOutcome::LocalError(Box::new(error)),
+                        Err(elapsed) => Err(elapsed),
+                    }
+                }
+            },
+            // An inet local address can't be bound on a UNIX-domain
+            // socket: nginx's bind() fails there with EINVAL.
+            PeerAddr::Unix(path) => match plan.bind {
+                None => timeout(plan.connect_timeout, Box::pin(connect_unix(path))).await,
+                Some(bind) => {
+                    return AttemptOutcome::LocalError(Box::new(UpstreamError::BindFailed(
+                        std::io::Error::from_raw_os_error(libc::EINVAL),
+                        bind.addr,
+                    )));
+                }
+            },
         };
         let stream = match stream {
             Ok(Ok(s)) => s,
