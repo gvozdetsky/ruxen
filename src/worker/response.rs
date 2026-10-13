@@ -780,10 +780,11 @@ pub(crate) fn intercept_proxy_error(
 }
 
 /// The location's root alone, for `$document_root` / `$request_filename`
-/// in a proxied response's `add_header` when the request kept no rewrite
-/// state (#363). Cold: only past a check that there is something to add.
+/// in a proxied response's `add_header`, or in an access log line, when
+/// the request kept no rewrite state (#363). Cold: only past a check that
+/// something reads them.
 #[cold]
-fn root_only_state(meta: &phase::ProcessMeta) -> Option<RewriteState> {
+pub(crate) fn root_only_state(meta: &phase::ProcessMeta) -> Option<RewriteState> {
     if meta.rewrite_state.is_some() {
         return None;
     }
