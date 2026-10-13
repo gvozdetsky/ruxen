@@ -299,17 +299,25 @@ pub struct UpstreamBlock {
     /// `keepalive_time T;` — hard lifetime cap from first use.
     /// `None` defaults to nginx's 1h.
     pub keepalive_max_lifetime_ms: Option<u64>,
-    /// LB algorithm. Default is smoothed weighted RR; `least_conn;` is supported.
+    /// LB algorithm. Default is smoothed weighted RR; `least_conn`, `hash`
+    /// and `ip_hash` are supported.
     pub lb: LbAlgorithm,
 }
 
 /// Load-balancing algorithm for an `upstream {}` block. Smoothed weighted
 /// round-robin matches `ngx_http_upstream_round_robin.c`; least-connection
 /// matches `ngx_http_upstream_least_conn.c`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LbAlgorithm {
     RoundRobin,
     LeastConn,
+    /// `hash key [consistent]` (ngx_http_upstream_hash_module, #97).
+    Hash {
+        key: Vec<ValuePart>,
+        consistent: bool,
+    },
+    /// `ip_hash` (ngx_http_upstream_ip_hash_module, #97).
+    IpHash,
 }
 
 /// Where an upstream peer listens: a TCP address, or a UNIX-domain socket

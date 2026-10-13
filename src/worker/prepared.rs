@@ -778,8 +778,9 @@ pub struct PreparedUpstream {
     pub keepalive_idle_timeout_ms: u64,
     /// `keepalive_time T;` — hard lifetime cap. Default 1h.
     pub keepalive_max_lifetime_ms: u64,
-    /// LB algorithm. M43 added `least_conn`; default is smoothed weighted RR.
-    pub lb: crate::config::LbAlgorithm,
+    /// LB algorithm: smoothed weighted RR by default, `least_conn`, `hash`
+    /// or `ip_hash`.
+    pub lb: crate::upstream::Lb,
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in

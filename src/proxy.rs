@@ -152,6 +152,9 @@ pub struct ProxyPlan {
     /// worker when `ProxyReport::redirect_header` is set), and the hide /
     /// pass lists.
     pub response: &'static crate::worker::ProxyResponseRules,
+    /// A hash balancer's state for this request (`hash`, `ip_hash`), which
+    /// `proxy_next_upstream` picks continue from.
+    pub hash: Option<Box<upstream::HashPick>>,
     /// `proxy_bind` for this request: the local address new upstream
     /// connections are bound to. Pooled ones are reused as they are.
     pub bind: Option<LocalBind>,
@@ -393,8 +396,7 @@ fn record_failure(
 /// `http://<peer><URI>` for `upstream: "…"` in error-log lines; the URI is
 /// taken from the request line already built for the upstream.
 fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
-    let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let uri = request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/");
+    let uri = upstream_uri(plan);
     let addr = plan.peer_addr(peer_idx);
     // nginx puts a `:` between a socket path and the URI
     // (ngx_http_log_error_handler).
@@ -403,6 +405,11 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
         PeerAddr::Inet(_) => "",
     };
     format!("http://{addr}{separator}{}", String::from_utf8_lossy(uri))
+}
+
+fn upstream_uri(plan: &ProxyPlan) -> &[u8] {
+    let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/")
 }
 
 impl ProxyPlan {
@@ -426,7 +433,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     let accel = &mut report.accel;
     let states = &mut report.states;
     let upstream = plan.upstream;
-    let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
+    // nginx's `peer.tries`: the servers not marked `down`
+    // (ngx_http_upstream_tries).
+    let live = upstream.peers.iter().filter(|p| !p.down).count();
+    let max_tries = compute_max_tries(plan.next_upstream_tries, live);
     let overall_deadline = if plan.next_upstream_timeout.is_zero() {
         None
     } else {
@@ -438,16 +448,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     // No initial peer: every peer is `down` or cooling off after
     // `max_fails`.
     let Some(mut current) = plan.initial_peer.take() else {
-        states.push(UpstreamState {
-            status: 502,
-            response_ms: Some(0),
-            ..UpstreamState::new(UpstreamPeerName::Group(upstream.name))
-        });
-        failures.push(AttemptFailure {
-            error: UpstreamError::NoLiveUpstreams,
-            upstream: String::new(),
-        });
-        return Response::Prebuilt(plan.bad_gateway.pick(plan.method));
+        return no_live_upstreams(&plan, states, failures);
     };
     let mut tried = upstream::Tried::default();
     tried.insert(current.peer_idx);
@@ -563,8 +564,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     } else {
                         upstream::report_failure(upstream, current.peer_idx);
                     }
-                    let Some(next) = upstream::pick_peer(upstream, &tried) else {
-                        return resp;
+                    let Some(next) =
+                        upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
+                    else {
+                        return no_live_upstreams(&plan, states, failures);
                     };
                     tried.insert(next.peer_idx);
                     drop(current);
@@ -631,9 +634,9 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     return last_failure
                         .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
                 }
-                let Some(next) = upstream::pick_peer(upstream, &tried) else {
-                    return last_failure
-                        .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                let Some(next) = upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
+                else {
+                    return no_live_upstreams(&plan, states, failures);
                 };
                 tried.insert(next.peer_idx);
                 drop(current);
@@ -644,9 +647,38 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     }
 }
 
+/// No peer to try (every one down, cooling off after `max_fails`, or
+/// tried): nginx's NGX_BUSY from the balancer. The try shows as the
+/// upstream's name in `$upstream_addr`, `no live upstreams` is logged and
+/// the answer is a 502, whatever earlier tries got
+/// (ngx_http_upstream_connect, NGX_HTTP_UPSTREAM_FT_NOLIVE).
+#[cold]
+fn no_live_upstreams(
+    plan: &ProxyPlan,
+    states: &mut Vec<UpstreamState>,
+    failures: &mut Vec<AttemptFailure>,
+) -> Response {
+    states.push(UpstreamState {
+        status: 502,
+        response_ms: Some(0),
+        ..UpstreamState::new(UpstreamPeerName::Group(plan.upstream.name))
+    });
+    // `upstream:` names the group, as the balancer's `pc->name`.
+    failures.push(AttemptFailure {
+        error: UpstreamError::NoLiveUpstreams,
+        upstream: format!(
+            "http://{}{}",
+            String::from_utf8_lossy(plan.upstream.name),
+            String::from_utf8_lossy(upstream_uri(plan))
+        ),
+    });
+    Response::Prebuilt(plan.bad_gateway.pick(plan.method))
+}
+
 /// `proxy_next_upstream_tries 0;` is "no cap"; everything else caps the
-/// retry loop at the configured value. `peers.len()` is the natural upper
-/// bound when no cap is set (we never re-try the same peer).
+/// retry loop at the configured value. The peers not marked `down` are
+/// the natural upper bound when no cap is set (we never re-try the same
+/// peer).
 fn compute_max_tries(configured: u32, peers: usize) -> u32 {
     let peer_cap = (peers as u32).max(1);
     if configured == 0 {
