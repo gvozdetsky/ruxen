@@ -651,6 +651,10 @@ pub struct PreparedProxy {
     pub request_path: &'static [u8],
     /// What to do with the upstream's response headers.
     pub response: &'static ProxyResponseRules,
+    /// `proxy_pass` with variables (#100): the URL, rendered and parsed per
+    /// request. `upstream` is then a placeholder with one peer that the
+    /// request's own address replaces, and `host_header` is unused.
+    pub url: Option<&'static [PreparedValuePart]>,
     /// Inheritance-resolved `proxy_bind`; `None` when unset or `off`.
     pub bind: Option<&'static PreparedBind>,
 }
@@ -1548,6 +1552,10 @@ pub struct PreparedHttp {
     /// path for round-robin selection.
     #[allow(dead_code)]
     pub upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream>,
+    /// The upstreams of `proxy_pass http://host[:port]` without variables,
+    /// by lowercased host and port (80 when none): nginx's implicit
+    /// upstreams, which a `proxy_pass` with variables can name too (#100).
+    pub implicit_upstreams: &'static [(&'static [u8], u16, &'static PreparedUpstream)],
     /// Directory of the main config file, for resolving relative paths that
     /// are only known per request (e.g. `auth_basic_user_file $var`).
     pub conf_prefix: Option<&'static Path>,

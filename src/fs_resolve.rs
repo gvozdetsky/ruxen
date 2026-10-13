@@ -217,6 +217,7 @@ fn note_failed_lookup(message: String, not_found: bool) {
     note_failed_lookup_at(message, not_found, ErrorLogLevel::Error);
 }
 
+/// Also for a `proxy_pass` with variables that can't be used (#100).
 #[cold]
 pub(crate) fn note_failed_lookup_at(message: String, not_found: bool, level: ErrorLogLevel) {
     FAILED_LOOKUP.with(|f| *f.borrow_mut() = Some((message.into_bytes(), not_found, level)));

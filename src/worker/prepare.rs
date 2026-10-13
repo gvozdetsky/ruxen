@@ -297,6 +297,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
         internal_error: Prebuilt::leak(500, "Internal Server Error\n", http_server_bytes),
         upstreams: prepared_upstreams,
+        implicit_upstreams: IMPLICIT_UPSTREAMS.with(|i| i.take().leak()),
         conf_prefix: conf_prefix.map(leak_path_buf),
     })))
 }
@@ -496,6 +497,32 @@ pub(crate) fn prepare_upstreams(
     out
 }
 
+thread_local! {
+    /// Filled by `build_proxy` while a config is prepared, taken into
+    /// `PreparedHttp::implicit_upstreams`.
+    static IMPLICIT_UPSTREAMS: std::cell::Cell<
+        Vec<(&'static [u8], u16, &'static PreparedUpstream)>,
+    > = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Note the upstream of `proxy_pass http://<authority>` by host and port.
+fn note_implicit_upstream(authority: &str, upstream: &'static PreparedUpstream) {
+    // `[::1]` has colons of its own; its port parse fails and it keeps 80.
+    let (host, port) = match authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+    {
+        Some((host, port)) if !host.is_empty() => (host, port),
+        _ => (authority, 80),
+    };
+    let host: &'static [u8] = Box::leak(host.to_ascii_lowercase().into_bytes().into_boxed_slice());
+    IMPLICIT_UPSTREAMS.with(|i| {
+        let mut all = i.take();
+        all.push((host, port, upstream));
+        i.set(all);
+    });
+}
+
 pub(crate) type UpstreamMap = std::collections::HashMap<&'static str, &'static PreparedUpstream>;
 
 /// Resolve a parsed `proxy_pass` argument against the http-scope upstream
@@ -555,8 +582,8 @@ pub(crate) fn build_proxy(
         }
         _ => (b"".as_slice(), b"".as_slice()),
     };
-    let redirects = {
-        let (ProxyPass::Direct {
+    let redirects = match &pp {
+        ProxyPass::Direct {
             host_header,
             request_path,
             ..
@@ -565,13 +592,30 @@ pub(crate) fn build_proxy(
             host_header,
             request_path,
             ..
-        }) = &pp;
-        prepare_redirects(
+        } => prepare_redirects(
             eff.redirect,
             host_header,
             request_path.as_deref(),
             location_pattern,
-        )?
+        )?,
+        // With variables there is no URL to derive `default` from: no
+        // implicit rule, and an explicit one is an error
+        // (ngx_http_proxy_redirect, ngx_http_proxy_merge_loc_conf).
+        ProxyPass::Variable { .. } => match eff.redirect {
+            None | Some(crate::config::ProxyRedirect::Off) => &[],
+            Some(crate::config::ProxyRedirect::Rules(rules))
+                if rules
+                    .iter()
+                    .any(|r| matches!(r, crate::config::ProxyRedirectRule::Default)) =>
+            {
+                return Err(
+                    "\"proxy_redirect default\" cannot be used with \"proxy_pass\" \
+                     directive with variables"
+                        .to_string(),
+                );
+            }
+            Some(_) => prepare_redirects(eff.redirect, "", None, location_pattern)?,
+        },
     };
     let response = prepare_response_rules(
         redirects,
@@ -586,6 +630,7 @@ pub(crate) fn build_proxy(
         ProxyPass::Direct {
             addr, host_header, ..
         } => {
+            let inet = matches!(addr, crate::config::UpstreamAddr::Inet(_));
             let display: &'static [u8] =
                 Box::leak(host_header.clone().into_bytes().into_boxed_slice());
             let peer = PreparedPeer {
@@ -609,6 +654,9 @@ pub(crate) fn build_proxy(
                 keepalive_max_lifetime_ms: 3_600_000,
                 lb: crate::config::LbAlgorithm::RoundRobin,
             }));
+            if inet && let Ok(authority) = std::str::from_utf8(host_header_static) {
+                note_implicit_upstream(authority, upstream);
+            }
             PreparedProxy {
                 upstream,
                 host_header: without_default_port(host_header_static),
@@ -630,6 +678,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                url: None,
                 bind: eff.bind,
             }
         }
@@ -665,6 +714,55 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                url: None,
+                bind: eff.bind,
+            }
+        }
+        ProxyPass::Variable { url } => {
+            // One peer, never marked down (`max_fails=0`): each request
+            // brings its own address, as nginx creates a peer per request
+            // (ngx_http_upstream_create_round_robin_peer).
+            let peer = PreparedPeer {
+                addr: PeerAddr::Inet(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+                display: b"",
+                weight: 1,
+                max_fails: 0,
+                fail_timeout_ms: 10_000,
+                down: false,
+                backup: false,
+            };
+            let peers: &'static [PreparedPeer] = Box::leak(Box::new([peer]));
+            let upstream: &'static PreparedUpstream = Box::leak(Box::new(PreparedUpstream {
+                name: b"",
+                peers,
+                keepalive_max_idle: None,
+                keepalive_requests: 1000,
+                keepalive_idle_timeout_ms: 60_000,
+                keepalive_max_lifetime_ms: 3_600_000,
+                lb: crate::config::LbAlgorithm::RoundRobin,
+            }));
+            PreparedProxy {
+                upstream,
+                host_header: b"",
+                set_headers: eff.set_headers,
+                pass_request_headers: eff.pass_request_headers,
+                pass_request_body: eff.pass_request_body,
+                set_body: eff.set_body,
+                connect_timeout_ms: eff.connect_timeout_ms,
+                read_timeout_ms: eff.read_timeout_ms,
+                send_timeout_ms: eff.send_timeout_ms,
+                limit_rate: eff.limit_rate,
+                http_version: eff.http_version,
+                next_upstream: eff.next_upstream,
+                next_upstream_tries: eff.next_upstream_tries,
+                next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
+                intercept_errors: eff.intercept_errors,
+                ignore_invalid_headers: eff.ignore_invalid_headers,
+                underscores_in_headers: eff.underscores_in_headers,
+                location_prefix: b"",
+                request_path: b"",
+                response,
+                url: Some(prepare_value_parts(url)),
                 bind: eff.bind,
             }
         }

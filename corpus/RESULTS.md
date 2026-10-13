@@ -6,11 +6,11 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 162 of 238 configurations nginx accepts (68%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 167 of 238 configurations nginx accepts (70%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 147 | 69% |
+| github | 214 | 152 | 71% |
 | php | 3 | 0 | 0% |
 | proxy | 17 | 12 | 71% |
 | static | 4 | 3 | 75% |
@@ -20,14 +20,13 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | configurations | first error in ruxen | examples |
 |---:|---|---|
 | 14 | open() "…" failed (No such file or directory (os error N)) in <sandbox>…:N | h5bp:nginx.conf, gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:ocftw/OpenGovReport14-16/nginx.config, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt … |
-| 7 | bad value for proxy_pass ($var dynamic upstream not supported in vN.N; declare an upstream{} block): | gh:gsw945/wechat-demo4dev/app-nginx.conf, gh:vazw/siamstr/nginx.config, gh:sul-cidr/mime/nginx.config, gh:chelebyy/link-manager/frontend/nginx.conf … |
+| 7 | unknown directive `proxy_cache` | gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example, gh:jsjfai/AgentDNS-Node/nginx.conf.example, gh:Athenavi/chiron/frontend-vue/nginx.conf, gh:azzaraq-creator/admix/deploy/nginx.conf.template … |
 | 6 | unknown directive `limit_req_zone` | gh:decred/dcrstakepool/sample-nginx.conf, gh:thuongtruong109/flashot/nginx.conf, gh:hatanaca/quick-filler-test/nginx.conf, gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf … |
-| 6 | unknown directive `proxy_cache` | gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example, gh:jsjfai/AgentDNS-Node/nginx.conf.example, gh:azzaraq-creator/admix/deploy/nginx.conf.template, gh:tesfandiari1/LLM-txt/frontend/nginx.conf … |
 | 5 | unknown directive `proxy_cache_revalidate` | gh:wednesday-solutions/react-template/app/.nginx.conf, gh:SiddOnKeys/react-temp-wednesday/app/.nginx.conf, gh:tusharanekardev/react-template/app/.nginx.conf, gh:apurv-wednesday/react-template/app/.nginx.conf … |
 | 4 | bad value for ssl_protocols (insecure version rejected): TLSvN in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:EstudioNexos/flautodiscover/fla_nginx.conf, gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf |
+| 4 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf, gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf |
 | 4 | unknown directive `proxy_pass` | puma#1, gh:limingxinleo/phalcon/swoole.nginx.conf, gh:limingxinleo/basic-phalcon/swoole.nginx.conf, gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
-| 3 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf |
 | 3 | unknown directive `http2` | gh:refluxdb/influxdb3-community/iox-nginx.conf, gh:qida/gohp/jsonx/nginx.conf.txt, gh:exp0logy/familycal/frontend/nginx.conf |
 | 3 | unknown directive `zone` | vaultwarden#1, vaultwarden#2, vaultwarden#3 |
 | 2 | unknown directive `auth_request` | gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in, gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf |
@@ -143,7 +142,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:jsjfai/AgentDNS-Node/nginx.conf.example | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache` in a location block in <sandbox>/conf/nginx.conf:28 |
 | gh:nocomp/scribe/nginx.conf.example | github | ok | ok |  |
 | gh:Apress/adv-microservices/ch4-nginx.conf | github | ok | ok |  |
-| gh:gsw945/wechat-demo4dev/app-nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://app_server/web/$sub_domain$static_file in <sandbox>/conf/nginx.conf:38 |
+| gh:gsw945/wechat-demo4dev/app-nginx.conf | github | ok | ok |  |
 | gh:backupify/yard-server/yard-nginx.conf | github | ok | ok |  |
 | gh:Agunxzzz/XrayCol/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:31 |
 | gh:inab/openEBench-nuxt/nginx.conf.devci | github | ok | ok |  |
@@ -151,7 +150,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:Ozrlz/odoo-nginx-reverse-proxy/odoo-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache_valid` in a location block in <sandbox>/conf/nginx.conf:43 |
 | gh:kaakaww/vuln_django_play/nginx.conf.micro | github | ok | ok |  |
 | gh:mohamedtharwat000/eliteTech/nginx.config | github | ok | ok |  |
-| gh:vazw/siamstr/nginx.config | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://127.0.0.1:8008/.well-known/lnurlp/$name in <sandbox>/conf/nginx.conf:10 |
+| gh:vazw/siamstr/nginx.config | github | ok | ok |  |
 | gh:awfeequdng/rust-admin/nginx.conf.default | github | ok | ok |  |
 | gh:mazz/kifu/nginx.conf.sample | github | ok | ok |  |
 | gh:eubr-bigsea/citrus/custom_nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 in <sandbox>/conf/nginx.conf:21 |
@@ -167,7 +166,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:MEGWARE-HPC/xbat/conf/nginx.conf.in | github | — | — | (nginx: [emerg] unexpected "}" in <sandbox>/conf/nginx.conf:15) |
 | gh:rede-sustentabilidade/site-wordpress/nginx.conf.sigil | github | — | — | (nginx: [emerg] directive "server_name" is not terminated by ";" in <sandbox>/con) |
 | gh:sk123/theyownwhat/nginx.conf_dev | github | ok | ok |  |
-| gh:sul-cidr/mime/nginx.config | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://127.0.0.1:5000/frame/$1/$2/ in <sandbox>/conf/nginx.conf:57 |
+| gh:sul-cidr/mime/nginx.config | github | ok | ok |  |
 | gh:llong2195/nest-fastify/nginx.conf.d | github | ok | ok |  |
 | gh:TetAlius/GoSyncMyCalendars/.nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1.1 in <sandbox>/conf/nginx.conf:25 |
 | gh:opensessions/opensessions/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
@@ -238,7 +237,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:betarixm/poka-roulette/nginx.conf | github | ok | ok |  |
 | gh:hatanaca/quick-filler-test/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in a http block in <sandbox>/conf/nginx.conf:5 |
 | gh:Ecalose/ocr/nginx.conf | github | ok | ok |  |
-| gh:chelebyy/link-manager/frontend/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): $backend_upstream in <sandbox>/conf/nginx.conf:25 |
+| gh:chelebyy/link-manager/frontend/nginx.conf | github | ok | ok |  |
 | gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:4 |
 | gh:Ingvord/animated-garbanzo/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:33 |
 | gh:cfrank/nextjs-common-host-redirect-issue/nginx/nginx.conf | github | ok | ok |  |
@@ -257,10 +256,10 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:ThNikGhost/notipus2/nginx.conf | github | ok | ok |  |
 | gh:Gagen4/map4/nginx.conf | github | ok | ok |  |
 | gh:ok245/Food-Order-System-Backend/nginx.conf | github | — | — | (nginx: [emerg] unexpected end of file, expecting ";" or "}" in <sandbox>/conf/ng) |
-| gh:Athenavi/chiron/frontend-vue/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://$chiron_gateway in <sandbox>/conf/nginx.conf:81 |
+| gh:Athenavi/chiron/frontend-vue/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_cache` in a location block in <sandbox>/conf/nginx.conf:97 |
 | gh:QuantumBitstream/travelplanner_vue/nginx/nginx.conf | github | ok | ok |  |
 | gh:mohamed-azd/sonidle/nginx/nginx.conf | github | ok | ok |  |
-| gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): $frontend_upstream in <sandbox>/conf/nginx.conf:54 |
+| gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a if block in <sandbox>/conf/nginx.conf:84 |
 | gh:Amitkushwaha328/CivicSense-AI/nginx/nginx.conf | github | ok | ok |  |
 | gh:zumassh/foodgram-st/infra/nginx.conf | github | ok | ok |  |
 | gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req` in a location block in <sandbox>/conf/nginx.conf:74 |
@@ -315,7 +314,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:kayab23/Base_Costos_PWA/nginx.conf | github | ok | ok |  |
 | gh:NikMassV/nginx/nginx.conf | github | ok | ok |  |
 | gh:Ermuk-code/arenda-site/nginx.conf | github | ok | ok |  |
-| gh:ksanyok/mailforge/docker/web/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block): http://webmail:80$request_uri in <sandbox>/conf/nginx.conf:63 |
+| gh:ksanyok/mailforge/docker/web/nginx.conf | github | ok | ok |  |
 | gh:Ikeu-1030/iRun/docker/nginx/nginx.conf | github | ok | ok |  |
 | gh:rajim59/SwarmFort/infra/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server param: resolve in <sandbox>/conf/nginx.conf:6 |
 | gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `limit_req_zone` in a http block in <sandbox>/conf/nginx.conf:22 |

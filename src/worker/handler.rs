@@ -511,6 +511,28 @@ pub(crate) fn run_location_handler(
     // location's proxy add_header/add_trailer state with `$upstream_*`
     // variables populated.
     if let PreparedHandler::Proxy(proxy) = loc.handler {
+        // `proxy_pass` with variables: where this request goes (#100).
+        let variable = match proxy.url {
+            None => None,
+            Some(url) => match resolve_variable_url(http, proxy.upstream, url, &render_ctx_base) {
+                Ok(target) => Some(target),
+                Err(status) => {
+                    return variable_url_failed(
+                        http,
+                        status,
+                        &loc,
+                        req,
+                        &render_ctx_base,
+                        in_error_page,
+                        preserved_www_authenticate,
+                    );
+                }
+            },
+        };
+        let upstream = variable.as_ref().map_or(proxy.upstream, |v| v.upstream);
+        let host_header: &[u8] = variable
+            .as_ref()
+            .map_or(proxy.host_header, |v| &v.host_header);
         // Path rewriting: nginx forwards the *post-rewrite* URI (`r->uri`
         // after any internal redirects), not the client's original
         // request line. When `proxy_pass http://up/PATH` had a URI part,
@@ -529,7 +551,12 @@ pub(crate) fn run_location_handler(
             b""
         };
         let rewritten_uri: Vec<u8>;
-        let request_uri: &[u8] = if request_path.is_empty() {
+        let request_uri: &[u8] = if let Some(uri) = variable.as_ref().and_then(|v| v.uri.as_deref())
+        {
+            // With variables, a URI part is the whole upstream URI
+            // (ngx_http_proxy_create_request).
+            uri
+        } else if request_path.is_empty() {
             if args.is_empty() {
                 let mut buf = Vec::with_capacity(url_path.len());
                 buf.extend_from_slice(url_path);
@@ -564,12 +591,12 @@ pub(crate) fn run_location_handler(
         // Pick the first peer via the per-worker LB. None means every
         // peer is `down` or in a `max_fails` cooldown: `run_proxy` answers
         // 502 and reports `no live upstreams` for the error log.
-        let initial_peer = crate::upstream::pick_peer(proxy.upstream, &Default::default());
+        let initial_peer = crate::upstream::pick_peer(upstream, &Default::default());
         // Render proxy_set_header values with $proxy_host populated for
         // this location's upstream URL authority. The other RenderCtx
         // fields are inherited from the base built above.
         let mut proxy_render_ctx = render_ctx_base;
-        proxy_render_ctx.proxy_host = proxy.host_header;
+        proxy_render_ctx.proxy_host = host_header;
 
         // Build the final header set: proxy_set_header overrides first
         // (nginx wins ties on declaration order) plus a synthesized
@@ -598,13 +625,13 @@ pub(crate) fn run_location_handler(
             overrides_buf.push((sh.name, value));
         }
         if !have_host_override {
-            overrides_buf.insert(0, (b"Host", proxy.host_header.to_vec()));
+            overrides_buf.insert(0, (b"Host", host_header.to_vec()));
         }
 
         // Pool eligibility: HTTP/1.1 + the upstream block opted into
         // `keepalive N;`. Drives both the Connection-header default
         // synthesized below and `run_proxy`'s pool-release decision.
-        let pool_eligible = proxy.http_version == 1 && proxy.upstream.keepalive_max_idle.is_some();
+        let pool_eligible = proxy.http_version == 1 && upstream.keepalive_max_idle.is_some();
 
         if !have_connection_override {
             // Default Connection on the upstream side: keep-alive when
@@ -732,7 +759,8 @@ pub(crate) fn run_location_handler(
             .bind
             .and_then(|bind| resolve_bind(bind, &proxy_render_ctx));
         return Response::Proxy(crate::proxy::ProxyPlan {
-            upstream: proxy.upstream,
+            upstream,
+            adhoc_peer: variable.as_ref().and_then(|v| v.adhoc_peer).map(Box::new),
             initial_peer,
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
             body: separate_body,
@@ -1120,6 +1148,244 @@ fn prebuilt_with_literal_add_headers(
         cache.borrow_mut().insert(key, built);
         built
     })
+}
+
+/// Where a `proxy_pass` with variables sends one request (#100).
+struct VariableTarget {
+    upstream: &'static PreparedUpstream,
+    /// The URL's own address (an IP literal or `unix:` path); `None` when
+    /// it named an `upstream` block.
+    adhoc_peer: Option<crate::worker::PeerAddr>,
+    /// `$proxy_host` and the default `Host`.
+    host_header: Vec<u8>,
+    /// The URL's URI part, sent as the whole request URI; `None`: the
+    /// request's own.
+    uri: Option<Vec<u8>>,
+}
+
+/// Render and parse a `proxy_pass` URL with variables, as nginx's
+/// ngx_http_proxy_eval and ngx_http_upstream_init_request do: an `upstream`
+/// block of that name (when the URL has no port), else an IP literal or a
+/// `unix:` path as the one peer, else a name only a resolver could turn
+/// into an address, which ruxen doesn't have: 502 and nginx's `no resolver
+/// defined to resolve` line. A malformed URL is a 500. The error lines are
+/// logged with the request's context once processing returns.
+#[cold]
+#[inline(never)]
+fn resolve_variable_url(
+    http: &'static PreparedHttp,
+    placeholder: &'static PreparedUpstream,
+    url: &[PreparedValuePart],
+    ctx: &RenderCtx<'_>,
+) -> Result<VariableTarget, u16> {
+    use crate::config::ErrorLogLevel;
+    use crate::worker::PeerAddr;
+    let mut rendered = Vec::with_capacity(64);
+    render_parts(url, ctx, &mut rendered);
+    let fail = |status: u16, message: String| {
+        crate::fs_resolve::note_failed_lookup_at(message, false, ErrorLogLevel::Error);
+        Err(status)
+    };
+    let rest = match rendered.get(..7) {
+        Some(scheme) if scheme.eq_ignore_ascii_case(b"http://") && rendered.len() > 7 => {
+            &rendered[7..]
+        }
+        _ => {
+            return fail(
+                500,
+                format!(
+                    "invalid URL prefix in \"{}\"",
+                    String::from_utf8_lossy(&rendered)
+                ),
+            );
+        }
+    };
+    let in_upstream =
+        |what: &str| format!("{what} in upstream \"{}\"", String::from_utf8_lossy(rest));
+    // `unix:/path[:uri]`: the path ends at the next `:`.
+    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"unix:") {
+        let after = &rest[5..];
+        let (path, uri) = match after.iter().position(|&b| b == b':') {
+            Some(colon) => (&after[..colon], &after[colon + 1..]),
+            None => (after, &b""[..]),
+        };
+        if path.is_empty() {
+            return fail(500, in_upstream("no path in the unix domain socket"));
+        }
+        if path.len() + 1 > 108 {
+            return fail(500, in_upstream("too long path in the unix domain socket"));
+        }
+        let Some(path) = intern_unix_path(path) else {
+            return fail(502, in_upstream("too many unix: upstream paths"));
+        };
+        return Ok(VariableTarget {
+            upstream: placeholder,
+            adhoc_peer: Some(PeerAddr::Unix(path)),
+            host_header: b"localhost".to_vec(),
+            uri: (!uri.is_empty()).then(|| uri.to_vec()),
+        });
+    }
+    // host[:port] up to the URI, which starts at `/` or `?`.
+    let end = rest
+        .iter()
+        .position(|&b| b == b'/' || b == b'?')
+        .unwrap_or(rest.len());
+    let (authority, uri) = rest.split_at(end);
+    let (host, port): (&[u8], Option<&[u8]>) = if authority.first() == Some(&b'[') {
+        let Some(close) = authority.iter().position(|&b| b == b']') else {
+            return fail(500, in_upstream("invalid host"));
+        };
+        match &authority[close + 1..] {
+            [] => (&authority[..=close], None),
+            [b':', port @ ..] => (&authority[..=close], Some(port)),
+            _ => return fail(500, in_upstream("invalid host")),
+        }
+    } else {
+        match authority.iter().rposition(|&b| b == b':') {
+            Some(colon) => (&authority[..colon], Some(&authority[colon + 1..])),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return fail(500, in_upstream("no host"));
+    }
+    let port = match port {
+        None => None,
+        Some(p) => match std::str::from_utf8(p)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            Some(n) if n > 0 => Some(n),
+            _ => return fail(500, in_upstream("invalid port")),
+        },
+    };
+    // ngx_http_proxy_set_vars: the scheme's port isn't repeated.
+    let host_header = match port {
+        None | Some(80) => host.to_vec(),
+        Some(_) => authority.to_vec(),
+    };
+    let uri = match uri {
+        [] => None,
+        [b'?', ..] => Some([&b"/"[..], uri].concat()),
+        _ => Some(uri.to_vec()),
+    };
+    let literal = std::str::from_utf8(host).ok().and_then(|h| {
+        h.strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(h)
+            .parse::<std::net::IpAddr>()
+            .ok()
+    });
+    if let Some(ip) = literal {
+        return Ok(VariableTarget {
+            upstream: placeholder,
+            adhoc_peer: Some(PeerAddr::Inet(std::net::SocketAddr::new(
+                ip,
+                port.unwrap_or(80),
+            ))),
+            host_header,
+            uri,
+        });
+    }
+    // An `upstream` block matches only a URL without a port, as its
+    // name has none; the implicit upstream of another location's
+    // `proxy_pass http://host:port` matches by host and port
+    // (ngx_http_upstream_init_request).
+    let block = || {
+        http.upstreams
+            .iter()
+            .find(|(name, _)| name.as_bytes().eq_ignore_ascii_case(host))
+            .map(|(_, upstream)| *upstream)
+    };
+    let implicit = || {
+        http.implicit_upstreams
+            .iter()
+            .find(|(name, p, _)| *p == port.unwrap_or(80) && name.eq_ignore_ascii_case(host))
+            .map(|(_, _, upstream)| *upstream)
+    };
+    if let Some(upstream) = port.is_none().then(block).flatten().or_else(implicit) {
+        return Ok(VariableTarget {
+            upstream,
+            adhoc_peer: None,
+            host_header,
+            uri,
+        });
+    }
+    fail(
+        502,
+        format!(
+            "no resolver defined to resolve {}",
+            String::from_utf8_lossy(host)
+        ),
+    )
+}
+
+thread_local! {
+    /// `unix:` paths that requests have named through `proxy_pass` with
+    /// variables, kept for the life of the worker so a peer can hold a
+    /// `&'static Path`. Bounded: the URL may come from the client.
+    static UNIX_PATHS: std::cell::RefCell<Vec<&'static std::path::Path>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const UNIX_PATHS_MAX: usize = 1024;
+
+fn intern_unix_path(path: &[u8]) -> Option<&'static std::path::Path> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+    UNIX_PATHS.with(|paths| {
+        let mut paths = paths.borrow_mut();
+        if let Some(known) = paths.iter().find(|p| **p == path) {
+            return Some(*known);
+        }
+        if paths.len() >= UNIX_PATHS_MAX {
+            return None;
+        }
+        let leaked: &'static std::path::Path = Box::leak(path.to_path_buf().into_boxed_path());
+        paths.push(leaked);
+        Some(leaked)
+    })
+}
+
+/// The 500 or 502 for a `proxy_pass` URL that can't be used, through the
+/// location's `error_page` as nginx finalizes it.
+#[cold]
+fn variable_url_failed(
+    http: &'static PreparedHttp,
+    status: u16,
+    loc: &MatchedLocation<'static>,
+    req: &phase::RequestCtx<'_>,
+    render_ctx_base: &RenderCtx<'_>,
+    in_error_page: bool,
+    preserved_www_authenticate: &[Vec<u8>],
+) -> Response {
+    let prebuilt = if status == 502 {
+        &http.bad_gateway
+    } else {
+        &http.internal_error
+    };
+    let intercepted = maybe_intercept_error_page(
+        Response::Prebuilt(prebuilt.pick(req.method)),
+        loc.error_pages,
+        req,
+        render_ctx_base,
+        in_error_page,
+        loc.recursive_error_pages,
+        loc.server_header,
+    );
+    let trailers_allowed =
+        req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
+    finalize_location_response(
+        intercepted,
+        loc.add_headers,
+        loc.add_trailers,
+        trailers_allowed,
+        render_ctx_base,
+        None,
+        None,
+        preserved_www_authenticate,
+        loc.expires,
+    )
 }
 
 /// The request's `proxy_bind` address (ngx_http_upstream_set_local): the
