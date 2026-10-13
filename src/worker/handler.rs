@@ -753,6 +753,20 @@ pub(crate) fn run_location_handler(
             build_templated_return(*status, parts, &render_ctx_base, req.method, server_bytes),
         ),
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
+        // ngx_http_stub_status_handler: GET and HEAD only, text/plain.
+        PreparedHandler::StubStatus => match req.method {
+            Method::Get => Response::Owned(http::build_response(
+                200,
+                &super::stats::status_text(),
+                server_bytes,
+            )),
+            Method::Head => Response::Owned(http::build_head_response(
+                200,
+                super::stats::status_text().len(),
+                server_bytes,
+            )),
+            _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
+        },
         // Static-file mapping follows the configured path mode:
         // `root` appends the whole normalized URI, while `alias` strips the
         // matched location prefix first. `PreparedRoot` carries that choice.

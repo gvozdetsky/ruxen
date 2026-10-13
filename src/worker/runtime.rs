@@ -1126,7 +1126,11 @@ pub fn run(
                 }
                 match accept_or_tick(&listener).await {
                     Ok(Some((stream, addr))) => {
-                        if !admit_connection(http) {
+                        let admitted = admit_connection(http);
+                        if http.stats {
+                            super::stats::accepted(admitted);
+                        }
+                        if !admitted {
                             continue;
                         }
                         let _ = stream.set_nodelay(true);
@@ -1176,7 +1180,11 @@ pub(crate) async fn run_listener(
         }
         match accept_or_tick(&listener).await {
             Ok(Some((stream, addr))) => {
-                if !admit_connection(http) {
+                let admitted = admit_connection(http);
+                if http.stats {
+                    super::stats::accepted(admitted);
+                }
+                if !admitted {
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
@@ -2160,7 +2168,11 @@ pub(crate) async fn handle<S: ConnIo>(
         };
     }
 
+    // stub_status / $connections_* (#96); inert unless the config reads them.
+    let mut conn_stats = super::stats::ConnStats::new(http.stats);
+
     'idle: loop {
+        conn_stats.set(super::stats::Phase::Waiting);
         let (next, returned) = stream
             .idle_read(
                 std::mem::take(&mut *buf),
@@ -2176,6 +2188,7 @@ pub(crate) async fn handle<S: ConnIo>(
             IdleRead::Ready => 0,
             IdleRead::Read(n) => n,
         };
+        conn_stats.set(super::stats::Phase::Reading);
         keepalive_idle_timeout = None;
         // The header's time starts with its first bytes, as nginx's
         // client_header_timeout after the keep-alive read.
@@ -2210,6 +2223,7 @@ pub(crate) async fn handle<S: ConnIo>(
                 let view = &buf[read_start..filled];
                 match http::parse_request(view, &mut parse_state) {
                     Parse::Complete(req) => {
+                        conn_stats.request();
                         let request_start = Instant::now();
                         // Counted up front so a request refused below logs
                         // `$connection_requests` as nginx does.

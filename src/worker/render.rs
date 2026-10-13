@@ -342,6 +342,16 @@ impl RenderCtx<'_> {
             Variable::SslClientVEnd => {}
             Variable::SslClientVRemain => {}
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            Variable::Connections(gauge) => {
+                let t = super::stats::totals();
+                let n = match gauge {
+                    crate::config::ConnectionsGauge::Active => t.active,
+                    crate::config::ConnectionsGauge::Reading => t.reading,
+                    crate::config::ConnectionsGauge::Writing => t.writing,
+                    crate::config::ConnectionsGauge::Waiting => t.waiting,
+                };
+                write_u64_decimal(out, n);
+            }
             Variable::RequestBody => {
                 // nginx leaves `$request_body` empty whenever the body was
                 // spilled to disk — readers consult `$request_body_file`

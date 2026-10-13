@@ -528,6 +528,8 @@ pub enum PreparedHandler {
     Return(PreparedReturn),
     Root(PreparedRoot),
     Proxy(PreparedProxy),
+    /// `stub_status` (#96).
+    StubStatus,
 }
 
 /// Per-location rules for an upstream's response headers, behind one
@@ -1463,6 +1465,9 @@ pub struct PreparedHttp {
     /// An `error_log stderr` appears in the config: `-e` doesn't take over
     /// stderr (nginx's `log_use_stderr`; #309).
     pub uses_stderr_log: bool,
+    /// `stub_status` or `$connections_*` is used: keep the counters
+    /// (`stats`).
+    pub stats: bool,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],
