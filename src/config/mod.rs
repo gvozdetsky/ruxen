@@ -2173,6 +2173,7 @@ mod tests {
             SessionResumption {
                 cache: Some(true),
                 shared: true,
+                shared_zone: Some("shared:SSL:1m".to_string()),
                 tickets: Some(false),
                 ticket_keys: None,
             }
