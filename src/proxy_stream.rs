@@ -141,7 +141,8 @@ pub(crate) async fn relay<S: monoio::io::AsyncWriteRent>(
             return finish(s, end, extra, head);
         }
     };
-    crate::proxy::return_proxy_buf(pending);
+    // `pending` was cut to the body's size: not a read buffer, dropped.
+    drop(pending);
     let len = head.len();
     let (ok, returned) =
         write_out(client, head, len, &mut pacer, timer.as_mut(), send_timeout).await;

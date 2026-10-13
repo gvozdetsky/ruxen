@@ -59,7 +59,9 @@ fn take_proxy_buf() -> Vec<u8> {
 pub(crate) fn return_proxy_buf(mut v: Vec<u8>) {
     // Cap individual buffer growth so a giant chunked body doesn't keep an
     // oversized Vec alive in the pool forever.
-    if v.capacity() > PROXY_SCRATCH_CAP * 16 {
+    // And a smaller one would come back as a read buffer: a read into no
+    // room returns 0, which looks like the upstream closing.
+    if v.capacity() > PROXY_SCRATCH_CAP * 16 || v.capacity() < PROXY_SCRATCH_CAP {
         return;
     }
     v.clear();
@@ -2856,6 +2858,17 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_buffer_pool_keeps_only_read_sized_buffers() {
+        PROXY_BUF_POOL.with(|p| p.borrow_mut().clear());
+        return_proxy_buf(Vec::new());
+        return_proxy_buf(Vec::with_capacity(3));
+        return_proxy_buf(Vec::with_capacity(PROXY_SCRATCH_CAP * 32));
+        assert_eq!(PROXY_BUF_POOL.with(|p| p.borrow().len()), 0);
+        return_proxy_buf(Vec::with_capacity(PROXY_SCRATCH_CAP));
+        assert!(take_proxy_buf().capacity() >= PROXY_SCRATCH_CAP);
+    }
 
     #[test]
     fn request_parts_advance_across_head_and_body() {
