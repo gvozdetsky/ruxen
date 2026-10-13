@@ -71,6 +71,17 @@ cd ruxen-v*-x86_64-linux-gnu
 
 On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`) and a `SHA256SUMS` file.
 
+**Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), published with every release after 0.1.2:
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/gvozdetsky/ruxen
+curl http://127.0.0.1:8080/      # hello from ruxen
+# your configuration (listen on a port above 1024):
+docker run --rm -p 8080:8080 -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ghcr.io/gvozdetsky/ruxen
+```
+
+Under Docker's default seccomp profile ruxen runs on epoll; for `io_uring`, see Docker under [Run as a service](#run-as-a-service).
+
 **From crates.io:**
 
 ```bash
