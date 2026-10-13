@@ -84,7 +84,7 @@ if [[ -f "$baseline_file" && "$FORCE" != "1" ]]; then
     die "baseline already exists: $baseline_file (pass --force to recapture)"
 fi
 
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 work_dir="$(mktemp -d -t ruxen-baseline-XXXXXX)"
 trap 'rm -rf "$work_dir"' EXIT
 

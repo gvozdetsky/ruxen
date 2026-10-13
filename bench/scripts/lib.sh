@@ -19,14 +19,31 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || die "missing required command: ${cmd}"
 }
 
+# The URL scheme of a manifest `scheme`: `h2c` (HTTP/2 with prior
+# knowledge) is http, `h2` (HTTP/2 over TLS) is https.
+url_scheme() {
+    case "$1" in
+        h2c) echo http ;;
+        h2) echo https ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# curl options for a manifest `scheme`, one per line.
+curl_scheme_opts() {
+    case "$1" in
+        https) echo -k ;;
+        h2) printf '%s\n' -k --http2 ;;
+        h2c) echo --http2-prior-knowledge ;;
+    esac
+}
+
 wait_for_http() {
     local url="$1"
     local attempts="${2:-100}"
     local scheme="${3:-http}"
     local -a tls_opts=()
-    if [[ "$scheme" == "https" ]]; then
-        tls_opts=(-k)
-    fi
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
     local i
     for ((i = 0; i < attempts; i++)); do
         if curl -sS -m 1 "${tls_opts[@]}" -o /dev/null "$url" >/dev/null 2>&1; then
@@ -88,9 +105,7 @@ extract_etag() {
     local url="$1"
     local scheme="${2:-http}"
     local -a tls_opts=()
-    if [[ "$scheme" == "https" ]]; then
-        tls_opts=(-k)
-    fi
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
     curl -fsSI "${tls_opts[@]}" "$url" \
         | tr -d '\r' \
         | awk 'BEGIN { IGNORECASE=1 } $1=="ETag:" { print $2; exit }'
@@ -100,9 +115,7 @@ extract_last_modified() {
     local url="$1"
     local scheme="${2:-http}"
     local -a tls_opts=()
-    if [[ "$scheme" == "https" ]]; then
-        tls_opts=(-k)
-    fi
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
     curl -fsSI "${tls_opts[@]}" "$url" \
         | tr -d '\r' \
         | awk 'BEGIN { IGNORECASE=1 } tolower($1)=="last-modified:" { sub(/^[^:]*: */, ""); print; exit }'
@@ -137,7 +150,7 @@ wrk_metric_elapsed() {
 wrk_metric_non2xx() {
     local file="$1"
     awk '
-        /^Non-2xx or 3xx responses:/ { print $4; found=1; exit }
+        /Non-2xx or 3xx responses:/ { print $NF; found=1; exit }
         END { if (!found) print 0 }
     ' "$file"
 }
@@ -306,7 +319,7 @@ run_iteration() {
     }
 
     local -a tls_opts=()
-    [[ "$scheme" == "https" ]] && tls_opts=(-k)
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
 
     local ready=0 attempt
     for ((attempt = 0; attempt < 120; attempt++)); do
@@ -326,6 +339,13 @@ run_iteration() {
         fi
         _stop_server
         die "server did not become ready: $url"
+    fi
+
+    if [[ "$scheme" == "h2" || "$scheme" == "h2c" ]]; then
+        run_h2load "$url" "$threads" "$connections" "$warmup" "$duration" "$wrk_log"
+        local h2_rc=$?
+        _stop_server
+        return $h2_rc
     fi
 
     local -a headers=()
@@ -357,4 +377,39 @@ run_iteration() {
         tail -n 40 "$wrk_log" >&2 || true
         return $wrk_rc
     fi
+}
+
+# HTTP/2 load (#348): h2load with 10 streams per connection, its summary
+# rewritten into the wrk lines the metric functions read (Requests/sec,
+# Non-2xx, Socket errors with failed + errored + timed-out requests as
+# `timeout`). h2load's own output is kept next to it (`.h2load`).
+run_h2load() {
+    local url="$1" threads="$2" connections="$3" warmup="$4" duration="$5" out="$6"
+    command -v h2load >/dev/null 2>&1 || die "h2load not found (apt install nghttp2-client)"
+    local -a cmd=(h2load -t "$threads" -c "$connections" -m 10)
+    set +e
+    "${cmd[@]}" -D "${warmup%s}" "$url" >/dev/null 2>&1
+    "${cmd[@]}" -D "${duration%s}" "$url" >"${out}.h2load" 2>&1
+    local rc=$?
+    set -e
+    h2load_as_wrk "${out}.h2load" >"$out"
+    if [[ $rc -ne 0 ]]; then
+        echo "h2load failed (rc=$rc) for $url:" >&2
+        tail -n 20 "${out}.h2load" >&2 || true
+    fi
+    return $rc
+}
+
+h2load_as_wrk() {
+    awk '
+        /^finished in/ { secs = $3; sub(/s,$/, "", secs); rps = $4 }
+        /^requests:/ { total = $2; failed = $10; errored = $12; timeout = $14 }
+        /^status codes:/ { c4 = $7; c5 = $9 }
+        END {
+            printf "  %s requests in %ss, 0MB read\n", total, secs
+            printf "Requests/sec: %s\n", rps
+            if (c4 + c5 > 0) printf "Non-2xx or 3xx responses: %d\n", c4 + c5
+            printf "Socket errors: connect 0, read 0, write 0, timeout %d\n", failed + errored + timeout
+        }
+    ' "$1"
 }

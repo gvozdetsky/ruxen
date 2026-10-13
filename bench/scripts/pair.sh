@@ -103,7 +103,7 @@ port="${f[2]}" path="${f[3]}" threads="${f[4]}" connections="${f[5]}"
 warmup="${f[7]}" conf_abs="${REPO_ROOT}/${f[9]}" header_mode="${f[11]}"
 headers_raw="${f[12]}" scheme="${f[13]}"
 [[ -f "$conf_abs" ]] || die "missing config: $conf_abs"
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 
 work_dir="$(mktemp -d -t ruxen-pair-XXXXXX)"
 trap 'rm -rf "$work_dir"' EXIT
