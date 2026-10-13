@@ -114,3 +114,112 @@ fn if_blocks_switch_the_location() {
     assert!(main.ends_with("main\n"), "{main}");
     assert!(other.ends_with("other\n"), "{other}");
 }
+
+/// What the request does once an `if` holds, case by case against nginx:
+/// the location's own `return` still answers, a `return` in the block
+/// uses its configuration, `root` alone keeps the location's handler, the
+/// root (the server's too, set below) and a regex location's alias carry
+/// into the block, and a later
+/// block of rewrite directives only goes back to the location's settings.
+#[test]
+fn if_locations_follow_nginx() {
+    let (port, up) = (free_port(), free_port());
+    let dir = std::env::temp_dir().join(format!("ruxen-m121b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("html/static")).unwrap();
+    std::fs::create_dir_all(dir.join("other")).unwrap();
+    std::fs::write(dir.join("html/static/index.html"), "main\n").unwrap();
+    let setup = common::ports::setup_lock();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{ access_log off;\n\
+             server {{ listen 127.0.0.1:{port};\n\
+               location /guard {{ if ($arg_x) {{ proxy_pass http://127.0.0.1:{up}; }} return 403; }}\n\
+               location /h {{\n\
+                 access_log {d}/access.log;\n\
+                 if ($arg_q) {{ access_log off; return 200 \"hc\\n\"; }}\n\
+                 return 204;\n\
+               }}\n\
+               location ~ ^/img/a$ {{ alias {d}/html/static/index.html; if ($arg_x) {{ add_header X-Img 1; }} }}\n\
+               location /alt {{ proxy_pass http://127.0.0.1:{up}; if ($arg_s) {{ root {d}/other; }} }}\n\
+               location /app {{\n\
+                 root {d}/html;\n\
+                 proxy_set_header X-Root $document_root;\n\
+                 if ($arg_x) {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+               }}\n\
+               location /two {{\n\
+                 add_header X-Loc 1;\n\
+                 if ($arg_a) {{ add_header X-A 1; }}\n\
+                 if ($arg_b) {{ set $v 1; }}\n\
+                 return 200 \"two\\n\";\n\
+               }}\n\
+               location /late/ {{\n\
+                 proxy_pass http://127.0.0.1:{up};\n\
+                 proxy_set_header X-Root $document_root;\n\
+                 if ($arg_h) {{ add_header X-H 1; }}\n\
+               }}\n\
+               root {d}/html;\n\
+             }}\n\
+             server {{ listen 127.0.0.1:{up}; return 200 \"uri:$uri$http_x_root\\n\"; }}\n\
+             }}\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+        .arg("-c")
+        .arg(dir.join("nginx.conf"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !dir.join("ruxen.pid").exists() {
+        assert!(
+            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
+            "ruxen did not start"
+        );
+        sleep(Duration::from_millis(10));
+    }
+    drop(setup);
+
+    let guard = get(port, "/guard?x=1");
+    let quiet = get(port, "/h?q=1");
+    let logged = get(port, "/h");
+    let img = get(port, "/img/a?x=1");
+    let alt = get(port, "/alt?s=1");
+    let app = get(port, "/app?x=1");
+    let two_a = get(port, "/two?a=1");
+    let two_ab = get(port, "/two?a=1&b=1");
+    let late = get(port, "/late/?h=1");
+    sleep(Duration::from_millis(100));
+    let log = std::fs::read_to_string(dir.join("access.log")).unwrap_or_default();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(guard.starts_with("HTTP/1.1 403"), "{guard}");
+    assert!(quiet.ends_with("hc\n"), "{quiet}");
+    assert!(logged.starts_with("HTTP/1.1 204"), "{logged}");
+    assert!(!log.contains("/h?q=1") && log.contains("GET /h "), "{log}");
+    assert!(img.contains("X-Img: 1") && img.ends_with("main\n"), "{img}");
+    assert!(alt.ends_with("uri:/alt\n"), "{alt}");
+    assert!(
+        app.ends_with(&format!("uri:/app{}/html\n", dir.display())),
+        "{app}"
+    );
+    assert!(
+        two_a.contains("X-A: 1") && !two_a.contains("X-Loc"),
+        "{two_a}"
+    );
+    assert!(
+        two_ab.contains("X-Loc: 1") && !two_ab.contains("X-A"),
+        "{two_ab}"
+    );
+    // The server's root, below the location, reaches the block too.
+    assert!(
+        late.contains("X-H: 1") && late.ends_with(&format!("uri:/late/{}/html\n", dir.display())),
+        "{late}"
+    );
+}

@@ -340,8 +340,24 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     child.client_timeouts = child.client_timeouts.inherit(parent.client_timeouts);
     // Its `if` blocks' anonymous locations, merged with it before it had
     // the parent's settings, get them too (an unset field takes them).
-    let snapshot = child.clone();
-    merge_if_locations(&mut child.rewrite_ops, &snapshot);
+    if has_if_locations(&child.rewrite_ops) {
+        let snapshot = child.clone();
+        merge_if_locations(&mut child.rewrite_ops, &snapshot);
+    }
+}
+
+/// Whether `ops` has an `if` block with an anonymous location (#137), at
+/// the top: nested ones are inside one that has.
+fn has_if_locations(ops: &[RewriteOp]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            RewriteOp::If {
+                location: Some(_),
+                ..
+            }
+        )
+    })
 }
 
 /// What `parse_location_block` found in an `if` block's body.
@@ -350,8 +366,10 @@ pub(crate) struct IfBody {
     /// Something besides rewrite directives: the block is an anonymous
     /// location (#137).
     settings: bool,
-    /// `proxy_pass` or `root` of its own.
+    /// `proxy_pass` of its own.
     own_handler: bool,
+    /// `root` of its own.
+    own_root: bool,
 }
 
 /// A location-level `if (…) { … }` (#137): its rewrite directives, and,
@@ -396,6 +414,7 @@ fn parse_location_if(args: &[String], lx: &mut Lexer) -> Result<RewriteOp, Error
     let location = info.settings.then(|| IfLocation::Parsed {
         location: Box::new(location),
         own_handler: info.own_handler,
+        own_root: info.own_root,
     });
     Ok(RewriteOp::If {
         guard,
@@ -406,12 +425,16 @@ fn parse_location_if(args: &[String], lx: &mut Lexer) -> Result<RewriteOp, Error
 
 /// Give the anonymous locations of `ops`' `if` blocks what they inherit
 /// from `parent` (nested ones from their enclosing block): everything
-/// `inherit_from_parent` passes on, and, without a `proxy_pass` or `root`
-/// of their own, the parent's content handler and root, as nginx keeps the
-/// location's handler when the `if` configuration sets none. With one of
-/// their own, the pattern starts with `@`: like a named location, there is
-/// no location prefix for a `proxy_pass` URI to replace (nginx: "cannot
-/// have URI part … inside "if" statement").
+/// `inherit_from_parent` passes on, the parent's root unless the block
+/// sets `root`, and the parent's content handler unless the block has a
+/// `proxy_pass`, or a `root` for what would be a static handler: nginx
+/// keeps the location's handler when the `if` configuration sets none
+/// (`ngx_http_update_location_config`). The parent's own `return` runs
+/// after the `if` in the same code array, so it is the handler whatever
+/// the block sets. With a `proxy_pass` of its own, the pattern starts with
+/// `@`: like a named location, there is no location prefix for a
+/// `proxy_pass` URI to replace (nginx: "cannot have URI part … inside
+/// "if" statement").
 fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
     for op in ops {
         let RewriteOp::If { body, location, .. } = op else {
@@ -421,17 +444,27 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
             Some(IfLocation::Parsed {
                 location,
                 own_handler,
+                own_root,
             }) => {
                 inherit_from_parent(location, parent);
                 location.mode = parent.mode;
-                if *own_handler {
-                    location.pattern = format!("@if:{}", parent.pattern);
-                } else {
-                    location.pattern = parent.pattern.clone();
-                    location.handler = parent.handler.clone();
+                if !*own_root {
                     location.document_root = parent.document_root.clone();
                     location.alias_prefix_override = parent.alias_prefix_override.clone();
                     location.inherits_root = parent.inherits_root;
+                }
+                let static_parent =
+                    !matches!(parent.handler, Handler::Proxy(_) | Handler::StubStatus);
+                let keeps_own =
+                    !parent.explicit_return && (*own_handler || (*own_root && static_parent));
+                if keeps_own && *own_handler {
+                    location.pattern = format!("@if:{}", parent.pattern);
+                } else {
+                    location.pattern = parent.pattern.clone();
+                }
+                if !keeps_own {
+                    location.handler = parent.handler.clone();
+                    location.explicit_return = parent.explicit_return;
                 }
                 let snapshot = (**location).clone();
                 merge_if_locations(body, &snapshot);
@@ -545,13 +578,14 @@ pub(crate) fn parse_location_block(
                 | "access_log" | "expires" | "gzip" | "limit_rate" | "limit_rate_after"
                 | "post_action" | "sendfile" => info.settings = true,
                 // Accepted and ignored anywhere, as they were in `if`.
-                n if term == Terminator::Semi && is_ignored_stmt(n) => {}
-                // nginx: "… directive is not allowed here".
+                n if term == Terminator::Semi && is_ignored_stmt(n) => {
+                    check_ignored_args(lx, &args)?;
+                    continue;
+                }
+                // nginx: "… directive is not allowed here". While
+                // collecting, `unknown` skips a block itself.
                 _ => {
                     compat::unknown(lx, &args, &term, "if")?;
-                    if term == Terminator::BlockOpen {
-                        skip_block(lx)?;
-                    }
                     continue;
                 }
             }
@@ -560,7 +594,8 @@ pub(crate) fn parse_location_block(
             return match term {
                 Terminator::BlockClose => {
                     if let Some(info) = if_body.as_deref_mut() {
-                        info.own_handler = proxy_pass.is_some() || local_path_mapping.is_some();
+                        info.own_handler = proxy_pass.is_some();
+                        info.own_root = local_path_mapping.is_some();
                     }
                     // `return` short-circuits the rewrite phase in nginx, so
                     // it wins over `root` / `alias` / `proxy_pass` if both
@@ -571,6 +606,7 @@ pub(crate) fn parse_location_block(
                     let document_root = root
                         .clone()
                         .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
+                    let explicit_return = ret.is_some();
                     let handler = if let Some((status, body)) = ret {
                         Handler::Return { status, body }
                     } else if stub_status {
@@ -675,10 +711,11 @@ pub(crate) fn parse_location_block(
                         client_timeouts,
                         alias_prefix_override,
                         inherits_root,
+                        explicit_return,
                     };
                     // The anonymous locations of its `if` blocks (#137).
                     let mut location = location;
-                    if if_body.is_none() {
+                    if if_body.is_none() && has_if_locations(&location.rewrite_ops) {
                         let snapshot = location.clone();
                         merge_if_locations(&mut location.rewrite_ops, &snapshot);
                     }

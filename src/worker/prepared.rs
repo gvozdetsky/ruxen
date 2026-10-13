@@ -119,7 +119,9 @@ pub enum PreparedRewriteOp {
         guard: PreparedGuard,
         body: &'static [PreparedRewriteOp],
         /// The block's anonymous location, as an index into
-        /// `PreparedServer::if_locations` (#137).
+        /// `PreparedServer::if_locations` (#137); for a block of rewrite
+        /// directives only, the enclosing block's, or `None` for the
+        /// location itself.
         location: Option<u32>,
     },
     Rewrite {

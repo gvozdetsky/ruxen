@@ -2675,6 +2675,7 @@ mod tests {
         let Some(IfLocation::Parsed {
             location: own,
             own_handler: true,
+            ..
         }) = &ifs[0]
         else {
             panic!("{:?}", ifs[0])
@@ -2685,6 +2686,7 @@ mod tests {
         let Some(IfLocation::Parsed {
             location: inherited,
             own_handler: false,
+            ..
         }) = &ifs[1]
         else {
             panic!("{:?}", ifs[1])

@@ -1538,7 +1538,7 @@ pub(crate) fn prepare_server(
     let mut locations = server.locations;
     let mut if_parsed: Vec<Location> = Vec::new();
     for l in &mut locations {
-        take_if_locations(&mut l.rewrite_ops, &mut if_parsed);
+        take_if_locations(&mut l.rewrite_ops, &mut if_parsed, None);
     }
     let mut if_locations: Vec<PreparedLocation> = Vec::with_capacity(if_parsed.len());
     for l in if_parsed {
@@ -1950,20 +1950,26 @@ pub(crate) fn prepare_guard(guard: IfGuard) -> PreparedGuard {
 }
 
 /// Move the anonymous locations of `ops`' `if` blocks (nested ones too)
-/// into `out`, leaving their index there (#137).
-fn take_if_locations(ops: &mut [RewriteOp], out: &mut Vec<Location>) {
+/// into `out`, leaving their index there (#137). A block of rewrite
+/// directives only inside one gets that one's index: nginx gives every
+/// location-level `if` a configuration, merged from the enclosing one, so
+/// the request goes on with the configuration it was in.
+fn take_if_locations(ops: &mut [RewriteOp], out: &mut Vec<Location>, enclosing: Option<usize>) {
+    use crate::config::IfLocation;
     for op in ops {
         if let RewriteOp::If { body, location, .. } = op {
-            if let Some(crate::config::IfLocation::Parsed { .. }) = location {
-                let Some(crate::config::IfLocation::Parsed {
+            let slot = match location.take() {
+                Some(IfLocation::Parsed {
                     location: parsed, ..
-                }) = location.replace(crate::config::IfLocation::Slot(out.len()))
-                else {
-                    unreachable!("matched above")
-                };
-                out.push(*parsed);
-            }
-            take_if_locations(body, out);
+                }) => {
+                    out.push(*parsed);
+                    Some(out.len() - 1)
+                }
+                Some(IfLocation::Slot(n)) => Some(n),
+                None => enclosing,
+            };
+            *location = slot.map(IfLocation::Slot);
+            take_if_locations(body, out, slot);
         }
     }
 }
@@ -2800,7 +2806,7 @@ pub(crate) fn build_prefix_or_exact(
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedLocation, String> {
     let Location {
-        mode: _,
+        mode,
         pattern,
         noregex,
         rewrite_ops,
@@ -2848,9 +2854,13 @@ pub(crate) fn build_prefix_or_exact(
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
+        explicit_return: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
+    // Only an `if` block's anonymous location in a regex location is
+    // built here with a regex mode (#137): its alias takes the captures.
+    let is_regex = matches!(mode, MatchMode::Regex { .. });
     let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
     let alias_prefix_override: Option<&'static [u8]> = alias_prefix_override
         .map(|s| Box::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
@@ -2878,7 +2888,7 @@ pub(crate) fn build_prefix_or_exact(
                 mapping: document_root.1,
             },
             pattern,
-            false,
+            is_regex,
             alias_prefix_override,
             index.clone(),
             None,
@@ -2903,7 +2913,7 @@ pub(crate) fn build_prefix_or_exact(
     let doc_root = leak_doc_root(
         document_root,
         pattern,
-        false,
+        is_regex,
         alias_prefix_override,
         location_disable_symlinks
             .clone()
@@ -2912,7 +2922,7 @@ pub(crate) fn build_prefix_or_exact(
     let handler = build_handler(
         handler,
         pattern,
-        false,
+        is_regex,
         alias_prefix_override,
         index,
         try_files,
@@ -3089,6 +3099,7 @@ pub(crate) fn build_regex_location(
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
+        explicit_return: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;

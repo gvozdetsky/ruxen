@@ -981,14 +981,34 @@ pub struct Location {
     /// No `root` / `alias` here or in an enclosing location: the server's
     /// (or http's) root applies, once the whole `http {}` block is read.
     pub inherits_root: bool,
+    /// The handler is the location's own `return` (not the 404 of a
+    /// location with rewrite directives and nothing to serve): it runs
+    /// after the `if` blocks, so it answers even when one of them holds
+    /// and has a `proxy_pass` of its own (#137).
+    pub explicit_return: bool,
 }
 
 impl Location {
-    /// Point a location that `inherits_root` at the root it inherits.
+    /// Point a location that `inherits_root` at the root it inherits, and
+    /// its `if` blocks' anonymous locations that inherit it too (#137).
     pub(crate) fn inherit_root(&mut self, root: &std::path::Path) {
         self.document_root.0 = root.to_path_buf();
         if let Handler::Root { path, .. } = &mut self.handler {
             *path = root.to_path_buf();
+        }
+        inherit_root_in_ifs(&mut self.rewrite_ops, root);
+    }
+}
+
+fn inherit_root_in_ifs(ops: &mut [RewriteOp], root: &std::path::Path) {
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            if let Some(IfLocation::Parsed { location, .. }) = location
+                && location.inherits_root
+            {
+                location.inherit_root(root);
+            }
+            inherit_root_in_ifs(body, root);
         }
     }
 }
@@ -1588,9 +1608,12 @@ pub enum RewriteOp {
 pub enum IfLocation {
     Parsed {
         location: Box<Location>,
-        /// `proxy_pass` or `root` in the block: it doesn't take the
-        /// enclosing location's content handler.
+        /// `proxy_pass` in the block: it doesn't take the enclosing
+        /// location's content handler (unless that is a `return`).
         own_handler: bool,
+        /// `root` in the block: it doesn't take the enclosing location's
+        /// root; a static handler serves from it.
+        own_root: bool,
     },
     Slot(usize),
 }

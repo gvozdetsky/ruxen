@@ -844,24 +844,7 @@ fn process_with_meta_inner(
                 },
             }
         };
-        rewrite_state.doc_root = Some(loc.doc_root);
-        meta.keepalive = KeepaliveMeta {
-            allow: loc.keepalive.allow,
-            idle_timeout_ms: loc.keepalive.idle_timeout_ms,
-            header_timeout_secs: loc.keepalive.header_timeout_secs,
-            max_requests: loc.keepalive.max_requests,
-            max_time_ms: loc.keepalive.max_time_ms,
-            disable_msie6: loc.keepalive.disable_msie6,
-            disable_safari: loc.keepalive.disable_safari,
-        };
-        meta.access_logs = loc.access_logs;
-        meta.doc_root = Some(loc.doc_root);
-        meta.timeouts = Some(loc.timeouts);
-        meta.post_action = loc.post_action;
-        meta.log = LogMeta {
-            error_logs: loc.error_logs,
-            log_not_found: loc.log_not_found,
-        };
+        apply_location_meta(&loc, &mut meta, &mut rewrite_state);
         if loc.internal && !internal_request {
             // ngx_http_core_find_config_phase: an `internal` location is
             // not found for an external request.
@@ -895,7 +878,15 @@ fn process_with_meta_inner(
             RewriteOutcome::Continue => false,
             RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
-            RewriteOutcome::Respond(response) => return (response, meta),
+            RewriteOutcome::Respond(response) => {
+                // Answered inside (or after) an `if` that holds: with its
+                // configuration, as nginx has switched `r->loc_conf` by
+                // then (its `access_log`, …).
+                if let Some(n) = rewrite_state.if_location {
+                    switch_to_if_location(server, n, &mut meta, &mut rewrite_state);
+                }
+                return (response, meta);
+            }
         };
         // An `if` block with settings of its own held: the request goes on
         // with its anonymous location (#137), as nginx's
@@ -1745,6 +1736,18 @@ fn switch_to_if_location(
     let loc = MatchedLocation::from_prefix(&server.if_locations[n as usize]);
     // What the location sets in the request's meta before its rewrite
     // program, again for the new one.
+    apply_location_meta(&loc, meta, rewrite_state);
+    loc
+}
+
+/// The request's meta from the location it is in: what the location sets
+/// before its rewrite program, and an `if` location again (#137).
+#[inline(always)]
+fn apply_location_meta(
+    loc: &MatchedLocation<'static>,
+    meta: &mut ProcessMeta,
+    rewrite_state: &mut RewriteState,
+) {
     rewrite_state.doc_root = Some(loc.doc_root);
     meta.keepalive = KeepaliveMeta {
         allow: loc.keepalive.allow,
@@ -1763,7 +1766,6 @@ fn switch_to_if_location(
         error_logs: loc.error_logs,
         log_not_found: loc.log_not_found,
     };
-    loc
 }
 
 /// Whether a ClientHello with this SNI name is to be refused

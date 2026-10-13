@@ -393,9 +393,10 @@ pub(crate) fn execute_rewrite_ops(
                     }
                 }
                 if holds {
-                    if location.is_some() {
-                        rewrite_state.if_location = *location;
-                    }
+                    // Every location-level `if` has a configuration of its
+                    // own in nginx: one with rewrite directives only goes
+                    // back to the enclosing one's.
+                    rewrite_state.if_location = *location;
                     match execute_rewrite_ops(
                         body,
                         http,
