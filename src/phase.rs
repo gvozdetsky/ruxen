@@ -249,6 +249,9 @@ pub struct ProcessMeta {
     /// The counts `limit_conn` took for this request, given back when the
     /// last copy of the meta goes, after the response is written (#95).
     pub limit_conn_held: Option<std::rc::Rc<crate::worker::limit_conn::Held>>,
+    /// The location's root, which an access_log path with variables
+    /// checks before it writes (#303).
+    pub doc_root: Option<&'static crate::worker::DocRoot>,
     /// The location's `send_timeout` (and `client_body_timeout`) for this
     /// request; `None` before routing (#147).
     pub timeouts: Option<&'static crate::worker::PreparedClientTimeouts>,
@@ -330,6 +333,7 @@ impl Default for ProcessMeta {
             access_logs: &[],
             limit_req_delay_ms: 0,
             limit_conn_held: None,
+            doc_root: None,
             timeouts: None,
             remote_user: None,
             realip: None,
@@ -841,6 +845,7 @@ fn process_with_meta_inner(
             disable_safari: loc.keepalive.disable_safari,
         };
         meta.access_logs = loc.access_logs;
+        meta.doc_root = Some(loc.doc_root);
         meta.timeouts = Some(loc.timeouts);
         meta.post_action = loc.post_action;
         meta.log = LogMeta {
