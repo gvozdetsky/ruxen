@@ -180,12 +180,15 @@ impl StreamIo {
                     return Ok(());
                 }
                 Out::Chunked(state) => {
-                    let (used, piece, end) = decode_chunked(state, data);
+                    let (used, piece, end) = decode_chunked(state, data, &mut self.head);
                     if let Some((from, to)) = piece {
                         self.send_data(&data[from..to], false).await?;
                     }
                     if end {
-                        self.send_data(&[], true).await?;
+                        // `add_trailer`: the fields after the last chunk
+                        // (gathered in `head`) go as a trailing HEADERS frame.
+                        let trailers = std::mem::take(&mut self.head);
+                        self.finish_with(&trailers).await?;
                         self.out = Out::Done;
                     }
                     data = &data[used..];
@@ -200,8 +203,13 @@ impl StreamIo {
 
 /// One step of the decoder of the chunked body `handle` writes, over
 /// `data`: bytes used, the range of chunk data among them (at most one
-/// run), and whether the body ended.
-fn decode_chunked(state: &mut Chunked, data: &[u8]) -> (usize, Option<(usize, usize)>, bool) {
+/// run), and whether the body ended. The trailer section goes to
+/// `trailers`.
+fn decode_chunked(
+    state: &mut Chunked,
+    data: &[u8],
+    trailers: &mut Vec<u8>,
+) -> (usize, Option<(usize, usize)>, bool) {
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
@@ -234,8 +242,14 @@ fn decode_chunked(state: &mut Chunked, data: &[u8]) -> (usize, Option<(usize, us
             Chunked::Trailer(empty) => match b {
                 b'\r' => {}
                 b'\n' if *empty => return (i + 1, None, true),
-                b'\n' => *empty = true,
-                _ => *empty = false,
+                b'\n' => {
+                    trailers.push(b'\n');
+                    *empty = true;
+                }
+                _ => {
+                    trailers.push(b);
+                    *empty = false;
+                }
             },
         }
         i += 1;
@@ -301,6 +315,32 @@ impl StreamIo {
         }
         self.out = out;
         Ok(())
+    }
+
+    /// End the body: with a trailing HEADERS frame when `trailers` (lines
+    /// of `name: value`) has fields, else an empty DATA frame.
+    async fn finish_with(&mut self, trailers: &[u8]) -> io::Result<()> {
+        let mut fields = http::HeaderMap::new();
+        for line in trailers.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                continue;
+            };
+            if let (Ok(name), Ok(value)) = (
+                http::HeaderName::from_bytes(&line[..colon]),
+                http::HeaderValue::from_bytes(line[colon + 1..].trim_ascii()),
+            ) {
+                fields.append(name, value);
+            }
+        }
+        if fields.is_empty() {
+            return self.send_data(&[], true).await;
+        }
+        match self.send.as_mut() {
+            Some(send) => send
+                .send_trailers(fields)
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
+            None => Ok(()),
+        }
     }
 
     /// Send `data` as DATA frames as the flow-control windows open.
@@ -557,10 +597,11 @@ mod tests {
     fn dechunk(body: &[u8], step: usize) -> (Vec<u8>, bool) {
         let mut state = Chunked::Size(0);
         let mut out = Vec::new();
+        let mut trailers = Vec::new();
         for piece in body.chunks(step) {
             let mut piece = piece;
             while !piece.is_empty() {
-                let (used, data, end) = decode_chunked(&mut state, piece);
+                let (used, data, end) = decode_chunked(&mut state, piece, &mut trailers);
                 if let Some((from, to)) = data {
                     out.extend_from_slice(&piece[from..to]);
                 }
