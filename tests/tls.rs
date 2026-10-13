@@ -923,3 +923,51 @@ fn ssl_session_id_is_empty_without_resumption() {
     let body = session_get(server.port, &session_client(&ca, &rustls::version::TLS13));
     assert_eq!(body, "id= reused=.");
 }
+
+/// `ssl_reject_handshake on` (#112): the default server has no
+/// certificate and refuses every handshake that comes to it (no SNI, or a
+/// name nothing else claims) with the `unrecognized_name` alert, while a
+/// named server with a certificate still serves.
+const REJECT_HANDSHAKE_CONF: &str = r#"
+daemon off;
+events { }
+
+http {
+    server {
+        listen 127.0.0.1:%%PORT%% ssl default_server;
+        ssl_reject_handshake on;
+        location / { return 200 "default\n"; }
+    }
+
+    server {
+        listen 127.0.0.1:%%PORT%%;
+        server_name a.test;
+        ssl_certificate     %%CERT_0%%;
+        ssl_certificate_key %%KEY_0%%;
+        location / { return 200 "server-A\n"; }
+    }
+}
+"#;
+
+#[test]
+fn ssl_reject_handshake_refuses_unknown_names() {
+    let cert_a = make_ca_and_leaf("a.test");
+    let ca_a = cert_a.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server_multi(REJECT_HANDSHAKE_CONF, vec![cert_a]);
+
+    let resp = curl_get(server.port, "a.test", "/", Some(&ca_a), false);
+    assert!(resp.ok, "a.test curl failed: stderr={}", resp.stderr);
+    assert!(resp.stdout.contains("server-A"), "{}", resp.stdout);
+
+    for host in ["other.test", "127.0.0.1"] {
+        let resp = curl_get(server.port, host, "/", None, true);
+        assert!(!resp.ok, "{host}: {}", resp.stdout);
+        assert!(
+            resp.stderr
+                .to_ascii_lowercase()
+                .contains("unrecognized name"),
+            "{host}: {}",
+            resp.stderr
+        );
+    }
+}
