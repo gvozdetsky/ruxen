@@ -11,7 +11,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -329,7 +329,9 @@ fn real_main() -> Result<(), Failure> {
             .map_err(|e| report_emerg(&e, &cli, &main_path))?;
     }
 
-    let runtime = Arc::new(worker::RuntimeState::default());
+    // Lives as long as the process: workers and connections borrow it
+    // instead of counting references on every accept (#128).
+    let runtime: &'static worker::RuntimeState = Box::leak(Box::default());
 
     let n_workers: usize = std::env::var("RUXEN_WORKERS")
         .ok()
@@ -344,7 +346,7 @@ fn real_main() -> Result<(), Failure> {
     let mut handles = Vec::with_capacity(n_workers);
     for i in 0..n_workers {
         let cpu = if pin { Some(i) } else { None };
-        let runtime = runtime.clone();
+
         let ready = ready_tx.clone();
         let exited = WorkerExit(i, exited_tx.clone());
         let handle = thread::Builder::new()
@@ -409,7 +411,7 @@ fn real_main() -> Result<(), Failure> {
     }
     runtime.release_workers();
 
-    let signal_runtime = runtime.clone();
+    let signal_runtime = runtime;
     let reopen_stderr = cli.errlog.clone().filter(|_| !http.uses_stderr_log);
     let monitor_pid_path = pid_path.clone();
     // Runs until the workers have finished (main drops `workers_done`),
