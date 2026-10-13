@@ -217,6 +217,24 @@ fn body(resp: &[u8]) -> &[u8] {
         .unwrap_or(&[])
 }
 
+/// A chunked body, decoded (no extensions or trailers in these tests).
+fn dechunked(mut body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let nl = body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("size line");
+        let size = usize::from_str_radix(std::str::from_utf8(&body[..nl]).unwrap(), 16).unwrap();
+        body = &body[nl + 2..];
+        if size == 0 {
+            return out;
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+}
+
 fn has_header(resp: &[u8], name: &str) -> bool {
     let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n");
     let head = match head_end {
@@ -438,10 +456,10 @@ http {
 /// reserved up front and aborted the process on allocation.
 #[test]
 fn m40_malformed_upstream_framing_is_502_and_server_survives() {
-    let responses: [&[u8]; 2] = [
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 1000000000000\r\n\r\nabc",
-    ];
+    // A `Content-Length` too large to buffer is relayed, not refused
+    // (#88, `m72_upstream_body_cap`).
+    let responses: [&[u8]; 1] =
+        [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n"];
     for response in responses {
         let backend = Backend::spawn(response.to_vec());
         let conf = format!(
@@ -575,9 +593,15 @@ fn m40_close_delimited_upstream_body_is_framed_for_keepalive_clients() {
     let (first, second) = text
         .split_once("body-until-eof")
         .unwrap_or_else(|| panic!("no proxied body in: {text}"));
+    // Relayed as it comes (#88): chunked, as nginx frames a body of
+    // unknown length for an HTTP/1.1 client.
     assert!(first.starts_with("HTTP/1.1 200"), "{text}");
-    assert!(first.contains("\r\nContent-Length: 14\r\n"), "{text}");
-    assert!(second.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(
+        first.contains("\r\nTransfer-Encoding: chunked\r\n"),
+        "{text}"
+    );
+    assert!(first.ends_with("\r\n\r\ne\r\n"), "{text}");
+    assert!(second.starts_with("\r\n0\r\n\r\nHTTP/1.1 200"), "{text}");
     assert!(second.ends_with("alive"), "{text}");
 }
 
@@ -597,7 +621,8 @@ fn m40_status_line_without_header_fields() {
         let resp = http_get_close(port, "/up/");
         let text = String::from_utf8_lossy(&resp);
         assert_eq!(status_code(&resp), 200, "{text}");
-        assert_eq!(body(&resp), want.as_bytes(), "{text}");
+        // Close-delimited, so relayed chunked (#88).
+        assert_eq!(dechunked(body(&resp)), want.as_bytes(), "{text}");
     }
 }
 
