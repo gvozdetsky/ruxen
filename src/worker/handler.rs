@@ -595,6 +595,9 @@ pub(crate) fn finish_access_denial(
     preserved_www_authenticate: &[Vec<u8>],
     server_name_captures: Option<&phase::ServerNameCaptures>,
     response: Response,
+    // False for a `return` with text from the rewrite phase, which nginx
+    // sends without `error_page` (#362).
+    takes_error_page: bool,
 ) -> Response {
     let render_ctx_base = location_render_ctx(
         http,
@@ -619,15 +622,19 @@ pub(crate) fn finish_access_denial(
             preserved_www_authenticate,
         );
     }
-    let intercepted = maybe_intercept_error_page(
-        response,
-        loc.error_pages,
-        req,
-        &render_ctx_base,
-        in_error_page,
-        loc.recursive_error_pages,
-        loc.server_header,
-    );
+    let intercepted = if takes_error_page {
+        maybe_intercept_error_page(
+            response,
+            loc.error_pages,
+            req,
+            &render_ctx_base,
+            in_error_page,
+            loc.recursive_error_pages,
+            loc.server_header,
+        )
+    } else {
+        response
+    };
     let trailers_allowed =
         req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
     finalize_location_response(

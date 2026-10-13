@@ -870,6 +870,8 @@ fn process_with_meta_inner(
         // filters, `error_page` and `add_header`, as nginx finalizes it
         // like a handler's (#362).
         let mut rewrite_response = None;
+        // A `return` with text is sent as it is: no `error_page` for it.
+        let mut takes_error_page = true;
         let rewrite_broke = match run_rewrite_program(
             http,
             server,
@@ -883,8 +885,9 @@ fn process_with_meta_inner(
             RewriteOutcome::Continue => false,
             RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
-            RewriteOutcome::Respond(response) => {
+            RewriteOutcome::Respond(response, finalized) => {
                 rewrite_response = Some(response);
+                takes_error_page = finalized;
                 false
             }
         };
@@ -1015,7 +1018,11 @@ fn process_with_meta_inner(
             );
             ResponseLimit::new(rate, after)
         };
-        if let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler {
+        // `$proxy_host` exists once the proxy handler runs: not for a
+        // response from the rewrite or access phase.
+        if denied.is_none()
+            && let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler
+        {
             meta.proxy_host = proxy.host_header;
         }
         let response = match denied {
@@ -1048,6 +1055,7 @@ fn process_with_meta_inner(
                 &preserved_www_authenticate,
                 regex_captures.as_ref(),
                 response,
+                takes_error_page,
             ),
         };
         match response {

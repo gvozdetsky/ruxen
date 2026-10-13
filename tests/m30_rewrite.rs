@@ -197,7 +197,8 @@ http {
 
 /// A response from the location's rewrite program goes through the
 /// location's `add_header` and `error_page` like a handler's (#362); one
-/// from inside an `if` with settings, through the block's.
+/// from inside an `if` with settings, through the block's. A `return` with
+/// text skips `error_page`, as nginx sends it directly.
 #[test]
 fn rewrite_responses_get_the_location_filters() {
     let conf = r#"
@@ -218,6 +219,7 @@ http {
       error_page 403 /page;
       if ($arg_a) { return 403; }
       if ($arg_b) { error_page 403 /other; return 403; }
+      if ($arg_t) { return 403 "text"; }
       return 200 "ok";
     }
 
@@ -244,4 +246,9 @@ http {
     let other = http_get(port, "/err?b=1");
     assert_eq!(status_line(&other), "HTTP/1.1 403 Forbidden");
     assert_eq!(body(&other), b"other");
+
+    // A `return` with text is sent as it is, error_page or not.
+    let text = http_get(port, "/err?t=1");
+    assert_eq!(status_line(&text), "HTTP/1.1 403 Forbidden");
+    assert_eq!(body(&text), b"text");
 }
