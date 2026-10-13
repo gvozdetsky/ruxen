@@ -2572,9 +2572,11 @@ pub(crate) async fn handle_plain(
         proxy_protocol,
     };
     let listen = &http.listens[listen_index];
+    // Boxed, here and in `handle_tls`: awaited in place, the HTTP/2
+    // futures would make every connection's task larger.
     if listen.h2_plain {
         let wait = listen.servers[listen.default_server].timeouts.header;
-        if super::h2::starts_with_preface(&stream, wait).await {
+        if Box::pin(super::h2::starts_with_preface(&stream, wait)).await {
             return serve_h2(
                 stream,
                 peer_addr,
@@ -2713,7 +2715,7 @@ pub(crate) async fn handle_tls(
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-async fn serve_h2<S>(
+fn serve_h2<S>(
     stream: S,
     peer_addr: SocketAddr,
     listen_index: usize,
@@ -2723,7 +2725,8 @@ async fn serve_h2<S>(
     http: &'static PreparedHttp,
     state: &'static RuntimeState,
     connection_id: u64,
-) where
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+where
     S: ConnIo + 'static,
 {
     Box::pin(super::h2::serve(
@@ -2739,7 +2742,6 @@ async fn serve_h2<S>(
             connection_id,
         },
     ))
-    .await;
 }
 
 pub(crate) async fn handle<S: ConnIo>(
