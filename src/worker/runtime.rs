@@ -2108,8 +2108,14 @@ pub(crate) async fn handle_tls(
     )
     .await;
     // close_notify before TCP FIN. Best-effort: peer may already have gone
-    // away; we don't have anything useful to do with the error.
-    let _ = monoio::io::AsyncWriteRent::shutdown(&mut tls_stream).await;
+    // away; we don't have anything useful to do with the error. A client
+    // that doesn't read (a tunnel that ended on send_timeout) gets 3 s, as
+    // ngx_ssl_shutdown gives it.
+    let _ = monoio::time::timeout(
+        Duration::from_secs(3),
+        monoio::io::AsyncWriteRent::shutdown(&mut tls_stream),
+    )
+    .await;
 }
 
 pub(crate) async fn handle<S: ConnIo>(
@@ -2721,6 +2727,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 read_timeout,
                                 send_timeout,
                                 upstream_url,
+                                lease,
                             } = *upgraded;
                             let head_len = head.len();
                             let (res, head) = write_all_timed(
@@ -2755,6 +2762,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             ))
                             .await;
                             drop(slot);
+                            drop(lease);
                             if tunnelled.end == TunnelEnd::UpstreamTimedOut {
                                 write_upstream_error_log(
                                     &process_meta.log,

@@ -12,8 +12,9 @@
 //!
 //! Timeouts are nginx's: the tunnel ends after `proxy_read_timeout` with
 //! nothing read from either side (nginx re-arms the upstream read timer on
-//! every event), a write to the upstream gets `proxy_send_timeout`, a
-//! write to the client `send_timeout`. After a reload, an upgraded
+//! every event) and no write waiting for its peer, a write to the
+//! upstream gets `proxy_send_timeout`, a write to the client
+//! `send_timeout`. After a reload, an upgraded
 //! connection lives on until `worker_shutdown_timeout`, as on an old
 //! nginx worker.
 
@@ -72,6 +73,10 @@ pub(crate) async fn run_tunnel<S: ConnIo>(
     let (mut up_read, mut up_write) = upstream.into_split();
     let client = UnsafeCell::from_mut(client);
     let activity = Cell::new(Instant::now());
+    // Writes in progress. While one waits for its peer to read, nginx
+    // reads nothing from the other side and its read timer is off: only
+    // the send timeouts count then.
+    let writing = Cell::new(0u32);
     let to_client = Cell::new(0u64);
     let to_upstream = Cell::new(0u64);
     let from_upstream = Cell::new(0u64);
@@ -84,11 +89,13 @@ pub(crate) async fn run_tunnel<S: ConnIo>(
                 // SAFETY: the other direction only reads from the client
                 // (see `begin_tunnel`); this is the only writer.
                 let c = unsafe { &mut *client.get() };
-                let (res, returned) =
-                    match timeout(conf.client_send_timeout, c.write_all(buf)).await {
-                        Ok(pair) => pair,
-                        Err(_) => return TunnelEnd::ClientTimedOut,
-                    };
+                writing.set(writing.get() + 1);
+                let written = timeout(conf.client_send_timeout, c.write_all(buf)).await;
+                writing.set(writing.get() - 1);
+                let (res, returned) = match written {
+                    Ok(pair) => pair,
+                    Err(_) => return TunnelEnd::ClientTimedOut,
+                };
                 buf = returned;
                 match res {
                     Ok(n) => to_client.set(to_client.get() + n as u64),
@@ -112,11 +119,13 @@ pub(crate) async fn run_tunnel<S: ConnIo>(
         buf.extend_from_slice(client_early);
         loop {
             if !buf.is_empty() {
-                let (res, returned) =
-                    match timeout(conf.upstream_send_timeout, up_write.write_all(buf)).await {
-                        Ok(pair) => pair,
-                        Err(_) => return TunnelEnd::UpstreamTimedOut,
-                    };
+                writing.set(writing.get() + 1);
+                let written = timeout(conf.upstream_send_timeout, up_write.write_all(buf)).await;
+                writing.set(writing.get() - 1);
+                let (res, returned) = match written {
+                    Ok(pair) => pair,
+                    Err(_) => return TunnelEnd::UpstreamTimedOut,
+                };
                 buf = returned;
                 match res {
                     Ok(n) => to_upstream.set(to_upstream.get() + n as u64),
@@ -140,6 +149,12 @@ pub(crate) async fn run_tunnel<S: ConnIo>(
 
     let idle = async {
         loop {
+            if writing.get() > 0 {
+                // Look again later: the write ends with its own timeout,
+                // and a finished one counts as activity.
+                monoio::time::sleep(conf.read_timeout).await;
+                continue;
+            }
             let due = activity.get() + conf.read_timeout;
             if Instant::now() >= due {
                 return TunnelEnd::UpstreamTimedOut;

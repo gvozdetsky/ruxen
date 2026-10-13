@@ -164,6 +164,9 @@ pub struct Upgraded {
     pub send_timeout: Duration,
     /// `upstream: "…"` for the error log.
     pub upstream_url: String,
+    /// The peer stays leased while the tunnel is open, so `least_conn`
+    /// counts it, as nginx frees the peer only when the request ends.
+    pub lease: Option<LeasedPeer>,
 }
 
 /// The temp file holding a large request body (an open descriptor: the
@@ -510,6 +513,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 // upstream request is finalized.
                 if let Some(state) = states.last_mut() {
                     state.in_flight = true;
+                }
+                let mut resp = resp;
+                if let Response::Upgrade(upgraded) = &mut resp {
+                    upgraded.lease = Some(current);
                 }
                 return resp;
             }
@@ -1742,6 +1749,7 @@ fn upgraded(
         read_timeout: plan.read_timeout,
         send_timeout: plan.send_timeout,
         upstream_url: upstream_url(plan, peer_idx),
+        lease: None,
     })))
 }
 
