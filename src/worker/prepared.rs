@@ -386,6 +386,21 @@ pub struct PreparedAccessLog {
     pub file_index: usize,
     /// `access_log syslog:…`: lines go to this peer, not to `path`.
     pub syslog: Option<&'static PreparedSyslogPeer>,
+    /// `buffer=` / `flush=` / `gzip`: lines collect in a per-worker buffer
+    /// for this file (#151).
+    pub buffer: Option<&'static PreparedLogBuffer>,
+}
+
+/// A buffered access_log file, shared by every `access_log` with buffer
+/// parameters for the same path, as nginx attaches the buffer to the file.
+#[derive(Debug)]
+pub struct PreparedLogBuffer {
+    /// Index into the worker's buffers.
+    pub slot: usize,
+    pub size: usize,
+    pub flush_ms: Option<u64>,
+    pub gzip: Option<u32>,
+    pub path: &'static Path,
 }
 
 /// A prepared `syslog:` peer (see `crate::syslog`).
@@ -528,6 +543,8 @@ pub enum PreparedHandler {
     Return(PreparedReturn),
     Root(PreparedRoot),
     Proxy(PreparedProxy),
+    /// `stub_status` (#96).
+    StubStatus,
 }
 
 /// Per-location rules for an upstream's response headers, behind one
@@ -632,6 +649,18 @@ pub struct PreparedProxy {
     pub request_path: &'static [u8],
     /// What to do with the upstream's response headers.
     pub response: &'static ProxyResponseRules,
+    /// Inheritance-resolved `proxy_bind`; `None` when unset or `off`.
+    pub bind: Option<&'static PreparedBind>,
+}
+
+/// `proxy_bind` (#135): the local address of upstream connections.
+#[derive(Debug)]
+pub struct PreparedBind {
+    /// A literal address, parsed once; otherwise `value` is rendered per
+    /// request.
+    pub addr: Option<SocketAddr>,
+    pub value: &'static [PreparedValuePart],
+    pub transparent: bool,
 }
 
 /// One prepared `proxy_set_header NAME VALUE;` entry. Name is a static
@@ -675,6 +704,8 @@ pub(crate) struct ProxyEffective {
     /// (each list inherits on its own, as in nginx).
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    /// `proxy_bind`; `None` when unset or `off`.
+    pub bind: Option<&'static PreparedBind>,
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
     pub recursive_error_pages: bool,
@@ -705,6 +736,7 @@ impl ProxyEffective {
             redirect: None,
             hide_headers: None,
             pass_headers: None,
+            bind: None,
             error_pages: &[],
             recursive_error_pages: false,
         }
@@ -733,13 +765,41 @@ pub struct PreparedUpstream {
     pub lb: crate::config::LbAlgorithm,
 }
 
+/// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in
+/// nginx's `$upstream_addr` and error log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAddr {
+    Inet(SocketAddr),
+    Unix(&'static std::path::Path),
+}
+
+impl PeerAddr {
+    pub(crate) fn from_config(addr: crate::config::UpstreamAddr) -> Self {
+        match addr {
+            crate::config::UpstreamAddr::Inet(addr) => PeerAddr::Inet(addr),
+            crate::config::UpstreamAddr::Unix(path) => {
+                PeerAddr::Unix(Box::leak(path.into_boxed_path()))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerAddr::Inet(addr) => addr.fmt(f),
+            PeerAddr::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
 /// Per-server entry inside an `upstream {}` block. The runtime consumes the
 /// full peer surface for weighted/least-conn selection, backup eligibility,
 /// and `max_fails` / `fail_timeout` liveness tracking.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct PreparedPeer {
-    pub addr: SocketAddr,
+    pub addr: PeerAddr,
     pub display: &'static [u8],
     pub weight: u32,
     pub max_fails: u32,
@@ -1046,6 +1106,9 @@ pub struct PreparedLocation {
     /// chunked is off there is no chunked frame to append trailers to,
     /// so they are silently dropped (matching nginx's chunked filter).
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// A regex-mode location after prepare. The compiled
@@ -1088,6 +1151,9 @@ pub struct PreparedRegexLocation {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// Common view onto a matched location. The matcher hands one of these to
@@ -1125,6 +1191,9 @@ pub struct MatchedLocation<'a> {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 impl<'a> MatchedLocation<'a> {
@@ -1156,6 +1225,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            timeouts: loc.timeouts,
         }
     }
 
@@ -1205,6 +1275,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            timeouts: loc.timeouts,
         }
     }
 }
@@ -1345,7 +1416,11 @@ pub struct PreparedServer {
 /// Server-name matching and default-server fallback are evaluated inside
 /// this bucket only.
 pub struct PreparedListen {
+    /// `0.0.0.0:0` for a `unix:` socket.
     pub addr: SocketAddr,
+    /// `listen unix:/path` (#263): bound once by `main` before the workers
+    /// start, accepted on by each through its copy of the descriptor.
+    pub unix: Option<&'static Path>,
     /// `addr`'s IP as `$server_addr` shows it (no brackets for IPv6); empty
     /// for a wildcard address, where each connection's own is used.
     pub addr_text: &'static [u8],
@@ -1359,6 +1434,12 @@ pub struct PreparedListen {
     /// so a future SIGHUP reload can swap it without invalidating
     /// references handed to in-flight connections.
     pub tls: Option<Arc<crate::tls::TlsAcceptor>>,
+    /// `ssl_reject_handshake on` in a server of this address (#112): which
+    /// servers reject, by index into `servers`, and the TLS default
+    /// server's index (a ClientHello without a matching name is its).
+    /// `None` when no server rejects: the handshake needs no ClientHello
+    /// look first.
+    pub reject_handshake: Option<(Box<[bool]>, usize)>,
     /// `listen … proxy_protocol` on any server of this address: every
     /// connection starts with a PROXY protocol header.
     pub proxy_protocol: bool,
@@ -1435,6 +1516,12 @@ pub struct PreparedHttp {
     /// `$request_body` appears in the config. If not, a body that a
     /// `return` location gets is dropped as it is read (#289).
     pub uses_request_body: bool,
+    /// An `error_log stderr` appears in the config: `-e` doesn't take over
+    /// stderr (nginx's `log_use_stderr`; #309).
+    pub uses_stderr_log: bool,
+    /// `stub_status` or `$connections_*` is used: keep the counters
+    /// (`stats`).
+    pub stats: bool,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],
@@ -1467,7 +1554,6 @@ pub struct PreparedHttp {
 #[derive(Default)]
 pub struct RuntimeState {
     shutting_down: AtomicBool,
-    active_connections: AtomicUsize,
     connection_ids: AtomicU64,
     /// Bumped each time the process receives SIGHUP. nginx's reload model
     /// re-execs new workers and tells the old workers to gracefully shut
@@ -1508,21 +1594,10 @@ impl RuntimeState {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn connection_started(&self) {
-        self.active_connections.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn connection_finished(&self) {
-        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn active_connections(&self) -> usize {
-        self.active_connections.load(Ordering::SeqCst)
-    }
-
     pub(crate) fn next_connection_id(&self) -> u64 {
+        // Only uniqueness matters (`$connection`): no ordering.
         self.connection_ids
-            .fetch_add(1, Ordering::SeqCst)
+            .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
     }
 

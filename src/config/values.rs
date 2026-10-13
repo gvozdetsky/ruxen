@@ -178,12 +178,37 @@ struct VariableRegistry {
     request_body_file: bool,
     /// `$request_body` appears somewhere in the config.
     request_body: bool,
+    /// An `error_log stderr` appears somewhere in the config (not a
+    /// variable, but noted the same way, while parsing).
+    stderr_log: bool,
+    /// `stub_status` or a `$connections_*` variable appears in the config.
+    stats: bool,
 }
 
 /// Whether the config just parsed reads `$request_body` anywhere: if not,
 /// a `return` location can drop a body unread (#289).
 pub(crate) fn request_body_used() -> bool {
     VARIABLES.with(|v| v.borrow().request_body)
+}
+
+/// `error_log stderr` was parsed (#309).
+pub(crate) fn note_stderr_log() {
+    VARIABLES.with(|v| v.borrow_mut().stderr_log = true);
+}
+
+/// Whether the config just parsed logs to stderr somewhere.
+pub(crate) fn stderr_log_used() -> bool {
+    VARIABLES.with(|v| v.borrow().stderr_log)
+}
+
+/// Whether the config just parsed reads the connection counters.
+pub(crate) fn stats_used() -> bool {
+    VARIABLES.with(|v| v.borrow().stats)
+}
+
+/// `stub_status` was parsed.
+pub(crate) fn note_stats_used() {
+    VARIABLES.with(|v| v.borrow_mut().stats = true);
 }
 
 /// Whether the config just parsed reads `$request_body_file` anywhere: if
@@ -251,17 +276,14 @@ pub(crate) fn check_variable_references() -> Result<Vec<String>, Error> {
 /// ruxen doesn't implement as such.
 fn is_nginx_variable(name: &str) -> bool {
     const NAMES: &[&str] = &[
-        "binary_remote_addr",
         "bytes_received",
         "date_gmt",
         "date_local",
-        "document_uri",
         "fastcgi_path_info",
         "fastcgi_script_name",
         "gzip_ratio",
         "http2",
         "http3",
-        "https",
         "invalid_referer",
         "limit_conn_status",
         "limit_req_status",
@@ -352,7 +374,8 @@ pub static SSL_SESSION_ID_USED: std::sync::atomic::AtomicBool =
 
 pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
     Ok(match name {
-        b"uri" => Variable::Uri,
+        // nginx's `$document_uri` is `$uri` under another name.
+        b"uri" | b"document_uri" => Variable::Uri,
         b"request_uri" => Variable::RequestUri,
         b"request_method" => Variable::RequestMethod,
         b"request" => Variable::Request,
@@ -370,6 +393,7 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"args" | b"query_string" => Variable::Args,
         b"is_args" => Variable::IsArgs,
         b"scheme" => Variable::Scheme,
+        b"https" => Variable::Https,
         b"ssl_protocol" => Variable::SslProtocol,
         b"ssl_cipher" => Variable::SslCipher,
         b"ssl_ciphers" => Variable::SslCiphers,
@@ -391,11 +415,24 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
             VARIABLES.with(|v| v.borrow_mut().request_body = true);
             Variable::RequestBody
         }
+        b"connections_active"
+        | b"connections_reading"
+        | b"connections_writing"
+        | b"connections_waiting" => {
+            note_stats_used();
+            Variable::Connections(match &name[12..] {
+                b"active" => ConnectionsGauge::Active,
+                b"reading" => ConnectionsGauge::Reading,
+                b"writing" => ConnectionsGauge::Writing,
+                _ => ConnectionsGauge::Waiting,
+            })
+        }
         b"request_body_file" => {
             VARIABLES.with(|v| v.borrow_mut().request_body_file = true);
             Variable::RequestBodyFile
         }
         b"remote_addr" => Variable::RemoteAddr,
+        b"binary_remote_addr" => Variable::BinaryRemoteAddr,
         b"remote_port" => Variable::RemotePort,
         b"realip_remote_addr" => Variable::RealIpRemoteAddr,
         b"realip_remote_port" => Variable::RealIpRemotePort,

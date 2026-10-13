@@ -160,18 +160,18 @@ pub(crate) fn parse_upstream_block(
 
 pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServer, Error> {
     let host_port = args.first().ok_or(Error::MissingArg("server host:port"))?;
-    if host_port.starts_with("unix:") {
-        // UNIX-domain upstreams are out of v0.1 scope. Reject explicitly so
-        // users get a clear "not yet" instead of a silent mis-resolution.
-        return Err(Error::BadValue {
-            what: "upstream server (unix: not supported)",
+    let addr = match strip_unix_prefix(host_port) {
+        Some(path) => unix_socket_path(path).map_err(|what| Error::BadValue {
+            what,
             got: host_port.clone(),
-        });
-    }
-    let addr = resolve_host_port(host_port).map_err(|msg| Error::BadValue {
-        what: "upstream server host:port",
-        got: format!("{host_port}: {msg}"),
-    })?;
+        })?,
+        None => {
+            UpstreamAddr::Inet(resolve_host_port(host_port).map_err(|msg| Error::BadValue {
+                what: "upstream server host:port",
+                got: format!("{host_port}: {msg}"),
+            })?)
+        }
+    };
     let mut weight: u32 = 1;
     let mut max_fails: u32 = 1;
     let mut fail_timeout_secs: u32 = 10;
@@ -219,6 +219,28 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
         down,
         backup,
     })
+}
+
+/// The part after `unix:` (any case, as ngx_parse_url), if `s` names a
+/// UNIX-domain socket.
+fn strip_unix_prefix(s: &str) -> Option<&str> {
+    s.get(..5)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("unix:"))
+        .map(|_| &s[5..])
+}
+
+/// A UNIX-domain socket address, checked as ngx_parse_unix_domain_url
+/// does: a path is required, and it has to fit `sun_path` with its NUL.
+/// The socket itself need not exist yet.
+fn unix_socket_path(path: &str) -> Result<UpstreamAddr, &'static str> {
+    const SUN_PATH_LEN: usize = 108;
+    if path.is_empty() {
+        return Err("upstream address (no path in the unix domain socket)");
+    }
+    if path.len() + 1 > SUN_PATH_LEN {
+        return Err("upstream address (too long path in the unix domain socket)");
+    }
+    Ok(UpstreamAddr::Unix(PathBuf::from(path)))
 }
 
 /// Resolve `host:port` (or bare IPv4/IPv6 with port) using the OS resolver
@@ -272,6 +294,24 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
     if after_scheme.is_empty() {
         return Err(Error::MissingArg("proxy_pass authority"));
     }
+    // `unix:/path[:uri]`: the path ends at the next `:`, the URI follows
+    // it, and the upstream sees `Host: localhost` (ngx_parse_unix_domain_url
+    // with uri_part, ngx_http_proxy_set_vars).
+    if let Some(rest) = strip_unix_prefix(after_scheme) {
+        let (path, uri) = match rest.find(':') {
+            Some(colon) => (&rest[..colon], &rest[colon + 1..]),
+            None => (rest, ""),
+        };
+        let addr = unix_socket_path(path).map_err(|what| Error::BadValue {
+            what,
+            got: raw.clone(),
+        })?;
+        return Ok(ProxyPass::Direct {
+            addr,
+            host_header: "localhost".to_string(),
+            request_path: (!uri.is_empty()).then(|| uri.to_string()),
+        });
+    }
     let (authority, request_path) = match after_scheme.find('/') {
         Some(slash) => {
             let path = &after_scheme[slash..];
@@ -313,7 +353,7 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
         got: format!("{raw}: {msg}"),
     })?;
     Ok(ProxyPass::Direct {
-        addr,
+        addr: UpstreamAddr::Inet(addr),
         host_header: authority.to_string(),
         request_path,
     })
@@ -468,6 +508,7 @@ impl ProxyConf {
         "proxy_next_upstream_tries",
         "proxy_next_upstream_timeout",
         "proxy_intercept_errors",
+        "proxy_bind",
         "proxy_redirect",
         "proxy_hide_header",
         "proxy_pass_header",
@@ -596,6 +637,44 @@ impl ProxyConf {
                     .get_or_insert_with(Vec::new)
                     .push(name.clone());
             }
+            // ngx_http_upstream_bind_set_slot: `off`, or an address with an
+            // optional `transparent`; a literal one must parse now.
+            "proxy_bind" => {
+                if self.bind.is_some() {
+                    return Err(Error::Duplicate("proxy_bind"));
+                }
+                self.bind = Some(match &args[1..] {
+                    [off] if off == "off" => ProxyBind::Off,
+                    [addr] | [addr, _] => {
+                        let transparent = match args.get(2).map(String::as_str) {
+                            None => false,
+                            Some("transparent") => true,
+                            Some(other) => {
+                                return Err(Error::BadValue {
+                                    what: "proxy_bind parameter",
+                                    got: other.to_string(),
+                                });
+                            }
+                        };
+                        if !addr.contains('$') && parse_bind_addr(addr).is_none() {
+                            return Err(Error::BadValue {
+                                what: "proxy_bind (invalid address)",
+                                got: addr.clone(),
+                            });
+                        }
+                        ProxyBind::Addr {
+                            value: parse_value_with_vars(addr)?,
+                            transparent,
+                        }
+                    }
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "proxy_bind",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                });
+            }
             "proxy_intercept_errors" => {
                 if self.intercept_errors.is_some() {
                     return Err(Error::Duplicate("proxy_intercept_errors"));
@@ -642,5 +721,93 @@ pub(crate) fn parse_proxy_http_version_args(args: &[String]) -> Result<u8, Error
             what: "proxy_http_version",
             got: raw.clone(),
         }),
+    }
+}
+
+/// `ip[:port]` or `[ipv6][:port]` (ngx_parse_addr_port), as `proxy_bind`
+/// takes it; port 0 when none.
+pub(crate) fn parse_bind_addr(s: &str) -> Option<SocketAddr> {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    let ip = s
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .unwrap_or(s)
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    Some(SocketAddr::new(ip, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy_pass(arg: &str) -> Result<ProxyPass, Error> {
+        parse_proxy_pass_arg(&[arg.to_string()])
+    }
+
+    #[test]
+    fn proxy_pass_unix_path_ends_at_the_next_colon() {
+        assert_eq!(
+            proxy_pass("http://unix:/run/app.sock:/api/").unwrap(),
+            ProxyPass::Direct {
+                addr: UpstreamAddr::Unix("/run/app.sock".into()),
+                host_header: "localhost".into(),
+                request_path: Some("/api/".into()),
+            }
+        );
+        assert_eq!(
+            proxy_pass("http://UNIX:/run/app.sock").unwrap(),
+            ProxyPass::Direct {
+                addr: UpstreamAddr::Unix("/run/app.sock".into()),
+                host_header: "localhost".into(),
+                request_path: None,
+            }
+        );
+        assert!(proxy_pass("http://unix::/x").is_err());
+    }
+
+    #[test]
+    fn upstream_server_unix_takes_the_whole_rest_as_path() {
+        let server =
+            parse_upstream_server_args(&["unix:///tmp/puma.sock".into(), "weight=2".into()])
+                .unwrap();
+        assert_eq!(server.addr, UpstreamAddr::Unix("///tmp/puma.sock".into()));
+        assert_eq!(server.weight, 2);
+        let too_long = format!("unix:/{}", "a".repeat(107));
+        assert!(parse_upstream_server_args(&[too_long]).is_err());
+        let fits = format!("unix:/{}", "a".repeat(106));
+        assert!(parse_upstream_server_args(&[fits]).is_ok());
+    }
+
+    #[test]
+    fn proxy_bind_addresses() {
+        use std::net::SocketAddr;
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(parse_bind_addr("127.0.0.2"), Some(addr("127.0.0.2:0")));
+        assert_eq!(parse_bind_addr("127.0.0.2:81"), Some(addr("127.0.0.2:81")));
+        assert_eq!(parse_bind_addr("[::1]"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("::1"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("[::1]:81"), Some(addr("[::1]:81")));
+        assert_eq!(parse_bind_addr("localhost"), None);
+        assert_eq!(parse_bind_addr("127.0.0.2:x"), None);
+
+        let parse = |args: &[&str]| {
+            let mut conf = ProxyConf::default();
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            conf.parse(&args).map(|()| conf.bind.unwrap())
+        };
+        assert_eq!(parse(&["proxy_bind", "off"]).unwrap(), ProxyBind::Off);
+        assert!(matches!(
+            parse(&["proxy_bind", "127.0.0.2", "transparent"]).unwrap(),
+            ProxyBind::Addr {
+                transparent: true,
+                ..
+            }
+        ));
+        assert!(parse(&["proxy_bind", "$arg_b"]).is_ok());
+        assert!(parse(&["proxy_bind", "bogus"]).is_err());
+        assert!(parse(&["proxy_bind", "127.0.0.2", "foo"]).is_err());
     }
 }

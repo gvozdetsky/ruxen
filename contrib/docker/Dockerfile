@@ -5,7 +5,8 @@
 #       --security-opt seccomp=contrib/docker/seccomp-io_uring.json ruxen
 #
 # Docker's default seccomp profile denies io_uring, which ruxen runs on;
-# seccomp-io_uring.json is that profile plus the three io_uring calls.
+# seccomp-io_uring.json is that profile plus the three io_uring calls and
+# unshare(CLONE_FILES), which gives each worker its own fd table.
 # Mount your configuration over /etc/ruxen/ruxen.conf; listen on ports
 # above 1024, since the container runs as an unprivileged user.
 

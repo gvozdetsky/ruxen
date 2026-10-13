@@ -777,7 +777,7 @@ pub(crate) async fn discard_request_body<S: ConnIo>(
 /// (memory, then a temp file for large bodies). Chunk data is passed on as
 /// it arrives and consumed input is dropped, so memory stays bounded
 /// whatever the chunk sizes.
-pub(crate) async fn read_chunked_request_body<S: ConnIo>(
+pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
     stream: &mut S,
     initial: &[u8],
     max_body: u64,

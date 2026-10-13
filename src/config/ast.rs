@@ -82,6 +82,19 @@ pub struct ProxyConf {
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
+    /// `proxy_bind` (#135); `Some(ProxyBind::Off)` turns an inherited one off.
+    pub bind: Option<ProxyBind>,
+}
+
+/// `proxy_bind address [transparent] | off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyBind {
+    Off,
+    /// The local address, `ip[:port]`, possibly with variables.
+    Addr {
+        value: Vec<ValuePart>,
+        transparent: bool,
+    },
 }
 
 impl ProxyConf {
@@ -109,6 +122,7 @@ impl ProxyConf {
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
+            bind: self.bind.or_else(|| parent.bind.clone()),
         }
     }
 }
@@ -203,6 +217,11 @@ pub struct HttpConfig {
     pub uses_request_body_file: bool,
     /// `$request_body` appears somewhere in the config.
     pub uses_request_body: bool,
+    /// An `error_log stderr` appears somewhere in the config (#309).
+    pub uses_stderr_log: bool,
+    /// `stub_status` or a `$connections_*` variable appears in the config:
+    /// the counters are kept.
+    pub uses_stats: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,
@@ -289,6 +308,14 @@ pub enum LbAlgorithm {
     LeastConn,
 }
 
+/// Where an upstream peer listens: a TCP address, or a UNIX-domain socket
+/// (`unix:/path`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamAddr {
+    Inet(SocketAddr),
+    Unix(PathBuf),
+}
+
 /// One `server <host:port> [weight=N] [max_fails=N] [fail_timeout=Ts]
 /// [down] [backup];` entry inside an `upstream {}` block. The host+port
 /// is resolved at parse time via `to_socket_addrs` — we don't carry a
@@ -298,7 +325,7 @@ pub struct UpstreamServer {
     /// Resolved peer address. nginx allows multiple addresses per host
     /// (one server entry expands to multiple peers); we pick the first
     /// resolution and document this as a v0.1 narrowing.
-    pub addr: SocketAddr,
+    pub addr: UpstreamAddr,
     /// Original `host:port` string as written. Used for the upstream
     /// `Host:` header default and for diagnostics.
     pub display: String,
@@ -316,7 +343,10 @@ pub struct UpstreamServer {
 /// against `default_server` / `reuseport` etc. is not significant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listen {
+    /// `0.0.0.0:0` for a `unix:` socket.
     pub addr: SocketAddr,
+    /// `listen unix:/path` (#263).
+    pub unix: Option<PathBuf>,
     /// `listen … ssl;` — terminate TLS on this socket.
     pub ssl: bool,
     /// `default_server` — server block becomes the catch-all for its addr.
@@ -367,6 +397,7 @@ impl Listen {
     pub(crate) fn from_addr(addr: SocketAddr) -> Self {
         Self {
             addr,
+            unix: None,
             ssl: false,
             default_server: false,
             reuseport: false,
@@ -443,17 +474,25 @@ pub struct ServerSsl {
     pub session_timeout_ms: Option<u64>,
     /// `ssl_session_cache` / `ssl_session_tickets`, merged with http scope.
     pub resumption: SessionResumption,
+    /// `ssl_reject_handshake on|off` (#112), merged with http scope.
+    pub reject_handshake: Option<bool>,
 }
 
 /// How TLS sessions can be resumed. `None` fields take nginx's defaults:
 /// no session-ID cache (`ssl_session_cache none`), tickets on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionResumption {
     /// `ssl_session_cache`: `builtin` / `shared:…` = true, `off` / `none` =
     /// false.
     pub cache: Option<bool>,
+    /// The `ssl_session_cache` that set `cache` has a `shared:` zone: nginx
+    /// then keeps rotating ticket keys in it (#140).
+    pub shared: bool,
     /// `ssl_session_tickets on|off`.
     pub tickets: Option<bool>,
+    /// `ssl_session_ticket_key file` lines, in order: the first encrypts,
+    /// all decrypt.
+    pub ticket_keys: Option<Vec<PathBuf>>,
 }
 
 impl SessionResumption {
@@ -486,6 +525,7 @@ impl SessionResumption {
                                 });
                             }
                         }
+                        self.shared = caches.iter().any(|c| c.starts_with("shared:"));
                         true
                     }
                 };
@@ -506,11 +546,22 @@ impl SessionResumption {
         }
     }
 
-    pub(crate) fn inherit(self, parent: SessionResumption) -> SessionResumption {
+    pub(crate) fn inherit(self, parent: &SessionResumption) -> SessionResumption {
+        let (cache, shared) = match self.cache {
+            Some(_) => (self.cache, self.shared),
+            None => (parent.cache, parent.shared),
+        };
         SessionResumption {
-            cache: self.cache.or(parent.cache),
+            cache,
+            shared,
             tickets: self.tickets.or(parent.tickets),
+            ticket_keys: self.ticket_keys.or_else(|| parent.ticket_keys.clone()),
         }
+    }
+
+    /// One `ssl_session_ticket_key` line (the path already resolved).
+    pub(crate) fn add_ticket_key(&mut self, path: PathBuf) {
+        self.ticket_keys.get_or_insert_with(Vec::new).push(path);
     }
 }
 
@@ -774,6 +825,9 @@ pub struct Location {
     /// `false`, the response body uses `Content-Length` framing and any
     /// `add_trailer` directives in scope are silently dropped.
     pub chunked_transfer_encoding: Option<bool>,
+    /// The location's own `client_body_timeout` / `send_timeout` (#147);
+    /// `client_header_timeout` stays a server setting.
+    pub client_timeouts: ClientTimeouts,
     /// Override for the alias-prefix used when this location's
     /// `Handler::Root` was inherited from an ancestor prefix-alias
     /// location (rather than set directly here). Unlike a directly-set
@@ -992,6 +1046,12 @@ pub struct AccessLog {
     pub syslog: Option<SyslogPeer>,
     pub format: Option<String>,
     pub condition: Option<Vec<ValuePart>>,
+    /// `buffer=size` (`gzip` alone means 64k), in bytes (#151).
+    pub buffer: Option<u64>,
+    /// `flush=time`, in milliseconds.
+    pub flush_ms: Option<u64>,
+    /// `gzip[=level]`: each flushed buffer is written as a gzip member.
+    pub gzip: Option<u32>,
 }
 
 /// Parsed `auth_basic` value. `off` explicitly disables inherited auth.
@@ -1463,6 +1523,15 @@ pub enum ProxyProtocolTlv {
     Unknown,
 }
 
+/// Which `$connections_*` gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionsGauge {
+    Active,
+    Reading,
+    Writing,
+    Waiting,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Variable {
     /// Normalized request URI (no query string).
@@ -1486,6 +1555,8 @@ pub enum Variable {
     Arg(String),
     /// `https` for connections accepted on a TLS listener, `http` otherwise.
     Scheme,
+    /// `$https`: `on` over TLS, else empty.
+    Https,
     /// Negotiated TLS protocol version (`TLSv1.3`, `TLSv1.2`, …). Empty
     /// outside a TLS connection.
     SslProtocol,
@@ -1522,11 +1593,15 @@ pub enum Variable {
     SslClientVRemain,
     /// Request body buffered by the parser.
     RequestBody,
+    /// `$connections_active`, `_reading`, `_writing`, `_waiting` (#96).
+    Connections(ConnectionsGauge),
     /// Path to the spilled request body temp file, when one was created.
     RequestBodyFile,
     /// Client IP address from the accepted peer socket (e.g. `127.0.0.1`,
     /// `::1`). Mirrors nginx's `$remote_addr`.
     RemoteAddr,
+    /// `$binary_remote_addr`: the client address as 4 or 16 bytes.
+    BinaryRemoteAddr,
     /// Client source port from the accepted peer socket. Mirrors nginx's
     /// `$remote_port`.
     RemotePort,
@@ -1822,6 +1897,8 @@ pub enum Handler {
     /// `proxy_pass http://...;` — reverse proxy this location to an upstream.
     /// Resolution to a concrete peer happens at prepare time.
     Proxy(ProxyPass),
+    /// `stub_status;` — the connection and request counters (#96).
+    StubStatus,
 }
 
 /// Parsed `proxy_pass` argument. nginx allows two forms:
@@ -1873,7 +1950,7 @@ pub enum ProxyPass {
         request_path: Option<String>,
     },
     Direct {
-        addr: SocketAddr,
+        addr: UpstreamAddr,
         host_header: String,
         request_path: Option<String>,
     },

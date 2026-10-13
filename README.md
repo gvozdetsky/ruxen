@@ -165,7 +165,7 @@ ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it graceful
 
 **systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to the log reopen. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` with it.
 
-**Docker:** the default seccomp profile denies `io_uring`, which ruxen runs on. [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json) is Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`; use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
+**Docker:** the default seccomp profile denies `io_uring`, which ruxen runs on. [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json) is Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`, and `unshare` with `CLONE_FILES` alone (each worker's own fd table; no namespaces); use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
 
 ```bash
 docker build -f contrib/docker/Dockerfile -t ruxen .
@@ -401,7 +401,7 @@ The following are intentionally outside the current v0.1 scope:
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
 
-Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
 Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
 
