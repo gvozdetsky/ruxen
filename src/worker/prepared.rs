@@ -1676,6 +1676,24 @@ pub struct PreparedHttp {
     /// `worker_shutdown_timeout` (unset or 0: none). Bounds an upgraded
     /// connection's life after a reload.
     pub shutdown_timeout: Option<Duration>,
+    /// The `root` / `alias` directories opened at prepare time
+    /// (`PreparedRoot::root_fd`), for `main` to close once a reload has
+    /// retired this configuration's workers.
+    pub root_fds: &'static [std::os::unix::io::RawFd],
+}
+
+impl PreparedHttp {
+    /// After a reload, once no worker serves this configuration any more:
+    /// close the directories it opened in `main`'s fd table, so the next
+    /// generations don't inherit them. The configuration must not be used
+    /// for requests after this.
+    pub fn close_root_fds(&self) {
+        for &fd in self.root_fds {
+            // SAFETY: a descriptor `prepare` opened for this configuration
+            // only, which nothing uses any more.
+            unsafe { libc::close(fd) };
+        }
+    }
 }
 
 /// One generation of workers: the ones started at startup, or by a reload

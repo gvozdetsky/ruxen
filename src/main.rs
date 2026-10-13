@@ -662,6 +662,7 @@ impl Master {
             for handle in generation.handles {
                 let _ = handle.join();
             }
+            generation.http.close_root_fds();
         }
     }
 
@@ -701,7 +702,10 @@ impl Master {
         }
         let worker_listeners = match self.listeners.open(http, settings.workers) {
             Ok(l) => l,
-            Err(e) => return log(old_http, config::ErrorLogLevel::Emerg, &e),
+            Err(e) => {
+                http.close_root_fds();
+                return log(old_http, config::ErrorLogLevel::Emerg, &e);
+            }
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -711,6 +715,7 @@ impl Master {
                 Err(e) => {
                     self.listeners
                         .retain(self.current.http, self.current.workers);
+                    http.close_root_fds();
                     return log(old_http, config::ErrorLogLevel::Emerg, &e);
                 }
             };
