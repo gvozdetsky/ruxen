@@ -266,17 +266,6 @@ pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<()
         })
 }
 
-/// Parse one `location {}` block and push the resulting `Location` into
-/// `sink`. Nested `location` blocks inside this one get flattened into the
-/// same sink — nginx's own matcher (`ngx_http_core_find_static_location`)
-/// descends into children only after the parent prefix matches, but since
-/// all sibling/child patterns live in the same absolute URI space, a
-/// flattened peer list + longest-prefix win produces the same routing
-/// decision for the cases our tests exercise. Directives on the parent
-/// (root/alias/add_header/error_page/return) do not cascade onto nested
-/// children beyond what the explicit inherited arguments propagate — that's
-/// a deliberate scope limit; if a test needs fuller nested inheritance,
-/// revisit here.
 /// What a nested location takes from its parent where it sets nothing
 /// itself (#106), as nginx's `merge_loc_conf` of each module: a list
 /// directive (`add_header`, `error_page`, `proxy_set_header`, …) comes as a
@@ -351,6 +340,14 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     child.client_timeouts = child.client_timeouts.inherit(parent.client_timeouts);
 }
 
+/// Parse one `location {}` block and push the resulting `Location` into
+/// `sink`. Nested `location` blocks inside this one get flattened into the
+/// same sink — nginx's own matcher (`ngx_http_core_find_static_location`)
+/// descends into children only after the parent prefix matches, but since
+/// all sibling/child patterns live in the same absolute URI space, a
+/// flattened peer list + longest-prefix win produces the same routing
+/// decision for the cases our tests exercise. The parent's settings reach
+/// them through `inherit_from_parent` when the parent's block ends (#106).
 pub(crate) fn parse_location_block(
     spec: LocationSpec,
     lx: &mut Lexer,
