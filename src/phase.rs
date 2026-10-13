@@ -865,6 +865,11 @@ fn process_with_meta_inner(
             loc = loc.limited(le);
         }
         rewrite_state.if_location = None;
+        // A response from the rewrite program (`return` in an `if`, a
+        // `rewrite … redirect`) goes on to the location's response
+        // filters, `error_page` and `add_header`, as nginx finalizes it
+        // like a handler's (#362).
+        let mut rewrite_response = None;
         let rewrite_broke = match run_rewrite_program(
             http,
             server,
@@ -879,18 +884,14 @@ fn process_with_meta_inner(
             RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
             RewriteOutcome::Respond(response) => {
-                // Answered inside (or after) an `if` that holds: with its
-                // configuration, as nginx has switched `r->loc_conf` by
-                // then (its `access_log`, …).
-                if let Some(n) = rewrite_state.if_location {
-                    switch_to_if_location(server, n, &mut meta, &mut rewrite_state);
-                }
-                return (response, meta);
+                rewrite_response = Some(response);
+                false
             }
         };
         // An `if` block with settings of its own held: the request goes on
         // with its anonymous location (#137), as nginx's
-        // `ngx_http_script_if_code` switches `r->loc_conf`.
+        // `ngx_http_script_if_code` switches `r->loc_conf`; a response
+        // from inside the block too (its `access_log`, `error_page`, …).
         if let Some(n) = rewrite_state.if_location {
             loc = switch_to_if_location(server, n, &mut meta, &mut rewrite_state);
         }
@@ -901,8 +902,8 @@ fn process_with_meta_inner(
         // ended the rewrite program first, in which case nginx never reaches
         // the `return` and does run access control.
         meta.remote_user = None;
-        let answered_in_rewrite_phase =
-            !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
+        let answered_in_rewrite_phase = rewrite_response.is_some()
+            || (!rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_)));
         // The realip module's pre-access handler, with the location's
         // settings, unless the post-read one already set the address.
         if !answered_in_rewrite_phase
@@ -915,7 +916,9 @@ fn process_with_meta_inner(
             req_now = Some(with_real_ip(req, state));
         }
         let req = req_now.as_ref().unwrap_or(req_in);
-        let mut denied = None;
+        // The access phase doesn't run for it: it is finished like a
+        // denial, with the location's filters.
+        let mut denied = rewrite_response;
         // The limit_req module's pre-access handler (#94), once per
         // request (nginx's `r->main->limit_req_status`); not again on the
         // way to an error page.
