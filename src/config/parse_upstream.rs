@@ -281,10 +281,11 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
         });
     }
     let raw = &args[0];
+    // With variables the URL is rendered and parsed per request, as
+    // nginx's ngx_http_proxy_eval does; its scheme is checked then.
     if raw.contains('$') {
-        return Err(Error::BadValue {
-            what: "proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block)",
-            got: raw.clone(),
+        return Ok(ProxyPass::Variable {
+            url: parse_value_with_vars(raw)?,
         });
     }
     let after_scheme = raw.strip_prefix("http://").ok_or_else(|| Error::BadValue {
