@@ -1743,7 +1743,7 @@ impl Drop for ConnBufs {
         // A buffer still lent to an I/O operation (empty here) or grown
         // large isn't kept.
         if self.buf.len() != READ_BUF
-            || self.scratch.capacity() > CONN_SCRATCH_KEEP
+            || !(READ_BUF..=CONN_SCRATCH_KEEP).contains(&self.scratch.capacity())
             || self.url_scratch.capacity() > CONN_SCRATCH_KEEP
         {
             return;
