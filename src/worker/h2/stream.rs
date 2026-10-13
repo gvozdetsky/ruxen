@@ -504,7 +504,7 @@ impl super::super::ConnIo for StreamIo {
         &self,
         _state: &RuntimeState,
         _idle: Option<std::time::Duration>,
-        _start_reload_gen: u64,
+        _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> bool {
         !self.started
@@ -516,7 +516,7 @@ impl super::super::ConnIo for StreamIo {
         mut buf: Vec<u8>,
         _state: &RuntimeState,
         _idle: Option<std::time::Duration>,
-        _start_reload_gen: u64,
+        _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
         if std::mem::replace(&mut self.started, true) {

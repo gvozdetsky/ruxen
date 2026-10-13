@@ -93,9 +93,16 @@ where
     let listen = &ctx.http.listens[ctx.listen_index];
     let timeouts = listen.servers[listen.default_server].timeouts;
     let io = compat::PollIo::new(stream);
-    // nginx's defaults: 128 concurrent streams (http2_max_concurrent_streams).
+    // What nginx announces (ngx_http_v2_send_settings): 128 concurrent
+    // streams (http2_max_concurrent_streams), a 64 KiB stream window
+    // (http2_body_preread_size) and the largest frame size; then it opens
+    // the connection window to the maximum with a WINDOW_UPDATE
+    // (ngx_http_v2_init). Clients such as Test::Nginx wait for both.
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(128)
+        .initial_window_size(64 * 1024)
+        .max_frame_size((1 << 24) - 1)
+        .initial_connection_window_size((1 << 31) - 1)
         .handshake::<_, Bytes>(io);
     // The preface and SETTINGS come under client_header_timeout, as the
     // first request line would.
