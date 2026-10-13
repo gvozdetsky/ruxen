@@ -212,6 +212,21 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             })
             .collect::<Result<_, _>>()?;
         let tls = build_listen_tls(addr, &tls_inputs)?;
+        let reject_handshake = (tls.is_some()
+            && tls_inputs
+                .iter()
+                .any(|i| i.ssl.reject_handshake == Some(true)))
+        .then(|| {
+            let flags = tls_inputs
+                .iter()
+                .map(|i| i.ssl.reject_handshake == Some(true))
+                .collect();
+            let default = tls_inputs
+                .iter()
+                .position(|i| i.default_server)
+                .unwrap_or(0);
+            (flags, default)
+        });
         let mut name_index: Vec<(u32, u32)> = Vec::new();
         for (si, server) in servers.iter().enumerate() {
             for ni in 0..server.regex_names.len() {
@@ -244,6 +259,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             servers,
             default_server: 0,
             tls,
+            reject_handshake,
             proxy_protocol,
             socket,
         });
@@ -334,7 +350,12 @@ pub(crate) fn build_listen_tls(
     // when they have one and otherwise get the default's.
     let default_idx = inputs.iter().position(|i| i.default_server).unwrap_or(0);
     let default = &inputs[default_idx];
-    if default.ssl.certs.is_empty() {
+    // Unless it rejects every handshake that comes to it; then each other
+    // server needs a certificate or to reject too.
+    let rejects = |i: &TlsServerInput| i.ssl.reject_handshake == Some(true);
+    if default.ssl.certs.is_empty()
+        && (!rejects(default) || inputs.iter().any(|i| i.ssl.certs.is_empty() && !rejects(i)))
+    {
         return Err(format!(
             "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive \
              (listen {addr})"

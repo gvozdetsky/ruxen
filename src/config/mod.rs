@@ -307,6 +307,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_ciphers: Option<String> = None;
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
+    let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut warnings: Vec<String> = Vec::new();
     loop {
@@ -359,6 +360,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                             ssl.prefer_server_ciphers.or(ssl_prefer_server_ciphers);
                         ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
                         ssl.resumption = std::mem::take(&mut ssl.resumption).inherit(&resumption);
+                        ssl.reject_handshake = ssl.reject_handshake.or(ssl_reject_handshake);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -581,6 +583,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
                 ssl_session_timeout_ms = Some(ssl_session_timeout_ms_arg(v)?);
             }
+            ("ssl_reject_handshake", Terminator::Semi) => {
+                if ssl_reject_handshake.is_some() {
+                    return Err(Error::Duplicate("ssl_reject_handshake"));
+                }
+                ssl_reject_handshake = Some(parse_on_off_args(&args[1..], "ssl_reject_handshake")?);
+            }
             (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
                 resumption.parse(name, &args)?;
             }
@@ -605,7 +613,6 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_crl"
                 | "ssl_password_file"
                 | "ssl_early_data"
-                | "ssl_reject_handshake"
                 | "ssl_conf_command",
                 Terminator::Semi,
             ) => warn_ignored_tls_policy(&args, &mut warnings),
@@ -1001,9 +1008,6 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let consequence = match args.first().map(String::as_str) {
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
-        }
-        Some("ssl_reject_handshake") if value == Some("on") => {
-            "handshakes for unknown names would complete with the default certificate"
         }
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
         // dropping them weakens what the config protects. Only `off` loads.
@@ -1852,7 +1856,9 @@ mod tests {
             )
         };
         unenforced_err(&tls("ssl_verify_client on;"));
-        unenforced_err(&tls("ssl_reject_handshake on;"));
+        // ssl_reject_handshake is enforced now (tls_stream::accept_or_reject).
+        let cfg = parse(&tls("ssl_reject_handshake on;")).unwrap();
+        assert_eq!(cfg.servers[0].ssl.reject_handshake, Some(true));
         // disable_symlinks is enforced now (fs_resolve), at every level.
         let symlinks = |value: &str| {
             parse(&format!(
