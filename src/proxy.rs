@@ -56,10 +56,12 @@ fn take_proxy_buf() -> Vec<u8> {
     })
 }
 
-fn return_proxy_buf(mut v: Vec<u8>) {
+pub(crate) fn return_proxy_buf(mut v: Vec<u8>) {
     // Cap individual buffer growth so a giant chunked body doesn't keep an
     // oversized Vec alive in the pool forever.
-    if v.capacity() > PROXY_SCRATCH_CAP * 16 {
+    // And a smaller one would come back as a read buffer: a read into no
+    // room returns 0, which looks like the upstream closing.
+    if v.capacity() > PROXY_SCRATCH_CAP * 16 || v.capacity() < PROXY_SCRATCH_CAP {
         return;
     }
     v.clear();
@@ -165,6 +167,10 @@ pub struct ProxyPlan {
     /// `proxy_bind` for this request: the local address new upstream
     /// connections are bound to. Pooled ones are reused as they are.
     pub bind: Option<LocalBind>,
+    /// A body that doesn't arrive with the header may be relayed as it
+    /// comes (#88): nothing on this location needs it whole (no cache,
+    /// gzip or `add_trailer`), and this is the request's first pass.
+    pub stream: bool,
 }
 
 /// An upstream that answered 101 to a client asking to upgrade: the
@@ -740,9 +746,10 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 if let Some(state) = report.states.last_mut() {
                     state.in_flight = true;
                 }
-                let mut resp = resp;
                 if let Response::Upgrade(upgraded) = &mut resp {
                     upgraded.lease = Some(current);
+                } else if let Response::ProxyStream(body) = &mut resp {
+                    body.lease = Some(current);
                 }
                 return resp;
             }
@@ -1572,6 +1579,7 @@ async fn attempt(
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
     let head_end_terminator: (usize, usize); // (head_end, terminator_len)
+    let mut scanned = 0;
     loop {
         let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
             Ok(pair) => pair,
@@ -1610,10 +1618,12 @@ async fn attempt(
                 );
             }
         }
-        if let Some(p) = find_head_end(&accum) {
+        if let Some(p) = find_head_end(&accum, scanned) {
             head_end_terminator = p;
             break;
         }
+        // A terminator can start in the last 3 bytes and end in the next read.
+        scanned = accum.len().saturating_sub(3);
         // Sanity bound on header block size — refuse 64 KiB+ headers.
         if accum.len() > 64 * 1024 {
             return AttemptOutcome::Failed(
@@ -1804,6 +1814,63 @@ async fn attempt(
     // already pulled in with the header read are counted as received.
     let body_pacer_start = Instant::now();
     let mut paced_body_bytes: u64 = body_len_in_accum as u64;
+    // A body that hasn't all arrived goes to the client as it comes (#88),
+    // unless something needs it whole: a status that may fail over or be
+    // intercepted (decided after the body today), or the plan says so.
+    if plan.stream
+        && body_has_content
+        && !plan.next_upstream.matches_status(status_code)
+        && !plan
+            .intercept
+            .as_ref()
+            .is_some_and(|rules| rules.iter().any(|r| r.status == status_code))
+        && let Some(framing) = stream_framing(
+            &accum[body_start..],
+            chunked,
+            content_length,
+            upstream_close,
+        )
+    {
+        state.response_length = body_len_in_accum as u64;
+        let head = client_head(
+            plan,
+            &accum[..head_end],
+            first_line_end,
+            None,
+            body_has_content,
+            skip_body,
+            upstream_headers,
+            redirect_header,
+        );
+        let pool =
+            (plan.keepalive_eligible && status_code != 101 && !upstream_close && upstream_is_11)
+                .then_some(crate::proxy_stream::StreamPool {
+                    upstream: plan.upstream,
+                    peer_idx,
+                    opened_at,
+                    requests_served,
+                });
+        let pending = accum[body_start..].to_vec();
+        return_proxy_buf(accum);
+        return AttemptOutcome::Ok(Response::ProxyStream(Box::new(
+            crate::proxy_stream::ProxyStream {
+                head,
+                framing,
+                pending,
+                upstream: stream,
+                read_buf,
+                read_timeout: plan.read_timeout,
+                limit_rate: plan.limit_rate,
+                pacer_start: body_pacer_start,
+                paced: paced_body_bytes,
+                started,
+                pool,
+                slot,
+                upstream_url: upstream_url(plan, peer_idx),
+                lease: None,
+            },
+        )));
+    }
     if !body_has_content {
         // No body to forward, whatever came in with the header (nginx
         // sends a 1xx not upgraded, a 204 or a 304 without one). Bytes
@@ -1962,7 +2029,7 @@ async fn attempt(
         plan,
         &accum[..head_end],
         first_line_end,
-        body_len,
+        Some(body_len),
         body_has_content,
         skip_body,
         upstream_headers,
@@ -2032,6 +2099,29 @@ async fn attempt(
     AttemptOutcome::Ok(Response::Owned(out))
 }
 
+/// How a body that hasn't all arrived with the header (`initial`) is
+/// relayed, or `None` when it is complete (or malformed): it is then
+/// buffered as before, which keeps small responses on one write.
+fn stream_framing(
+    initial: &[u8],
+    chunked: bool,
+    content_length: Option<u64>,
+    upstream_close: bool,
+) -> Option<crate::proxy_stream::StreamFraming> {
+    use crate::proxy_stream::{ChunkedDecoder, StreamFraming};
+    if chunked {
+        let mut probe = ChunkedDecoder::default();
+        return match probe.feed(initial, &mut Vec::new()) {
+            Ok((false, _)) => Some(StreamFraming::Chunked(ChunkedDecoder::default())),
+            _ => None,
+        };
+    }
+    match content_length {
+        Some(cl) => (cl > initial.len() as u64).then_some(StreamFraming::Length(cl)),
+        None => upstream_close.then_some(StreamFraming::Close),
+    }
+}
+
 /// Step 7 of `attempt`, also run on a cached response: the client's
 /// header block from the upstream's `head` (status line and header lines,
 /// without the empty line), ready for a body of `body_len` bytes.
@@ -2040,13 +2130,13 @@ fn client_head(
     plan: &ProxyPlan,
     head: &[u8],
     first_line_end: usize,
-    body_len: usize,
+    body_len: Option<usize>,
     body_has_content: bool,
     skip_body: bool,
     upstream_headers: &mut Vec<u8>,
     redirect_header: &mut bool,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(head.len() + 64 + body_len);
+    let mut out = Vec::with_capacity(head.len() + 64 + body_len.unwrap_or(0));
     out.extend_from_slice(b"HTTP/1.1");
     out.extend_from_slice(&head[8..first_line_end]);
     // nginx hides the upstream's `Server` and `Date`
@@ -2135,11 +2225,15 @@ fn client_head(
             break;
         }
     }
-    if body_has_content && !have_content_length {
+    if body_has_content
+        && !have_content_length
+        && let Some(body_len) = body_len
+    {
         // The body is fully buffered, so frame it for the client with its
         // length: chunked was decoded to identity, and a close-delimited
         // body (HTTP/1.0 or `Connection: close` without a length) would
         // otherwise go out unframed on a keep-alive client connection.
+        // A relayed body (`None`) is framed by the worker.
         out.extend_from_slice(b"Content-Length: ");
         let mut buf = itoa_buf();
         let s = u64_to_decimal(body_len as u64, &mut buf);
@@ -2345,7 +2439,7 @@ fn background_update(
 /// block, with the body's length, and drop the body.
 fn strip_body(resp: &mut Response) {
     if let Response::Owned(out) = resp
-        && let Some((end, terminator)) = find_head_end(out)
+        && let Some((end, terminator)) = find_head_end(out, 0)
     {
         out.truncate(end + terminator);
     }
@@ -2399,7 +2493,7 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         plan,
         head,
         first_line_end,
-        body.len(),
+        Some(body.len()),
         body_has_content,
         skip_body,
         &mut report.upstream_headers,
@@ -2521,7 +2615,7 @@ async fn send_body_file(
 /// `ngx_http_proxy_module.c`: pacing is computed from the start of the body
 /// transfer, not per-chunk, so a slow first read isn't "credited" against
 /// later reads.
-async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: Instant) {
+pub(crate) async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: Instant) {
     if limit_rate == 0 {
         return;
     }
@@ -2799,18 +2893,26 @@ fn u64_to_decimal(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[..len]
 }
 
-/// Find the head/body boundary (`\r\n\r\n` or `\n\n`). Returns
-/// `(position, terminator_len)`. nginx tolerates the LF-only form.
-fn find_head_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    let lflf = buf.windows(2).position(|w| w == b"\n\n");
-    match (crlf, lflf) {
-        (Some(a), Some(b)) if a < b => Some((a, 4)),
-        (Some(_), Some(b)) => Some((b, 2)),
-        (Some(a), None) => Some((a, 4)),
-        (None, Some(b)) => Some((b, 2)),
-        (None, None) => None,
+/// Find the head/body boundary (`\r\n\r\n` or `\n\n`, whichever comes
+/// first). Returns `(position, terminator_len)`. nginx tolerates the
+/// LF-only form. One pass over the line feeds from `from`, which both
+/// terminators contain, stopping at the first that ends the head: the body
+/// bytes read along with the head aren't scanned, nor the bytes an earlier
+/// read already looked at.
+fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while let Some(p) = buf[i..].iter().position(|&b| b == b'\n') {
+        let lf = i + p;
+        match buf.get(lf + 1) {
+            Some(b'\n') => return Some((lf, 2)),
+            Some(b'\r') if lf > 0 && buf[lf - 1] == b'\r' && buf.get(lf + 2) == Some(&b'\n') => {
+                return Some((lf - 1, 4));
+            }
+            _ => {}
+        }
+        i = lf + 1;
     }
+    None
 }
 
 /// Find the next line terminator (`\r\n` or `\n`). Returns
@@ -2881,6 +2983,53 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The single pass finds what the two whole-buffer searches it replaced
+    /// found, on every string of `\r`, `\n` and `a` up to 9 bytes, and also
+    /// when the bytes arrive split in two reads.
+    #[test]
+    fn find_head_end_matches_two_scans() {
+        fn two_scans(buf: &[u8]) -> Option<(usize, usize)> {
+            let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+            let lflf = buf.windows(2).position(|w| w == b"\n\n");
+            match (crlf, lflf) {
+                (Some(a), Some(b)) if a < b => Some((a, 4)),
+                (Some(_), Some(b)) => Some((b, 2)),
+                (Some(a), None) => Some((a, 4)),
+                (None, Some(b)) => Some((b, 2)),
+                (None, None) => None,
+            }
+        }
+        for len in 0..=9u32 {
+            for mut n in 0..3usize.pow(len) {
+                let buf: Vec<u8> = (0..len)
+                    .map(|_| {
+                        let b = [b'\r', b'\n', b'a'][n % 3];
+                        n /= 3;
+                        b
+                    })
+                    .collect();
+                let want = two_scans(&buf);
+                assert_eq!(find_head_end(&buf, 0), want, "{buf:?}");
+                for split in 0..=buf.len() {
+                    let first = two_scans(&buf[..split]);
+                    let got = first.or_else(|| find_head_end(&buf, split.saturating_sub(3)));
+                    assert_eq!(got, want, "{buf:?} split at {split}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_buffer_pool_keeps_only_read_sized_buffers() {
+        PROXY_BUF_POOL.with(|p| p.borrow_mut().clear());
+        return_proxy_buf(Vec::new());
+        return_proxy_buf(Vec::with_capacity(3));
+        return_proxy_buf(Vec::with_capacity(PROXY_SCRATCH_CAP * 32));
+        assert_eq!(PROXY_BUF_POOL.with(|p| p.borrow().len()), 0);
+        return_proxy_buf(Vec::with_capacity(PROXY_SCRATCH_CAP));
+        assert!(take_proxy_buf().capacity() >= PROXY_SCRATCH_CAP);
+    }
 
     #[test]
     fn request_parts_advance_across_head_and_body() {

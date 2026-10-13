@@ -629,6 +629,14 @@ fn finish_proxy_response(
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
     process_meta.upstream_cache_status = report.cache_status;
+    // A relayed body (#88): the head is filtered as an `Owned` response
+    // with no body, then goes back with the upstream connection.
+    let (upstream_resp, relayed) = match upstream_resp {
+        Response::ProxyStream(mut body) => {
+            (Response::Owned(std::mem::take(&mut body.head)), Some(body))
+        }
+        other => (other, None),
+    };
     // `X-Accel-Limit-Rate` is the response's `limit_rate`.
     if let Some(rate) = report.accel.as_ref().and_then(|a| a.limit_rate) {
         process_meta.limit_rate =
@@ -655,9 +663,19 @@ fn finish_proxy_response(
         &process_meta,
         &report.upstream_headers,
     );
-    // The header is filtered; the body is already read (responses are
-    // buffered whole), so the upstream request is over.
-    crate::proxy::finish_answer(&mut process_meta.upstream_states);
+    let response = match (response, relayed) {
+        (Response::Owned(head), Some(mut body)) => {
+            body.head = head;
+            Response::ProxyStream(body)
+        }
+        (response, _) => response,
+    };
+    // The header is filtered. A buffered body is already read, so the
+    // upstream request is over; a relayed one ends after the write, where
+    // its timing is filled in.
+    if !matches!(response, Response::ProxyStream(_)) {
+        crate::proxy::finish_answer(&mut process_meta.upstream_states);
+    }
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
 }
@@ -687,10 +705,13 @@ enum PassOutcome {
 async fn run_proxy_pass(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
-    plan: Box<crate::proxy::ProxyPlan>,
+    mut plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
 ) -> PassOutcome {
+    // After an internal redirect the answer's head is rewritten further
+    // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
+    plan.stream = false;
     let redirects = plan.response.redirects;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
@@ -1103,6 +1124,8 @@ async fn run_post_action(
         Response::Prebuilt(bytes) => static_response = Some(bytes),
         Response::Owned(bytes) => owned_response = bytes,
         Response::File { headers, body: _ } => owned_response = headers,
+        // post_action's answer isn't sent: the upstream connection closes.
+        Response::ProxyStream(s) => owned_response = s.head,
         // nginx refuses an upgrade in a subrequest.
         Response::Reroute(_) | Response::Proxy(_) | Response::Upgrade(_) => return,
     }
@@ -3458,6 +3481,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // once per worker and avoid per-request Vec copies.
                         scratch.clear();
                         let mut prebuilt_base: Option<&'static [u8]> = None;
+                        // An upstream body relayed after the head (#88).
+                        let mut proxy_body: Option<Box<crate::proxy_stream::ProxyStream>> = None;
                         let mut file_body: Option<phase::FileBody> = match response {
                             Response::Prebuilt(bytes) => {
                                 prebuilt_base = Some(bytes);
@@ -3478,6 +3503,16 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch.extend_from_slice(&headers);
                                 }
                                 Some(body)
+                            }
+                            Response::ProxyStream(mut body) => {
+                                let head = std::mem::take(&mut body.head);
+                                if head.capacity() > scratch.capacity() {
+                                    *scratch = head;
+                                } else {
+                                    scratch.extend_from_slice(&head);
+                                }
+                                proxy_body = Some(body);
+                                None
                             }
                             // phase::process consumes Reroute internally
                             // via its hop loop; a Reroute reaching the
@@ -3516,6 +3551,22 @@ pub(crate) async fn handle<S: ConnIo>(
                             // A compressed file to an HTTP/1.0 client has no
                             // length or chunks: the close ends it.
                             || gzip_stream.is_some_and(|g| !g.chunked);
+                        // A relayed body of unknown length: chunked to an
+                        // HTTP/1.1 client, ended by the close otherwise.
+                        let mut chunked_out = false;
+                        if proxy_body.as_ref().is_some_and(|b| !b.length_known()) {
+                            if req.http_11 {
+                                insert_header_at(
+                                    &mut *scratch,
+                                    &mut scan.head_end,
+                                    b"Transfer-Encoding: chunked\r\n",
+                                );
+                                chunked_out = true;
+                            } else {
+                                close_after = true;
+                            }
+                        }
+                        let mut relay_failed = false;
                         // Only scan the raw headers for User-Agent when a
                         // policy could actually trigger. disable_safari fires
                         // on any method; disable_msie6 only on POST. Skipping
@@ -3587,7 +3638,41 @@ pub(crate) async fn handle<S: ConnIo>(
                                 };
                                 insert_header_at(&mut *scratch, &mut scan.head_end, header);
                             }
-                            if let Some(limit) = process_meta.limit_rate.as_deref()
+                            if let Some(body) = proxy_body.take() {
+                                let pacer = process_meta.limit_rate.as_deref().and_then(|l| {
+                                    super::Pacer::new(l.rate, l.after, request_start)
+                                });
+                                let head = std::mem::take(&mut *scratch);
+                                let (end, head) = Box::pin(crate::proxy_stream::relay(
+                                    body,
+                                    stream,
+                                    head,
+                                    chunked_out,
+                                    pacer,
+                                    timers.io.as_mut(),
+                                    send_timeout,
+                                ))
+                                .await;
+                                *scratch = head;
+                                streamed_body_len = end.body_sent;
+                                if let Some(state) = process_meta.upstream_states.last_mut() {
+                                    state.bytes_received += end.upstream_read;
+                                    state.response_length += end.upstream_body;
+                                    state.response_ms = Some(end.response_ms);
+                                    state.in_flight = false;
+                                }
+                                if let Some(failure) = end.failure {
+                                    write_upstream_error_log(
+                                        &process_meta.log,
+                                        &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                            .with_realip(&process_meta),
+                                        &[failure],
+                                    );
+                                }
+                                // Cut short: the client can't tell, so the
+                                // connection closes (nginx closes it too).
+                                relay_failed = !end.complete;
+                            } else if let Some(limit) = process_meta.limit_rate.as_deref()
                                 && limit.rate > 0
                                 && gzip_stream.is_none()
                             {
@@ -3723,6 +3808,9 @@ pub(crate) async fn handle<S: ConnIo>(
                         if let Some(target) = process_meta.post_action {
                             run_post_action(http, &ctx, target, request_start, &mut *url_scratch)
                                 .await;
+                        }
+                        if relay_failed {
+                            return;
                         }
 
                         read_start += request_total_consumed;

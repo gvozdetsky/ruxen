@@ -1258,7 +1258,8 @@ pub(crate) fn maybe_intercept_error_page(
         Response::Reroute(_) => return response,
         // Proxy intercept is handled inside `proxy::run_proxy` from
         // pre-rendered plan rules; unresolved proxy plans pass through here.
-        Response::Proxy(_) => return response,
+        // A relayed body is only chosen when no intercept rule matched.
+        Response::Proxy(_) | Response::ProxyStream(_) => return response,
         // A 101 isn't an error.
         Response::Upgrade(_) => return response,
     };

@@ -1118,7 +1118,7 @@ mod tests {
             Response::Prebuilt(bytes) => bytes.to_vec(),
             Response::File { .. } => panic!("error path should not return streamed file body"),
             Response::Reroute(_) => panic!("root handler should not reroute on metadata failure"),
-            Response::Proxy(_) | Response::Upgrade(_) => {
+            Response::Proxy(_) | Response::Upgrade(_) | Response::ProxyStream(_) => {
                 panic!("root handler should not return proxy plan")
             }
         };

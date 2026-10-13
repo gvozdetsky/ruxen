@@ -75,6 +75,7 @@ pub(crate) fn finalize_location_response(
         // type system happy.
         Response::Proxy(plan) => Response::Proxy(plan),
         Response::Upgrade(upgraded) => Response::Upgrade(upgraded),
+        Response::ProxyStream(s) => Response::ProxyStream(s),
         Response::Prebuilt(bytes) => {
             let base_status = response_status(bytes);
             let status = effective_error_page_status(base_status, forced_status);
@@ -1031,6 +1032,7 @@ pub(crate) fn run_location_handler(
             in_error_page,
             intercept,
             upgrade: client_upgrade,
+            stream: cache.is_none() && loc.gzip.is_none() && loc.add_trailers.is_empty(),
             cache,
             hash,
             bind,
