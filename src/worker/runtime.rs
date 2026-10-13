@@ -687,7 +687,7 @@ enum PassOutcome {
 async fn run_proxy_pass(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
-    plan: crate::proxy::ProxyPlan,
+    plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
 ) -> PassOutcome {
