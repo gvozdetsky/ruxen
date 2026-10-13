@@ -84,6 +84,9 @@ impl ConnInfo {
     };
 }
 
+/// The body of a request that has none.
+pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
+
 /// Per-request inputs the pipeline needs from the parser + connection.
 /// Narrow on purpose — each field added here is a new dependency between
 /// the worker's parse loop and the phase machinery.
@@ -161,7 +164,8 @@ pub struct RequestCtx<'a> {
     /// request had no body or when `proxy_pass_request_body off;` is set.
     /// Both Content-Length and chunked client bodies arrive here decoded
     /// as plain bytes; proxy forwarding recomputes `Content-Length`.
-    pub body: &'a [u8],
+    /// Shared (`Bytes`) so the proxy can send it without a copy (#289).
+    pub body: &'a bytes::Bytes,
     /// Length of the request body: `body.len()`, unless the body was too
     /// large to keep in memory and is only in `body_file` (then `body` is
     /// empty, and `$request_body` too, as in nginx).
@@ -241,6 +245,9 @@ pub struct ProcessMeta {
     /// The counts `limit_conn` took for this request, given back when the
     /// last copy of the meta goes, after the response is written (#95).
     pub limit_conn_held: Option<std::rc::Rc<crate::worker::limit_conn::Held>>,
+    /// The location's `send_timeout` (and `client_body_timeout`) for this
+    /// request; `None` before routing (#147).
+    pub timeouts: Option<&'static crate::worker::PreparedClientTimeouts>,
     /// Authenticated user from HTTP Basic auth, for `$remote_user`.
     pub remote_user: Option<Vec<u8>>,
     /// The client address the realip module set, for the log lines the
@@ -319,6 +326,7 @@ impl Default for ProcessMeta {
             access_logs: &[],
             limit_req_delay_ms: 0,
             limit_conn_held: None,
+            timeouts: None,
             remote_user: None,
             realip: None,
             proxy_add_headers: &[],
@@ -595,6 +603,11 @@ fn process_with_meta_inner(
             return refuse(http, req, url_scratch, server, response, true, false);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if req.method == Method::Trace
+                && crate::worker::test_panic() == crate::worker::TestPanic::Trace
+            {
+                panic!("{}=trace", crate::worker::TEST_PANIC_ENV);
+            }
             let response = Response::Owned(crate::file::method_not_allowed(
                 req.method,
                 server.server_header,
@@ -824,6 +837,7 @@ fn process_with_meta_inner(
             disable_safari: loc.keepalive.disable_safari,
         };
         meta.access_logs = loc.access_logs;
+        meta.timeouts = Some(loc.timeouts);
         meta.post_action = loc.post_action;
         meta.log = LogMeta {
             error_logs: loc.error_logs,
@@ -1525,6 +1539,8 @@ pub(crate) struct FirstBodyLimit {
     /// The location's `client_body_temp_path` directory, if it (or its
     /// server) has its own.
     pub body_temp: Option<&'static crate::worker::BodyTempDir>,
+    /// The location's `client_body_timeout` (#147).
+    pub body_timeout: std::time::Duration,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -1594,6 +1610,7 @@ pub(crate) fn first_body_limit(
             crate::config::ClientBodyInFileOnly::On
         ),
         body_temp: loc.body_temp,
+        body_timeout: loc.timeouts.body,
     })
 }
 
@@ -1649,6 +1666,20 @@ fn find_config<'h, 'r>(
     }
 
     (&listen.servers[listen.default_server], None)
+}
+
+/// Whether a ClientHello with this SNI name is to be refused
+/// (`ssl_reject_handshake`): the server the name selects, as nginx's
+/// servername callback finds it, else the address's TLS default server.
+pub(crate) fn rejects_handshake(listen: &PreparedListen, sni: Option<&str>) -> bool {
+    let Some((rejecting, default)) = &listen.reject_handshake else {
+        return false;
+    };
+    let index = sni
+        .and_then(|name| match_server_name(listen, name.as_bytes()))
+        .and_then(|(server, _)| listen.servers.iter().position(|s| std::ptr::eq(s, server)))
+        .unwrap_or(*default);
+    rejecting.get(index).copied().unwrap_or(false)
 }
 
 /// Run the exact / leading-wildcard / trailing-wildcard / regex ladder
@@ -2055,7 +2086,7 @@ mod tests {
             request_length: 0,
             epoch_secs: 0,
             epoch_ms: 0,
-            body: &[],
+            body: &NO_BODY,
             body_len: 0,
             body_file: None,
             tls: None,

@@ -54,16 +54,19 @@ mod handler;
 pub(crate) mod limit_conn;
 pub(crate) mod limit_req;
 mod log;
+mod panics;
 mod prepare;
 mod prepared;
 mod render;
 mod response;
 mod rewrite;
 mod runtime;
+pub(crate) mod stats;
 
 pub(crate) use connection::*;
 pub(crate) use handler::*;
 pub(crate) use log::*;
+pub(crate) use panics::*;
 pub(crate) use prepare::*;
 pub(crate) use prepared::*;
 pub(crate) use render::*;
@@ -1064,7 +1067,7 @@ mod tests {
             request_length: 0,
             epoch_secs: 0,
             epoch_ms: 0,
-            body: &[],
+            body: &crate::phase::NO_BODY,
             body_len: 0,
             body_file: None,
             tls: None,

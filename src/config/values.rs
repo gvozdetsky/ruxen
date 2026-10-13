@@ -176,6 +176,31 @@ struct VariableRegistry {
     defined: std::collections::HashSet<String>,
     /// `$request_body_file` appears somewhere in the config.
     request_body_file: bool,
+    /// An `error_log stderr` appears somewhere in the config (not a
+    /// variable, but noted the same way, while parsing).
+    stderr_log: bool,
+    /// `stub_status` or a `$connections_*` variable appears in the config.
+    stats: bool,
+}
+
+/// `error_log stderr` was parsed (#309).
+pub(crate) fn note_stderr_log() {
+    VARIABLES.with(|v| v.borrow_mut().stderr_log = true);
+}
+
+/// Whether the config just parsed logs to stderr somewhere.
+pub(crate) fn stderr_log_used() -> bool {
+    VARIABLES.with(|v| v.borrow().stderr_log)
+}
+
+/// Whether the config just parsed reads the connection counters.
+pub(crate) fn stats_used() -> bool {
+    VARIABLES.with(|v| v.borrow().stats)
+}
+
+/// `stub_status` was parsed.
+pub(crate) fn note_stats_used() {
+    VARIABLES.with(|v| v.borrow_mut().stats = true);
 }
 
 /// Whether the config just parsed reads `$request_body_file` anywhere: if
@@ -379,6 +404,18 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"request_body" => Variable::RequestBody,
         b"limit_req_status" => Variable::LimitReqStatus,
         b"limit_conn_status" => Variable::LimitConnStatus,
+        b"connections_active"
+        | b"connections_reading"
+        | b"connections_writing"
+        | b"connections_waiting" => {
+            note_stats_used();
+            Variable::Connections(match &name[12..] {
+                b"active" => ConnectionsGauge::Active,
+                b"reading" => ConnectionsGauge::Reading,
+                b"writing" => ConnectionsGauge::Writing,
+                _ => ConnectionsGauge::Waiting,
+            })
+        }
         b"request_body_file" => {
             VARIABLES.with(|v| v.borrow_mut().request_body_file = true);
             Variable::RequestBodyFile

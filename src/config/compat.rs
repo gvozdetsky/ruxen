@@ -257,11 +257,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         "Set-Cookie paths are not rewritten (#40)",
     ),
     (
-        "proxy_bind",
-        Some("off"),
-        "upstream connections use the default source address (#135)",
-    ),
-    (
         "proxy_store",
         Some("off"),
         "proxied responses are not stored",
