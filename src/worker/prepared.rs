@@ -648,6 +648,11 @@ pub struct PreparedProxyCache {
     pub no_cache: &'static [&'static [PreparedValuePart]],
     pub convert_head: bool,
     pub revalidate: bool,
+    pub use_stale: crate::config::UseStale,
+    pub background_update: bool,
+    pub lock: bool,
+    pub lock_timeout_ms: u64,
+    pub lock_age_ms: u64,
     pub ignore: crate::proxy_cache::Ignore,
 }
 
@@ -738,6 +743,11 @@ pub(crate) static NO_CACHE_CONF: crate::config::ProxyCacheConf = crate::config::
     no_cache: None,
     convert_head: None,
     revalidate: None,
+    use_stale: None,
+    background_update: None,
+    lock: None,
+    lock_timeout_ms: None,
+    lock_age_ms: None,
 };
 
 impl ProxyEffective {

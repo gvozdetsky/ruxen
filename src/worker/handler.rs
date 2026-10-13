@@ -320,6 +320,10 @@ fn cache_plan(
     let mut hit = None;
     let mut stale = None;
     let mut store = !no_cache;
+    let mut token = None;
+    let mut wait_until = None;
+    let mut background = false;
+    let mut stale_error = false;
     if holds(conf.bypass) {
         // The response still refreshes the cache.
         status = CacheStatus::Bypass;
@@ -339,10 +343,37 @@ fn cache_plan(
                 Some(_) => {}
                 None => zone.forget_file(&hash),
             },
-            Lookup::Expired => {
-                status = CacheStatus::Expired;
-                if conf.revalidate {
-                    stale = Entry::read(&path(), &key);
+            Lookup::Stale {
+                token: updater,
+                stale_updating,
+                stale_error: covered,
+            } => {
+                // ngx_http_upstream_cache: STALE (this request updates) or
+                // UPDATING (another one does).
+                token = updater;
+                stale_error = covered;
+                let serve_stale = conf.use_stale.updating || stale_updating;
+                // Read only when something may answer with it.
+                let entry = (serve_stale || covered || conf.revalidate || conf.use_stale.any())
+                    .then(|| Entry::read(&path(), &key))
+                    .flatten()
+                    .filter(|e| e.matches_variant(req.headers_raw));
+                match entry {
+                    Some(entry) if serve_stale && updater.is_some() && conf.background_update => {
+                        status = CacheStatus::Stale;
+                        hit = Some(CacheHit::Entry(entry));
+                        background = true;
+                    }
+                    Some(entry) if serve_stale && updater.is_none() => {
+                        status = CacheStatus::Updating;
+                        hit = Some(CacheHit::Entry(entry));
+                    }
+                    // Fetched again; kept to revalidate with, or to answer
+                    // with if the upstream fails (proxy_cache_use_stale).
+                    entry => {
+                        status = CacheStatus::Expired;
+                        stale = entry;
+                    }
                 }
             }
             Lookup::Miss {
@@ -352,14 +383,28 @@ fn cache_plan(
                 store &= enough;
                 // A file from before a restart (nginx's cold cache).
                 if probe && let Some(entry) = Entry::read(&path(), &key) {
-                    zone.adopt(&hash, entry.valid_sec, entry.len());
+                    zone.adopt(&hash, &entry);
                     store = !no_cache;
                     if entry.valid_sec < now {
                         status = CacheStatus::Expired;
-                        stale = conf.revalidate.then_some(entry);
+                        stale = Some(entry);
                     } else if entry.matches_variant(req.headers_raw) {
                         status = CacheStatus::Hit;
                         hit = Some(CacheHit::Entry(entry));
+                    }
+                }
+                // proxy_cache_lock: one request fetches a missing response,
+                // the others wait for it.
+                if status == CacheStatus::Miss && store && conf.lock {
+                    match zone.try_lock(&hash, conf.lock_age_ms) {
+                        Some(lock) => token = Some(lock),
+                        None if conf.lock_timeout_ms == 0 => store = false,
+                        None => {
+                            wait_until = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(conf.lock_timeout_ms),
+                            );
+                        }
                     }
                 }
             }
@@ -371,8 +416,8 @@ fn cache_plan(
         hash,
         status,
         store,
-        // A hit needs neither.
-        request_headers: if hit.is_some() {
+        // A hit needs neither, unless it is updated in the background.
+        request_headers: if hit.is_some() && !background {
             Vec::new()
         } else {
             req.headers_raw.to_vec()
@@ -381,6 +426,10 @@ fn cache_plan(
         hit,
         stale,
         head_as_get: conf.convert_head && matches!(req.method, Method::Head),
+        token,
+        wait_until,
+        background,
+        stale_error,
     })))
 }
 
@@ -708,7 +757,10 @@ pub(crate) fn run_location_handler(
         // peer is `down` or in a `max_fails` cooldown: `run_proxy` answers
         // 502 and reports `no live upstreams` for the error log. A cache
         // hit needs none.
-        let initial_peer = if cache.as_ref().is_some_and(|c| c.hit.is_some()) {
+        let initial_peer = if cache
+            .as_ref()
+            .is_some_and(|c| c.hit.is_some() && !c.background)
+        {
             None
         } else {
             crate::upstream::pick_peer(proxy.upstream, &Default::default())
@@ -770,6 +822,7 @@ pub(crate) fn run_location_handler(
             // validators.
             let (last_modified, etag) = cache
                 .as_ref()
+                .filter(|c| c.conf.revalidate)
                 .and_then(|c| c.stale.as_ref())
                 .map_or((None, None), |stale| stale.validators());
             let none = None;
