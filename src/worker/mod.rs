@@ -1116,7 +1116,9 @@ mod tests {
             Response::Prebuilt(bytes) => bytes.to_vec(),
             Response::File { .. } => panic!("error path should not return streamed file body"),
             Response::Reroute(_) => panic!("root handler should not reroute on metadata failure"),
-            Response::Proxy(_) => panic!("root handler should not return proxy plan"),
+            Response::Proxy(_) | Response::ProxyStream(_) => {
+                panic!("root handler should not return proxy plan")
+            }
         };
         assert!(
             std::str::from_utf8(&r)

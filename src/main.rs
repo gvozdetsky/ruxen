@@ -28,6 +28,7 @@ mod privileges;
 mod proxy;
 mod proxy_cache;
 mod proxy_protocol;
+mod proxy_stream;
 mod syslog;
 mod tls;
 mod tls_certs;
