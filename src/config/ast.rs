@@ -458,13 +458,19 @@ pub struct ServerSsl {
 
 /// How TLS sessions can be resumed. `None` fields take nginx's defaults:
 /// no session-ID cache (`ssl_session_cache none`), tickets on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionResumption {
     /// `ssl_session_cache`: `builtin` / `shared:…` = true, `off` / `none` =
     /// false.
     pub cache: Option<bool>,
+    /// The `ssl_session_cache` that set `cache` has a `shared:` zone: nginx
+    /// then keeps rotating ticket keys in it (#140).
+    pub shared: bool,
     /// `ssl_session_tickets on|off`.
     pub tickets: Option<bool>,
+    /// `ssl_session_ticket_key file` lines, in order: the first encrypts,
+    /// all decrypt.
+    pub ticket_keys: Option<Vec<PathBuf>>,
 }
 
 impl SessionResumption {
@@ -497,6 +503,7 @@ impl SessionResumption {
                                 });
                             }
                         }
+                        self.shared = caches.iter().any(|c| c.starts_with("shared:"));
                         true
                     }
                 };
@@ -517,11 +524,22 @@ impl SessionResumption {
         }
     }
 
-    pub(crate) fn inherit(self, parent: SessionResumption) -> SessionResumption {
+    pub(crate) fn inherit(self, parent: &SessionResumption) -> SessionResumption {
+        let (cache, shared) = match self.cache {
+            Some(_) => (self.cache, self.shared),
+            None => (parent.cache, parent.shared),
+        };
         SessionResumption {
-            cache: self.cache.or(parent.cache),
+            cache,
+            shared,
             tickets: self.tickets.or(parent.tickets),
+            ticket_keys: self.ticket_keys.or_else(|| parent.ticket_keys.clone()),
         }
+    }
+
+    /// One `ssl_session_ticket_key` line (the path already resolved).
+    pub(crate) fn add_ticket_key(&mut self, path: PathBuf) {
+        self.ticket_keys.get_or_insert_with(Vec::new).push(path);
     }
 }
 
