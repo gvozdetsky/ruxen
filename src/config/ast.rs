@@ -217,6 +217,8 @@ pub struct HttpConfig {
     pub client_body_buffer_size: Option<u64>,
     /// `$request_body_file` appears somewhere in the config.
     pub uses_request_body_file: bool,
+    /// `$request_body` appears somewhere in the config.
+    pub uses_request_body: bool,
     /// An `error_log stderr` appears somewhere in the config (#309).
     pub uses_stderr_log: bool,
     /// `stub_status` or a `$connections_*` variable appears in the config:

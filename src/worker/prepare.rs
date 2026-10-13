@@ -59,6 +59,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         limit_req_zones,
         uses_request_body_file,
+        uses_request_body,
         uses_stderr_log,
         uses_stats,
         runtime,
@@ -282,6 +283,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         error_logs: main_error_logs,
         max_request_body,
         uses_request_body_file,
+        uses_request_body,
         uses_stderr_log,
         stats: uses_stats,
         body_temp: BodyTempDir::new(client_body_temp_path),
