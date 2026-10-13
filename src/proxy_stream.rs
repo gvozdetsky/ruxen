@@ -88,6 +88,11 @@ pub struct RelayEnd {
     pub complete: bool,
 }
 
+/// Read buffer of a relay: one read takes whatever the upstream socket
+/// holds, up to this, and goes out in one write (nginx reads until EAGAIN
+/// before it writes).
+const RELAY_BUF: usize = 64 * 1024;
+
 /// Write `head`, then relay the body: the bytes that came with the
 /// header, then each upstream read, re-chunked when `chunked_out`. Each
 /// client write is held to `send_timeout` (and `limit_rate` through
@@ -96,17 +101,12 @@ pub struct RelayEnd {
 pub(crate) async fn relay<S: monoio::io::AsyncWriteRent>(
     mut s: Box<ProxyStream>,
     client: &mut S,
-    head: Vec<u8>,
+    mut head: Vec<u8>,
     chunked_out: bool,
     mut pacer: Option<crate::worker::Pacer>,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
 ) -> (RelayEnd, Vec<u8>) {
-    let head_len = head.len();
-    let mut head_pending = head_len;
-    let mut out = head;
-    // `out` becomes the head again after the first write.
-    let mut head_back: Option<Vec<u8>> = None;
     let mut end = RelayEnd {
         body_sent: 0,
         upstream_read: 0,
@@ -115,107 +115,85 @@ pub(crate) async fn relay<S: monoio::io::AsyncWriteRent>(
         failure: None,
         complete: false,
     };
-    let mut decoded = Vec::new();
     // Bytes past the end of the body: the connection can't be pooled.
     let mut extra = false;
-    let mut input = std::mem::take(&mut s.pending);
-    let mut first = true;
+    // Client bytes when they differ from the input: chunk framing, or the
+    // decoded body of a chunked upstream.
+    let mut framed = Vec::new();
+    let mut decoded = Vec::new();
+
+    // The head goes out with whatever body came with it.
+    let head_len = head.len();
+    let pending = std::mem::take(&mut s.pending);
+    let done = match consume(
+        &mut s.framing,
+        &pending,
+        chunked_out,
+        &mut decoded,
+        &mut head,
+    ) {
+        Ok((done, _, more)) => {
+            extra |= more;
+            done
+        }
+        Err(()) => {
+            end.failure = Some(failure(&s, UpstreamError::InvalidChunked));
+            return finish(s, end, extra, head);
+        }
+    };
+    crate::proxy::return_proxy_buf(pending);
+    let len = head.len();
+    let (ok, returned) =
+        write_out(client, head, len, &mut pacer, timer.as_mut(), send_timeout).await;
+    head = returned;
+    let body_len = head.len().saturating_sub(head_len);
+    head.truncate(head_len);
+    if !ok {
+        return finish(s, end, extra, head);
+    }
+    end.body_sent += body_len as u64;
+    if done {
+        end.complete = true;
+        return finish(s, end, extra, head);
+    }
+
+    if s.read_buf.capacity() < RELAY_BUF {
+        crate::proxy::return_proxy_buf(std::mem::replace(
+            &mut s.read_buf,
+            Vec::with_capacity(RELAY_BUF),
+        ));
+    }
     loop {
-        // The input so far, as client bytes in `out`.
-        let done = match &mut s.framing {
-            StreamFraming::Length(left) => {
-                let take = input.len().min(*left as usize);
-                extra |= input.len() > take;
-                if !first {
-                    end.upstream_body += take as u64;
-                }
-                push_body(&mut out, &input[..take], chunked_out);
-                *left -= take as u64;
-                *left == 0
-            }
-            StreamFraming::Chunked(dec) => {
-                decoded.clear();
-                match dec.feed(&input, &mut decoded) {
-                    Ok((done, used)) => {
-                        extra |= done && used < input.len();
-                        if !first {
-                            end.upstream_body += used as u64;
-                        }
-                        push_body(&mut out, &decoded, chunked_out);
-                        done
-                    }
-                    Err(()) => {
-                        end.failure = Some(failure(&s, UpstreamError::InvalidChunked));
-                        break;
-                    }
-                }
-            }
-            StreamFraming::Close => {
-                if !first {
-                    end.upstream_body += input.len() as u64;
-                }
-                push_body(&mut out, &input, chunked_out);
-                false
-            }
-        };
-        first = false;
-        if done && chunked_out {
-            out.extend_from_slice(b"0\r\n\r\n");
-        }
-        if !out.is_empty() {
-            let len = out.len();
-            let (ok, returned) =
-                write_out(client, out, &mut pacer, timer.as_mut(), send_timeout).await;
-            out = returned;
-            if head_back.is_none() {
-                // The first write carried the head: keep it, write the
-                // rest from a buffer of its own.
-                out.truncate(head_len);
-                head_back = Some(std::mem::replace(
-                    &mut out,
-                    Vec::with_capacity(16 * 1024 + 32),
-                ));
-            }
-            if !ok {
-                break;
-            }
-            end.body_sent += (len - head_pending) as u64;
-            head_pending = 0;
-            out.clear();
-        }
-        if done {
-            end.complete = true;
-            break;
-        }
         // proxy_limit_rate: wait until the body read so far is due.
         crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
-        let buf = std::mem::take(&mut s.read_buf);
+        let mut buf = std::mem::take(&mut s.read_buf);
+        buf.clear();
         let (res, returned) = match timeout(s.read_timeout, s.upstream.read(buf)).await {
             Ok(pair) => pair,
             Err(_) => {
-                s.read_buf = vec![0; 4096];
                 end.failure = Some(failure(&s, UpstreamError::TimedOut(Stage::ReadingBody)));
                 break;
             }
         };
         s.read_buf = returned;
-        match res {
+        let n = match res {
             Ok(0) => {
                 if matches!(s.framing, StreamFraming::Close) {
+                    // The upstream closed: the body is complete, and
+                    // nothing goes back to the pool.
+                    s.pool = None;
                     if chunked_out {
-                        out.extend_from_slice(b"0\r\n\r\n");
-                        let (ok, returned) =
-                            write_out(client, out, &mut pacer, timer.as_mut(), send_timeout).await;
-                        out = returned;
+                        framed.clear();
+                        framed.extend_from_slice(b"0\r\n\r\n");
+                        let (ok, _) =
+                            write_out(client, framed, 5, &mut pacer, timer.as_mut(), send_timeout)
+                                .await;
                         if !ok {
                             break;
                         }
                         end.body_sent += 5;
-                        out.clear();
                     }
                     end.complete = true;
-                    // The upstream closed: nothing to pool.
-                    s.pool = None;
                 } else {
                     end.failure = Some(failure(
                         &s,
@@ -224,12 +202,7 @@ pub(crate) async fn relay<S: monoio::io::AsyncWriteRent>(
                 }
                 break;
             }
-            Ok(n) => {
-                end.upstream_read += n as u64;
-                s.paced += n as u64;
-                input.clear();
-                input.extend_from_slice(&s.read_buf[..n]);
-            }
+            Ok(n) => n,
             Err(e) => {
                 end.failure = Some(failure(
                     &s,
@@ -237,10 +210,119 @@ pub(crate) async fn relay<S: monoio::io::AsyncWriteRent>(
                 ));
                 break;
             }
+        };
+        end.upstream_read += n as u64;
+        s.paced += n as u64;
+        // A length-framed body to a client that takes it as it is goes
+        // out of the read buffer itself.
+        if !chunked_out && let StreamFraming::Length(left) = &mut s.framing {
+            let take = n.min(*left as usize);
+            extra |= n > take;
+            *left -= take as u64;
+            let done = *left == 0;
+            end.upstream_body += take as u64;
+            let buf = std::mem::take(&mut s.read_buf);
+            let (ok, returned) =
+                write_out(client, buf, take, &mut pacer, timer.as_mut(), send_timeout).await;
+            s.read_buf = returned;
+            if !ok {
+                break;
+            }
+            end.body_sent += take as u64;
+            if done {
+                end.complete = true;
+                break;
+            }
+            continue;
+        }
+        framed.clear();
+        let input = &s.read_buf[..n];
+        let done = match consume(
+            &mut s.framing,
+            input,
+            chunked_out,
+            &mut decoded,
+            &mut framed,
+        ) {
+            Ok((done, used, more)) => {
+                extra |= more;
+                end.upstream_body += used as u64;
+                done
+            }
+            Err(()) => {
+                end.failure = Some(failure(&s, UpstreamError::InvalidChunked));
+                break;
+            }
+        };
+        if !framed.is_empty() {
+            let len = framed.len();
+            let (ok, returned) = write_out(
+                client,
+                framed,
+                len,
+                &mut pacer,
+                timer.as_mut(),
+                send_timeout,
+            )
+            .await;
+            framed = returned;
+            if !ok {
+                break;
+            }
+            end.body_sent += len as u64;
+        }
+        if done {
+            end.complete = true;
+            break;
         }
     }
+    finish(s, end, extra, head)
+}
+
+/// Append `input`'s body bytes to `out` as the client gets them. Returns
+/// whether the body ended, how many input bytes were body (wire bytes for
+/// chunked), and whether bytes followed its end.
+fn consume(
+    framing: &mut StreamFraming,
+    input: &[u8],
+    chunked_out: bool,
+    decoded: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> Result<(bool, usize, bool), ()> {
+    match framing {
+        StreamFraming::Length(left) => {
+            let take = input.len().min(*left as usize);
+            push_body(out, &input[..take], chunked_out);
+            *left -= take as u64;
+            Ok((*left == 0, take, input.len() > take))
+        }
+        StreamFraming::Chunked(dec) => {
+            decoded.clear();
+            let (done, used) = dec.feed(input, decoded)?;
+            push_body(out, decoded, chunked_out);
+            if done && chunked_out {
+                out.extend_from_slice(b"0\r\n\r\n");
+            }
+            Ok((done, used, done && used < input.len()))
+        }
+        StreamFraming::Close => {
+            push_body(out, input, chunked_out);
+            Ok((false, input.len(), false))
+        }
+    }
+}
+
+/// The relay is over: time it, and pool the connection if the body was
+/// read exactly.
+fn finish(
+    s: Box<ProxyStream>,
+    mut end: RelayEnd,
+    extra: bool,
+    head: Vec<u8>,
+) -> (RelayEnd, Vec<u8>) {
     end.response_ms = s.started.elapsed().as_millis() as u64;
     let s = *s;
+    crate::proxy::return_proxy_buf(s.read_buf);
     if end.complete
         && !extra
         && let Some(pool) = s.pool
@@ -257,9 +339,7 @@ pub(crate) async fn relay<S: monoio::io::AsyncWriteRent>(
             },
         );
     }
-    crate::proxy::return_proxy_buf(s.read_buf);
-    crate::proxy::return_proxy_buf(input);
-    (end, head_back.unwrap_or(out))
+    (end, head)
 }
 
 fn failure(s: &ProxyStream, error: UpstreamError) -> AttemptFailure {
@@ -295,15 +375,15 @@ fn push_body(out: &mut Vec<u8>, data: &[u8], chunked_out: bool) {
     }
 }
 
-/// Write all of `buf` with `send_timeout`, under `limit_rate` if any.
+/// Write `buf[..len]` with `send_timeout`, under `limit_rate` if any.
 async fn write_out<S: monoio::io::AsyncWriteRent>(
     client: &mut S,
     buf: Vec<u8>,
+    len: usize,
     pacer: &mut Option<crate::worker::Pacer>,
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
 ) -> (bool, Vec<u8>) {
-    let len = buf.len();
     let (res, returned) = match pacer {
         Some(p) => crate::worker::write_all_paced(client, buf, len, p, timer, send_timeout).await,
         None => crate::worker::write_all_timed(client, buf, len, timer, send_timeout).await,
