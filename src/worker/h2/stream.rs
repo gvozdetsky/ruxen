@@ -179,8 +179,8 @@ impl StreamIo {
                     self.send_data(data, false).await?;
                     return Ok(());
                 }
-                Out::Chunked(_) => {
-                    let (used, piece, end) = self.decode_chunked(data);
+                Out::Chunked(state) => {
+                    let (used, piece, end) = decode_chunked(state, data);
                     if let Some((from, to)) = piece {
                         self.send_data(&data[from..to], false).await?;
                     }
@@ -196,54 +196,54 @@ impl StreamIo {
         }
         Ok(())
     }
+}
 
-    /// One step of the chunked decoder over `data`: bytes used, the data
-    /// range among them, and whether the body ended.
-    fn decode_chunked(&mut self, data: &[u8]) -> (usize, Option<(usize, usize)>, bool) {
-        let Out::Chunked(state) = &mut self.out else {
-            unreachable!("chunked output")
-        };
-        let mut i = 0;
-        while i < data.len() {
-            let b = data[i];
-            match state {
-                Chunked::Size(n) => match b {
-                    b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => {
-                        let digit = (b as char).to_digit(16).unwrap_or(0) as u64;
-                        *n = n.saturating_mul(16).saturating_add(digit);
-                    }
-                    b'\r' => *state = Chunked::SizeLf(*n),
-                    b'\n' => *state = next_after_size(*n),
-                    _ => *state = Chunked::Ext(*n),
-                },
-                Chunked::Ext(n) => match b {
-                    b'\r' => *state = Chunked::SizeLf(*n),
-                    b'\n' => *state = next_after_size(*n),
-                    _ => {}
-                },
-                Chunked::SizeLf(n) => *state = next_after_size(*n),
-                Chunked::Data(left) => {
-                    let k = (*left).min((data.len() - i) as u64) as usize;
-                    *left -= k as u64;
-                    if *left == 0 {
-                        *state = Chunked::DataCr;
-                    }
-                    return (i + k, Some((i, i + k)), false);
+/// One step of the decoder of the chunked body `handle` writes, over
+/// `data`: bytes used, the range of chunk data among them (at most one
+/// run), and whether the body ended.
+fn decode_chunked(state: &mut Chunked, data: &[u8]) -> (usize, Option<(usize, usize)>, bool) {
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        match state {
+            Chunked::Size(n) => match b {
+                b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => {
+                    let digit = (b as char).to_digit(16).unwrap_or(0) as u64;
+                    *n = n.saturating_mul(16).saturating_add(digit);
                 }
-                Chunked::DataCr => *state = Chunked::DataLf,
-                Chunked::DataLf => *state = Chunked::Size(0),
-                Chunked::Trailer(empty) => match b {
-                    b'\r' => {}
-                    b'\n' if *empty => return (i + 1, None, true),
-                    b'\n' => *empty = true,
-                    _ => *empty = false,
-                },
+                b'\r' => *state = Chunked::SizeLf(*n),
+                b'\n' => *state = next_after_size(*n),
+                _ => *state = Chunked::Ext(*n),
+            },
+            Chunked::Ext(n) => match b {
+                b'\r' => *state = Chunked::SizeLf(*n),
+                b'\n' => *state = next_after_size(*n),
+                _ => {}
+            },
+            Chunked::SizeLf(n) => *state = next_after_size(*n),
+            Chunked::Data(left) => {
+                let k = (*left).min((data.len() - i) as u64) as usize;
+                *left -= k as u64;
+                if *left == 0 {
+                    *state = Chunked::DataCr;
+                }
+                return (i + k, Some((i, i + k)), false);
             }
-            i += 1;
+            Chunked::DataCr => *state = Chunked::DataLf,
+            Chunked::DataLf => *state = Chunked::Size(0),
+            Chunked::Trailer(empty) => match b {
+                b'\r' => {}
+                b'\n' if *empty => return (i + 1, None, true),
+                b'\n' => *empty = true,
+                _ => *empty = false,
+            },
         }
-        (i, None, false)
+        i += 1;
     }
+    (i, None, false)
+}
 
+impl StreamIo {
     /// The response head `handle` wrote, as a HEADERS frame.
     fn send_head(&mut self, head: &[u8]) -> io::Result<()> {
         let (status, fields) = parse_head(head)?;
@@ -546,5 +546,80 @@ impl super::super::ConnIo for StreamIo {
 
     fn conn_counters(&self) -> Option<(std::time::Instant, u64)> {
         Some(self.counters)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode `body` fed in pieces of `step` bytes.
+    fn dechunk(body: &[u8], step: usize) -> (Vec<u8>, bool) {
+        let mut state = Chunked::Size(0);
+        let mut out = Vec::new();
+        for piece in body.chunks(step) {
+            let mut piece = piece;
+            while !piece.is_empty() {
+                let (used, data, end) = decode_chunked(&mut state, piece);
+                if let Some((from, to)) = data {
+                    out.extend_from_slice(&piece[from..to]);
+                }
+                if end {
+                    return (out, true);
+                }
+                piece = &piece[used..];
+            }
+        }
+        (out, false)
+    }
+
+    #[test]
+    fn chunked_bodies_decode_whatever_the_pieces() {
+        let body = b"5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\nX-T: 1\r\n\r\n";
+        for step in 1..body.len() {
+            assert_eq!(
+                dechunk(body, step),
+                (b"hello, world".to_vec(), true),
+                "{step}"
+            );
+        }
+        assert_eq!(dechunk(b"0\r\n\r\n", 3), (Vec::new(), true));
+        assert_eq!(dechunk(b"3\r\nabc\r\n", 4), (b"abc".to_vec(), false));
+    }
+
+    #[test]
+    fn response_heads_parse() {
+        let head = b"HTTP/1.1 404 Not Found\r\nServer: ruxen\r\nContent-Length:  10 \r\n\r\n";
+        let (status, fields) = parse_head(head).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(
+            fields,
+            vec![
+                (&b"Server"[..], &b"ruxen"[..]),
+                (&b"Content-Length"[..], &b"10"[..])
+            ]
+        );
+        assert!(parse_head(b"HTTP/1.1 2x0 OK\r\n\r\n").is_err());
+        assert!(parse_head(b"HTTP/1.1 200 OK\r\nno colon\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn request_heads_carry_authority_and_cookies() {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://example.com:8080/p?q=1")
+            .header("cookie", "a=1")
+            .header("x-y", "z")
+            .header("cookie", "b=2")
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+        let mut out = Vec::new();
+        request_head(&parts, true, &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "POST /p?q=1 HTTP/2.0\r\nHost: example.com:8080\r\nCookie: a=1; b=2\r\n\
+             x-y: z\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
     }
 }
