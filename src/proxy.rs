@@ -78,7 +78,9 @@ pub struct ProxyPlan {
     pub upstream: &'static PreparedUpstream,
     /// `proxy_pass` with variables naming an address (#100): the one peer
     /// to use instead of `upstream`'s, which is then a placeholder.
-    pub adhoc_peer: Option<PeerAddr>,
+    /// Boxed: only a `proxy_pass` with variables has one, and the plan
+    /// moves with every proxied response.
+    pub adhoc_peer: Option<Box<PeerAddr>>,
     /// First peer to try, leased at plan-build time. Subsequent
     /// `proxy_next_upstream` retries lease their own peers inside
     /// `run_proxy`. Wrapped in `Option` so the run loop can `.take()`
@@ -317,8 +319,8 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
 impl ProxyPlan {
     /// The address of `upstream.peers[peer_idx]`, or the request's own peer.
     fn peer_addr(&self, peer_idx: usize) -> PeerAddr {
-        match self.adhoc_peer {
-            Some(addr) => addr,
+        match &self.adhoc_peer {
+            Some(addr) => **addr,
             None => self.upstream.peers[peer_idx].addr,
         }
     }

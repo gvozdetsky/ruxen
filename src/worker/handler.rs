@@ -748,7 +748,7 @@ pub(crate) fn run_location_handler(
         };
         return Response::Proxy(crate::proxy::ProxyPlan {
             upstream,
-            adhoc_peer: variable.as_ref().and_then(|v| v.adhoc_peer),
+            adhoc_peer: variable.as_ref().and_then(|v| v.adhoc_peer).map(Box::new),
             initial_peer,
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
             method: req.method,
