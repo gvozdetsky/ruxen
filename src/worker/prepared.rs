@@ -1678,17 +1678,18 @@ pub struct PreparedHttp {
     pub shutdown_timeout: Option<Duration>,
 }
 
+/// One generation of workers: the ones started at startup, or by a reload
+/// (#89), with the configuration they serve.
 #[derive(Default)]
 pub struct RuntimeState {
     shutting_down: AtomicBool,
+    /// `worker_shutdown_timeout` passed after a reload: the workers end
+    /// their connections (`listeners::shut_down_sockets`).
+    forced: AtomicBool,
     connection_ids: AtomicU64,
-    /// Bumped each time the process receives SIGHUP. nginx's reload model
-    /// re-execs new workers and tells the old workers to gracefully shut
-    /// down; we don't have separate worker generations, so we instead use
-    /// this counter to nudge already-accepted connections out of their
-    /// idle keepalive wait and prevent them from re-entering it after a
-    /// reload, while leaving the listener loop free to keep accepting new
-    /// connections.
+    /// Bumped when a reload retires these workers, along with the
+    /// shutdown: an upgraded connection then lives until
+    /// `worker_shutdown_timeout` (`tunnel`), as on an old nginx worker.
     reload_gen: AtomicU64,
     /// Set by `main` once root is dropped (`privileges`); workers bind,
     /// report ready, and wait for it before accepting.
@@ -1719,6 +1720,14 @@ impl RuntimeState {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    pub fn force_close(&self) {
+        self.forced.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_forced(&self) -> bool {
+        self.forced.load(Ordering::SeqCst)
     }
 
     pub(crate) fn next_connection_id(&self) -> u64 {

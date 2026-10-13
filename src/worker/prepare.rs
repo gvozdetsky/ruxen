@@ -546,17 +546,15 @@ fn prepare_cache_zones(paths: Vec<crate::config::ProxyCachePath>) -> Result<(), 
             _ => {}
         }
         crate::privileges::note_temp_dir(&p.path);
-        zones.push(&*Box::leak(Box::new(crate::proxy_cache::CacheZone::new(
-            crate::proxy_cache::ZoneConf {
-                name: p.zone,
-                path: p.path,
-                levels: p.levels,
-                size: p.size,
-                inactive_secs: p.inactive_secs,
-                max_size: p.max_size,
-                min_free: p.min_free,
-            },
-        ))));
+        zones.push(crate::proxy_cache::zone_for(crate::proxy_cache::ZoneConf {
+            name: p.zone,
+            path: p.path,
+            levels: p.levels,
+            size: p.size,
+            inactive_secs: p.inactive_secs,
+            max_size: p.max_size,
+            min_free: p.min_free,
+        }));
     }
     CACHE_ZONES.with(|z| *z.borrow_mut() = zones);
     Ok(())

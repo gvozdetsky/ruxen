@@ -57,8 +57,10 @@ pub fn install_panic_hook(http: &'static PreparedHttp) {
             .location()
             .map(|l| format!(" at {}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
+        // A worker logs where its generation's configuration says (#89).
+        let logs = super::worker_http().map_or(http.error_logs, |h| h.error_logs);
         write_worker_log(
-            http.error_logs,
+            logs,
             ErrorLogLevel::Alert,
             &format!(
                 "{} panicked{location}: {message}",

@@ -109,7 +109,7 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         &self,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool;
 
@@ -134,10 +134,10 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         buf: Vec<u8>,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
-        let next = if self.idle_wait(state, idle, start_reload_gen, timers).await {
+        let next = if self.idle_wait(state, idle, fresh, timers).await {
             IdleRead::Ready
         } else {
             IdleRead::Close
@@ -165,20 +165,20 @@ impl ConnIo for TcpStream {
         buf: Vec<u8>,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
-        read_first_or_shutdown(self, buf, state, idle, start_reload_gen, timers).await
+        read_first_or_shutdown(self, buf, state, idle, fresh, timers).await
     }
 
     async fn idle_wait(
         &self,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool {
-        wait_readable_or_shutdown(self, state, idle, start_reload_gen, timers).await
+        wait_readable_or_shutdown(self, state, idle, fresh, timers).await
     }
 
     fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -196,13 +196,13 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
         &self,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool {
         if self.has_buffered_input() {
-            return !state.is_shutting_down() && state.reload_gen() == start_reload_gen;
+            return fresh || !state.is_shutting_down();
         }
-        wait_readable_or_shutdown(self.io(), state, idle, start_reload_gen, timers).await
+        wait_readable_or_shutdown(self.io(), state, idle, fresh, timers).await
     }
 
     fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
