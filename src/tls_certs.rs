@@ -399,6 +399,50 @@ fn normalize_host(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// The state of an `ssl_session_cache shared:NAME:SIZE` zone (#342): the
+/// cached sessions and the rotating ticket keys nginx keeps in the zone.
+/// A reload that declares the zone the same way gets them, as nginx reuses
+/// a shared memory zone of the same name and size
+/// (`ngx_ssl_session_cache_init` with the old zone's data); servers that
+/// name the same zone share it, as in nginx.
+pub(crate) struct KeptTlsZone {
+    sessions: Arc<dyn rustls::server::StoresServerSessions>,
+    ticketer: Arc<crate::tls_ticket::NginxTicketer>,
+}
+
+static KEPT_TLS_ZONES: std::sync::Mutex<Vec<(String, u32, Arc<KeptTlsZone>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The zone `spec` (`shared:NAME:SIZE`) with this session timeout, kept or
+/// new.
+fn kept_tls_zone(spec: &str, timeout_secs: u32) -> Result<Arc<KeptTlsZone>, rustls::Error> {
+    let fresh = || -> Result<Arc<KeptTlsZone>, rustls::Error> {
+        Ok(Arc::new(KeptTlsZone {
+            sessions: rustls::server::ServerSessionMemoryCache::new(4096),
+            ticketer: Arc::new(
+                crate::tls_ticket::NginxTicketer::rotating(timeout_secs).ok_or_else(|| {
+                    rustls::Error::General("cannot set up session ticket keys".into())
+                })?,
+            ),
+        }))
+    };
+    // Unit tests build many configurations in one process.
+    if cfg!(test) {
+        return fresh();
+    }
+    let mut kept = KEPT_TLS_ZONES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, zone)) = kept
+        .iter()
+        .find(|(s, t, _)| s == spec && *t == timeout_secs)
+    {
+        return Ok(zone.clone());
+    }
+    let zone = fresh()?;
+    kept.retain(|(s, _, _)| s != spec);
+    kept.push((spec.to_string(), timeout_secs, zone.clone()));
+    Ok(zone)
+}
+
 /// Build a rustls `ServerConfig` from a populated resolver and the parsed
 /// `ssl_protocols` set.
 ///
@@ -432,9 +476,18 @@ pub fn build_server_config(
     let timeout_secs = session_timeout_secs.unwrap_or(300);
     let cache = resumption.cache.unwrap_or(false);
     let tickets = resumption.tickets.unwrap_or(true);
+    // A `shared:` zone keeps its sessions and ticket keys across reloads.
+    let kept = match (&resumption.shared_zone, cache) {
+        (Some(zone), true) => Some(kept_tls_zone(zone, timeout_secs)?),
+        _ => None,
+    };
     cfg.session_storage = if cache {
         Arc::new(crate::tls_session::ExpiringSessionStorage::new(
-            rustls::server::ServerSessionMemoryCache::new(4096),
+            match &kept {
+                Some(k) => k.sessions.clone(),
+                None => rustls::server::ServerSessionMemoryCache::new(4096)
+                    as Arc<dyn rustls::server::StoresServerSessions>,
+            },
             std::time::Duration::from_secs(timeout_secs as u64),
         ))
     } else {
@@ -444,15 +497,18 @@ pub fn build_server_config(
         // nginx's ticket keys (`tls_ticket`): the files, keys rotating with
         // a shared session cache, or one random key.
         let inner = match ticket_keys {
-            Some(keys) => crate::tls_ticket::NginxTicketer::from_keys(keys, timeout_secs),
-            None if cache && resumption.shared => {
-                crate::tls_ticket::NginxTicketer::rotating(timeout_secs)
+            Some(keys) => {
+                crate::tls_ticket::NginxTicketer::from_keys(keys, timeout_secs).map(Arc::new)
             }
-            None => crate::tls_ticket::NginxTicketer::single(timeout_secs),
+            None if cache && resumption.shared => match &kept {
+                Some(k) => Some(k.ticketer.clone()),
+                None => crate::tls_ticket::NginxTicketer::rotating(timeout_secs).map(Arc::new),
+            },
+            None => crate::tls_ticket::NginxTicketer::single(timeout_secs).map(Arc::new),
         }
         .ok_or_else(|| rustls::Error::General("cannot set up session ticket keys".into()))?;
         cfg.ticketer = Arc::new(crate::tls_session::ExpiringTicketer::new(
-            Arc::new(inner),
+            inner,
             timeout_secs,
         ));
     } else if !cache {

@@ -617,6 +617,10 @@ pub struct SessionResumption {
     /// The `ssl_session_cache` that set `cache` has a `shared:` zone: nginx
     /// then keeps rotating ticket keys in it (#140).
     pub shared: bool,
+    /// That zone as written (`shared:NAME:SIZE`): a reload that declares it
+    /// the same way keeps its sessions and ticket keys, as nginx keeps a
+    /// shared memory zone (#342).
+    pub shared_zone: Option<String>,
     /// `ssl_session_tickets on|off`.
     pub tickets: Option<bool>,
     /// `ssl_session_ticket_key file` lines, in order: the first encrypts,
@@ -654,7 +658,9 @@ impl SessionResumption {
                                 });
                             }
                         }
-                        self.shared = caches.iter().any(|c| c.starts_with("shared:"));
+                        self.shared_zone =
+                            caches.iter().find(|c| c.starts_with("shared:")).cloned();
+                        self.shared = self.shared_zone.is_some();
                         true
                     }
                 };
@@ -676,13 +682,14 @@ impl SessionResumption {
     }
 
     pub(crate) fn inherit(self, parent: &SessionResumption) -> SessionResumption {
-        let (cache, shared) = match self.cache {
-            Some(_) => (self.cache, self.shared),
-            None => (parent.cache, parent.shared),
+        let (cache, shared, shared_zone) = match self.cache {
+            Some(_) => (self.cache, self.shared, self.shared_zone),
+            None => (parent.cache, parent.shared, parent.shared_zone.clone()),
         };
         SessionResumption {
             cache,
             shared,
+            shared_zone,
             tickets: self.tickets.or(parent.tickets),
             ticket_keys: self.ticket_keys.or_else(|| parent.ticket_keys.clone()),
         }

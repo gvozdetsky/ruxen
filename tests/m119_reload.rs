@@ -418,3 +418,51 @@ fn limit_req_state_survives_a_reload() {
         "{response}"
     );
 }
+
+/// `ssl_session_cache shared:NAME:SIZE` keeps its sessions across a
+/// reload, as nginx keeps the shared zone (#342): a session saved before
+/// the reload resumes after it. TLS 1.2, so the session ID cache is used.
+#[test]
+fn shared_ssl_session_cache_survives_a_reload() {
+    let certs = common::tls::make_self_signed("localhost");
+    let port = free_port();
+    let s = start("tlscache", "", "");
+    let conf = |text: &str| {
+        format!(
+            "server {{ listen 127.0.0.1:{port} ssl; ssl_protocols TLSv1.2;\n\
+               ssl_certificate {c}; ssl_certificate_key {k};\n\
+               ssl_session_cache shared:SSL:1m; ssl_session_tickets off;\n\
+               location / {{ return 200 \"{text}\\n\"; }} }}",
+            c = certs.cert_path().display(),
+            k = certs.key_path().display()
+        )
+    };
+    s.write_conf("", &conf("one"));
+    s.reload();
+    s.wait_threads(2);
+    let sess = s.dir.join("sess.pem");
+    let connect = |flag: &str| -> String {
+        let out = Command::new("openssl")
+            .args([
+                "s_client",
+                "-connect",
+                &format!("127.0.0.1:{port}"),
+                "-tls1_2",
+            ])
+            .args([flag, sess.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("openssl");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let first = connect("-sess_out");
+    assert!(first.contains("New, "), "{first}");
+    let again = connect("-sess_in");
+    assert!(again.contains("Reused, "), "{again}");
+
+    s.write_conf("", &conf("two"));
+    s.reload();
+    s.wait_threads(2);
+    let after = connect("-sess_in");
+    assert!(after.contains("Reused, "), "after the reload: {after}");
+}
