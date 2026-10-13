@@ -461,7 +461,10 @@ fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) 
 }
 
 /// The status and fields of a response head `handle` wrote.
-fn parse_head(head: &[u8]) -> io::Result<(u16, Vec<(&[u8], &[u8])>)> {
+/// A response head's fields: (name, value) slices of it.
+type Fields<'a> = Vec<(&'a [u8], &'a [u8])>;
+
+fn parse_head(head: &[u8]) -> io::Result<(u16, Fields<'_>)> {
     let mut lines = head
         .split(|&b| b == b'\n')
         .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
