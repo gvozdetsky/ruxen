@@ -105,6 +105,10 @@ where
         .initial_window_size(64 * 1024)
         .max_frame_size((1 << 24) - 1)
         .initial_connection_window_size((1 << 31) - 1)
+        // The decoded request head is held whole before `handle` sees it:
+        // bounded, as nginx's large_client_header_buffers bound a head
+        // (4 × 8k by default), with room for big cookies.
+        .max_header_list_size(64 * 1024)
         .handshake::<_, Bytes>(io);
     // The preface and SETTINGS come under client_header_timeout, as the
     // first request line would.
