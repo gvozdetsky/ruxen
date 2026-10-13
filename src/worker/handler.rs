@@ -74,6 +74,7 @@ pub(crate) fn finalize_location_response(
         // is defensive: passing the plan through unchanged keeps the
         // type system happy.
         Response::Proxy(plan) => Response::Proxy(plan),
+        Response::ProxyStream(s) => Response::ProxyStream(s),
         Response::Prebuilt(bytes) => {
             let base_status = response_status(bytes);
             let status = effective_error_page_status(base_status, forced_status);
@@ -1023,6 +1024,7 @@ pub(crate) fn run_location_handler(
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
             intercept,
+            stream: cache.is_none() && loc.gzip.is_none() && loc.add_trailers.is_empty(),
             cache,
             hash,
             bind,

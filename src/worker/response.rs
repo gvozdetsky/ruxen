@@ -1252,7 +1252,8 @@ pub(crate) fn maybe_intercept_error_page(
         Response::Reroute(_) => return response,
         // Proxy intercept is handled inside `proxy::run_proxy` from
         // pre-rendered plan rules; unresolved proxy plans pass through here.
-        Response::Proxy(_) => return response,
+        // A relayed body is only chosen when no intercept rule matched.
+        Response::Proxy(_) | Response::ProxyStream(_) => return response,
     };
     let Some(rule) = error_pages.iter().find(|rule| rule.status == status) else {
         return response;
