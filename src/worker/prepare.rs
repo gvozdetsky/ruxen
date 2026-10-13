@@ -97,13 +97,14 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     // to listen on and idle until shutdown.
     // Group server blocks by listen address while preserving declaration
     // order both across listen buckets and within each bucket.
-    let mut grouped: Vec<(SocketAddr, Vec<Server>)> = Vec::new();
+    // A `unix:` socket is its own address (#263).
+    let mut grouped: Vec<((SocketAddr, Option<std::path::PathBuf>), Vec<Server>)> = Vec::new();
     for server in servers {
-        let addr = server.listen.addr;
-        if let Some((_, bucket)) = grouped.iter_mut().find(|(a, _)| *a == addr) {
+        let key = (server.listen.addr, server.listen.unix.clone());
+        if let Some((_, bucket)) = grouped.iter_mut().find(|(k, _)| *k == key) {
             bucket.push(server);
         } else {
-            grouped.push((addr, vec![server]));
+            grouped.push((key, vec![server]));
         }
     }
 
@@ -159,7 +160,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         prepare_upstreams(upstreams);
 
     let mut listens: Vec<PreparedListen> = Vec::with_capacity(grouped.len());
-    for (addr, servers_for_addr) in grouped {
+    for ((addr, unix), servers_for_addr) in grouped {
+        let unix: Option<&'static Path> = unix.map(|p| &*Box::leak(p.into_boxed_path()));
         // Snapshot the TLS-relevant fields up front: prepare_server consumes
         // each `Server`, and we want to feed the SNI resolver in the same
         // declaration order.
@@ -251,7 +253,12 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             exact_names,
             regex_name_set,
             addr,
-            addr_text: if addr.ip().is_unspecified() {
+            unix,
+            // nginx shows a unix socket's address as `unix:` (the client
+            // side has no path).
+            addr_text: if unix.is_some() {
+                b"unix:"
+            } else if addr.ip().is_unspecified() {
                 b""
             } else {
                 Box::leak(addr.ip().to_string().into_bytes().into_boxed_slice())
@@ -1188,6 +1195,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1219,6 +1227,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1250,6 +1259,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1282,6 +1292,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1372,6 +1383,9 @@ pub(crate) fn prepare_server(
             post_action: server_post_action,
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
+            timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+                server.client_timeouts,
+            ))),
         })
     } else {
         None
@@ -2321,6 +2335,7 @@ pub(crate) fn build_prefix_or_exact(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2363,6 +2378,7 @@ pub(crate) fn build_prefix_or_exact(
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2521,6 +2537,9 @@ pub(crate) fn build_prefix_or_exact(
         post_action,
         expires,
         chunked_transfer_encoding,
+        timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 
@@ -2551,6 +2570,7 @@ pub(crate) fn build_regex_location(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2593,6 +2613,7 @@ pub(crate) fn build_regex_location(
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2761,6 +2782,9 @@ pub(crate) fn build_regex_location(
         post_action,
         expires,
         chunked_transfer_encoding,
+        timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 
