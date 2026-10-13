@@ -231,6 +231,12 @@ pub struct RewriteState {
     /// The chosen location's (or, in the server's rewrite phase, the
     /// server's) root, for `$request_filename` / `$document_root`.
     pub(crate) doc_root: Option<&'static DocRoot>,
+    /// `$limit_req_status` (`limit_req::status`); 0 before limit_req ran.
+    /// Once set, limit_req doesn't run again for the request, as nginx's
+    /// `r->main->limit_req_status` (#94).
+    pub(crate) limit_req_status: u8,
+    /// `$limit_conn_status` (`limit_conn::status`), likewise (#95).
+    pub(crate) limit_conn_status: u8,
 }
 
 impl Default for RewriteState {
@@ -241,6 +247,8 @@ impl Default for RewriteState {
             valid_location: true,
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
+            limit_req_status: 0,
+            limit_conn_status: 0,
         }
     }
 }
@@ -326,7 +334,10 @@ impl RewriteState {
     /// Something later rendering (the access log, a proxied response's
     /// `add_header`) needs from this state: `set` values or cached maps.
     pub(crate) fn worth_keeping(&self) -> bool {
-        self.has_user_vars() || !self.map_cache.borrow().is_empty()
+        self.has_user_vars()
+            || !self.map_cache.borrow().is_empty()
+            || self.limit_req_status != 0
+            || self.limit_conn_status != 0
     }
 
     /// Appends the cached result of map `slot` to `out`, if there is one.
@@ -386,6 +397,23 @@ pub struct PreparedAccessLog {
     pub file_index: usize,
     /// `access_log syslog:…`: lines go to this peer, not to `path`.
     pub syslog: Option<&'static PreparedSyslogPeer>,
+    /// `buffer=` / `flush=` / `gzip`: lines collect in a per-worker buffer
+    /// for this file (#151).
+    pub buffer: Option<&'static PreparedLogBuffer>,
+    /// The path has variables: rendered, opened and closed per line (#303).
+    pub path_vars: Option<&'static [PreparedValuePart]>,
+}
+
+/// A buffered access_log file, shared by every `access_log` with buffer
+/// parameters for the same path, as nginx attaches the buffer to the file.
+#[derive(Debug)]
+pub struct PreparedLogBuffer {
+    /// Index into the worker's buffers.
+    pub slot: usize,
+    pub size: usize,
+    pub flush_ms: Option<u64>,
+    pub gzip: Option<u32>,
+    pub path: &'static Path,
 }
 
 /// A prepared `syslog:` peer (see `crate::syslog`).
@@ -528,6 +556,8 @@ pub enum PreparedHandler {
     Return(PreparedReturn),
     Root(PreparedRoot),
     Proxy(PreparedProxy),
+    /// `stub_status` (#96).
+    StubStatus,
 }
 
 /// Per-location rules for an upstream's response headers, behind one
@@ -634,6 +664,12 @@ pub struct PreparedProxy {
     pub response: &'static ProxyResponseRules,
     /// `proxy_cache` (#233); `None` without one, or with `proxy_cache off`.
     pub cache: Option<&'static PreparedProxyCache>,
+    /// `proxy_pass` with variables (#100): the URL, rendered and parsed per
+    /// request. `upstream` is then a placeholder with one peer that the
+    /// request's own address replaces, and `host_header` is unused.
+    pub url: Option<&'static [PreparedValuePart]>,
+    /// Inheritance-resolved `proxy_bind`; `None` when unset or `off`.
+    pub bind: Option<&'static PreparedBind>,
 }
 
 /// A location's resolved `proxy_cache*` directives (#233).
@@ -682,6 +718,16 @@ impl PreparedProxyCache {
     }
 }
 
+/// `proxy_bind` (#135): the local address of upstream connections.
+#[derive(Debug)]
+pub struct PreparedBind {
+    /// A literal address, parsed once; otherwise `value` is rendered per
+    /// request.
+    pub addr: Option<SocketAddr>,
+    pub value: &'static [PreparedValuePart],
+    pub transparent: bool,
+}
+
 /// One prepared `proxy_set_header NAME VALUE;` entry. Name is a static
 /// byte slice (header tokens, no rendering); value is a prepared value
 /// expression rendered per request from the `RenderCtx`.
@@ -723,6 +769,8 @@ pub(crate) struct ProxyEffective {
     /// (each list inherits on its own, as in nginx).
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    /// `proxy_bind`; `None` when unset or `off`.
+    pub bind: Option<&'static PreparedBind>,
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
     pub recursive_error_pages: bool,
@@ -775,6 +823,7 @@ impl ProxyEffective {
             redirect: None,
             hide_headers: None,
             pass_headers: None,
+            bind: None,
             error_pages: &[],
             recursive_error_pages: false,
             cache: &NO_CACHE_CONF,
@@ -807,8 +856,9 @@ pub struct PreparedUpstream {
     pub keepalive_idle_timeout_ms: u64,
     /// `keepalive_time T;` — hard lifetime cap. Default 1h.
     pub keepalive_max_lifetime_ms: u64,
-    /// LB algorithm. M43 added `least_conn`; default is smoothed weighted RR.
-    pub lb: crate::config::LbAlgorithm,
+    /// LB algorithm: smoothed weighted RR by default, `least_conn`, `hash`
+    /// or `ip_hash`.
+    pub lb: crate::upstream::Lb,
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in
@@ -1152,6 +1202,13 @@ pub struct PreparedLocation {
     /// chunked is off there is no chunked frame to append trailers to,
     /// so they are silently dropped (matching nginx's chunked filter).
     pub chunked_transfer_encoding: bool,
+    /// `limit_req` for requests routed here (#94); `None` without.
+    pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
+    /// `limit_conn` for requests routed here (#95); `None` without.
+    pub limit_conn: Option<&'static super::limit_conn::PreparedLimitConns>,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// A regex-mode location after prepare. The compiled
@@ -1194,6 +1251,13 @@ pub struct PreparedRegexLocation {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `limit_req` for requests routed here (#94); `None` without.
+    pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
+    /// `limit_conn` for requests routed here (#95); `None` without.
+    pub limit_conn: Option<&'static super::limit_conn::PreparedLimitConns>,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 /// Common view onto a matched location. The matcher hands one of these to
@@ -1231,6 +1295,13 @@ pub struct MatchedLocation<'a> {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `limit_req` for requests routed here (#94); `None` without.
+    pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
+    /// `limit_conn` for requests routed here (#95); `None` without.
+    pub limit_conn: Option<&'static super::limit_conn::PreparedLimitConns>,
+    /// `client_body_timeout` / `send_timeout` for requests routed here
+    /// (location → server → http; #147).
+    pub timeouts: &'static PreparedClientTimeouts,
 }
 
 impl<'a> MatchedLocation<'a> {
@@ -1262,6 +1333,9 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            limit_req: loc.limit_req,
+            limit_conn: loc.limit_conn,
+            timeouts: loc.timeouts,
         }
     }
 
@@ -1311,6 +1385,9 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            limit_req: loc.limit_req,
+            limit_conn: loc.limit_conn,
+            timeouts: loc.timeouts,
         }
     }
 }
@@ -1451,7 +1528,11 @@ pub struct PreparedServer {
 /// Server-name matching and default-server fallback are evaluated inside
 /// this bucket only.
 pub struct PreparedListen {
+    /// `0.0.0.0:0` for a `unix:` socket.
     pub addr: SocketAddr,
+    /// `listen unix:/path` (#263): bound once by `main` before the workers
+    /// start, accepted on by each through its copy of the descriptor.
+    pub unix: Option<&'static Path>,
     /// `addr`'s IP as `$server_addr` shows it (no brackets for IPv6); empty
     /// for a wildcard address, where each connection's own is used.
     pub addr_text: &'static [u8],
@@ -1465,6 +1546,12 @@ pub struct PreparedListen {
     /// so a future SIGHUP reload can swap it without invalidating
     /// references handed to in-flight connections.
     pub tls: Option<Arc<crate::tls::TlsAcceptor>>,
+    /// `ssl_reject_handshake on` in a server of this address (#112): which
+    /// servers reject, by index into `servers`, and the TLS default
+    /// server's index (a ClientHello without a matching name is its).
+    /// `None` when no server rejects: the handshake needs no ClientHello
+    /// look first.
+    pub reject_handshake: Option<(Box<[bool]>, usize)>,
     /// `listen … proxy_protocol` on any server of this address: every
     /// connection starts with a PROXY protocol header.
     pub proxy_protocol: bool,
@@ -1540,9 +1627,15 @@ pub struct PreparedHttp {
     /// in memory is never also written to a temp file: nothing would read
     /// it (#246).
     pub uses_request_body_file: bool,
+    /// `$request_body` appears in the config. If not, a body that a
+    /// `return` location gets is dropped as it is read (#289).
+    pub uses_request_body: bool,
     /// An `error_log stderr` appears in the config: `-e` doesn't take over
     /// stderr (nginx's `log_use_stderr`; #309).
     pub uses_stderr_log: bool,
+    /// `stub_status` or `$connections_*` is used: keep the counters
+    /// (`stats`).
+    pub stats: bool,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],
@@ -1567,6 +1660,10 @@ pub struct PreparedHttp {
     /// path for round-robin selection.
     #[allow(dead_code)]
     pub upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream>,
+    /// The upstreams of `proxy_pass http://host[:port]` without variables,
+    /// by lowercased host and port (80 when none): nginx's implicit
+    /// upstreams, which a `proxy_pass` with variables can name too (#100).
+    pub implicit_upstreams: &'static [(&'static [u8], u16, &'static PreparedUpstream)],
     /// Directory of the main config file, for resolving relative paths that
     /// are only known per request (e.g. `auth_basic_user_file $var`).
     pub conf_prefix: Option<&'static Path>,
@@ -1575,7 +1672,6 @@ pub struct PreparedHttp {
 #[derive(Default)]
 pub struct RuntimeState {
     shutting_down: AtomicBool,
-    active_connections: AtomicUsize,
     connection_ids: AtomicU64,
     /// Bumped each time the process receives SIGHUP. nginx's reload model
     /// re-execs new workers and tells the old workers to gracefully shut
@@ -1616,21 +1712,10 @@ impl RuntimeState {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn connection_started(&self) {
-        self.active_connections.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn connection_finished(&self) {
-        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn active_connections(&self) -> usize {
-        self.active_connections.load(Ordering::SeqCst)
-    }
-
     pub(crate) fn next_connection_id(&self) -> u64 {
+        // Only uniqueness matters (`$connection`): no ordering.
         self.connection_ids
-            .fetch_add(1, Ordering::SeqCst)
+            .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
     }
 

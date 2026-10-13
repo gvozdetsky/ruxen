@@ -377,3 +377,51 @@ fn oversized_body_gets_the_locations_error_page() {
     assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
     assert!(resp.contains("\r\nX-Always: yes\r\n"), "{resp}");
 }
+
+/// Bodies kept in memory, below and above the size from which the proxy
+/// sends the body from its own buffer after the header block (16 KiB,
+/// #289), arrive intact; also through an upstream with a tiny receive
+/// buffer that reads slowly, so the writes to it come back short.
+#[test]
+fn in_memory_bodies_are_proxied_intact_through_short_writes() {
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
+    let small: libc::c_int = 4096;
+    // SAFETY: setsockopt on a socket this test owns, with a c_int value.
+    let rc = unsafe {
+        use std::os::fd::AsRawFd;
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &small as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0);
+    let slow = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                // Let the proxy's writes fill the small window first.
+                sleep(Duration::from_millis(50));
+                serve_one(stream)
+            });
+        }
+    });
+    let fast = spawn_echo_upstream();
+    for upstream in [fast, slow] {
+        let server = start(&proxy_conf(upstream));
+        for len in [16 * 1024, 16 * 1024 + 1, 64 * 1024, 1024 * 1024] {
+            let body = payload(len);
+            let resp = post_cl(server.port, "/default/", &body);
+            assert!(
+                resp.ends_with(&format!("len={} sum={}", body.len(), checksum(&body))),
+                "{len} bytes via {upstream}: {}",
+                &resp[..resp.len().min(300)]
+            );
+        }
+    }
+}

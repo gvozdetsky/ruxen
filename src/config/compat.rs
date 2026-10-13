@@ -257,11 +257,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         "Set-Cookie paths are not rewritten (#40)",
     ),
     (
-        "proxy_bind",
-        Some("off"),
-        "upstream connections use the default source address (#135)",
-    ),
-    (
         "proxy_store",
         Some("off"),
         "proxied responses are not stored",
@@ -394,7 +389,7 @@ mod tests {
     #[test]
     fn collects_every_unknown_directive_and_skips_blocks() {
         let (found, res) = findings(
-            "http { server { fastcgi_pass 127.0.0.1:9000; limit_req zone=one; \
+            "http { server { fastcgi_pass 127.0.0.1:9000; secure_link $arg_s; \
              location / { uwsgi_pass x; } } map_x { a b; } }",
         );
         let names: Vec<&str> = found.iter().map(|f| f.directive.as_str()).collect();
@@ -402,7 +397,7 @@ mod tests {
             names,
             [
                 "fastcgi_pass 127.0.0.1:9000",
-                "limit_req zone=one",
+                "secure_link $arg_s",
                 "uwsgi_pass x",
                 "map_x"
             ]

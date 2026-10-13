@@ -84,7 +84,14 @@ pub(crate) fn parse_upstream_block(
         }
         match (args[0].as_str(), &term) {
             ("server", Terminator::Semi) => {
-                servers.push(parse_upstream_server_args(&args[1..])?);
+                let server = parse_upstream_server_args(&args[1..])?;
+                if server.backup && matches!(lb, LbAlgorithm::Hash { .. } | LbAlgorithm::IpHash) {
+                    return Err(Error::BadValue {
+                        what: "upstream server param (balancing method does not support it)",
+                        got: "backup".into(),
+                    });
+                }
+                servers.push(server);
             }
             ("server", _) => {
                 return Err(Error::WrongTerminator {
@@ -93,16 +100,58 @@ pub(crate) fn parse_upstream_block(
                 });
             }
             ("least_conn", Terminator::Semi) => {
-                if !matches!(lb, LbAlgorithm::RoundRobin) {
-                    return Err(Error::Duplicate("least_conn"));
-                }
                 if args.len() != 1 {
                     return Err(Error::BadValue {
                         what: "least_conn",
                         got: args[1..].join(" "),
                     });
                 }
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
                 lb = LbAlgorithm::LeastConn;
+            }
+            // ngx_http_upstream_hash / ngx_http_upstream_ip_hash: a method
+            // set before is replaced with a warning. Neither takes `backup`
+            // servers after it; ones listed before stay out of the hash and
+            // serve only its round-robin fallback, as in nginx.
+            ("hash", Terminator::Semi) => {
+                let consistent = match &args[1..] {
+                    [_] => false,
+                    [_, c] if c == "consistent" => true,
+                    [_, other] => {
+                        return Err(Error::BadValue {
+                            what: "hash parameter",
+                            got: other.clone(),
+                        });
+                    }
+                    [] => return Err(Error::MissingArg("hash key")),
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "hash",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                };
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
+                lb = LbAlgorithm::Hash {
+                    key: parse_value_with_vars(&args[1])?,
+                    consistent,
+                };
+            }
+            ("ip_hash", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::BadValue {
+                        what: "ip_hash",
+                        got: args[1..].join(" "),
+                    });
+                }
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
+                lb = LbAlgorithm::IpHash;
             }
             ("keepalive", Terminator::Semi) => {
                 if keepalive_max_idle.is_some() {
@@ -281,10 +330,11 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
         });
     }
     let raw = &args[0];
+    // With variables the URL is rendered and parsed per request, as
+    // nginx's ngx_http_proxy_eval does; its scheme is checked then.
     if raw.contains('$') {
-        return Err(Error::BadValue {
-            what: "proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block)",
-            got: raw.clone(),
+        return Ok(ProxyPass::Variable {
+            url: parse_value_with_vars(raw)?,
         });
     }
     let after_scheme = raw.strip_prefix("http://").ok_or_else(|| Error::BadValue {
@@ -508,6 +558,7 @@ impl ProxyConf {
         "proxy_next_upstream_tries",
         "proxy_next_upstream_timeout",
         "proxy_intercept_errors",
+        "proxy_bind",
         "proxy_redirect",
         "proxy_hide_header",
         "proxy_pass_header",
@@ -648,6 +699,44 @@ impl ProxyConf {
                 self.pass_headers
                     .get_or_insert_with(Vec::new)
                     .push(name.clone());
+            }
+            // ngx_http_upstream_bind_set_slot: `off`, or an address with an
+            // optional `transparent`; a literal one must parse now.
+            "proxy_bind" => {
+                if self.bind.is_some() {
+                    return Err(Error::Duplicate("proxy_bind"));
+                }
+                self.bind = Some(match &args[1..] {
+                    [off] if off == "off" => ProxyBind::Off,
+                    [addr] | [addr, _] => {
+                        let transparent = match args.get(2).map(String::as_str) {
+                            None => false,
+                            Some("transparent") => true,
+                            Some(other) => {
+                                return Err(Error::BadValue {
+                                    what: "proxy_bind parameter",
+                                    got: other.to_string(),
+                                });
+                            }
+                        };
+                        if !addr.contains('$') && parse_bind_addr(addr).is_none() {
+                            return Err(Error::BadValue {
+                                what: "proxy_bind (invalid address)",
+                                got: addr.clone(),
+                            });
+                        }
+                        ProxyBind::Addr {
+                            value: parse_value_with_vars(addr)?,
+                            transparent,
+                        }
+                    }
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "proxy_bind",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                });
             }
             "proxy_intercept_errors" => {
                 if self.intercept_errors.is_some() {
@@ -973,6 +1062,21 @@ pub(crate) fn parse_proxy_http_version_args(args: &[String]) -> Result<u8, Error
     }
 }
 
+/// `ip[:port]` or `[ipv6][:port]` (ngx_parse_addr_port), as `proxy_bind`
+/// takes it; port 0 when none.
+pub(crate) fn parse_bind_addr(s: &str) -> Option<SocketAddr> {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    let ip = s
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .unwrap_or(s)
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    Some(SocketAddr::new(ip, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,5 +1117,67 @@ mod tests {
         assert!(parse_upstream_server_args(&[too_long]).is_err());
         let fits = format!("unix:/{}", "a".repeat(106));
         assert!(parse_upstream_server_args(&[fits]).is_ok());
+    }
+
+    #[test]
+    fn hash_and_ip_hash_directives() {
+        let upstream = |body: &str| {
+            crate::config::parse(&format!(
+                "http {{ upstream u {{ {body} }} server {{ listen 80; location / {{ proxy_pass http://u; }} }} }}"
+            ))
+        };
+        let cfg = upstream("hash $arg_k consistent; server 127.0.0.1:1;").unwrap();
+        assert!(matches!(
+            cfg.upstreams[0].lb,
+            LbAlgorithm::Hash {
+                consistent: true,
+                ..
+            }
+        ));
+        // A method set before is replaced, with nginx's warning.
+        let cfg = upstream("least_conn; ip_hash; server 127.0.0.1:1;").unwrap();
+        assert_eq!(cfg.upstreams[0].lb, LbAlgorithm::IpHash);
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("load balancing method redefined")),
+            "{:?}",
+            cfg.warnings
+        );
+        // `backup` after a hash method is refused; before, it is kept.
+        assert!(upstream("hash $arg_k; server 127.0.0.1:1 backup;").is_err());
+        assert!(upstream("server 127.0.0.1:1 backup; ip_hash; server 127.0.0.1:2;").is_ok());
+        assert!(upstream("hash $arg_k foo; server 127.0.0.1:1;").is_err());
+        assert!(upstream("hash; server 127.0.0.1:1;").is_err());
+    }
+
+    #[test]
+    fn proxy_bind_addresses() {
+        use std::net::SocketAddr;
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(parse_bind_addr("127.0.0.2"), Some(addr("127.0.0.2:0")));
+        assert_eq!(parse_bind_addr("127.0.0.2:81"), Some(addr("127.0.0.2:81")));
+        assert_eq!(parse_bind_addr("[::1]"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("::1"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("[::1]:81"), Some(addr("[::1]:81")));
+        assert_eq!(parse_bind_addr("localhost"), None);
+        assert_eq!(parse_bind_addr("127.0.0.2:x"), None);
+
+        let parse = |args: &[&str]| {
+            let mut conf = ProxyConf::default();
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            conf.parse(&args).map(|()| conf.bind.unwrap())
+        };
+        assert_eq!(parse(&["proxy_bind", "off"]).unwrap(), ProxyBind::Off);
+        assert!(matches!(
+            parse(&["proxy_bind", "127.0.0.2", "transparent"]).unwrap(),
+            ProxyBind::Addr {
+                transparent: true,
+                ..
+            }
+        ));
+        assert!(parse(&["proxy_bind", "$arg_b"]).is_ok());
+        assert!(parse(&["proxy_bind", "bogus"]).is_err());
+        assert!(parse(&["proxy_bind", "127.0.0.2", "foo"]).is_err());
     }
 }
