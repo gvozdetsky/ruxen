@@ -78,7 +78,7 @@ conf_abs="${REPO_ROOT}/${conf_rel}"
 config_dir="$(dirname "$conf_abs")"
 history_file="${config_dir}/history_${SCENARIO_ID}.tsv"
 
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 
 # Git context — works whether or not the working tree is clean.
 commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"

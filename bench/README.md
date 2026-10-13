@@ -31,7 +31,7 @@ From repo root:
 cargo build --release
 ```
 
-Required in `PATH`: `wrk`, `curl`, `nginx`.
+Required in `PATH`: `wrk`, `curl`, `nginx`; for the HTTP/2 scenarios (`scheme` `h2c` / `h2` in the manifest: `h2c_hello`, `h2c_static_8k`, `h2_tls_hello`), `h2load` (package `nghttp2-client`), which runs them with 10 streams per connection, and a ruxen with HTTP/2 (#144).
 
 Some scenarios need fixtures (the `m19` 1MiB / 128MiB blobs, TLS certs,
 htpasswd files). `baseline.sh` / `measure.sh` don't create them — run
