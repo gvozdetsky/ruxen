@@ -82,6 +82,19 @@ pub struct ProxyConf {
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
+    /// `proxy_bind` (#135); `Some(ProxyBind::Off)` turns an inherited one off.
+    pub bind: Option<ProxyBind>,
+}
+
+/// `proxy_bind address [transparent] | off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyBind {
+    Off,
+    /// The local address, `ip[:port]`, possibly with variables.
+    Addr {
+        value: Vec<ValuePart>,
+        transparent: bool,
+    },
 }
 
 impl ProxyConf {
@@ -109,6 +122,7 @@ impl ProxyConf {
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
+            bind: self.bind.or_else(|| parent.bind.clone()),
         }
     }
 }
@@ -203,6 +217,9 @@ pub struct HttpConfig {
     pub uses_request_body_file: bool,
     /// An `error_log stderr` appears somewhere in the config (#309).
     pub uses_stderr_log: bool,
+    /// `stub_status` or a `$connections_*` variable appears in the config:
+    /// the counters are kept.
+    pub uses_stats: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,
@@ -457,13 +474,19 @@ pub struct ServerSsl {
 
 /// How TLS sessions can be resumed. `None` fields take nginx's defaults:
 /// no session-ID cache (`ssl_session_cache none`), tickets on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionResumption {
     /// `ssl_session_cache`: `builtin` / `shared:…` = true, `off` / `none` =
     /// false.
     pub cache: Option<bool>,
+    /// The `ssl_session_cache` that set `cache` has a `shared:` zone: nginx
+    /// then keeps rotating ticket keys in it (#140).
+    pub shared: bool,
     /// `ssl_session_tickets on|off`.
     pub tickets: Option<bool>,
+    /// `ssl_session_ticket_key file` lines, in order: the first encrypts,
+    /// all decrypt.
+    pub ticket_keys: Option<Vec<PathBuf>>,
 }
 
 impl SessionResumption {
@@ -496,6 +519,7 @@ impl SessionResumption {
                                 });
                             }
                         }
+                        self.shared = caches.iter().any(|c| c.starts_with("shared:"));
                         true
                     }
                 };
@@ -516,11 +540,22 @@ impl SessionResumption {
         }
     }
 
-    pub(crate) fn inherit(self, parent: SessionResumption) -> SessionResumption {
+    pub(crate) fn inherit(self, parent: &SessionResumption) -> SessionResumption {
+        let (cache, shared) = match self.cache {
+            Some(_) => (self.cache, self.shared),
+            None => (parent.cache, parent.shared),
+        };
         SessionResumption {
-            cache: self.cache.or(parent.cache),
+            cache,
+            shared,
             tickets: self.tickets.or(parent.tickets),
+            ticket_keys: self.ticket_keys.or_else(|| parent.ticket_keys.clone()),
         }
+    }
+
+    /// One `ssl_session_ticket_key` line (the path already resolved).
+    pub(crate) fn add_ticket_key(&mut self, path: PathBuf) {
+        self.ticket_keys.get_or_insert_with(Vec::new).push(path);
     }
 }
 
@@ -1473,6 +1508,15 @@ pub enum ProxyProtocolTlv {
     Unknown,
 }
 
+/// Which `$connections_*` gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionsGauge {
+    Active,
+    Reading,
+    Writing,
+    Waiting,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Variable {
     /// Normalized request URI (no query string).
@@ -1534,6 +1578,8 @@ pub enum Variable {
     SslClientVRemain,
     /// Request body buffered by the parser.
     RequestBody,
+    /// `$connections_active`, `_reading`, `_writing`, `_waiting` (#96).
+    Connections(ConnectionsGauge),
     /// Path to the spilled request body temp file, when one was created.
     RequestBodyFile,
     /// Client IP address from the accepted peer socket (e.g. `127.0.0.1`,
@@ -1836,6 +1882,8 @@ pub enum Handler {
     /// `proxy_pass http://...;` — reverse proxy this location to an upstream.
     /// Resolution to a concrete peer happens at prepare time.
     Proxy(ProxyPass),
+    /// `stub_status;` — the connection and request counters (#96).
+    StubStatus,
 }
 
 /// Parsed `proxy_pass` argument. nginx allows two forms:

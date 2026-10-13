@@ -276,9 +276,15 @@ pub(crate) fn parse_server_block(
                 saw_any_ssl_directive = true;
                 resumption.parse(name, &args)?;
             }
+            ("ssl_session_ticket_key", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_session_ticket_key"));
+                };
+                resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
+            }
             (
-                "ssl_session_ticket_key"
-                | "ssl_buffer_size"
+                "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"
                 | "ssl_stapling"

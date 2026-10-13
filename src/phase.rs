@@ -84,6 +84,9 @@ impl ConnInfo {
     };
 }
 
+/// The body of a request that has none.
+pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
+
 /// Per-request inputs the pipeline needs from the parser + connection.
 /// Narrow on purpose — each field added here is a new dependency between
 /// the worker's parse loop and the phase machinery.
@@ -161,7 +164,8 @@ pub struct RequestCtx<'a> {
     /// request had no body or when `proxy_pass_request_body off;` is set.
     /// Both Content-Length and chunked client bodies arrive here decoded
     /// as plain bytes; proxy forwarding recomputes `Content-Length`.
-    pub body: &'a [u8],
+    /// Shared (`Bytes`) so the proxy can send it without a copy (#289).
+    pub body: &'a bytes::Bytes,
     /// Length of the request body: `body.len()`, unless the body was too
     /// large to keep in memory and is only in `body_file` (then `body` is
     /// empty, and `$request_body` too, as in nginx).
@@ -587,6 +591,11 @@ fn process_with_meta_inner(
             return refuse(http, req, url_scratch, server, response, true, false);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if req.method == Method::Trace
+                && crate::worker::test_panic() == crate::worker::TestPanic::Trace
+            {
+                panic!("{}=trace", crate::worker::TEST_PANIC_ENV);
+            }
             let response = Response::Owned(crate::file::method_not_allowed(
                 req.method,
                 server.server_header,
@@ -2007,7 +2016,7 @@ mod tests {
             request_length: 0,
             epoch_secs: 0,
             epoch_ms: 0,
-            body: &[],
+            body: &NO_BODY,
             body_len: 0,
             body_file: None,
             tls: None,

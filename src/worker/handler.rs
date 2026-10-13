@@ -688,6 +688,15 @@ pub(crate) fn run_location_handler(
             );
         }
 
+        // A large client body is sent from its own buffer, after the
+        // header block, instead of being copied into it (#289). A small
+        // one is copied: one buffer, one write.
+        let (forward_body, separate_body) =
+            if set_body.is_none() && forward_body.len() > crate::proxy::SEPARATE_BODY_MIN {
+                (&[][..], req.body.clone())
+            } else {
+                (forward_body, bytes::Bytes::new())
+            };
         // Pooled: with the body in it the buffer is as large as the body,
         // and a fresh one per request faults its pages in each time (#289).
         let mut request = crate::worker::take_body_buffer(0);
@@ -719,10 +728,14 @@ pub(crate) fn run_location_handler(
         } else {
             None
         };
+        let bind = proxy
+            .bind
+            .and_then(|bind| resolve_bind(bind, &proxy_render_ctx));
         return Response::Proxy(crate::proxy::ProxyPlan {
             upstream: proxy.upstream,
             initial_peer,
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
+            body: separate_body,
             method: req.method,
             server_bytes,
             connect_timeout: std::time::Duration::from_millis(proxy.connect_timeout_ms),
@@ -743,6 +756,7 @@ pub(crate) fn run_location_handler(
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
             intercept,
+            bind,
         });
     }
     let inner = match loc.handler {
@@ -753,6 +767,20 @@ pub(crate) fn run_location_handler(
             build_templated_return(*status, parts, &render_ctx_base, req.method, server_bytes),
         ),
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
+        // ngx_http_stub_status_handler: GET and HEAD only, text/plain.
+        PreparedHandler::StubStatus => match req.method {
+            Method::Get => Response::Owned(http::build_response(
+                200,
+                &super::stats::status_text(),
+                server_bytes,
+            )),
+            Method::Head => Response::Owned(http::build_head_response(
+                200,
+                super::stats::status_text().len(),
+                server_bytes,
+            )),
+            _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
+        },
         // Static-file mapping follows the configured path mode:
         // `root` appends the whole normalized URI, while `alias` strips the
         // matched location prefix first. `PreparedRoot` carries that choice.
@@ -1091,5 +1119,43 @@ fn prebuilt_with_literal_add_headers(
         });
         cache.borrow_mut().insert(key, built);
         built
+    })
+}
+
+/// The request's `proxy_bind` address (ngx_http_upstream_set_local): the
+/// literal one, or the value rendered now. An empty value binds nothing;
+/// one that isn't an address is logged and binds nothing either.
+fn resolve_bind(
+    bind: &'static super::PreparedBind,
+    ctx: &RenderCtx<'_>,
+) -> Option<crate::proxy::LocalBind> {
+    let addr = match bind.addr {
+        Some(addr) => addr,
+        None => {
+            let mut value = Vec::new();
+            render_parts(bind.value, ctx, &mut value);
+            if value.is_empty() {
+                return None;
+            }
+            let parsed = std::str::from_utf8(&value)
+                .ok()
+                .and_then(crate::config::parse_bind_addr);
+            let Some(addr) = parsed else {
+                crate::fs_resolve::note_failed_lookup_at(
+                    format!(
+                        "invalid local address \"{}\"",
+                        String::from_utf8_lossy(&value)
+                    ),
+                    false,
+                    ErrorLogLevel::Error,
+                );
+                return None;
+            };
+            addr
+        }
+    };
+    Some(crate::proxy::LocalBind {
+        addr,
+        transparent: bind.transparent,
     })
 }
