@@ -136,6 +136,9 @@ pub(crate) async fn write_access_logs(
         proxy_host: meta.map_or(&[][..], |m| m.proxy_host),
         upstream_headers: meta.map_or(&[][..], |m| &m.upstream_headers),
         upstream_states: meta.map_or(&[][..], |m| &m.upstream_states),
+        upstream_cache_status: meta
+            .and_then(|m| m.upstream_cache_status)
+            .map_or(&[][..], |s| s.as_bytes()),
         sent_trailers: &[],
         tls,
         conn,
@@ -534,6 +537,7 @@ async fn settle_proxy_response(
                         let mut process_meta = process_meta;
                         process_meta.upstream_states = report.states;
                         process_meta.upstream_headers = report.upstream_headers;
+                        process_meta.upstream_cache_status = report.cache_status;
                         return (carry_accel_headers(response, &carried, false), process_meta);
                     }
                 },
@@ -555,6 +559,7 @@ async fn settle_proxy_response(
     let trail = crate::proxy::UpstreamTrail {
         states: report.states,
         headers: report.upstream_headers,
+        cache_status: report.cache_status,
     };
     // The counts limit_conn took stay held through the redirect (#95).
     let held = process_meta.limit_conn_held.clone();
@@ -591,6 +596,7 @@ fn intercept_with_report(
     let trail = crate::proxy::UpstreamTrail {
         states: std::mem::take(&mut report.states),
         headers: std::mem::take(&mut report.upstream_headers),
+        cache_status: report.cache_status,
     };
     let pass_ctx = phase::RequestCtx {
         upstream: Some(&trail),
@@ -622,6 +628,7 @@ fn finish_proxy_response(
     mut process_meta: phase::ProcessMeta,
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
+    process_meta.upstream_cache_status = report.cache_status;
     // `X-Accel-Limit-Rate` is the response's `limit_rate`.
     if let Some(rate) = report.accel.as_ref().and_then(|a| a.limit_rate) {
         process_meta.limit_rate =
@@ -725,6 +732,7 @@ async fn run_proxy_pass(
             trail: crate::proxy::UpstreamTrail {
                 states: report.states,
                 headers: report.upstream_headers,
+                cache_status: report.cache_status,
             },
             carried: Vec::new(),
             as_get,
@@ -752,6 +760,7 @@ async fn run_proxy_pass(
                         let mut process_meta = process_meta;
                         process_meta.upstream_states = report.states;
                         process_meta.upstream_headers = report.upstream_headers;
+                        process_meta.upstream_cache_status = report.cache_status;
                         let response = carry_accel_headers(response, &carried, false);
                         return PassOutcome::Done(response, process_meta);
                     }
@@ -762,6 +771,7 @@ async fn run_proxy_pass(
                 trail: crate::proxy::UpstreamTrail {
                     states: report.states,
                     headers: report.upstream_headers,
+                    cache_status: report.cache_status,
                 },
                 carried,
                 as_get,
@@ -807,12 +817,14 @@ async fn settle_redirected(
         let Response::Proxy(plan) = response else {
             process_meta.upstream_states = trail.states;
             process_meta.upstream_headers = trail.headers;
+            process_meta.upstream_cache_status = trail.cache_status;
             return (carry_accel_headers(response, &carried, false), process_meta);
         };
         match run_proxy_pass(http, ctx, plan, process_meta, as_get).await {
             PassOutcome::Done(response, mut meta) => {
                 trail.states.append(&mut meta.upstream_states);
                 meta.upstream_states = trail.states;
+                meta.upstream_cache_status = meta.upstream_cache_status.or(trail.cache_status);
                 return (carry_accel_headers(response, &carried, true), meta);
             }
             PassOutcome::Redirect {
@@ -824,6 +836,7 @@ async fn settle_redirected(
             } => {
                 trail.states.append(&mut more.states);
                 trail.headers = more.headers;
+                trail.cache_status = more.cache_status.or(trail.cache_status);
                 carried.extend_from_slice(&more_carried);
                 reroute = next;
                 as_get = next_as_get;

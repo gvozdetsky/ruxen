@@ -322,6 +322,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
         proxy_host: &[],
         upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
         upstream_states: req.upstream.map_or(&[], |u| &u.states),
+        upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
         sent_trailers: &[],
         tls: req.tls,
         conn: req.conn,

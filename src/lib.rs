@@ -17,6 +17,7 @@ mod http_date;
 mod phase;
 mod privileges;
 mod proxy;
+mod proxy_cache;
 mod proxy_protocol;
 mod syslog;
 mod tls;

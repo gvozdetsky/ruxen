@@ -123,6 +123,8 @@ pub(crate) struct RenderCtx<'a> {
     /// `$upstream_status`, `$upstream_response_time` and the rest. Empty
     /// outside a proxy context.
     pub upstream_states: &'a [crate::proxy::UpstreamState],
+    /// `$upstream_cache_status`; empty when no cache was looked at.
+    pub upstream_cache_status: &'a [u8],
     /// Pre-rendered `add_trailer` lines, joined with CRLF and rendered as
     /// `Name: value\r\n` per entry. Used by `$sent_trailer_*` lookups via
     /// the same scanner that handles request/response headers.
@@ -430,6 +432,7 @@ impl RenderCtx<'_> {
             Variable::UpstreamBytesSent => {
                 self.write_upstream_list(out, |out, s| write_u64_decimal(out, s.bytes_sent))
             }
+            Variable::UpstreamCacheStatus => out.extend_from_slice(self.upstream_cache_status),
             Variable::SentTrailer(name) => {
                 write_all_request_header_values(out, self.sent_trailers, name.as_bytes());
             }
@@ -1032,6 +1035,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::UpstreamHeaderTime
             | Variable::UpstreamBytesReceived
             | Variable::UpstreamBytesSent
+            | Variable::UpstreamCacheStatus
             | Variable::SslProtocol
             | Variable::SslCipher
             | Variable::SslCiphers

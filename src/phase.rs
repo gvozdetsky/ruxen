@@ -304,6 +304,8 @@ pub struct ProcessMeta {
     /// The worker runs this after the client response is written and
     /// suppresses its output.
     pub post_action: Option<&'static [u8]>,
+    /// `$upstream_cache_status` (#233).
+    pub upstream_cache_status: Option<crate::proxy_cache::CacheStatus>,
     /// One entry per upstream attempt (`$upstream_addr` and friends), set
     /// by `settle_proxy_response`. Empty when the request wasn't proxied.
     pub upstream_states: Vec<crate::proxy::UpstreamState>,
@@ -350,6 +352,7 @@ impl Default for ProcessMeta {
             limit_rate: None,
             post_action: None,
             upstream_states: Vec::new(),
+            upstream_cache_status: None,
             upstream_headers: Vec::new(),
             proxy_expires: crate::worker::PreparedExpires::Off,
             invalid_uri: false,

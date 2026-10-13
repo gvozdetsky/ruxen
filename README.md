@@ -37,7 +37,7 @@ The v0.1 scope is deliberately limited:
 - reverse proxying and upstreams
 - TLS 1.2/1.3 termination via rustls
 - no module system
-- no HTTP cache
+- a proxy cache (`proxy_cache`), without stale responses yet
 - no HTTP/2 yet
 
 The upstream `nginx-tests` suite is used as a compatibility test. **63 of the 105 test files that ruxen currently opts into pass end-to-end** (v0.1.1).
@@ -235,6 +235,7 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - `proxy_hide_header` / `proxy_pass_header`
 - `X-Accel-Redirect`, `X-Accel-Limit-Rate` and `proxy_ignore_headers`
 - `$upstream_*` per-attempt variables, `$proxy_host`, `$proxy_port`
+- `proxy_cache` on `proxy_cache_path` zones: `proxy_cache_key`, `proxy_cache_valid`, `proxy_cache_methods`, `proxy_cache_min_uses`, `proxy_cache_bypass`, `proxy_no_cache`, `proxy_cache_convert_head`, `proxy_cache_revalidate`, `Vary`, and `$upstream_cache_status`
 
 ### TLS
 
@@ -391,7 +392,7 @@ The following are intentionally outside the current v0.1 scope:
 
 - HTTP/2
 - nginx's module ecosystem
-- HTTP caching
+- stale cached responses and cache locks (`proxy_cache_use_stale`, `proxy_cache_background_update`, `proxy_cache_lock`)
 - TLS to upstream servers (`proxy_ssl_*`)
 - OCSP stapling
 - client certificate authentication

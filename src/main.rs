@@ -26,6 +26,7 @@ mod http_date;
 mod phase;
 mod privileges;
 mod proxy;
+mod proxy_cache;
 mod proxy_protocol;
 mod syslog;
 mod tls;
@@ -412,6 +413,11 @@ fn real_main() -> Result<(), Failure> {
         return Err(Failure::Reported);
     }
     runtime.release_workers();
+    // nginx's cache loader and manager, a thread per zone, as the user
+    // the workers run as.
+    for zone in http.cache_zones {
+        proxy_cache::start_manager(zone);
+    }
 
     let signal_runtime = runtime;
     let reopen_stderr = cli.errlog.clone().filter(|_| !http.uses_stderr_log);
@@ -651,7 +657,6 @@ fn version_output() -> &'static str {
         " --with-http_realip_module",
         " --with-http_stub_status_module",
         " --without-pcre",
-        " --without-http-cache",
         " --without-http_charset_module",
         " --without-http_ssi_module",
         " --without-http_mirror_module",
@@ -887,7 +892,6 @@ mod tests {
                 " --with-http_realip_module",
                 " --with-http_stub_status_module",
                 " --without-pcre",
-                " --without-http-cache",
                 " --without-http_charset_module",
                 " --without-http_ssi_module",
                 " --without-http_mirror_module",
