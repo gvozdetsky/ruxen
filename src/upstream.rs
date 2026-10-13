@@ -40,6 +40,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -49,6 +50,57 @@ use crate::config::LbAlgorithm;
 use crate::worker::PreparedPeer;
 use crate::worker::PreparedUpstream;
 use crate::worker::PreparedValuePart;
+
+/// A peer's state shared by all workers, for an upstream with `zone`
+/// (#143): connections in progress and the failure window, so every
+/// worker sees the same `max_conns` count, the same `least_conn` load
+/// and the same peer health. The smoothed round-robin weights stay per
+/// worker: only the interleaving of picks across workers differs from
+/// nginx's locked pick. One cache line per peer.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub struct PeerShared {
+    conns: AtomicU32,
+    fails: AtomicU32,
+    /// When the current failure window opened, in ms since `origin()`
+    /// plus one; 0 = no failure recorded.
+    fails_started_ms: AtomicU64,
+}
+
+impl PeerShared {
+    pub(crate) fn for_peers(n: usize) -> &'static [PeerShared] {
+        Box::leak((0..n).map(|_| PeerShared::default()).collect())
+    }
+}
+
+fn origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+fn ms_since_origin(t: Instant) -> u64 {
+    t.saturating_duration_since(origin()).as_millis() as u64 + 1
+}
+
+/// Requests in progress on peer `i`.
+fn active(rt: &UpstreamRt, up: &PreparedUpstream, i: usize) -> u32 {
+    match up.shared {
+        Some(shared) => shared[i].conns.load(Ordering::Relaxed),
+        None => rt.peers[i].active,
+    }
+}
+
+/// Peer `i`'s failures in the current window and when the window opened.
+fn fail_state(rt: &UpstreamRt, up: &PreparedUpstream, i: usize) -> (u32, Option<Instant>) {
+    match up.shared {
+        Some(shared) => {
+            let started = shared[i].fails_started_ms.load(Ordering::Relaxed);
+            let opened = (started != 0).then(|| origin() + Duration::from_millis(started - 1));
+            (shared[i].fails.load(Ordering::Relaxed), opened)
+        }
+        None => (rt.peers[i].fails, rt.peers[i].fails_started),
+    }
+}
 
 /// An upstream's balancing method, prepared.
 #[derive(Debug, Clone, Copy)]
@@ -287,7 +339,7 @@ fn hash_pick(
         return None;
     }
     let total: u32 = primary(peers).map(|(_, p)| p.weight).sum();
-    let usable = |rt: &UpstreamRt, i: usize| peer_eligible(rt, peers, i, false, tried, now);
+    let usable = |rt: &UpstreamRt, i: usize| peer_eligible(rt, upstream, i, false, tried, now);
     match state {
         HashPick::RoundRobin => None,
         HashPick::Hash {
@@ -485,18 +537,23 @@ pub fn pick_peer(
         let key = upstream as *const PreparedUpstream;
         let rt = map.entry(key).or_insert_with(|| ensure_rt(upstream));
         let pick = match upstream.lb {
-            Lb::LeastConn => least_conn_pick(rt, upstream.peers, false, tried, now)
-                .or_else(|| least_conn_pick(rt, upstream.peers, true, tried, now)),
+            Lb::LeastConn => least_conn_pick(rt, upstream, false, tried, now)
+                .or_else(|| least_conn_pick(rt, upstream, true, tried, now)),
             // A hash balancer falls back to round-robin.
             Lb::Hash(_) | Lb::IpHash => hash
                 .and_then(|h| hash_pick(rt, upstream, h, tried, now))
-                .or_else(|| rr_pick_with_filter(rt, upstream.peers, false, tried, now))
-                .or_else(|| rr_pick_with_filter(rt, upstream.peers, true, tried, now)),
-            Lb::RoundRobin => rr_pick_with_filter(rt, upstream.peers, false, tried, now)
-                .or_else(|| rr_pick_with_filter(rt, upstream.peers, true, tried, now)),
+                .or_else(|| rr_pick_with_filter(rt, upstream, false, tried, now))
+                .or_else(|| rr_pick_with_filter(rt, upstream, true, tried, now)),
+            Lb::RoundRobin => rr_pick_with_filter(rt, upstream, false, tried, now)
+                .or_else(|| rr_pick_with_filter(rt, upstream, true, tried, now)),
         };
         let idx = pick?;
-        rt.peers[idx].active = rt.peers[idx].active.saturating_add(1);
+        match upstream.shared {
+            Some(shared) => {
+                shared[idx].conns.fetch_add(1, Ordering::Relaxed);
+            }
+            None => rt.peers[idx].active = rt.peers[idx].active.saturating_add(1),
+        }
         Some(LeasedPeer {
             upstream,
             peer_idx: idx,
@@ -506,13 +563,13 @@ pub fn pick_peer(
 
 fn peer_eligible(
     rt: &UpstreamRt,
-    peers: &[PreparedPeer],
+    up: &PreparedUpstream,
     i: usize,
     backup_tier: bool,
     tried: &Tried,
     now: Instant,
 ) -> bool {
-    let p = &peers[i];
+    let p = &up.peers[i];
     if p.down {
         return false;
     }
@@ -522,9 +579,12 @@ fn peer_eligible(
     if tried.contains(i) {
         return false;
     }
-    let s = &rt.peers[i];
-    if let Some(opened) = s.fails_started {
-        if s.fails >= p.max_fails && p.max_fails > 0 {
+    if p.max_conns > 0 && active(rt, up, i) >= p.max_conns {
+        return false;
+    }
+    let (fails, fails_started) = fail_state(rt, up, i);
+    if let Some(opened) = fails_started {
+        if fails >= p.max_fails && p.max_fails > 0 {
             // Cooldown is active until fail_timeout has elapsed since the
             // most recent failure.
             if now.saturating_duration_since(opened) < Duration::from_millis(p.fail_timeout_ms) {
@@ -537,15 +597,16 @@ fn peer_eligible(
 
 fn rr_pick_with_filter(
     rt: &mut UpstreamRt,
-    peers: &[PreparedPeer],
+    up: &PreparedUpstream,
     backup_tier: bool,
     tried: &Tried,
     now: Instant,
 ) -> Option<usize> {
+    let peers = up.peers;
     let mut total: i64 = 0;
     let mut best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         let s = &mut rt.peers[i];
@@ -568,17 +629,18 @@ fn rr_pick_with_filter(
 
 fn least_conn_pick(
     rt: &mut UpstreamRt,
-    peers: &[PreparedPeer],
+    up: &PreparedUpstream,
     backup_tier: bool,
     tried: &Tried,
     now: Instant,
 ) -> Option<usize> {
+    let peers = up.peers;
     // First pass: find the smallest active/weight ratio across eligible
     // peers. nginx compares fractions via the cross-multiplication
     // `c1 * w2 vs c2 * w1` to avoid float math; we mirror that with i128.
     let mut best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         match best {
@@ -586,8 +648,8 @@ fn least_conn_pick(
             Some(b) => {
                 let pi = &peers[i];
                 let pb = &peers[b];
-                let ci = rt.peers[i].active as i128;
-                let cb = rt.peers[b].active as i128;
+                let ci = active(rt, up, i) as i128;
+                let cb = active(rt, up, b) as i128;
                 let wi = pi.weight.max(1) as i128;
                 let wb = pb.weight.max(1) as i128;
                 if ci * wb < cb * wi {
@@ -597,7 +659,7 @@ fn least_conn_pick(
         }
     }
     let candidate = best?;
-    let candidate_active = rt.peers[candidate].active;
+    let candidate_active = active(rt, up, candidate);
     let candidate_weight = peers[candidate].weight.max(1) as i128;
     // Tie-break: among peers tied with the candidate on `c/w`, run the
     // smoothed weighted RR pick to keep the distribution fair. This is
@@ -605,11 +667,11 @@ fn least_conn_pick(
     // `n == many` fallback (lc.c:171–219).
     let mut tie_count = 0;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         let pi = &peers[i];
-        let ci = rt.peers[i].active as i128;
+        let ci = active(rt, up, i) as i128;
         let wi = pi.weight.max(1) as i128;
         if ci * candidate_weight == candidate_active as i128 * wi {
             tie_count += 1;
@@ -623,11 +685,11 @@ fn least_conn_pick(
     let mut total: i64 = 0;
     let mut tie_best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         let pi = &peers[i];
-        let ci = rt.peers[i].active as i128;
+        let ci = active(rt, up, i) as i128;
         let wi = pi.weight.max(1) as i128;
         if ci * candidate_weight != candidate_active as i128 * wi {
             continue;
@@ -673,15 +735,30 @@ pub fn report_failure(upstream: &'static PreparedUpstream, peer_idx: usize) {
         };
         let s = &mut rt.peers[peer_idx];
         let now = Instant::now();
-        if let Some(opened) = s.fails_started {
-            if now.saturating_duration_since(opened) >= Duration::from_millis(peer.fail_timeout_ms)
+        let window = Duration::from_millis(peer.fail_timeout_ms);
+        if let Some(shared) = upstream.shared {
+            // Every worker counts into the same window.
+            let shared = &shared[peer_idx];
+            let started = shared.fails_started_ms.load(Ordering::Relaxed);
+            if started != 0
+                && ms_since_origin(now).saturating_sub(started) >= window.as_millis() as u64
             {
-                // Prior window elapsed — start a fresh failure window.
-                s.fails = 0;
+                shared.fails.store(0, Ordering::Relaxed);
             }
+            shared.fails.fetch_add(1, Ordering::Relaxed);
+            shared
+                .fails_started_ms
+                .store(ms_since_origin(now), Ordering::Relaxed);
+        } else {
+            if let Some(opened) = s.fails_started {
+                if now.saturating_duration_since(opened) >= window {
+                    // Prior window elapsed — start a fresh failure window.
+                    s.fails = 0;
+                }
+            }
+            s.fails = s.fails.saturating_add(1);
+            s.fails_started = Some(now);
         }
-        s.fails = s.fails.saturating_add(1);
-        s.fails_started = Some(now);
         // effective_weight penalty per nginx (rr.c:1051):
         //   weight - weight / max_fails  (i.e. lose 1/max_fails per fail).
         if peer.max_fails > 0 {
@@ -713,6 +790,20 @@ fn ensure_rt(upstream: &'static PreparedUpstream) -> UpstreamRt {
 /// failure is older than `fail_timeout`, so intermittent failures still
 /// accumulate and can trip `max_fails`.
 pub fn report_success(upstream: &'static PreparedUpstream, peer_idx: usize) {
+    if let Some(shared) = upstream.shared {
+        let (Some(shared), Some(peer)) = (shared.get(peer_idx), upstream.peers.get(peer_idx))
+        else {
+            return;
+        };
+        let started = shared.fails_started_ms.load(Ordering::Relaxed);
+        if started != 0
+            && ms_since_origin(Instant::now()).saturating_sub(started) >= peer.fail_timeout_ms
+        {
+            shared.fails.store(0, Ordering::Relaxed);
+            shared.fails_started_ms.store(0, Ordering::Relaxed);
+        }
+        return;
+    }
     LB_STATE.with(|state| {
         let mut map = state.borrow_mut();
         let key = upstream as *const PreparedUpstream;
@@ -753,6 +844,10 @@ impl LeasedPeer {
 
 impl Drop for LeasedPeer {
     fn drop(&mut self) {
+        if let Some(shared) = self.upstream.shared {
+            shared[self.peer_idx].conns.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
         LB_STATE.with(|state| {
             let mut map = state.borrow_mut();
             let key = self.upstream as *const PreparedUpstream;
@@ -879,6 +974,7 @@ mod tests {
                 weight: *w,
                 max_fails: 1,
                 fail_timeout_ms,
+                max_conns: 0,
                 down: *down,
                 backup: *backup,
             })
@@ -892,6 +988,7 @@ mod tests {
             keepalive_idle_timeout_ms: 60_000,
             keepalive_max_lifetime_ms: 3_600_000,
             lb,
+            shared: None,
         }))
     }
 
@@ -1076,6 +1173,7 @@ mod tests {
                 weight: *weight,
                 max_fails: 1,
                 fail_timeout_ms: 10_000,
+                max_conns: 0,
                 down: second_down && i == 1,
                 backup: false,
             })
@@ -1089,6 +1187,7 @@ mod tests {
             keepalive_idle_timeout_ms: 60_000,
             keepalive_max_lifetime_ms: 3_600_000,
             lb: Lb::prepare(lb, peers),
+            shared: None,
         }))
     }
 
@@ -1185,5 +1284,67 @@ mod tests {
                 .peer_idx] += 1;
         }
         assert_eq!(counts, [1, 2, 3, 1]);
+    }
+
+    fn zoned(max_conns: u32, zone: bool) -> &'static PreparedUpstream {
+        let peers: Vec<PreparedPeer> = (0..2)
+            .map(|i| PreparedPeer {
+                addr: crate::worker::PeerAddr::Inet(
+                    format!("127.0.0.1:{}", 1 + i).parse().unwrap(),
+                ),
+                display: b"x",
+                weight: 1,
+                max_fails: 1,
+                fail_timeout_ms: 10_000,
+                max_conns,
+                down: false,
+                backup: false,
+            })
+            .collect();
+        let peers: &'static [PreparedPeer] = Box::leak(peers.into_boxed_slice());
+        Box::leak(Box::new(PreparedUpstream {
+            name: b"z",
+            peers,
+            keepalive_max_idle: None,
+            keepalive_requests: 1000,
+            keepalive_idle_timeout_ms: 60_000,
+            keepalive_max_lifetime_ms: 3_600_000,
+            lb: Lb::RoundRobin,
+            shared: zone.then(|| PeerShared::for_peers(peers.len())),
+        }))
+    }
+
+    #[test]
+    fn max_conns_caps_each_peer() {
+        // Without a zone the cap is per worker (thread), as nginx's per
+        // process.
+        let u = zoned(1, false);
+        let a = pick_peer(u, &Tried::default(), None).unwrap();
+        let b = pick_peer(u, &Tried::default(), None).unwrap();
+        assert_ne!(a.peer_idx, b.peer_idx);
+        assert!(pick_peer(u, &Tried::default(), None).is_none());
+        let other = std::thread::spawn(move || pick_peer(u, &Tried::default(), None).is_some());
+        assert!(other.join().unwrap());
+        drop(a);
+        assert!(pick_peer(u, &Tried::default(), None).is_some());
+    }
+
+    #[test]
+    fn a_zone_shares_counts_and_failures_across_workers() {
+        let u = zoned(1, true);
+        let a = pick_peer(u, &Tried::default(), None).unwrap();
+        let b = pick_peer(u, &Tried::default(), None).unwrap();
+        // Another worker sees both peers busy.
+        let other = std::thread::spawn(move || pick_peer(u, &Tried::default(), None).is_none());
+        assert!(other.join().unwrap());
+        drop((a, b));
+        // A failure seen by one worker keeps the peer out for all of them.
+        std::thread::spawn(move || report_failure(u, 0))
+            .join()
+            .unwrap();
+        for _ in 0..4 {
+            let l = pick_peer(u, &Tried::default(), None).unwrap();
+            assert_eq!(l.peer_idx, 1);
+        }
     }
 }

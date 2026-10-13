@@ -482,6 +482,7 @@ pub(crate) fn prepare_upstreams(
                 weight: s.weight,
                 max_fails: s.max_fails,
                 fail_timeout_ms: (s.fail_timeout_secs as u64) * 1_000,
+                max_conns: s.max_conns,
                 down: s.down,
                 backup: s.backup,
             });
@@ -495,6 +496,9 @@ pub(crate) fn prepare_upstreams(
             keepalive_idle_timeout_ms: u.keepalive_idle_timeout_ms.unwrap_or(60_000),
             keepalive_max_lifetime_ms: u.keepalive_max_lifetime_ms.unwrap_or(3_600_000),
             lb: crate::upstream::Lb::prepare(u.lb, peers),
+            shared: u
+                .zone
+                .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
         }));
         out.insert(name_static, &*prepared);
     }
@@ -757,6 +761,7 @@ pub(crate) fn build_proxy(
                 weight: 1,
                 max_fails: 1,
                 fail_timeout_ms: 10_000,
+                max_conns: 0,
                 down: false,
                 backup: false,
             };
@@ -771,6 +776,7 @@ pub(crate) fn build_proxy(
                 keepalive_idle_timeout_ms: 60_000,
                 keepalive_max_lifetime_ms: 3_600_000,
                 lb: crate::upstream::Lb::RoundRobin,
+                shared: None,
             }));
             if inet && let Ok(authority) = std::str::from_utf8(host_header_static) {
                 note_implicit_upstream(authority, upstream);
@@ -846,6 +852,7 @@ pub(crate) fn build_proxy(
                 weight: 1,
                 max_fails: 0,
                 fail_timeout_ms: 10_000,
+                max_conns: 0,
                 down: false,
                 backup: false,
             };
@@ -858,6 +865,7 @@ pub(crate) fn build_proxy(
                 keepalive_idle_timeout_ms: 60_000,
                 keepalive_max_lifetime_ms: 3_600_000,
                 lb: crate::upstream::Lb::RoundRobin,
+                shared: None,
             }));
             PreparedProxy {
                 upstream,

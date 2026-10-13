@@ -781,6 +781,10 @@ pub struct PreparedUpstream {
     /// LB algorithm: smoothed weighted RR by default, `least_conn`, `hash`
     /// or `ip_hash`.
     pub lb: crate::upstream::Lb,
+    /// `zone`: the peers' connection counts and failure state, shared by
+    /// all workers (one slot per peer). `None`: per worker, as nginx's
+    /// without a zone.
+    pub shared: Option<&'static [crate::upstream::PeerShared]>,
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in
@@ -822,6 +826,8 @@ pub struct PreparedPeer {
     pub weight: u32,
     pub max_fails: u32,
     pub fail_timeout_ms: u64,
+    /// `max_conns=`; 0 = unlimited.
+    pub max_conns: u32,
     pub down: bool,
     pub backup: bool,
 }

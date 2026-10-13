@@ -302,6 +302,9 @@ pub struct UpstreamBlock {
     /// LB algorithm. Default is smoothed weighted RR; `least_conn`, `hash`
     /// and `ip_hash` are supported.
     pub lb: LbAlgorithm,
+    /// `zone name [size]` (#143): the peers' state is shared by all
+    /// workers.
+    pub zone: Option<String>,
 }
 
 /// Load-balancing algorithm for an `upstream {}` block. Smoothed weighted
@@ -344,6 +347,8 @@ pub struct UpstreamServer {
     pub weight: u32,
     pub max_fails: u32,
     pub fail_timeout_secs: u32,
+    /// `max_conns=N`; 0 = unlimited.
+    pub max_conns: u32,
     pub down: bool,
     pub backup: bool,
 }
