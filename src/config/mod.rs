@@ -24,6 +24,7 @@ mod error;
 mod lexer;
 mod parse_access;
 mod parse_gzip;
+mod parse_limit_req;
 mod parse_location;
 mod parse_log;
 mod parse_map;
@@ -35,6 +36,7 @@ mod values;
 pub use ast::*;
 pub use error::*;
 pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
 pub(crate) use lexer::*;
@@ -262,6 +264,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut servers: Vec<Server> = Vec::new();
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
+    let mut limit_req = LimitReqConf::default();
+    let mut limit_req_zones: Vec<LimitReqZoneDef> = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut log_formats: Vec<LogFormatDef> = Vec::new();
     let mut access_logs: Vec<AccessLog> = Vec::new();
@@ -321,6 +325,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     for server in &mut servers {
                         server.proxy = std::mem::take(&mut server.proxy).inherit(&proxy);
                         server.gzip = std::mem::take(&mut server.gzip).inherit(&gzip);
+                        server.limit_req =
+                            std::mem::take(&mut server.limit_req).inherit(&limit_req);
                         if server.index.is_none() {
                             server.index.clone_from(&index);
                         }
@@ -396,6 +402,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ignore_invalid_headers,
                         underscores_in_headers,
                         upstreams,
+                        limit_req_zones,
                         warnings: warn_ssl_without_ssl_listen(&servers, warnings),
                         servers,
                         dump_files: Vec::new(),
@@ -835,6 +842,18 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
+            (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
+            ("limit_req_zone", Terminator::Semi) => {
+                let zone = parse_limit_req::parse_limit_req_zone(&args[1..])?;
+                // ngx_http_limit_req_zone: one key per zone name.
+                if let Some(known) = limit_req_zones.iter().find(|z| z.name == zone.name) {
+                    return Err(Error::BadValue {
+                        what: "limit_req_zone (is already bound to key)",
+                        got: format!("\"{}\" bound to \"{}\"", zone.name, known.key_text),
+                    });
+                }
+                limit_req_zones.push(zone);
+            }
             ("error_log", Terminator::Semi) => {
                 error_logs
                     .get_or_insert_with(Vec::new)

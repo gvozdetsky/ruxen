@@ -3155,8 +3155,25 @@ pub(crate) async fn handle<S: ConnIo>(
                             epoch_secs,
                             epoch_ms
                         );
-                        let (response, mut process_meta) =
+                        let (mut response, mut process_meta) =
                             phase::process_with_meta(http, &ctx, &mut *url_scratch);
+                        // limit_req delayed the request (#94): processing
+                        // stopped before the content handler. Wait, then
+                        // run it again past limit_req, as nginx resumes
+                        // its phases after the delay timer: the handler,
+                        // the upstream and `$request_time` come after it.
+                        let mut ctx = ctx;
+                        if process_meta.limit_req_delay_ms > 0 {
+                            monoio::time::sleep(Duration::from_millis(
+                                process_meta.limit_req_delay_ms,
+                            ))
+                            .await;
+                            ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+                            super::limit_req::resume_after_delay(true);
+                            (response, process_meta) =
+                                phase::process_with_meta(http, &ctx, &mut *url_scratch);
+                            super::limit_req::resume_after_delay(false);
+                        }
 
                         let (response, settled_meta) = settle_proxy_response(
                             http,

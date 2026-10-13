@@ -286,7 +286,6 @@ fn is_nginx_variable(name: &str) -> bool {
         "http3",
         "invalid_referer",
         "limit_conn_status",
-        "limit_req_status",
         "memcached_key",
         "msie",
         "nginx_version",
@@ -415,6 +414,7 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
             VARIABLES.with(|v| v.borrow_mut().request_body = true);
             Variable::RequestBody
         }
+        b"limit_req_status" => Variable::LimitReqStatus,
         b"connections_active"
         | b"connections_reading"
         | b"connections_writing"

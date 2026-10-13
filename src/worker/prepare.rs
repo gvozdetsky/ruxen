@@ -57,6 +57,7 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
+        limit_req_zones,
         uses_request_body_file,
         uses_request_body,
         uses_stderr_log,
@@ -157,6 +158,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_access_logs: &'static [PreparedAccessLog] = alp.prepare_list(&access_logs)?;
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
+    prepare_limit_req_zones(limit_req_zones);
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
         prepare_upstreams(upstreams);
 
@@ -503,6 +505,68 @@ thread_local! {
     static IMPLICIT_UPSTREAMS: std::cell::Cell<
         Vec<(&'static [u8], u16, &'static PreparedUpstream)>,
     > = const { std::cell::Cell::new(Vec::new()) };
+    /// The http block's `limit_req_zone`s by name while a config is
+    /// prepared (#94).
+    static LIMIT_REQ_ZONES: std::cell::RefCell<
+        std::collections::HashMap<String, &'static super::limit_req::LimitReqZone>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Build the zones of `limit_req_zone` (#94).
+fn prepare_limit_req_zones(zones: Vec<crate::config::LimitReqZoneDef>) {
+    let built = zones
+        .into_iter()
+        .map(|z| {
+            let name: &'static str = Box::leak(z.name.into_boxed_str());
+            let zone: &'static super::limit_req::LimitReqZone =
+                Box::leak(Box::new(super::limit_req::LimitReqZone::new(
+                    name,
+                    prepare_value_parts(z.key),
+                    z.size,
+                    z.rate,
+                )));
+            (name.to_string(), zone)
+        })
+        .collect();
+    LIMIT_REQ_ZONES.with(|m| *m.borrow_mut() = built);
+}
+
+/// A location's resolved `limit_req*` (`None` without `limit_req`). A zone
+/// no `limit_req_zone` declares is nginx's startup error.
+fn prepare_limit_req(
+    conf: crate::config::LimitReqConf,
+) -> Result<Option<&'static super::limit_req::PreparedLimitReq>, String> {
+    use super::limit_req::{PreparedLimit, PreparedLimitReq};
+    let Some(limits) = conf.limits.filter(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let limits = limits
+        .into_iter()
+        .map(|l| {
+            let zone = LIMIT_REQ_ZONES
+                .with(|m| m.borrow().get(&l.zone).copied())
+                .ok_or_else(|| format!("zero size shared memory zone \"{}\"", l.zone))?;
+            Ok(PreparedLimit {
+                zone,
+                burst: l.burst,
+                delay: l.delay,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let log_level = conf.log_level.unwrap_or(ErrorLogLevel::Error);
+    Ok(Some(Box::leak(Box::new(PreparedLimitReq {
+        limits: Box::leak(limits.into_boxed_slice()),
+        status: conf.status.unwrap_or(503),
+        log_level,
+        // ngx_http_limit_req_merge_conf: delays log one level lower.
+        delay_log_level: match log_level {
+            ErrorLogLevel::Info => ErrorLogLevel::Info,
+            ErrorLogLevel::Notice => ErrorLogLevel::Info,
+            ErrorLogLevel::Warn => ErrorLogLevel::Notice,
+            _ => ErrorLogLevel::Warn,
+        },
+        dry_run: conf.dry_run.unwrap_or(false),
+    }))))
 }
 
 /// Note the upstream of `proxy_pass http://<authority>` by host and port.
@@ -1295,6 +1359,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
                 server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
@@ -1327,6 +1392,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
                 server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
@@ -1359,6 +1425,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
                 server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
@@ -1392,6 +1459,7 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
                 server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
@@ -1483,6 +1551,7 @@ pub(crate) fn prepare_server(
             post_action: server_post_action,
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
+            limit_req: prepare_limit_req(server.limit_req.clone())?,
             timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
                 server.client_timeouts,
             ))),
@@ -2438,6 +2507,7 @@ pub(crate) fn build_prefix_or_exact(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_limit_req: &crate::config::LimitReqConf,
     server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
@@ -2481,6 +2551,7 @@ pub(crate) fn build_prefix_or_exact(
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        limit_req: location_limit_req,
         client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
@@ -2640,6 +2711,7 @@ pub(crate) fn build_prefix_or_exact(
         post_action,
         expires,
         chunked_transfer_encoding,
+        limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
         timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
             location_client_timeouts.inherit(server_client_timeouts),
         ))),
@@ -2673,6 +2745,7 @@ pub(crate) fn build_regex_location(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_limit_req: &crate::config::LimitReqConf,
     server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
@@ -2716,6 +2789,7 @@ pub(crate) fn build_regex_location(
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        limit_req: location_limit_req,
         client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
@@ -2885,6 +2959,7 @@ pub(crate) fn build_regex_location(
         post_action,
         expires,
         chunked_transfer_encoding,
+        limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
         timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
             location_client_timeouts.inherit(server_client_timeouts),
         ))),
