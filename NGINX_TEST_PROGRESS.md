@@ -2,21 +2,22 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-12 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-13 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 69
-- **Intentionally skipped (`-V` banner excludes the module):** 389
-- **Failing — work in progress:** 47
+- **Passing in ruxen:** 100
+- **Intentionally skipped (`-V` banner excludes the module):** 346
+- **Failing — work in progress:** 59
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (69)
+## Passing in ruxen (100)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
+- `access.t`
 - `access_log_variables.t`
 - `auth_basic.t`
 - `auth_delay.t`
@@ -24,6 +25,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `body.t`
 - `body_chunked.t`
 - `config_dump.t`
+- `error_log.t`
 - `gzip.t`
 - `headers.t`
 - `http_error_page.t`
@@ -33,6 +35,8 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `http_host.t`
 - `http_include.t`
 - `http_keepalive.t`
+- `http_keepalive_shutdown.t`
+- `http_listen.t`
 - `http_location.t`
 - `http_location_auto.t`
 - `http_method.t`
@@ -43,16 +47,36 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `http_variables.t`
 - `ignore_invalid_headers.t`
 - `index.t`
+- `limit_conn_complex.t`
+- `limit_conn_dry_run.t`
 - `limit_rate.t`
+- `limit_req.t`
+- `limit_req2.t`
+- `limit_req_delay.t`
+- `limit_req_dry_run.t`
 - `map.t`
 - `map_complex.t`
 - `map_volatile.t`
 - `merge_slashes.t`
 - `not_modified.t`
+- `not_modified_finalize.t`
 - `post_action.t`
 - `proxy_available.t`
+- `proxy_bind.t`
+- `proxy_cache_bypass.t`
+- `proxy_cache_chunked.t`
+- `proxy_cache_control.t`
+- `proxy_cache_error.t`
+- `proxy_cache_lock.t`
+- `proxy_cache_lock_age.t`
+- `proxy_cache_min_free.t`
+- `proxy_cache_path.t`
+- `proxy_cache_revalidate.t`
+- `proxy_cache_valid.t`
+- `proxy_cache_variables.t`
 - `proxy_chunked_extra.t`
 - `proxy_duplicate_headers.t`
+- `proxy_implicit.t`
 - `proxy_intercept_errors.t`
 - `proxy_limit_rate.t`
 - `proxy_max_temp_file_size.t`
@@ -62,10 +86,12 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_pass_request.t`
 - `proxy_request_buffering_keepalive.t`
 - `proxy_set_body.t`
+- `proxy_unix.t`
 - `proxy_upstream_cookie.t`
 - `proxy_variables.t`
 - `proxy_xar.t`
 - `range_if_range.t`
+- `realip_hostname.t`
 - `realip_remote_addr.t`
 - `realip_remote_port.t`
 - `rewrite.t`
@@ -79,32 +105,46 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `ssl_session_reuse.t`
 - `ssl_sni.t`
 - `ssl_sni_sessions.t`
+- `syslog.t`
 - `trailers.t`
 - `upstream.t`
+- `upstream_hash.t`
+- `upstream_ip_hash.t`
+- `upstream_ip_hash_ipv6.t`
 - `upstream_keepalive.t`
 - `upstream_least_conn.t`
+- `upstream_zone.t`
 - `worker_channel.t`
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (47)
+## Failing — actively being worked on (59)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
-- `access_log.t` — 19/21
+- `access_log.t` — 2/21
 - `http_absolute_redirect.t` — 16/25
-- `http_disable_symlinks.t` — 8/30
-- `http_listen.t` — 0/0
-- `http_resolver.t` — 0/0
-- `http_resolver_cleanup.t` — 1/3
-- `http_resolver_cname.t` — 11/13
-- `proxy.t` — 28/30
-- `proxy_bind.t` — 3/7
+- `http_disable_symlinks.t` — 4/30
+- `http_resolver.t` — 25/40
+- `http_resolver_aaaa.t` — 49/74
+- `http_resolver_cleanup.t` — 0/3
+- `http_resolver_cname.t` — 3/13
+- `http_resolver_ipv4.t` — 3/5
+- `limit_conn.t` — 1/10
+- `not_modified_proxy.t` — 4/14
+- `proxy.t` — 1/30
+- `proxy_cache.t` — 0/0
+- `proxy_cache_convert_head.t` — 2/10
+- `proxy_cache_max_range_offset.t` — 0/0
+- `proxy_cache_range.t` — 6/9
+- `proxy_cache_vary.t` — 28/54
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 0/0
+- `proxy_force_ranges.t` — 7/9
 - `proxy_if.t` — 15/17
+- `proxy_merge_headers.t` — 2/13
 - `proxy_method.t` — 3/6
-- `proxy_next_upstream_tries.t` — 8/10
+- `proxy_next_upstream_tries.t` — 1/10
 - `proxy_protocol.t` — 24/26
 - `proxy_protocol2.t` — 28/30
 - `proxy_protocol2_tlv.t` — 14/16
@@ -120,9 +160,9 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_ssl_keepalive.t` — 3/5
 - `proxy_ssl_verify.t` — 6/8
 - `proxy_ssl_verify_ip.t` — 8/10
-- `proxy_unix.t` — 5/7
+- `proxy_websocket.t` — 24/28
+- `range_clearing.t` — 3/5
 - `realip.t` — 0/0
-- `realip_hostname.t` — 0/0
 - `ssl.t` — 3/23
 - `ssl_cache.t` — 4/6
 - `ssl_certificate_aux.t` — 0/0
@@ -138,8 +178,11 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_stapling.t` — 10/12
 - `ssl_verify_client.t` — 14/16
 - `ssl_verify_depth.t` — 9/11
+- `stub_status.t` — 2/36
+- `upstream_max_conns.t` — 16/18
+- `upstream_zone_ssl.t` — 9/11
 
-## Intentionally skipped (389)
+## Intentionally skipped (346)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
@@ -291,38 +334,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `proxy_trailers.t`
 - `worker_shutdown_timeout_h2.t`
 
-### no cache available (29)
-
-- `auth_request.t`
-- `image_filter_finalize.t`
-- `not_modified_finalize.t`
-- `not_modified_proxy.t`
-- `proxy_cache.t`
-- `proxy_cache_bypass.t`
-- `proxy_cache_chunked.t`
-- `proxy_cache_control.t`
-- `proxy_cache_convert_head.t`
-- `proxy_cache_error.t`
-- `proxy_cache_lock.t`
-- `proxy_cache_lock_age.t`
-- `proxy_cache_lock_ssi.t`
-- `proxy_cache_max_range_offset.t`
-- `proxy_cache_min_free.t`
-- `proxy_cache_path.t`
-- `proxy_cache_range.t`
-- `proxy_cache_revalidate.t`
-- `proxy_cache_use_stale.t`
-- `proxy_cache_valid.t`
-- `proxy_cache_variables.t`
-- `proxy_cache_vary.t`
-- `proxy_extra_data.t`
-- `proxy_force_ranges.t`
-- `proxy_merge_headers.t`
-- `proxy_unfinished.t`
-- `range_charset.t`
-- `range_clearing.t`
-- `slice.t`
-
 ### no http_v3 available (23)
 
 - `h3_absolute_redirect.t`
@@ -368,9 +379,11 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `mail_ssl_session_reuse.t`
 - `worker_shutdown_timeout_mail.t`
 
-### no ssi available (14)
+### no ssi available (16)
 
 - `msie_refresh.t`
+- `proxy_cache_lock_ssi.t`
+- `proxy_cache_use_stale.t`
 - `proxy_chunked.t`
 - `proxy_keepalive.t`
 - `proxy_ssi_body.t`
@@ -401,9 +414,10 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `fastcgi_unix.t`
 - `fastcgi_variables.t`
 
-### no sub available (8)
+### no sub available (9)
 
 - `addition_buffered.t`
+- `proxy_unfinished.t`
 - `sub_filter.t`
 - `sub_filter_buffering.t`
 - `sub_filter_merge.t`
@@ -412,16 +426,16 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `sub_filter_perl.t`
 - `sub_filter_ssi.t`
 
-### no upstream_zone available (8)
+### no upstream_sticky available (8)
 
-- `upstream_random.t`
-- `upstream_resolve.t`
-- `upstream_resolve_reload.t`
-- `upstream_resolver.t`
-- `upstream_service.t`
-- `upstream_service_reload.t`
-- `upstream_zone.t`
-- `upstream_zone_ssl.t`
+- `upstream_max_conns_sticky.t`
+- `upstream_sticky.t`
+- `upstream_sticky_drain.t`
+- `upstream_sticky_learn.t`
+- `upstream_sticky_learn_header.t`
+- `upstream_sticky_next.t`
+- `upstream_sticky_resolve.t`
+- `upstream_sticky_route.t`
 
 ### SCGI not installed (7)
 
@@ -432,26 +446,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `scgi_gzip.t`
 - `scgi_merge_params.t`
 - `scgi_request_buffering.t`
-
-### no limit_req available (7)
-
-- `error_log.t`
-- `http_keepalive_shutdown.t`
-- `limit_req.t`
-- `limit_req2.t`
-- `limit_req_delay.t`
-- `limit_req_dry_run.t`
-- `syslog.t`
-
-### no upstream_sticky available (7)
-
-- `upstream_max_conns_sticky.t`
-- `upstream_sticky.t`
-- `upstream_sticky_drain.t`
-- `upstream_sticky_learn.t`
-- `upstream_sticky_learn_header.t`
-- `upstream_sticky_next.t`
-- `upstream_sticky_resolve.t`
 
 ### no uwsgi available (7)
 
@@ -489,20 +483,20 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `memcached_keepalive_stale.t`
 - `upstream_hash_memcached.t`
 
-### no inet6 support (5)
-
-- `access.t`
-- `http_resolver_aaaa.t`
-- `http_resolver_ipv4.t`
-- `proxy_implicit.t`
-- `proxy_ssl_name.t`
-
-### no charset available (4)
+### no charset available (5)
 
 - `autoindex.t`
 - `charset.t`
 - `charset_gzip_static.t`
 - `range.t`
+- `range_charset.t`
+
+### no fastcgi available (4)
+
+- `auth_request.t`
+- `fastcgi_body.t`
+- `fastcgi_keepalive.t`
+- `slice.t`
 
 ### no gunzip available (4)
 
@@ -517,13 +511,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `mp4_ssi.t`
 - `mp4_start_key_frame.t`
 - `range_mp4.t`
-
-### no upstream_ip_hash available (4)
-
-- `upstream_ip_hash.t`
-- `upstream_ip_hash_ipv6.t`
-- `upstream_max_conns.t`
-- `upstream_sticky_route.t`
 
 ### can leave orphaned process group (3)
 
@@ -549,17 +536,17 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `dav_chunked.t`
 - `dav_utf8.t`
 
-### no limit_conn available (3)
-
-- `limit_conn.t`
-- `limit_conn_complex.t`
-- `limit_conn_dry_run.t`
-
 ### no openssl:1.0.2 available (3)
 
 - `proxy_ssl_certificate_cache.t`
 - `ssl_certificate_cache.t`
 - `ssl_conf_command.t`
+
+### no resolve in upstream server (3)
+
+- `upstream_resolve.t`
+- `upstream_resolve_reload.t`
+- `upstream_service_reload.t`
 
 ### no tunnel (3)
 
@@ -589,6 +576,11 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `geo_binary.t`
 - `stream_geo_binary.t`
 
+### no addition available (2)
+
+- `addition.t`
+- `proxy_extra_data.t`
+
 ### no auth_request available (2)
 
 - `auth_request_satisfy.t`
@@ -599,10 +591,10 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `control_api.t`
 - `control_api_unix.t`
 
-### no fastcgi available (2)
+### no image_filter available (2)
 
-- `fastcgi_body.t`
-- `fastcgi_keepalive.t`
+- `image_filter_finalize.t`
+- `image_filter_webp.t`
 
 ### no memcached available (2)
 
@@ -623,10 +615,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `image_filter.t`
 
-### Protocol::WebSocket not installed (1)
-
-- `proxy_websocket.t`
-
 ### Win32API::File not installed (1)
 
 - `autoindex_win32.t`
@@ -643,10 +631,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `ssl_engine_keys.t`
 
-### no addition available (1)
-
-- `addition.t`
-
 ### no empty_gif available (1)
 
 - `empty_gif.t`
@@ -659,9 +643,9 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `geoip.t`
 
-### no image_filter available (1)
+### no inet6 support (1)
 
-- `image_filter_webp.t`
+- `proxy_ssl_name.t`
 
 ### no json available (1)
 
@@ -695,9 +679,17 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `referer.t`
 
+### no resolver in upstream (1)
+
+- `upstream_resolver.t`
+
 ### no secure_link available (1)
 
 - `secure_link.t`
+
+### no service in upstream server (1)
+
+- `upstream_service.t`
 
 ### no slice available (1)
 
@@ -711,13 +703,9 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `ssl_cache_reload.t`
 
-### no stub_status available (1)
+### no upstream_random available (1)
 
-- `stub_status.t`
-
-### no upstream_hash available (1)
-
-- `upstream_hash.t`
+- `upstream_random.t`
 
 ### not win32 (1)
 
