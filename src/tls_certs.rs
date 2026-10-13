@@ -412,6 +412,7 @@ pub fn build_server_config(
     protocols: TlsVersionSet,
     session_timeout_secs: Option<u32>,
     resumption: crate::config::SessionResumption,
+    ticket_keys: Option<Vec<crate::tls_ticket::TicketKey>>,
 ) -> Result<Arc<ServerConfig>, rustls::Error> {
     let versions: Vec<&'static SupportedProtocolVersion> =
         match (protocols.tlsv1_2, protocols.tlsv1_3) {
@@ -440,9 +441,18 @@ pub fn build_server_config(
         Arc::new(rustls::server::NoServerSessionStorage {})
     };
     if tickets {
-        let inner_ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()?;
+        // nginx's ticket keys (`tls_ticket`): the files, keys rotating with
+        // a shared session cache, or one random key.
+        let inner = match ticket_keys {
+            Some(keys) => crate::tls_ticket::NginxTicketer::from_keys(keys, timeout_secs),
+            None if cache && resumption.shared => {
+                crate::tls_ticket::NginxTicketer::rotating(timeout_secs)
+            }
+            None => crate::tls_ticket::NginxTicketer::single(timeout_secs),
+        }
+        .ok_or_else(|| rustls::Error::General("cannot set up session ticket keys".into()))?;
         cfg.ticketer = Arc::new(crate::tls_session::ExpiringTicketer::new(
-            inner_ticketer,
+            Arc::new(inner),
             timeout_secs,
         ));
     } else if !cache {
@@ -684,7 +694,7 @@ mod tests {
         let key = ck(RSA_CRT, RSA_KEY_PKCS8);
         let mut r = ServerNameResolver::new();
         r.add_exact("test.ruxen.local", key);
-        let cfg = build_server_config(r, TlsVersionSet::default(), None, Default::default())
+        let cfg = build_server_config(r, TlsVersionSet::default(), None, Default::default(), None)
             .expect("default protocols build");
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
@@ -699,7 +709,12 @@ mod tests {
                 r,
                 TlsVersionSet::default(),
                 None,
-                SessionResumption { cache, tickets },
+                SessionResumption {
+                    cache,
+                    tickets,
+                    ..Default::default()
+                },
+                None,
             )
             .unwrap()
         };
@@ -726,7 +741,7 @@ mod tests {
             tlsv1_2: false,
             tlsv1_3: false,
         };
-        let err = build_server_config(r, empty, None, Default::default())
+        let err = build_server_config(r, empty, None, Default::default(), None)
             .expect_err("empty set rejected");
         assert!(matches!(err, rustls::Error::General(_)));
     }

@@ -148,6 +148,7 @@ pub(crate) fn parse_error_log_args(args: &[String]) -> Result<ErrorLog, Error> {
 
 pub(crate) fn parse_error_log_target(raw: &str) -> Result<ErrorLogTarget, Error> {
     if raw == "stderr" {
+        values::note_stderr_log();
         return Ok(ErrorLogTarget::Stderr);
     }
     if let Some(syslog) = raw.strip_prefix("syslog:") {
