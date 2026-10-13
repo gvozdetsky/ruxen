@@ -167,8 +167,17 @@ fn m102_upstream_name_or_ip_literal() {
         (200, format!("GET /up?q=1 HTTP/1.0 | 127.0.0.1:{backend}"))
     );
     let log = std::fs::read_to_string(server.1.join("access.log")).unwrap();
-    let want = format!("127.0.0.1:{backend}");
-    assert_eq!(log.lines().collect::<Vec<_>>(), [want.as_str(); 4]);
+    let v4 = format!("127.0.0.1:{backend}");
+    // `localhost` is the first address it resolves to.
+    let localhost = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", backend))
+        .unwrap()
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        [v4.as_str(), v4.as_str(), localhost.as_str(), v4.as_str()]
+    );
 }
 
 #[test]
