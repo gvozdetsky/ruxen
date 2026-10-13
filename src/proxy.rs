@@ -490,7 +490,7 @@ impl ProxyPlan {
 /// failed attempt is appended to `failures` so the worker can log it with
 /// the request's context; on the happy path nothing is pushed and the
 /// caller's empty `Vec` never allocates.
-pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Response {
+pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Response {
     if let Some(cache) = plan.cache.as_deref_mut() {
         if cache.wait_until.is_some() {
             Box::pin(wait_for_lock(cache)).await;
@@ -2280,7 +2280,7 @@ async fn wait_for_lock(cache: &mut CachePlan) {
 /// client; this fetches the new one and stores it, as nginx's background
 /// subrequest does. Boxed: `run_proxy` spawns it.
 fn background_update(
-    mut plan: ProxyPlan,
+    mut plan: Box<ProxyPlan>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
     if let Some(cache) = plan.cache.as_deref_mut() {
         cache.background = false;
