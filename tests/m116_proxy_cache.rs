@@ -289,4 +289,14 @@ fn m116_conditional_hits() {
     assert!(r.starts_with("HTTP/1.1 412"), "{r}");
     let r = conditional("If-Match: \"other\"");
     assert!(r.starts_with("HTTP/1.1 412"), "{r}");
+
+    // A response fetched now and stored (a bypass refreshes the cache)
+    // gets the same answer.
+    let r = request(
+        s.port,
+        &format!("GET /c.txt?bypass=1 HTTP/1.0\r\nHost: x\r\nIf-None-Match: {etag}\r\n\r\n"),
+    );
+    assert!(r.starts_with("HTTP/1.1 304"), "{r}");
+    assert_eq!(status_of(&r), "BYPASS", "{r}");
+    assert_eq!(body_of(&r), "", "{r}");
 }

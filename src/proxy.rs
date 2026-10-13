@@ -725,6 +725,11 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 if let Some(cache) = plan.cache.as_deref() {
                     if let Some(storable) = storable.take() {
                         store_response(cache, storable, status, intercepted.is_some(), &resp);
+                        // The client may already have it (#349): the
+                        // not-modified filter of a cacheable response.
+                        if status == 200 && intercepted.is_none() {
+                            conditional_fresh(&plan, cache, &mut resp);
+                        }
                     }
                     if cache.head_as_get {
                         strip_body(&mut resp);
@@ -2588,6 +2593,28 @@ fn not_modified(head: &[u8], request_headers: &[u8]) -> Option<u16> {
         return None;
     }
     Some(304)
+}
+
+/// `not_modified` for a response just fetched and stored: `resp` (the
+/// client's response, buffered with a cache) becomes the 304 or 412.
+#[cold]
+#[inline(never)]
+fn conditional_fresh(plan: &ProxyPlan, cache: &CachePlan, resp: &mut Response) {
+    let Response::Owned(out) = resp else {
+        return;
+    };
+    let Some((end, terminator)) = find_head_end(out, 0) else {
+        return;
+    };
+    match not_modified(&out[..end + terminator], &cache.request_headers) {
+        Some(412) => {
+            let body = format!("{}\n", crate::http::reason_phrase(412));
+            *out =
+                crate::http::build_response_for_method(412, &body, plan.method, plan.server_bytes);
+        }
+        Some(status) => *out = conditional_head(&out[..end], status),
+        None => {}
+    }
 }
 
 /// The cached head as the not-modified filter sends a 304: without
