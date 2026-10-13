@@ -23,9 +23,11 @@ Wants=network-online.target
 Type=exec
 ExecStartPre=/usr/local/bin/ruxen -t -q -c /etc/ruxen/ruxen.conf
 ExecStart=/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf
-# SIGUSR1 reopens the log files, for logrotate. ruxen can't re-read its
-# configuration yet (`-s reload`, issue #89): restart it to apply a change.
-ExecReload=/bin/kill -USR1 $MAINPID
+# SIGHUP reloads the configuration without dropping connections, as
+# `ruxen -s reload`. Check it first: a configuration that fails is logged
+# and the running one stays.
+ExecReload=/usr/local/bin/ruxen -t -q -c /etc/ruxen/ruxen.conf
+ExecReload=/bin/kill -HUP $MAINPID
 # SIGQUIT is the graceful stop: requests in flight finish, within
 # worker_shutdown_timeout if the configuration sets one. systemd sends
 # SIGKILL after TimeoutStopSec.

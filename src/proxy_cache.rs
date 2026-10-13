@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The key's hash: names the file and indexes the zone.
 pub type CacheHash = [u8; 16];
@@ -239,6 +239,52 @@ pub struct CacheZone {
     size: AtomicU64,
     temp_seq: AtomicU64,
     lock_seq: AtomicU64,
+    /// The configured zone size (`keys_zone=name:size`).
+    zone_size: u64,
+    /// A manager thread looks after the zone (`start_manager`).
+    managed: AtomicBool,
+    /// No configuration uses the zone any more after a reload: its
+    /// manager stops.
+    retired: AtomicBool,
+}
+
+/// The zones of the configurations workers serve. A reload that declares a
+/// zone the same way gets the same one, with what its index knows, as
+/// nginx keeps a shared memory zone of the same name and size (#89).
+static ZONES: Mutex<Vec<&'static CacheZone>> = Mutex::new(Vec::new());
+
+/// The zone for `conf`: the one already in use if it is the same,
+/// otherwise a new one.
+pub fn zone_for(conf: ZoneConf) -> &'static CacheZone {
+    let mut zones = ZONES.lock().unwrap_or_else(|e| e.into_inner());
+    let same = zones.iter().copied().find(|z| {
+        z.name == conf.name
+            && z.path == conf.path
+            && z.levels == conf.levels
+            && z.zone_size == conf.size
+            && z.inactive == conf.inactive_secs as i64
+            && z.max_size == conf.max_size.unwrap_or(u64::MAX)
+            && z.min_free == conf.min_free.unwrap_or(0)
+    });
+    if let Some(zone) = same {
+        return zone;
+    }
+    let zone: &'static CacheZone = Box::leak(Box::new(CacheZone::new(conf)));
+    zones.push(zone);
+    zone
+}
+
+/// After a reload: stop managing the zones `keep` (the new configuration's)
+/// doesn't have.
+pub fn retire_zones_but(keep: &[&'static CacheZone]) {
+    let mut zones = ZONES.lock().unwrap_or_else(|e| e.into_inner());
+    zones.retain(|z| {
+        let kept = keep.iter().any(|k| std::ptr::eq(*k, *z));
+        if !kept {
+            z.retired.store(true, Ordering::Relaxed);
+        }
+        kept
+    });
 }
 
 /// A `proxy_cache_path` as configured.
@@ -280,6 +326,9 @@ impl CacheZone {
             size: AtomicU64::new(0),
             temp_seq: AtomicU64::new(0),
             lock_seq: AtomicU64::new(1),
+            zone_size: conf.size,
+            managed: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -685,11 +734,15 @@ impl CacheZone {
 /// Run the loader, then the manager every second, on a thread of its own
 /// (nginx's cache loader and manager processes).
 pub fn start_manager(zone: &'static CacheZone) {
+    // A zone a reload kept has its manager already.
+    if zone.managed.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let _ = std::thread::Builder::new()
         .name(format!("ruxen-cache-{}", zone.name))
         .spawn(move || {
             zone.load(now_secs());
-            loop {
+            while !zone.retired.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 zone.manage(now_secs());
             }

@@ -1185,35 +1185,55 @@ async fn run_post_action(
 /// everything else — listeners, the io_uring ring, accepted sockets,
 /// per-request files, access-log handles — is opened by the worker that
 /// uses it. `RUXEN_UNSHARE_FILES=0` keeps the shared table (for A/B runs).
-fn unshare_fd_table() {
+fn unshare_fd_table() -> bool {
     if matches!(std::env::var("RUXEN_UNSHARE_FILES").as_deref(), Ok("0")) {
-        return;
+        return false;
     }
     // Said once, not by every worker: they all fail the same way (a
     // seccomp profile without the rule in contrib/docker, say).
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // SAFETY: plain syscall; affects only the calling thread's fd table.
-    if unsafe { libc::unshare(libc::CLONE_FILES) } != 0
-        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
+    if unsafe { libc::unshare(libc::CLONE_FILES) } == 0 {
+        return true;
+    }
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
             "ruxen: unshare(CLONE_FILES) failed: {}; workers keep the shared fd table",
             std::io::Error::last_os_error()
         );
     }
+    false
 }
 
 /// Worker thread body. `ready` gets exactly one message once startup is
-/// done — `Ok` when every listener is bound, or the `[emerg]` text of the
-/// first failure, after which the worker exits. `main` waits for all of
-/// them before writing the pid file.
+/// done — `Ok` when the worker is ready to accept on `listeners` (opened
+/// by `main`, see `listeners`), or the `[emerg]` text of the first
+/// failure, after which the worker exits. `main` waits for all of them
+/// before writing the pid file, or before a reload retires the workers of
+/// the configuration before.
 pub fn run(
     http: &'static PreparedHttp,
     cpu: Option<usize>,
     state: &'static RuntimeState,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
+    listeners: super::listeners::WorkerListeners,
 ) {
-    unshare_fd_table();
+    let unshared = unshare_fd_table();
+    let adopted = match super::listeners::adopt(listeners, unshared) {
+        Ok(adopted) => adopted,
+        Err(e) => {
+            let _ = ready.send(Err(format!("dup() failed ({})", errno_text(&e))));
+            return;
+        }
+    };
+    // What `force_close` leaves alone: everything open now but the
+    // listeners. Only with a table of its own, where the rest is this
+    // worker's.
+    let inherited = unshared.then(|| {
+        use std::os::fd::AsRawFd;
+        let own: Vec<_> = adopted.iter().map(|(_, fd)| fd.as_raw_fd()).collect();
+        super::listeners::inherited_fds(&own)
+    });
     if let Some(c) = cpu {
         // Pin before building the runtime so io_uring setup + the submission
         // queue end up on the target CPU's kernel workers too.
@@ -1235,35 +1255,24 @@ pub fn run(
         }
 
         let mut listeners = Vec::with_capacity(http.listens.len());
-        // `listen unix:` sockets, bound by `main` (#263).
+        // `listen unix:` sockets (#263).
         let mut unix_listeners = Vec::new();
-        for (listen_index, prepared) in http.listens.iter().enumerate() {
-            if prepared.unix.is_some() {
-                match unix_listener_for(listen_index) {
-                    Ok(listener) => unix_listeners.push((listen_index, listener)),
-                    Err(e) => {
-                        let _ = ready.send(Err(format!(
-                            "unix:{} failed ({})",
-                            prepared.unix.unwrap_or(Path::new("")).display(),
-                            errno_text(&e)
-                        )));
-                        return;
-                    }
-                }
-                continue;
-            }
-            let bound = listen_socket(http, prepared)
-                .and_then(|socket| TcpListener::from_std(socket.into()));
-            match bound {
-                Ok(listener) => listeners.push((listen_index, listener)),
-                Err(e) => {
-                    let _ = ready.send(Err(format!(
-                        "bind() to {} failed ({})",
-                        prepared.addr,
-                        errno_text(&e)
-                    )));
-                    return;
-                }
+        for (listen_index, fd) in adopted {
+            let prepared = &http.listens[listen_index];
+            let made = if prepared.unix.is_some() {
+                monoio::net::UnixListener::from_std(std::os::unix::net::UnixListener::from(fd))
+                    .map(|l| unix_listeners.push((listen_index, l)))
+            } else {
+                TcpListener::from_std(std::net::TcpListener::from(fd))
+                    .map(|l| listeners.push((listen_index, l)))
+            };
+            if let Err(e) = made {
+                let _ = ready.send(Err(format!(
+                    "registering the listener of {} failed ({})",
+                    prepared.addr,
+                    errno_text(&e)
+                )));
+                return;
             }
         }
         let _ = ready.send(Ok(()));
@@ -1287,9 +1296,11 @@ pub fn run(
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
                 if state.is_shutting_down() {
-                    while worker_clients() != 0 {
-                        monoio::time::sleep(Duration::from_millis(10)).await;
-                    }
+                    // Stop accepting at once: after a reload, the socket
+                    // goes on with the next generation's worker, or is
+                    // closed if the address went away.
+                    drop(listener);
+                    drain(state, inherited.as_deref()).await;
                     flush_access_log_buffers();
                     return;
                 }
@@ -1320,17 +1331,36 @@ pub fn run(
                 }
             }
         } else {
+            let mut accepting = Vec::with_capacity(listeners.len() + unix_listeners.len());
             for (listen_index, listener) in listeners {
-                monoio::spawn(run_listener(listener, listen_index, http, state));
+                accepting.push(monoio::spawn(run_listener(
+                    listener,
+                    listen_index,
+                    http,
+                    state,
+                )));
             }
             for (listen_index, listener) in unix_listeners {
-                monoio::spawn(run_unix_listener(listener, listen_index, http, state));
+                accepting.push(monoio::spawn(run_unix_listener(
+                    listener,
+                    listen_index,
+                    http,
+                    state,
+                )));
             }
 
             loop {
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(&state);
-                if state.is_shutting_down() && worker_clients() == 0 {
+                if state.is_shutting_down() {
+                    // The accept loops cancel their accepts and close their
+                    // sockets. Dropped with the runtime instead, an accept
+                    // left in the ring kept the socket listening after a
+                    // reload removed its address.
+                    for task in accepting {
+                        task.await;
+                    }
+                    drain(state, inherited.as_deref()).await;
                     flush_access_log_buffers();
                     return;
                 }
@@ -1390,74 +1420,23 @@ pub fn driver() -> Driver {
     }
 }
 
-/// `listen unix:` sockets, bound once by `main` before the workers start:
-/// a unix stream socket can't be shared with `SO_REUSEPORT`, so every
-/// worker accepts on its copy of the one descriptor (nginx's workers share
-/// the inherited socket the same way). (listen index, descriptor).
-static UNIX_LISTEN_FDS: std::sync::OnceLock<Vec<(usize, std::os::fd::RawFd)>> =
-    std::sync::OnceLock::new();
-
-/// Bind every `listen unix:` socket (#263), as ngx_open_listening_sockets:
-/// a socket file left behind fails with EADDRINUSE, and the socket is
-/// made writable for everyone (0666).
-pub fn bind_unix_listeners(http: &PreparedHttp) -> Result<(), String> {
-    use std::os::fd::IntoRawFd;
-    use std::os::unix::fs::PermissionsExt;
-    let mut fds = Vec::new();
-    for (listen_index, listen) in http.listens.iter().enumerate() {
-        let Some(path) = listen.unix else { continue };
-        let failed = |e: std::io::Error| {
-            format!(
-                "bind() to unix:{} failed ({})",
-                path.display(),
-                errno_text(&e)
-            )
-        };
-        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-            .map_err(failed)?;
-        socket
-            .bind(&socket2::SockAddr::unix(path).map_err(failed)?)
-            .map_err(failed)?;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
-        socket.listen(listen.socket.backlog).map_err(|e| {
-            format!(
-                "listen() to unix:{} failed ({})",
-                path.display(),
-                errno_text(&e)
-            )
-        })?;
-        socket.set_nonblocking(true).map_err(failed)?;
-        fds.push((listen_index, socket.into_raw_fd()));
-    }
-    let _ = UNIX_LISTEN_FDS.set(fds);
-    Ok(())
-}
-
-/// Remove the `listen unix:` socket files on exit, as
-/// ngx_close_listening_sockets does.
-pub fn remove_unix_sockets(http: &PreparedHttp) {
-    for listen in &http.listens {
-        if let Some(path) = listen.unix {
-            let _ = std::fs::remove_file(path);
+/// Wait for this worker's connections to finish once shutdown began. When
+/// `main` forces the end (`worker_shutdown_timeout` after a reload), shut
+/// their sockets down, again every second for connections opened since
+/// (an upstream retry); `inherited` is `None` without a private fd table,
+/// where that can't be told apart.
+async fn drain(state: &RuntimeState, inherited: Option<&[std::os::fd::RawFd]>) {
+    let mut swept: Option<Instant> = None;
+    while worker_clients() != 0 {
+        if state.is_forced()
+            && let Some(inherited) = inherited
+            && swept.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            super::listeners::shut_down_sockets(inherited);
+            swept = Some(Instant::now());
         }
+        monoio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-
-/// This worker's listener for a `listen unix:` socket: its copy of the
-/// descriptor `main` bound.
-fn unix_listener_for(listen_index: usize) -> std::io::Result<monoio::net::UnixListener> {
-    use std::os::fd::FromRawFd;
-    let fd = UNIX_LISTEN_FDS
-        .get()
-        .and_then(|fds| fds.iter().find(|(i, _)| *i == listen_index))
-        .map(|(_, fd)| *fd)
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-    // SAFETY: `fd` is a listening unix socket in this worker's own copy of
-    // the fd table (unshared after `main` bound it); only this listener
-    // uses it here.
-    monoio::net::UnixListener::from_std(unsafe {
-        std::os::unix::net::UnixListener::from_raw_fd(fd)
-    })
 }
 
 /// The accept loop of a `listen unix:` socket (#263). A connection is
@@ -1757,7 +1736,7 @@ async fn handle_proxy_protocol(
 /// instance may still be letting go), an `[emerg]` per failed bind, then
 /// `still could not bind()`. Addresses with `reuseport` are skipped, as
 /// nginx shares them too.
-pub(crate) fn claim_addresses(listens: &[PreparedListen]) -> Result<(), String> {
+pub(crate) fn claim_addresses(listens: &[&PreparedListen]) -> Result<(), String> {
     use socket2::{Domain, Protocol, Socket, Type};
     for tries in (0..5).rev() {
         let mut busy = false;
@@ -1819,22 +1798,44 @@ pub(crate) fn listen_socket(
     socket.set_nonblocking(true)?;
     socket.set_reuse_port(true)?;
     socket.set_reuse_address(true)?;
-    let alert = |what: String, e: std::io::Error| {
-        write_worker_log(
-            http.error_logs,
-            ErrorLogLevel::Alert,
-            &format!(
-                "setsockopt({what}) {addr} failed ({}), ignored",
-                errno_text(&e)
-            ),
-        );
-    };
     if addr.is_ipv6()
         && let Err(e) = socket.set_only_v6(o.ipv6only)
     {
-        alert(format!("IPV6_V6ONLY, {}", o.ipv6only as i32), e);
+        listen_alert(
+            http,
+            prepared,
+            format!("IPV6_V6ONLY, {}", o.ipv6only as i32),
+            e,
+        );
     }
     socket.bind(&addr.into())?;
+    set_listen_options(http, prepared, &socket);
+    socket.listen(o.backlog)?;
+    set_deferred(http, prepared, &socket, false);
+    Ok(socket)
+}
+
+fn listen_alert(http: &PreparedHttp, prepared: &PreparedListen, what: String, e: std::io::Error) {
+    write_worker_log(
+        http.error_logs,
+        ErrorLogLevel::Alert,
+        &format!(
+            "setsockopt({what}) {} failed ({}), ignored",
+            prepared.addr,
+            errno_text(&e)
+        ),
+    );
+}
+
+/// The options set between bind and listen. Also for a socket a reload
+/// keeps (`listeners`).
+pub(crate) fn set_listen_options(
+    http: &PreparedHttp,
+    prepared: &PreparedListen,
+    socket: &socket2::Socket,
+) {
+    let o = &prepared.socket;
+    let alert = |what: String, e| listen_alert(http, prepared, what, e);
     if let Some(n) = o.rcvbuf
         && let Err(e) = socket.set_recv_buffer_size(n)
     {
@@ -1857,7 +1858,7 @@ pub(crate) fn listen_socket(
                 (libc::TCP_KEEPCNT, "TCP_KEEPCNT", cnt),
             ] {
                 if let Some(v) = value
-                    && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, opt, v as i32)
+                    && let Err(e) = setsockopt_int(socket, libc::IPPROTO_TCP, opt, v as i32)
                 {
                     alert(format!("{name}, {v}"), e);
                 }
@@ -1865,18 +1866,28 @@ pub(crate) fn listen_socket(
         }
     }
     if let Some(n) = o.fastopen
-        && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, n as i32)
+        && let Err(e) = setsockopt_int(socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, n as i32)
     {
         alert(format!("TCP_FASTOPEN, {n}"), e);
     }
-    socket.listen(o.backlog)?;
-    // nginx: a 1 s defer, since how long a connection queued can't be known.
-    if o.deferred
-        && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, 1)
-    {
-        alert("TCP_DEFER_ACCEPT, 1".to_string(), e);
+}
+
+/// `deferred`, set after listen. nginx: a 1 s defer, since how long a
+/// connection queued can't be known. `kept`: a socket a reload keeps, on
+/// which the option is cleared again when the new `listen` drops it.
+pub(crate) fn set_deferred(
+    http: &PreparedHttp,
+    prepared: &PreparedListen,
+    socket: &socket2::Socket,
+    kept: bool,
+) {
+    if !prepared.socket.deferred && !kept {
+        return;
     }
-    Ok(socket)
+    let on = prepared.socket.deferred as i32;
+    if let Err(e) = setsockopt_int(socket, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, on) {
+        listen_alert(http, prepared, format!("TCP_DEFER_ACCEPT, {on}"), e);
+    }
 }
 
 fn setsockopt_int(
@@ -2030,7 +2041,7 @@ pub(crate) async fn wait_readable_or_shutdown(
     stream: &TcpStream,
     state: &RuntimeState,
     idle_timeout: Option<Duration>,
-    start_reload_gen: u64,
+    fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> bool {
     use std::task::Poll;
@@ -2044,10 +2055,7 @@ pub(crate) async fn wait_readable_or_shutdown(
     // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
     // no per-connection tick.
     std::future::poll_fn(|cx| {
-        if state.is_shutting_down()
-            || state.reload_gen() != start_reload_gen
-            || idle.asked_to_close()
-        {
+        if (!fresh && state.is_shutting_down()) || idle.asked_to_close() {
             return Poll::Ready(false);
         }
         if let Poll::Ready(res) = readable.as_mut().poll(cx) {
@@ -2075,7 +2083,7 @@ pub(crate) async fn read_first_or_shutdown(
     buf: Vec<u8>,
     state: &RuntimeState,
     idle_timeout: Option<Duration>,
-    start_reload_gen: u64,
+    fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> (IdleRead, Vec<u8>) {
     use monoio::io::CancelableAsyncReadRent;
@@ -2102,10 +2110,7 @@ pub(crate) async fn read_first_or_shutdown(
     // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
     // no per-connection tick.
     let woke = std::future::poll_fn(|cx| {
-        if state.is_shutting_down()
-            || state.reload_gen() != start_reload_gen
-            || idle.asked_to_close()
-        {
+        if (!fresh && state.is_shutting_down()) || idle.asked_to_close() {
             return Poll::Ready(Woke::Close);
         }
         if let Poll::Ready(done) = read.as_mut().poll(cx) {
@@ -2208,6 +2213,11 @@ impl Drop for ConnectionGuard {
 /// This worker's accepted connections that haven't finished: a shutting
 /// down worker waits for them. Per worker, so an accept touches no cache
 /// line another worker writes (#128).
+/// The configuration this worker thread serves; `None` outside a worker.
+pub(crate) fn worker_http() -> Option<&'static PreparedHttp> {
+    WORKER_CONNS.with(|w| w.http.get())
+}
+
 fn worker_clients() -> usize {
     WORKER_CONNS.with(|w| w.clients.get())
 }
@@ -2724,12 +2734,14 @@ pub(crate) async fn handle<S: ConnIo>(
         io: std::pin::pin!(monoio::time::sleep(far)),
         idle: std::pin::pin!(monoio::time::sleep(far)),
     };
-    // Snapshot the reload generation at accept time. SIGHUP bumps the
-    // counter; idle keepalive waits and post-request keepalive checks both
-    // bail when the live value drifts above this snapshot, which makes
-    // existing connections close on reload while new ones (accepted after
-    // the bump) keep their fresh snapshot and stay open.
+    // A reload bumps the retired generation's counter: an upgraded
+    // connection then lives until `worker_shutdown_timeout` (`tunnel`).
     let start_reload_gen = state.reload_gen();
+    // Waiting for the first request: a shutdown or reload doesn't close
+    // the connection, as nginx's ngx_close_idle_connections closes only
+    // keep-alive ones; client_header_timeout bounds the wait. A connection
+    // an old worker accepted just before it stopped is served, not reset.
+    let mut fresh = true;
 
     // Per-connection scratch buffers — allocated once and reused across
     // every request on this connection. `mem::take` during `write_all`
@@ -2777,7 +2789,7 @@ pub(crate) async fn handle<S: ConnIo>(
                 std::mem::take(&mut *buf),
                 &state,
                 keepalive_idle_timeout,
-                start_reload_gen,
+                std::mem::take(&mut fresh),
                 &mut timers,
             )
             .await;
@@ -3546,7 +3558,6 @@ pub(crate) async fn handle<S: ConnIo>(
                             || connection_time_us / 1_000 > process_meta.keepalive.max_time_ms
                             || matches!(method, Method::Trace | Method::Connect)
                             || state.is_shutting_down()
-                            || state.reload_gen() != start_reload_gen
                             || (scan.has_connection && scan.connection_is_close)
                             // A compressed file to an HTTP/1.0 client has no
                             // length or chunks: the close ends it.

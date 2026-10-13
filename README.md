@@ -174,7 +174,7 @@ With nothing unsupported, the configuration is then loaded the way `-t` does it 
 
 ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it gracefully, `SIGTERM` at once, `SIGUSR1` reopens the log files; it can't re-read its configuration yet, so restart it to apply a change.
 
-**systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to the log reopen. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` with it.
+**systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to a configuration reload. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` and has ruxen reopen them with `SIGUSR1`.
 
 **Docker:** the default seccomp profile denies `io_uring`, so there ruxen runs on epoll. For `io_uring`, use [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json): Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`, and `unshare` with `CLONE_FILES` alone (each worker's own fd table; no namespaces); use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
 
@@ -311,7 +311,7 @@ and one option nginx doesn't have: `--compat`, the configuration check described
 
 Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.29.2` instead, because the upstream tests assert nginx's header.
 
-ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) and log reopening via `SIGUSR1`. `-s stop|quit|reopen` send `SIGTERM`/`SIGQUIT`/`SIGUSR1` to the PID in the config's `pid` file, as nginx does. `-s reload` is refused: ruxen can't re-read its configuration yet, so restart it instead.
+ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) log reopening via `SIGUSR1`, and configuration reload via `SIGHUP`. `-s stop|quit|reopen|reload` send `SIGTERM`/`SIGQUIT`/`SIGUSR1`/`SIGHUP` to the PID in the config's `pid` file, as nginx does. A reload starts new workers with the new configuration (certificates included) on the same listening sockets, so connections aren't refused or reset in the handover, and the old workers finish their requests, within `worker_shutdown_timeout` if set; a configuration that fails to load is logged and the running one stays. After a switch to `user`, a reload reads the configuration as that user and can't bind new ports below 1024.
 
 ## Compatibility philosophy
 
@@ -411,7 +411,6 @@ The following are intentionally outside the current v0.1 scope:
 - client certificate authentication
 - 0-RTT / TLS early data
 - persistent TLS session caches (the cache lives in memory and is lost on restart)
-- hot certificate reload
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
 

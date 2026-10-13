@@ -305,6 +305,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         upstreams: prepared_upstreams,
         cache_zones: CACHE_ZONES.with(|z| &*Box::leak(z.borrow().clone().into_boxed_slice())),
         implicit_upstreams: IMPLICIT_UPSTREAMS.with(|i| i.take().leak()),
+        root_fds: ROOT_FDS.with(|fds| fds.take().leak()),
         conf_prefix: conf_prefix.map(leak_path_buf),
         shutdown_timeout: runtime
             .worker_shutdown_timeout_ms
@@ -522,6 +523,10 @@ thread_local! {
     static IMPLICIT_UPSTREAMS: std::cell::Cell<
         Vec<(&'static [u8], u16, &'static PreparedUpstream)>,
     > = const { std::cell::Cell::new(Vec::new()) };
+    /// The root directories opened while a config is prepared, taken into
+    /// `PreparedHttp::root_fds`.
+    static ROOT_FDS: std::cell::RefCell<Vec<std::os::unix::io::RawFd>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The http block's `limit_req_zone`s by name while a config is
     /// prepared (#94).
     static LIMIT_REQ_ZONES: std::cell::RefCell<
@@ -546,17 +551,15 @@ fn prepare_cache_zones(paths: Vec<crate::config::ProxyCachePath>) -> Result<(), 
             _ => {}
         }
         crate::privileges::note_temp_dir(&p.path);
-        zones.push(&*Box::leak(Box::new(crate::proxy_cache::CacheZone::new(
-            crate::proxy_cache::ZoneConf {
-                name: p.zone,
-                path: p.path,
-                levels: p.levels,
-                size: p.size,
-                inactive_secs: p.inactive_secs,
-                max_size: p.max_size,
-                min_free: p.min_free,
-            },
-        ))));
+        zones.push(crate::proxy_cache::zone_for(crate::proxy_cache::ZoneConf {
+            name: p.zone,
+            path: p.path,
+            levels: p.levels,
+            size: p.size,
+            inactive_secs: p.inactive_secs,
+            max_size: p.max_size,
+            min_free: p.min_free,
+        }));
     }
     CACHE_ZONES.with(|z| *z.borrow_mut() = zones);
     Ok(())
@@ -2565,6 +2568,9 @@ pub(crate) fn build_handler(
             // exists, else on first use (`PreparedRoot::fd`).
             let root: &'static Path = Box::leak(path.into_boxed_path());
             let root_fd = open_root(root).unwrap_or(-1);
+            if root_fd != -1 {
+                ROOT_FDS.with(|fds| fds.borrow_mut().push(root_fd));
+            }
             let path_mapping = prepare_path_mapping(
                 mapping,
                 location_pattern,
