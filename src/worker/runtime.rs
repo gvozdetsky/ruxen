@@ -2724,7 +2724,7 @@ async fn serve_h2<S>(
     state: &'static RuntimeState,
     connection_id: u64,
 ) where
-    S: AsyncReadRent + AsyncWriteRent + 'static,
+    S: ConnIo + 'static,
 {
     Box::pin(super::h2::serve(
         stream,
@@ -2772,7 +2772,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // nginx increments `r->connection->requests` at request init, so
     // `$connection_requests` reads 1 on the first request, 2 on the
     // second, etc. Incrementing before rendering matches that contract.
-    let connection_start = Instant::now();
+    let (connection_start, mut request_count) = stream
+        .conn_counters()
+        .unwrap_or_else(|| (Instant::now(), 0));
     let mut remote_addr_buf = [0u8; 48];
     let (remote_addr, remote_port): (&[u8], u16) = if http.listens[listen_index].unix.is_some() {
         // A unix-domain client is `unix:`, with no port (#263).
@@ -2786,7 +2788,6 @@ pub(crate) async fn handle<S: ConnIo>(
         let n = cursor.position() as usize;
         (&remote_addr_buf[..n], peer_addr.port())
     };
-    let mut request_count: u64 = 0;
     // The default server's client timeouts: the header is read before a
     // virtual server is chosen (as in nginx). A request's body and response
     // use its location's client_body_timeout and send_timeout (#147).

@@ -14,6 +14,7 @@ use std::cell::UnsafeCell;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
@@ -37,7 +38,11 @@ pub(crate) struct PollIo<S: 'static> {
     wbuf: Vec<u8>,
     /// A failed write, reported by the next `poll_write` or `poll_flush`.
     write_error: Option<io::Error>,
-    stream: Box<UnsafeCell<S>>,
+    /// When the write in flight started; `None` while none is.
+    writing_since: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
+    /// Shared with `serve`, which closes the connection once the `h2`
+    /// connection (and with it this) is dropped.
+    stream: Rc<UnsafeCell<S>>,
 }
 
 impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
@@ -50,8 +55,21 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
             rpos: 0,
             wbuf: Vec::new(),
             write_error: None,
-            stream: Box::new(UnsafeCell::new(stream)),
+            writing_since: Default::default(),
+            stream: Rc::new(UnsafeCell::new(stream)),
         }
+    }
+
+    /// The stream, for after `self` is dropped: no operation borrows it
+    /// any more then.
+    pub(crate) fn stream_handle(&self) -> Rc<UnsafeCell<S>> {
+        self.stream.clone()
+    }
+
+    /// When the write in flight started, kept up to date for whoever
+    /// holds the handle (`serve`, once the `h2` connection owns `self`).
+    pub(crate) fn writing_since(&self) -> std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>> {
+        self.writing_since.clone()
     }
 
     /// The stream, for an operation that may run alongside the other
@@ -69,6 +87,7 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
         if let Some(op) = self.writing.as_mut() {
             let (res, buf) = ready!(op.as_mut().poll(cx));
             self.writing = None;
+            self.writing_since.set(None);
             self.wbuf = buf;
             if let Err(e) = res {
                 self.write_error = Some(e);
@@ -132,6 +151,7 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for Poll
         // SAFETY: see `stream`.
         let stream = unsafe { this.stream() };
         this.writing = Some(Box::pin(async move { stream.write_all(buf).await }));
+        this.writing_since.set(Some(std::time::Instant::now()));
         // Start it now: on io_uring, the submission is what gets it going.
         if let Poll::Ready(Err(e)) = this.poll_written(cx) {
             // Taken already: reported as this write's error.

@@ -87,12 +87,14 @@ pub(crate) async fn starts_with_preface(stream: &TcpStream, wait: Duration) -> b
 /// Serve an HTTP/2 connection until the client or a shutdown ends it.
 pub(crate) async fn serve<S>(stream: S, ctx: ConnCtx)
 where
-    S: AsyncReadRent + AsyncWriteRent + 'static,
+    S: super::ConnIo + 'static,
 {
     let ctx = Rc::new(ctx);
     let listen = &ctx.http.listens[ctx.listen_index];
     let timeouts = listen.servers[listen.default_server].timeouts;
     let io = compat::PollIo::new(stream);
+    let writing_since = io.writing_since();
+    let stream = io.stream_handle();
     // What nginx announces (ngx_http_v2_send_settings): 128 concurrent
     // streams (http2_max_concurrent_streams), a 64 KiB stream window
     // (http2_body_preread_size) and the largest frame size; then it opens
@@ -106,49 +108,113 @@ where
         .handshake::<_, Bytes>(io);
     // The preface and SETTINGS come under client_header_timeout, as the
     // first request line would.
-    let mut conn = match monoio::time::timeout(timeouts.header, handshake).await {
+    let conn = match monoio::time::timeout(timeouts.header, handshake).await {
         Ok(Ok(conn)) => conn,
         _ => return,
     };
+    drive(conn, &ctx, timeouts, writing_since).await;
+    // The `h2` connection, and with it every operation on the stream, is
+    // gone. Close as nginx does (ngx_http_v2_finalize_connection →
+    // lingering close): what the client still sends (a WINDOW_UPDATE, a
+    // PING) would otherwise make the kernel reset the connection, and the
+    // client could lose the end of a response.
+    // SAFETY: nothing else borrows the stream any more (see above).
+    let stream = unsafe { &mut *stream.get() };
+    super::lingering_close(stream, &mut Vec::new()).await;
+}
+
+/// Accept streams and keep the connection going until the client or a
+/// GOAWAY ends it.
+async fn drive<IO>(
+    mut conn: h2::server::Connection<IO, Bytes>,
+    ctx: &Rc<ConnCtx>,
+    timeouts: super::PreparedClientTimeouts,
+    writing_since: Rc<Cell<Option<std::time::Instant>>>,
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let listen = &ctx.http.listens[ctx.listen_index];
+    // The default server's keep-alive settings, as nginx applies its
+    // default server's to the connection (ngx_http_v2_state_headers,
+    // ngx_http_v2_handle_connection).
+    let keepalive = listen.servers[listen.default_server].keepalive;
+    let idle = keepalive
+        .idle_timeout_ms
+        .map_or(IDLE, Duration::from_millis);
+    let max_time = Duration::from_millis(keepalive.max_time_ms);
+    let started = std::time::Instant::now();
+    let mut requests: u64 = 0;
     let active = Rc::new(Cell::new(0usize));
     let mut idle_since = Some(monoio::time::Instant::now());
     let mut going_away = false;
+    // Gone away with nothing left to send: closed shortly after, also for a
+    // client that doesn't answer the GOAWAY's PING.
+    let mut drained_at: Option<monoio::time::Instant> = None;
     loop {
         let accepted = monoio::time::timeout(Duration::from_millis(50), conn.accept()).await;
+        let now = monoio::time::Instant::now();
         match accepted {
             Ok(Some(Ok((request, respond)))) => {
                 idle_since = None;
                 active.set(active.get() + 1);
+                let counters = (started, requests);
+                requests += 1;
                 let (http, connection_id, peer_addr) = (ctx.http, ctx.connection_id, ctx.peer_addr);
                 let ctx = ctx.clone();
                 let active = active.clone();
                 monoio::spawn(Contained::new(
                     async move {
-                        serve_stream(request, respond, &ctx).await;
+                        serve_stream(request, respond, &ctx, counters).await;
                         active.set(active.get() - 1);
                     },
                     http,
                     connection_id,
                     peer_addr,
                 ));
+                // nginx: GOAWAY once the connection carried
+                // keepalive_requests streams or outlived keepalive_time;
+                // the open streams finish.
+                if !going_away
+                    && (requests >= keepalive.max_requests || started.elapsed() > max_time)
+                {
+                    conn.graceful_shutdown();
+                    going_away = true;
+                }
             }
             // The client went away, or the connection failed.
             Ok(Some(Err(_))) | Ok(None) => break,
             Err(_) => {}
         }
         if going_away {
+            // Done once the streams are and what they sent is written, or
+            // when a write has made no progress for send_timeout.
+            let stuck = writing_since
+                .get()
+                .is_some_and(|since| since.elapsed() >= timeouts.send);
+            if active.get() == 0 && !conn.has_streams() && writing_since.get().is_none() {
+                let at = *drained_at.get_or_insert(now);
+                if now.duration_since(at) >= Duration::from_millis(200) {
+                    break;
+                }
+            } else {
+                drained_at = None;
+            }
+            if stuck {
+                break;
+            }
             continue;
         }
-        // keepalive_timeout bounds an HTTP/2 connection without streams, as
-        // nginx (http2_idle_timeout is obsolete); a shutdown or reload
-        // sends GOAWAY and lets the open streams finish.
-        let now = monoio::time::Instant::now();
         if active.get() > 0 {
             idle_since = None;
         } else if idle_since.is_none() {
             idle_since = Some(now);
         }
-        let idle_expired = idle_since.is_some_and(|since| now.duration_since(since) >= IDLE);
+        // keepalive_timeout bounds a connection without streams (0: closed
+        // after its streams), as nginx (http2_idle_timeout is obsolete); a
+        // shutdown or reload sends GOAWAY and lets the open streams finish.
+        let idle_expired = idle_since.is_some_and(|since| {
+            (!keepalive.allow && requests > 0) || now.duration_since(since) >= idle
+        });
         if ctx.state.is_shutting_down() || idle_expired {
             conn.graceful_shutdown();
             going_away = true;
@@ -205,13 +271,14 @@ async fn serve_stream(
     request: http::Request<h2::RecvStream>,
     respond: h2::server::SendResponse<Bytes>,
     ctx: &ConnCtx,
+    counters: (std::time::Instant, u64),
 ) {
     let (parts, body) = request.into_parts();
     let listen = &ctx.http.listens[ctx.listen_index];
     if !listen.http2_listen && !h2_server(listen, &parts, ctx.sni.as_deref()) {
         return misdirected(respond);
     }
-    let mut io = stream::StreamIo::new(&parts, body, respond);
+    let mut io = stream::StreamIo::new(&parts, body, respond, counters);
     super::handle(
         &mut io,
         ctx.peer_addr,

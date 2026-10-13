@@ -50,6 +50,8 @@ pub(crate) struct StreamIo {
     out: Out,
     /// The response head, until it is complete.
     head: Vec<u8>,
+    /// The connection's start and the streams it carried before this one.
+    counters: (std::time::Instant, u64),
 }
 
 enum Out {
@@ -83,6 +85,7 @@ impl StreamIo {
         parts: &http::request::Parts,
         body: RecvStream,
         respond: SendResponse<Bytes>,
+        counters: (std::time::Instant, u64),
     ) -> Self {
         let has_body = !body.is_end_stream();
         let length = parts.headers.contains_key(http::header::CONTENT_LENGTH);
@@ -100,6 +103,7 @@ impl StreamIo {
             send: None,
             out: Out::Head,
             head: Vec::new(),
+            counters,
         }
     }
 
@@ -538,5 +542,9 @@ impl super::super::ConnIo for StreamIo {
 
     fn h2(&self) -> bool {
         true
+    }
+
+    fn conn_counters(&self) -> Option<(std::time::Instant, u64)> {
+        Some(self.counters)
     }
 }

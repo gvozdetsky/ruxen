@@ -1803,6 +1803,7 @@ pub(crate) fn prepare_server(
         doc_root: server_doc_root,
         // Set by the caller, which knows the http scope.
         http2: false,
+        keepalive: server_keepalive,
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
         exact_names,
         wildcard_leading,

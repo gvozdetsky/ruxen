@@ -1461,6 +1461,10 @@ pub struct PreparedServer {
     /// HTTP/2 for this server: `http2 on` (server, else http) or
     /// `listen … http2` (#144).
     pub http2: bool,
+    /// The server-level keep-alive settings, which an HTTP/2 connection
+    /// follows (`keepalive_requests` per connection, as nginx does with
+    /// its default server's).
+    pub keepalive: PreparedKeepalive,
     pub timeouts: PreparedClientTimeouts,
     /// Lowercased exact-match names (e.g. `localhost`,
     /// `www.example.com`). HostCheck compares byte-for-byte.

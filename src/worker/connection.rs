@@ -131,6 +131,12 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         false
     }
 
+    /// For an HTTP/2 stream, its connection's start and the requests it
+    /// carried before this one (`$connection_time`, `$connection_requests`).
+    fn conn_counters(&self) -> Option<(Instant, u64)> {
+        None
+    }
+
     /// The keep-alive wait for the next request, which may also read its
     /// first bytes into `buf` (from offset 0). By default the readiness
     /// wait of `idle_wait`, after which the caller reads.
