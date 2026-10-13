@@ -734,6 +734,7 @@ pub(crate) fn build_proxy(
                 weight: 1,
                 max_fails: 0,
                 fail_timeout_ms: 10_000,
+                max_conns: 0,
                 down: false,
                 backup: false,
             };
@@ -746,6 +747,7 @@ pub(crate) fn build_proxy(
                 keepalive_idle_timeout_ms: 60_000,
                 keepalive_max_lifetime_ms: 3_600_000,
                 lb: crate::upstream::Lb::RoundRobin,
+                shared: None,
             }));
             PreparedProxy {
                 upstream,
