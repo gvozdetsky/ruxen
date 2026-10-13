@@ -76,6 +76,11 @@ fn return_proxy_buf(mut v: Vec<u8>) {
 pub struct ProxyPlan {
     /// Pointer to the prepared upstream (owns peers + keepalive config).
     pub upstream: &'static PreparedUpstream,
+    /// `proxy_pass` with variables naming an address (#100): the one peer
+    /// to use instead of `upstream`'s, which is then a placeholder.
+    /// Boxed: only a `proxy_pass` with variables has one, and the plan
+    /// moves with every proxied response.
+    pub adhoc_peer: Option<Box<PeerAddr>>,
     /// First peer to try, leased at plan-build time. Subsequent
     /// `proxy_next_upstream` retries lease their own peers inside
     /// `run_proxy`. Wrapped in `Option` so the run loop can `.take()`
@@ -89,6 +94,9 @@ pub struct ProxyPlan {
     /// matters because retries hold the original while the in-flight
     /// `write_all` consumes a clone.
     pub request: bytes::Bytes,
+    /// A large client body, sent after `request` from the request's own
+    /// buffer (shared, not copied); empty when the body is in `request`.
+    pub body: bytes::Bytes,
     /// Method of the *client* request — needed to strip the body for
     /// HEAD responses on the way back when the upstream sends one
     /// anyway.
@@ -147,6 +155,12 @@ pub struct ProxyPlan {
     /// `proxy_cache` (#233): `None` unless the location has one and the
     /// request may use it.
     pub cache: Option<Box<CachePlan>>,
+    /// A hash balancer's state for this request (`hash`, `ip_hash`), which
+    /// `proxy_next_upstream` picks continue from.
+    pub hash: Option<Box<upstream::HashPick>>,
+    /// `proxy_bind` for this request: the local address new upstream
+    /// connections are bound to. Pooled ones are reused as they are.
+    pub bind: Option<LocalBind>,
 }
 
 /// A request's view of its `proxy_cache`: what the lookup found, and what
@@ -187,6 +201,89 @@ struct Storable {
     valid_sec: i64,
     vary: Vec<u8>,
     client_head_len: usize,
+}
+
+/// Bodies up to this size are copied into the upstream request buffer
+/// (one buffer, one write); larger ones are sent from their own buffer with
+/// one writev, which keeps a body-sized copy per request out of the cache.
+pub const SEPARATE_BODY_MIN: usize = 16 * 1024;
+
+/// The upstream request header block and a body, owned by the writev
+/// operation (monoio keeps it until the kernel is done, also when the
+/// attempt is cancelled by a timeout, so the pooled buffers can't be
+/// reused while they are being sent).
+struct RequestParts {
+    head: bytes::Bytes,
+    body: bytes::Bytes,
+    /// Boxed so its address stays put while the value moves around.
+    iov: Box<[libc::iovec; 2]>,
+}
+
+impl RequestParts {
+    fn new(head: bytes::Bytes, body: bytes::Bytes) -> Self {
+        let empty = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        let mut parts = RequestParts {
+            head,
+            body,
+            iov: Box::new([empty, empty]),
+        };
+        parts.set_iov();
+        parts
+    }
+
+    fn set_iov(&mut self) {
+        for (iov, part) in self.iov.iter_mut().zip([&self.head, &self.body]) {
+            iov.iov_base = part.as_ptr() as *mut libc::c_void;
+            iov.iov_len = part.len();
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.head.len() + self.body.len()
+    }
+
+    /// Drop the first `n` bytes, which were written.
+    fn advance(&mut self, n: usize) {
+        let from_head = n.min(self.head.len());
+        bytes::Buf::advance(&mut self.head, from_head);
+        bytes::Buf::advance(&mut self.body, n - from_head);
+        self.set_iov();
+    }
+}
+
+// SAFETY: the iovecs point into `head` and `body`, which the value owns
+// and doesn't change while the runtime holds it; the boxed array keeps its
+// address when the value moves.
+unsafe impl monoio::buf::IoVecBuf for RequestParts {
+    fn read_iovec_ptr(&self) -> *const libc::iovec {
+        self.iov.as_ptr()
+    }
+    fn read_iovec_len(&self) -> usize {
+        2
+    }
+}
+
+/// Write the header block and the body with writev until both are sent.
+async fn write_request_parts(
+    stream: &mut TcpStream,
+    head: bytes::Bytes,
+    body: bytes::Bytes,
+) -> std::io::Result<()> {
+    let mut parts = RequestParts::new(head, body);
+    while parts.len() > 0 {
+        let (res, returned) = monoio::io::AsyncWriteRent::writev(stream, parts).await;
+        parts = returned;
+        match res {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => parts.advance(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// The temp file holding a large request body (an open descriptor: the
@@ -342,9 +439,8 @@ fn record_failure(
 /// `http://<peer><URI>` for `upstream: "…"` in error-log lines; the URI is
 /// taken from the request line already built for the upstream.
 fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
-    let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let uri = request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/");
-    let addr = plan.upstream.peers[peer_idx].addr;
+    let uri = upstream_uri(plan);
+    let addr = plan.peer_addr(peer_idx);
     // nginx puts a `:` between a socket path and the URI
     // (ngx_http_log_error_handler).
     let separator = match addr {
@@ -352,6 +448,21 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
         PeerAddr::Inet(_) => "",
     };
     format!("http://{addr}{separator}{}", String::from_utf8_lossy(uri))
+}
+
+fn upstream_uri(plan: &ProxyPlan) -> &[u8] {
+    let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/")
+}
+
+impl ProxyPlan {
+    /// The address of `upstream.peers[peer_idx]`, or the request's own peer.
+    fn peer_addr(&self, peer_idx: usize) -> PeerAddr {
+        match &self.adhoc_peer {
+            Some(addr) => **addr,
+            None => self.upstream.peers[peer_idx].addr,
+        }
+    }
 }
 
 /// Run the upstream exchange, with `proxy_next_upstream` failover. Each
@@ -372,7 +483,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     let accel = &mut report.accel;
     let states = &mut report.states;
     let upstream = plan.upstream;
-    let max_tries = compute_max_tries(plan.next_upstream_tries, upstream.peers.len());
+    // nginx's `peer.tries`: the servers not marked `down`
+    // (ngx_http_upstream_tries).
+    let live = upstream.peers.iter().filter(|p| !p.down).count();
+    let max_tries = compute_max_tries(plan.next_upstream_tries, live);
     let overall_deadline = if plan.next_upstream_timeout.is_zero() {
         None
     } else {
@@ -384,16 +498,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     // No initial peer: every peer is `down` or cooling off after
     // `max_fails`.
     let Some(mut current) = plan.initial_peer.take() else {
-        states.push(UpstreamState {
-            status: 502,
-            response_ms: Some(0),
-            ..UpstreamState::new(UpstreamPeerName::Group(upstream.name))
-        });
-        failures.push(AttemptFailure {
-            error: UpstreamError::NoLiveUpstreams,
-            upstream: String::new(),
-        });
-        return Response::Prebuilt(plan.bad_gateway.pick(plan.method));
+        return no_live_upstreams(&plan, states, failures);
     };
     let mut tried = upstream::Tried::default();
     tried.insert(current.peer_idx);
@@ -414,9 +519,8 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     loop {
         attempts += 1;
         let started = Instant::now();
-        let mut state = UpstreamState::new(UpstreamPeerName::Addr(
-            upstream.peers[current.peer_idx].addr,
-        ));
+        let mut state =
+            UpstreamState::new(UpstreamPeerName::Addr(plan.peer_addr(current.peer_idx)));
         // 1. Try the pool first for this peer. On any failure before the
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
@@ -513,8 +617,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     } else {
                         upstream::report_failure(upstream, current.peer_idx);
                     }
-                    let Some(next) = upstream::pick_peer(upstream, &tried) else {
-                        return resp;
+                    let Some(next) =
+                        upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
+                    else {
+                        return no_live_upstreams(&plan, states, failures);
                     };
                     tried.insert(next.peer_idx);
                     drop(current);
@@ -568,6 +674,10 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
             AttemptOutcome::NoConnection => {
                 return crate::worker::internal_error_response(plan.method);
             }
+            AttemptOutcome::LocalError(error) => {
+                record_failure(failures, &plan, current.peer_idx, error);
+                return crate::worker::internal_error_response(plan.method);
+            }
             AttemptOutcome::PooledStale => {
                 // The pre-match collapses PooledStale into either a fresh
                 // retry or a Failed; reaching here is a logic bug.
@@ -596,9 +706,9 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                     return last_failure
                         .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
                 }
-                let Some(next) = upstream::pick_peer(upstream, &tried) else {
-                    return last_failure
-                        .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
+                let Some(next) = upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
+                else {
+                    return no_live_upstreams(&plan, states, failures);
                 };
                 tried.insert(next.peer_idx);
                 drop(current);
@@ -609,9 +719,38 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
     }
 }
 
+/// No peer to try (every one down, cooling off after `max_fails`, or
+/// tried): nginx's NGX_BUSY from the balancer. The try shows as the
+/// upstream's name in `$upstream_addr`, `no live upstreams` is logged and
+/// the answer is a 502, whatever earlier tries got
+/// (ngx_http_upstream_connect, NGX_HTTP_UPSTREAM_FT_NOLIVE).
+#[cold]
+fn no_live_upstreams(
+    plan: &ProxyPlan,
+    states: &mut Vec<UpstreamState>,
+    failures: &mut Vec<AttemptFailure>,
+) -> Response {
+    states.push(UpstreamState {
+        status: 502,
+        response_ms: Some(0),
+        ..UpstreamState::new(UpstreamPeerName::Group(plan.upstream.name))
+    });
+    // `upstream:` names the group, as the balancer's `pc->name`.
+    failures.push(AttemptFailure {
+        error: UpstreamError::NoLiveUpstreams,
+        upstream: format!(
+            "http://{}{}",
+            String::from_utf8_lossy(plan.upstream.name),
+            String::from_utf8_lossy(upstream_uri(plan))
+        ),
+    });
+    Response::Prebuilt(plan.bad_gateway.pick(plan.method))
+}
+
 /// `proxy_next_upstream_tries 0;` is "no cap"; everything else caps the
-/// retry loop at the configured value. `peers.len()` is the natural upper
-/// bound when no cap is set (we never re-try the same peer).
+/// retry loop at the configured value. The peers not marked `down` are
+/// the natural upper bound when no cap is set (we never re-try the same
+/// peer).
 fn compute_max_tries(configured: u32, peers: usize) -> u32 {
     let peer_cap = (peers as u32).max(1);
     if configured == 0 {
@@ -764,6 +903,10 @@ pub enum UpstreamError {
     /// A UNIX-domain socket refuses at once, so nginx reports it from
     /// connect() itself, with the path (ngx_event_connect_peer).
     UnixConnectFailed(std::io::Error, &'static std::path::Path),
+    /// `proxy_bind`: socket(), setsockopt(IP_TRANSPARENT) or bind() failed.
+    SocketFailed(std::io::Error),
+    TransparentFailed(std::io::Error, &'static str),
+    BindFailed(std::io::Error, std::net::SocketAddr),
     SendFailed(std::io::Error),
     RecvFailed(std::io::Error, Stage),
     TimedOut(Stage),
@@ -803,6 +946,10 @@ impl UpstreamError {
                 ) => ErrorLogLevel::Error,
                 _ => ErrorLogLevel::Crit,
             },
+            UpstreamError::SocketFailed(_) | UpstreamError::TransparentFailed(..) => {
+                ErrorLogLevel::Alert
+            }
+            UpstreamError::BindFailed(..) => ErrorLogLevel::Crit,
             _ => ErrorLogLevel::Error,
         }
     }
@@ -823,6 +970,32 @@ impl std::fmt::Display for UpstreamError {
                 f,
                 "connect() to unix:{} failed ({}) while {}",
                 path.display(),
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            SocketFailed(e) => write!(
+                f,
+                "socket() failed ({}) while {}",
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            TransparentFailed(e, option) => write!(
+                f,
+                "setsockopt({option}_TRANSPARENT) failed ({}) while {}",
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            // nginx names the address as given: no port when none was.
+            BindFailed(e, addr) if addr.port() == 0 => write!(
+                f,
+                "bind({}) failed ({}) while {}",
+                addr.ip(),
+                errno_text(e),
+                Stage::Connecting.as_str()
+            ),
+            BindFailed(e, addr) => write!(
+                f,
+                "bind({addr}) failed ({}) while {}",
                 errno_text(e),
                 Stage::Connecting.as_str()
             ),
@@ -1069,6 +1242,90 @@ enum AttemptOutcome {
     /// with a 500, without trying another peer or blaming this one
     /// (ngx_http_upstream_connect on NGX_ERROR).
     NoConnection,
+    /// Setting up the connection failed before connect(), on our side
+    /// (`proxy_bind`): the request ends with a 500, the peer not blamed
+    /// (ngx_http_upstream_connect on NGX_ERROR).
+    LocalError(Box<UpstreamError>),
+}
+
+/// A `proxy_bind` address, resolved for one request.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalBind {
+    pub addr: std::net::SocketAddr,
+    pub transparent: bool,
+}
+
+/// Connect to `addr` from `bind`, as ngx_event_connect_peer does with a
+/// local address: IP_TRANSPARENT first if asked, IP_BIND_ADDRESS_NO_PORT
+/// when no port is given (the port is then picked at connect time, so
+/// many connections can share the address), then bind(). A failure
+/// before connect() is the request's (500), not the peer's.
+#[cold]
+#[inline(never)]
+async fn connect_bound(
+    addr: std::net::SocketAddr,
+    bind: LocalBind,
+) -> Result<std::io::Result<TcpStream>, UpstreamError> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::fd::AsRawFd;
+    let socket = Socket::new(
+        Domain::for_address(addr),
+        Type::STREAM.nonblocking().cloexec(),
+        None,
+    )
+    .map_err(UpstreamError::SocketFailed)?;
+    let fd = socket.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int| -> std::io::Result<()> {
+        let one: libc::c_int = 1;
+        // SAFETY: an int option on a socket this function owns.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    if bind.transparent {
+        let (level, name, option) = match bind.addr {
+            std::net::SocketAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_TRANSPARENT, "IP"),
+            std::net::SocketAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, "IPV6"),
+        };
+        set(level, name).map_err(|e| UpstreamError::TransparentFailed(e, option))?;
+    }
+    if bind.addr.port() == 0 {
+        // nginx goes on without it when the kernel lacks it.
+        let _ = set(libc::IPPROTO_IP, libc::IP_BIND_ADDRESS_NO_PORT);
+    }
+    socket
+        .bind(&SockAddr::from(bind.addr))
+        .map_err(|e| UpstreamError::BindFailed(e, bind.addr))?;
+    Ok(async {
+        match socket.connect(&SockAddr::from(addr)) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) => return Err(e),
+        }
+        let stream = TcpStream::from_std(socket.into())?;
+        stream.writable(false).await?;
+        let fd = stream.as_raw_fd();
+        // SAFETY: borrowed for getsockopt only; `stream` keeps the fd.
+        let sock = std::mem::ManuallyDrop::new(unsafe {
+            <Socket as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        });
+        match sock.take_error()? {
+            Some(e) => Err(e),
+            None => Ok(stream),
+        }
+    }
+    .await)
 }
 
 /// Connect to a UNIX-domain socket, returned as a `TcpStream`: monoio's
@@ -1098,7 +1355,7 @@ async fn attempt(
     // Only the answering attempt's X-Accel headers count.
     *accel = None;
     *storable = None;
-    let peer_addr = plan.upstream.peers[peer_idx].addr;
+    let peer_addr = plan.peer_addr(peer_idx);
     let (mut stream, opened_at, requests_served, slot) = if let Some(c) = pooled {
         (c.stream, c.opened_at, c.requests_served, c.slot)
     } else {
@@ -1106,10 +1363,27 @@ async fn attempt(
             return AttemptOutcome::NoConnection;
         };
         let stream = match peer_addr {
-            PeerAddr::Inet(addr) => timeout(plan.connect_timeout, TcpStream::connect(addr)).await,
-            PeerAddr::Unix(path) => {
-                timeout(plan.connect_timeout, Box::pin(connect_unix(path))).await
-            }
+            PeerAddr::Inet(addr) => match plan.bind {
+                None => timeout(plan.connect_timeout, TcpStream::connect(addr)).await,
+                Some(bind) => {
+                    match timeout(plan.connect_timeout, Box::pin(connect_bound(addr, bind))).await {
+                        Ok(Ok(connected)) => Ok(connected),
+                        Ok(Err(error)) => return AttemptOutcome::LocalError(Box::new(error)),
+                        Err(elapsed) => Err(elapsed),
+                    }
+                }
+            },
+            // An inet local address can't be bound on a UNIX-domain
+            // socket: nginx's bind() fails there with EINVAL.
+            PeerAddr::Unix(path) => match plan.bind {
+                None => timeout(plan.connect_timeout, Box::pin(connect_unix(path))).await,
+                Some(bind) => {
+                    return AttemptOutcome::LocalError(Box::new(UpstreamError::BindFailed(
+                        std::io::Error::from_raw_os_error(libc::EINVAL),
+                        bind.addr,
+                    )));
+                }
+            },
         };
         let stream = match stream {
             Ok(Ok(s)) => s,
@@ -1144,10 +1418,16 @@ async fn attempt(
     // the original on `plan.request` is the only way to recover. With
     // `Bytes` the clone is just an Arc bump; the underlying request bytes
     // are never copied per attempt.
-    let req = plan.request.clone();
-    let send_fut = stream.write_all(req);
-    let (res, _returned) = match timeout(plan.send_timeout, send_fut).await {
-        Ok(pair) => pair,
+    let res = if plan.body.is_empty() {
+        timeout(plan.send_timeout, stream.write_all(plan.request.clone()))
+            .await
+            .map(|(res, _)| res.map(drop))
+    } else {
+        let parts = write_request_parts(&mut stream, plan.request.clone(), plan.body.clone());
+        timeout(plan.send_timeout, Box::pin(parts)).await
+    };
+    let res = match res {
+        Ok(res) => res,
         Err(_) => {
             return AttemptOutcome::Failed(
                 Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
@@ -1166,7 +1446,7 @@ async fn attempt(
             Box::new(UpstreamError::SendFailed(e)),
         );
     }
-    state.bytes_sent = plan.request.len() as u64;
+    state.bytes_sent = (plan.request.len() + plan.body.len()) as u64;
     if let Some(file) = &plan.body_file
         && let Err(error) = send_body_file(&mut stream, file, plan.send_timeout).await
     {
@@ -1260,17 +1540,9 @@ async fn attempt(
     let term_len = head_end_terminator.1;
     let body_start = head_end + term_len;
 
-    // 4. Parse the status line.
-    let first_line_end = match find_line_end(&accum[..head_end]) {
-        Some(p) => p.0,
-        None => {
-            return AttemptOutcome::Failed(
-                Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                FailKind::InvalidHeader,
-                Box::new(UpstreamError::InvalidStatusLine),
-            );
-        }
-    };
+    // 4. Parse the status line. Without header fields, its CRLF is part
+    // of the terminator and the whole head is the status line (#323).
+    let first_line_end = find_line_end(&accum[..head_end]).map_or(head_end, |p| p.0);
     // `status_line` is `accum[..first_line_end]`, but binding it as a
     // slice would hold an immutable borrow across the body-pull loop
     // (which mutates accum). Re-borrow on each use instead.
@@ -1305,8 +1577,7 @@ async fn attempt(
     }
 
     // 5. Parse framing-relevant headers.
-    let head_after_status =
-        &accum[first_line_end + first_line_terminator_len(&accum, first_line_end)..head_end];
+    let head_after_status = &accum[headers_start(&accum, first_line_end, head_end)..head_end];
     let mut content_length: Option<u64> = None;
     let mut chunked = false;
     let mut upstream_close = !upstream_is_11; // HTTP/1.0 closes by default
@@ -1693,7 +1964,7 @@ fn client_head(
     if keep_upstream_headers {
         upstream_headers.clear();
     }
-    let mut cursor = first_line_end + first_line_terminator_len(head, first_line_end);
+    let mut cursor = headers_start(head, first_line_end, head.len());
     let mut have_content_length = false;
     let mut seen_single: u16 = 0;
     while cursor < head.len() {
@@ -2282,6 +2553,12 @@ fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// Where the header fields start: past the status line's terminator, or
+/// at `head_end` when there are none.
+fn headers_start(buf: &[u8], first_line_end: usize, head_end: usize) -> usize {
+    (first_line_end + first_line_terminator_len(buf, first_line_end)).min(head_end)
+}
+
 fn first_line_terminator_len(buf: &[u8], line_end: usize) -> usize {
     if line_end + 1 < buf.len() && buf[line_end] == b'\r' && buf[line_end + 1] == b'\n' {
         2
@@ -2330,6 +2607,38 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_parts_advance_across_head_and_body() {
+        fn sent(parts: &RequestParts) -> Vec<u8> {
+            use monoio::buf::IoVecBuf;
+            let iov = parts.read_iovec_ptr();
+            let mut out = Vec::new();
+            for i in 0..parts.read_iovec_len() {
+                // SAFETY: the iovecs point into `parts`' own buffers.
+                let v = unsafe { *iov.add(i) };
+                if v.iov_len > 0 {
+                    out.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len)
+                    });
+                }
+            }
+            out
+        }
+        let mut parts = RequestParts::new(
+            bytes::Bytes::from_static(b"HEAD\r\n"),
+            bytes::Bytes::from_static(b"body"),
+        );
+        assert_eq!(sent(&parts), b"HEAD\r\nbody");
+        parts.advance(3);
+        assert_eq!(sent(&parts), b"D\r\nbody");
+        parts.advance(4);
+        assert_eq!(sent(&parts), b"ody");
+        assert_eq!(parts.len(), 3);
+        parts.advance(3);
+        assert_eq!(parts.len(), 0);
+        assert_eq!(sent(&parts), b"");
+    }
 
     #[test]
     fn build_request_minimal() {

@@ -84,6 +84,8 @@ pub struct ProxyConf {
     pub pass_headers: Option<Vec<String>>,
     /// `proxy_cache` and the directives that tune it (#233).
     pub cache: ProxyCacheConf,
+    /// `proxy_bind` (#135); `Some(ProxyBind::Off)` turns an inherited one off.
+    pub bind: Option<ProxyBind>,
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -150,6 +152,17 @@ pub struct ProxyCachePath {
     pub min_free: Option<u64>,
 }
 
+/// `proxy_bind address [transparent] | off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyBind {
+    Off,
+    /// The local address, `ip[:port]`, possibly with variables.
+    Addr {
+        value: Vec<ValuePart>,
+        transparent: bool,
+    },
+}
+
 impl ProxyConf {
     /// Unset values come from `parent`.
     pub(crate) fn inherit(self, parent: &ProxyConf) -> ProxyConf {
@@ -176,6 +189,7 @@ impl ProxyConf {
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
             cache: self.cache.inherit(&parent.cache),
+            bind: self.bind.or_else(|| parent.bind.clone()),
         }
     }
 }
@@ -224,6 +238,10 @@ pub enum WorkerProcesses {
 #[derive(Debug)]
 pub struct HttpConfig {
     pub runtime: RuntimeOpts,
+    /// `limit_req_zone` declarations (#94).
+    pub limit_req_zones: Vec<super::LimitReqZoneDef>,
+    /// `limit_conn_zone` declarations (#95).
+    pub limit_conn_zones: Vec<super::LimitConnZoneDef>,
     /// http-scope `error_log` lines; `None` inherits the top-level ones.
     pub error_logs: Option<Vec<ErrorLog>>,
     /// `log_format name <format...>;` definitions declared at http scope.
@@ -268,8 +286,13 @@ pub struct HttpConfig {
     pub client_body_buffer_size: Option<u64>,
     /// `$request_body_file` appears somewhere in the config.
     pub uses_request_body_file: bool,
+    /// `$request_body` appears somewhere in the config.
+    pub uses_request_body: bool,
     /// An `error_log stderr` appears somewhere in the config (#309).
     pub uses_stderr_log: bool,
+    /// `stub_status` or a `$connections_*` variable appears in the config:
+    /// the counters are kept.
+    pub uses_stats: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,
@@ -345,17 +368,25 @@ pub struct UpstreamBlock {
     /// `keepalive_time T;` — hard lifetime cap from first use.
     /// `None` defaults to nginx's 1h.
     pub keepalive_max_lifetime_ms: Option<u64>,
-    /// LB algorithm. Default is smoothed weighted RR; `least_conn;` is supported.
+    /// LB algorithm. Default is smoothed weighted RR; `least_conn`, `hash`
+    /// and `ip_hash` are supported.
     pub lb: LbAlgorithm,
 }
 
 /// Load-balancing algorithm for an `upstream {}` block. Smoothed weighted
 /// round-robin matches `ngx_http_upstream_round_robin.c`; least-connection
 /// matches `ngx_http_upstream_least_conn.c`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LbAlgorithm {
     RoundRobin,
     LeastConn,
+    /// `hash key [consistent]` (ngx_http_upstream_hash_module, #97).
+    Hash {
+        key: Vec<ValuePart>,
+        consistent: bool,
+    },
+    /// `ip_hash` (ngx_http_upstream_ip_hash_module, #97).
+    IpHash,
 }
 
 /// Where an upstream peer listens: a TCP address, or a UNIX-domain socket
@@ -393,7 +424,10 @@ pub struct UpstreamServer {
 /// against `default_server` / `reuseport` etc. is not significant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listen {
+    /// `0.0.0.0:0` for a `unix:` socket.
     pub addr: SocketAddr,
+    /// `listen unix:/path` (#263).
+    pub unix: Option<PathBuf>,
     /// `listen … ssl;` — terminate TLS on this socket.
     pub ssl: bool,
     /// `default_server` — server block becomes the catch-all for its addr.
@@ -444,6 +478,7 @@ impl Listen {
     pub(crate) fn from_addr(addr: SocketAddr) -> Self {
         Self {
             addr,
+            unix: None,
             ssl: false,
             default_server: false,
             reuseport: false,
@@ -520,17 +555,25 @@ pub struct ServerSsl {
     pub session_timeout_ms: Option<u64>,
     /// `ssl_session_cache` / `ssl_session_tickets`, merged with http scope.
     pub resumption: SessionResumption,
+    /// `ssl_reject_handshake on|off` (#112), merged with http scope.
+    pub reject_handshake: Option<bool>,
 }
 
 /// How TLS sessions can be resumed. `None` fields take nginx's defaults:
 /// no session-ID cache (`ssl_session_cache none`), tickets on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionResumption {
     /// `ssl_session_cache`: `builtin` / `shared:…` = true, `off` / `none` =
     /// false.
     pub cache: Option<bool>,
+    /// The `ssl_session_cache` that set `cache` has a `shared:` zone: nginx
+    /// then keeps rotating ticket keys in it (#140).
+    pub shared: bool,
     /// `ssl_session_tickets on|off`.
     pub tickets: Option<bool>,
+    /// `ssl_session_ticket_key file` lines, in order: the first encrypts,
+    /// all decrypt.
+    pub ticket_keys: Option<Vec<PathBuf>>,
 }
 
 impl SessionResumption {
@@ -563,6 +606,7 @@ impl SessionResumption {
                                 });
                             }
                         }
+                        self.shared = caches.iter().any(|c| c.starts_with("shared:"));
                         true
                     }
                 };
@@ -583,11 +627,22 @@ impl SessionResumption {
         }
     }
 
-    pub(crate) fn inherit(self, parent: SessionResumption) -> SessionResumption {
+    pub(crate) fn inherit(self, parent: &SessionResumption) -> SessionResumption {
+        let (cache, shared) = match self.cache {
+            Some(_) => (self.cache, self.shared),
+            None => (parent.cache, parent.shared),
+        };
         SessionResumption {
-            cache: self.cache.or(parent.cache),
+            cache,
+            shared,
             tickets: self.tickets.or(parent.tickets),
+            ticket_keys: self.ticket_keys.or_else(|| parent.ticket_keys.clone()),
         }
+    }
+
+    /// One `ssl_session_ticket_key` line (the path already resolved).
+    pub(crate) fn add_ticket_key(&mut self, path: PathBuf) {
+        self.ticket_keys.get_or_insert_with(Vec::new).push(path);
     }
 }
 
@@ -703,6 +758,10 @@ pub struct Server {
     pub proxy: ProxyConf,
     /// Server-scope `gzip*` settings, http's merged in.
     pub gzip: GzipConf,
+    /// Server-scope `limit_req*`, http's merged in (#94).
+    pub limit_req: super::LimitReqConf,
+    /// Server-scope `limit_conn*`, http's merged in (#95).
+    pub limit_conn: super::LimitConnConf,
     /// Server-scope `chunked_transfer_encoding on|off;`. `None` inherits the
     /// nginx default (`on`). When `false`, response bodies stay framed by
     /// `Content-Length` and `add_trailer` directives are silently dropped
@@ -846,11 +905,18 @@ pub struct Location {
     pub proxy: ProxyConf,
     /// Location-scope `gzip*` settings; unset ones inherit from server.
     pub gzip: GzipConf,
+    /// Location-scope `limit_req*`; unset ones inherit from server.
+    pub limit_req: super::LimitReqConf,
+    /// Location-scope `limit_conn*`; unset ones inherit from server.
+    pub limit_conn: super::LimitConnConf,
     /// Location-scope `chunked_transfer_encoding on|off;`. `None` inherits
     /// from server scope, which itself defaults to nginx's `on`. When
     /// `false`, the response body uses `Content-Length` framing and any
     /// `add_trailer` directives in scope are silently dropped.
     pub chunked_transfer_encoding: Option<bool>,
+    /// The location's own `client_body_timeout` / `send_timeout` (#147);
+    /// `client_header_timeout` stays a server setting.
+    pub client_timeouts: ClientTimeouts,
     /// Override for the alias-prefix used when this location's
     /// `Handler::Root` was inherited from an ancestor prefix-alias
     /// location (rather than set directly here). Unlike a directly-set
@@ -1069,6 +1135,14 @@ pub struct AccessLog {
     pub syslog: Option<SyslogPeer>,
     pub format: Option<String>,
     pub condition: Option<Vec<ValuePart>>,
+    /// `buffer=size` (`gzip` alone means 64k), in bytes (#151).
+    pub buffer: Option<u64>,
+    /// `flush=time`, in milliseconds.
+    pub flush_ms: Option<u64>,
+    /// `gzip[=level]`: each flushed buffer is written as a gzip member.
+    pub gzip: Option<u32>,
+    /// The path has variables: rendered per request (#303).
+    pub path_vars: Option<Vec<ValuePart>>,
 }
 
 /// Parsed `auth_basic` value. `off` explicitly disables inherited auth.
@@ -1540,6 +1614,15 @@ pub enum ProxyProtocolTlv {
     Unknown,
 }
 
+/// Which `$connections_*` gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionsGauge {
+    Active,
+    Reading,
+    Writing,
+    Waiting,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Variable {
     /// Normalized request URI (no query string).
@@ -1601,6 +1684,12 @@ pub enum Variable {
     SslClientVRemain,
     /// Request body buffered by the parser.
     RequestBody,
+    /// `$limit_req_status` (#94).
+    LimitReqStatus,
+    /// `$limit_conn_status` (#95).
+    LimitConnStatus,
+    /// `$connections_active`, `_reading`, `_writing`, `_waiting` (#96).
+    Connections(ConnectionsGauge),
     /// Path to the spilled request body temp file, when one was created.
     RequestBodyFile,
     /// Client IP address from the accepted peer socket (e.g. `127.0.0.1`,
@@ -1905,6 +1994,8 @@ pub enum Handler {
     /// `proxy_pass http://...;` — reverse proxy this location to an upstream.
     /// Resolution to a concrete peer happens at prepare time.
     Proxy(ProxyPass),
+    /// `stub_status;` — the connection and request counters (#96).
+    StubStatus,
 }
 
 /// Parsed `proxy_pass` argument. nginx allows two forms:
@@ -1960,4 +2051,6 @@ pub enum ProxyPass {
         host_header: String,
         request_path: Option<String>,
     },
+    /// A URL with variables, evaluated per request (#100).
+    Variable { url: Vec<ValuePart> },
 }

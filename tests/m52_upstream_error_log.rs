@@ -178,7 +178,8 @@ fn upstream_failures_are_logged_like_nginx() {
         line.contains("no live upstreams while connecting to upstream, client: 127.0.0.1"),
         "{line}"
     );
-    assert!(!line.contains("upstream: \""), "{line}");
+    // The balancer names the group (nginx's `pc->name = peers->name`).
+    assert!(line.contains("upstream: \"http://down/down/2\""), "{line}");
     // A lone server is never marked unavailable (nginx's `peers->single`):
     // both requests try it.
     for path in ["GET /single/1 ", "GET /single/2 "] {

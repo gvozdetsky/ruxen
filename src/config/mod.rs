@@ -24,6 +24,8 @@ mod error;
 mod lexer;
 mod parse_access;
 mod parse_gzip;
+mod parse_limit_conn;
+mod parse_limit_req;
 mod parse_location;
 mod parse_log;
 mod parse_map;
@@ -35,6 +37,8 @@ mod values;
 pub use ast::*;
 pub use error::*;
 pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
+pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
 pub(crate) use lexer::*;
@@ -248,7 +252,9 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut http = http.ok_or(Error::UnexpectedEof)?;
     http.warnings.extend(lx.take_warnings());
     http.uses_request_body_file = values::request_body_file_used();
+    http.uses_request_body = values::request_body_used();
     http.uses_stderr_log = values::stderr_log_used();
+    http.uses_stats = values::stats_used();
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -260,6 +266,10 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut servers: Vec<Server> = Vec::new();
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
+    let mut limit_req = LimitReqConf::default();
+    let mut limit_req_zones: Vec<LimitReqZoneDef> = Vec::new();
+    let mut limit_conn = LimitConnConf::default();
+    let mut limit_conn_zones: Vec<LimitConnZoneDef> = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut log_formats: Vec<LogFormatDef> = Vec::new();
     let mut access_logs: Vec<AccessLog> = Vec::new();
@@ -307,6 +317,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_ciphers: Option<String> = None;
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
+    let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut warnings: Vec<String> = Vec::new();
     loop {
@@ -319,6 +330,10 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     for server in &mut servers {
                         server.proxy = std::mem::take(&mut server.proxy).inherit(&proxy);
                         server.gzip = std::mem::take(&mut server.gzip).inherit(&gzip);
+                        server.limit_req =
+                            std::mem::take(&mut server.limit_req).inherit(&limit_req);
+                        server.limit_conn =
+                            std::mem::take(&mut server.limit_conn).inherit(&limit_conn);
                         if server.index.is_none() {
                             server.index.clone_from(&index);
                         }
@@ -358,7 +373,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ssl.prefer_server_ciphers =
                             ssl.prefer_server_ciphers.or(ssl_prefer_server_ciphers);
                         ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
-                        ssl.resumption = ssl.resumption.inherit(resumption);
+                        ssl.resumption = std::mem::take(&mut ssl.resumption).inherit(&resumption);
+                        ssl.reject_handshake = ssl.reject_handshake.or(ssl_reject_handshake);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -380,7 +396,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         client_body_buffer_size,
                         // Set once the whole config is read.
                         uses_request_body_file: false,
+                        uses_request_body: false,
                         uses_stderr_log: false,
+                        uses_stats: false,
                         client_body_temp_path,
                         sendfile,
                         disable_symlinks,
@@ -392,6 +410,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         underscores_in_headers,
                         proxy_cache_paths,
                         upstreams,
+                        limit_req_zones,
+                        limit_conn_zones,
                         warnings: warn_ssl_without_ssl_listen(&servers, warnings),
                         servers,
                         dump_files: Vec::new(),
@@ -591,12 +611,23 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
                 ssl_session_timeout_ms = Some(ssl_session_timeout_ms_arg(v)?);
             }
+            ("ssl_reject_handshake", Terminator::Semi) => {
+                if ssl_reject_handshake.is_some() {
+                    return Err(Error::Duplicate("ssl_reject_handshake"));
+                }
+                ssl_reject_handshake = Some(parse_on_off_args(&args[1..], "ssl_reject_handshake")?);
+            }
             (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
                 resumption.parse(name, &args)?;
             }
+            ("ssl_session_ticket_key", Terminator::Semi) => {
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_session_ticket_key"));
+                };
+                resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
+            }
             (
-                "ssl_session_ticket_key"
-                | "ssl_buffer_size"
+                "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"
                 | "ssl_stapling"
@@ -610,7 +641,6 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_crl"
                 | "ssl_password_file"
                 | "ssl_early_data"
-                | "ssl_reject_handshake"
                 | "ssl_conf_command",
                 Terminator::Semi,
             ) => warn_ignored_tls_policy(&args, &mut warnings),
@@ -831,6 +861,29 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
+            (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
+            (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,
+            ("limit_conn_zone", Terminator::Semi) => {
+                let zone = parse_limit_conn::parse_limit_conn_zone(&args[1..])?;
+                if let Some(known) = limit_conn_zones.iter().find(|z| z.name == zone.name) {
+                    return Err(Error::BadValue {
+                        what: "limit_conn_zone (is already bound to key)",
+                        got: format!("\"{}\" bound to \"{}\"", zone.name, known.key_text),
+                    });
+                }
+                limit_conn_zones.push(zone);
+            }
+            ("limit_req_zone", Terminator::Semi) => {
+                let zone = parse_limit_req::parse_limit_req_zone(&args[1..])?;
+                // ngx_http_limit_req_zone: one key per zone name.
+                if let Some(known) = limit_req_zones.iter().find(|z| z.name == zone.name) {
+                    return Err(Error::BadValue {
+                        what: "limit_req_zone (is already bound to key)",
+                        got: format!("\"{}\" bound to \"{}\"", zone.name, known.key_text),
+                    });
+                }
+                limit_req_zones.push(zone);
+            }
             ("error_log", Terminator::Semi) => {
                 error_logs
                     .get_or_insert_with(Vec::new)
@@ -952,7 +1005,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_cookie_path",
     "proxy_cookie_flags",
     "proxy_socket_keepalive",
-    "proxy_bind",
     "proxy_store",
     "proxy_store_access",
     // File I/O knobs (we use std::fs; these are nginx-only tuning)
@@ -1001,9 +1053,6 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let consequence = match args.first().map(String::as_str) {
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
-        }
-        Some("ssl_reject_handshake") if value == Some("on") => {
-            "handshakes for unknown names would complete with the default certificate"
         }
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
         // dropping them weakens what the config protects. Only `off` loads.
@@ -1852,7 +1901,9 @@ mod tests {
             )
         };
         unenforced_err(&tls("ssl_verify_client on;"));
-        unenforced_err(&tls("ssl_reject_handshake on;"));
+        // ssl_reject_handshake is enforced now (tls_stream::accept_or_reject).
+        let cfg = parse(&tls("ssl_reject_handshake on;")).unwrap();
+        assert_eq!(cfg.servers[0].ssl.reject_handshake, Some(true));
         // disable_symlinks is enforced now (fs_resolve), at every level.
         let symlinks = |value: &str| {
             parse(&format!(
@@ -2121,13 +2172,39 @@ mod tests {
             cfg.servers[0].ssl.resumption,
             SessionResumption {
                 cache: Some(true),
-                tickets: Some(false)
+                shared: true,
+                tickets: Some(false),
+                ticket_keys: None,
             }
         );
         assert_eq!(cfg.servers[1].ssl.resumption.cache, Some(false));
         assert_eq!(cfg.servers[1].ssl.resumption.tickets, Some(false));
         assert!(parse("http { ssl_session_cache bogus; }").is_err());
         assert!(parse("http { ssl_session_tickets maybe; }").is_err());
+    }
+
+    #[test]
+    fn ssl_session_ticket_keys_parse_and_inherit() {
+        let cfg = parse(
+            "http { ssl_session_ticket_key /k/a.key; ssl_session_ticket_key /k/b.key;
+                    ssl_session_cache builtin;
+                    server { listen 443 ssl; ssl_certificate c; ssl_certificate_key k; }
+                    server { listen 444 ssl; ssl_certificate c; ssl_certificate_key k;
+                             ssl_session_ticket_key /k/c.key;
+                             ssl_session_cache shared:SSL:1m; } }",
+        )
+        .unwrap();
+        let first = &cfg.servers[0].ssl.resumption;
+        assert_eq!(
+            first.ticket_keys,
+            Some(vec![PathBuf::from("/k/a.key"), PathBuf::from("/k/b.key")])
+        );
+        assert!(!first.shared);
+        // A server's own lines replace the inherited list.
+        let second = &cfg.servers[1].ssl.resumption;
+        assert_eq!(second.ticket_keys, Some(vec![PathBuf::from("/k/c.key")]));
+        assert!(second.shared);
+        assert!(parse("http { ssl_session_ticket_key; }").is_err());
     }
 
     #[test]
@@ -2464,6 +2541,36 @@ mod tests {
     }
 
     #[test]
+    fn access_log_buffer_flush_gzip() {
+        let parsed = |args: &str| {
+            let args: Vec<String> = args.split(' ').map(str::to_string).collect();
+            parse_log::parse_access_log_args(&args)
+        };
+        let Ok(parse_log::ParsedAccessLog::Entry(log)) =
+            parsed("/tmp/a.log main buffer=32k flush=5s if=$x")
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(
+            (log.buffer, log.flush_ms, log.gzip),
+            (Some(32 * 1024), Some(5000), None)
+        );
+        assert!(log.condition.is_some());
+        // `gzip` alone: level 1 and a 64k buffer.
+        let Ok(parse_log::ParsedAccessLog::Entry(log)) = parsed("/tmp/a.log main gzip") else {
+            panic!("not parsed");
+        };
+        assert_eq!((log.buffer, log.gzip), (Some(64 * 1024), Some(1)));
+        assert!(
+            parsed("/tmp/a.log main flush=1s").is_err(),
+            "flush without buffer"
+        );
+        assert!(parsed("/tmp/a.log main gzip=10").is_err());
+        assert!(parsed("/tmp/a.log main buffer=0").is_err());
+        assert!(parsed("syslog:server=127.0.0.1 main buffer=1k").is_err());
+    }
+
+    #[test]
     fn access_log_rejects_format_after_if_parameter() {
         let src = r#"
             http {
@@ -2472,10 +2579,12 @@ mod tests {
                 server { listen 80; location / { return 200 ""; } }
             }
         "#;
+        // The second argument is the format (`if=$arg_l`, as nginx reads
+        // it), and `test1` is then no parameter.
         assert!(matches!(
             parse(src),
             Err(Error::BadValue {
-                what: "access_log",
+                what: "access_log parameter",
                 ..
             })
         ));

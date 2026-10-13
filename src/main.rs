@@ -11,7 +11,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,6 +33,7 @@ mod tls;
 mod tls_certs;
 mod tls_session;
 mod tls_stream;
+mod tls_ticket;
 mod upstream;
 mod uri;
 mod worker;
@@ -321,6 +322,7 @@ fn real_main() -> Result<(), Failure> {
 
     // Fail like nginx when another process already listens on a port.
     worker::claim_addresses(&http.listens).map_err(|e| report_emerg(&e, &cli, &main_path))?;
+    worker::bind_unix_listeners(http).map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
     // Still one thread here, which the fork needs.
     if let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0) {
@@ -329,7 +331,9 @@ fn real_main() -> Result<(), Failure> {
             .map_err(|e| report_emerg(&e, &cli, &main_path))?;
     }
 
-    let runtime = Arc::new(worker::RuntimeState::default());
+    // Lives as long as the process: workers and connections borrow it
+    // instead of counting references on every accept (#128).
+    let runtime: &'static worker::RuntimeState = Box::leak(Box::default());
 
     let n_workers: usize = std::env::var("RUXEN_WORKERS")
         .ok()
@@ -337,18 +341,26 @@ fn real_main() -> Result<(), Failure> {
         .unwrap_or(config_workers);
     let pin = matches!(std::env::var("RUXEN_PIN").as_deref(), Ok("1"));
 
+    // Panic messages go to the error log (#130).
+    worker::install_panic_hook(http);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
     let mut handles = Vec::with_capacity(n_workers);
     for i in 0..n_workers {
         let cpu = if pin { Some(i) } else { None };
-        let runtime = runtime.clone();
+
         let ready = ready_tx.clone();
+        let exited = WorkerExit(i, exited_tx.clone());
         let handle = thread::Builder::new()
             .name(format!("ruxen-worker-{i}"))
-            .spawn(move || worker::run(http, cpu, runtime, ready))?;
+            .spawn(move || {
+                let _exited = exited;
+                worker::run(http, cpu, runtime, ready)
+            })?;
         handles.push(handle);
     }
     drop(ready_tx);
+    drop(exited_tx);
 
     // Each worker reports once its listeners are bound. Wait for all of
     // them: a busy port becomes one `[emerg]` and exit 1 instead of a
@@ -397,6 +409,7 @@ fn real_main() -> Result<(), Failure> {
         if pid_written && let Some(path) = &pid_path {
             privileges::remove_pid_file_on_exit(path);
         }
+        worker::remove_unix_sockets(http);
         return Err(Failure::Reported);
     }
     runtime.release_workers();
@@ -406,7 +419,7 @@ fn real_main() -> Result<(), Failure> {
         proxy_cache::start_manager(zone);
     }
 
-    let signal_runtime = runtime.clone();
+    let signal_runtime = runtime;
     let reopen_stderr = cli.errlog.clone().filter(|_| !http.uses_stderr_log);
     let monitor_pid_path = pid_path.clone();
     // Runs until the workers have finished (main drops `workers_done`),
@@ -436,6 +449,10 @@ fn real_main() -> Result<(), Failure> {
                 // were unlinked at creation), so the private directory is
                 // empty unless `client_body_in_file_only on` kept some.
                 http.body_temp.remove_private_if_empty();
+                // Buffered access_log lines (#151): nginx's workers write
+                // them on their way out.
+                worker::logbuf::flush_at_exit();
+                worker::remove_unix_sockets(http);
                 std::process::exit(0);
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
@@ -469,22 +486,48 @@ fn real_main() -> Result<(), Failure> {
         }
     });
 
-    for handle in handles {
-        if handle.join().is_err() {
+    // Workers say when they are gone, in any order. One that panicked
+    // ends the server: the others stop as on SIGQUIT, and ruxen exits 1
+    // for a supervisor to restart it (#130; see worker/panics.rs).
+    let mut worker_panicked = false;
+    for (i, panicked) in exited_rx.iter() {
+        if panicked && !worker_panicked {
+            worker_panicked = true;
+            worker::write_worker_log(
+                http.error_logs,
+                config::ErrorLogLevel::Alert,
+                &format!("worker {i} exited after a panic, stopping"),
+            );
             runtime.begin_shutdown();
-            return Err(io::Error::other("worker thread panicked").into());
         }
+    }
+    for handle in handles {
+        let _ = handle.join();
     }
 
     runtime.begin_shutdown();
     drop(workers_done);
     let _ = signal_monitor.join();
     http.body_temp.remove_private_if_empty();
+    worker::remove_unix_sockets(http);
 
     if let Some(path) = &pid_path {
         privileges::remove_pid_file_on_exit(path);
     }
+    if worker_panicked {
+        return Err(Failure::Reported);
+    }
     Ok(())
+}
+
+/// Held by a worker thread: tells `main` the worker is gone, and whether it
+/// unwound from a panic, when the thread ends either way.
+struct WorkerExit(usize, std::sync::mpsc::Sender<(usize, bool)>);
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        let _ = self.1.send((self.0, thread::panicking()));
+    }
 }
 
 /// `ruxen --compat`: parse the whole configuration, collecting what ruxen
@@ -612,6 +655,7 @@ fn version_output() -> &'static str {
         "configure arguments:",
         " --with-http_ssl_module",
         " --with-http_realip_module",
+        " --with-http_stub_status_module",
         " --without-pcre",
         " --without-http_charset_module",
         " --without-http_ssi_module",
@@ -624,12 +668,8 @@ fn version_output() -> &'static str {
         " --without-http_scgi_module",
         " --without-http_grpc_module",
         " --without-http_memcached_module",
-        " --without-http_limit_conn_module",
-        " --without-http_limit_req_module",
         " --without-http_empty_gif_module",
         " --without-http_browser_module",
-        " --without-http_upstream_hash_module",
-        " --without-http_upstream_ip_hash_module",
         " --without-http_upstream_random_module",
         " --without-http_upstream_zone_module",
         " --without-http_upstream_sticky_module",
@@ -851,6 +891,7 @@ mod tests {
                 "configure arguments:",
                 " --with-http_ssl_module",
                 " --with-http_realip_module",
+                " --with-http_stub_status_module",
                 " --without-pcre",
                 " --without-http_charset_module",
                 " --without-http_ssi_module",
@@ -863,12 +904,8 @@ mod tests {
                 " --without-http_scgi_module",
                 " --without-http_grpc_module",
                 " --without-http_memcached_module",
-                " --without-http_limit_conn_module",
-                " --without-http_limit_req_module",
                 " --without-http_empty_gif_module",
                 " --without-http_browser_module",
-                " --without-http_upstream_hash_module",
-                " --without-http_upstream_ip_hash_module",
                 " --without-http_upstream_random_module",
                 " --without-http_upstream_zone_module",
                 " --without-http_upstream_sticky_module",

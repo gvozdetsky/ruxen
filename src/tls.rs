@@ -61,6 +61,28 @@ where
     }
 }
 
+/// `accept_with_timeout` for an address where a server has
+/// `ssl_reject_handshake on`: `reject` decides from the ClientHello's SNI
+/// name (`TlsAcceptor::accept_or_reject`).
+pub async fn accept_or_reject_with_timeout<IO>(
+    acceptor: &TlsAcceptor,
+    stream: IO,
+    timeout: Duration,
+    reject: impl FnOnce(Option<&str>) -> bool,
+) -> Result<(ServerTlsStream<IO>, HandshakeInfo), AcceptError>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    match monoio::time::timeout(timeout, acceptor.accept_or_reject(stream, reject)).await {
+        Ok(Ok(s)) => {
+            let info = HandshakeInfo::from_stream(&s);
+            Ok((s, info))
+        }
+        Ok(Err(e)) => Err(AcceptError::Tls(e)),
+        Err(_elapsed) => Err(AcceptError::Timeout),
+    }
+}
+
 /// Snapshot of negotiated TLS parameters, taken once after the handshake.
 ///
 /// Stashed on the connection and read for `$ssl_*` variable rendering. We

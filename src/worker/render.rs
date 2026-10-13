@@ -344,6 +344,26 @@ impl RenderCtx<'_> {
             Variable::SslClientVEnd => {}
             Variable::SslClientVRemain => {}
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            Variable::LimitConnStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_conn::status::text(state.limit_conn_status));
+                }
+            }
+            Variable::LimitReqStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_req::status::text(state.limit_req_status));
+                }
+            }
+            Variable::Connections(gauge) => {
+                let t = super::stats::totals();
+                let n = match gauge {
+                    crate::config::ConnectionsGauge::Active => t.active,
+                    crate::config::ConnectionsGauge::Reading => t.reading,
+                    crate::config::ConnectionsGauge::Writing => t.writing,
+                    crate::config::ConnectionsGauge::Waiting => t.waiting,
+                };
+                write_u64_decimal(out, n);
+            }
             Variable::RequestBody => {
                 // nginx leaves `$request_body` empty whenever the body was
                 // spilled to disk — readers consult `$request_body_file`
@@ -1000,6 +1020,8 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::ContentType
             | Variable::RemoteUser
             | Variable::RequestBody
+            | Variable::LimitReqStatus
+            | Variable::LimitConnStatus
             | Variable::RequestBodyFile
             | Variable::ProxyHost
             | Variable::ProxyPort
