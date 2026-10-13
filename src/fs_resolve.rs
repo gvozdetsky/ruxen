@@ -213,7 +213,7 @@ pub(crate) fn take_failed_lookup() -> Option<(Vec<u8>, bool, ErrorLogLevel)> {
 }
 
 #[cold]
-fn note_failed_lookup(message: String, not_found: bool) {
+pub(crate) fn note_failed_lookup(message: String, not_found: bool) {
     note_failed_lookup_at(message, not_found, ErrorLogLevel::Error);
 }
 

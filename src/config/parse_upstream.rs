@@ -511,6 +511,15 @@ impl ProxyConf {
         "proxy_redirect",
         "proxy_hide_header",
         "proxy_pass_header",
+        "proxy_cache",
+        "proxy_cache_key",
+        "proxy_cache_valid",
+        "proxy_cache_methods",
+        "proxy_cache_min_uses",
+        "proxy_cache_bypass",
+        "proxy_no_cache",
+        "proxy_cache_convert_head",
+        "proxy_cache_revalidate",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -531,12 +540,11 @@ impl ProxyConf {
                 self.pass_request_headers =
                     Some(parse_on_off_args(&args[1..], "proxy_pass_request_headers")?);
             }
-            "proxy_ignore_headers" => {
-                if self.ignore_headers.is_some() {
-                    return Err(Error::Duplicate("proxy_ignore_headers"));
-                }
-                self.ignore_headers = Some(parse_proxy_ignore_headers(&args[1..])?);
-            }
+            // A bitmask in nginx: lines add up.
+            "proxy_ignore_headers" => self
+                .ignore_headers
+                .get_or_insert_with(Vec::new)
+                .extend(parse_proxy_ignore_headers(&args[1..])?),
             "proxy_set_body" => {
                 if self.set_body.is_some() {
                     return Err(Error::Duplicate("proxy_set_body"));
@@ -643,10 +651,219 @@ impl ProxyConf {
                 self.intercept_errors =
                     Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
             }
+            "proxy_cache" => {
+                if self.cache.cache.is_some() {
+                    return Err(Error::Duplicate("proxy_cache"));
+                }
+                let [_, value] = args else {
+                    return Err(Error::MissingArg("proxy_cache"));
+                };
+                let parts = parse_value_with_vars(value)?;
+                self.cache.cache = Some(if value == "off" {
+                    ProxyCacheSetting::Off
+                } else if parts.iter().any(|p| !matches!(p, ValuePart::Literal(_))) {
+                    ProxyCacheSetting::Var(parts)
+                } else {
+                    ProxyCacheSetting::Zone(value.clone())
+                });
+            }
+            "proxy_cache_key" => {
+                if self.cache.key.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_key"));
+                }
+                let [_, value] = args else {
+                    return Err(Error::MissingArg("proxy_cache_key"));
+                };
+                self.cache.key = Some(parse_value_with_vars(value)?);
+            }
+            "proxy_cache_valid" => {
+                let entries = parse_proxy_cache_valid(&args[1..])?;
+                self.cache
+                    .valid
+                    .get_or_insert_with(Vec::new)
+                    .extend(entries);
+            }
+            "proxy_cache_methods" => {
+                if args.len() < 2 {
+                    return Err(Error::MissingArg("proxy_cache_methods"));
+                }
+                let mut post = self.cache.methods_post.unwrap_or(false);
+                for method in &args[1..] {
+                    match method.to_ascii_uppercase().as_str() {
+                        "GET" | "HEAD" => {}
+                        "POST" => post = true,
+                        _ => {
+                            return Err(Error::BadValue {
+                                what: "proxy_cache_methods",
+                                got: method.clone(),
+                            });
+                        }
+                    }
+                }
+                self.cache.methods_post = Some(post);
+            }
+            "proxy_cache_min_uses" => {
+                if self.cache.min_uses.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_min_uses"));
+                }
+                let v = args
+                    .get(1)
+                    .ok_or(Error::MissingArg("proxy_cache_min_uses"))?;
+                self.cache.min_uses = Some(v.parse::<u32>().map_err(|_| Error::BadValue {
+                    what: "proxy_cache_min_uses",
+                    got: v.clone(),
+                })?);
+            }
+            name @ ("proxy_cache_bypass" | "proxy_no_cache") => {
+                if args.len() < 2 {
+                    return Err(Error::MissingArg(if name == "proxy_no_cache" {
+                        "proxy_no_cache"
+                    } else {
+                        "proxy_cache_bypass"
+                    }));
+                }
+                let slot = if name == "proxy_no_cache" {
+                    &mut self.cache.no_cache
+                } else {
+                    &mut self.cache.bypass
+                };
+                let list = slot.get_or_insert_with(Vec::new);
+                for value in &args[1..] {
+                    list.push(parse_value_with_vars(value)?);
+                }
+            }
+            "proxy_cache_convert_head" => {
+                if self.cache.convert_head.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_convert_head"));
+                }
+                self.cache.convert_head =
+                    Some(parse_on_off_args(&args[1..], "proxy_cache_convert_head")?);
+            }
+            "proxy_cache_revalidate" => {
+                if self.cache.revalidate.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_revalidate"));
+                }
+                self.cache.revalidate =
+                    Some(parse_on_off_args(&args[1..], "proxy_cache_revalidate")?);
+            }
             other => unreachable!("not a ProxyConf directive: {other}"),
         }
         Ok(())
     }
+}
+
+/// `proxy_cache_valid [code ...] time;` (ngx_http_file_cache_valid_set_slot):
+/// a time alone is for 200, 301 and 302; `any` is every status.
+pub(crate) fn parse_proxy_cache_valid(args: &[String]) -> Result<Vec<CacheValid>, Error> {
+    let (time, codes) = args
+        .split_last()
+        .ok_or(Error::MissingArg("proxy_cache_valid"))?;
+    let secs = super::parse_server::parse_duration_secs(time, "proxy_cache_valid")?;
+    if codes.is_empty() {
+        return Ok([200, 301, 302]
+            .into_iter()
+            .map(|status| CacheValid { status, secs })
+            .collect());
+    }
+    codes
+        .iter()
+        .map(|code| {
+            let status = if code == "any" {
+                0
+            } else {
+                code.parse::<u16>()
+                    .ok()
+                    .filter(|s| (100..=599).contains(s))
+                    .ok_or_else(|| Error::BadValue {
+                        what: "proxy_cache_valid status",
+                        got: code.clone(),
+                    })?
+            };
+            Ok(CacheValid { status, secs })
+        })
+        .collect()
+}
+
+/// `proxy_cache_path` (ngx_http_file_cache_set_slot). The loader and
+/// manager tunables are checked and otherwise unused: the index learns
+/// files lazily and eviction runs as entries are stored.
+pub(crate) fn parse_proxy_cache_path(args: &[String]) -> Result<ProxyCachePath, Error> {
+    let (path, params) = args
+        .split_first()
+        .ok_or(Error::MissingArg("proxy_cache_path"))?;
+    let bad = |got: &String| Error::BadValue {
+        what: "proxy_cache_path",
+        got: got.clone(),
+    };
+    let path = match path.strip_suffix('/') {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => path.as_str(),
+    };
+    let mut levels = [0u8; 3];
+    let mut zone: Option<(String, u64)> = None;
+    let mut inactive_secs = 600;
+    let mut max_size = None;
+    let mut min_free = None;
+    for param in params {
+        let (name, value) = param.split_once('=').ok_or_else(|| bad(param))?;
+        match name {
+            "levels" => {
+                let parts: Vec<&str> = value.split(':').collect();
+                if parts.len() > 3 {
+                    return Err(bad(param));
+                }
+                for (slot, part) in levels.iter_mut().zip(&parts) {
+                    *slot = match *part {
+                        "1" => 1,
+                        "2" => 2,
+                        _ => return Err(bad(param)),
+                    };
+                }
+            }
+            "keys_zone" => {
+                let (zone_name, size) = value.split_once(':').ok_or_else(|| bad(param))?;
+                let size = super::parse_server::parse_size_bytes(size).ok_or_else(|| bad(param))?;
+                // nginx: "keys zone ... is too small" below two pages.
+                if zone_name.is_empty() || size < 8192 {
+                    return Err(bad(param));
+                }
+                zone = Some((zone_name.to_string(), size));
+            }
+            "inactive" => {
+                inactive_secs = super::parse_server::parse_duration_secs(value, "inactive")?;
+            }
+            "max_size" => {
+                max_size =
+                    Some(super::parse_server::parse_size_bytes(value).ok_or_else(|| bad(param))?);
+            }
+            "use_temp_path" => {
+                if value != "on" && value != "off" {
+                    return Err(bad(param));
+                }
+            }
+            "min_free" => {
+                min_free =
+                    Some(super::parse_server::parse_size_bytes(value).ok_or_else(|| bad(param))?);
+            }
+            "loader_files" | "manager_files" => {
+                value.parse::<u64>().map_err(|_| bad(param))?;
+            }
+            "loader_sleep" | "loader_threshold" | "manager_sleep" | "manager_threshold" => {
+                super::parse_server::parse_duration_ms(value, "proxy_cache_path")?;
+            }
+            _ => return Err(bad(param)),
+        }
+    }
+    let (zone, size) = zone.ok_or(Error::MissingArg("proxy_cache_path keys_zone"))?;
+    Ok(ProxyCachePath {
+        path: PathBuf::from(path),
+        levels,
+        zone,
+        size,
+        inactive_secs,
+        max_size,
+        min_free,
+    })
 }
 
 /// Parse a `proxy_*_timeout` argument. Single time-suffix value (`60s`,

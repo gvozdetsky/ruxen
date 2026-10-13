@@ -82,6 +82,72 @@ pub struct ProxyConf {
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
+    /// `proxy_cache` and the directives that tune it (#233).
+    pub cache: ProxyCacheConf,
+}
+
+/// The `proxy_cache*` directives of one level, each `None` until set.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyCacheConf {
+    pub cache: Option<ProxyCacheSetting>,
+    pub key: Option<Vec<ValuePart>>,
+    pub valid: Option<Vec<CacheValid>>,
+    /// `proxy_cache_methods POST`: GET and HEAD are always cached.
+    pub methods_post: Option<bool>,
+    pub min_uses: Option<u32>,
+    /// `proxy_cache_bypass` / `proxy_no_cache` conditions: any that renders
+    /// non-empty and not `0` holds.
+    pub bypass: Option<Vec<Vec<ValuePart>>>,
+    pub no_cache: Option<Vec<Vec<ValuePart>>>,
+    pub convert_head: Option<bool>,
+    pub revalidate: Option<bool>,
+}
+
+impl ProxyCacheConf {
+    /// Unset values come from `parent`.
+    pub(crate) fn inherit(self, parent: &ProxyCacheConf) -> ProxyCacheConf {
+        ProxyCacheConf {
+            cache: self.cache.or_else(|| parent.cache.clone()),
+            key: self.key.or_else(|| parent.key.clone()),
+            valid: self.valid.or_else(|| parent.valid.clone()),
+            methods_post: self.methods_post.or(parent.methods_post),
+            min_uses: self.min_uses.or(parent.min_uses),
+            bypass: self.bypass.or_else(|| parent.bypass.clone()),
+            no_cache: self.no_cache.or_else(|| parent.no_cache.clone()),
+            convert_head: self.convert_head.or(parent.convert_head),
+            revalidate: self.revalidate.or(parent.revalidate),
+        }
+    }
+}
+
+/// `proxy_cache zone | off | $variable;`.
+#[derive(Debug, Clone)]
+pub enum ProxyCacheSetting {
+    Off,
+    Zone(String),
+    /// Rendered per request: a zone name, or empty / `off` for none.
+    Var(Vec<ValuePart>),
+}
+
+/// One `proxy_cache_valid` entry: a status (0 for `any`) and how long a
+/// response with it stays fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheValid {
+    pub status: u16,
+    pub secs: u64,
+}
+
+/// `proxy_cache_path path [levels=] keys_zone=name:size [inactive=]
+/// [max_size=] …;` (#233).
+#[derive(Debug, Clone)]
+pub struct ProxyCachePath {
+    pub path: PathBuf,
+    pub levels: [u8; 3],
+    pub zone: String,
+    pub size: u64,
+    pub inactive_secs: u64,
+    pub max_size: Option<u64>,
+    pub min_free: Option<u64>,
 }
 
 impl ProxyConf {
@@ -109,6 +175,7 @@ impl ProxyConf {
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
+            cache: self.cache.inherit(&parent.cache),
         }
     }
 }
@@ -227,6 +294,8 @@ pub struct HttpConfig {
     /// http-scope `underscores_in_headers on|off;`. `None` means "not set"
     /// and server scopes inherit/default to `off`.
     pub underscores_in_headers: Option<bool>,
+    /// `proxy_cache_path` lines (#233).
+    pub proxy_cache_paths: Vec<ProxyCachePath>,
     /// http-scope `upstream NAME { ... }` blocks. Referenced by name from
     /// `proxy_pass http://NAME;`. Names must be unique; duplicate
     /// declarations are rejected at parse time.
@@ -1584,6 +1653,8 @@ pub enum Variable {
     UpstreamHeaderTime,
     UpstreamBytesReceived,
     UpstreamBytesSent,
+    /// `$upstream_cache_status`: MISS, BYPASS, EXPIRED or HIT (#233).
+    UpstreamCacheStatus,
     /// `$upstream_response_length` — total bytes of the upstream response
     /// body (excluding upstream headers). Empty outside a proxy context.
     UpstreamResponseLength,

@@ -292,6 +292,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ignore_invalid_headers: Option<bool> = None;
     let mut underscores_in_headers: Option<bool> = None;
     let mut upstreams: Vec<UpstreamBlock> = Vec::new();
+    let mut proxy_cache_paths: Vec<ProxyCachePath> = Vec::new();
     // Server-level defaults set at http scope: servers without their own
     // inherit them once the block is closed (see `BlockClose`).
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -389,6 +390,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         expires,
                         ignore_invalid_headers,
                         underscores_in_headers,
+                        proxy_cache_paths,
                         upstreams,
                         warnings: warn_ssl_without_ssl_listen(&servers, warnings),
                         servers,
@@ -500,6 +502,16 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     name: "map".into(),
                     ctx: "http",
                 });
+            }
+            ("proxy_cache_path", Terminator::Semi) => {
+                let cache_path = parse_upstream::parse_proxy_cache_path(&args[1..])?;
+                if proxy_cache_paths.iter().any(|p| p.zone == cache_path.zone) {
+                    return Err(Error::BadValue {
+                        what: "proxy_cache_path duplicate zone",
+                        got: cache_path.zone,
+                    });
+                }
+                proxy_cache_paths.push(cache_path);
             }
             ("upstream", Terminator::BlockOpen) => {
                 let block = parse_upstream_block(&args[1..], lx)?;
@@ -934,12 +946,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Caches the descriptors of access logs whose path has variables; ruxen
     // opens access logs once per worker anyway. Arguments are checked.
     "open_log_file_cache",
-    // Read only by the proxy cache (ngx_http_upstream_cache, when
-    // `proxy_cache` is set). Without it, which ruxen doesn't implement
-    // (`proxy_cache` stays unknown), nginx ignores them too. The WebSocket
-    // boilerplate `proxy_cache_bypass $http_upgrade;` is in many configs.
-    "proxy_cache_bypass",
-    "proxy_no_cache",
     "proxy_method",
     "proxy_force_ranges",
     "proxy_cookie_domain",
@@ -3434,16 +3440,47 @@ mod tests {
     }
 
     #[test]
-    fn proxy_cache_bypass_and_no_cache_are_no_ops_without_a_cache() {
+    fn proxy_cache_directives_parse_at_every_level() {
         let src = r#"
-            http { proxy_cache_bypass $http_upgrade; server { listen 80; proxy_no_cache $arg_x;
-                location / { proxy_pass http://127.0.0.1:8080; proxy_cache_bypass $http_upgrade; }
+            http {
+                proxy_cache_path /tmp/c levels=1:2 keys_zone=one:1m inactive=1h max_size=1g
+                                 use_temp_path=off loader_files=10 manager_sleep=50ms;
+                proxy_cache_bypass $http_upgrade; proxy_cache_valid 1m;
+                server { listen 80; proxy_no_cache $arg_x $arg_y; proxy_cache one;
+                    location / { proxy_pass http://127.0.0.1:8080; proxy_cache_bypass $http_upgrade;
+                        proxy_cache_valid 200 301 10m; proxy_cache_valid any 1y;
+                        proxy_cache_key $uri; proxy_cache_methods GET POST;
+                        proxy_cache_min_uses 2; proxy_cache_convert_head off;
+                        proxy_cache_revalidate on;
+                        proxy_ignore_headers Expires; proxy_ignore_headers Vary; }
+                    location /v { proxy_pass http://127.0.0.1:8080; proxy_cache $arg_c; }
+                    location /off { proxy_pass http://127.0.0.1:8080; proxy_cache off; }
             } }
         "#;
-        parse(src).unwrap();
-        // The cache itself is still unknown.
-        let cached = "http { server { listen 80; location / { proxy_cache one; } } }";
-        assert!(parse(cached).is_err());
+        let cfg = parse(src).unwrap();
+        let path = &cfg.proxy_cache_paths[0];
+        assert_eq!(path.zone, "one");
+        assert_eq!(path.levels, [1, 2, 0]);
+        assert_eq!(path.inactive_secs, 3600);
+        assert_eq!(path.max_size, Some(1 << 30));
+        assert_eq!(path.min_free, None);
+        for bad in [
+            "proxy_cache_path /tmp/c;",
+            "proxy_cache_path /tmp/c keys_zone=one;",
+            "proxy_cache_path /tmp/c keys_zone=one:1k;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m levels=3;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m levels=1:2:2:2;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m use_temp_path=maybe;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m bogus=1;",
+            "proxy_cache_path /a keys_zone=one:1m; proxy_cache_path /b keys_zone=one:1m;",
+            "proxy_cache_valid 999 1m;",
+            "proxy_cache_valid 200 soon;",
+            "proxy_cache_methods PUT;",
+            "proxy_cache one; proxy_cache two;",
+        ] {
+            let src = format!("http {{ {bad} server {{ listen 80; }} }}");
+            assert!(parse(&src).is_err(), "{bad}");
+        }
     }
 
     #[test]

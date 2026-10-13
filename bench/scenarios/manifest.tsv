@@ -37,6 +37,8 @@ m1_hello_c1|return 200, one connection|8080|/|1|1|30s|5s|20|bench/m1/nginx.conf|
 m1_hello_c4096|return 200, 4096 connections|8080|/|16|4096|30s|5s|20|bench/m1/nginx.conf||none||http
 static_8k_c4096|static 8 KiB file, 4096 connections|8102|/hello.txt|16|4096|30s|5s|20|bench/static_8k/nginx.conf||none||http
 proxy_hello_c32|proxy_pass with upstream keep-alive, low concurrency|8095|/|4|32|30s|5s|20|bench/proxy_pass/nginx.conf||none||http
+proxy_cache_hit|proxy_cache, every request a hit on one fresh key|8170|/|16|512|30s|5s|20|bench/proxy_cache/nginx.conf||none||http
+proxy_cache_miss|proxy_cache lookup on every request, nothing cacheable, so each goes upstream|8171|/|16|512|30s|5s|20|bench/proxy_cache/nginx.conf||none||http
 tls_hello_c32|TLS 1.3 return 200, low concurrency|8443|/|4|32|30s|5s|20|bench/tls/nginx.conf|bench/tls/generate.sh|none||https
 redirect_301|return 301 with $request_uri|8110|/redirect?a=1|16|512|30s|5s|20|bench/core2/nginx.conf||none||http
 vars_render|return 200 with eight variables|8110|/vars?a=1&b=2|16|512|30s|5s|20|bench/core2/nginx.conf||none||http

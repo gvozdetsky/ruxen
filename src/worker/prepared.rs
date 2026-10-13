@@ -632,6 +632,49 @@ pub struct PreparedProxy {
     pub request_path: &'static [u8],
     /// What to do with the upstream's response headers.
     pub response: &'static ProxyResponseRules,
+    /// `proxy_cache` (#233); `None` without one, or with `proxy_cache off`.
+    pub cache: Option<&'static PreparedProxyCache>,
+}
+
+/// A location's resolved `proxy_cache*` directives (#233).
+pub struct PreparedProxyCache {
+    pub zone: PreparedCacheZone,
+    /// `proxy_cache_key`; `None`: the upstream URL, nginx's default key.
+    pub key: Option<&'static [PreparedValuePart]>,
+    pub valid: &'static [crate::config::CacheValid],
+    pub methods_post: bool,
+    pub min_uses: u32,
+    pub bypass: &'static [&'static [PreparedValuePart]],
+    pub no_cache: &'static [&'static [PreparedValuePart]],
+    pub convert_head: bool,
+    pub revalidate: bool,
+    pub ignore: crate::proxy_cache::Ignore,
+}
+
+impl std::fmt::Debug for PreparedProxyCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedProxyCache").finish_non_exhaustive()
+    }
+}
+
+/// The zone of `proxy_cache name`, or the zones a variable may name.
+pub enum PreparedCacheZone {
+    Zone(&'static crate::proxy_cache::CacheZone),
+    Var(
+        &'static [PreparedValuePart],
+        &'static [&'static crate::proxy_cache::CacheZone],
+    ),
+}
+
+impl PreparedProxyCache {
+    /// ngx_http_file_cache_valid: seconds a response with `status` stays
+    /// fresh by `proxy_cache_valid`, 0 for not at all.
+    pub fn valid_for(&self, status: u16) -> u64 {
+        self.valid
+            .iter()
+            .find(|v| v.status == 0 || v.status == status)
+            .map_or(0, |v| v.secs)
+    }
 }
 
 /// One prepared `proxy_set_header NAME VALUE;` entry. Name is a static
@@ -678,7 +721,24 @@ pub(crate) struct ProxyEffective {
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
     pub recursive_error_pages: bool,
+    /// The nearest scopes' `proxy_cache*` directives, and the cache fields
+    /// of `proxy_ignore_headers`.
+    pub cache: &'static crate::config::ProxyCacheConf,
+    pub cache_ignore: crate::proxy_cache::Ignore,
 }
+
+/// No `proxy_cache*` directive anywhere.
+pub(crate) static NO_CACHE_CONF: crate::config::ProxyCacheConf = crate::config::ProxyCacheConf {
+    cache: None,
+    key: None,
+    valid: None,
+    methods_post: None,
+    min_uses: None,
+    bypass: None,
+    no_cache: None,
+    convert_head: None,
+    revalidate: None,
+};
 
 impl ProxyEffective {
     /// Defaults match nginx (`60s` for all three timeouts; `on` for both
@@ -707,6 +767,14 @@ impl ProxyEffective {
             pass_headers: None,
             error_pages: &[],
             recursive_error_pages: false,
+            cache: &NO_CACHE_CONF,
+            cache_ignore: crate::proxy_cache::Ignore {
+                x_accel_expires: false,
+                expires: false,
+                cache_control: false,
+                set_cookie: false,
+                vary: false,
+            },
         }
     }
 }
@@ -1444,6 +1512,8 @@ impl ListenSocket {
 /// Top-level prepared state.
 pub struct PreparedHttp {
     pub listens: Vec<PreparedListen>,
+    /// `proxy_cache_path` zones, each looked after by a manager thread.
+    pub cache_zones: &'static [&'static crate::proxy_cache::CacheZone],
     /// Top-level `error_log` sinks, for worker-level lines (`accept()
     /// failed`, `worker_connections are not enough`); empty = stderr.
     pub error_logs: &'static [PreparedErrorLog],

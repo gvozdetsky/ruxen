@@ -38,6 +38,9 @@ regex = "1"
 zlib-rs = { version = "0.6", default-features = false, features = ["std", "rust-allocator"] }
 socket2 = "0.5"
 rustls = "0.23"
+# The proxy cache's file names (#233); already in the tree through
+# rustls, with the features rustls turns on.
+aws-lc-rs = { version = "1.16", default-features = false }
 rustls-pemfile = "2"
 
 # musl's allocator is slow on the per-request proxy and TLS paths (#199);

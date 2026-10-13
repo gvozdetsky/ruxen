@@ -144,6 +144,49 @@ pub struct ProxyPlan {
     /// worker when `ProxyReport::redirect_header` is set), and the hide /
     /// pass lists.
     pub response: &'static crate::worker::ProxyResponseRules,
+    /// `proxy_cache` (#233): `None` unless the location has one and the
+    /// request may use it.
+    pub cache: Option<Box<CachePlan>>,
+}
+
+/// A request's view of its `proxy_cache`: what the lookup found, and what
+/// storing the response needs.
+pub struct CachePlan {
+    pub conf: &'static crate::worker::PreparedProxyCache,
+    pub zone: &'static crate::proxy_cache::CacheZone,
+    pub key: Vec<u8>,
+    pub hash: crate::proxy_cache::CacheHash,
+    pub status: crate::proxy_cache::CacheStatus,
+    /// The response may be stored (`proxy_cache_min_uses` reached, no
+    /// `proxy_no_cache` condition holds).
+    pub store: bool,
+    /// The answer the cache already has.
+    pub hit: Option<CacheHit>,
+    /// The stale response, kept with `proxy_cache_revalidate` to answer
+    /// with if the upstream says 304.
+    pub stale: Option<crate::proxy_cache::Entry>,
+    /// The client's request header block, for the variant of a response
+    /// with `Vary`.
+    pub request_headers: Vec<u8>,
+    /// A HEAD request went upstream as a GET, so the body can be stored
+    /// (`proxy_cache_convert_head`).
+    pub head_as_get: bool,
+}
+
+pub enum CacheHit {
+    Entry(crate::proxy_cache::Entry),
+    /// A cached intercepted error.
+    Error(u16),
+}
+
+/// A response `attempt` found cacheable: its upstream header block (the
+/// file keeps it, and a hit filters it again) and freshness. The body is
+/// the client response's, after `client_head_len` bytes.
+struct Storable {
+    head: Vec<u8>,
+    valid_sec: i64,
+    vary: Vec<u8>,
+    client_head_len: usize,
 }
 
 /// The temp file holding a large request body (an open descriptor: the
@@ -316,6 +359,13 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
 /// the request's context; on the happy path nothing is pushed and the
 /// caller's empty `Vec` never allocates.
 pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Response {
+    if let Some(cache) = plan.cache.as_deref_mut() {
+        report.cache_status = Some(cache.status);
+        if let Some(hit) = cache.hit.take() {
+            return cached_response(&plan, hit, report);
+        }
+    }
+    let mut storable: Option<Storable> = None;
     let failures = &mut report.failures;
     let upstream_headers = &mut report.upstream_headers;
     let redirect_header = &mut report.redirect_header;
@@ -382,6 +432,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 accel,
                 &mut state,
                 started,
+                &mut storable,
             )
             .await
             {
@@ -400,6 +451,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                             accel,
                             &mut state,
                             started,
+                            &mut storable,
                         )
                         .await
                     } else {
@@ -422,6 +474,7 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 accel,
                 &mut state,
                 started,
+                &mut storable,
             )
             .await
         };
@@ -473,9 +526,28 @@ pub async fn run_proxy(mut plan: ProxyPlan, report: &mut ProxyReport) -> Respons
                 // matches a configured `error_page` rule turns into a
                 // Reroute instead of being forwarded.
                 upstream::report_success(upstream, current.peer_idx);
-                if let Some(rules) = plan.intercept.as_ref()
-                    && let Some(rule) = rules.iter().find(|r| r.status == status)
+                if status == 304
+                    && let Some(cache) = plan.cache.as_deref_mut()
+                    && let Some(stale) = cache.stale.take()
                 {
+                    revalidate(cache, &stale, storable.take());
+                    report.cache_status = Some(crate::proxy_cache::CacheStatus::Revalidated);
+                    return cached_response(&plan, CacheHit::Entry(stale), report);
+                }
+                let intercepted = plan
+                    .intercept
+                    .as_ref()
+                    .and_then(|rules| rules.iter().find(|r| r.status == status));
+                let mut resp = resp;
+                if let Some(cache) = plan.cache.as_deref() {
+                    if let Some(storable) = storable.take() {
+                        store_response(cache, storable, status, intercepted.is_some(), &resp);
+                    }
+                    if cache.head_as_get {
+                        strip_body(&mut resp);
+                    }
+                }
+                if let Some(rule) = intercepted {
                     return build_intercept_reroute(
                         rule,
                         status,
@@ -845,6 +917,14 @@ impl std::fmt::Display for UpstreamError {
 pub struct UpstreamTrail {
     pub states: Vec<UpstreamState>,
     pub headers: Vec<u8>,
+    /// `$upstream_cache_status` of the last pass that looked at a cache.
+    pub cache_status: Option<crate::proxy_cache::CacheStatus>,
+}
+
+impl UpstreamTrail {
+    pub fn cache_status_bytes(&self) -> &'static [u8] {
+        self.cache_status.map_or(&[], |s| s.as_bytes())
+    }
 }
 
 /// What `run_proxy` reports besides the response.
@@ -867,6 +947,8 @@ pub struct ProxyReport {
     /// One entry per attempt, for `$upstream_addr`, `$upstream_status` and
     /// the other per-attempt variables.
     pub states: Vec<UpstreamState>,
+    /// `$upstream_cache_status`, when the location has a `proxy_cache`.
+    pub cache_status: Option<crate::proxy_cache::CacheStatus>,
 }
 
 /// The answer's upstream request is over (its header filtered, or the
@@ -1010,10 +1092,12 @@ async fn attempt(
     accel: &mut Option<Box<AccelHeaders>>,
     state: &mut UpstreamState,
     started: Instant,
+    storable: &mut Option<Storable>,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     // Only the answering attempt's X-Accel headers count.
     *accel = None;
+    *storable = None;
     let peer_addr = plan.upstream.peers[peer_idx].addr;
     let (mut stream, opened_at, requests_served, slot) = if let Some(c) = pooled {
         (c.stream, c.opened_at, c.requests_served, c.slot)
@@ -1324,7 +1408,10 @@ async fn attempt(
     // does (ngx_http_proxy_module.c:1999), provided nothing was read past
     // the header.
     let skip_body = accel.as_ref().is_some_and(|a| a.redirect.is_some());
-    let bodiless = matches!(plan.method, Method::Head)
+    // A HEAD the cache sent as a GET (proxy_cache_convert_head) gets a body.
+    let upstream_head =
+        matches!(plan.method, Method::Head) && !plan.cache.as_ref().is_some_and(|c| c.head_as_get);
+    let bodiless = upstream_head
         || status_code == 204
         || status_code == 304
         || (!chunked && content_length == Some(0));
@@ -1332,7 +1419,7 @@ async fn attempt(
         upstream_close = true;
     }
     let body_has_content = !skip_body
-        && !matches!(plan.method, Method::Head)
+        && !upstream_head
         && status_code != 204
         && status_code != 304
         && !(status_code >= 100 && status_code < 200);
@@ -1492,9 +1579,95 @@ async fn attempt(
         .as_ref()
         .map(Vec::len)
         .unwrap_or(body_len_in_accum);
-    let mut out = Vec::with_capacity(head_end + 64 + body_len);
+    let mut out = client_head(
+        plan,
+        &accum[..head_end],
+        first_line_end,
+        body_len,
+        body_has_content,
+        skip_body,
+        upstream_headers,
+        redirect_header,
+    );
+    let client_head_len = out.len();
+    if let Some(decoded) = decoded_chunked_body.as_ref() {
+        out.extend_from_slice(decoded);
+    } else {
+        out.extend_from_slice(&accum[body_start..body_start + body_len_in_accum]);
+    }
+    if !skip_body && let Some(cache) = plan.cache.as_deref() {
+        *storable = if status_code == 304 && cache.stale.is_some() {
+            // A revalidation: the 304's own header is what renews the entry.
+            Some(Storable {
+                head: accum[..head_end].to_vec(),
+                valid_sec: 0,
+                vary: Vec::new(),
+                client_head_len,
+            })
+        } else if cache.store && !upstream_head {
+            // A HEAD's answer has no body to store (proxy_cache_convert_head
+            // off): a GET hitting it would get none.
+            storable_response(plan, &accum[..head_end], status_code, client_head_len)
+        } else {
+            None
+        };
+    }
+
+    // 8. Pool eligibility — return the socket only if all of these hold:
+    //    - upstream block opted into keepalive (plan.keepalive_eligible)
+    //    - the response isn't a 101: the connection now speaks another
+    //      protocol, and a later request from another client would be
+    //      written into that tunnel (nginx sets u->keepalive = 0 for it)
+    //    - upstream did not signal close
+    //    - the upstream announced HTTP/1.1
+    //    - we framed the body (chunked or content-length) so we know we
+    //      consumed exactly the right number of bytes
+    let response_framed = chunked || content_length.is_some() || !body_has_content;
+    if plan.keepalive_eligible
+        && status_code != 101
+        && !upstream_close
+        && upstream_is_11
+        && response_framed
+    {
+        upstream::pool_release(
+            plan.upstream,
+            peer_idx,
+            upstream::PooledConn {
+                stream,
+                last_used: Instant::now(),
+                opened_at,
+                requests_served: requests_served + 1,
+                slot,
+            },
+        );
+    }
+
+    // Return scratch to the per-worker pool only on the success path. Error
+    // returns (timeout, bad upstream framing, etc.) are rare in steady state
+    // and just drop the buffers; the pool refills naturally on subsequent
+    // requests.
+    return_proxy_buf(accum);
+    return_proxy_buf(read_buf);
+    AttemptOutcome::Ok(Response::Owned(out))
+}
+
+/// Step 7 of `attempt`, also run on a cached response: the client's
+/// header block from the upstream's `head` (status line and header lines,
+/// without the empty line), ready for a body of `body_len` bytes.
+#[allow(clippy::too_many_arguments)]
+fn client_head(
+    plan: &ProxyPlan,
+    head: &[u8],
+    first_line_end: usize,
+    body_len: usize,
+    body_has_content: bool,
+    skip_body: bool,
+    upstream_headers: &mut Vec<u8>,
+    redirect_header: &mut bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len() + 64 + body_len);
     out.extend_from_slice(b"HTTP/1.1");
-    out.extend_from_slice(&accum[8..first_line_end]);
+    out.extend_from_slice(&head[8..first_line_end]);
     // nginx hides the upstream's `Server` and `Date`
     // (`ngx_http_proxy_hide_headers`) and its header filter writes its own;
     // the worker write path stamps the date.
@@ -1520,15 +1693,15 @@ async fn attempt(
     if keep_upstream_headers {
         upstream_headers.clear();
     }
-    let mut cursor = first_line_end + first_line_terminator_len(&accum, first_line_end);
+    let mut cursor = first_line_end + first_line_terminator_len(head, first_line_end);
     let mut have_content_length = false;
     let mut seen_single: u16 = 0;
-    while cursor < head_end {
-        let (line_len, t) = match find_line_end(&accum[cursor..head_end]) {
+    while cursor < head.len() {
+        let (line_len, t) = match find_line_end(&head[cursor..]) {
             Some(v) => v,
-            None => (head_end - cursor, 0),
+            None => (head.len() - cursor, 0),
         };
-        let line = &accum[cursor..cursor + line_len];
+        let line = &head[cursor..cursor + line_len];
         cursor += line_len + t;
         if line.is_empty() {
             break;
@@ -1593,48 +1766,171 @@ async fn attempt(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    if let Some(decoded) = decoded_chunked_body.as_ref() {
-        out.extend_from_slice(decoded);
+    out
+}
+
+/// The response may be cached: its headers allow it, and they or
+/// `proxy_cache_valid` give it a lifetime (ngx_http_upstream_send_response).
+#[cold]
+fn storable_response(
+    plan: &ProxyPlan,
+    head: &[u8],
+    status: u16,
+    client_head_len: usize,
+) -> Option<Storable> {
+    let cache = plan.cache.as_deref()?;
+    // A 1xx (a 101 included) answers nothing to keep.
+    if status < 200 {
+        return None;
+    }
+    let now = crate::proxy_cache::now_secs();
+    let fresh = crate::proxy_cache::freshness(
+        crate::proxy_cache::header_lines(head),
+        cache.conf.ignore,
+        now,
+    )?;
+    let valid_sec = match fresh.valid_sec {
+        0 => match cache.conf.valid_for(status) {
+            0 => return None,
+            secs => now.saturating_add(secs as i64),
+        },
+        until => until,
+    };
+    Some(Storable {
+        head: head.to_vec(),
+        valid_sec,
+        vary: fresh.vary.to_vec(),
+        client_head_len,
+    })
+}
+
+/// Keep the response in the cache: on disk, or as its status alone when
+/// `proxy_intercept_errors` takes it (nginx's cached `error`).
+#[cold]
+fn store_response(
+    cache: &CachePlan,
+    storable: Storable,
+    status: u16,
+    intercepted: bool,
+    resp: &Response,
+) {
+    if intercepted {
+        cache
+            .zone
+            .store_error(&cache.hash, status, storable.valid_sec);
+        return;
+    }
+    let Response::Owned(out) = resp else {
+        return;
+    };
+    let variant = if storable.vary.is_empty() {
+        [0; 16]
     } else {
-        out.extend_from_slice(&accum[body_start..body_start + body_len_in_accum]);
-    }
+        crate::proxy_cache::vary_digest(&storable.vary, &cache.request_headers)
+    };
+    let entry = crate::proxy_cache::EntryParts {
+        valid_sec: storable.valid_sec,
+        key: &cache.key,
+        vary: &storable.vary,
+        variant,
+        head: &storable.head,
+        body: &out[storable.client_head_len..],
+    };
+    // A file that can't be written leaves the entry uncached; the
+    // response itself still goes out.
+    let _ = cache.zone.store(&cache.hash, &entry);
+}
 
-    // 8. Pool eligibility — return the socket only if all of these hold:
-    //    - upstream block opted into keepalive (plan.keepalive_eligible)
-    //    - the response isn't a 101: the connection now speaks another
-    //      protocol, and a later request from another client would be
-    //      written into that tunnel (nginx sets u->keepalive = 0 for it)
-    //    - upstream did not signal close
-    //    - the upstream announced HTTP/1.1
-    //    - we framed the body (chunked or content-length) so we know we
-    //      consumed exactly the right number of bytes
-    let response_framed = chunked || content_length.is_some() || !body_has_content;
-    if plan.keepalive_eligible
-        && status_code != 101
-        && !upstream_close
-        && upstream_is_11
-        && response_framed
+/// The upstream said 304 to a revalidation (ngx_http_upstream_test_next):
+/// the stale entry is fresh again for the 304's lifetime, else for the one
+/// its own headers give from now, else `proxy_cache_valid`'s for its
+/// status.
+#[cold]
+fn revalidate(cache: &CachePlan, stale: &crate::proxy_cache::Entry, reply: Option<Storable>) {
+    use crate::proxy_cache::{header_lines, header_valid_sec, now_secs};
+    let now = now_secs();
+    let ignore = cache.conf.ignore;
+    let mut valid = reply.map_or(0, |r| header_valid_sec(header_lines(&r.head), ignore, now));
+    if valid == 0 {
+        valid = header_valid_sec(header_lines(stale.head()), ignore, now);
+    }
+    if valid == 0 {
+        valid = match cache.conf.valid_for(stale.status()) {
+            0 => return,
+            secs => now.saturating_add(secs as i64),
+        };
+    }
+    cache.zone.refresh(&cache.hash, valid);
+}
+
+/// The client asked with HEAD and the upstream got a GET: keep the header
+/// block, with the body's length, and drop the body.
+fn strip_body(resp: &mut Response) {
+    if let Response::Owned(out) = resp
+        && let Some((end, terminator)) = find_head_end(out)
     {
-        upstream::pool_release(
-            plan.upstream,
-            peer_idx,
-            upstream::PooledConn {
-                stream,
-                last_used: Instant::now(),
-                opened_at,
-                requests_served: requests_served + 1,
-                slot,
-            },
-        );
+        out.truncate(end + terminator);
     }
+}
 
-    // Return scratch to the per-worker pool only on the success path. Error
-    // returns (timeout, bad upstream framing, etc.) are rare in steady state
-    // and just drop the buffers; the pool refills naturally on subsequent
-    // requests.
-    return_proxy_buf(accum);
-    return_proxy_buf(read_buf);
-    AttemptOutcome::Ok(Response::Owned(out))
+/// The answer from the cache (ngx_http_upstream_cache_send): the stored
+/// upstream header goes through the same filtering as a fresh one.
+#[cold]
+fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) -> Response {
+    let entry = match hit {
+        // nginx finalizes the request with the status, so the location's
+        // error_page answers it.
+        CacheHit::Error(status) => {
+            let body = format!("{}\n", crate::http::reason_phrase(status));
+            let resp = Response::Owned(crate::http::build_response_for_method(
+                status,
+                &body,
+                plan.method,
+                plan.server_bytes,
+            ));
+            let rule = plan
+                .intercept
+                .as_ref()
+                .and_then(|rules| rules.iter().find(|r| r.status == status));
+            return match rule {
+                Some(rule) => build_intercept_reroute(
+                    rule,
+                    status,
+                    resp,
+                    plan.response.recursive_error_pages,
+                    plan.method,
+                    plan.server_bytes,
+                ),
+                None => resp,
+            };
+        }
+        CacheHit::Entry(entry) => entry,
+    };
+    let head = entry.head();
+    let first_line_end = find_line_end(head).map_or(head.len(), |(end, _)| end);
+    let status = parse_status_code(&head[..first_line_end]);
+    for (name, value) in crate::proxy_cache::header_lines(head) {
+        if name.len() >= 16 && name[..8].eq_ignore_ascii_case(b"x-accel-") {
+            note_accel_header(&mut report.accel, plan.response, name, value);
+        }
+    }
+    let skip_body = report.accel.as_ref().is_some_and(|a| a.redirect.is_some());
+    let body_has_content = !skip_body && status >= 200 && status != 204 && status != 304;
+    let body = entry.body();
+    let mut out = client_head(
+        plan,
+        head,
+        first_line_end,
+        body.len(),
+        body_has_content,
+        skip_body,
+        &mut report.upstream_headers,
+        &mut report.redirect_header,
+    );
+    if body_has_content && !matches!(plan.method, Method::Head) {
+        out.extend_from_slice(body);
+    }
+    Response::Owned(out)
 }
 
 /// Stream a request body that was too large to keep in memory from its

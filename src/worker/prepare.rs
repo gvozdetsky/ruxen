@@ -86,6 +86,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         ignore_invalid_headers,
         underscores_in_headers,
         upstreams,
+        proxy_cache_paths,
         servers,
         warnings: _,
         dump_files: _,
@@ -154,6 +155,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_access_logs: &'static [PreparedAccessLog] = alp.prepare_list(&access_logs)?;
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
+    prepare_cache_zones(proxy_cache_paths)?;
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
         prepare_upstreams(upstreams);
 
@@ -270,6 +272,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
         internal_error: Prebuilt::leak(500, "Internal Server Error\n", http_server_bytes),
         upstreams: prepared_upstreams,
+        cache_zones: CACHE_ZONES.with(|z| &*Box::leak(z.borrow().clone().into_boxed_slice())),
         conf_prefix: conf_prefix.map(leak_path_buf),
     })))
 }
@@ -445,6 +448,92 @@ pub(crate) fn prepare_upstreams(
     out
 }
 
+thread_local! {
+    /// The http block's `proxy_cache_path` zones while a config is
+    /// prepared (#233).
+    static CACHE_ZONES: std::cell::RefCell<Vec<&'static crate::proxy_cache::CacheZone>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Build the zones of `proxy_cache_path` (#233). The directories are made
+/// at startup, as nginx's ngx_create_paths does.
+fn prepare_cache_zones(paths: Vec<crate::config::ProxyCachePath>) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut zones = Vec::with_capacity(paths.len());
+    for p in paths {
+        match std::fs::DirBuilder::new().mode(0o700).create(&p.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "mkdir() \"{}\" failed ({})",
+                    p.path.display(),
+                    errno_text(&e)
+                ));
+            }
+            _ => {}
+        }
+        crate::privileges::note_temp_dir(&p.path);
+        zones.push(&*Box::leak(Box::new(crate::proxy_cache::CacheZone::new(
+            crate::proxy_cache::ZoneConf {
+                name: p.zone,
+                path: p.path,
+                levels: p.levels,
+                size: p.size,
+                inactive_secs: p.inactive_secs,
+                max_size: p.max_size,
+                min_free: p.min_free,
+            },
+        ))));
+    }
+    CACHE_ZONES.with(|z| *z.borrow_mut() = zones);
+    Ok(())
+}
+
+/// A location's resolved `proxy_cache*` (`None` without `proxy_cache` or
+/// with `proxy_cache off`). A zone no `proxy_cache_path` declares is
+/// nginx's startup error.
+fn prepare_proxy_cache(
+    conf: &'static crate::config::ProxyCacheConf,
+    ignore: crate::proxy_cache::Ignore,
+) -> Result<Option<&'static PreparedProxyCache>, String> {
+    use crate::config::ProxyCacheSetting;
+    let zone = match &conf.cache {
+        None | Some(ProxyCacheSetting::Off) => return Ok(None),
+        Some(ProxyCacheSetting::Zone(name)) => {
+            let zone = CACHE_ZONES
+                .with(|z| z.borrow().iter().find(|z| z.name == name.as_str()).copied())
+                .ok_or_else(|| format!("\"proxy_cache\" zone \"{name}\" is unknown"))?;
+            PreparedCacheZone::Zone(zone)
+        }
+        Some(ProxyCacheSetting::Var(parts)) => {
+            let zones: Vec<_> = CACHE_ZONES.with(|z| z.borrow().clone());
+            PreparedCacheZone::Var(
+                prepare_value_parts(parts.clone()),
+                Box::leak(zones.into_boxed_slice()),
+            )
+        }
+    };
+    let conditions = |list: &Option<Vec<Vec<crate::config::ValuePart>>>| {
+        let list: Vec<&'static [PreparedValuePart]> = list
+            .iter()
+            .flatten()
+            .map(|parts| prepare_value_parts(parts.clone()))
+            .collect();
+        &*Box::leak(list.into_boxed_slice())
+    };
+    Ok(Some(Box::leak(Box::new(PreparedProxyCache {
+        zone,
+        key: conf.key.clone().map(prepare_value_parts),
+        valid: conf.valid.as_deref().unwrap_or(&[]),
+        methods_post: conf.methods_post.unwrap_or(false),
+        min_uses: conf.min_uses.unwrap_or(1),
+        bypass: conditions(&conf.bypass),
+        no_cache: conditions(&conf.no_cache),
+        convert_head: conf.convert_head.unwrap_or(true),
+        revalidate: conf.revalidate.unwrap_or(false),
+        ignore,
+    }))))
+}
+
 pub(crate) type UpstreamMap = std::collections::HashMap<&'static str, &'static PreparedUpstream>;
 
 /// Resolve a parsed `proxy_pass` argument against the http-scope upstream
@@ -522,6 +611,7 @@ pub(crate) fn build_proxy(
             location_pattern,
         )?
     };
+    let cache = prepare_proxy_cache(eff.cache, eff.cache_ignore)?;
     let response = prepare_response_rules(
         redirects,
         eff.hide_headers,
@@ -579,6 +669,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                cache,
             }
         }
         ProxyPass::UpstreamRef {
@@ -613,6 +704,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                cache,
             }
         }
     })
@@ -759,6 +851,27 @@ pub(crate) struct ServerProxyDefaults {
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    pub cache: &'static crate::config::ProxyCacheConf,
+    pub cache_ignore: crate::proxy_cache::Ignore,
+}
+
+/// The cache fields of `proxy_ignore_headers` at one scope, the unset ones
+/// from `parent`.
+fn cache_ignore(
+    list: Option<&[String]>,
+    parent: crate::proxy_cache::Ignore,
+) -> crate::proxy_cache::Ignore {
+    if list.is_none() {
+        return parent;
+    }
+    let has = |field| ignores(list, field).unwrap_or(false);
+    crate::proxy_cache::Ignore {
+        x_accel_expires: has("x-accel-expires"),
+        expires: has("expires"),
+        cache_control: has("cache-control"),
+        set_cookie: has("set-cookie"),
+        vary: has("vary"),
+    }
 }
 
 /// `proxy_ignore_headers` as set at one scope: whether it lists `field`
@@ -814,6 +927,8 @@ impl ServerProxyDefaults {
             redirect: conf.redirect.map(|r| &*Box::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
+            cache_ignore: cache_ignore(conf.ignore_headers.as_deref(), defaults.cache_ignore),
+            cache: Box::leak(Box::new(conf.cache)),
         }
     }
 }
@@ -885,6 +1000,11 @@ pub(crate) fn resolve_proxy_effective(
             Some(r) => Some(&*Box::leak(Box::new(r))),
             None => server_defaults.redirect,
         },
+        cache_ignore: cache_ignore(
+            location.ignore_headers.as_deref(),
+            server_defaults.cache_ignore,
+        ),
+        cache: Box::leak(Box::new(location.cache.inherit(server_defaults.cache))),
         hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
         // Filled in by the location once its error_page list is resolved.

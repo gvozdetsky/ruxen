@@ -446,6 +446,7 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
         b"upstream_header_time" => Variable::UpstreamHeaderTime,
         b"upstream_bytes_received" => Variable::UpstreamBytesReceived,
         b"upstream_bytes_sent" => Variable::UpstreamBytesSent,
+        b"upstream_cache_status" => Variable::UpstreamCacheStatus,
         b"upstream_response_time" => Variable::UpstreamResponseTime,
         _ if name.starts_with(b"upstream_http_") => {
             Variable::UpstreamHttp(header_var_name(&name[b"upstream_http_".len()..]))
