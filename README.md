@@ -71,7 +71,7 @@ cd ruxen-v*-x86_64-linux-gnu
 
 On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`) and a `SHA256SUMS` file.
 
-**Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), from each release:
+**Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), published with every release after 0.1.2:
 
 ```bash
 docker run --rm -p 8080:8080 ghcr.io/gvozdetsky/ruxen
