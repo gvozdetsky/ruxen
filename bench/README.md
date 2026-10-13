@@ -149,6 +149,22 @@ It reads the server's utime/stime from `/proc` around one measured run and
 prints user/system µs per request. Alternate the runs and repeat a few
 times; the first run after idle is unreliable here too.
 
+### Idle connections: `idle_cpu.sh`
+
+What the server spends while nothing happens: N keep-alive connections
+each make one request and then stay open, and the server's utime/stime
+are read over a window (default 10 000 connections, 10 s). nginx spends
+nothing here; a timer or tick per connection or per worker shows up.
+
+```bash
+ulimit -n 65536
+bench/scripts/idle_cpu.sh m1_hello --server nginx
+bench/scripts/idle_cpu.sh m1_hello --bin /tmp/ruxen-main --connections 5000 --seconds 5
+```
+
+It prints the share of one core. Plain-HTTP scenarios only; the scenario's
+`keepalive_timeout` has to outlast the window.
+
 ### Profiling
 
 `perf record -g -p <pid>` works once

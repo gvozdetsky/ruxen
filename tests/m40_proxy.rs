@@ -581,6 +581,26 @@ fn m40_close_delimited_upstream_body_is_framed_for_keepalive_clients() {
     assert!(second.ends_with("alive"), "{text}");
 }
 
+/// A status line followed directly by the empty line, with no header
+/// fields, is a valid response (#323; proxy_merge_headers.t). Its CRLF
+/// is part of the head's terminator, which used to make it a 502.
+#[test]
+fn m40_status_line_without_header_fields() {
+    let cases: [(&[u8], &str); 3] = [
+        (b"HTTP/1.0 200 OK\r\n\r\nbare", "bare"),
+        (b"HTTP/1.0 200 OK\r\n\r\n", ""),
+        (b"HTTP/1.0 200 OK\n\nlf", "lf"),
+    ];
+    for (response, want) in cases {
+        let backend = Backend::spawn(response.to_vec());
+        let (_guard, port, _dir) = spawn_ruxen(&proxy_conf(backend.addr.port()));
+        let resp = http_get_close(port, "/up/");
+        let text = String::from_utf8_lossy(&resp);
+        assert_eq!(status_code(&resp), 200, "{text}");
+        assert_eq!(body(&resp), want.as_bytes(), "{text}");
+    }
+}
+
 /// nginx's proxy hides the upstream's Server, Date, X-Pad and X-Accel-*
 /// headers by default and writes its own Server and Date (#31), while
 /// `$upstream_http_*` still read the upstream's values.
