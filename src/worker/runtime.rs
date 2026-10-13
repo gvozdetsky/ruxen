@@ -2763,6 +2763,17 @@ pub(crate) async fn handle<S: ConnIo>(
                             .await;
                             drop(slot);
                             drop(lease);
+                            if tunnelled.end == TunnelEnd::ClientTimedOut {
+                                // ngx_http_upstream_process_upgraded, at info.
+                                write_error_log(
+                                    process_meta.log.error_logs,
+                                    ErrorLogLevel::Info,
+                                    &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                        .with_realip(&process_meta),
+                                    b"client timed out (110: Connection timed out) while proxying upgraded connection",
+                                    Some(&upstream_url),
+                                );
+                            }
                             if tunnelled.end == TunnelEnd::UpstreamTimedOut {
                                 write_upstream_error_log(
                                     &process_meta.log,
