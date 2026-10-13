@@ -108,6 +108,18 @@ pub(crate) fn parse_access_log_args(args: &[String]) -> Result<ParsedAccessLog, 
             &args[0],
         ));
     }
+    // A path with variables is rendered per request (ngx_http_log_set_log
+    // compiles it to a script).
+    let path_vars = match syslog {
+        None if args[0].contains('$') => Some(parse_value_with_vars(&args[0])?),
+        _ => None,
+    };
+    if buffer.is_some() && path_vars.is_some() {
+        return Err(bad(
+            "access_log (buffered logs cannot have variables in name)",
+            &args[0],
+        ));
+    }
     if buffer.is_some() && syslog.is_some() {
         return Err(bad(
             "access_log (logs to syslog cannot be buffered)",
@@ -123,6 +135,7 @@ pub(crate) fn parse_access_log_args(args: &[String]) -> Result<ParsedAccessLog, 
         buffer,
         flush_ms,
         gzip,
+        path_vars,
     }))
 }
 

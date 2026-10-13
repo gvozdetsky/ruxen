@@ -127,11 +127,17 @@ thread_local! {
 pub(crate) enum AccessLogSink {
     File(AsyncFile),
     Syslog(crate::syslog::SyslogSocket),
+    /// A path with variables: opened per line (#303).
+    PerLine,
 }
 
 fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AccessLogSink]>, String> {
     let mut opened: Vec<AccessLogSink> = Vec::with_capacity(logs.len());
     for log in logs {
+        if log.path_vars.is_some() {
+            opened.push(AccessLogSink::PerLine);
+            continue;
+        }
         if let Some(peer) = log.syslog {
             let sock = crate::syslog::SyslogSocket::open(peer).map_err(|e| {
                 format!(

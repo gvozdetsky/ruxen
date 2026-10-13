@@ -243,6 +243,9 @@ pub struct ProcessMeta {
     /// access_logs` — so location-scope `access_log` directives fire
     /// against the right format/path for the request that landed.
     pub access_logs: &'static [crate::worker::PreparedAccessLog],
+    /// The location's root, which an access_log path with variables
+    /// checks before it writes (#303).
+    pub doc_root: Option<&'static crate::worker::DocRoot>,
     /// The location's `send_timeout` (and `client_body_timeout`) for this
     /// request; `None` before routing (#147).
     pub timeouts: Option<&'static crate::worker::PreparedClientTimeouts>,
@@ -322,6 +325,7 @@ impl Default for ProcessMeta {
             log: LogMeta::default(),
             server_port: 0,
             access_logs: &[],
+            doc_root: None,
             timeouts: None,
             remote_user: None,
             realip: None,
@@ -833,6 +837,7 @@ fn process_with_meta_inner(
             disable_safari: loc.keepalive.disable_safari,
         };
         meta.access_logs = loc.access_logs;
+        meta.doc_root = Some(loc.doc_root);
         meta.timeouts = Some(loc.timeouts);
         meta.post_action = loc.post_action;
         meta.log = LogMeta {

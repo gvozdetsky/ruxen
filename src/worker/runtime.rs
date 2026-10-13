@@ -161,6 +161,13 @@ pub(crate) async fn write_access_logs(
         }
         line.push(b'\n');
 
+        // A path with variables: render, open, write, close (#303).
+        if let Some(path) = log.path_vars {
+            let error_logs = meta.map_or(&[][..], |m| m.log.error_logs);
+            write_access_line_by_path(path, meta.and_then(|m| m.doc_root), error_logs, &ctx, line)
+                .await;
+            continue;
+        }
         // `buffer=`: into this worker's buffer for the file (#151).
         if let Some(buffer) = log.buffer {
             write_buffered_access_line(http, &files, log, buffer, &line).await;
@@ -185,6 +192,63 @@ pub(crate) async fn write_access_logs(
                 log.path.display()
             );
         }
+    }
+}
+
+/// An access_log line for a path with variables, as nginx's
+/// ngx_http_log_script_write: only when the location's root exists (so a
+/// bogus `Host` can't make files), then to the rendered path, opened for
+/// this line and closed after it.
+#[cold]
+#[inline(never)]
+async fn write_access_line_by_path(
+    path: &'static [PreparedValuePart],
+    doc_root: Option<&'static DocRoot>,
+    error_logs: &'static [PreparedErrorLog],
+    ctx: &RenderCtx<'_>,
+    line: Vec<u8>,
+) {
+    if let Some(root) = doc_root
+        && let Err(e) = std::fs::metadata(root.path)
+    {
+        write_worker_log(
+            error_logs,
+            ErrorLogLevel::Error,
+            &format!(
+                "testing \"{}\" existence failed ({}) while logging request",
+                root.path.display(),
+                errno_text(&e)
+            ),
+        );
+        return;
+    }
+    let mut rendered = Vec::with_capacity(64);
+    render_parts(path, ctx, &mut rendered);
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&rendered));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(AsyncFile::from_std);
+    let file = match file {
+        Ok(file) => file,
+        Err(e) => {
+            write_worker_log(
+                error_logs,
+                ErrorLogLevel::Error,
+                &format!(
+                    "open() \"{}\" failed ({}) while logging request",
+                    path.display(),
+                    errno_text(&e)
+                ),
+            );
+            return;
+        }
+    };
+    let (res, _) = file.write_all_at(line, 0).await;
+    if let Err(e) = res {
+        eprintln!("ruxen: access_log write to {} failed: {e}", path.display());
     }
 }
 
