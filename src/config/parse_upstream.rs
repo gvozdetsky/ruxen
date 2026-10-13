@@ -87,13 +87,14 @@ pub(crate) fn parse_upstream_block(
         match (args[0].as_str(), &term) {
             ("server", Terminator::Semi) => {
                 let server = parse_upstream_server_args(&args[1..])?;
-                if server.backup && matches!(lb, LbAlgorithm::Hash { .. } | LbAlgorithm::IpHash) {
+                if server[0].backup && matches!(lb, LbAlgorithm::Hash { .. } | LbAlgorithm::IpHash)
+                {
                     return Err(Error::BadValue {
                         what: "upstream server param (balancing method does not support it)",
                         got: "backup".into(),
                     });
                 }
-                servers.push(server);
+                servers.extend(server);
             }
             ("server", _) => {
                 return Err(Error::WrongTerminator {
@@ -246,19 +247,24 @@ pub(crate) fn parse_upstream_block(
     }
 }
 
-pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServer, Error> {
+/// One `server` line: a server per address its name resolves to, all with
+/// the line's parameters (ngx_http_upstream_init_round_robin counts
+/// `server[i].naddrs` peers).
+pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<UpstreamServer>, Error> {
     let host_port = args.first().ok_or(Error::MissingArg("server host:port"))?;
-    let addr = match strip_unix_prefix(host_port) {
-        Some(path) => unix_socket_path(path).map_err(|what| Error::BadValue {
+    let addrs = match strip_unix_prefix(host_port) {
+        Some(path) => vec![unix_socket_path(path).map_err(|what| Error::BadValue {
             what,
             got: host_port.clone(),
-        })?,
-        None => {
-            UpstreamAddr::Inet(resolve_host_port(host_port).map_err(|msg| Error::BadValue {
+        })?],
+        None => resolve_host_port(host_port)
+            .map_err(|msg| Error::BadValue {
                 what: "upstream server host:port",
                 got: format!("{host_port}: {msg}"),
-            })?)
-        }
+            })?
+            .into_iter()
+            .map(UpstreamAddr::Inet)
+            .collect(),
     };
     let mut weight: u32 = 1;
     let mut max_fails: u32 = 1;
@@ -304,16 +310,19 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
             });
         }
     }
-    Ok(UpstreamServer {
-        addr,
-        display: host_port.clone(),
-        weight,
-        max_fails,
-        fail_timeout_secs,
-        max_conns,
-        down,
-        backup,
-    })
+    Ok(addrs
+        .into_iter()
+        .map(|addr| UpstreamServer {
+            addr,
+            display: host_port.clone(),
+            weight,
+            max_fails,
+            fail_timeout_secs,
+            max_conns,
+            down,
+            backup,
+        })
+        .collect())
 }
 
 /// The part after `unix:` (any case, as ngx_parse_url), if `s` names a
@@ -342,12 +351,20 @@ fn unix_socket_path(path: &str) -> Result<UpstreamAddr, &'static str> {
 /// at parse time. nginx itself does this via `getaddrinfo` for non-resolver
 /// upstreams; we do the same. Picks the first resolved address — multi-A
 /// expansion is not supported in v0.1.
-pub(crate) fn resolve_host_port(s: &str) -> Result<SocketAddr, String> {
+pub(crate) fn resolve_host_port(s: &str) -> Result<Vec<SocketAddr>, String> {
     use std::net::ToSocketAddrs;
-    s.to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or_else(|| "no addresses resolved".into())
+    // Every address, in getaddrinfo's order: each is a peer, as
+    // ngx_inet_resolve_host makes it (#330).
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for addr in s.to_socket_addrs().map_err(|e| e.to_string())? {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    if addrs.is_empty() {
+        return Err("no addresses resolved".into());
+    }
+    Ok(addrs)
 }
 
 /// Parse a `[N]s` / bare integer seconds value. Allows the `s` suffix only
@@ -403,7 +420,7 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
             got: raw.clone(),
         })?;
         return Ok(ProxyPass::Direct {
-            addr,
+            addrs: vec![addr],
             host_header: "localhost".to_string(),
             request_path: (!uri.is_empty()).then(|| uri.to_string()),
         });
@@ -444,12 +461,12 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
     } else {
         format!("{authority}:80")
     };
-    let addr = resolve_host_port(&host_port).map_err(|msg| Error::BadValue {
+    let addrs = resolve_host_port(&host_port).map_err(|msg| Error::BadValue {
         what: "proxy_pass host:port",
         got: format!("{raw}: {msg}"),
     })?;
     Ok(ProxyPass::Direct {
-        addr: UpstreamAddr::Inet(addr),
+        addrs: addrs.into_iter().map(UpstreamAddr::Inet).collect(),
         host_header: authority.to_string(),
         request_path,
     })
@@ -1136,7 +1153,7 @@ mod tests {
         assert_eq!(
             proxy_pass("http://unix:/run/app.sock:/api/").unwrap(),
             ProxyPass::Direct {
-                addr: UpstreamAddr::Unix("/run/app.sock".into()),
+                addrs: vec![UpstreamAddr::Unix("/run/app.sock".into())],
                 host_header: "localhost".into(),
                 request_path: Some("/api/".into()),
             }
@@ -1144,7 +1161,7 @@ mod tests {
         assert_eq!(
             proxy_pass("http://UNIX:/run/app.sock").unwrap(),
             ProxyPass::Direct {
-                addr: UpstreamAddr::Unix("/run/app.sock".into()),
+                addrs: vec![UpstreamAddr::Unix("/run/app.sock".into())],
                 host_header: "localhost".into(),
                 request_path: None,
             }
@@ -1153,12 +1170,43 @@ mod tests {
     }
 
     #[test]
+    fn every_address_of_a_name_is_a_server() {
+        use std::net::ToSocketAddrs;
+        // As many servers as the name has distinct addresses here (one or
+        // two for `localhost`), with the line's parameters on each.
+        let mut want: Vec<std::net::SocketAddr> = Vec::new();
+        for a in "localhost:8081".to_socket_addrs().unwrap() {
+            if !want.contains(&a) {
+                want.push(a);
+            }
+        }
+        let servers =
+            parse_upstream_server_args(&["localhost:8081".into(), "weight=3".into()]).unwrap();
+        let got: Vec<UpstreamAddr> = servers.iter().map(|s| s.addr.clone()).collect();
+        let want: Vec<UpstreamAddr> = want.into_iter().map(UpstreamAddr::Inet).collect();
+        assert_eq!(got, want);
+        assert!(
+            servers
+                .iter()
+                .all(|s| s.weight == 3 && s.display == "localhost:8081")
+        );
+        match proxy_pass("http://localhost:8081/").unwrap() {
+            ProxyPass::Direct { addrs, .. } => assert_eq!(addrs, want),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn upstream_server_unix_takes_the_whole_rest_as_path() {
         let server =
             parse_upstream_server_args(&["unix:///tmp/puma.sock".into(), "weight=2".into()])
                 .unwrap();
-        assert_eq!(server.addr, UpstreamAddr::Unix("///tmp/puma.sock".into()));
-        assert_eq!(server.weight, 2);
+        assert_eq!(server.len(), 1);
+        assert_eq!(
+            server[0].addr,
+            UpstreamAddr::Unix("///tmp/puma.sock".into())
+        );
+        assert_eq!(server[0].weight, 2);
         let too_long = format!("unix:/{}", "a".repeat(107));
         assert!(parse_upstream_server_args(&[too_long]).is_err());
         let fits = format!("unix:/{}", "a".repeat(106));

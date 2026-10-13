@@ -449,9 +449,9 @@ pub enum UpstreamAddr {
 /// runtime resolver. Hostname-only resolution picks the first address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamServer {
-    /// Resolved peer address. nginx allows multiple addresses per host
-    /// (one server entry expands to multiple peers); we pick the first
-    /// resolution and document this as a v0.1 narrowing.
+    /// Resolved peer address. A `server` whose name resolves to several
+    /// addresses is one `UpstreamServer` per address, as nginx makes a
+    /// peer of each (#330).
     pub addr: UpstreamAddr,
     /// Original `host:port` string as written. Used for the upstream
     /// `Host:` header default and for diagnostics.
@@ -2095,7 +2095,8 @@ pub enum ProxyPass {
         request_path: Option<String>,
     },
     Direct {
-        addr: UpstreamAddr,
+        /// Every address the host resolves to (one for a `unix:` path).
+        addrs: Vec<UpstreamAddr>,
         host_header: String,
         request_path: Option<String>,
     },

@@ -116,7 +116,10 @@ fn m112_proxy_bind() {
     );
     assert!(
         log.contains("[crit] ")
-            && log.contains(" failed (98: Address already in use) while connecting to upstream"),
+            && log.contains(&format!(
+                " failed ({}) while connecting to upstream",
+                common::errno_text(98)
+            )),
         "{log}"
     );
 }
