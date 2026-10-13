@@ -307,17 +307,10 @@ fn real_main() -> Result<(), Failure> {
     set_rlimit(true, rlimit_nofile);
     set_rlimit(false, rlimit_core);
 
-    // Workers can't run without io_uring; say why up front instead of
-    // letting every worker thread panic on runtime setup.
-    if !monoio::utils::detect_uring() {
-        eprintln!(
-            "ruxen: [emerg] io_uring is not available: it is blocked by seccomp \
-             (Docker's default profile denies it: use contrib/docker/seccomp-io_uring.json \
-             from the ruxen repository), disabled via the kernel.io_uring_disabled sysctl, \
-             or the kernel is too old"
-        );
-        return Err(Failure::Reported);
-    }
+    // io_uring, else epoll (monoio's legacy driver, #215). Chosen once, up
+    // front, so every worker runs on the same one.
+    let driver = choose_driver(http)?;
+    worker::set_driver(driver);
 
     install_signal_handlers()?;
 
@@ -708,6 +701,42 @@ fn warn_if_fd_limit_too_low(
             &format!("{connections} worker_connections exceed open file resource limit: {limit}"),
         );
     }
+}
+
+/// The I/O driver (#215): io_uring where the kernel and seccomp allow it,
+/// else epoll, with a `[notice]` saying why. `RUXEN_DRIVER=epoll` picks
+/// epoll anyway; `RUXEN_DRIVER=io_uring` refuses to start without
+/// io_uring. `events { use epoll; }` doesn't choose: configurations
+/// written for nginx set it because it's the best method nginx has on
+/// Linux.
+fn choose_driver(http: &worker::PreparedHttp) -> Result<worker::Driver, Failure> {
+    const WHY: &str = "it is blocked by seccomp (Docker's default profile denies it: \
+                       use contrib/docker/seccomp-io_uring.json from the ruxen repository), \
+                       disabled via the kernel.io_uring_disabled sysctl, or the kernel is too old";
+    let wanted = std::env::var("RUXEN_DRIVER").unwrap_or_default();
+    match wanted.as_str() {
+        "epoll" => return Ok(worker::Driver::Epoll),
+        "io_uring" | "" => {}
+        other => {
+            eprintln!(
+                "ruxen: [emerg] RUXEN_DRIVER=\"{other}\" is not a driver (io_uring or epoll)"
+            );
+            return Err(Failure::Reported);
+        }
+    }
+    if monoio::utils::detect_uring() {
+        return Ok(worker::Driver::IoUring);
+    }
+    if wanted == "io_uring" {
+        eprintln!("ruxen: [emerg] io_uring is not available: {WHY}");
+        return Err(Failure::Reported);
+    }
+    worker::write_worker_log(
+        http.error_logs,
+        config::ErrorLogLevel::Notice,
+        &format!("io_uring is not available, using epoll: {WHY}"),
+    );
+    Ok(worker::Driver::Epoll)
 }
 
 /// `worker_rlimit_nofile` / `worker_rlimit_core`: both soft and hard limits

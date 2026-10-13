@@ -3,8 +3,10 @@ name: Release
 # Push a `v*` tag to test and build the Linux binaries and publish a GitHub
 # release with the notes from `.github/release-notes/<tag>.md`. Run it by
 # hand (workflow_dispatch) to build and upload the tarballs as workflow
-# artifacts without creating a release. Publishing to crates.io is a
-# separate, manual `cargo publish` (see CONTRIBUTING.md, "Releasing").
+# artifacts without creating a release. A tag also publishes the container
+# image ghcr.io/gvozdetsky/ruxen (amd64 and arm64) from the same binaries.
+# Publishing to crates.io is a separate, manual `cargo publish` (see
+# CONTRIBUTING.md, "Releasing").
 
 on:
   push:
@@ -149,3 +151,66 @@ jobs:
             --notes-file ".github/release-notes/$tag.md" \
             dist/*.tar.gz dist/SHA256SUMS
           gh release edit "$tag" --draft=false
+
+  image:
+    # The glibc release binaries in contrib/docker/Dockerfile.release, for
+    # amd64 and arm64 (Apple Silicon's Docker runs arm64). Pushed on a tag
+    # only; a manual run builds and smoke-tests the amd64 image.
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Binaries
+        id: bins
+        run: |
+          mkdir -p bin
+          for pair in amd64:x86_64-linux-gnu arm64:aarch64-linux-gnu; do
+            arch=${pair%%:*} name=${pair#*:}
+            tar xzf "dist/ruxen-${name}.tar.gz" --wildcards --strip-components=1 \
+              -C bin '*/ruxen'
+            mv bin/ruxen "bin/ruxen-${arch}"
+          done
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Smoke test (amd64, Docker's default seccomp profile)
+        run: |
+          docker buildx build -f contrib/docker/Dockerfile.release \
+            --platform linux/amd64 --load -t ruxen:release .
+          docker run -d --name ruxen -p 8080:8080 ruxen:release
+          for i in $(seq 50); do curl -sf http://127.0.0.1:8080/ && break; sleep 0.2; done \
+            | grep -q "hello from ruxen"
+          docker stop ruxen
+          test "$(docker inspect ruxen --format '{{.State.ExitCode}}')" = 0
+
+      - uses: docker/login-action@v3
+        if: github.ref_type == 'tag'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.ref_type == 'tag'
+        run: |
+          image=ghcr.io/gvozdetsky/ruxen
+          tags=(-t "${image}:${{ steps.bins.outputs.version }}")
+          # A pre-release (v0.2.0-rc.1) doesn't move `latest`.
+          [[ "${GITHUB_REF_NAME}" != *-* ]] && tags+=(-t "${image}:latest")
+          docker buildx build -f contrib/docker/Dockerfile.release \
+            --platform linux/amd64,linux/arm64 \
+            --label org.opencontainers.image.source=https://github.com/gvozdetsky/ruxen \
+            --label org.opencontainers.image.version=${{ steps.bins.outputs.version }} \
+            "${tags[@]}" --push .

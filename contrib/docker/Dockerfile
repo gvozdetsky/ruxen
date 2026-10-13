@@ -4,9 +4,10 @@
 #   docker run --rm -p 8080:8080 \
 #       --security-opt seccomp=contrib/docker/seccomp-io_uring.json ruxen
 #
-# Docker's default seccomp profile denies io_uring, which ruxen runs on;
-# seccomp-io_uring.json is that profile plus the three io_uring calls and
-# unshare(CLONE_FILES), which gives each worker its own fd table.
+# Docker's default seccomp profile denies io_uring; ruxen then runs on
+# epoll, which is slower. seccomp-io_uring.json is that profile plus the
+# three io_uring calls and unshare(CLONE_FILES), which gives each worker its
+# own fd table: with it, ruxen runs on io_uring.
 # Mount your configuration over /etc/ruxen/ruxen.conf; listen on ports
 # above 1024, since the container runs as an unprivileged user.
 

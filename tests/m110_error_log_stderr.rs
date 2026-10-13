@@ -9,18 +9,35 @@ use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The server stops when the test ends, also when an assertion panics:
+/// an orphaned ruxen otherwise keeps its port and CPU after the run.
+struct KillOnDrop(std::process::Child);
+
+impl KillOnDrop {
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn run(name: &str, location_log: &str) -> (String, String) {
     let dir = std::env::temp_dir().join(format!("ruxen-m110-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html")).unwrap();
-    let port = {
-        let _setup = common::ports::setup_lock();
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
+    // Held until ruxen listens: released earlier, another test could take
+    // the same free port, and the readiness probe would reach its server.
+    let setup = common::ports::setup_lock();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let d = dir.display();
     std::fs::write(
         dir.join("nginx.conf"),
@@ -34,20 +51,23 @@ fn run(name: &str, location_log: &str) -> (String, String) {
     )
     .unwrap();
     let stderr = std::fs::File::create(dir.join("stderr")).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-e")
-        .arg(dir.join("error.log"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-e")
+            .arg(dir.join("error.log"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
+    drop(setup);
     for path in ["/logged/missing-a", "/plain/missing-b"] {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         use std::io::{Read, Write};
@@ -55,8 +75,7 @@ fn run(name: &str, location_log: &str) -> (String, String) {
         let _ = s.read_to_end(&mut Vec::new());
     }
     std::thread::sleep(Duration::from_millis(200));
-    let _ = child.kill();
-    let _ = child.wait();
+    child.stop();
     let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
     let out = (read("stderr"), read("error.log"));
     let _ = std::fs::remove_dir_all(&dir);
