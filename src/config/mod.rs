@@ -250,6 +250,8 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut http = http.ok_or(Error::UnexpectedEof)?;
     http.warnings.extend(lx.take_warnings());
     http.uses_request_body_file = values::request_body_file_used();
+    http.uses_stderr_log = values::stderr_log_used();
+    http.uses_stats = values::stats_used();
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -309,6 +311,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_ciphers: Option<String> = None;
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
+    let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut warnings: Vec<String> = Vec::new();
     loop {
@@ -362,7 +365,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ssl.prefer_server_ciphers =
                             ssl.prefer_server_ciphers.or(ssl_prefer_server_ciphers);
                         ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
-                        ssl.resumption = ssl.resumption.inherit(resumption);
+                        ssl.resumption = std::mem::take(&mut ssl.resumption).inherit(&resumption);
+                        ssl.reject_handshake = ssl.reject_handshake.or(ssl_reject_handshake);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -384,6 +388,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         client_body_buffer_size,
                         // Set once the whole config is read.
                         uses_request_body_file: false,
+                        uses_stderr_log: false,
+                        uses_stats: false,
                         client_body_temp_path,
                         sendfile,
                         disable_symlinks,
@@ -584,12 +590,23 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
                 ssl_session_timeout_ms = Some(ssl_session_timeout_ms_arg(v)?);
             }
+            ("ssl_reject_handshake", Terminator::Semi) => {
+                if ssl_reject_handshake.is_some() {
+                    return Err(Error::Duplicate("ssl_reject_handshake"));
+                }
+                ssl_reject_handshake = Some(parse_on_off_args(&args[1..], "ssl_reject_handshake")?);
+            }
             (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
                 resumption.parse(name, &args)?;
             }
+            ("ssl_session_ticket_key", Terminator::Semi) => {
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_session_ticket_key"));
+                };
+                resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
+            }
             (
-                "ssl_session_ticket_key"
-                | "ssl_buffer_size"
+                "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"
                 | "ssl_stapling"
@@ -603,7 +620,6 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_crl"
                 | "ssl_password_file"
                 | "ssl_early_data"
-                | "ssl_reject_handshake"
                 | "ssl_conf_command",
                 Terminator::Semi,
             ) => warn_ignored_tls_policy(&args, &mut warnings),
@@ -963,7 +979,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_cookie_path",
     "proxy_cookie_flags",
     "proxy_socket_keepalive",
-    "proxy_bind",
     "proxy_store",
     "proxy_store_access",
     // File I/O knobs (we use std::fs; these are nginx-only tuning)
@@ -1012,9 +1027,6 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let consequence = match args.first().map(String::as_str) {
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
-        }
-        Some("ssl_reject_handshake") if value == Some("on") => {
-            "handshakes for unknown names would complete with the default certificate"
         }
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
         // dropping them weakens what the config protects. Only `off` loads.
@@ -1863,7 +1875,9 @@ mod tests {
             )
         };
         unenforced_err(&tls("ssl_verify_client on;"));
-        unenforced_err(&tls("ssl_reject_handshake on;"));
+        // ssl_reject_handshake is enforced now (tls_stream::accept_or_reject).
+        let cfg = parse(&tls("ssl_reject_handshake on;")).unwrap();
+        assert_eq!(cfg.servers[0].ssl.reject_handshake, Some(true));
         // disable_symlinks is enforced now (fs_resolve), at every level.
         let symlinks = |value: &str| {
             parse(&format!(
@@ -2132,13 +2146,39 @@ mod tests {
             cfg.servers[0].ssl.resumption,
             SessionResumption {
                 cache: Some(true),
-                tickets: Some(false)
+                shared: true,
+                tickets: Some(false),
+                ticket_keys: None,
             }
         );
         assert_eq!(cfg.servers[1].ssl.resumption.cache, Some(false));
         assert_eq!(cfg.servers[1].ssl.resumption.tickets, Some(false));
         assert!(parse("http { ssl_session_cache bogus; }").is_err());
         assert!(parse("http { ssl_session_tickets maybe; }").is_err());
+    }
+
+    #[test]
+    fn ssl_session_ticket_keys_parse_and_inherit() {
+        let cfg = parse(
+            "http { ssl_session_ticket_key /k/a.key; ssl_session_ticket_key /k/b.key;
+                    ssl_session_cache builtin;
+                    server { listen 443 ssl; ssl_certificate c; ssl_certificate_key k; }
+                    server { listen 444 ssl; ssl_certificate c; ssl_certificate_key k;
+                             ssl_session_ticket_key /k/c.key;
+                             ssl_session_cache shared:SSL:1m; } }",
+        )
+        .unwrap();
+        let first = &cfg.servers[0].ssl.resumption;
+        assert_eq!(
+            first.ticket_keys,
+            Some(vec![PathBuf::from("/k/a.key"), PathBuf::from("/k/b.key")])
+        );
+        assert!(!first.shared);
+        // A server's own lines replace the inherited list.
+        let second = &cfg.servers[1].ssl.resumption;
+        assert_eq!(second.ticket_keys, Some(vec![PathBuf::from("/k/c.key")]));
+        assert!(second.shared);
+        assert!(parse("http { ssl_session_ticket_key; }").is_err());
     }
 
     #[test]

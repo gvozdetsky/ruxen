@@ -345,6 +345,7 @@ pub(crate) fn parse_location_block(
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
+    let mut stub_status = false;
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
     let mut limit_req = LimitReqConf::default();
@@ -353,6 +354,7 @@ pub(crate) fn parse_location_block(
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
+    let mut client_timeouts = ClientTimeouts::default();
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     // Children parsed inside this block — appended to `sink` after the
     // parent so the parent's entry appears first in declaration order.
@@ -374,6 +376,8 @@ pub(crate) fn parse_location_block(
                         .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
                     let handler = if let Some((status, body)) = ret {
                         Handler::Return { status, body }
+                    } else if stub_status {
+                        Handler::StubStatus
                     } else if let Some(pp) = proxy_pass {
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
@@ -470,6 +474,7 @@ pub(crate) fn parse_location_block(
                         gzip,
                         limit_req,
                         chunked_transfer_encoding,
+                        client_timeouts,
                         alias_prefix_override,
                         inherits_root,
                     });
@@ -725,6 +730,16 @@ pub(crate) fn parse_location_block(
                     return Err(Error::MissingArg("try_files"));
                 }
                 try_files = Some(parse_try_files(&args[1..])?);
+            }
+            // Location settings in nginx; `client_header_timeout` is not.
+            (name @ ("client_body_timeout" | "send_timeout"), Terminator::Semi) => {
+                client_timeouts.parse(name, &args)?;
+            }
+            // An optional argument is ignored, as nginx does for old
+            // configurations (`stub_status on;`).
+            ("stub_status", Terminator::Semi) if args.len() <= 2 => {
+                stub_status = true;
+                crate::config::values::note_stats_used();
             }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {

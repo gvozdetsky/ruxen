@@ -59,6 +59,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         limit_req_zones,
         uses_request_body_file,
+        uses_stderr_log,
+        uses_stats,
         runtime,
         error_logs: http_error_logs,
         log_formats,
@@ -212,6 +214,21 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             })
             .collect::<Result<_, _>>()?;
         let tls = build_listen_tls(addr, &tls_inputs)?;
+        let reject_handshake = (tls.is_some()
+            && tls_inputs
+                .iter()
+                .any(|i| i.ssl.reject_handshake == Some(true)))
+        .then(|| {
+            let flags = tls_inputs
+                .iter()
+                .map(|i| i.ssl.reject_handshake == Some(true))
+                .collect();
+            let default = tls_inputs
+                .iter()
+                .position(|i| i.default_server)
+                .unwrap_or(0);
+            (flags, default)
+        });
         let mut name_index: Vec<(u32, u32)> = Vec::new();
         for (si, server) in servers.iter().enumerate() {
             for ni in 0..server.regex_names.len() {
@@ -244,6 +261,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             servers,
             default_server: 0,
             tls,
+            reject_handshake,
             proxy_protocol,
             socket,
         });
@@ -257,6 +275,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         error_logs: main_error_logs,
         max_request_body,
         uses_request_body_file,
+        uses_stderr_log,
+        stats: uses_stats,
         body_temp: BodyTempDir::new(client_body_temp_path),
         listens,
         access_logs: canonical_access_logs,
@@ -332,7 +352,12 @@ pub(crate) fn build_listen_tls(
     // when they have one and otherwise get the default's.
     let default_idx = inputs.iter().position(|i| i.default_server).unwrap_or(0);
     let default = &inputs[default_idx];
-    if default.ssl.certs.is_empty() {
+    // Unless it rejects every handshake that comes to it; then each other
+    // server needs a certificate or to reject too.
+    let rejects = |i: &TlsServerInput| i.ssl.reject_handshake == Some(true);
+    if default.ssl.certs.is_empty()
+        && (!rejects(default) || inputs.iter().any(|i| i.ssl.certs.is_empty() && !rejects(i)))
+    {
         return Err(format!(
             "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive \
              (listen {addr})"
@@ -401,11 +426,30 @@ pub(crate) fn build_listen_tls(
     }
 
     resolver.set_default(default_keys);
+    // `ssl_session_ticket_key` files: 48 or 80 bytes each
+    // (ngx_ssl_session_ticket_keys).
+    let ticket_keys = match &default.ssl.resumption.ticket_keys {
+        Some(paths) => {
+            let mut keys = Vec::with_capacity(paths.len());
+            for path in paths {
+                let buf = std::fs::read(path).map_err(|e| {
+                    format!("open() \"{}\" failed ({})", path.display(), errno_text(&e))
+                })?;
+                keys.push(
+                    crate::tls_ticket::TicketKey::from_file_bytes(&buf)
+                        .ok_or_else(|| format!("\"{}\" must be 48 or 80 bytes", path.display()))?,
+                );
+            }
+            Some(keys)
+        }
+        None => None,
+    };
     let cfg = crate::tls_certs::build_server_config(
         resolver,
         protocols,
         session_timeout_secs,
-        default.ssl.resumption,
+        default.ssl.resumption.clone(),
+        ticket_keys,
     )
     .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
     Ok(Some(Arc::new(crate::tls::acceptor_from_config(cfg))))
@@ -644,6 +688,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                bind: eff.bind,
             }
         }
         ProxyPass::UpstreamRef {
@@ -678,6 +723,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                bind: eff.bind,
             }
         }
     })
@@ -824,6 +870,7 @@ pub(crate) struct ServerProxyDefaults {
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    pub bind: Option<&'static PreparedBind>,
 }
 
 /// `proxy_ignore_headers` as set at one scope: whether it lists `field`
@@ -879,8 +926,26 @@ impl ServerProxyDefaults {
             redirect: conf.redirect.map(|r| &*Box::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
+            bind: conf.bind.and_then(prepare_bind),
         }
     }
+}
+
+/// `proxy_bind`, `None` for `off`. A literal address was checked by the
+/// parser.
+fn prepare_bind(bind: crate::config::ProxyBind) -> Option<&'static PreparedBind> {
+    let crate::config::ProxyBind::Addr { value, transparent } = bind else {
+        return None;
+    };
+    let addr = match value.as_slice() {
+        [ValuePart::Literal(text)] => crate::config::parse_bind_addr(text),
+        _ => None,
+    };
+    Some(Box::leak(Box::new(PreparedBind {
+        addr,
+        value: prepare_value_parts(value),
+        transparent,
+    })))
 }
 
 pub(crate) fn prepare_proxy_set_headers(
@@ -952,6 +1017,10 @@ pub(crate) fn resolve_proxy_effective(
         },
         hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
+        bind: match location.bind {
+            Some(bind) => prepare_bind(bind),
+            None => server_defaults.bind,
+        },
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
@@ -1187,6 +1256,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1219,6 +1289,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1251,6 +1322,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1284,6 +1356,7 @@ pub(crate) fn prepare_server(
                 server_expires,
                 server_chunked_transfer_encoding,
                 &server.limit_req,
+                server.client_timeouts,
                 server_proxy_defaults,
                 &server_gzip,
                 upstreams,
@@ -1375,6 +1448,9 @@ pub(crate) fn prepare_server(
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
             limit_req: prepare_limit_req(server.limit_req.clone())?,
+            timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+                server.client_timeouts,
+            ))),
         })
     } else {
         None
@@ -1746,9 +1822,11 @@ fn prepare_syslog_peer(
             PreparedErrorLogSyslogServer::Udp(Box::leak(addr.clone().into_boxed_str()))
         }
     };
+    // nginx's default tag is `nginx`; ruxen's own name, unless it presents
+    // itself as nginx (RUXEN_NGINX_IDENTITY, as for `Server:`).
     let tag: &'static [u8] = match &peer.tag {
         Some(tag) => Box::leak(tag.clone().into_bytes().into_boxed_slice()),
-        None => b"ruxen",
+        None => crate::http::identity().plain,
     };
     Ok(Box::leak(Box::new(PreparedSyslogPeer {
         server,
@@ -2081,7 +2159,7 @@ fn resolve_access(
 /// the static handler, or with the location's `proxy_pass`.
 fn limit_except_rebuilds_handler(handler: &Handler, try_files: &Option<TryFiles>) -> bool {
     match handler {
-        Handler::Proxy(_) => false,
+        Handler::Proxy(_) | Handler::StubStatus => false,
         Handler::Root { .. } => try_files.is_some(),
         Handler::Return { .. } => true,
     }
@@ -2135,6 +2213,7 @@ pub(crate) fn build_handler(
         Handler::Return { status, body } => {
             PreparedHandler::Return(prepare_return(status, body, tokens))
         }
+        Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
             pp,
             upstreams,
@@ -2292,6 +2371,7 @@ pub(crate) fn build_prefix_or_exact(
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
     server_limit_req: &crate::config::LimitReqConf,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2335,6 +2415,7 @@ pub(crate) fn build_prefix_or_exact(
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
         limit_req: location_limit_req,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2494,6 +2575,9 @@ pub(crate) fn build_prefix_or_exact(
         expires,
         chunked_transfer_encoding,
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
+        timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 
@@ -2525,6 +2609,7 @@ pub(crate) fn build_regex_location(
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
     server_limit_req: &crate::config::LimitReqConf,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
     server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
@@ -2568,6 +2653,7 @@ pub(crate) fn build_regex_location(
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
         limit_req: location_limit_req,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
@@ -2737,6 +2823,9 @@ pub(crate) fn build_regex_location(
         expires,
         chunked_transfer_encoding,
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
+        timeouts: Box::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 
