@@ -2780,7 +2780,7 @@ const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 
 /// How the response stitch treats one upstream header.
 #[derive(Debug, PartialEq, Eq)]
-enum UpstreamHeader {
+pub(crate) enum UpstreamHeader {
     /// Hop-by-hop: never forwarded.
     HopByHop,
     /// Hidden by default like nginx's `ngx_http_proxy_hide_headers` (Date,
@@ -2805,7 +2805,7 @@ const HIDDEN_X_ACCEL_LIMIT_RATE: u16 = 1 << 7;
 
 /// One dispatch on the name's length, then at most a few compares: this
 /// runs for every upstream header line on the proxy hot path.
-fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
+pub(crate) fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
     use UpstreamHeader::*;
     let is = |h: &[u8]| name.eq_ignore_ascii_case(h);
     match name.len() {
@@ -2845,7 +2845,7 @@ pub fn default_hidden_bit(name: &[u8]) -> Option<u16> {
 
 /// `Content-Length` value as nginx's `ngx_atoof` accepts it: decimal
 /// digits only, no sign, no overflow.
-fn parse_content_length(value: &[u8]) -> Option<u64> {
+pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return None;
     }
@@ -2862,7 +2862,7 @@ fn trim_crlf(s: &[u8]) -> &[u8] {
     &s[..end]
 }
 
-fn parse_status_code(status_line: &[u8]) -> u16 {
+pub(crate) fn parse_status_code(status_line: &[u8]) -> u16 {
     if status_line.len() < 12 {
         return 0;
     }
@@ -2899,7 +2899,7 @@ fn u64_to_decimal(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
 /// terminators contain, stopping at the first that ends the head: the body
 /// bytes read along with the head aren't scanned, nor the bytes an earlier
 /// read already looked at.
-fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+pub(crate) fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     let mut i = from;
     while let Some(p) = buf[i..].iter().position(|&b| b == b'\n') {
         let lf = i + p;
@@ -2917,7 +2917,7 @@ fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
 
 /// Find the next line terminator (`\r\n` or `\n`). Returns
 /// `(line_len, terminator_len)`.
-fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
     for (i, &b) in buf.iter().enumerate() {
         if b == b'\n' {
             if i > 0 && buf[i - 1] == b'\r' {
@@ -2931,7 +2931,7 @@ fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
 
 /// Where the header fields start: past the status line's terminator, or
 /// at `head_end` when there are none.
-fn headers_start(buf: &[u8], first_line_end: usize, head_end: usize) -> usize {
+pub(crate) fn headers_start(buf: &[u8], first_line_end: usize, head_end: usize) -> usize {
     (first_line_end + first_line_terminator_len(buf, first_line_end)).min(head_end)
 }
 
