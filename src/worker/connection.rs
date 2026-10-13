@@ -126,6 +126,11 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// to the socket itself.
     fn begin_tunnel(&mut self) {}
 
+    /// An HTTP/2 stream (`h2::StreamIo`): its request line says `HTTP/2.0`.
+    fn h2(&self) -> bool {
+        false
+    }
+
     /// The keep-alive wait for the next request, which may also read its
     /// first bytes into `buf` (from offset 0). By default the readiness
     /// wait of `idle_wait`, after which the caller reads.

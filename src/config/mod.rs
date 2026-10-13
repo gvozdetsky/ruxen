@@ -288,6 +288,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
+    let mut http2: Option<bool> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
@@ -401,6 +402,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         uses_stats: false,
                         client_body_temp_path,
                         sendfile,
+                        http2,
                         disable_symlinks,
                         limit_rate,
                         limit_rate_after,
@@ -760,6 +762,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     return Err(Error::Duplicate("disable_symlinks"));
                 }
                 disable_symlinks = Some(parse_disable_symlinks_args(&args[1..])?);
+            }
+            ("http2", Terminator::Semi) => {
+                if http2.is_some() {
+                    return Err(Error::Duplicate("http2"));
+                }
+                http2 = Some(parse_on_off_args(&args[1..], "http2")?);
             }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {

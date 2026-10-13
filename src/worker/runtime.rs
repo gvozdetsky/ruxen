@@ -2571,6 +2571,24 @@ pub(crate) async fn handle_plain(
         realip: None,
         proxy_protocol,
     };
+    let listen = &http.listens[listen_index];
+    if listen.http2 {
+        let wait = listen.servers[listen.default_server].timeouts.header;
+        if super::h2::starts_with_preface(&stream, wait).await {
+            return serve_h2(
+                stream,
+                peer_addr,
+                listen_index,
+                None,
+                None,
+                conn,
+                http,
+                state,
+                connection_id,
+            )
+            .await;
+        }
+    }
     // Boxed: the connection's future is about 10 KiB, and the task that
     // `spawn_connection` builds would otherwise be moved, all of it, into
     // the runtime on every accept. Here the task stays small and the big
@@ -2649,6 +2667,23 @@ pub(crate) async fn handle_tls(
             .map(|b| b.to_ascii_lowercase())
             .collect()
     });
+    if info.alpn_protocol.as_deref() == Some(b"h2") {
+        // A read and a write run at once on an HTTP/2 connection.
+        tls_stream.begin_tunnel();
+        let sni = sni.clone();
+        return serve_h2(
+            tls_stream,
+            peer_addr,
+            listen_index,
+            sni,
+            Some(info),
+            conn,
+            http,
+            state,
+            connection_id,
+        )
+        .await;
+    }
     // Boxed, as in `handle_plain`.
     Box::pin(handle(
         &mut tls_stream,
@@ -2673,6 +2708,40 @@ pub(crate) async fn handle_tls(
     .await;
 }
 
+/// An HTTP/2 connection (#144), cold: boxed so its future isn't part of
+/// the HTTP/1.1 connection's.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn serve_h2<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    listen_index: usize,
+    sni: Option<Vec<u8>>,
+    tls: Option<crate::tls::HandshakeInfo>,
+    conn: phase::ConnInfo,
+    http: &'static PreparedHttp,
+    state: &'static RuntimeState,
+    connection_id: u64,
+) where
+    S: AsyncReadRent + AsyncWriteRent + 'static,
+{
+    Box::pin(super::h2::serve(
+        stream,
+        super::h2::ConnCtx {
+            peer_addr,
+            listen_index,
+            sni,
+            tls,
+            conn,
+            http,
+            state,
+            connection_id,
+        },
+    ))
+    .await;
+}
+
 pub(crate) async fn handle<S: ConnIo>(
     stream: &mut S,
     peer_addr: SocketAddr,
@@ -2692,7 +2761,10 @@ pub(crate) async fn handle<S: ConnIo>(
     // Outer loop = idle ↔ active cycle; inner loop = within an active
     // session, read more / parse / write until the session drains back to
     // empty (→ idle) or the request-line overflows the buffer (→ close).
-    let mut parse_state = ParseState::default();
+    let mut parse_state = ParseState {
+        h2: stream.h2(),
+        ..ParseState::default()
+    };
 
     // Per-connection counters surfaced via `$connection*` variables.
     // `connection_id` is assigned once in the accept loop. `request_count` tracks

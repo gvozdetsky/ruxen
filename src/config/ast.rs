@@ -341,6 +341,8 @@ pub struct HttpConfig {
     pub client_body_temp_path: Option<TempPath>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
+    /// http-scope `http2 on|off` (nginx 1.25.1+). `None`: not set (off).
+    pub http2: Option<bool>,
     /// http-scope `disable_symlinks`. `None`: off.
     pub disable_symlinks: Option<DisableSymlinks>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).
@@ -485,7 +487,8 @@ pub struct Listen {
     /// `reuseport` — set `SO_REUSEPORT` per-listener. Already implicit in the
     /// thread-per-core design; presence is a parse-time noop.
     pub reuseport: bool,
-    /// `http2` — accepted, ignored. v0.1 advertises HTTP/1.1 only.
+    /// `http2`: HTTP/2 on this address, the nginx 1.24 spelling of
+    /// `http2 on` (#144).
     pub http2: bool,
     /// `http3` — accepted, ignored.
     pub http3: bool,
@@ -792,6 +795,8 @@ pub struct Server {
     pub client_body_temp_path: Option<TempPath>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
     pub sendfile: Option<bool>,
+    /// Server-scope `http2 on|off`. `None` inherits from http.
+    pub http2: Option<bool>,
     /// Server-scope `disable_symlinks`. `None` inherits from http.
     pub disable_symlinks: Option<DisableSymlinks>,
     /// `limit_rate` / `limit_rate_after` (sizes, variables allowed).

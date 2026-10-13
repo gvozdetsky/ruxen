@@ -1561,6 +1561,10 @@ pub struct PreparedListen {
     /// `listen … proxy_protocol` on any server of this address: every
     /// connection starts with a PROXY protocol header.
     pub proxy_protocol: bool,
+    /// HTTP/2 on this address (#144): a plain connection that starts with
+    /// the HTTP/2 preface, or a TLS one that negotiated `h2`, is served by
+    /// `worker::h2`.
+    pub http2: bool,
     /// The listening socket's options.
     pub socket: ListenSocket,
     /// Every regex `server_name` of `servers`, in the order they are tried
