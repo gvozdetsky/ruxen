@@ -1478,6 +1478,26 @@ async fn unix_accept_or_tick(
     }
 }
 
+/// A request limit_req delayed (#94): wait, then run it again past
+/// limit_req, as nginx resumes its phases after the delay timer: the
+/// handler, the upstream and `$request_time` come after the delay.
+#[cold]
+#[inline(never)]
+async fn limit_req_delayed(
+    http: &'static PreparedHttp,
+    ctx: &mut phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    delay_ms: u64,
+    request_start: Instant,
+) -> (Response, phase::ProcessMeta) {
+    monoio::time::sleep(Duration::from_millis(delay_ms)).await;
+    ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+    super::limit_req::resume_after_delay(true);
+    let out = phase::process_with_meta(http, ctx, url_scratch);
+    super::limit_req::resume_after_delay(false);
+    out
+}
+
 pub(crate) async fn run_listener(
     listener: TcpListener,
     listen_index: usize,
@@ -3166,7 +3186,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         let epoch_secs = now.as_secs();
                         let epoch_ms = (now.subsec_millis() as u16) % 1000;
 
-                        let ctx = request_ctx!(
+                        let mut ctx = request_ctx!(
                             &body_vec,
                             body_len,
                             body_file,
@@ -3177,21 +3197,18 @@ pub(crate) async fn handle<S: ConnIo>(
                         let (mut response, mut process_meta) =
                             phase::process_with_meta(http, &ctx, &mut *url_scratch);
                         // limit_req delayed the request (#94): processing
-                        // stopped before the content handler. Wait, then
-                        // run it again past limit_req, as nginx resumes
-                        // its phases after the delay timer: the handler,
-                        // the upstream and `$request_time` come after it.
-                        let mut ctx = ctx;
+                        // stopped before the content handler. Boxed, so the
+                        // wait's timer isn't part of every connection's
+                        // future.
                         if process_meta.limit_req_delay_ms > 0 {
-                            monoio::time::sleep(Duration::from_millis(
+                            (response, process_meta) = Box::pin(limit_req_delayed(
+                                http,
+                                &mut ctx,
+                                &mut *url_scratch,
                                 process_meta.limit_req_delay_ms,
+                                request_start,
                             ))
                             .await;
-                            ctx.request_time_us = request_start.elapsed().as_micros() as u64;
-                            super::limit_req::resume_after_delay(true);
-                            (response, process_meta) =
-                                phase::process_with_meta(http, &ctx, &mut *url_scratch);
-                            super::limit_req::resume_after_delay(false);
                         }
 
                         let (response, settled_meta) = settle_proxy_response(
