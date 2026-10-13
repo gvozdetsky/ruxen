@@ -37,7 +37,7 @@ The v0.1 scope is deliberately limited:
 - reverse proxying and upstreams
 - TLS 1.2/1.3 termination via rustls
 - no module system
-- no HTTP cache
+- a proxy cache (`proxy_cache`)
 - no HTTP/2 yet
 
 The upstream `nginx-tests` suite is used as a compatibility test. **63 of the 105 test files that ruxen currently opts into pass end-to-end** (v0.1.1).
@@ -235,6 +235,7 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - `proxy_hide_header` / `proxy_pass_header`
 - `X-Accel-Redirect`, `X-Accel-Limit-Rate` and `proxy_ignore_headers`
 - `$upstream_*` per-attempt variables, `$proxy_host`, `$proxy_port`
+- `proxy_cache` on `proxy_cache_path` zones: `proxy_cache_key`, `proxy_cache_valid`, `proxy_cache_methods`, `proxy_cache_min_uses`, `proxy_cache_bypass`, `proxy_no_cache`, `proxy_cache_convert_head`, `proxy_cache_revalidate`, `proxy_cache_use_stale`, `proxy_cache_background_update`, `proxy_cache_lock` (`_timeout`, `_age`), `Vary`, and `$upstream_cache_status`
 
 ### TLS
 
@@ -391,7 +392,7 @@ The following are intentionally outside the current v0.1 scope:
 
 - HTTP/2
 - nginx's module ecosystem
-- HTTP caching
+- the proxy cache's manager and loader (`min_free`, eviction in the background), and a file per `Vary` variant
 - TLS to upstream servers (`proxy_ssl_*`)
 - OCSP stapling
 - client certificate authentication
@@ -401,7 +402,7 @@ The following are intentionally outside the current v0.1 scope:
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
 
-Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
 Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
 

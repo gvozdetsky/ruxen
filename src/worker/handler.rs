@@ -256,6 +256,184 @@ pub(crate) fn classify_header_name_policy(
     }
 }
 
+/// `proxy_cache` for one request (#233, ngx_http_upstream_cache): the
+/// zone, the key, and what the cache holds for it. `None` when the method
+/// isn't cached or `proxy_cache $var` renders empty or `off`; `Err` (a
+/// 500) when it names no zone.
+fn cache_plan(
+    conf: &'static crate::worker::PreparedProxyCache,
+    req: &phase::RequestCtx<'_>,
+    ctx: &RenderCtx<'_>,
+    request_uri: &[u8],
+    host_header: &[u8],
+) -> Result<Option<Box<crate::proxy::CachePlan>>, ()> {
+    use crate::proxy::{CacheHit, CachePlan};
+    use crate::proxy_cache::{CacheStatus, Entry, Lookup};
+    // proxy_cache_methods: GET and HEAD always.
+    if !matches!(req.method, Method::Get | Method::Head)
+        && !(conf.methods_post && req.method_bytes == b"POST")
+    {
+        return Ok(None);
+    }
+    let zone = match conf.zone {
+        crate::worker::PreparedCacheZone::Zone(zone) => zone,
+        crate::worker::PreparedCacheZone::Var(parts, zones) => {
+            let mut name = Vec::new();
+            render_parts(parts, ctx, &mut name);
+            if name.is_empty() || name == b"off" {
+                return Ok(None);
+            }
+            match zones.iter().copied().find(|z| z.name.as_bytes() == name) {
+                Some(zone) => zone,
+                None => {
+                    crate::fs_resolve::note_failed_lookup(
+                        format!("cache \"{}\" not found", String::from_utf8_lossy(&name)),
+                        false,
+                    );
+                    return Err(());
+                }
+            }
+        }
+    };
+    // Without proxy_cache_key: the upstream URL, as nginx's proxy module
+    // keys it.
+    let mut key = Vec::with_capacity(64);
+    match conf.key {
+        Some(parts) => render_parts(parts, ctx, &mut key),
+        None => {
+            key.extend_from_slice(b"http://");
+            key.extend_from_slice(host_header);
+            key.extend_from_slice(request_uri);
+        }
+    }
+    let hash = crate::proxy_cache::hash_key(&key);
+    // ngx_http_test_predicates: a condition holds when it renders
+    // non-empty and not "0".
+    let holds = |conditions: &[&[PreparedValuePart]]| {
+        conditions.iter().any(|parts| {
+            let mut value = Vec::new();
+            render_parts(parts, ctx, &mut value);
+            !value.is_empty() && value != b"0"
+        })
+    };
+    let no_cache = holds(conf.no_cache);
+    let mut status = CacheStatus::Miss;
+    let mut hit = None;
+    let mut stale = None;
+    let mut store = !no_cache;
+    let mut token = None;
+    let mut wait_until = None;
+    let mut background = false;
+    let mut stale_error = false;
+    if holds(conf.bypass) {
+        // The response still refreshes the cache.
+        status = CacheStatus::Bypass;
+    } else {
+        let now = crate::proxy_cache::now_secs();
+        let path = || zone.file_path(&hash);
+        match zone.lookup(&hash, conf.min_uses, now) {
+            Lookup::Error(code) => {
+                status = CacheStatus::Hit;
+                hit = Some(CacheHit::Error(code));
+            }
+            Lookup::Hit => match Entry::read(&path(), &key) {
+                Some(entry) if entry.matches_variant(req.headers_raw) => {
+                    status = CacheStatus::Hit;
+                    hit = Some(CacheHit::Entry(entry));
+                }
+                Some(_) => {}
+                None => zone.forget_file(&hash),
+            },
+            Lookup::Stale {
+                token: updater,
+                stale_updating,
+                stale_error: covered,
+            } => {
+                // ngx_http_upstream_cache: STALE (this request updates) or
+                // UPDATING (another one does).
+                token = updater;
+                stale_error = covered;
+                let serve_stale = conf.use_stale.updating || stale_updating;
+                // Read only when something may answer with it.
+                let entry = (serve_stale || covered || conf.revalidate || conf.use_stale.any())
+                    .then(|| Entry::read(&path(), &key))
+                    .flatten()
+                    .filter(|e| e.matches_variant(req.headers_raw));
+                match entry {
+                    Some(entry) if serve_stale && updater.is_some() && conf.background_update => {
+                        status = CacheStatus::Stale;
+                        hit = Some(CacheHit::Entry(entry));
+                        background = true;
+                    }
+                    Some(entry) if serve_stale && updater.is_none() => {
+                        status = CacheStatus::Updating;
+                        hit = Some(CacheHit::Entry(entry));
+                    }
+                    // Fetched again; kept to revalidate with, or to answer
+                    // with if the upstream fails (proxy_cache_use_stale).
+                    entry => {
+                        status = CacheStatus::Expired;
+                        stale = entry;
+                    }
+                }
+            }
+            Lookup::Miss {
+                store: enough,
+                probe,
+            } => {
+                store &= enough;
+                // A file from before a restart (nginx's cold cache).
+                if probe && let Some(entry) = Entry::read(&path(), &key) {
+                    zone.adopt(&hash, &entry);
+                    store = !no_cache;
+                    if entry.valid_sec < now {
+                        status = CacheStatus::Expired;
+                        stale = Some(entry);
+                    } else if entry.matches_variant(req.headers_raw) {
+                        status = CacheStatus::Hit;
+                        hit = Some(CacheHit::Entry(entry));
+                    }
+                }
+                // proxy_cache_lock: one request fetches a missing response,
+                // the others wait for it.
+                if status == CacheStatus::Miss && store && conf.lock {
+                    match zone.try_lock(&hash, conf.lock_age_ms) {
+                        Some(lock) => token = Some(lock),
+                        None if conf.lock_timeout_ms == 0 => store = false,
+                        None => {
+                            wait_until = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(conf.lock_timeout_ms),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(Box::new(CachePlan {
+        conf,
+        zone,
+        hash,
+        status,
+        store,
+        // A hit needs neither, unless it is updated in the background.
+        request_headers: if hit.is_some() && !background {
+            Vec::new()
+        } else {
+            req.headers_raw.to_vec()
+        },
+        key,
+        hit,
+        stale,
+        head_as_get: conf.convert_head && matches!(req.method, Method::Head),
+        token,
+        wait_until,
+        background,
+        stale_error,
+    })))
+}
+
 pub(crate) fn forward_client_headers<'a>(
     headers_raw: &'a [u8],
     overrides: &[(&[u8], Vec<u8>)],
@@ -389,6 +567,7 @@ fn location_render_ctx<'a>(
         proxy_host: &[],
         upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
         upstream_states: req.upstream.map_or(&[], |u| &u.states),
+        upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
         sent_trailers: &[],
         tls: req.tls,
         conn: req.conn,
@@ -516,6 +695,28 @@ pub(crate) fn run_location_handler(
     // location's proxy add_header/add_trailer state with `$upstream_*`
     // variables populated.
     if let PreparedHandler::Proxy(proxy) = loc.handler {
+        // `proxy_pass` with variables: where this request goes (#100).
+        let variable = match proxy.url {
+            None => None,
+            Some(url) => match resolve_variable_url(http, proxy.upstream, url, &render_ctx_base) {
+                Ok(target) => Some(target),
+                Err(status) => {
+                    return variable_url_failed(
+                        http,
+                        status,
+                        &loc,
+                        req,
+                        &render_ctx_base,
+                        in_error_page,
+                        preserved_www_authenticate,
+                    );
+                }
+            },
+        };
+        let upstream = variable.as_ref().map_or(proxy.upstream, |v| v.upstream);
+        let host_header: &[u8] = variable
+            .as_ref()
+            .map_or(proxy.host_header, |v| &v.host_header);
         // Path rewriting: nginx forwards the *post-rewrite* URI (`r->uri`
         // after any internal redirects), not the client's original
         // request line. When `proxy_pass http://up/PATH` had a URI part,
@@ -534,7 +735,12 @@ pub(crate) fn run_location_handler(
             b""
         };
         let rewritten_uri: Vec<u8>;
-        let request_uri: &[u8] = if request_path.is_empty() {
+        let request_uri: &[u8] = if let Some(uri) = variable.as_ref().and_then(|v| v.uri.as_deref())
+        {
+            // With variables, a URI part is the whole upstream URI
+            // (ngx_http_proxy_create_request).
+            uri
+        } else if request_path.is_empty() {
             if args.is_empty() {
                 let mut buf = Vec::with_capacity(url_path.len());
                 buf.extend_from_slice(url_path);
@@ -566,15 +772,42 @@ pub(crate) fn run_location_handler(
             rewritten_uri = buf;
             rewritten_uri.as_slice()
         };
-        // Pick the first peer via the per-worker LB. None means every
-        // peer is `down` or in a `max_fails` cooldown: `run_proxy` answers
-        // 502 and reports `no live upstreams` for the error log.
-        let initial_peer = crate::upstream::pick_peer(proxy.upstream, &Default::default());
         // Render proxy_set_header values with $proxy_host populated for
         // this location's upstream URL authority. The other RenderCtx
         // fields are inherited from the base built above.
         let mut proxy_render_ctx = render_ctx_base;
-        proxy_render_ctx.proxy_host = proxy.host_header;
+        proxy_render_ctx.proxy_host = host_header;
+        // `proxy_cache` (#233): what the cache has for this request.
+        let cache = match proxy.cache {
+            Some(conf) => {
+                match cache_plan(conf, req, &proxy_render_ctx, request_uri, host_header) {
+                    Ok(cache) => cache,
+                    Err(()) => return crate::worker::internal_error_response(req.method),
+                }
+            }
+            None => None,
+        };
+        // Pick the first peer via the per-worker LB. None means every
+        // peer is `down` or in a `max_fails` cooldown: `run_proxy` answers
+        // 502 and reports `no live upstreams` for the error log. A cache
+        // hit needs none.
+        let mut hash = crate::upstream::HashPick::for_request(
+            upstream,
+            |key| {
+                let mut out = Vec::new();
+                render_parts(key, &render_ctx_base, &mut out);
+                out
+            },
+            render_ctx_base.remote_addr,
+        );
+        let initial_peer = if cache
+            .as_ref()
+            .is_some_and(|c| c.hit.is_some() && !c.background)
+        {
+            None
+        } else {
+            crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+        };
 
         // Build the final header set: proxy_set_header overrides first
         // (nginx wins ties on declaration order) plus a synthesized
@@ -603,13 +836,13 @@ pub(crate) fn run_location_handler(
             overrides_buf.push((sh.name, value));
         }
         if !have_host_override {
-            overrides_buf.insert(0, (b"Host", proxy.host_header.to_vec()));
+            overrides_buf.insert(0, (b"Host", host_header.to_vec()));
         }
 
         // Pool eligibility: HTTP/1.1 + the upstream block opted into
         // `keepalive N;`. Drives both the Connection-header default
         // synthesized below and `run_proxy`'s pool-release decision.
-        let pool_eligible = proxy.http_version == 1 && proxy.upstream.keepalive_max_idle.is_some();
+        let pool_eligible = proxy.http_version == 1 && upstream.keepalive_max_idle.is_some();
 
         if !have_connection_override {
             // Default Connection on the upstream side: keep-alive when
@@ -623,6 +856,34 @@ pub(crate) fn run_location_handler(
                 b"close"
             };
             overrides_buf.push((b"Connection", value.to_vec()));
+        }
+
+        if cache.is_some() {
+            // ngx_http_proxy_cache_headers: with a cache the upstream gets no
+            // conditional or range request headers, so what comes back can
+            // be stored whole; a revalidation asks with the stale entry's
+            // validators.
+            let (last_modified, etag) = cache
+                .as_ref()
+                .filter(|c| c.conf.revalidate)
+                .and_then(|c| c.stale.as_ref())
+                .map_or((None, None), |stale| stale.validators());
+            let none = None;
+            for (name, value) in [
+                (&b"If-Modified-Since"[..], last_modified),
+                (&b"If-Unmodified-Since"[..], none),
+                (&b"If-None-Match"[..], etag),
+                (&b"If-Match"[..], none),
+                (&b"Range"[..], none),
+                (&b"If-Range"[..], none),
+            ] {
+                if !overrides_buf
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
+                    overrides_buf.push((name, value.map_or(Vec::new(), <[u8]>::to_vec)));
+                }
+            }
         }
 
         // Decide on the body to forward. `proxy_set_body` replaces it;
@@ -695,12 +956,26 @@ pub(crate) fn run_location_handler(
             lookup_request_header(req.headers_raw, b"upgrade").is_some()
         };
 
+        // A large client body is sent from its own buffer, after the
+        // header block, instead of being copied into it (#289). A small
+        // one is copied: one buffer, one write.
+        let (forward_body, separate_body) =
+            if set_body.is_none() && forward_body.len() > crate::proxy::SEPARATE_BODY_MIN {
+                (&[][..], req.body.clone())
+            } else {
+                (forward_body, bytes::Bytes::new())
+            };
         // Pooled: with the body in it the buffer is as large as the body,
         // and a fresh one per request faults its pages in each time (#289).
         let mut request = crate::worker::take_body_buffer(0);
+        let method_bytes = if cache.as_ref().is_some_and(|c| c.head_as_get) {
+            &b"GET"[..]
+        } else {
+            req.method_bytes
+        };
         crate::proxy::write_request(
             &mut request,
-            req.method_bytes,
+            method_bytes,
             request_uri,
             proxy.http_version,
             &headers,
@@ -726,10 +1001,15 @@ pub(crate) fn run_location_handler(
         } else {
             None
         };
+        let bind = proxy
+            .bind
+            .and_then(|bind| resolve_bind(bind, &proxy_render_ctx));
         return Response::Proxy(crate::proxy::ProxyPlan {
-            upstream: proxy.upstream,
+            upstream,
+            adhoc_peer: variable.as_ref().and_then(|v| v.adhoc_peer).map(Box::new),
             initial_peer,
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
+            body: separate_body,
             method: req.method,
             server_bytes,
             connect_timeout: std::time::Duration::from_millis(proxy.connect_timeout_ms),
@@ -751,6 +1031,9 @@ pub(crate) fn run_location_handler(
             in_error_page,
             intercept,
             upgrade: client_upgrade,
+            cache,
+            hash,
+            bind,
         });
     }
     let inner = match loc.handler {
@@ -761,6 +1044,20 @@ pub(crate) fn run_location_handler(
             build_templated_return(*status, parts, &render_ctx_base, req.method, server_bytes),
         ),
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
+        // ngx_http_stub_status_handler: GET and HEAD only, text/plain.
+        PreparedHandler::StubStatus => match req.method {
+            Method::Get => Response::Owned(http::build_response(
+                200,
+                &super::stats::status_text(),
+                server_bytes,
+            )),
+            Method::Head => Response::Owned(http::build_head_response(
+                200,
+                super::stats::status_text().len(),
+                server_bytes,
+            )),
+            _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
+        },
         // Static-file mapping follows the configured path mode:
         // `root` appends the whole normalized URI, while `alias` strips the
         // matched location prefix first. `PreparedRoot` carries that choice.
@@ -1099,5 +1396,281 @@ fn prebuilt_with_literal_add_headers(
         });
         cache.borrow_mut().insert(key, built);
         built
+    })
+}
+
+/// Where a `proxy_pass` with variables sends one request (#100).
+struct VariableTarget {
+    upstream: &'static PreparedUpstream,
+    /// The URL's own address (an IP literal or `unix:` path); `None` when
+    /// it named an `upstream` block.
+    adhoc_peer: Option<crate::worker::PeerAddr>,
+    /// `$proxy_host` and the default `Host`.
+    host_header: Vec<u8>,
+    /// The URL's URI part, sent as the whole request URI; `None`: the
+    /// request's own.
+    uri: Option<Vec<u8>>,
+}
+
+/// Render and parse a `proxy_pass` URL with variables, as nginx's
+/// ngx_http_proxy_eval and ngx_http_upstream_init_request do: an `upstream`
+/// block of that name (when the URL has no port), else an IP literal or a
+/// `unix:` path as the one peer, else a name only a resolver could turn
+/// into an address, which ruxen doesn't have: 502 and nginx's `no resolver
+/// defined to resolve` line. A malformed URL is a 500. The error lines are
+/// logged with the request's context once processing returns.
+#[cold]
+#[inline(never)]
+fn resolve_variable_url(
+    http: &'static PreparedHttp,
+    placeholder: &'static PreparedUpstream,
+    url: &[PreparedValuePart],
+    ctx: &RenderCtx<'_>,
+) -> Result<VariableTarget, u16> {
+    use crate::config::ErrorLogLevel;
+    use crate::worker::PeerAddr;
+    let mut rendered = Vec::with_capacity(64);
+    render_parts(url, ctx, &mut rendered);
+    let fail = |status: u16, message: String| {
+        crate::fs_resolve::note_failed_lookup_at(message, false, ErrorLogLevel::Error);
+        Err(status)
+    };
+    let rest = match rendered.get(..7) {
+        Some(scheme) if scheme.eq_ignore_ascii_case(b"http://") && rendered.len() > 7 => {
+            &rendered[7..]
+        }
+        _ => {
+            return fail(
+                500,
+                format!(
+                    "invalid URL prefix in \"{}\"",
+                    String::from_utf8_lossy(&rendered)
+                ),
+            );
+        }
+    };
+    let in_upstream =
+        |what: &str| format!("{what} in upstream \"{}\"", String::from_utf8_lossy(rest));
+    // `unix:/path[:uri]`: the path ends at the next `:`.
+    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"unix:") {
+        let after = &rest[5..];
+        let (path, uri) = match after.iter().position(|&b| b == b':') {
+            Some(colon) => (&after[..colon], &after[colon + 1..]),
+            None => (after, &b""[..]),
+        };
+        if path.is_empty() {
+            return fail(500, in_upstream("no path in the unix domain socket"));
+        }
+        if path.len() + 1 > 108 {
+            return fail(500, in_upstream("too long path in the unix domain socket"));
+        }
+        let Some(path) = intern_unix_path(path) else {
+            return fail(502, in_upstream("too many unix: upstream paths"));
+        };
+        return Ok(VariableTarget {
+            upstream: placeholder,
+            adhoc_peer: Some(PeerAddr::Unix(path)),
+            host_header: b"localhost".to_vec(),
+            uri: (!uri.is_empty()).then(|| uri.to_vec()),
+        });
+    }
+    // host[:port] up to the URI, which starts at `/` or `?`.
+    let end = rest
+        .iter()
+        .position(|&b| b == b'/' || b == b'?')
+        .unwrap_or(rest.len());
+    let (authority, uri) = rest.split_at(end);
+    let (host, port): (&[u8], Option<&[u8]>) = if authority.first() == Some(&b'[') {
+        let Some(close) = authority.iter().position(|&b| b == b']') else {
+            return fail(500, in_upstream("invalid host"));
+        };
+        match &authority[close + 1..] {
+            [] => (&authority[..=close], None),
+            [b':', port @ ..] => (&authority[..=close], Some(port)),
+            _ => return fail(500, in_upstream("invalid host")),
+        }
+    } else {
+        match authority.iter().rposition(|&b| b == b':') {
+            Some(colon) => (&authority[..colon], Some(&authority[colon + 1..])),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return fail(500, in_upstream("no host"));
+    }
+    let port = match port {
+        None => None,
+        Some(p) => match std::str::from_utf8(p)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            Some(n) if n > 0 => Some(n),
+            _ => return fail(500, in_upstream("invalid port")),
+        },
+    };
+    // ngx_http_proxy_set_vars: the scheme's port isn't repeated.
+    let host_header = match port {
+        None | Some(80) => host.to_vec(),
+        Some(_) => authority.to_vec(),
+    };
+    let uri = match uri {
+        [] => None,
+        [b'?', ..] => Some([&b"/"[..], uri].concat()),
+        _ => Some(uri.to_vec()),
+    };
+    let literal = std::str::from_utf8(host).ok().and_then(|h| {
+        h.strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(h)
+            .parse::<std::net::IpAddr>()
+            .ok()
+    });
+    if let Some(ip) = literal {
+        return Ok(VariableTarget {
+            upstream: placeholder,
+            adhoc_peer: Some(PeerAddr::Inet(std::net::SocketAddr::new(
+                ip,
+                port.unwrap_or(80),
+            ))),
+            host_header,
+            uri,
+        });
+    }
+    // An `upstream` block matches only a URL without a port, as its
+    // name has none; the implicit upstream of another location's
+    // `proxy_pass http://host:port` matches by host and port
+    // (ngx_http_upstream_init_request).
+    let block = || {
+        http.upstreams
+            .iter()
+            .find(|(name, _)| name.as_bytes().eq_ignore_ascii_case(host))
+            .map(|(_, upstream)| *upstream)
+    };
+    let implicit = || {
+        http.implicit_upstreams
+            .iter()
+            .find(|(name, p, _)| *p == port.unwrap_or(80) && name.eq_ignore_ascii_case(host))
+            .map(|(_, _, upstream)| *upstream)
+    };
+    if let Some(upstream) = port.is_none().then(block).flatten().or_else(implicit) {
+        return Ok(VariableTarget {
+            upstream,
+            adhoc_peer: None,
+            host_header,
+            uri,
+        });
+    }
+    fail(
+        502,
+        format!(
+            "no resolver defined to resolve {}",
+            String::from_utf8_lossy(host)
+        ),
+    )
+}
+
+thread_local! {
+    /// `unix:` paths that requests have named through `proxy_pass` with
+    /// variables, kept for the life of the worker so a peer can hold a
+    /// `&'static Path`. Bounded: the URL may come from the client.
+    static UNIX_PATHS: std::cell::RefCell<Vec<&'static std::path::Path>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const UNIX_PATHS_MAX: usize = 1024;
+
+fn intern_unix_path(path: &[u8]) -> Option<&'static std::path::Path> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+    UNIX_PATHS.with(|paths| {
+        let mut paths = paths.borrow_mut();
+        if let Some(known) = paths.iter().find(|p| **p == path) {
+            return Some(*known);
+        }
+        if paths.len() >= UNIX_PATHS_MAX {
+            return None;
+        }
+        let leaked: &'static std::path::Path = Box::leak(path.to_path_buf().into_boxed_path());
+        paths.push(leaked);
+        Some(leaked)
+    })
+}
+
+/// The 500 or 502 for a `proxy_pass` URL that can't be used, through the
+/// location's `error_page` as nginx finalizes it.
+#[cold]
+fn variable_url_failed(
+    http: &'static PreparedHttp,
+    status: u16,
+    loc: &MatchedLocation<'static>,
+    req: &phase::RequestCtx<'_>,
+    render_ctx_base: &RenderCtx<'_>,
+    in_error_page: bool,
+    preserved_www_authenticate: &[Vec<u8>],
+) -> Response {
+    let prebuilt = if status == 502 {
+        &http.bad_gateway
+    } else {
+        &http.internal_error
+    };
+    let intercepted = maybe_intercept_error_page(
+        Response::Prebuilt(prebuilt.pick(req.method)),
+        loc.error_pages,
+        req,
+        render_ctx_base,
+        in_error_page,
+        loc.recursive_error_pages,
+        loc.server_header,
+    );
+    let trailers_allowed =
+        req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
+    finalize_location_response(
+        intercepted,
+        loc.add_headers,
+        loc.add_trailers,
+        trailers_allowed,
+        render_ctx_base,
+        None,
+        None,
+        preserved_www_authenticate,
+        loc.expires,
+    )
+}
+
+/// The request's `proxy_bind` address (ngx_http_upstream_set_local): the
+/// literal one, or the value rendered now. An empty value binds nothing;
+/// one that isn't an address is logged and binds nothing either.
+fn resolve_bind(
+    bind: &'static super::PreparedBind,
+    ctx: &RenderCtx<'_>,
+) -> Option<crate::proxy::LocalBind> {
+    let addr = match bind.addr {
+        Some(addr) => addr,
+        None => {
+            let mut value = Vec::new();
+            render_parts(bind.value, ctx, &mut value);
+            if value.is_empty() {
+                return None;
+            }
+            let parsed = std::str::from_utf8(&value)
+                .ok()
+                .and_then(crate::config::parse_bind_addr);
+            let Some(addr) = parsed else {
+                crate::fs_resolve::note_failed_lookup_at(
+                    format!(
+                        "invalid local address \"{}\"",
+                        String::from_utf8_lossy(&value)
+                    ),
+                    false,
+                    ErrorLogLevel::Error,
+                );
+                return None;
+            };
+            addr
+        }
+    };
+    Some(crate::proxy::LocalBind {
+        addr,
+        transparent: bind.transparent,
     })
 }

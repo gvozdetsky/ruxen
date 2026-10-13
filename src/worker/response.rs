@@ -451,7 +451,16 @@ pub(crate) fn apply_expires(
         PreparedExpires::Variable(parts) | PreparedExpires::VariableModified(parts) => {
             let modified = matches!(expires, PreparedExpires::VariableModified(_));
             let mut buf = Vec::with_capacity(32);
-            render_parts(parts, ctx, &mut buf);
+            // `$sent_http_*` (a `map $sent_http_content_type $expires`)
+            // reads the response's headers, as nginx's headers filter sees
+            // `r->headers_out` by then.
+            let sep_pos = response.windows(4).position(|w| w == b"\r\n\r\n");
+            let mut local_ctx = *ctx;
+            local_ctx.sent_headers = match sep_pos {
+                Some(p) => &response[..p + 2],
+                None => &response[..],
+            };
+            render_parts(parts, &local_ctx, &mut buf);
             let s = match std::str::from_utf8(&buf) {
                 Ok(v) => v,
                 Err(_) => return response,
@@ -818,6 +827,7 @@ fn proxy_render_ctx<'a>(
         proxy_host: meta.proxy_host,
         upstream_headers,
         upstream_states: &meta.upstream_states,
+        upstream_cache_status: meta.upstream_cache_status.map_or(&[][..], |s| s.as_bytes()),
         sent_trailers: &[],
         tls: ctx.tls,
         conn: ctx.conn,
@@ -885,6 +895,7 @@ pub(crate) fn finish_server_response(
         proxy_host: &[],
         upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
         upstream_states: req.upstream.map_or(&[], |u| &u.states),
+        upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
         sent_trailers: &[],
         tls: req.tls,
         conn: req.conn,

@@ -742,6 +742,46 @@ pub(crate) const MAX_CHUNK_LINE_BYTES: usize = 8192;
 /// Maximum trailer block size in bytes. Bounds total trailer-line growth.
 pub(crate) const MAX_TRAILER_BLOCK_BYTES: usize = 16 * 1024;
 
+/// Read `len` more bytes of a body nothing will read and drop them, through
+/// one small pooled buffer (nginx's ngx_http_read_discarded_request_body):
+/// no body-sized buffer is held per request (#289). `false` on EOF, an
+/// error or `client_body_timeout`.
+pub(crate) async fn discard_request_body<S: ConnIo>(
+    stream: &mut S,
+    mut len: u64,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    read_timeout: Duration,
+) -> bool {
+    use monoio::buf::IoBufMut;
+    const DISCARD_CHUNK: usize = 16 * 1024;
+    if len == 0 {
+        return true;
+    }
+    let mut buf = super::take_body_buffer(DISCARD_CHUNK);
+    let ok = loop {
+        // Never past the body, so a pipelined request isn't consumed.
+        let want = len.min(DISCARD_CHUNK as u64) as usize;
+        let slice = std::mem::take(&mut buf).slice_mut(0..want);
+        let Some((res, returned)) =
+            with_timeout(timer.as_mut(), read_timeout, stream.read(slice)).await
+        else {
+            break false;
+        };
+        buf = returned.into_inner();
+        match res {
+            Ok(0) | Err(_) => break false,
+            Ok(n) => {
+                len -= n as u64;
+                if len == 0 {
+                    break true;
+                }
+            }
+        }
+    };
+    drop(super::PooledBody(buf));
+    ok
+}
+
 /// Read and decode a chunked request body from the connection into `sink`
 /// (memory, then a temp file for large bodies). Chunk data is passed on as
 /// it arrives and consumed input is dropped, so memory stays bounded

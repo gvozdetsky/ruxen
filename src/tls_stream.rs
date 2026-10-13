@@ -71,7 +71,81 @@ impl TlsAcceptor {
     where
         IO: AsyncReadRent + AsyncWriteRent,
     {
-        let mut conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
+        let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
+        self.handshake_with(io, conn).await
+    }
+
+    /// `accept`, but the ClientHello is read first and `reject` sees its
+    /// SNI name (nginx's servername callback): when it says so, the
+    /// handshake ends with a fatal `unrecognized_name` alert before any
+    /// certificate is chosen (`ssl_reject_handshake`, #112). The error is
+    /// `ConnectionRefused`.
+    pub async fn accept_or_reject<IO>(
+        &self,
+        mut io: IO,
+        reject: impl FnOnce(Option<&str>) -> bool,
+    ) -> io::Result<TlsStream<IO>>
+    where
+        IO: AsyncReadRent + AsyncWriteRent,
+    {
+        let mut acceptor = rustls::server::Acceptor::default();
+        let mut buf = Vec::with_capacity(READ_BUF_SIZE);
+        let accepted = loop {
+            buf.clear();
+            let (res, returned) = io.read(buf).await;
+            buf = returned;
+            if res? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "tls handshake eof",
+                ));
+            }
+            let mut pending = &buf[..];
+            while !pending.is_empty() {
+                acceptor.read_tls(&mut pending)?;
+            }
+            match acceptor.accept() {
+                Ok(Some(accepted)) => break accepted,
+                Ok(None) => {}
+                Err((e, mut alert)) => {
+                    let mut out = Vec::new();
+                    let _ = alert.write_all(&mut out);
+                    let _ = io.write_all(out).await;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+            }
+        };
+        if reject(accepted.client_hello().server_name()) {
+            // A plaintext fatal alert record, unrecognized_name (112): no
+            // keys exist yet, for TLS 1.2 and 1.3 alike.
+            let _ = io
+                .write_all(vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70])
+                .await;
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "handshake rejected (ssl_reject_handshake)",
+            ));
+        }
+        let conn = match accepted.into_connection(self.config.clone()) {
+            Ok(conn) => conn,
+            Err((e, mut alert)) => {
+                let mut out = Vec::new();
+                let _ = alert.write_all(&mut out);
+                let _ = io.write_all(out).await;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        };
+        self.handshake_with(io, conn).await
+    }
+
+    async fn handshake_with<IO>(
+        &self,
+        io: IO,
+        mut conn: ServerConnection,
+    ) -> io::Result<TlsStream<IO>>
+    where
+        IO: AsyncReadRent + AsyncWriteRent,
+    {
         let session_id = if self.session_ids {
             let mut id = [0; 32];
             self.config

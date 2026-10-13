@@ -123,6 +123,8 @@ pub(crate) struct RenderCtx<'a> {
     /// `$upstream_status`, `$upstream_response_time` and the rest. Empty
     /// outside a proxy context.
     pub upstream_states: &'a [crate::proxy::UpstreamState],
+    /// `$upstream_cache_status`; empty when no cache was looked at.
+    pub upstream_cache_status: &'a [u8],
     /// Pre-rendered `add_trailer` lines, joined with CRLF and rendered as
     /// `Name: value\r\n` per entry. Used by `$sent_trailer_*` lookups via
     /// the same scanner that handles request/response headers.
@@ -342,6 +344,26 @@ impl RenderCtx<'_> {
             Variable::SslClientVEnd => {}
             Variable::SslClientVRemain => {}
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            Variable::LimitConnStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_conn::status::text(state.limit_conn_status));
+                }
+            }
+            Variable::LimitReqStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_req::status::text(state.limit_req_status));
+                }
+            }
+            Variable::Connections(gauge) => {
+                let t = super::stats::totals();
+                let n = match gauge {
+                    crate::config::ConnectionsGauge::Active => t.active,
+                    crate::config::ConnectionsGauge::Reading => t.reading,
+                    crate::config::ConnectionsGauge::Writing => t.writing,
+                    crate::config::ConnectionsGauge::Waiting => t.waiting,
+                };
+                write_u64_decimal(out, n);
+            }
             Variable::RequestBody => {
                 // nginx leaves `$request_body` empty whenever the body was
                 // spilled to disk — readers consult `$request_body_file`
@@ -410,6 +432,7 @@ impl RenderCtx<'_> {
             Variable::UpstreamBytesSent => {
                 self.write_upstream_list(out, |out, s| write_u64_decimal(out, s.bytes_sent))
             }
+            Variable::UpstreamCacheStatus => out.extend_from_slice(self.upstream_cache_status),
             Variable::SentTrailer(name) => {
                 write_all_request_header_values(out, self.sent_trailers, name.as_bytes());
             }
@@ -997,6 +1020,8 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::ContentType
             | Variable::RemoteUser
             | Variable::RequestBody
+            | Variable::LimitReqStatus
+            | Variable::LimitConnStatus
             | Variable::RequestBodyFile
             | Variable::ProxyHost
             | Variable::ProxyPort
@@ -1010,6 +1035,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::UpstreamHeaderTime
             | Variable::UpstreamBytesReceived
             | Variable::UpstreamBytesSent
+            | Variable::UpstreamCacheStatus
             | Variable::SslProtocol
             | Variable::SslCipher
             | Variable::SslCiphers

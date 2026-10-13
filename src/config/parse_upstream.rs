@@ -60,6 +60,7 @@ pub(crate) fn parse_upstream_block(
     let mut keepalive_idle_timeout_ms: Option<u64> = None;
     let mut keepalive_max_lifetime_ms: Option<u64> = None;
     let mut lb: LbAlgorithm = LbAlgorithm::RoundRobin;
+    let mut zone: Option<String> = None;
     loop {
         let (args, term) = lx.read_directive()?;
         if args.is_empty() {
@@ -76,6 +77,7 @@ pub(crate) fn parse_upstream_block(
                         keepalive_idle_timeout_ms,
                         keepalive_max_lifetime_ms,
                         lb,
+                        zone,
                     })
                 }
                 Terminator::Eof => Err(Error::UnclosedBlock),
@@ -84,7 +86,14 @@ pub(crate) fn parse_upstream_block(
         }
         match (args[0].as_str(), &term) {
             ("server", Terminator::Semi) => {
-                servers.push(parse_upstream_server_args(&args[1..])?);
+                let server = parse_upstream_server_args(&args[1..])?;
+                if server.backup && matches!(lb, LbAlgorithm::Hash { .. } | LbAlgorithm::IpHash) {
+                    return Err(Error::BadValue {
+                        what: "upstream server param (balancing method does not support it)",
+                        got: "backup".into(),
+                    });
+                }
+                servers.push(server);
             }
             ("server", _) => {
                 return Err(Error::WrongTerminator {
@@ -93,16 +102,95 @@ pub(crate) fn parse_upstream_block(
                 });
             }
             ("least_conn", Terminator::Semi) => {
-                if !matches!(lb, LbAlgorithm::RoundRobin) {
-                    return Err(Error::Duplicate("least_conn"));
-                }
                 if args.len() != 1 {
                     return Err(Error::BadValue {
                         what: "least_conn",
                         got: args[1..].join(" "),
                     });
                 }
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
                 lb = LbAlgorithm::LeastConn;
+            }
+            // ngx_http_upstream_hash / ngx_http_upstream_ip_hash: a method
+            // set before is replaced with a warning. Neither takes `backup`
+            // servers after it; ones listed before stay out of the hash and
+            // serve only its round-robin fallback, as in nginx.
+            ("hash", Terminator::Semi) => {
+                let consistent = match &args[1..] {
+                    [_] => false,
+                    [_, c] if c == "consistent" => true,
+                    [_, other] => {
+                        return Err(Error::BadValue {
+                            what: "hash parameter",
+                            got: other.clone(),
+                        });
+                    }
+                    [] => return Err(Error::MissingArg("hash key")),
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "hash",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                };
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
+                lb = LbAlgorithm::Hash {
+                    key: parse_value_with_vars(&args[1])?,
+                    consistent,
+                };
+            }
+            ("ip_hash", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::BadValue {
+                        what: "ip_hash",
+                        got: args[1..].join(" "),
+                    });
+                }
+                if !matches!(lb, LbAlgorithm::RoundRobin) {
+                    lx.warn("load balancing method redefined".into());
+                }
+                lb = LbAlgorithm::IpHash;
+            }
+            // ngx_http_upstream_zone: `zone name [size]`. Workers are
+            // threads, so the size bounds nothing; it is checked as nginx
+            // checks it.
+            ("zone", Terminator::Semi) => {
+                if zone.is_some() {
+                    return Err(Error::Duplicate("zone"));
+                }
+                let (name, size) = match &args[1..] {
+                    [name] => (name, None),
+                    [name, size] => (name, Some(size)),
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "zone",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                };
+                if name.is_empty() {
+                    return Err(Error::BadValue {
+                        what: "zone name",
+                        got: name.clone(),
+                    });
+                }
+                if let Some(size) = size {
+                    let bytes = parse_size_bytes(size).ok_or_else(|| Error::BadValue {
+                        what: "zone size",
+                        got: size.clone(),
+                    })?;
+                    if bytes < 8 * 4096 {
+                        return Err(Error::BadValue {
+                            what: "zone (zone is too small)",
+                            got: size.clone(),
+                        });
+                    }
+                }
+                zone = Some(name.clone());
             }
             ("keepalive", Terminator::Semi) => {
                 if keepalive_max_idle.is_some() {
@@ -175,6 +263,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
     let mut weight: u32 = 1;
     let mut max_fails: u32 = 1;
     let mut fail_timeout_secs: u32 = 10;
+    let mut max_conns: u32 = 0;
     let mut down = false;
     let mut backup = false;
     for tok in &args[1..] {
@@ -199,6 +288,11 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
                 what: "upstream fail_timeout",
                 got: tok.clone(),
             })?;
+        } else if let Some(v) = tok.strip_prefix("max_conns=") {
+            max_conns = v.parse::<u32>().map_err(|_| Error::BadValue {
+                what: "upstream max_conns",
+                got: tok.clone(),
+            })?;
         } else if tok == "down" {
             down = true;
         } else if tok == "backup" {
@@ -216,6 +310,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<UpstreamServ
         weight,
         max_fails,
         fail_timeout_secs,
+        max_conns,
         down,
         backup,
     })
@@ -281,10 +376,11 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
         });
     }
     let raw = &args[0];
+    // With variables the URL is rendered and parsed per request, as
+    // nginx's ngx_http_proxy_eval does; its scheme is checked then.
     if raw.contains('$') {
-        return Err(Error::BadValue {
-            what: "proxy_pass ($var dynamic upstream not supported in v0.1; declare an upstream{} block)",
-            got: raw.clone(),
+        return Ok(ProxyPass::Variable {
+            url: parse_value_with_vars(raw)?,
         });
     }
     let after_scheme = raw.strip_prefix("http://").ok_or_else(|| Error::BadValue {
@@ -508,9 +604,24 @@ impl ProxyConf {
         "proxy_next_upstream_tries",
         "proxy_next_upstream_timeout",
         "proxy_intercept_errors",
+        "proxy_bind",
         "proxy_redirect",
         "proxy_hide_header",
         "proxy_pass_header",
+        "proxy_cache",
+        "proxy_cache_key",
+        "proxy_cache_valid",
+        "proxy_cache_methods",
+        "proxy_cache_min_uses",
+        "proxy_cache_bypass",
+        "proxy_no_cache",
+        "proxy_cache_convert_head",
+        "proxy_cache_revalidate",
+        "proxy_cache_use_stale",
+        "proxy_cache_background_update",
+        "proxy_cache_lock",
+        "proxy_cache_lock_timeout",
+        "proxy_cache_lock_age",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -531,12 +642,11 @@ impl ProxyConf {
                 self.pass_request_headers =
                     Some(parse_on_off_args(&args[1..], "proxy_pass_request_headers")?);
             }
-            "proxy_ignore_headers" => {
-                if self.ignore_headers.is_some() {
-                    return Err(Error::Duplicate("proxy_ignore_headers"));
-                }
-                self.ignore_headers = Some(parse_proxy_ignore_headers(&args[1..])?);
-            }
+            // A bitmask in nginx: lines add up.
+            "proxy_ignore_headers" => self
+                .ignore_headers
+                .get_or_insert_with(Vec::new)
+                .extend(parse_proxy_ignore_headers(&args[1..])?),
             "proxy_set_body" => {
                 if self.set_body.is_some() {
                     return Err(Error::Duplicate("proxy_set_body"));
@@ -636,6 +746,44 @@ impl ProxyConf {
                     .get_or_insert_with(Vec::new)
                     .push(name.clone());
             }
+            // ngx_http_upstream_bind_set_slot: `off`, or an address with an
+            // optional `transparent`; a literal one must parse now.
+            "proxy_bind" => {
+                if self.bind.is_some() {
+                    return Err(Error::Duplicate("proxy_bind"));
+                }
+                self.bind = Some(match &args[1..] {
+                    [off] if off == "off" => ProxyBind::Off,
+                    [addr] | [addr, _] => {
+                        let transparent = match args.get(2).map(String::as_str) {
+                            None => false,
+                            Some("transparent") => true,
+                            Some(other) => {
+                                return Err(Error::BadValue {
+                                    what: "proxy_bind parameter",
+                                    got: other.to_string(),
+                                });
+                            }
+                        };
+                        if !addr.contains('$') && parse_bind_addr(addr).is_none() {
+                            return Err(Error::BadValue {
+                                what: "proxy_bind (invalid address)",
+                                got: addr.clone(),
+                            });
+                        }
+                        ProxyBind::Addr {
+                            value: parse_value_with_vars(addr)?,
+                            transparent,
+                        }
+                    }
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "proxy_bind",
+                            got: args[1..].join(" "),
+                        });
+                    }
+                });
+            }
             "proxy_intercept_errors" => {
                 if self.intercept_errors.is_some() {
                     return Err(Error::Duplicate("proxy_intercept_errors"));
@@ -643,10 +791,285 @@ impl ProxyConf {
                 self.intercept_errors =
                     Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
             }
+            "proxy_cache" => {
+                if self.cache.cache.is_some() {
+                    return Err(Error::Duplicate("proxy_cache"));
+                }
+                let [_, value] = args else {
+                    return Err(Error::MissingArg("proxy_cache"));
+                };
+                let parts = parse_value_with_vars(value)?;
+                self.cache.cache = Some(if value == "off" {
+                    ProxyCacheSetting::Off
+                } else if parts.iter().any(|p| !matches!(p, ValuePart::Literal(_))) {
+                    ProxyCacheSetting::Var(parts)
+                } else {
+                    ProxyCacheSetting::Zone(value.clone())
+                });
+            }
+            "proxy_cache_key" => {
+                if self.cache.key.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_key"));
+                }
+                let [_, value] = args else {
+                    return Err(Error::MissingArg("proxy_cache_key"));
+                };
+                self.cache.key = Some(parse_value_with_vars(value)?);
+            }
+            "proxy_cache_valid" => {
+                let entries = parse_proxy_cache_valid(&args[1..])?;
+                self.cache
+                    .valid
+                    .get_or_insert_with(Vec::new)
+                    .extend(entries);
+            }
+            "proxy_cache_methods" => {
+                if args.len() < 2 {
+                    return Err(Error::MissingArg("proxy_cache_methods"));
+                }
+                let mut post = self.cache.methods_post.unwrap_or(false);
+                for method in &args[1..] {
+                    match method.to_ascii_uppercase().as_str() {
+                        "GET" | "HEAD" => {}
+                        "POST" => post = true,
+                        _ => {
+                            return Err(Error::BadValue {
+                                what: "proxy_cache_methods",
+                                got: method.clone(),
+                            });
+                        }
+                    }
+                }
+                self.cache.methods_post = Some(post);
+            }
+            "proxy_cache_min_uses" => {
+                if self.cache.min_uses.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_min_uses"));
+                }
+                let v = args
+                    .get(1)
+                    .ok_or(Error::MissingArg("proxy_cache_min_uses"))?;
+                self.cache.min_uses = Some(v.parse::<u32>().map_err(|_| Error::BadValue {
+                    what: "proxy_cache_min_uses",
+                    got: v.clone(),
+                })?);
+            }
+            name @ ("proxy_cache_bypass" | "proxy_no_cache") => {
+                if args.len() < 2 {
+                    return Err(Error::MissingArg(if name == "proxy_no_cache" {
+                        "proxy_no_cache"
+                    } else {
+                        "proxy_cache_bypass"
+                    }));
+                }
+                let slot = if name == "proxy_no_cache" {
+                    &mut self.cache.no_cache
+                } else {
+                    &mut self.cache.bypass
+                };
+                let list = slot.get_or_insert_with(Vec::new);
+                for value in &args[1..] {
+                    list.push(parse_value_with_vars(value)?);
+                }
+            }
+            "proxy_cache_convert_head" => {
+                if self.cache.convert_head.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_convert_head"));
+                }
+                self.cache.convert_head =
+                    Some(parse_on_off_args(&args[1..], "proxy_cache_convert_head")?);
+            }
+            "proxy_cache_revalidate" => {
+                if self.cache.revalidate.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_revalidate"));
+                }
+                self.cache.revalidate =
+                    Some(parse_on_off_args(&args[1..], "proxy_cache_revalidate")?);
+            }
+            "proxy_cache_use_stale" => {
+                if self.cache.use_stale.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_use_stale"));
+                }
+                self.cache.use_stale = Some(parse_proxy_cache_use_stale(&args[1..])?);
+            }
+            "proxy_cache_background_update" => {
+                if self.cache.background_update.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_background_update"));
+                }
+                self.cache.background_update = Some(parse_on_off_args(
+                    &args[1..],
+                    "proxy_cache_background_update",
+                )?);
+            }
+            "proxy_cache_lock" => {
+                if self.cache.lock.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_lock"));
+                }
+                self.cache.lock = Some(parse_on_off_args(&args[1..], "proxy_cache_lock")?);
+            }
+            name @ ("proxy_cache_lock_timeout" | "proxy_cache_lock_age") => {
+                let (slot, what) = if name == "proxy_cache_lock_age" {
+                    (&mut self.cache.lock_age_ms, "proxy_cache_lock_age")
+                } else {
+                    (&mut self.cache.lock_timeout_ms, "proxy_cache_lock_timeout")
+                };
+                if slot.is_some() {
+                    return Err(Error::Duplicate(what));
+                }
+                *slot = Some(parse_proxy_timeout_args(&args[1..], what)?);
+            }
             other => unreachable!("not a ProxyConf directive: {other}"),
         }
         Ok(())
     }
+}
+
+/// `proxy_cache_valid [code ...] time;` (ngx_http_file_cache_valid_set_slot):
+/// a time alone is for 200, 301 and 302; `any` is every status.
+pub(crate) fn parse_proxy_cache_valid(args: &[String]) -> Result<Vec<CacheValid>, Error> {
+    let (time, codes) = args
+        .split_last()
+        .ok_or(Error::MissingArg("proxy_cache_valid"))?;
+    let secs = super::parse_server::parse_duration_secs(time, "proxy_cache_valid")?;
+    if codes.is_empty() {
+        return Ok([200, 301, 302]
+            .into_iter()
+            .map(|status| CacheValid { status, secs })
+            .collect());
+    }
+    codes
+        .iter()
+        .map(|code| {
+            let status = if code == "any" {
+                0
+            } else {
+                code.parse::<u16>()
+                    .ok()
+                    .filter(|s| (100..=599).contains(s))
+                    .ok_or_else(|| Error::BadValue {
+                        what: "proxy_cache_valid status",
+                        got: code.clone(),
+                    })?
+            };
+            Ok(CacheValid { status, secs })
+        })
+        .collect()
+}
+
+/// `proxy_cache_use_stale` (ngx_http_proxy_next_upstream_masks plus
+/// `updating`); `off` alone turns every case off.
+pub(crate) fn parse_proxy_cache_use_stale(args: &[String]) -> Result<UseStale, Error> {
+    if args.is_empty() {
+        return Err(Error::MissingArg("proxy_cache_use_stale"));
+    }
+    let mut stale = UseStale::default();
+    if let [only] = args
+        && only == "off"
+    {
+        return Ok(stale);
+    }
+    for arg in args {
+        match arg.as_str() {
+            "error" => stale.error = true,
+            "timeout" => stale.timeout = true,
+            "invalid_header" => stale.invalid_header = true,
+            "updating" => stale.updating = true,
+            other => {
+                let slot = other
+                    .strip_prefix("http_")
+                    .and_then(|code| code.parse::<u16>().ok())
+                    .and_then(|code| UseStale::STATUSES.iter().position(|&s| s == code))
+                    .ok_or_else(|| Error::BadValue {
+                        what: "proxy_cache_use_stale",
+                        got: arg.clone(),
+                    })?;
+                stale.statuses[slot] = true;
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// `proxy_cache_path` (ngx_http_file_cache_set_slot). The loader and
+/// manager tunables are checked and otherwise unused: the index learns
+/// files lazily and eviction runs as entries are stored.
+pub(crate) fn parse_proxy_cache_path(args: &[String]) -> Result<ProxyCachePath, Error> {
+    let (path, params) = args
+        .split_first()
+        .ok_or(Error::MissingArg("proxy_cache_path"))?;
+    let bad = |got: &String| Error::BadValue {
+        what: "proxy_cache_path",
+        got: got.clone(),
+    };
+    let path = match path.strip_suffix('/') {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => path.as_str(),
+    };
+    let mut levels = [0u8; 3];
+    let mut zone: Option<(String, u64)> = None;
+    let mut inactive_secs = 600;
+    let mut max_size = None;
+    let mut min_free = None;
+    for param in params {
+        let (name, value) = param.split_once('=').ok_or_else(|| bad(param))?;
+        match name {
+            "levels" => {
+                let parts: Vec<&str> = value.split(':').collect();
+                if parts.len() > 3 {
+                    return Err(bad(param));
+                }
+                for (slot, part) in levels.iter_mut().zip(&parts) {
+                    *slot = match *part {
+                        "1" => 1,
+                        "2" => 2,
+                        _ => return Err(bad(param)),
+                    };
+                }
+            }
+            "keys_zone" => {
+                let (zone_name, size) = value.split_once(':').ok_or_else(|| bad(param))?;
+                let size = super::parse_server::parse_size_bytes(size).ok_or_else(|| bad(param))?;
+                // nginx: "keys zone ... is too small" below two pages.
+                if zone_name.is_empty() || size < 8192 {
+                    return Err(bad(param));
+                }
+                zone = Some((zone_name.to_string(), size));
+            }
+            "inactive" => {
+                inactive_secs = super::parse_server::parse_duration_secs(value, "inactive")?;
+            }
+            "max_size" => {
+                max_size =
+                    Some(super::parse_server::parse_size_bytes(value).ok_or_else(|| bad(param))?);
+            }
+            "use_temp_path" => {
+                if value != "on" && value != "off" {
+                    return Err(bad(param));
+                }
+            }
+            "min_free" => {
+                min_free =
+                    Some(super::parse_server::parse_size_bytes(value).ok_or_else(|| bad(param))?);
+            }
+            "loader_files" | "manager_files" => {
+                value.parse::<u64>().map_err(|_| bad(param))?;
+            }
+            "loader_sleep" | "loader_threshold" | "manager_sleep" | "manager_threshold" => {
+                super::parse_server::parse_duration_ms(value, "proxy_cache_path")?;
+            }
+            _ => return Err(bad(param)),
+        }
+    }
+    let (zone, size) = zone.ok_or(Error::MissingArg("proxy_cache_path keys_zone"))?;
+    Ok(ProxyCachePath {
+        path: PathBuf::from(path),
+        levels,
+        zone,
+        size,
+        inactive_secs,
+        max_size,
+        min_free,
+    })
 }
 
 /// Parse a `proxy_*_timeout` argument. Single time-suffix value (`60s`,
@@ -683,6 +1106,21 @@ pub(crate) fn parse_proxy_http_version_args(args: &[String]) -> Result<u8, Error
             got: raw.clone(),
         }),
     }
+}
+
+/// `ip[:port]` or `[ipv6][:port]` (ngx_parse_addr_port), as `proxy_bind`
+/// takes it; port 0 when none.
+pub(crate) fn parse_bind_addr(s: &str) -> Option<SocketAddr> {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    let ip = s
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .unwrap_or(s)
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    Some(SocketAddr::new(ip, 0))
 }
 
 #[cfg(test)]
@@ -725,5 +1163,67 @@ mod tests {
         assert!(parse_upstream_server_args(&[too_long]).is_err());
         let fits = format!("unix:/{}", "a".repeat(106));
         assert!(parse_upstream_server_args(&[fits]).is_ok());
+    }
+
+    #[test]
+    fn hash_and_ip_hash_directives() {
+        let upstream = |body: &str| {
+            crate::config::parse(&format!(
+                "http {{ upstream u {{ {body} }} server {{ listen 80; location / {{ proxy_pass http://u; }} }} }}"
+            ))
+        };
+        let cfg = upstream("hash $arg_k consistent; server 127.0.0.1:1;").unwrap();
+        assert!(matches!(
+            cfg.upstreams[0].lb,
+            LbAlgorithm::Hash {
+                consistent: true,
+                ..
+            }
+        ));
+        // A method set before is replaced, with nginx's warning.
+        let cfg = upstream("least_conn; ip_hash; server 127.0.0.1:1;").unwrap();
+        assert_eq!(cfg.upstreams[0].lb, LbAlgorithm::IpHash);
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("load balancing method redefined")),
+            "{:?}",
+            cfg.warnings
+        );
+        // `backup` after a hash method is refused; before, it is kept.
+        assert!(upstream("hash $arg_k; server 127.0.0.1:1 backup;").is_err());
+        assert!(upstream("server 127.0.0.1:1 backup; ip_hash; server 127.0.0.1:2;").is_ok());
+        assert!(upstream("hash $arg_k foo; server 127.0.0.1:1;").is_err());
+        assert!(upstream("hash; server 127.0.0.1:1;").is_err());
+    }
+
+    #[test]
+    fn proxy_bind_addresses() {
+        use std::net::SocketAddr;
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(parse_bind_addr("127.0.0.2"), Some(addr("127.0.0.2:0")));
+        assert_eq!(parse_bind_addr("127.0.0.2:81"), Some(addr("127.0.0.2:81")));
+        assert_eq!(parse_bind_addr("[::1]"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("::1"), Some(addr("[::1]:0")));
+        assert_eq!(parse_bind_addr("[::1]:81"), Some(addr("[::1]:81")));
+        assert_eq!(parse_bind_addr("localhost"), None);
+        assert_eq!(parse_bind_addr("127.0.0.2:x"), None);
+
+        let parse = |args: &[&str]| {
+            let mut conf = ProxyConf::default();
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            conf.parse(&args).map(|()| conf.bind.unwrap())
+        };
+        assert_eq!(parse(&["proxy_bind", "off"]).unwrap(), ProxyBind::Off);
+        assert!(matches!(
+            parse(&["proxy_bind", "127.0.0.2", "transparent"]).unwrap(),
+            ProxyBind::Addr {
+                transparent: true,
+                ..
+            }
+        ));
+        assert!(parse(&["proxy_bind", "$arg_b"]).is_ok());
+        assert!(parse(&["proxy_bind", "bogus"]).is_err());
+        assert!(parse(&["proxy_bind", "127.0.0.2", "foo"]).is_err());
     }
 }

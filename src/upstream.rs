@@ -40,6 +40,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -48,6 +49,386 @@ use monoio::net::TcpStream;
 use crate::config::LbAlgorithm;
 use crate::worker::PreparedPeer;
 use crate::worker::PreparedUpstream;
+use crate::worker::PreparedValuePart;
+
+/// A peer's state shared by all workers, for an upstream with `zone`
+/// (#143): connections in progress and the failure window, so every
+/// worker sees the same `max_conns` count, the same `least_conn` load
+/// and the same peer health. The smoothed round-robin weights stay per
+/// worker: only the interleaving of picks across workers differs from
+/// nginx's locked pick. One cache line per peer.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub struct PeerShared {
+    conns: AtomicU32,
+    fails: AtomicU32,
+    /// When the current failure window opened, in ms since `origin()`
+    /// plus one; 0 = no failure recorded.
+    fails_started_ms: AtomicU64,
+}
+
+impl PeerShared {
+    pub(crate) fn for_peers(n: usize) -> &'static [PeerShared] {
+        Box::leak((0..n).map(|_| PeerShared::default()).collect())
+    }
+}
+
+fn origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+fn ms_since_origin(t: Instant) -> u64 {
+    t.saturating_duration_since(origin()).as_millis() as u64 + 1
+}
+
+/// Requests in progress on peer `i`.
+fn active(rt: &UpstreamRt, up: &PreparedUpstream, i: usize) -> u32 {
+    match up.shared {
+        Some(shared) => shared[i].conns.load(Ordering::Relaxed),
+        None => rt.peers[i].active,
+    }
+}
+
+/// Peer `i`'s failures in the current window and when the window opened.
+fn fail_state(rt: &UpstreamRt, up: &PreparedUpstream, i: usize) -> (u32, Option<Instant>) {
+    match up.shared {
+        Some(shared) => {
+            let started = shared[i].fails_started_ms.load(Ordering::Relaxed);
+            let opened = (started != 0).then(|| origin() + Duration::from_millis(started - 1));
+            (shared[i].fails.load(Ordering::Relaxed), opened)
+        }
+        None => (rt.peers[i].fails, rt.peers[i].fails_started),
+    }
+}
+
+/// An upstream's balancing method, prepared.
+#[derive(Debug, Clone, Copy)]
+pub enum Lb {
+    RoundRobin,
+    LeastConn,
+    Hash(&'static HashLb),
+    IpHash,
+}
+
+/// `hash key [consistent]`.
+#[derive(Debug)]
+pub struct HashLb {
+    pub key: &'static [PreparedValuePart],
+    /// `consistent`: the ring of points, sorted by hash.
+    pub ring: Option<Box<[ChashPoint]>>,
+}
+
+/// A point of the consistent-hash ring, and the peer it maps to (the
+/// first one with that `server` text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChashPoint {
+    pub hash: u32,
+    pub peer: u32,
+}
+
+impl Lb {
+    pub(crate) fn prepare(lb: LbAlgorithm, peers: &[PreparedPeer]) -> Lb {
+        match lb {
+            LbAlgorithm::RoundRobin => Lb::RoundRobin,
+            LbAlgorithm::LeastConn => Lb::LeastConn,
+            LbAlgorithm::IpHash => Lb::IpHash,
+            LbAlgorithm::Hash { key, consistent } => Lb::Hash(Box::leak(Box::new(HashLb {
+                key: crate::worker::prepare_value_parts(key),
+                ring: consistent.then(|| chash_ring(peers)),
+            }))),
+        }
+    }
+}
+
+/// CRC-32 as nginx's ngx_crc32_* (the zlib polynomial).
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            table[i] = c;
+            i += 1;
+        }
+        table
+    };
+    for &b in data {
+        crc = TABLE[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    crc32_update(0xffff_ffff, data) ^ 0xffff_ffff
+}
+
+/// ngx_http_upstream_init_chash: `160 × weight` points per primary peer,
+/// each `crc32(HOST \0 PORT PREV_HASH)` from the `server` text as written,
+/// sorted, equal hashes kept once.
+fn chash_ring(peers: &[PreparedPeer]) -> Box<[ChashPoint]> {
+    let mut points = Vec::new();
+    for (i, peer) in peers.iter().enumerate().filter(|(_, p)| !p.backup) {
+        let server = peer.display;
+        let (host, port): (&[u8], &[u8]) = if server.len() >= 5
+            && server[..5].eq_ignore_ascii_case(b"unix:")
+        {
+            (&server[5..], b"")
+        } else {
+            // The port is the run of digits after the last `:`.
+            let digits = server
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            match server.len().checked_sub(digits + 1) {
+                Some(colon) if server[colon] == b':' => (&server[..colon], &server[colon + 1..]),
+                _ => (server, b""),
+            }
+        };
+        let mut base = crc32_update(0xffff_ffff, host);
+        base = crc32_update(base, b"\0");
+        base = crc32_update(base, port);
+        // Owners are the first peer with this text, as nginx compares
+        // the point's server string with each peer's.
+        let owner = peers
+            .iter()
+            .position(|p| p.display == server && !p.backup)
+            .unwrap_or(i) as u32;
+        let mut prev: u32 = 0;
+        for _ in 0..peer.weight as usize * 160 {
+            let hash = crc32_update(base, &prev.to_le_bytes()) ^ 0xffff_ffff;
+            points.push(ChashPoint { hash, peer: owner });
+            prev = hash;
+        }
+    }
+    // ngx_qsort isn't stable, but points with one hash collapse to the
+    // first, and nginx's choice between two servers on one hash is
+    // arbitrary too.
+    points.sort_by_key(|p| p.hash);
+    points.dedup_by_key(|p| p.hash);
+    points.into_boxed_slice()
+}
+
+/// ngx_http_upstream_find_chash_point: the first point at or after
+/// `hash` (`len` when past the last; taken modulo the ring size).
+fn find_chash_point(ring: &[ChashPoint], hash: u32) -> usize {
+    ring.partition_point(|p| p.hash < hash)
+}
+
+/// The per-request state of a hash balancer across tries, as nginx keeps
+/// it in the peer data: picks after a failed try go on from it.
+#[derive(Debug)]
+pub enum HashPick {
+    /// `hash key`: the key, the running hash and the rehash count.
+    Hash {
+        key: Box<[u8]>,
+        hash: u32,
+        rehash: u32,
+        tries: u32,
+    },
+    /// `hash key consistent`: the ring position.
+    Chash { point: usize, tries: u32 },
+    /// `ip_hash`: the address bytes hashed and the running hash.
+    IpHash {
+        addr: [u8; 16],
+        len: u8,
+        hash: u32,
+        tries: u32,
+    },
+    /// An empty key: round-robin.
+    RoundRobin,
+}
+
+impl HashPick {
+    /// The state for one request: `key` renders the `hash` key,
+    /// `remote_addr` is the client address (realip's, if any). `None` for
+    /// the other methods.
+    pub(crate) fn for_request(
+        upstream: &PreparedUpstream,
+        key: impl FnOnce(&'static [PreparedValuePart]) -> Vec<u8>,
+        remote_addr: &[u8],
+    ) -> Option<Box<HashPick>> {
+        let pick = match upstream.lb {
+            Lb::RoundRobin | Lb::LeastConn => return None,
+            Lb::Hash(h) => {
+                let key = key(h.key);
+                if key.is_empty() {
+                    HashPick::RoundRobin
+                } else if let Some(ring) = &h.ring {
+                    HashPick::Chash {
+                        point: find_chash_point(ring, crc32(&key)),
+                        tries: 0,
+                    }
+                } else {
+                    HashPick::Hash {
+                        key: key.into_boxed_slice(),
+                        hash: 0,
+                        rehash: 0,
+                        tries: 0,
+                    }
+                }
+            }
+            Lb::IpHash => {
+                // IPv4: the first three octets; IPv6: all sixteen; anything
+                // else (a unix-domain client): three zero bytes.
+                let mut addr = [0u8; 16];
+                let len = match std::str::from_utf8(remote_addr)
+                    .ok()
+                    .and_then(|a| a.parse::<std::net::IpAddr>().ok())
+                {
+                    Some(std::net::IpAddr::V4(ip)) => {
+                        addr[..3].copy_from_slice(&ip.octets()[..3]);
+                        3
+                    }
+                    Some(std::net::IpAddr::V6(ip)) => {
+                        addr = ip.octets();
+                        16
+                    }
+                    None => 3,
+                };
+                HashPick::IpHash {
+                    addr,
+                    len,
+                    hash: 89,
+                    tries: 0,
+                }
+            }
+        };
+        Some(Box::new(pick))
+    }
+}
+
+/// Primary peers with their weights, in order: what the hash walks.
+fn primary(peers: &[PreparedPeer]) -> impl Iterator<Item = (usize, &PreparedPeer)> {
+    peers.iter().enumerate().filter(|(_, p)| !p.backup)
+}
+
+/// The primary peer `w` falls on when walking the weights.
+fn weighted_peer(peers: &[PreparedPeer], mut w: u32) -> usize {
+    for (i, p) in primary(peers) {
+        if w < p.weight {
+            return i;
+        }
+        w -= p.weight;
+    }
+    unreachable!("w is below the total weight")
+}
+
+/// ngx_http_upstream_get_hash_peer / _get_chash_peer / _get_ip_hash_peer.
+/// `None`: fall back to round-robin (an empty key, a single peer, or 20
+/// tries without a usable peer).
+fn hash_pick(
+    rt: &mut UpstreamRt,
+    upstream: &PreparedUpstream,
+    state: &mut HashPick,
+    tried: &Tried,
+    now: Instant,
+) -> Option<usize> {
+    let peers = upstream.peers;
+    if primary(peers).nth(1).is_none() {
+        return None;
+    }
+    let total: u32 = primary(peers).map(|(_, p)| p.weight).sum();
+    let usable = |rt: &UpstreamRt, i: usize| peer_eligible(rt, upstream, i, false, tried, now);
+    match state {
+        HashPick::RoundRobin => None,
+        HashPick::Hash {
+            key,
+            hash,
+            rehash,
+            tries,
+        } => loop {
+            if *tries > 20 {
+                return None;
+            }
+            // ((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH, as
+            // Cache::Memcached; no REHASH the first time.
+            let mut crc = 0xffff_ffff;
+            if *rehash > 0 {
+                crc = crc32_update(crc, rehash.to_string().as_bytes());
+            }
+            crc = crc32_update(crc, key) ^ 0xffff_ffff;
+            *hash = hash.wrapping_add((crc >> 16) & 0x7fff);
+            *rehash += 1;
+            let i = weighted_peer(peers, *hash % total);
+            if usable(rt, i) {
+                return Some(i);
+            }
+            *tries += 1;
+        },
+        HashPick::IpHash {
+            addr,
+            len,
+            hash,
+            tries,
+        } => {
+            let mut h = *hash;
+            loop {
+                if *tries > 20 {
+                    return None;
+                }
+                for &b in &addr[..*len as usize] {
+                    h = (h * 113 + b as u32) % 6271;
+                }
+                let i = weighted_peer(peers, h % total);
+                if usable(rt, i) {
+                    // Kept only once a peer is taken, as nginx does.
+                    *hash = h;
+                    return Some(i);
+                }
+                *tries += 1;
+            }
+        }
+        HashPick::Chash { point, tries } => {
+            let Lb::Hash(HashLb {
+                ring: Some(ring), ..
+            }) = upstream.lb
+            else {
+                return None;
+            };
+            loop {
+                if *tries > 20 {
+                    return None;
+                }
+                let owner = &peers[ring[*point % ring.len()].peer as usize];
+                // The peers with that server text, by smoothed weight.
+                let mut total = 0i64;
+                let mut best: Option<usize> = None;
+                for (i, p) in primary(peers) {
+                    if p.display != owner.display || !usable(rt, i) {
+                        continue;
+                    }
+                    let s = &mut rt.peers[i];
+                    s.current_weight += s.effective_weight;
+                    total += s.effective_weight;
+                    if s.effective_weight < p.weight as i64 {
+                        s.effective_weight += 1;
+                    }
+                    let current = s.current_weight;
+                    if best.is_none_or(|b| current > rt.peers[b].current_weight) {
+                        best = Some(i);
+                    }
+                }
+                if let Some(b) = best {
+                    rt.peers[b].current_weight -= total;
+                    return Some(b);
+                }
+                *point += 1;
+                *tries += 1;
+            }
+        }
+    }
+}
 
 /// Per-peer mutable state for the smoothed weighted round-robin algorithm,
 /// failure tracking, and active-conn counters. Field meanings mirror
@@ -142,20 +523,37 @@ fn is_single(upstream: &PreparedUpstream) -> bool {
 /// `tried` holds the peers already attempted on this request (empty for
 /// the first pick). Used by the `proxy_next_upstream` retry loop in
 /// `proxy.rs` to avoid re-trying a peer that already failed.
-pub fn pick_peer(upstream: &'static PreparedUpstream, tried: &Tried) -> Option<LeasedPeer> {
+///
+/// `hash` carries a hash balancer's state for the request (`None` for
+/// round-robin and least_conn).
+pub fn pick_peer(
+    upstream: &'static PreparedUpstream,
+    tried: &Tried,
+    hash: Option<&mut HashPick>,
+) -> Option<LeasedPeer> {
     let now = Instant::now();
     LB_STATE.with(|state| {
         let mut map = state.borrow_mut();
         let key = upstream as *const PreparedUpstream;
         let rt = map.entry(key).or_insert_with(|| ensure_rt(upstream));
         let pick = match upstream.lb {
-            LbAlgorithm::RoundRobin => rr_pick_with_filter(rt, upstream.peers, false, tried, now)
-                .or_else(|| rr_pick_with_filter(rt, upstream.peers, true, tried, now)),
-            LbAlgorithm::LeastConn => least_conn_pick(rt, upstream.peers, false, tried, now)
-                .or_else(|| least_conn_pick(rt, upstream.peers, true, tried, now)),
+            Lb::LeastConn => least_conn_pick(rt, upstream, false, tried, now)
+                .or_else(|| least_conn_pick(rt, upstream, true, tried, now)),
+            // A hash balancer falls back to round-robin.
+            Lb::Hash(_) | Lb::IpHash => hash
+                .and_then(|h| hash_pick(rt, upstream, h, tried, now))
+                .or_else(|| rr_pick_with_filter(rt, upstream, false, tried, now))
+                .or_else(|| rr_pick_with_filter(rt, upstream, true, tried, now)),
+            Lb::RoundRobin => rr_pick_with_filter(rt, upstream, false, tried, now)
+                .or_else(|| rr_pick_with_filter(rt, upstream, true, tried, now)),
         };
         let idx = pick?;
-        rt.peers[idx].active = rt.peers[idx].active.saturating_add(1);
+        match upstream.shared {
+            Some(shared) => {
+                shared[idx].conns.fetch_add(1, Ordering::Relaxed);
+            }
+            None => rt.peers[idx].active = rt.peers[idx].active.saturating_add(1),
+        }
         Some(LeasedPeer {
             upstream,
             peer_idx: idx,
@@ -165,13 +563,13 @@ pub fn pick_peer(upstream: &'static PreparedUpstream, tried: &Tried) -> Option<L
 
 fn peer_eligible(
     rt: &UpstreamRt,
-    peers: &[PreparedPeer],
+    up: &PreparedUpstream,
     i: usize,
     backup_tier: bool,
     tried: &Tried,
     now: Instant,
 ) -> bool {
-    let p = &peers[i];
+    let p = &up.peers[i];
     if p.down {
         return false;
     }
@@ -181,9 +579,12 @@ fn peer_eligible(
     if tried.contains(i) {
         return false;
     }
-    let s = &rt.peers[i];
-    if let Some(opened) = s.fails_started {
-        if s.fails >= p.max_fails && p.max_fails > 0 {
+    if p.max_conns > 0 && active(rt, up, i) >= p.max_conns {
+        return false;
+    }
+    let (fails, fails_started) = fail_state(rt, up, i);
+    if let Some(opened) = fails_started {
+        if fails >= p.max_fails && p.max_fails > 0 {
             // Cooldown is active until fail_timeout has elapsed since the
             // most recent failure.
             if now.saturating_duration_since(opened) < Duration::from_millis(p.fail_timeout_ms) {
@@ -196,15 +597,16 @@ fn peer_eligible(
 
 fn rr_pick_with_filter(
     rt: &mut UpstreamRt,
-    peers: &[PreparedPeer],
+    up: &PreparedUpstream,
     backup_tier: bool,
     tried: &Tried,
     now: Instant,
 ) -> Option<usize> {
+    let peers = up.peers;
     let mut total: i64 = 0;
     let mut best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         let s = &mut rt.peers[i];
@@ -227,17 +629,18 @@ fn rr_pick_with_filter(
 
 fn least_conn_pick(
     rt: &mut UpstreamRt,
-    peers: &[PreparedPeer],
+    up: &PreparedUpstream,
     backup_tier: bool,
     tried: &Tried,
     now: Instant,
 ) -> Option<usize> {
+    let peers = up.peers;
     // First pass: find the smallest active/weight ratio across eligible
     // peers. nginx compares fractions via the cross-multiplication
     // `c1 * w2 vs c2 * w1` to avoid float math; we mirror that with i128.
     let mut best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         match best {
@@ -245,8 +648,8 @@ fn least_conn_pick(
             Some(b) => {
                 let pi = &peers[i];
                 let pb = &peers[b];
-                let ci = rt.peers[i].active as i128;
-                let cb = rt.peers[b].active as i128;
+                let ci = active(rt, up, i) as i128;
+                let cb = active(rt, up, b) as i128;
                 let wi = pi.weight.max(1) as i128;
                 let wb = pb.weight.max(1) as i128;
                 if ci * wb < cb * wi {
@@ -256,7 +659,7 @@ fn least_conn_pick(
         }
     }
     let candidate = best?;
-    let candidate_active = rt.peers[candidate].active;
+    let candidate_active = active(rt, up, candidate);
     let candidate_weight = peers[candidate].weight.max(1) as i128;
     // Tie-break: among peers tied with the candidate on `c/w`, run the
     // smoothed weighted RR pick to keep the distribution fair. This is
@@ -264,11 +667,11 @@ fn least_conn_pick(
     // `n == many` fallback (lc.c:171–219).
     let mut tie_count = 0;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         let pi = &peers[i];
-        let ci = rt.peers[i].active as i128;
+        let ci = active(rt, up, i) as i128;
         let wi = pi.weight.max(1) as i128;
         if ci * candidate_weight == candidate_active as i128 * wi {
             tie_count += 1;
@@ -282,11 +685,11 @@ fn least_conn_pick(
     let mut total: i64 = 0;
     let mut tie_best: Option<usize> = None;
     for i in 0..peers.len() {
-        if !peer_eligible(rt, peers, i, backup_tier, tried, now) {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         let pi = &peers[i];
-        let ci = rt.peers[i].active as i128;
+        let ci = active(rt, up, i) as i128;
         let wi = pi.weight.max(1) as i128;
         if ci * candidate_weight != candidate_active as i128 * wi {
             continue;
@@ -332,15 +735,30 @@ pub fn report_failure(upstream: &'static PreparedUpstream, peer_idx: usize) {
         };
         let s = &mut rt.peers[peer_idx];
         let now = Instant::now();
-        if let Some(opened) = s.fails_started {
-            if now.saturating_duration_since(opened) >= Duration::from_millis(peer.fail_timeout_ms)
+        let window = Duration::from_millis(peer.fail_timeout_ms);
+        if let Some(shared) = upstream.shared {
+            // Every worker counts into the same window.
+            let shared = &shared[peer_idx];
+            let started = shared.fails_started_ms.load(Ordering::Relaxed);
+            if started != 0
+                && ms_since_origin(now).saturating_sub(started) >= window.as_millis() as u64
             {
-                // Prior window elapsed — start a fresh failure window.
-                s.fails = 0;
+                shared.fails.store(0, Ordering::Relaxed);
             }
+            shared.fails.fetch_add(1, Ordering::Relaxed);
+            shared
+                .fails_started_ms
+                .store(ms_since_origin(now), Ordering::Relaxed);
+        } else {
+            if let Some(opened) = s.fails_started {
+                if now.saturating_duration_since(opened) >= window {
+                    // Prior window elapsed — start a fresh failure window.
+                    s.fails = 0;
+                }
+            }
+            s.fails = s.fails.saturating_add(1);
+            s.fails_started = Some(now);
         }
-        s.fails = s.fails.saturating_add(1);
-        s.fails_started = Some(now);
         // effective_weight penalty per nginx (rr.c:1051):
         //   weight - weight / max_fails  (i.e. lose 1/max_fails per fail).
         if peer.max_fails > 0 {
@@ -372,6 +790,20 @@ fn ensure_rt(upstream: &'static PreparedUpstream) -> UpstreamRt {
 /// failure is older than `fail_timeout`, so intermittent failures still
 /// accumulate and can trip `max_fails`.
 pub fn report_success(upstream: &'static PreparedUpstream, peer_idx: usize) {
+    if let Some(shared) = upstream.shared {
+        let (Some(shared), Some(peer)) = (shared.get(peer_idx), upstream.peers.get(peer_idx))
+        else {
+            return;
+        };
+        let started = shared.fails_started_ms.load(Ordering::Relaxed);
+        if started != 0
+            && ms_since_origin(Instant::now()).saturating_sub(started) >= peer.fail_timeout_ms
+        {
+            shared.fails.store(0, Ordering::Relaxed);
+            shared.fails_started_ms.store(0, Ordering::Relaxed);
+        }
+        return;
+    }
     LB_STATE.with(|state| {
         let mut map = state.borrow_mut();
         let key = upstream as *const PreparedUpstream;
@@ -412,6 +844,10 @@ impl LeasedPeer {
 
 impl Drop for LeasedPeer {
     fn drop(&mut self) {
+        if let Some(shared) = self.upstream.shared {
+            shared[self.peer_idx].conns.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
         LB_STATE.with(|state| {
             let mut map = state.borrow_mut();
             let key = self.upstream as *const PreparedUpstream;
@@ -518,16 +954,16 @@ mod tests {
     use std::net::SocketAddr;
 
     fn mk_upstream(specs: &[(u32, bool, bool)]) -> &'static PreparedUpstream {
-        mk_upstream_lb(specs, LbAlgorithm::RoundRobin)
+        mk_upstream_lb(specs, Lb::RoundRobin)
     }
 
-    fn mk_upstream_lb(specs: &[(u32, bool, bool)], lb: LbAlgorithm) -> &'static PreparedUpstream {
+    fn mk_upstream_lb(specs: &[(u32, bool, bool)], lb: Lb) -> &'static PreparedUpstream {
         mk_upstream_lb_with_timeout(specs, lb, 10_000)
     }
 
     fn mk_upstream_lb_with_timeout(
         specs: &[(u32, bool, bool)],
-        lb: LbAlgorithm,
+        lb: Lb,
         fail_timeout_ms: u64,
     ) -> &'static PreparedUpstream {
         let peers: Vec<PreparedPeer> = specs
@@ -538,6 +974,7 @@ mod tests {
                 weight: *w,
                 max_fails: 1,
                 fail_timeout_ms,
+                max_conns: 0,
                 down: *down,
                 backup: *backup,
             })
@@ -551,11 +988,12 @@ mod tests {
             keepalive_idle_timeout_ms: 60_000,
             keepalive_max_lifetime_ms: 3_600_000,
             lb,
+            shared: None,
         }))
     }
 
     fn pick_release(u: &'static PreparedUpstream) -> Option<usize> {
-        let leased = pick_peer(u, &Tried::default())?;
+        let leased = pick_peer(u, &Tried::default(), None)?;
         let i = leased.peer_idx;
         drop(leased);
         Some(i)
@@ -605,23 +1043,23 @@ mod tests {
     #[test]
     fn all_down_returns_none() {
         let u = mk_upstream(&[(1, true, false), (1, true, true)]);
-        assert!(pick_peer(u, &Tried::default()).is_none());
+        assert!(pick_peer(u, &Tried::default(), None).is_none());
     }
 
     #[test]
     fn tried_peers_are_excluded_within_attempt() {
         let u = mk_upstream(&[(1, false, false), (1, false, false), (1, false, false)]);
         let mut tried = Tried::default();
-        let l0 = pick_peer(u, &tried).unwrap();
+        let l0 = pick_peer(u, &tried, None).unwrap();
         tried.insert(l0.peer_idx);
-        let l1 = pick_peer(u, &tried).unwrap();
+        let l1 = pick_peer(u, &tried, None).unwrap();
         assert_ne!(l0.peer_idx, l1.peer_idx);
         tried.insert(l1.peer_idx);
-        let l2 = pick_peer(u, &tried).unwrap();
+        let l2 = pick_peer(u, &tried, None).unwrap();
         assert_ne!(l2.peer_idx, l0.peer_idx);
         assert_ne!(l2.peer_idx, l1.peer_idx);
         tried.insert(l2.peer_idx);
-        assert!(pick_peer(u, &tried).is_none());
+        assert!(pick_peer(u, &tried, None).is_none());
     }
 
     /// Peers past index 63 each have their own bit; they used to share
@@ -641,7 +1079,7 @@ mod tests {
         let u = mk_upstream(&[(1, false, false); 70]);
         let mut tried = Tried::default();
         let mut seen = std::collections::HashSet::new();
-        while let Some(leased) = pick_peer(u, &tried) {
+        while let Some(leased) = pick_peer(u, &tried, None) {
             assert!(
                 seen.insert(leased.peer_idx),
                 "{} picked twice",
@@ -656,7 +1094,7 @@ mod tests {
     fn max_fails_cools_down_then_recovers() {
         let u = mk_upstream_lb_with_timeout(
             &[(1, false, false), (1, false, false)],
-            LbAlgorithm::RoundRobin,
+            Lb::RoundRobin,
             20,
         );
         // Drive enough failures into peer 0 to trip its cooldown.
@@ -694,13 +1132,10 @@ mod tests {
 
     #[test]
     fn least_conn_picks_lowest_active() {
-        let u = mk_upstream_lb(
-            &[(1, false, false), (1, false, false)],
-            LbAlgorithm::LeastConn,
-        );
+        let u = mk_upstream_lb(&[(1, false, false), (1, false, false)], Lb::LeastConn);
         // Hold a lease on peer 0, force least_conn to pick peer 1.
-        let l0 = pick_peer(u, &Tried::default()).unwrap();
-        let next = pick_peer(u, &Tried::default()).unwrap();
+        let l0 = pick_peer(u, &Tried::default(), None).unwrap();
+        let next = pick_peer(u, &Tried::default(), None).unwrap();
         assert_ne!(next.peer_idx, l0.peer_idx);
         drop(next);
         drop(l0);
@@ -708,10 +1143,7 @@ mod tests {
 
     #[test]
     fn least_conn_falls_back_to_weighted_rr_on_ties() {
-        let u = mk_upstream_lb(
-            &[(3, false, false), (1, false, false)],
-            LbAlgorithm::LeastConn,
-        );
+        let u = mk_upstream_lb(&[(3, false, false), (1, false, false)], Lb::LeastConn);
         // No active connections held — both peers are tied at 0/w. The
         // weighted-RR fallback should distribute 3:1 over many picks.
         let mut hits = [0usize; 2];
@@ -719,5 +1151,200 @@ mod tests {
             hits[pick_release(u).unwrap()] += 1;
         }
         assert_eq!(hits, [30, 10]);
+    }
+
+    /// The upstreams of the nginx 1.24.0 comparison: four servers with
+    /// weights 1, 2, 3, 1, the second possibly `down`.
+    fn hashed(lb: LbAlgorithm, second_down: bool) -> &'static PreparedUpstream {
+        let servers: [(&'static [u8], u32); 4] = [
+            (b"127.0.0.1:18411", 1),
+            (b"127.0.0.1:18412", 2),
+            (b"127.0.0.1:18413", 3),
+            (b"localhost:18414", 1),
+        ];
+        let peers: Vec<PreparedPeer> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, (display, weight))| PreparedPeer {
+                addr: crate::worker::PeerAddr::Inet(
+                    format!("127.0.0.1:{}", 18411 + i).parse().unwrap(),
+                ),
+                display,
+                weight: *weight,
+                max_fails: 1,
+                fail_timeout_ms: 10_000,
+                max_conns: 0,
+                down: second_down && i == 1,
+                backup: false,
+            })
+            .collect();
+        let peers: &'static [PreparedPeer] = Box::leak(peers.into_boxed_slice());
+        Box::leak(Box::new(PreparedUpstream {
+            name: b"t",
+            peers,
+            keepalive_max_idle: None,
+            keepalive_requests: 1000,
+            keepalive_idle_timeout_ms: 60_000,
+            keepalive_max_lifetime_ms: 3_600_000,
+            lb: Lb::prepare(lb, peers),
+            shared: None,
+        }))
+    }
+
+    /// The port `key` (or the client `addr`) goes to on a first pick.
+    fn hashed_port(u: &'static PreparedUpstream, key: &str, addr: &str) -> u16 {
+        let mut state = HashPick::for_request(u, |_| key.as_bytes().to_vec(), addr.as_bytes());
+        let leased = pick_peer(u, &Tried::default(), state.as_deref_mut()).unwrap();
+        match leased.addr() {
+            crate::worker::PeerAddr::Inet(a) => a.port(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn hash_key(consistent: bool) -> LbAlgorithm {
+        LbAlgorithm::Hash {
+            key: vec![crate::config::ValuePart::Var(
+                crate::config::Variable::RequestUri,
+            )],
+            consistent,
+        }
+    }
+
+    #[test]
+    fn crc32_matches_zlib() {
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    // Golden assignments: what nginx 1.24.0 picked for these keys and
+    // client addresses on the same upstreams.
+    #[test]
+    fn hash_picks_as_nginx() {
+        let u = hashed(hash_key(false), false);
+        let got: Vec<u16> = ["1", "2", "3", "4", "5", "abc"]
+            .iter()
+            .map(|k| hashed_port(u, k, ""))
+            .collect();
+        assert_eq!(got, [18412, 18412, 18412, 18413, 18413, 18413]);
+        // Rehashed past the down server.
+        let u = hashed(hash_key(false), true);
+        assert_eq!(hashed_port(u, "1", ""), 18413);
+    }
+
+    #[test]
+    fn consistent_hash_picks_as_nginx() {
+        let u = hashed(hash_key(true), false);
+        let got: Vec<u16> = ["1", "2", "3", "4", "5", "abc"]
+            .iter()
+            .map(|k| hashed_port(u, k, ""))
+            .collect();
+        assert_eq!(got, [18412, 18411, 18413, 18413, 18413, 18413]);
+        // Only the down server's keys move.
+        let u = hashed(hash_key(true), true);
+        let got: Vec<u16> = ["1", "2", "3"]
+            .iter()
+            .map(|k| hashed_port(u, k, ""))
+            .collect();
+        assert_eq!(got, [18413, 18411, 18413]);
+    }
+
+    #[test]
+    fn ip_hash_picks_as_nginx() {
+        let u = hashed(LbAlgorithm::IpHash, false);
+        let got: Vec<u16> = [
+            "10.0.0.1",
+            "10.0.1.1",
+            "1.2.3.4",
+            "8.8.8.8",
+            "100.64.1.1",
+            "2001:db8::1",
+            "::1",
+        ]
+        .iter()
+        .map(|a| hashed_port(u, "", a))
+        .collect();
+        assert_eq!(got, [18413, 18413, 18412, 18414, 18414, 18413, 18412]);
+    }
+
+    #[test]
+    fn hash_retry_moves_on_and_empty_key_is_round_robin() {
+        let u = hashed(hash_key(false), false);
+        let mut state = HashPick::for_request(u, |_| b"1".to_vec(), b"");
+        let mut tried = Tried::default();
+        let first = pick_peer(u, &tried, state.as_deref_mut()).unwrap();
+        tried.insert(first.peer_idx);
+        let second = pick_peer(u, &tried, state.as_deref_mut()).unwrap();
+        assert_ne!(first.peer_idx, second.peer_idx);
+        // An empty key: round-robin by weight, 1 + 2 + 3 + 1.
+        let mut counts = [0; 4];
+        for _ in 0..7 {
+            let mut state = HashPick::for_request(u, |_| Vec::new(), b"");
+            counts[pick_peer(u, &Tried::default(), state.as_deref_mut())
+                .unwrap()
+                .peer_idx] += 1;
+        }
+        assert_eq!(counts, [1, 2, 3, 1]);
+    }
+
+    fn zoned(max_conns: u32, zone: bool) -> &'static PreparedUpstream {
+        let peers: Vec<PreparedPeer> = (0..2)
+            .map(|i| PreparedPeer {
+                addr: crate::worker::PeerAddr::Inet(
+                    format!("127.0.0.1:{}", 1 + i).parse().unwrap(),
+                ),
+                display: b"x",
+                weight: 1,
+                max_fails: 1,
+                fail_timeout_ms: 10_000,
+                max_conns,
+                down: false,
+                backup: false,
+            })
+            .collect();
+        let peers: &'static [PreparedPeer] = Box::leak(peers.into_boxed_slice());
+        Box::leak(Box::new(PreparedUpstream {
+            name: b"z",
+            peers,
+            keepalive_max_idle: None,
+            keepalive_requests: 1000,
+            keepalive_idle_timeout_ms: 60_000,
+            keepalive_max_lifetime_ms: 3_600_000,
+            lb: Lb::RoundRobin,
+            shared: zone.then(|| PeerShared::for_peers(peers.len())),
+        }))
+    }
+
+    #[test]
+    fn max_conns_caps_each_peer() {
+        // Without a zone the cap is per worker (thread), as nginx's per
+        // process.
+        let u = zoned(1, false);
+        let a = pick_peer(u, &Tried::default(), None).unwrap();
+        let b = pick_peer(u, &Tried::default(), None).unwrap();
+        assert_ne!(a.peer_idx, b.peer_idx);
+        assert!(pick_peer(u, &Tried::default(), None).is_none());
+        let other = std::thread::spawn(move || pick_peer(u, &Tried::default(), None).is_some());
+        assert!(other.join().unwrap());
+        drop(a);
+        assert!(pick_peer(u, &Tried::default(), None).is_some());
+    }
+
+    #[test]
+    fn a_zone_shares_counts_and_failures_across_workers() {
+        let u = zoned(1, true);
+        let a = pick_peer(u, &Tried::default(), None).unwrap();
+        let b = pick_peer(u, &Tried::default(), None).unwrap();
+        // Another worker sees both peers busy.
+        let other = std::thread::spawn(move || pick_peer(u, &Tried::default(), None).is_none());
+        assert!(other.join().unwrap());
+        drop((a, b));
+        // A failure seen by one worker keeps the peer out for all of them.
+        std::thread::spawn(move || report_failure(u, 0))
+            .join()
+            .unwrap();
+        for _ in 0..4 {
+            let l = pick_peer(u, &Tried::default(), None).unwrap();
+            assert_eq!(l.peer_idx, 1);
+        }
     }
 }
