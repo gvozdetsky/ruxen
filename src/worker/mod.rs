@@ -48,6 +48,7 @@ use crate::http::{self, Method, Parse, ParseState, READ_BUF};
 use crate::phase::{self, Response};
 use crate::{autoindex, file, fs_resolve, uri};
 
+mod client_watch;
 mod connection;
 pub(crate) mod gzip;
 mod h2;

@@ -79,6 +79,9 @@ pub struct ProxyConf {
     pub intercept_errors: Option<bool>,
     /// `proxy_force_ranges on|off` (#370); unset means off.
     pub force_ranges: Option<bool>,
+    /// `proxy_ignore_client_abort`: keep the upstream exchange when the
+    /// client goes away (#136).
+    pub ignore_client_abort: Option<bool>,
     /// `proxy_redirect`; unset means nginx's implicit `default`.
     pub redirect: Option<ProxyRedirect>,
     /// `proxy_hide_header` / `proxy_pass_header` names.
@@ -232,6 +235,7 @@ impl ProxyConf {
                 .or(parent.next_upstream_timeout_ms),
             intercept_errors: self.intercept_errors.or(parent.intercept_errors),
             force_ranges: self.force_ranges.or(parent.force_ranges),
+            ignore_client_abort: self.ignore_client_abort.or(parent.ignore_client_abort),
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),

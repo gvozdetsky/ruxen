@@ -1011,7 +1011,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_buffer_size",
     "proxy_busy_buffers_size",
     "proxy_request_buffering",
-    "proxy_ignore_client_abort",
     // Temp directories of modules ruxen doesn't have (`fastcgi_pass` and
     // friends stay unknown), so never used. Container images' default
     // configurations set all of them. Arguments are checked
