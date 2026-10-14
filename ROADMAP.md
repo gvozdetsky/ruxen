@@ -1,6 +1,6 @@
 # ruxen roadmap
 
-Where ruxen is going, and in what order. The work itself is tracked in GitHub issues and milestones; this file says why the milestones are what they are. Last revised 2026-10-06.
+Where ruxen is going, and in what order. The work itself is tracked in GitHub issues and milestones; this file says why the milestones are what they are. Last revised 2026-10-14 (0.1.3).
 
 ## Positioning
 
@@ -9,6 +9,12 @@ Where ruxen is going, and in what order. The work itself is tracked in GitHub is
 That is a narrower goal than "replace nginx". The mail proxy, the stream module, FastCGI and friends, and the long tail of third-party-module directives are out of scope for now. Unknown directives keep failing at startup rather than being ignored (see `DESIGN.md`). Widening toward full drop-in compatibility is a later decision, made on evidence such as the config corpus below rather than by default.
 
 Why this is worth doing: nginx serves a large share of the web and is written in C. Edge servers parse untrusted input all day, which is where memory-safety bugs matter most. Rust servers exist, but they ask you to rewrite your configuration (Caddy, Envoy) or are libraries for building your own proxy (Pingora). Taking the nginx configuration as it is removes the migration cost.
+
+## Where it stands
+
+As of 0.1.3 most of phase 1 is in: HTTP/2 for clients, reload without dropping connections, WebSocket tunnels, gzip, `allow` / `deny`, realip, `user`, the epoll fallback with a container image and a systemd unit, panics contained per connection, the corpus, fuzzing of the request, URI, upstream-response and config parsers (in CI on every pull request), and the passing nginx-tests in CI (v0.2.0); rate and connection limits, `stub_status`, `hash` / `ip_hash`, variables in `proxy_pass`, `unix:` upstreams and most of proxy caching (v0.3.0).
+
+Still open: for v0.2.0, the four small configuration blockers (#16, #17, #35, #38), the list of supported directives (#18), closing the fuzzing issue (#217), relaying the responses that are still buffered whole (#88), HTTP/2 to upstreams (#144) and a few bench scenarios below 95% (#177, #247, #249, #289); for v0.3.0, HTTPS upstreams (#116, #117), cookie rewriting (#40), variables in `root` / `alias` (#232), the rest of the cache (#233), nginx's error pages (#34) and the 304 scenarios (#129). The milestones in GitHub are the live list.
 
 ## Phase 1: in front of a real site
 
@@ -65,4 +71,4 @@ Each release reports these four numbers:
 
 ## Communication
 
-No broad announcement until phase 1's essentials are in: HTTP/2, reload, WebSocket and a container image. First impressions only happen once. Until then, short technical write-ups (for example, how a bisection on the quiet machine found 3% in connection timers) and the release notes.
+No broad announcement until phase 1's essentials are in: HTTP/2, reload, WebSocket and a container image. First impressions only happen once. All four are in since 0.1.3; until the announcement, short technical write-ups (for example, how a bisection on the quiet machine found 3% in connection timers) and the release notes.
