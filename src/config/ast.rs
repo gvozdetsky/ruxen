@@ -988,14 +988,34 @@ pub struct Location {
     /// No `root` / `alias` here or in an enclosing location: the server's
     /// (or http's) root applies, once the whole `http {}` block is read.
     pub inherits_root: bool,
+    /// The handler is the location's own `return` (not the 404 of a
+    /// location with rewrite directives and nothing to serve): it runs
+    /// after the `if` blocks, so it answers even when one of them holds
+    /// and has a `proxy_pass` of its own (#137).
+    pub explicit_return: bool,
 }
 
 impl Location {
-    /// Point a location that `inherits_root` at the root it inherits.
+    /// Point a location that `inherits_root` at the root it inherits, and
+    /// its `if` blocks' anonymous locations that inherit it too (#137).
     pub(crate) fn inherit_root(&mut self, root: &std::path::Path) {
         self.document_root.0 = root.to_path_buf();
         if let Handler::Root { path, .. } = &mut self.handler {
             *path = root.to_path_buf();
+        }
+        inherit_root_in_ifs(&mut self.rewrite_ops, root);
+    }
+}
+
+fn inherit_root_in_ifs(ops: &mut [RewriteOp], root: &std::path::Path) {
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            if let Some(IfLocation::Parsed { location, .. }) = location
+                && location.inherits_root
+            {
+                location.inherit_root(root);
+            }
+            inherit_root_in_ifs(body, root);
         }
     }
 }
@@ -1573,6 +1593,12 @@ pub enum RewriteOp {
     If {
         guard: IfGuard,
         body: Vec<RewriteOp>,
+        /// A location-level `if` whose block sets more than rewrite
+        /// directives (`proxy_pass`, `add_header`, …): nginx's anonymous
+        /// location (`ngx_http_rewrite_if`, `noname`), which the request
+        /// switches to when the condition holds (#137). `None` for a block
+        /// of rewrite directives only, and in server context.
+        location: Option<IfLocation>,
     },
     Rewrite(RewriteRule),
     Return {
@@ -1581,6 +1607,39 @@ pub enum RewriteOp {
     },
     Break,
 }
+
+/// The anonymous location of an `if` block (#137): parsed, then, once
+/// `worker::prepare` moved it into the server's list of them, its index
+/// there.
+#[derive(Debug, Clone)]
+pub enum IfLocation {
+    Parsed {
+        location: Box<Location>,
+        /// `proxy_pass` in the block: it doesn't take the enclosing
+        /// location's content handler (unless that is a `return`).
+        own_handler: bool,
+        /// `root` in the block: it doesn't take the enclosing location's
+        /// root; a static handler serves from it.
+        own_root: bool,
+    },
+    Slot(usize),
+}
+
+impl PartialEq for IfLocation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (IfLocation::Slot(a), IfLocation::Slot(b)) => a == b,
+            // `Location` has no equality of its own: compared as printed,
+            // which is enough for the parser's tests.
+            (IfLocation::Parsed { location: a, .. }, IfLocation::Parsed { location: b, .. }) => {
+                format!("{a:?}") == format!("{b:?}")
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for IfLocation {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteRule {

@@ -92,6 +92,14 @@ pub(crate) async fn write_access_logs(
             .map(|i| &request_uri[..i])
             .unwrap_or(request_uri)
     });
+    // `$document_root` / `$request_filename` without a kept rewrite state:
+    // the location's root alone, only when a log reads them (#363).
+    let root_only = match meta {
+        Some(m) if m.rewrite_state.is_none() && logs.iter().any(|l| l.reads_doc_root) => {
+            super::response::root_only_state(m)
+        }
+        _ => None,
+    };
     let ctx = RenderCtx {
         uri,
         request_uri,
@@ -130,7 +138,9 @@ pub(crate) async fn write_access_logs(
         // empty here, which mirrors nginx (where regex captures are
         // discarded after request termination).
         server_name_captures: &[],
-        rewrite_state: meta.and_then(|m| m.rewrite_state.as_deref()),
+        rewrite_state: meta
+            .and_then(|m| m.rewrite_state.as_deref())
+            .or(root_only.as_ref()),
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.map_or(&[][..], |m| m.proxy_host),
@@ -476,6 +486,8 @@ async fn settle_proxy_response(
     let Response::Proxy(plan) = response else {
         return (response, process_meta);
     };
+    // `$uri` for the response's add_header / proxy_redirect / error page.
+    let uri = final_uri(&process_meta, url_scratch);
 
     // The first pass is inline (an `async fn` layer here costs on the
     // proxy hot path); later passes, after an internal redirect, are in
@@ -509,6 +521,7 @@ async fn settle_proxy_response(
             ctx,
             &process_meta,
             server_bytes,
+            uri,
         )
     };
     let mut carried = Vec::new();
@@ -531,6 +544,7 @@ async fn settle_proxy_response(
                     ctx,
                     &process_meta,
                     server_bytes,
+                    uri,
                 ) {
                     Response::Reroute(reroute) => (reroute, false),
                     response => {
@@ -551,6 +565,7 @@ async fn settle_proxy_response(
                 http,
                 ctx,
                 process_meta,
+                uri,
             );
         }
     };
@@ -592,6 +607,7 @@ fn intercept_with_report(
     ctx: &phase::RequestCtx<'_>,
     process_meta: &phase::ProcessMeta,
     server_bytes: &'static [u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let trail = crate::proxy::UpstreamTrail {
         states: std::mem::take(&mut report.states),
@@ -610,6 +626,7 @@ fn intercept_with_report(
         &pass_ctx,
         process_meta,
         server_bytes,
+        uri,
     );
     report.states = trail.states;
     report.upstream_headers = trail.headers;
@@ -626,6 +643,8 @@ fn finish_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     mut process_meta: phase::ProcessMeta,
+    // `$uri`: the current URI (`final_uri`).
+    uri: Option<&[u8]>,
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
     process_meta.upstream_cache_status = report.cache_status;
@@ -652,6 +671,7 @@ fn finish_proxy_response(
             ctx,
             &process_meta,
             &report.upstream_headers,
+            uri,
         )
     } else {
         upstream_resp
@@ -662,6 +682,7 @@ fn finish_proxy_response(
         ctx,
         &process_meta,
         &report.upstream_headers,
+        uri,
     );
     let response = match (response, relayed) {
         (Response::Owned(head), Some(mut body)) => {
@@ -708,6 +729,7 @@ async fn run_proxy_pass(
     mut plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
+    uri: Option<&[u8]>,
 ) -> PassOutcome {
     // After an internal redirect the answer's head is rewritten further
     // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
@@ -742,6 +764,7 @@ async fn run_proxy_pass(
             &pass_request(ctx, as_get),
             &process_meta,
             server_bytes,
+            uri,
         )
     };
     let limit_rate = report.accel.as_ref().and_then(|a| a.limit_rate);
@@ -775,6 +798,7 @@ async fn run_proxy_pass(
                     &pass_request(ctx, as_get),
                     &process_meta,
                     server_bytes,
+                    uri,
                 ) {
                     Response::Reroute(reroute) => (reroute, as_get),
                     response => {
@@ -800,8 +824,15 @@ async fn run_proxy_pass(
             }
         }
         upstream_resp => {
-            let (response, process_meta) =
-                finish_proxy_response(upstream_resp, report, redirects, http, ctx, process_meta);
+            let (response, process_meta) = finish_proxy_response(
+                upstream_resp,
+                report,
+                redirects,
+                http,
+                ctx,
+                process_meta,
+                uri,
+            );
             PassOutcome::Done(response, process_meta)
         }
     }
@@ -841,7 +872,8 @@ async fn settle_redirected(
             process_meta.upstream_cache_status = trail.cache_status;
             return (carry_accel_headers(response, &carried, false), process_meta);
         };
-        match run_proxy_pass(http, ctx, plan, process_meta, as_get).await {
+        let uri = final_uri(&process_meta, url_scratch);
+        match run_proxy_pass(http, ctx, plan, process_meta, as_get, uri).await {
             PassOutcome::Done(response, mut meta) => {
                 trail.states.append(&mut meta.upstream_states);
                 meta.upstream_states = trail.states;
@@ -927,6 +959,7 @@ fn refuse_unsafe_accel(
     ctx: &phase::RequestCtx<'_>,
     process_meta: &phase::ProcessMeta,
     server_bytes: &'static [u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let mut message = b"unsafe URI \"".to_vec();
     message.extend_from_slice(target);
@@ -947,6 +980,7 @@ fn refuse_unsafe_accel(
         ctx,
         process_meta,
         server_bytes,
+        uri,
     )
 }
 

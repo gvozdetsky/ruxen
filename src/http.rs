@@ -1422,22 +1422,34 @@ pub fn write_response_bytes(out: &mut Vec<u8>, status: u16, body: &[u8], server:
     }
 }
 
-/// Build a redirect response. Status is usually 301; body is a tiny HTML
-/// stub so clients that don't follow redirects still see something. HEAD
-/// responses omit the body per RFC 9110 §9.3.2 but keep the `Location`
-/// header and the would-be `Content-Length`.
+/// Build a redirect response. Status is usually 301; the body is nginx's
+/// page for the status (#368). HEAD responses omit the body per RFC 9110
+/// §9.3.2 but keep the `Location` header and the would-be
+/// `Content-Length`.
 pub fn build_redirect_response(
     status: u16,
     location: &[u8],
     method: Method,
     server: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + location.len() + REDIRECT_BODY.len());
+    let mut out = Vec::with_capacity(320 + location.len() + server.len());
     write_redirect_response(&mut out, status, location, method, server);
     out
 }
 
-const REDIRECT_BODY: &[u8] = b"<html><body>Moved</body></html>\n";
+/// The title of nginx's page for a redirect status (`ngx_http_error_301_page`
+/// and the others in `ngx_http_special_response.c`); none for 300 and
+/// 304–306.
+fn redirect_page_title(status: u16) -> Option<&'static [u8]> {
+    Some(match status {
+        301 => b"301 Moved Permanently",
+        302 => b"302 Found",
+        303 => b"303 See Other",
+        307 => b"307 Temporary Redirect",
+        308 => b"308 Permanent Redirect",
+        _ => return None,
+    })
+}
 
 /// Hot-path variant of `build_redirect_response`.
 pub fn write_redirect_response(
@@ -1447,7 +1459,16 @@ pub fn write_redirect_response(
     method: Method,
     server: &[u8],
 ) {
-    let body_len = REDIRECT_BODY.len();
+    const PARTS: [&[u8]; 4] = [
+        b"<html>\r\n<head><title>",
+        b"</title></head>\r\n<body>\r\n<center><h1>",
+        b"</h1></center>\r\n<hr><center>",
+        b"</center>\r\n</body>\r\n</html>\r\n",
+    ];
+    let title = redirect_page_title(status);
+    let body_len = title.map_or(0, |t| {
+        PARTS.iter().map(|p| p.len()).sum::<usize>() + 2 * t.len() + server.len()
+    });
     out.extend_from_slice(b"HTTP/1.1 ");
     write_u16(out, status);
     out.push(b' ');
@@ -1458,8 +1479,15 @@ pub fn write_redirect_response(
     out.extend_from_slice(b"\r\nContent-Type: text/html\r\nContent-Length: ");
     write_usize(out, body_len);
     out.extend_from_slice(b"\r\n\r\n");
-    if !matches!(method, Method::Head) {
-        out.extend_from_slice(REDIRECT_BODY);
+    if let Some(title) = title
+        && !matches!(method, Method::Head)
+    {
+        // The tail names the server as its `Server` header does
+        // (`server_tokens`, the identity).
+        for (part, value) in PARTS.iter().zip([title, title, server, b""]) {
+            out.extend_from_slice(part);
+            out.extend_from_slice(value);
+        }
     }
 }
 
@@ -2184,6 +2212,31 @@ mod tests {
         // Must match the `nginx version:` line of `-V`.
         assert_eq!(NGINX_IDENTITY.versioned, b"nginx/1.29.2");
         assert_eq!(NGINX_IDENTITY.plain, b"nginx");
+    }
+
+    #[test]
+    fn redirects_carry_nginxs_page() {
+        // #368: `ngx_http_error_302_page` and the tail naming the server.
+        let get =
+            String::from_utf8(build_redirect_response(302, b"/x", Method::Get, b"ruxen")).unwrap();
+        let (head, body) = get.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            body,
+            "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n\
+             <center><h1>302 Found</h1></center>\r\n<hr><center>ruxen</center>\r\n\
+             </body>\r\n</html>\r\n"
+        );
+        assert!(
+            head.contains(&format!("\r\nContent-Length: {}", body.len())),
+            "{head}"
+        );
+        let head_only =
+            String::from_utf8(build_redirect_response(302, b"/x", Method::Head, b"ruxen")).unwrap();
+        assert_eq!(head_only, format!("{head}\r\n\r\n"));
+        // No page for a 3xx nginx has none for.
+        let other =
+            String::from_utf8(build_redirect_response(300, b"/x", Method::Get, b"ruxen")).unwrap();
+        assert!(other.ends_with("\r\nContent-Length: 0\r\n\r\n"), "{other}");
     }
 
     #[test]

@@ -321,3 +321,36 @@ http {
     let log = std::fs::read_to_string(dir.join("t.log")).unwrap();
     assert_eq!(log, "/%61bc /abc\n/a/../b//c /b/c\n/rw?q=1 /target\n");
 }
+
+/// `$document_root` / `$request_filename` in a log line come from the
+/// final location's root, whether or not the request kept rewrite state
+/// (#363).
+#[test]
+fn logged_document_root_is_the_locations() {
+    let conf = r#"
+events {}
+http {
+  log_format t "$document_root $request_filename";
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    access_log %%DIR%%/t.log t;
+    location /a { root /srv/a; return 200 "a"; }
+    location /b { root /srv/b; set $x 1; return 200 "b"; }
+  }
+}
+"#;
+    let (_guard, port, dir) = spawn_server(conf);
+    for path in ["/a/%61", "/b/x"] {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let _ = read_one_response(&mut s);
+    }
+    sleep(Duration::from_millis(50));
+    let log = std::fs::read_to_string(dir.join("t.log")).unwrap();
+    assert_eq!(log, "/srv/a /srv/a/a/a\n/srv/b /srv/b/b/x\n");
+}
