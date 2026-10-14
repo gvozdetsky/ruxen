@@ -131,7 +131,10 @@ pub enum PreparedRewriteOp {
         flag: PreparedRewriteFlag,
         drop_args: bool,
     },
-    Return(PreparedReturn),
+    /// The `return`, and whether `error_page` can take its response:
+    /// not for one with text (other than a redirect URL), which nginx's
+    /// `ngx_http_script_return_code` sends as it is (#362).
+    Return(PreparedReturn, bool),
     Break,
 }
 

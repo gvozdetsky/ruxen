@@ -2027,7 +2027,8 @@ pub(crate) fn prepare_rewrite_ops(
                 }
             }
             RewriteOp::Return { status, body } => {
-                PreparedRewriteOp::Return(prepare_return(status, body, tokens))
+                let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
+                PreparedRewriteOp::Return(prepare_return(status, body, tokens), finalized)
             }
             RewriteOp::Break => PreparedRewriteOp::Break,
         };
