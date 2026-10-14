@@ -40,7 +40,7 @@ The v0.1 scope is deliberately limited:
 - a proxy cache (`proxy_cache`)
 - no HTTP/2 yet
 
-The upstream `nginx-tests` suite is used as a compatibility test. **63 of the 105 test files that ruxen currently opts into pass end-to-end** (v0.1.1).
+The upstream `nginx-tests` suite is used as a compatibility test. **106 of the 159 test files that ruxen currently opts into pass end-to-end** (v0.1.3).
 
 See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, and [`ROADMAP.md`](ROADMAP.md) for where ruxen is going: first a memory-safe edge server (TLS termination, reverse proxy, static files) that takes your nginx configuration.
 
@@ -156,7 +156,7 @@ ruxen --compat -c /etc/nginx/nginx.conf
 ```
 
 ```text
-ruxen 0.1.2: checking /etc/nginx/nginx.conf
+ruxen 0.1.3: checking /etc/nginx/nginx.conf
 /etc/nginx/nginx.conf:33: unsupported: ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3 — TLSv1, TLSv1.1 rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old names with a warning)
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
 /etc/nginx/nginx.conf:27: differs: default_type application/octet-stream — files of unknown types get ruxen's built-in default (#38)
@@ -405,7 +405,7 @@ The following are intentionally outside the current v0.1 scope:
 
 - HTTP/2
 - nginx's module ecosystem
-- the proxy cache's manager and loader (`min_free`, eviction in the background), and a file per `Vary` variant
+- a proxy cache file per `Vary` variant (another variant replaces the stored one)
 - TLS to upstream servers (`proxy_ssl_*`)
 - OCSP stapling
 - client certificate authentication
@@ -414,7 +414,7 @@ The following are intentionally outside the current v0.1 scope:
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
 
-Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
 Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
 

@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-13 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-14 against `nginx-tests` 0b70854 (2026-09-30).
 
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 100
+- **Passing in ruxen:** 106
 - **Intentionally skipped (`-V` banner excludes the module):** 346
-- **Failing — work in progress:** 59
+- **Failing — work in progress:** 53
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (100)
+## Passing in ruxen (106)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -60,6 +60,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `merge_slashes.t`
 - `not_modified.t`
 - `not_modified_finalize.t`
+- `not_modified_proxy.t`
 - `post_action.t`
 - `proxy_available.t`
 - `proxy_bind.t`
@@ -80,6 +81,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_intercept_errors.t`
 - `proxy_limit_rate.t`
 - `proxy_max_temp_file_size.t`
+- `proxy_merge_headers.t`
 - `proxy_next_upstream.t`
 - `proxy_noclose.t`
 - `proxy_non_idempotent.t`
@@ -89,6 +91,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_unix.t`
 - `proxy_upstream_cookie.t`
 - `proxy_variables.t`
+- `proxy_websocket.t`
 - `proxy_xar.t`
 - `range_if_range.t`
 - `realip_hostname.t`
@@ -102,9 +105,12 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `ssl_certificate_chain.t`
 - `ssl_certificates.t`
 - `ssl_curve.t`
+- `ssl_proxy_protocol.t`
+- `ssl_proxy_upgrade.t`
 - `ssl_session_reuse.t`
 - `ssl_sni.t`
 - `ssl_sni_sessions.t`
+- `stub_status.t`
 - `syslog.t`
 - `trailers.t`
 - `upstream.t`
@@ -118,31 +124,29 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (59)
+## Failing — actively being worked on (53)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
 - `access_log.t` — 2/21
 - `http_absolute_redirect.t` — 16/25
-- `http_disable_symlinks.t` — 4/30
+- `http_disable_symlinks.t` — 1/30
 - `http_resolver.t` — 25/40
 - `http_resolver_aaaa.t` — 49/74
 - `http_resolver_cleanup.t` — 0/3
 - `http_resolver_cname.t` — 3/13
 - `http_resolver_ipv4.t` — 3/5
 - `limit_conn.t` — 1/10
-- `not_modified_proxy.t` — 4/14
 - `proxy.t` — 1/30
 - `proxy_cache.t` — 0/0
 - `proxy_cache_convert_head.t` — 2/10
 - `proxy_cache_max_range_offset.t` — 0/0
 - `proxy_cache_range.t` — 6/9
-- `proxy_cache_vary.t` — 28/54
+- `proxy_cache_vary.t` — 0/0
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 0/0
 - `proxy_force_ranges.t` — 7/9
 - `proxy_if.t` — 15/17
-- `proxy_merge_headers.t` — 2/13
 - `proxy_method.t` — 3/6
 - `proxy_next_upstream_tries.t` — 1/10
 - `proxy_protocol.t` — 24/26
@@ -160,7 +164,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_ssl_keepalive.t` — 3/5
 - `proxy_ssl_verify.t` — 6/8
 - `proxy_ssl_verify_ip.t` — 8/10
-- `proxy_websocket.t` — 24/28
 - `range_clearing.t` — 3/5
 - `realip.t` — 0/0
 - `ssl.t` — 3/23
@@ -170,15 +173,12 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_crl.t` — 5/7
 - `ssl_ocsp.t` — 0/0
 - `ssl_password_file.t` — 3/5
-- `ssl_proxy_protocol.t` — 2/20
-- `ssl_proxy_upgrade.t` — 28/32
 - `ssl_reject_handshake.t` — 7/9
 - `ssl_session_ticket_key.t` — 2/4
 - `ssl_sni_reneg.t` — 8/10
 - `ssl_stapling.t` — 10/12
 - `ssl_verify_client.t` — 14/16
 - `ssl_verify_depth.t` — 9/11
-- `stub_status.t` — 2/36
 - `upstream_max_conns.t` — 16/18
 - `upstream_zone_ssl.t` — 9/11
 
