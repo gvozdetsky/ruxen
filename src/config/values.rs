@@ -226,7 +226,7 @@ pub(crate) fn reset_variable_registry() {
 /// (`(?<x>…)`, `(?P<x>…)`, `(?'x'…)`).
 pub(crate) fn note_defined_variables(args: &[String]) {
     let target = match args.first().map(String::as_str) {
-        Some("set") => args.get(1),
+        Some("set" | "auth_request_set") => args.get(1),
         Some("map" | "split_clients") => args.get(2),
         _ => None,
     };

@@ -1564,6 +1564,151 @@ async fn unix_accept_or_tick(
 /// handler, the upstream and `$request_time` come after the delay.
 #[cold]
 #[inline(never)]
+/// `auth_request` (#358): run the subrequests the request needs, then
+/// process it again with their outcomes (`phase::resume_auth_request`), as
+/// nginx re-enters its access phase. Processing starts over each time, so
+/// a location reached after an internal redirect may need another one;
+/// the outcomes so far go along, by URI. The first pass's limit_conn
+/// counts stay with the request.
+async fn auth_subrequest(
+    http: &'static PreparedHttp,
+    ctx: &mut phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    first: phase::ProcessMeta,
+    request_start: Instant,
+) -> (Response, phase::ProcessMeta) {
+    let held = first.limit_conn_held.clone();
+    let mut meta = first;
+    let mut outcomes: Vec<(&'static [u8], phase::AuthResume)> = Vec::new();
+    // More subrequests than this means a loop of redirects.
+    for _ in 0..8 {
+        let Some(pending) = meta.auth_request.take() else {
+            break;
+        };
+        let outcome = run_auth_subrequest(http, ctx, url_scratch, &pending, request_start).await;
+        outcomes.push((pending.uri, outcome));
+        phase::resume_auth_request(outcomes.clone());
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        let (response, next) = phase::process_with_meta(http, ctx, url_scratch);
+        phase::resume_auth_request(Vec::new());
+        meta = next;
+        if meta.limit_conn_held.is_none() {
+            meta.limit_conn_held = held.clone();
+        }
+        if meta.auth_request.is_none() {
+            return (response, meta);
+        }
+    }
+    meta.auth_request = None;
+    (
+        Response::Prebuilt(http.internal_error.pick(ctx.method)),
+        meta,
+    )
+}
+
+/// One `auth_request` subrequest: a GET to its URI with the request's
+/// headers and no body, through the internal-redirect path (so `internal`
+/// locations answer). Its body isn't wanted (`header_only`); its status,
+/// `WWW-Authenticate` and `auth_request_set` values are.
+async fn run_auth_subrequest(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    pending: &phase::AuthPending,
+    request_start: Instant,
+) -> phase::AuthResume {
+    // `$request_uri` stays the request's, as for an nginx subrequest; the
+    // auth URI is where it is routed, with its own arguments only.
+    let sub_ctx = phase::RequestCtx {
+        method: Method::Get,
+        method_bytes: b"GET",
+        body: &phase::NO_BODY,
+        body_len: 0,
+        body_file: None,
+        refuse: None,
+        upstream: None,
+        ..*ctx
+    };
+    let (response, sub_meta) =
+        phase::process_with_meta_from_reroute(http, &sub_ctx, url_scratch, {
+            let (path, args) = match pending.uri.iter().position(|&b| b == b'?') {
+                Some(q) => (&pending.uri[..q], pending.uri[q + 1..].to_vec()),
+                None => (pending.uri, Vec::new()),
+            };
+            phase::Reroute {
+                target: phase::RerouteTarget::Uri(path.to_vec()),
+                args: Some(args),
+                error_page_status: None,
+                enters_error_page: false,
+                preserved_location: None,
+                preserved_www_authenticate: Vec::new(),
+            }
+        });
+    // `auth_request_set` reads the upstream's header (`$upstream_http_*`):
+    // keep it, whatever the subrequest's location reads itself.
+    let response = match response {
+        Response::Proxy(mut plan) => {
+            plan.keep_upstream_headers = true;
+            Response::Proxy(plan)
+        }
+        other => other,
+    };
+    let (response, sub_meta) =
+        settle_proxy_response(http, &sub_ctx, url_scratch, response, sub_meta).await;
+    let head: &[u8] = match &response {
+        Response::Prebuilt(b) => b,
+        Response::Owned(b) => b,
+        Response::File { headers, .. } => headers,
+        Response::ProxyStream(stream) => &stream.head,
+        _ => &[],
+    };
+    let head = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(head, |end| &head[..end + 4]);
+    let status = super::response_status(head);
+    // nginx takes the subrequest's own `WWW-Authenticate`, else its
+    // upstream's.
+    let mut www_authenticate = super::response_header_values_all(head, b"www-authenticate");
+    if www_authenticate.is_empty() && !sub_meta.upstream_headers.is_empty() {
+        www_authenticate =
+            super::response_header_values_all(&sub_meta.upstream_headers, b"www-authenticate");
+    }
+    let trail = crate::proxy::UpstreamTrail {
+        states: sub_meta.upstream_states.clone(),
+        headers: sub_meta.upstream_headers.clone(),
+        cache_status: None,
+    };
+    let render_req = phase::RequestCtx {
+        upstream: Some(&trail),
+        request_time_us: request_start.elapsed().as_micros() as u64,
+        ..sub_ctx
+    };
+    let vars = pending
+        .sets
+        .iter()
+        .map(|(name, parts)| {
+            let value = super::render_in_subrequest(
+                http,
+                &render_req,
+                sub_meta.server_name,
+                sub_meta.server_port,
+                status,
+                head,
+                parts,
+            );
+            (*name, value)
+        })
+        .collect();
+    phase::AuthResume {
+        status,
+        www_authenticate,
+        vars,
+        limit_req_status: pending.limit_req_status,
+        limit_conn_status: pending.limit_conn_status,
+    }
+}
+
 async fn limit_req_delayed(
     http: &'static PreparedHttp,
     ctx: &mut phase::RequestCtx<'_>,
@@ -3474,6 +3619,19 @@ pub(crate) async fn handle<S: ConnIo>(
                                 &mut ctx,
                                 &mut *url_scratch,
                                 process_meta.limit_req_delay_ms,
+                                request_start,
+                            ))
+                            .await;
+                        }
+
+                        // auth_request's subrequest (#358): the request is
+                        // processed again with its outcome.
+                        if process_meta.auth_request.is_some() {
+                            (response, process_meta) = Box::pin(auth_subrequest(
+                                http,
+                                &mut ctx,
+                                &mut *url_scratch,
+                                process_meta,
                                 request_start,
                             ))
                             .await;

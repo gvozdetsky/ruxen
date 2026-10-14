@@ -92,6 +92,43 @@ impl ConnInfo {
     };
 }
 
+/// An `auth_request` subrequest to run before the request goes on (#358).
+#[derive(Debug, Clone)]
+pub struct AuthPending {
+    pub uri: &'static [u8],
+    pub sets: &'static [(&'static [u8], &'static [crate::worker::PreparedValuePart])],
+    /// What limit_req and limit_conn noted on this pass: the pass after
+    /// the subrequest doesn't count the request again.
+    pub limit_req_status: u8,
+    pub limit_conn_status: u8,
+}
+
+/// A subrequest's outcome, for the passes that follow it.
+#[derive(Debug, Default, Clone)]
+pub struct AuthResume {
+    pub status: u16,
+    pub www_authenticate: Vec<Vec<u8>>,
+    /// `auth_request_set` values, rendered in the subrequest's context.
+    pub vars: Vec<(&'static [u8], Vec<u8>)>,
+    pub limit_req_status: u8,
+    pub limit_conn_status: u8,
+}
+
+thread_local! {
+    /// The outcomes so far, by auth_request URI: processing starts over
+    /// after each subrequest, and a location after an internal redirect
+    /// may need another one (`auth_request_set.t`, "set on second auth").
+    static AUTH_RESUME: std::cell::RefCell<Vec<(&'static [u8], AuthResume)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The worker hands the next `process` call the subrequests' outcomes,
+/// and takes them back after (an empty list), so no other request sees
+/// them.
+pub(crate) fn resume_auth_request(resume: Vec<(&'static [u8], AuthResume)>) {
+    AUTH_RESUME.with(|r| *r.borrow_mut() = resume);
+}
+
 /// The body of a request that has none.
 pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
 
@@ -253,6 +290,9 @@ pub struct ProcessMeta {
     /// The counts `limit_conn` took for this request, given back when the
     /// last copy of the meta goes, after the response is written (#95).
     pub limit_conn_held: Option<std::rc::Rc<crate::worker::limit_conn::Held>>,
+    /// `auth_request` needs its subrequest (#358): the worker runs it and
+    /// processes the request again with the result (`AuthResume`).
+    pub auth_request: Option<Box<AuthPending>>,
     /// The location's root, which an access_log path with variables
     /// checks before it writes (#303).
     pub doc_root: Option<&'static crate::worker::DocRoot>,
@@ -343,6 +383,7 @@ impl Default for ProcessMeta {
             access_logs: &[],
             limit_req_delay_ms: 0,
             limit_conn_held: None,
+            auth_request: None,
             doc_root: None,
             timeouts: None,
             remote_user: None,
@@ -840,15 +881,21 @@ fn process_with_meta_inner(
                         meta.access_logs = server.access_logs;
                         meta.post_action = server.post_action;
                         meta.remote_user = None;
+                        let auth_resume = take_auth_resume(&server.access, &mut rewrite_state);
                         match run_access_control(
                             http,
                             req,
                             &server.access,
                             server.server_header,
                             &meta,
+                            auth_resume.as_ref(),
                         ) {
                             AccessControl::Allow { remote_user } => {
                                 meta.remote_user = remote_user;
+                            }
+                            AccessControl::Subrequest => {
+                                meta.auth_request = auth_pending(&server.access, &rewrite_state);
+                                return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
                             }
                             AccessControl::Deny { response, delay_ms } => {
                                 // The server's error_page applies.
@@ -955,6 +1002,19 @@ fn process_with_meta_inner(
         // The access phase doesn't run for it: it is finished like a
         // denial, with the location's filters.
         let mut denied = rewrite_response;
+        // After an auth_request subrequest (#358): its outcome, and what
+        // the first pass noted, so limit_req and limit_conn don't count
+        // the request again.
+        let auth_resume = take_auth_resume(loc.access, &mut rewrite_state);
+        // `auth_request_set $args …`: the variable's setter replaces the
+        // request's arguments (auth_request_set.t, "variable with
+        // set_handler").
+        if let Some(args) = auth_resume
+            .as_ref()
+            .and_then(|r| r.vars.iter().find(|(name, _)| *name == b"args"))
+        {
+            current_args = Some(args.1.clone());
+        }
         // The limit_req module's pre-access handler (#94), once per
         // request (nginx's `r->main->limit_req_status`); not again on the
         // way to an error page.
@@ -1010,13 +1070,26 @@ fn process_with_meta_inner(
             denied = rejected;
         }
         if !answered_in_rewrite_phase && denied.is_none() {
-            match run_access_control(http, req, loc.access, loc.server_header, &meta) {
+            match run_access_control(
+                http,
+                req,
+                loc.access,
+                loc.server_header,
+                &meta,
+                auth_resume.as_ref(),
+            ) {
                 AccessControl::Allow { remote_user } => {
                     meta.remote_user = remote_user;
                 }
                 AccessControl::Deny { response, delay_ms } => {
                     meta.response_delay_ms = delay_ms;
                     denied = Some(response);
+                }
+                AccessControl::Subrequest => {
+                    // The worker runs the subrequest, then processes the
+                    // request again (`resume_auth_request`).
+                    meta.auth_request = auth_pending(loc.access, &rewrite_state);
+                    return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
                 }
             }
         }
@@ -1365,11 +1438,14 @@ enum AccessControl {
         response: Response,
         delay_ms: u64,
     },
+    /// `auth_request` needs its subrequest first (#358).
+    Subrequest,
 }
 
-/// The access phase: `allow` / `deny`, then auth_basic, combined as
-/// `satisfy` says (`ngx_http_core_access_phase`). The common case, no
-/// checks at all, stays inline.
+/// The access phase: `allow` / `deny`, then auth_basic, then
+/// auth_request, combined as `satisfy` says (`ngx_http_core_access_phase`).
+/// The common case, no checks at all, stays inline. `auth`: the
+/// subrequest's outcome, on the pass after it.
 #[inline]
 fn run_access_control(
     http: &PreparedHttp,
@@ -1377,13 +1453,53 @@ fn run_access_control(
     access: &PreparedAccess,
     server_header: &'static [u8],
     meta: &ProcessMeta,
+    auth: Option<&AuthResume>,
 ) -> AccessControl {
-    if access.rules.is_empty() && matches!(access.auth_basic, PreparedAuthBasic::Off) {
+    if access.rules.is_empty()
+        && matches!(access.auth_basic, PreparedAuthBasic::Off)
+        && access.auth_request.is_none()
+    {
         return AccessControl::Allow { remote_user: None };
     }
-    check_access(http, req, access, server_header, meta)
+    check_access(http, req, access, server_header, meta, auth)
 }
 
+/// The pass after an `auth_request` subrequest: its outcome, with its
+/// variables set and the first pass's limit_req / limit_conn statuses
+/// restored. `None` on any other pass, or where auth_request is off.
+#[inline]
+fn take_auth_resume(access: &PreparedAccess, state: &mut RewriteState) -> Option<AuthResume> {
+    if access.auth_request.is_none() {
+        return None;
+    }
+    let uri = access.auth_request?;
+    let resume = AUTH_RESUME.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|(u, _)| *u == uri)
+            .map(|(_, resume)| resume.clone())
+    })?;
+    state.limit_req_status = resume.limit_req_status;
+    state.limit_conn_status = resume.limit_conn_status;
+    for (name, value) in &resume.vars {
+        state.set_user_var(name, value.clone());
+    }
+    Some(resume)
+}
+
+fn auth_pending(access: &PreparedAccess, state: &RewriteState) -> Option<Box<AuthPending>> {
+    Some(Box::new(AuthPending {
+        uri: access.auth_request?,
+        sets: access.auth_request_set,
+        limit_req_status: state.limit_req_status,
+        limit_conn_status: state.limit_conn_status,
+    }))
+}
+
+/// The handlers in nginx's order: the access module's, auth_basic's, then
+/// auth_request's (the reverse of the module list). With `satisfy all` the
+/// first that refuses answers; with `any` the first that allows does, and
+/// otherwise a 401 wins over a 403 (`r->access_code`).
 #[inline(never)]
 fn check_access(
     http: &PreparedHttp,
@@ -1391,22 +1507,119 @@ fn check_access(
     access: &PreparedAccess,
     server_header: &'static [u8],
     meta: &ProcessMeta,
+    auth: Option<&AuthResume>,
 ) -> AccessControl {
-    // The access module's handler runs before auth_basic's. With `satisfy
-    // all` a deny answers at once; with `any` an allow does, and a deny
-    // only counts if auth_basic doesn't pass either.
-    let forbidden = match match_access_rules(access.rules, req.conn.peer_ip, req.conn.peer_unix) {
-        Some(false) if access.satisfy_any => return AccessControl::Allow { remote_user: None },
-        Some(true) if !access.satisfy_any => return access_forbidden(http, req, meta),
+    let any = access.satisfy_any;
+    // `satisfy any`'s pending refusal: 403, or a 401 with its response.
+    let mut unauthorized: Option<(Response, u64)> = None;
+    let mut forbidden = match match_access_rules(access.rules, req.conn.peer_ip, req.conn.peer_unix)
+    {
+        Some(false) if any => return AccessControl::Allow { remote_user: None },
+        Some(true) if !any => return access_forbidden(http, req, meta),
         found => found == Some(true),
     };
+    let mut remote_user = None;
     match run_auth_basic(http, req, access, server_header) {
-        // auth_basic off: only the rules decided.
-        None if forbidden => access_forbidden(http, req, meta),
-        None => AccessControl::Allow { remote_user: None },
-        // A 401 wins over the rules' 403, and errors end the phase.
-        Some(outcome) => outcome,
+        None => {}
+        Some(AccessControl::Allow { remote_user: user }) => {
+            if any {
+                return AccessControl::Allow { remote_user: user };
+            }
+            remote_user = user;
+        }
+        Some(AccessControl::Deny { response, delay_ms }) if is_unauthorized(&response) && any => {
+            unauthorized = Some((response, delay_ms));
+        }
+        // A refusal under `satisfy all`, or an error.
+        Some(outcome) => return outcome,
     }
+    if access.auth_request.is_some() {
+        let Some(auth) = auth else {
+            return AccessControl::Subrequest;
+        };
+        match auth.status {
+            200..=299 => {
+                if any {
+                    return AccessControl::Allow { remote_user };
+                }
+            }
+            401 => {
+                let response = Response::Owned(crate::auth::build_unauthorized_with(
+                    req.method,
+                    server_header,
+                    &auth.www_authenticate,
+                ));
+                if !any {
+                    return AccessControl::Deny {
+                        response,
+                        delay_ms: access.auth_delay_ms,
+                    };
+                }
+                // Both handlers' challenges, as nginx keeps the list.
+                unauthorized = Some(match unauthorized.take() {
+                    Some((basic, delay_ms)) => (merge_challenges(basic, response), delay_ms),
+                    None => (response, access.auth_delay_ms),
+                });
+            }
+            403 => {
+                if !any {
+                    return AccessControl::Deny {
+                        response: Response::Prebuilt(http.forbidden.pick(req.method)),
+                        delay_ms: 0,
+                    };
+                }
+                forbidden = true;
+            }
+            status => {
+                crate::worker::write_error_log(
+                    meta.log.error_logs,
+                    crate::config::ErrorLogLevel::Error,
+                    &crate::worker::ErrorLogRequest::new(req, meta.server_name),
+                    format!("auth request unexpected status: {status}").as_bytes(),
+                    None,
+                );
+                return AccessControl::Deny {
+                    response: Response::Prebuilt(http.internal_error.pick(req.method)),
+                    delay_ms: 0,
+                };
+            }
+        }
+    }
+    // The post-access phase: what `satisfy any` kept, a 401 first.
+    match unauthorized {
+        Some((response, delay_ms)) => AccessControl::Deny { response, delay_ms },
+        None if forbidden => access_forbidden(http, req, meta),
+        None => AccessControl::Allow { remote_user },
+    }
+}
+
+fn is_unauthorized(response: &Response) -> bool {
+    match response {
+        Response::Owned(b) => crate::worker::response_status(b) == 401,
+        Response::Prebuilt(b) => crate::worker::response_status(b) == 401,
+        _ => false,
+    }
+}
+
+/// auth_basic's 401 with auth_request's `WWW-Authenticate` lines added.
+fn merge_challenges(basic: Response, other: Response) -> Response {
+    let (Response::Owned(mut basic), Response::Owned(other)) = (basic, other) else {
+        unreachable!("both 401s are built owned");
+    };
+    let lines: Vec<u8> = other
+        .split(|&b| b == b'\n')
+        .filter(|l| l.len() > 18 && l[..18].eq_ignore_ascii_case(b"www-authenticate: "))
+        .flat_map(|l| {
+            b"\r\n"
+                .iter()
+                .chain(l.strip_suffix(b"\r").unwrap_or(l))
+                .copied()
+        })
+        .collect();
+    if let Some(head_end) = basic.windows(4).position(|w| w == b"\r\n\r\n") {
+        basic.splice(head_end..head_end, lines);
+    }
+    Response::Owned(basic)
 }
 
 /// The first `allow` / `deny` rule matching `peer`: `Some(deny)`, or

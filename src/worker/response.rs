@@ -877,6 +877,75 @@ fn proxy_render_ctx<'a>(
 /// rewrite program's `return`. nginx's special response handler and
 /// header filter run with the server's configuration then: its
 /// `error_page` (a match becomes a `Reroute`), else its `add_header`s.
+/// `parts` rendered in an `auth_request` subrequest's context (#358): its
+/// URI, its status, the head it answered with (`$sent_http_*`) and its
+/// upstream (`req.upstream`, `$upstream_*`), as nginx evaluates
+/// `auth_request_set` with the subrequest.
+pub(crate) fn render_in_subrequest(
+    http: &'static PreparedHttp,
+    req: &phase::RequestCtx<'_>,
+    server_name: &'static [u8],
+    server_port: u16,
+    status: u16,
+    sent_headers: &[u8],
+    parts: &[PreparedValuePart],
+) -> Vec<u8> {
+    let request_uri = req.path;
+    let args = request_args(request_uri);
+    let uri = request_uri
+        .iter()
+        .position(|&b| b == b'?')
+        .map(|i| &request_uri[..i])
+        .unwrap_or(request_uri);
+    let ctx = RenderCtx {
+        uri,
+        request_uri,
+        request_method: req.method_bytes,
+        request_line: req.request_line,
+        host: req.host.unwrap_or(server_name),
+        remote_addr: req.remote_addr,
+        remote_port: req.remote_port,
+        remote_user: b"",
+        server_name,
+        status,
+        args,
+        is_args: if args.is_empty() { b"" } else { b"?" },
+        scheme: if req.tls.is_some() { b"https" } else { b"http" },
+        hostname: hostname(),
+        headers_raw: req.headers_raw,
+        underscores_in_headers: false,
+        sent_headers,
+        connection_id: req.connection_id,
+        connection_requests: req.connection_requests,
+        connection_time_us: req.connection_time_us,
+        request_time_us: req.request_time_us,
+        server_port,
+        request_port: req.request_port,
+        pipe: req.pipe,
+        request_length: req.request_length,
+        request_body: req.body,
+        request_body_file: &[],
+        bytes_sent: 0,
+        body_bytes_sent: 0,
+        epoch_secs: req.epoch_secs,
+        epoch_ms: req.epoch_ms,
+        server_name_captures: &[],
+        rewrite_state: None,
+        split_clients: Some(&http.split_clients),
+        maps: Some(&http.maps),
+        proxy_host: &[],
+        upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
+        upstream_states: req.upstream.map_or(&[], |u| &u.states),
+        upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
+        sent_trailers: &[],
+        tls: req.tls,
+        conn: req.conn,
+    };
+    let mut out = Vec::new();
+    render_parts(parts, &ctx, &mut out);
+    out
+}
+
 pub(crate) fn finish_server_response(
     http: &'static PreparedHttp,
     req: &phase::RequestCtx<'_>,

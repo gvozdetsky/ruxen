@@ -133,6 +133,25 @@ pub fn build_unauthorized_response(method: http::Method, server: &[u8], realm: &
     response
 }
 
+/// A 401 with the `WWW-Authenticate` values an `auth_request` subrequest
+/// answered with (#358), as nginx copies them to the main request.
+pub fn build_unauthorized_with(
+    method: http::Method,
+    server: &[u8],
+    www_authenticate: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut response = http::build_response_for_method(401, "Unauthorized\n", method, server);
+    let mut headers = Vec::new();
+    for value in www_authenticate {
+        headers.extend_from_slice(b"\r\nWWW-Authenticate: ");
+        headers.extend_from_slice(value);
+    }
+    if let Some(head_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+        response.splice(head_end..head_end, headers);
+    }
+    response
+}
+
 fn verify_stored_password(stored: &[u8], password: &[u8]) -> bool {
     if let Some(plain) = stored.strip_prefix(b"{PLAIN}") {
         return plain == password;
