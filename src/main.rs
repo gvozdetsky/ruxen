@@ -676,6 +676,9 @@ impl Master {
                 let _ = handle.join();
             }
             generation.http.close_root_fds();
+            // Keyed by peer address: a freed peer's entry could match a
+            // later one at the same address.
+            syslog::forget_error_log_sockets();
             if let Some(arena) = generation.arena.take() {
                 // SAFETY: its workers are joined, and what a later
                 // generation keeps (zone state, cache zones, the buffered
@@ -745,6 +748,7 @@ impl Master {
             }
         };
         generation.state.release_workers();
+        worker::set_panic_hook_config(http);
         let mut old = std::mem::replace(&mut self.current, generation);
         old.state.begin_shutdown();
         old.state.bump_reload_gen();

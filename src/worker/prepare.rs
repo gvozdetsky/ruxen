@@ -2318,7 +2318,7 @@ impl<'a> AccessLogPrep<'a> {
                             size: wanted.0,
                             flush_ms: wanted.1,
                             gzip: wanted.2,
-                            path: crate::arena::leak(log.path.clone().into_boxed_path()),
+                            path: Box::leak(log.path.clone().into_boxed_path()),
                         }));
                     self.buffers.insert(log.path.clone(), buffer);
                     Some(buffer)
