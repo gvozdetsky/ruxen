@@ -10,8 +10,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn get(port: u16, path: &str) -> String {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -59,22 +58,18 @@ fn http_level_server_defaults_apply() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(d.join("nginx.conf"))
-        .env("TMPDIR", &d)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !d.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(d.join("nginx.conf"))
+            .env("TMPDIR", &d)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &d.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let cases = [
@@ -86,8 +81,7 @@ fn http_level_server_defaults_apply() {
         ("/a/b", "200 merged"),
     ];
     let got: Vec<String> = cases.iter().map(|(p, _)| get(port, p)).collect();
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&d);
     for ((path, want), got) in cases.iter().zip(&got) {
         assert_eq!(got, want, "{path}");

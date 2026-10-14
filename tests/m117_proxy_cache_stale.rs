@@ -81,16 +81,18 @@ fn m117_use_stale_and_background_update() {
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg("-c")
         .arg(dir.join("nginx.conf"))
+        .arg("-g")
+        .arg(format!("pid {d}/ruxen.pid;"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let _server = Server(child, dir.clone());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut server = Server(child, dir.clone());
+    common::ports::wait_for_pid_file(
+        &mut server.0,
+        &dir.join("ruxen.pid"),
+        Duration::from_secs(5),
+    );
     drop(setup);
 
     let r = get(port, "/e/e.txt");

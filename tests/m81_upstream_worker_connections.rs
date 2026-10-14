@@ -88,18 +88,17 @@ fn upstream_connections_take_worker_connection_slots() {
         ),
     )
     .unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     // The first request holds a client and an upstream slot; the second
@@ -127,8 +126,7 @@ fn upstream_connections_take_worker_connection_slots() {
     }
     let closed_after = closed.load(Ordering::SeqCst);
     drop((idle, third));
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(first.starts_with("HTTP/1.1 200"), "{first}");
