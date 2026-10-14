@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod arena;
 mod auth;
 mod autoindex;
 mod config;
@@ -259,8 +260,13 @@ fn real_main() -> Result<(), Failure> {
     let settings = Settings::from_config(&cfg);
     // Load certificates, open roots and log files. `-t` does this too, so
     // it catches everything short of a busy port, like `nginx -t`.
+    // What `prepare` leaks is recorded, to be freed once a reload has
+    // retired this generation (#343).
+    arena::open();
+    let prepared = worker::prepare(cfg);
+    let arena = arena::close();
     let http: &'static worker::PreparedHttp =
-        worker::prepare(cfg).map_err(|e| report_emerg(&e, &cli, &main_path))?;
+        prepared.map_err(|e| report_emerg(&e, &cli, &main_path))?;
     warn_if_fd_limit_too_low(http, settings.worker_connections, settings.rlimit_nofile);
     if cli.test_only {
         if report_test {
@@ -317,7 +323,7 @@ fn real_main() -> Result<(), Failure> {
     // them: a failure becomes one `[emerg]` and exit 1 instead of a panic
     // per worker, and the pid file (which Test::Nginx polls for) appears
     // only once the server accepts connections.
-    let generation = Generation::start(0, http, &settings, worker_listeners, &exited_tx);
+    let generation = Generation::start(0, http, arena, &settings, worker_listeners, &exited_tx);
     let mut startup_error = generation.as_ref().err().cloned();
     // The pid file goes where root may write (/run), so before the switch.
     let mut pid_written = false;
@@ -436,6 +442,10 @@ struct Generation {
     shutdown_timeout: Option<Duration>,
     /// When a reload retired it.
     retired_at: Option<Instant>,
+    /// What preparing `http` leaked: freed once the workers are joined.
+    /// `None` once freed, or when it must stay (a generation that failed
+    /// to start).
+    arena: Option<arena::Arena>,
 }
 
 impl Generation {
@@ -445,6 +455,7 @@ impl Generation {
     fn start(
         id: u64,
         http: &'static worker::PreparedHttp,
+        arena: arena::Arena,
         settings: &Settings,
         listeners: Vec<worker::listeners::WorkerListeners>,
         exited_tx: &std::sync::mpsc::Sender<(u64, usize, bool)>,
@@ -460,6 +471,7 @@ impl Generation {
             alive: 0,
             shutdown_timeout: settings.shutdown_timeout,
             retired_at: None,
+            arena: Some(arena),
         };
         let mut error = None;
         for (i, own) in listeners.into_iter().enumerate() {
@@ -659,11 +671,17 @@ impl Master {
             .into_iter()
             .partition(|g| g.alive == 0);
         self.retiring = live;
-        for generation in done {
-            for handle in generation.handles {
+        for mut generation in done {
+            for handle in std::mem::take(&mut generation.handles) {
                 let _ = handle.join();
             }
             generation.http.close_root_fds();
+            if let Some(arena) = generation.arena.take() {
+                // SAFETY: its workers are joined, and what a later
+                // generation keeps (zone state, cache zones, the buffered
+                // log registry) is leaked outside the arena.
+                unsafe { arena.free() };
+            }
         }
     }
 
@@ -694,7 +712,7 @@ impl Master {
                 t.join()
                     .unwrap_or_else(|_| Err("reading the configuration panicked".into()))
             });
-        let (settings, http, warnings) = match loaded {
+        let (settings, http, arena, warnings) = match loaded {
             Ok(loaded) => loaded,
             Err(e) => return log(old_http, config::ErrorLogLevel::Emerg, &e),
         };
@@ -710,16 +728,22 @@ impl Master {
         };
         let id = self.next_id;
         self.next_id += 1;
-        let generation =
-            match Generation::start(id, http, &settings, worker_listeners, &self.exited_tx) {
-                Ok(g) => g,
-                Err(e) => {
-                    self.listeners
-                        .retain(self.current.http, self.current.workers);
-                    http.close_root_fds();
-                    return log(old_http, config::ErrorLogLevel::Emerg, &e);
-                }
-            };
+        let generation = match Generation::start(
+            id,
+            http,
+            arena,
+            &settings,
+            worker_listeners,
+            &self.exited_tx,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                self.listeners
+                    .retain(self.current.http, self.current.workers);
+                http.close_root_fds();
+                return log(old_http, config::ErrorLogLevel::Emerg, &e);
+            }
+        };
         generation.state.release_workers();
         let mut old = std::mem::replace(&mut self.current, generation);
         old.state.begin_shutdown();
@@ -751,7 +775,15 @@ impl Master {
 /// Read, parse and prepare the configuration as at startup, for a reload.
 fn load_for_reload(
     cli: &Cli,
-) -> Result<(Settings, &'static worker::PreparedHttp, Vec<String>), String> {
+) -> Result<
+    (
+        Settings,
+        &'static worker::PreparedHttp,
+        arena::Arena,
+        Vec<String>,
+    ),
+    String,
+> {
     let (main_path, file_src) = read_main_config(cli).map_err(|e| e.to_string())?;
     let globals_src = (!cli.globals.is_empty()).then(|| {
         cli.globals
@@ -769,8 +801,11 @@ fn load_for_reload(
         config::parse_with_main(main_path, file_src, globals_src).map_err(|e| e.to_string())?;
     let settings = Settings::from_config(&cfg);
     let warnings = cfg.warnings.clone();
-    let http = worker::prepare(cfg)?;
-    Ok((settings, http, warnings))
+    arena::open();
+    let prepared = worker::prepare(cfg);
+    // On an error the arena is dropped: what was leaked stays.
+    let arena = arena::close();
+    Ok((settings, prepared?, arena, warnings))
 }
 
 /// Held by a worker thread: tells `main` the worker (generation, index) is

@@ -466,3 +466,53 @@ fn shared_ssl_session_cache_survives_a_reload() {
     let after = connect("-sess_in");
     assert!(after.contains("Reused, "), "after the reload: {after}");
 }
+
+/// A reload frees the configuration it replaced once the old workers are
+/// gone (#343), so memory stays flat over many reloads. Before, each one of
+/// this configuration kept about 25 KiB: 200 reloads added some 5 MiB.
+#[test]
+fn reloads_free_the_retired_configuration() {
+    let port = free_port();
+    let http = format!(
+        "server {{ listen 127.0.0.1:{port};\n\
+           location / {{ add_header X-A a; return 200 \"x\"; }}\n\
+           location ~ \\.php$ {{ return 403; }}\n\
+           location /p/ {{ proxy_pass http://127.0.0.1:{port}/; }} }}"
+    );
+    let s = start("memory", "", &http);
+    let rss_kib = || {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", s.child.id())).unwrap();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
+            .unwrap()
+    };
+    let reload = |times: usize| {
+        for _ in 0..times {
+            unsafe {
+                assert_eq!(kill(s.child.id() as i32, SIGHUP), 0);
+            }
+            sleep(Duration::from_millis(30));
+        }
+        // Until every retired generation has gone.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while s.threads() != 2 {
+            assert!(Instant::now() < deadline, "{} threads", s.threads());
+            sleep(Duration::from_millis(20));
+        }
+    };
+    // Warm up the allocator first.
+    reload(20);
+    let before = rss_kib();
+    reload(200);
+    let after = rss_kib();
+    assert_eq!(get(port, "/").unwrap()[9..12].to_string(), "200");
+    assert!(
+        after < before + 3 * 1024,
+        "RSS grew from {before} KiB to {after} KiB over 200 reloads"
+    );
+    unsafe {
+        assert_eq!(kill(s.child.id() as i32, SIGQUIT), 0);
+    }
+}

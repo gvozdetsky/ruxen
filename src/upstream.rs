@@ -69,7 +69,7 @@ pub struct PeerShared {
 
 impl PeerShared {
     pub(crate) fn for_peers(n: usize) -> &'static [PeerShared] {
-        Box::leak((0..n).map(|_| PeerShared::default()).collect())
+        crate::arena::leak((0..n).map(|_| PeerShared::default()).collect())
     }
 }
 
@@ -133,10 +133,12 @@ impl Lb {
             LbAlgorithm::RoundRobin => Lb::RoundRobin,
             LbAlgorithm::LeastConn => Lb::LeastConn,
             LbAlgorithm::IpHash => Lb::IpHash,
-            LbAlgorithm::Hash { key, consistent } => Lb::Hash(Box::leak(Box::new(HashLb {
-                key: crate::worker::prepare_value_parts(key),
-                ring: consistent.then(|| chash_ring(peers)),
-            }))),
+            LbAlgorithm::Hash { key, consistent } => {
+                Lb::Hash(crate::arena::leak(Box::new(HashLb {
+                    key: crate::worker::prepare_value_parts(key),
+                    ring: consistent.then(|| chash_ring(peers)),
+                })))
+            }
         }
     }
 }
@@ -979,8 +981,8 @@ mod tests {
                 backup: *backup,
             })
             .collect();
-        let peers: &'static [PreparedPeer] = Box::leak(peers.into_boxed_slice());
-        Box::leak(Box::new(PreparedUpstream {
+        let peers: &'static [PreparedPeer] = crate::arena::leak(peers.into_boxed_slice());
+        crate::arena::leak(Box::new(PreparedUpstream {
             name: b"t",
             peers,
             keepalive_max_idle: None,
@@ -1178,8 +1180,8 @@ mod tests {
                 backup: false,
             })
             .collect();
-        let peers: &'static [PreparedPeer] = Box::leak(peers.into_boxed_slice());
-        Box::leak(Box::new(PreparedUpstream {
+        let peers: &'static [PreparedPeer] = crate::arena::leak(peers.into_boxed_slice());
+        crate::arena::leak(Box::new(PreparedUpstream {
             name: b"t",
             peers,
             keepalive_max_idle: None,
@@ -1301,8 +1303,8 @@ mod tests {
                 backup: false,
             })
             .collect();
-        let peers: &'static [PreparedPeer] = Box::leak(peers.into_boxed_slice());
-        Box::leak(Box::new(PreparedUpstream {
+        let peers: &'static [PreparedPeer] = crate::arena::leak(peers.into_boxed_slice());
+        crate::arena::leak(Box::new(PreparedUpstream {
             name: b"z",
             peers,
             keepalive_max_idle: None,
