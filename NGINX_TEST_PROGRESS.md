@@ -8,8 +8,8 @@ Last run: 2026-10-14 against `nginx-tests` 0b70854 (2026-09-30).
 
 - **Total tests tracked:** 505
 - **Passing in ruxen:** 106
-- **Intentionally skipped (`-V` banner excludes the module):** 346
-- **Failing — work in progress:** 53
+- **Intentionally skipped (`-V` banner excludes the module):** 347
+- **Failing — work in progress:** 52
 
 The three groups below are mutually exclusive and sum to 505.
 
@@ -124,13 +124,12 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (53)
+## Failing — actively being worked on (52)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
 - `access_log.t` — 2/21
 - `http_absolute_redirect.t` — 16/25
-- `http_disable_symlinks.t` — 1/30
 - `http_resolver.t` — 25/40
 - `http_resolver_aaaa.t` — 49/74
 - `http_resolver_cleanup.t` — 0/3
@@ -182,7 +181,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `upstream_max_conns.t` — 16/18
 - `upstream_zone_ssl.t` — 9/11
 
-## Intentionally skipped (346)
+## Intentionally skipped (347)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
@@ -631,6 +630,10 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `ssl_engine_keys.t`
 
+### no disable_symlinks (1)
+
+- `http_disable_symlinks.t` — its probe uses `alias` with a capture, refused until #232
+
 ### no empty_gif available (1)
 
 - `empty_gif.t`
@@ -714,4 +717,3 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 ### wants ssl_client_certificate (1)
 
 - `ssl_verify_client_trusted.t`
-

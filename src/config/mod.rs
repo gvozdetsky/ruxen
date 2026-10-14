@@ -1059,12 +1059,22 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
         Some("proxy_cookie_flags") if value != Some("off") || args.len() != 2 => {
             "upstream cookies would reach clients without the flags it sets"
         }
+        // Taken literally, `root /var/www/$host` or `alias /srv/$1` looks
+        // for a directory named `$host` (#232). Until the path is rendered
+        // per request, such a configuration is refused rather than served
+        // from the wrong place. nginx refuses a `$` that doesn't start a
+        // variable, so any `$` here is one.
+        Some("root" | "alias") if value.is_some_and(|v| v.contains('$')) => {
+            "variables in the path aren't expanded yet (#232), so other files would be served than nginx serves"
+        }
         _ => return Ok(()),
     };
-    Err(Error::Unenforced {
-        name: args[0].clone(),
-        consequence,
-    })
+    // For a path, the whole directive: "root" alone isn't what's missing.
+    let name = match args.first().map(String::as_str) {
+        Some("root" | "alias") => args.join(" "),
+        _ => args[0].clone(),
+    };
+    Err(Error::Unenforced { name, consequence })
 }
 
 /// Accepted with a warning: `ssl_ciphers` / `ssl_ecdh_curve`, because
@@ -1886,6 +1896,27 @@ mod tests {
             Err(e @ Error::Unenforced { .. }) => e.to_string(),
             other => panic!("expected Unenforced, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn variables_in_root_and_alias_are_refused() {
+        // #232: taken literally they serve other files than nginx does.
+        for src in [
+            "http { root /var/www/$host; server { listen 80; } }",
+            "http { server { listen 80; root /srv/$server_name; } }",
+            "http { server { listen 80; location / { root $document_root/x; } } }",
+            "http { server { listen 80; location ~ ^/i/(.+)$ { alias /srv/img/$1; } } }",
+        ] {
+            let e = unenforced_err(src);
+            assert!(e.contains("(#232)"), "{src}: {e}");
+        }
+        let e = unenforced_err("http { server { listen 80; root /var/www/$host; } }");
+        assert!(
+            e.starts_with("\"root /var/www/$host\" is not supported yet"),
+            "{e}"
+        );
+        // Without variables, as before.
+        parse("http { server { listen 80; root /srv; location /a/ { alias /srv/a/; } } }").unwrap();
     }
 
     #[test]
