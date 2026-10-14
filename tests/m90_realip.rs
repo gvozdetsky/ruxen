@@ -25,7 +25,10 @@ fn request(port: u16, prefix: &str, head: &str) -> String {
     let code = out.get(9..12).unwrap_or("").to_string();
     let body = out.split_once("\r\n\r\n").map_or("", |(_, b)| b).trim();
     let reason = out.lines().next().and_then(|l| l.get(13..)).unwrap_or("");
-    if body.is_empty() || body.contains(reason) || body.contains(&code) {
+    // An error page (nginx's, or the status text) says only the status.
+    // Not `body.contains(&code)`: the client's port in the body may hold
+    // the status digits (`[42003]`).
+    if body.is_empty() || body.starts_with("<html>") || body.contains(reason) {
         return code;
     }
     format!("{code} {body}")
