@@ -272,6 +272,67 @@ fn smoke() {
     assert!(resp.stdout.contains("ok"), "body: {}", resp.stdout);
 }
 
+/// Plain HTTP sent to an `ssl` port (#384): nginx reads it as HTTP and
+/// finalizes it with 497, sent as 400 ("The plain HTTP request was sent to
+/// HTTPS port") unless `error_page 497` takes it, as in the common
+/// redirect to https. TLS on the same port is unaffected.
+#[test]
+fn plain_http_on_ssl_port() {
+    const CONF: &str = r#"
+events {}
+http {
+    access_log off;
+    server {
+        listen 127.0.0.1:%%PORT%% ssl;
+        server_name localhost;
+        ssl_certificate %%CERT%%;
+        ssl_certificate_key %%KEY%%;
+        location / { return 200 "ok\n"; }
+    }
+    server {
+        listen 127.0.0.1:%%PORT%% ssl;
+        server_name redirect.test;
+        ssl_certificate %%CERT%%;
+        ssl_certificate_key %%KEY%%;
+        error_page 497 https://$host$request_uri;
+        location / { return 200 "ok\n"; }
+    }
+}
+"#;
+    let server = spawn_https_server(CONF, make_self_signed("localhost"));
+    let raw = |request: &str| {
+        use std::io::{Read, Write};
+        let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    };
+
+    let resp = raw("GET /a?b=1 HTTP/1.0\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{resp}");
+    assert!(resp.contains("Connection: close\r\n"), "{resp}");
+    assert!(
+        resp.ends_with("\r\n\r\nThe plain HTTP request was sent to HTTPS port\n"),
+        "{resp}"
+    );
+
+    // The h2c preface, as nginx-tests' h2_ssl.t sends it: no HTTP/2 here.
+    let resp = raw("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{resp}");
+
+    let resp = raw("GET /x?y=2 HTTP/1.1\r\nHost: redirect.test\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 302 "), "{resp}");
+    assert!(
+        resp.contains("\r\nLocation: https://redirect.test/x?y=2\r\n"),
+        "{resp}"
+    );
+
+    let resp = curl_get(server.port, "localhost", "/", None, true);
+    assert_eq!(resp.status(), Some(200), "stdout={}", resp.stdout);
+}
+
 /// X.509 v1 certificates (no extensions, which is what nginx-tests and a
 /// bare `openssl req -x509` make) load and serve, as with nginx/OpenSSL.
 /// webpki rejects them with `UnsupportedCertVersion`, so ruxen used to

@@ -1681,6 +1681,8 @@ pub struct PreparedHttp {
     /// PreparedServer) avoids one copy per server block.
     pub not_found: Prebuilt,
     pub bad_request: Prebuilt,
+    /// nginx's 497 page: plain HTTP on an `ssl` port, sent as 400 (#384).
+    pub plain_http: Prebuilt,
     pub not_implemented: Prebuilt,
     pub forbidden: Prebuilt,
     pub bad_gateway: Prebuilt,

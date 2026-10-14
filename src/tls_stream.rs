@@ -36,6 +36,33 @@ const READ_BUF_SIZE: usize = 17 * 1024;
 /// outgoing limit) for the rest of its keepalive life.
 const WRITE_BUF_KEEP: usize = 32 * 1024;
 
+/// What a client opened on a TLS port with.
+pub enum Accepted<IO> {
+    /// A completed handshake.
+    Tls(TlsStream<IO>),
+    /// The first bytes aren't a TLS record: plain HTTP sent to an `ssl`
+    /// port (#384). The transport comes back with the bytes already read,
+    /// for the caller to answer as nginx does (`NGX_HTTP_TO_HTTPS`).
+    Plain(IO, Vec<u8>),
+}
+
+/// nginx's test in `ngx_http_ssl_handshake`: an SSLv2 ClientHello has the
+/// top bit set, a TLS record starts with the handshake type (22). Anything
+/// else is taken for plain HTTP.
+fn starts_tls(first: u8) -> bool {
+    first & 0x80 != 0 || first == 0x16
+}
+
+/// The first read on a TLS port: `None` at EOF.
+async fn first_read<IO: AsyncReadRent>(io: &mut IO) -> io::Result<Option<Vec<u8>>> {
+    let (res, buf) = io.read(Vec::with_capacity(READ_BUF_SIZE)).await;
+    Ok((res? > 0).then_some(buf))
+}
+
+fn handshake_eof() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof")
+}
+
 /// Per-listen handshake entry point, built once from the listen's
 /// `ServerConfig`.
 #[derive(Clone)]
@@ -67,38 +94,52 @@ impl TlsAcceptor {
 
     /// Run the server handshake over `io`. rustls errors surface as
     /// `InvalidData`, a peer that hangs up mid-handshake as `UnexpectedEof`.
-    pub async fn accept<IO>(&self, io: IO) -> io::Result<TlsStream<IO>>
+    /// A first byte that can't start TLS gives `Accepted::Plain`.
+    pub async fn accept<IO>(&self, mut io: IO) -> io::Result<Accepted<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
     {
+        let Some(first) = first_read(&mut io).await? else {
+            return Err(handshake_eof());
+        };
+        if !starts_tls(first[0]) {
+            return Ok(Accepted::Plain(io, first));
+        }
         let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
-        self.handshake_with(io, conn).await
+        self.handshake_with(io, conn, first)
+            .await
+            .map(Accepted::Tls)
     }
 
     /// `accept`, but the ClientHello is read first and `reject` sees its
     /// SNI name (nginx's servername callback): when it says so, the
     /// handshake ends with a fatal `unrecognized_name` alert before any
     /// certificate is chosen (`ssl_reject_handshake`, #112). The error is
-    /// `ConnectionRefused`.
+    /// `ConnectionRefused`. Plain HTTP is `Accepted::Plain`, as in `accept`.
     pub async fn accept_or_reject<IO>(
         &self,
         mut io: IO,
         reject: impl FnOnce(Option<&str>) -> bool,
-    ) -> io::Result<TlsStream<IO>>
+    ) -> io::Result<Accepted<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
     {
         let mut acceptor = rustls::server::Acceptor::default();
-        let mut buf = Vec::with_capacity(READ_BUF_SIZE);
+        let Some(mut buf) = first_read(&mut io).await? else {
+            return Err(handshake_eof());
+        };
+        if !starts_tls(buf[0]) {
+            return Ok(Accepted::Plain(io, buf));
+        }
+        let mut first = true;
         let accepted = loop {
-            buf.clear();
-            let (res, returned) = io.read(buf).await;
-            buf = returned;
-            if res? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "tls handshake eof",
-                ));
+            if !mem::take(&mut first) {
+                buf.clear();
+                let (res, returned) = io.read(buf).await;
+                buf = returned;
+                if res? == 0 {
+                    return Err(handshake_eof());
+                }
             }
             let mut pending = &buf[..];
             while !pending.is_empty() {
@@ -135,13 +176,17 @@ impl TlsAcceptor {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
         };
-        self.handshake_with(io, conn).await
+        self.handshake_with(io, conn, Vec::new())
+            .await
+            .map(Accepted::Tls)
     }
 
+    /// The handshake, with `rbuf` holding ciphertext already read.
     async fn handshake_with<IO>(
         &self,
         io: IO,
         mut conn: ServerConnection,
+        rbuf: Vec<u8>,
     ) -> io::Result<TlsStream<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
@@ -161,7 +206,7 @@ impl TlsAcceptor {
         let mut stream = TlsStream {
             io,
             conn,
-            rbuf: Vec::new(),
+            rbuf,
             rpos: 0,
             wbuf: Vec::new(),
             session_id,
@@ -245,10 +290,7 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
                 return Ok(());
             }
             if self.read_tls().await? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "tls handshake eof",
-                ));
+                return Err(handshake_eof());
             }
             // A resumed TLS 1.3 session keeps its id, also in the tickets
             // issued now (after the client's Finished, a later flight).
@@ -489,11 +531,18 @@ mod tests {
         });
     }
 
+    fn tls<IO>(accepted: Accepted<IO>) -> TlsStream<IO> {
+        match accepted {
+            Accepted::Tls(s) => s,
+            Accepted::Plain(..) => panic!("plain bytes on the TLS port"),
+        }
+    }
+
     #[test]
     fn roundtrip_writev_and_close_notify() {
         run(
             |acceptor, sock| async move {
-                let mut s = acceptor.accept(sock).await.unwrap();
+                let mut s = tls(acceptor.accept(sock).await.unwrap());
                 assert_eq!(s.connection().server_name(), Some("localhost"));
                 let (res, buf) = s.read(Vec::with_capacity(64)).await;
                 assert_eq!(res.unwrap(), 4);
@@ -524,7 +573,7 @@ mod tests {
         let expect = body.clone();
         run(
             |acceptor, sock| async move {
-                let mut s = acceptor.accept(sock).await.unwrap();
+                let mut s = tls(acceptor.accept(sock).await.unwrap());
                 // Longer than rustls's 64 KiB outgoing limit: `write_all`
                 // has to loop over partial writes.
                 let (res, _) = s.write_all(body).await;
@@ -559,7 +608,9 @@ mod tests {
     fn handshake_eof() {
         run(
             |acceptor, sock| async move {
-                let err = acceptor.accept(sock).await.unwrap_err();
+                let Err(err) = acceptor.accept(sock).await else {
+                    panic!("accepted a closed connection");
+                };
                 assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
             },
             |c| c.sock.shutdown(std::net::Shutdown::Both).unwrap(),

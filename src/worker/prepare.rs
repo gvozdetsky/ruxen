@@ -297,6 +297,11 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         maps: prepared_maps,
         not_found: Prebuilt::leak(404, "Not Found\n", http_server_bytes),
         bad_request: Prebuilt::leak(400, "Bad Request\n", http_server_bytes),
+        plain_http: Prebuilt::leak(
+            400,
+            "The plain HTTP request was sent to HTTPS port\n",
+            http_server_bytes,
+        ),
         not_implemented: Prebuilt::leak(501, "Not Implemented\n", http_server_bytes),
         forbidden: Prebuilt::leak(403, "Forbidden\n", http_server_bytes),
         bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),

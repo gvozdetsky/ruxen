@@ -218,6 +218,132 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     }
 }
 
+/// A plain TCP connection whose first bytes are already read: plain HTTP
+/// sent to an `ssl` port, read by the TLS acceptor (#384). Those bytes
+/// come first, then the socket's.
+pub(crate) struct Preread {
+    io: TcpStream,
+    read: Vec<u8>,
+    pos: usize,
+}
+
+impl Preread {
+    pub(crate) fn new(io: TcpStream, read: Vec<u8>) -> Self {
+        Preread { io, read, pos: 0 }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pos < self.read.len()
+    }
+
+    /// Copy what is left of the read bytes to `dst`, as far as it fits.
+    ///
+    /// # Safety
+    /// `dst` is valid for writes of `len` bytes.
+    unsafe fn take_into(&mut self, dst: *mut u8, len: usize) -> usize {
+        let n = (self.read.len() - self.pos).min(len);
+        // SAFETY: `n` bytes from our own buffer into `dst`, which the
+        // caller vouches for; the two can't overlap.
+        unsafe { std::ptr::copy_nonoverlapping(self.read.as_ptr().add(self.pos), dst, n) };
+        self.pos += n;
+        n
+    }
+}
+
+impl AsyncReadRent for Preread {
+    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+        if !self.has_pending() {
+            return self.io.read(buf).await;
+        }
+        // SAFETY: `write_ptr` is valid for `bytes_total` bytes, and the
+        // first `n` are initialized once copied.
+        unsafe {
+            let n = self.take_into(buf.write_ptr(), buf.bytes_total());
+            buf.set_init(n);
+            (Ok(n), buf)
+        }
+    }
+
+    async fn readv<T: monoio::buf::IoVecBufMut>(
+        &mut self,
+        mut buf: T,
+    ) -> monoio::BufResult<usize, T> {
+        if !self.has_pending() {
+            return self.io.readv(buf).await;
+        }
+        // The first iovec only: a short read, which callers handle.
+        // SAFETY: `buf` is owned here and outlives `raw`.
+        let res = match unsafe { monoio::buf::RawBuf::new_from_iovec_mut(&mut buf) } {
+            Some(raw) => self.read(raw).await.0,
+            None => Ok(0),
+        };
+        if let Ok(n) = res {
+            // SAFETY: `n` bytes of the first iovec were just written.
+            unsafe { buf.set_init(n) };
+        }
+        (res, buf)
+    }
+}
+
+impl AsyncWriteRent for Preread {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        self.io.write(buf).await
+    }
+
+    async fn writev<T: monoio::buf::IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        self.io.writev(buf).await
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.io.flush().await
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.io.shutdown().await
+    }
+}
+
+impl ConnIo for Preread {
+    async fn idle_read(
+        &mut self,
+        mut buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        if !self.has_pending() {
+            return read_first_or_shutdown(&mut self.io, buf, state, idle, fresh, timers).await;
+        }
+        // As `read_first_or_shutdown`: into `buf[..buf.len()]`.
+        // SAFETY: `buf` holds `len` initialized bytes to overwrite.
+        let n = unsafe { self.take_into(buf.as_mut_ptr(), buf.len()) };
+        (IdleRead::Read(n), buf)
+    }
+
+    async fn idle_wait(
+        &self,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> bool {
+        if self.has_pending() {
+            return fresh || !state.is_shutting_down();
+        }
+        wait_readable_or_shutdown(&self.io, state, idle, fresh, timers).await
+    }
+
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.io.as_raw_fd())
+    }
+
+    async fn wait_writable(&self) -> std::io::Result<()> {
+        self.io.writable(false).await
+    }
+}
+
 /// Upper bound for one `sendfile(2)` call, matching nginx's
 /// `sendfile_max_chunk` default (2m since 1.21.4).
 const SENDFILE_MAX_CHUNK: usize = 2 * 1024 * 1024;
