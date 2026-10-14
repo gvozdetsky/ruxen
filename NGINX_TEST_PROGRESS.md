@@ -7,13 +7,13 @@ Last run: 2026-10-14 against `nginx-tests` 0b70854 (2026-09-30).
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 105
+- **Passing in ruxen:** 106
 - **Intentionally skipped (`-V` banner excludes the module):** 346
-- **Failing — work in progress:** 54
+- **Failing — work in progress:** 53
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (105)
+## Passing in ruxen (106)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -110,6 +110,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `ssl_session_reuse.t`
 - `ssl_sni.t`
 - `ssl_sni_sessions.t`
+- `stub_status.t`
 - `syslog.t`
 - `trailers.t`
 - `upstream.t`
@@ -123,7 +124,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (54)
+## Failing — actively being worked on (53)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -178,7 +179,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `ssl_stapling.t` — 10/12
 - `ssl_verify_client.t` — 14/16
 - `ssl_verify_depth.t` — 9/11
-- `stub_status.t` — passes on some runs, not on CI: a just-closed connection is sometimes still counted (#383)
 - `upstream_max_conns.t` — 16/18
 - `upstream_zone_ssl.t` — 9/11
 
