@@ -56,7 +56,9 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// waits until it accepts.
 fn start(tag: &str, user_line: &str, conf: &str) -> (Server, u16, PathBuf) {
     let dir = temp_dir(tag);
-    let _setup = common::ports::setup_lock();
+    // Held until ruxen listens: released earlier, another test could take
+    // the same free port, and the readiness probe would reach its server.
+    let setup = common::ports::setup_lock();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -67,25 +69,23 @@ fn start(tag: &str, user_line: &str, conf: &str) -> (Server, u16, PathBuf) {
         .replace("%%PORT%%", &port.to_string());
     let conf_path = dir.join("ruxen.conf");
     std::fs::write(&conf_path, conf).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .args(["-c", conf_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .args(["-c", conf_path.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        dir: dir.clone(),
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    (
-        Server {
-            child,
-            dir: dir.clone(),
-        },
-        port,
-        dir,
-    )
+    drop(setup);
+    (server, port, dir)
 }
 
 fn get(port: u16, path: &str) -> String {

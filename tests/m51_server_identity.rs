@@ -10,8 +10,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Server {
     child: Child,
@@ -30,7 +29,7 @@ impl Drop for Server {
 fn start(nginx_identity: bool) -> Server {
     // Held from the port pick until ruxen listens: a parallel test's
     // backend can't take the port in between (#230).
-    let _setup = common::ports::setup_lock();
+    let setup = common::ports::setup_lock();
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let port = {
@@ -57,19 +56,24 @@ fn start(nginx_identity: bool) -> Server {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ruxen"));
     cmd.arg("-c")
         .arg(&conf)
+        .arg("-g")
+        .arg(format!("pid {}/ruxen.pid;", dir.display()))
         .env_remove("RUXEN_NGINX_IDENTITY")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if nginx_identity {
         cmd.env("RUXEN_NGINX_IDENTITY", "1");
     }
-    let child = cmd.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
-    Server { child, port, dir }
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server {
+        child: cmd.spawn().unwrap(),
+        port,
+        dir,
+    };
+    let pid_file = server.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.child, &pid_file, Duration::from_secs(3));
+    drop(setup);
+    server
 }
 
 fn get(port: u16, path: &str) -> String {

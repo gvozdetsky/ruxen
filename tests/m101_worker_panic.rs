@@ -10,20 +10,39 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::MutexGuard;
+use std::time::Duration;
 
-fn setup(name: &str) -> (PathBuf, u16) {
+/// The server stops when the test ends, also when an assertion panics:
+/// an orphaned ruxen otherwise keeps its port and CPU after the run.
+struct KillOnDrop(std::process::Child);
+
+impl KillOnDrop {
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The directory, the port, and the port lock, held until ruxen listens
+/// (or has exited): released earlier, another test could take the same
+/// free port, and ruxen would fail to bind it.
+fn setup(name: &str) -> (PathBuf, u16, MutexGuard<'static, ()>) {
     let dir = std::env::temp_dir().join(format!("ruxen-m101-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let port = {
-        let _setup = common::ports::setup_lock();
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
+    let setup = common::ports::setup_lock();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let d = dir.display();
     std::fs::write(
         dir.join("nginx.conf"),
@@ -34,7 +53,7 @@ fn setup(name: &str) -> (PathBuf, u16) {
         ),
     )
     .unwrap();
-    (dir, port)
+    (dir, port, setup)
 }
 
 fn request(port: u16, method: &str) -> String {
@@ -52,20 +71,19 @@ fn request(port: u16, method: &str) -> String {
 
 #[test]
 fn m101_panic_in_a_connection_closes_only_that_connection() {
-    let (dir, port) = setup("conn");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .env("RUXEN_TEST_PANIC", "trace")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let (dir, port, setup) = setup("conn");
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .env("RUXEN_TEST_PANIC", "trace")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child.0, &dir.join("ruxen.pid"), Duration::from_secs(5));
+    drop(setup);
     // The TRACE connection is dropped without an answer.
     assert_eq!(request(port, "TRACE"), "");
     // The one worker is still there, and keeps answering.
@@ -73,9 +91,8 @@ fn m101_panic_in_a_connection_closes_only_that_connection() {
         let response = request(port, "GET");
         assert!(response.ends_with("\r\n\r\nok"), "{response}");
     }
-    assert!(child.try_wait().unwrap().is_none(), "ruxen exited");
-    let _ = child.kill();
-    let _ = child.wait();
+    assert!(child.0.try_wait().unwrap().is_none(), "ruxen exited");
+    child.stop();
     let log = std::fs::read_to_string(dir.join("error.log")).unwrap();
     assert!(
         log.contains("[alert] ") && log.contains("ruxen-worker-0 panicked at src/phase.rs:"),
@@ -91,7 +108,8 @@ fn m101_panic_in_a_connection_closes_only_that_connection() {
 
 #[test]
 fn m101_worker_that_panics_stops_the_server() {
-    let (dir, _port) = setup("worker");
+    // The lock stays held while this ruxen binds the port and exits.
+    let (dir, _port, setup) = setup("worker");
     let out = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg("-c")
         .arg(dir.join("nginx.conf"))
@@ -100,6 +118,7 @@ fn m101_worker_that_panics_stops_the_server() {
         .stderr(Stdio::null())
         .output()
         .unwrap();
+    drop(setup);
     assert_eq!(out.status.code(), Some(1));
     assert!(!dir.join("ruxen.pid").exists(), "pid file left behind");
     let log = std::fs::read_to_string(dir.join("error.log")).unwrap();
