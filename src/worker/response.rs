@@ -181,6 +181,13 @@ pub(crate) fn response_header_values_all(response: &[u8], name: &[u8]) -> Vec<Ve
     values
 }
 
+/// A 444 without a body: nginx's NGX_HTTP_CLOSE, which closes the
+/// connection instead of answering (#397).
+#[inline]
+pub(crate) fn closes_unanswered(bytes: &[u8]) -> bool {
+    bytes.get(9..12) == Some(b"444") && bytes.ends_with(b"\r\n\r\n")
+}
+
 pub(crate) fn response_status(bytes: &[u8]) -> u16 {
     if bytes.len() < 12 {
         return 0;

@@ -3627,6 +3627,55 @@ pub(crate) async fn handle<S: ConnIo>(
                             None => (response, None),
                         };
 
+                        // `return 444;` (no text) is nginx's NGX_HTTP_CLOSE: no
+                        // response at all; the connection closes after the
+                        // log line (#397). With text it is an ordinary response.
+                        let closes = match &response {
+                            Response::Prebuilt(b) => super::closes_unanswered(b),
+                            Response::Owned(b) => super::closes_unanswered(b),
+                            _ => false,
+                        };
+                        if closes {
+                            if !process_meta.access_logs.is_empty() {
+                                let logged: &[u8] = match &response {
+                                    Response::Prebuilt(b) => b,
+                                    Response::Owned(b) => b,
+                                    _ => &[],
+                                };
+                                Box::pin(write_access_logs(
+                                    process_meta.access_logs,
+                                    path,
+                                    method_bytes,
+                                    request_line,
+                                    host,
+                                    &remote_addr,
+                                    remote_port,
+                                    process_meta.remote_user.as_deref(),
+                                    headers_raw,
+                                    logged,
+                                    connection_id,
+                                    request_count,
+                                    connection_time_us,
+                                    request_start.elapsed().as_micros() as u64,
+                                    process_meta.server_port,
+                                    request_port,
+                                    pipe_byte,
+                                    request_length,
+                                    0,
+                                    0,
+                                    epoch_secs,
+                                    epoch_ms,
+                                    tls,
+                                    conn,
+                                    http,
+                                    Some(&process_meta),
+                                    final_uri(&process_meta, url_scratch),
+                                ))
+                                .await;
+                            }
+                            return;
+                        }
+
                         // Funnel the response bytes into `scratch`. Owned and
                         // File variants hand us a Vec the handler allocated
                         // this request — prefer whichever of the two buffers
