@@ -24,6 +24,7 @@ mod error;
 mod lexer;
 mod parse_access;
 mod parse_gzip;
+mod parse_http2;
 mod parse_limit_conn;
 mod parse_limit_req;
 mod parse_location;
@@ -37,6 +38,7 @@ mod values;
 pub use ast::*;
 pub use error::*;
 pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_http2::Http2Conf;
 pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
 pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
@@ -266,6 +268,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut servers: Vec<Server> = Vec::new();
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
+    let mut http2_conf = Http2Conf::default();
     let mut limit_req = LimitReqConf::default();
     let mut limit_req_zones: Vec<LimitReqZoneDef> = Vec::new();
     let mut limit_conn = LimitConnConf::default();
@@ -288,6 +291,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
+    let mut http2: Option<bool> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
@@ -401,6 +405,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         uses_stats: false,
                         client_body_temp_path,
                         sendfile,
+                        http2,
+                        http2_conf,
                         disable_symlinks,
                         limit_rate,
                         limit_rate_after,
@@ -761,6 +767,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 disable_symlinks = Some(parse_disable_symlinks_args(&args[1..])?);
             }
+            ("http2", Terminator::Semi) => {
+                if http2.is_some() {
+                    return Err(Error::Duplicate("http2"));
+                }
+                http2 = Some(parse_on_off_args(&args[1..], "http2")?);
+            }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
                     return Err(Error::Duplicate("sendfile"));
@@ -861,6 +873,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
+            (name, Terminator::Semi) if Http2Conf::takes(name) => {
+                http2_conf.parse(&args, &mut warnings)?
+            }
             (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
             (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,
             ("limit_conn_zone", Terminator::Semi) => {

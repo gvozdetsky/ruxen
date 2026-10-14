@@ -1826,6 +1826,40 @@ pub(crate) fn rejects_handshake(listen: &PreparedListen, sni: Option<&str>) -> b
     rejecting.get(index).copied().unwrap_or(false)
 }
 
+/// The handshake for a ClientHello with this SNI name: refused
+/// (`rejects_handshake`), or accepted with `h2` offered only when the
+/// server the name selects (else the TLS default server) has HTTP/2 on,
+/// as ngx_http_ssl_alpn_select asks the server the servername callback
+/// chose (#144).
+pub(crate) fn tls_choice(listen: &PreparedListen, sni: Option<&str>) -> crate::tls_stream::Choice {
+    use crate::tls_stream::Choice;
+    if rejects_handshake(listen, sni) {
+        return Choice::Reject;
+    }
+    if !listen.h2_by_sni {
+        return Choice::Accept;
+    }
+    let server = sni
+        .and_then(|name| match_server_name(listen, name.as_bytes()))
+        .map(|(server, _)| server)
+        .unwrap_or(&listen.servers[listen.tls_default_server]);
+    if server.http2 {
+        Choice::Accept
+    } else {
+        Choice::AcceptWithoutH2
+    }
+}
+
+/// The server a request with this `Host` (else SNI name) goes to, as
+/// `process` chooses it.
+pub(crate) fn server_for(
+    listen: &'static PreparedListen,
+    host: Option<&[u8]>,
+    sni: Option<&[u8]>,
+) -> &'static PreparedServer {
+    find_config(listen, host, sni).0
+}
+
 /// Run the exact / leading-wildcard / trailing-wildcard / regex ladder
 /// for one candidate hostname. Used both for the HTTP `Host` header pass
 /// and the TLS SNI fallback pass — the matching logic is identical, only

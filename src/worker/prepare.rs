@@ -85,6 +85,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         client_body_buffer_size,
         client_body_temp_path,
         sendfile,
+        http2,
+        http2_conf,
         disable_symlinks,
         limit_rate,
         limit_rate_after,
@@ -133,6 +135,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_client_max_body_size = client_max_body_size;
     let http_client_body_buffer_size = client_body_buffer_size;
     let http_sendfile = sendfile;
+    let http_http2 = http2;
     let http_disable_symlinks = disable_symlinks;
     let http_limit_rate =
         PreparedLimitRate::inherit(limit_rate, limit_rate_after, PreparedLimitRate::default());
@@ -185,6 +188,22 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             })
             .collect();
         let proxy_protocol = servers_for_addr.iter().any(|s| s.listen.proxy_protocol);
+        // HTTP/2 (#144): `listen … http2` for the address, `http2 on` per
+        // server (server, else http).
+        let http2_listen = servers_for_addr.iter().any(|s| s.listen.http2);
+        let server_http2: Vec<bool> = servers_for_addr
+            .iter()
+            .map(|s| http2_listen || s.http2.or(http_http2).unwrap_or(false))
+            .collect();
+        let http2 = server_http2.iter().any(|&on| on);
+        let server_h2: Vec<crate::config::Http2Conf> = servers_for_addr
+            .iter()
+            .map(|s| s.http2_conf.inherit(&http2_conf))
+            .collect();
+        let tls_default_server = servers_for_addr
+            .iter()
+            .position(|s| s.listen.default_server)
+            .unwrap_or(0);
         // Socket options belong to the address: one server may set them
         // (nginx's "duplicate listen options").
         let mut with_options = servers_for_addr
@@ -196,7 +215,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             return Err(format!("duplicate listen options for {addr}"));
         }
         let socket = ListenSocket::from_listen(options);
-        let servers: Vec<PreparedServer> = servers_for_addr
+        let mut servers: Vec<PreparedServer> = servers_for_addr
             .into_iter()
             .map(|s| {
                 prepare_server(
@@ -223,7 +242,13 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 )
             })
             .collect::<Result<_, _>>()?;
-        let tls = build_listen_tls(addr, &tls_inputs)?;
+        for ((server, on), h2) in servers.iter_mut().zip(&server_http2).zip(&server_h2) {
+            server.http2 = *on;
+            server.h2 = *h2;
+        }
+        let h2_by_sni = server_http2.iter().any(|&on| on != http2);
+        let tls = build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)?;
+        let h2_by_sni = h2_by_sni && tls.is_some();
         let reject_handshake = (tls.is_some()
             && tls_inputs
                 .iter()
@@ -278,6 +303,11 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             tls,
             reject_handshake,
             proxy_protocol,
+            http2_listen,
+            // The default server is the first (`default_server: 0`).
+            h2_plain: server_http2.first().copied().unwrap_or(false),
+            h2_by_sni,
+            tls_default_server,
             socket,
         });
     }
@@ -368,6 +398,8 @@ pub(crate) struct TlsServerInput {
 pub(crate) fn build_listen_tls(
     addr: SocketAddr,
     inputs: &[TlsServerInput],
+    http2: bool,
+    h2_by_sni: bool,
 ) -> Result<Option<Arc<crate::tls::TlsAcceptor>>, String> {
     use crate::config::ServerNameSpec;
 
@@ -474,7 +506,7 @@ pub(crate) fn build_listen_tls(
         }
         None => None,
     };
-    let cfg = crate::tls_certs::build_server_config(
+    let mut cfg = crate::tls_certs::build_server_config(
         resolver,
         protocols,
         session_timeout_secs,
@@ -482,7 +514,17 @@ pub(crate) fn build_listen_tls(
         ticket_keys,
     )
     .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
-    Ok(Some(Arc::new(crate::tls::acceptor_from_config(cfg))))
+    // ALPN offers h2 first where HTTP/2 is on (#144), as
+    // ngx_http_ssl_alpn_select prefers it.
+    if http2 && let Some(cfg) = Arc::get_mut(&mut cfg) {
+        cfg.alpn_protocols.insert(0, b"h2".to_vec());
+    }
+    let acceptor = crate::tls::acceptor_from_config(cfg);
+    Ok(Some(Arc::new(if h2_by_sni {
+        acceptor.with_choice_of_h2()
+    } else {
+        acceptor
+    })))
 }
 
 pub(crate) fn prepare_upstreams(
@@ -1830,6 +1872,10 @@ pub(crate) fn prepare_server(
 
     Ok(PreparedServer {
         doc_root: server_doc_root,
+        // Set by the caller, which knows the http scope.
+        http2: false,
+        h2: Default::default(),
+        keepalive: server_keepalive,
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
         exact_names,
         wildcard_leading,
@@ -2195,6 +2241,7 @@ fn request_constant(parts: &[ValuePart]) -> bool {
                 | Variable::IsRequestPort
                 | Variable::Request
                 | Variable::ServerProtocol
+                | Variable::Http2
                 | Variable::SslProtocol
                 | Variable::SslCipher
                 | Variable::SslCiphers

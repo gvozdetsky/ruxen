@@ -50,6 +50,7 @@ use crate::{autoindex, file, fs_resolve, uri};
 
 mod connection;
 pub(crate) mod gzip;
+mod h2;
 mod handler;
 pub(crate) mod limit_conn;
 pub(crate) mod limit_req;

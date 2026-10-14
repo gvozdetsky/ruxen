@@ -78,19 +78,19 @@ where
     }
 }
 
-/// `accept_with_timeout` for an address where a server has
-/// `ssl_reject_handshake on`: `reject` decides from the ClientHello's SNI
-/// name (`TlsAcceptor::accept_or_reject`).
-pub async fn accept_or_reject_with_timeout<IO>(
+/// `accept_with_timeout` for an address where the ClientHello's SNI name
+/// decides something (`TlsAcceptor::accept_choosing`): a server has
+/// `ssl_reject_handshake on`, or HTTP/2 is on for some servers only.
+pub async fn accept_choosing_with_timeout<IO>(
     acceptor: &TlsAcceptor,
     stream: IO,
     timeout: Duration,
-    reject: impl FnOnce(Option<&str>) -> bool,
+    choose: impl FnOnce(Option<&str>) -> crate::tls_stream::Choice,
 ) -> Result<Handshake<IO>, AcceptError>
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
-    match monoio::time::timeout(timeout, acceptor.accept_or_reject(stream, reject)).await {
+    match monoio::time::timeout(timeout, acceptor.accept_choosing(stream, choose)).await {
         Ok(Ok(accepted)) => Ok(accepted.into()),
         Ok(Err(e)) => Err(AcceptError::Tls(e)),
         Err(_elapsed) => Err(AcceptError::Timeout),

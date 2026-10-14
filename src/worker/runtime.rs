@@ -2610,6 +2610,26 @@ pub(crate) async fn handle_plain(
         proxy_protocol,
         plain_http: false,
     };
+    let listen = &http.listens[listen_index];
+    // Boxed, here and in `handle_tls`: awaited in place, the HTTP/2
+    // futures would make every connection's task larger.
+    if listen.h2_plain {
+        let wait = listen.servers[listen.default_server].timeouts.header;
+        if Box::pin(super::h2::starts_with_preface(&stream, wait)).await {
+            return serve_h2(
+                stream,
+                peer_addr,
+                listen_index,
+                None,
+                None,
+                conn,
+                http,
+                state,
+                connection_id,
+            )
+            .await;
+        }
+    }
     // Boxed: the connection's future is about 10 KiB, and the task that
     // `spawn_connection` builds would otherwise be moved, all of it, into
     // the runtime on every accept. Here the task stays small and the big
@@ -2654,9 +2674,9 @@ pub(crate) async fn handle_tls(
         plain_http: false,
     };
     let budget = budget.saturating_sub(accepted_at.elapsed());
-    let accepted = if listen.reject_handshake.is_some() {
-        crate::tls::accept_or_reject_with_timeout(&acceptor, stream, budget, |sni| {
-            phase::rejects_handshake(listen, sni)
+    let accepted = if listen.reject_handshake.is_some() || listen.h2_by_sni {
+        crate::tls::accept_choosing_with_timeout(&acceptor, stream, budget, |sni| {
+            phase::tls_choice(listen, sni)
         })
         .await
     } else {
@@ -2711,6 +2731,23 @@ pub(crate) async fn handle_tls(
             .map(|b| b.to_ascii_lowercase())
             .collect()
     });
+    if info.alpn_protocol.as_deref() == Some(b"h2") {
+        // A read and a write run at once on an HTTP/2 connection.
+        tls_stream.begin_tunnel();
+        let sni = sni.clone();
+        return serve_h2(
+            tls_stream,
+            peer_addr,
+            listen_index,
+            sni,
+            Some(info),
+            conn,
+            http,
+            state,
+            connection_id,
+        )
+        .await;
+    }
     // Boxed, as in `handle_plain`.
     Box::pin(handle(
         &mut tls_stream,
@@ -2735,6 +2772,40 @@ pub(crate) async fn handle_tls(
     .await;
 }
 
+/// An HTTP/2 connection (#144), cold: boxed so its future isn't part of
+/// the HTTP/1.1 connection's.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn serve_h2<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    listen_index: usize,
+    sni: Option<Vec<u8>>,
+    tls: Option<crate::tls::HandshakeInfo>,
+    conn: phase::ConnInfo,
+    http: &'static PreparedHttp,
+    state: &'static RuntimeState,
+    connection_id: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+where
+    S: ConnIo + 'static,
+{
+    Box::pin(super::h2::serve(
+        stream,
+        super::h2::ConnCtx {
+            peer_addr,
+            listen_index,
+            sni,
+            tls,
+            conn,
+            http,
+            state,
+            connection_id,
+        },
+    ))
+}
+
 pub(crate) async fn handle<S: ConnIo>(
     stream: &mut S,
     peer_addr: SocketAddr,
@@ -2754,7 +2825,10 @@ pub(crate) async fn handle<S: ConnIo>(
     // Outer loop = idle ↔ active cycle; inner loop = within an active
     // session, read more / parse / write until the session drains back to
     // empty (→ idle) or the request-line overflows the buffer (→ close).
-    let mut parse_state = ParseState::default();
+    let mut parse_state = ParseState {
+        h2: stream.h2(),
+        ..ParseState::default()
+    };
 
     // Per-connection counters surfaced via `$connection*` variables.
     // `connection_id` is assigned once in the accept loop. `request_count` tracks
@@ -2762,7 +2836,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // nginx increments `r->connection->requests` at request init, so
     // `$connection_requests` reads 1 on the first request, 2 on the
     // second, etc. Incrementing before rendering matches that contract.
-    let connection_start = Instant::now();
+    let (connection_start, mut request_count) = stream
+        .conn_counters()
+        .unwrap_or_else(|| (Instant::now(), 0));
     let mut remote_addr_buf = [0u8; 48];
     let (remote_addr, remote_port): (&[u8], u16) = if http.listens[listen_index].unix.is_some() {
         // A unix-domain client is `unix:`, with no port (#263).
@@ -2776,7 +2852,6 @@ pub(crate) async fn handle<S: ConnIo>(
         let n = cursor.position() as usize;
         (&remote_addr_buf[..n], peer_addr.port())
     };
-    let mut request_count: u64 = 0;
     // The default server's client timeouts: the header is read before a
     // virtual server is chosen (as in nginx). A request's body and response
     // use its location's client_body_timeout and send_timeout (#147).
@@ -3826,15 +3901,22 @@ pub(crate) async fn handle<S: ConnIo>(
                                         )
                                         .await
                                     }
-                                    None => stream_file(
-                                        stream,
-                                        body,
-                                        timers.io.as_mut(),
-                                        send_timeout,
-                                        None,
-                                    )
-                                    .await
-                                    .then_some(streamed_body_len),
+                                    None => match if stream.sends_file_bodies() {
+                                        stream.send_file_body(&body).await
+                                    } else {
+                                        None
+                                    } {
+                                        Some(sent) => sent.then_some(streamed_body_len),
+                                        None => stream_file(
+                                            stream,
+                                            body,
+                                            timers.io.as_mut(),
+                                            send_timeout,
+                                            None,
+                                        )
+                                        .await
+                                        .then_some(streamed_body_len),
+                                    },
                                 };
                                 match sent {
                                     Some(n) => streamed_body_len = n,

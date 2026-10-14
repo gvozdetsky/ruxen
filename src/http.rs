@@ -147,11 +147,18 @@ pub struct ParseState {
     pub has_content_range: bool,
     pub has_expect: bool,
     pub has_authorization: bool,
+    /// The request comes from an HTTP/2 stream (#144), translated to a
+    /// request head whose version is `HTTP/2.0`, which only then is
+    /// valid. Kept across `reset`: it belongs to the connection.
+    pub h2: bool,
 }
 
 impl ParseState {
     pub fn reset(&mut self) {
-        *self = ParseState::default();
+        *self = ParseState {
+            h2: self.h2,
+            ..ParseState::default()
+        };
     }
 }
 
@@ -166,7 +173,7 @@ pub fn parse_request(buf: &[u8], st: &mut ParseState) -> Parse {
     let n = buf.len();
 
     if !st.rline_done {
-        match parse_request_line(buf, st.cursor) {
+        match parse_request_line(buf, st.cursor, st.h2) {
             LineParse::Ok {
                 next,
                 method_start,
@@ -596,7 +603,7 @@ enum LineParse {
     Invalid,
 }
 
-fn parse_request_line(buf: &[u8], start: usize) -> LineParse {
+fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
     let n = buf.len();
     let mut i = start;
 
@@ -665,9 +672,12 @@ fn parse_request_line(buf: &[u8], start: usize) -> LineParse {
     }
     let v = &buf[i..i + 8];
     if &v[..7] != b"HTTP/1." || (v[7] != b'0' && v[7] != b'1') {
-        return LineParse::Invalid;
+        // An HTTP/2 stream's request: HTTP/1.1 semantics otherwise.
+        if !(h2 && v == b"HTTP/2.0") {
+            return LineParse::Invalid;
+        }
     }
-    let http_11 = v[7] == b'1';
+    let http_11 = v[7] == b'1' || v[5] == b'2';
     i += 8;
 
     if i >= n {

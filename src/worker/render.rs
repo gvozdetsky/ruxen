@@ -211,6 +211,12 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::ServerProtocol => out.extend_from_slice(server_protocol(self.request_line)),
+            // An HTTP/2 stream's request line says `HTTP/2.0` (`worker::h2`).
+            Variable::Http2 => {
+                if server_protocol(self.request_line) == b"HTTP/2.0" {
+                    out.extend_from_slice(if self.tls.is_some() { b"h2" } else { b"h2c" });
+                }
+            }
             Variable::Host => out.extend_from_slice(self.host),
             Variable::RemoteAddr => out.extend_from_slice(self.remote_addr),
             // ngx_http_variable_binary_remote_addr: the address bytes; a

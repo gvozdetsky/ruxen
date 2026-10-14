@@ -43,6 +43,9 @@ rustls = "0.23"
 # rustls, with the features rustls turns on.
 aws-lc-rs = { version = "1.16", default-features = false }
 rustls-pemfile = "2"
+h2 = "0.4"
+http = "1"
+tokio = { version = "1", default-features = false }
 
 # musl's allocator is slow on the per-request proxy and TLS paths (#199);
 # the glibc builds keep the system allocator.

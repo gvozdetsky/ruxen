@@ -1481,6 +1481,15 @@ pub struct PreparedServer {
     pub doc_root: &'static DocRoot,
     /// Client-side timeouts. The worker uses the listen's default server's
     /// values for the whole connection (see `handle`).
+    /// HTTP/2 for this server: `http2 on` (server, else http) or
+    /// `listen … http2` (#144).
+    pub http2: bool,
+    /// Its `http2_*` settings, http's inherited (#346).
+    pub h2: crate::config::Http2Conf,
+    /// The server-level keep-alive settings, which an HTTP/2 connection
+    /// follows (`keepalive_requests` per connection, as nginx does with
+    /// its default server's).
+    pub keepalive: PreparedKeepalive,
     pub timeouts: PreparedClientTimeouts,
     /// Lowercased exact-match names (e.g. `localhost`,
     /// `www.example.com`). HostCheck compares byte-for-byte.
@@ -1587,6 +1596,18 @@ pub struct PreparedListen {
     /// `listen … proxy_protocol` on any server of this address: every
     /// connection starts with a PROXY protocol header.
     pub proxy_protocol: bool,
+    /// `listen … http2` on the address: every server takes HTTP/2, as
+    /// nginx's `addr_conf->http2`.
+    pub http2_listen: bool,
+    /// Plain connections are looked at for the preface: `listen … http2`,
+    /// or `http2 on` in the default server (ngx_http_init_connection).
+    pub h2_plain: bool,
+    /// The servers differ in `http2`: the SNI name decides whether ALPN
+    /// offers `h2` (`phase::tls_choice`).
+    pub h2_by_sni: bool,
+    /// The TLS default server (`default_server`, else the first), for a
+    /// ClientHello without a name that selects one.
+    pub tls_default_server: usize,
     /// The listening socket's options.
     pub socket: ListenSocket,
     /// Every regex `server_name` of `servers`, in the order they are tried

@@ -28,7 +28,7 @@ See [`DESIGN.md`](DESIGN.md) for the architecture notes and the reasoning behind
 The v0.1 scope is deliberately limited:
 
 - Linux only
-- HTTP/1.1 only
+- HTTP/1.1, and HTTP/2 for clients (`http2 on`; over TLS through ALPN, and cleartext with prior knowledge)
 - hand-written HTTP parser
 - thread-per-core workers
 - `io_uring` via monoio (epoll where `io_uring` is unavailable)
@@ -38,7 +38,6 @@ The v0.1 scope is deliberately limited:
 - TLS 1.2/1.3 termination via rustls
 - no module system
 - a proxy cache (`proxy_cache`)
-- no HTTP/2 yet
 
 The upstream `nginx-tests` suite is used as a compatibility test. **105 of the 159 test files that ruxen currently opts into pass end-to-end** (v0.1.3).
 
@@ -403,7 +402,7 @@ See [`DESIGN.md`](DESIGN.md) for the current baseline and performance notes.
 
 The following are intentionally outside the current v0.1 scope:
 
-- HTTP/2
+- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
 - nginx's module ecosystem
 - a proxy cache file per `Vary` variant (another variant replaces the stored one)
 - TLS to upstream servers (`proxy_ssl_*`)
