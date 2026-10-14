@@ -92,7 +92,7 @@ pub struct ProxyPlan {
     /// HEAD responses on the way back when the upstream sends one
     /// anyway.
     pub method: Method,
-    /// Stores whether proxy_method is HEAD so it we know not to expect a response from the upstream
+    /// Stores whether proxy_method is HEAD so we can use it to determine whether to expect a body in the response
     pub upstream_head: bool,
     /// `Server:` header bytes for synthesized 502/504 errors.
     #[allow(dead_code)]

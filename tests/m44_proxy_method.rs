@@ -326,3 +326,62 @@ http {
 "#;
     assert!(!config_test_passes(conf));
 }
+
+/// `proxy_method HEAD` with a GET client: the upstream answers HEAD with
+/// headers and no body. ruxen must not wait for a body, so the backend
+/// keeps the connection open for a while and the client must still get
+/// its response well before the backend closes.
+#[test]
+fn m44_proxy_method_head_does_not_wait_for_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_b = listener.local_addr().unwrap().port();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            match s.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let _ = seen_tx.send(buf);
+        // Headers only, with a Content-Length that is never filled.
+        let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 1000\r\n\r\n");
+        // Hold the connection open so a ruxen that waits for the body
+        // would stall until this sleep ends.
+        sleep(Duration::from_secs(4));
+    });
+
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://127.0.0.1:{port_b};
+            proxy_method HEAD;
+        }}
+    }}
+}}
+"#
+    );
+    let (_guard, port) = spawn_ruxen(&conf);
+    let start = Instant::now();
+    let resp = http_send(
+        port,
+        b"GET /h HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n",
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(status_code(&resp), 200, "response: {resp:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "ruxen waited for a body that never comes ({elapsed:?})"
+    );
+    let req = seen_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("backend saw request");
+    assert_eq!(request_line(&req), "HEAD /h HTTP/1.0");
+}
