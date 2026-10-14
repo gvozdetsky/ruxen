@@ -3870,7 +3870,11 @@ pub(crate) async fn handle<S: ConnIo>(
                                         )
                                         .await
                                     }
-                                    None => match stream.send_file_body(&body).await {
+                                    None => match if stream.sends_file_bodies() {
+                                        stream.send_file_body(&body).await
+                                    } else {
+                                        None
+                                    } {
                                         Some(sent) => sent.then_some(streamed_body_len),
                                         None => stream_file(
                                             stream,

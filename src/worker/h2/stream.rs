@@ -626,6 +626,10 @@ impl super::super::ConnIo for StreamIo {
         true
     }
 
+    fn sends_file_bodies(&self) -> bool {
+        true
+    }
+
     /// The file read straight into the `Bytes` its DATA frames carry: no
     /// zeroed buffer per request and no copy into the frames (#348). Only
     /// for a body the head announced with its length, up to 1 MiB.

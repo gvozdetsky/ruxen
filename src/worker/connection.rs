@@ -126,10 +126,16 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// to the socket itself.
     fn begin_tunnel(&mut self) {}
 
+    /// Whether `send_file_body` may take a file body: a plain check, so
+    /// that HTTP/1 connections don't pay for the call.
+    fn sends_file_bodies(&self) -> bool {
+        false
+    }
+
     /// Send a file body itself, when the transport can do better than
     /// `stream_file`'s read-and-write loop: an HTTP/2 stream hands the
     /// bytes to its DATA frames without copying them (#348). `None`: not
-    /// done, use the loop.
+    /// done, use the loop. Called only when `sends_file_bodies`.
     async fn send_file_body(&mut self, _body: &phase::FileBody) -> Option<bool> {
         None
     }
