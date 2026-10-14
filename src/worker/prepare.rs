@@ -2306,9 +2306,23 @@ impl<'a> AccessLogPrep<'a> {
             }
         };
         let file_index = self.canonical.len();
+        let path_vars = log.path_vars.clone().map(prepare_value_parts);
+        let condition = log.condition.clone().map(prepare_value_parts);
+        let reads_doc_root = [Some(format), path_vars, condition]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|p| {
+                matches!(
+                    p,
+                    PreparedValuePart::Var(
+                        Variable::DocumentRoot | Variable::RequestFilename | Variable::RealpathRoot
+                    )
+                )
+            });
         let prepared = PreparedAccessLog {
             buffer,
-            path_vars: log.path_vars.clone().map(prepare_value_parts),
+            path_vars,
             path: Box::leak(log.path.clone().into_boxed_path()),
             format,
             escape,
@@ -2318,7 +2332,8 @@ impl<'a> AccessLogPrep<'a> {
                     PreparedValuePart::Var(Variable::UpstreamHttp(_) | Variable::UpstreamCookie(_))
                 )
             }),
-            condition: log.condition.clone().map(prepare_value_parts),
+            reads_doc_root,
+            condition,
             file_index,
             syslog,
         };
