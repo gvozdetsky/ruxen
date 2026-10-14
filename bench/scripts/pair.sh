@@ -93,9 +93,11 @@ require_cmd wrk
 require_cmd curl
 require_cmd awk
 default_bin="${REPO_ROOT}/target/release/ruxen"
-for bin in "${A_BIN:-$default_bin}" "${B_BIN:-$default_bin}"; do
-    [[ -x "$bin" ]] || die "missing ruxen binary: $bin (run: cargo build --release)"
-done
+# Only a ruxen side needs a binary: an nginx A side runs without one.
+[[ "$A_KIND" != "ruxen" || -x "${A_BIN:-$default_bin}" ]] \
+    || die "missing ruxen binary: ${A_BIN:-$default_bin} (run: cargo build --release)"
+[[ "$B_KIND" != "ruxen" || -x "${B_BIN:-$default_bin}" ]] \
+    || die "missing ruxen binary: ${B_BIN:-$default_bin} (run: cargo build --release)"
 
 mapfile -t f < <(lookup_scenario "$SCENARIO_ID") \
     || die "unknown scenario: $SCENARIO_ID (see bench/scenarios/manifest.tsv)"
