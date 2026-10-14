@@ -146,10 +146,15 @@ http {
 
         location /preserve {
             error_page 404 /body200;
-            return 404 "first";
+            return 404;
         }
 
         location /override {
+            error_page 404 =200 /body200;
+            return 404;
+        }
+
+        location /text {
             error_page 404 =200 /body200;
             return 404 "first";
         }
@@ -161,7 +166,7 @@ http {
 
         location /redir {
             error_page 405 /return302;
-            return 405 "first";
+            return 405;
         }
 
         location /return302 {
@@ -230,6 +235,13 @@ fn m12_error_page_preserves_or_overrides_status_for_success_targets() {
     assert_eq!(status_line(&override_200), "HTTP/1.1 200 OK");
     assert_eq!(header_value(&override_200, "X-Status"), Some("200"));
     assert_eq!(body(&override_200), b"replacement");
+
+    // A `return` with text is sent as it is: nginx's
+    // ngx_http_script_return_code doesn't finalize it with the status
+    // (#372).
+    let text = http_get(port, "/text");
+    assert_eq!(status_line(&text), "HTTP/1.1 404 Not Found");
+    assert_eq!(body(&text), b"first");
 }
 
 #[test]
