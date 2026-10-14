@@ -695,6 +695,9 @@ pub struct PreparedProxy {
     pub request_path: &'static [u8],
     /// What to do with the upstream's response headers.
     pub response: &'static ProxyResponseRules,
+    /// Inheritance-resolved `proxy_method`: rendered per request and sent
+    /// instead of the client's request method.
+    pub proxy_method: Option<&'static [PreparedValuePart]>,
     /// `proxy_cache` (#233); `None` without one, or with `proxy_cache off`.
     pub cache: Option<&'static PreparedProxyCache>,
     /// `proxy_pass` with variables (#100): the URL, rendered and parsed per
@@ -808,6 +811,7 @@ pub(crate) struct ProxyEffective {
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
     pub recursive_error_pages: bool,
+    pub proxy_method: Option<&'static [PreparedValuePart]>,
     /// The nearest scopes' `proxy_cache*` directives, and the cache fields
     /// of `proxy_ignore_headers`.
     pub cache: &'static crate::config::ProxyCacheConf,
@@ -861,6 +865,7 @@ impl ProxyEffective {
             bind: None,
             error_pages: &[],
             recursive_error_pages: false,
+            proxy_method: None,
             cache: &NO_CACHE_CONF,
             cache_ignore: crate::proxy_cache::Ignore {
                 x_accel_expires: false,

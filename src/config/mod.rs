@@ -1022,7 +1022,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Caches the descriptors of access logs whose path has variables; ruxen
     // opens access logs once per worker anyway. Arguments are checked.
     "open_log_file_cache",
-    "proxy_method",
     "proxy_cookie_domain",
     "proxy_cookie_path",
     "proxy_cookie_flags",

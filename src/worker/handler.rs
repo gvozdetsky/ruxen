@@ -989,8 +989,15 @@ pub(crate) fn run_location_handler(
         // Pooled: with the body in it the buffer is as large as the body,
         // and a fresh one per request faults its pages in each time (#289).
         let mut request = crate::worker::take_body_buffer(0);
+        // The method sent upstream, in nginx's order
+        // (ngx_http_proxy_create_request): a HEAD the cache turns into a
+        // GET, then `proxy_method`, then the client's.
+        let mut proxy_method = Vec::new();
         let method_bytes = if cache.as_ref().is_some_and(|c| c.head_as_get) {
             &b"GET"[..]
+        } else if let Some(parts) = proxy.proxy_method {
+            render_parts(parts, &proxy_render_ctx, &mut proxy_method);
+            &proxy_method[..]
         } else {
             req.method_bytes
         };
@@ -1024,6 +1031,7 @@ pub(crate) fn run_location_handler(
         } else {
             None
         };
+        let upstream_head = method_bytes.eq_ignore_ascii_case(b"HEAD");
         let bind = proxy
             .bind
             .and_then(|bind| resolve_bind(bind, &proxy_render_ctx));
@@ -1034,6 +1042,7 @@ pub(crate) fn run_location_handler(
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
             body: separate_body,
             method: req.method,
+            upstream_head,
             server_bytes,
             connect_timeout: std::time::Duration::from_millis(proxy.connect_timeout_ms),
             read_timeout: std::time::Duration::from_millis(proxy.read_timeout_ms),

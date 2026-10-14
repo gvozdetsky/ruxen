@@ -84,6 +84,7 @@ pub struct ProxyConf {
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
+    pub proxy_method: Option<Vec<ValuePart>>,
     /// `proxy_cache` and the directives that tune it (#233).
     pub cache: ProxyCacheConf,
     /// `proxy_bind` (#135); `Some(ProxyBind::Off)` turns an inherited one off.
@@ -234,6 +235,7 @@ impl ProxyConf {
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
+            proxy_method: self.proxy_method.or_else(|| parent.proxy_method.clone()),
             cache: self.cache.inherit(&parent.cache),
             bind: self.bind.or_else(|| parent.bind.clone()),
         }

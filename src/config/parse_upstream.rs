@@ -651,6 +651,7 @@ impl ProxyConf {
         "proxy_redirect",
         "proxy_hide_header",
         "proxy_pass_header",
+        "proxy_method",
         "proxy_cache",
         "proxy_cache_key",
         "proxy_cache_valid",
@@ -966,6 +967,19 @@ impl ProxyConf {
                     return Err(Error::Duplicate(what));
                 }
                 *slot = Some(parse_proxy_timeout_args(&args[1..], what)?);
+            }
+            "proxy_method" => {
+                if self.proxy_method.is_some() {
+                    return Err(Error::Duplicate("proxy_method"));
+                }
+                let method = args.get(1).ok_or(Error::MissingArg("proxy_method"))?;
+                if args.len() != 2 {
+                    return Err(Error::BadValue {
+                        what: "proxy_method",
+                        got: args[1..].join(" "),
+                    });
+                }
+                self.proxy_method = Some(parse_value_with_vars(method)?);
             }
             other => unreachable!("not a ProxyConf directive: {other}"),
         }

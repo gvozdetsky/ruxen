@@ -970,6 +970,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                proxy_method: eff.proxy_method,
                 cache,
                 url: None,
                 bind: eff.bind,
@@ -1008,6 +1009,7 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                proxy_method: eff.proxy_method,
                 cache,
                 url: None,
                 bind: eff.bind,
@@ -1064,6 +1066,7 @@ pub(crate) fn build_proxy(
                 cache,
                 url: Some(prepare_value_parts(url)),
                 bind: eff.bind,
+                proxy_method: eff.proxy_method,
             }
         }
     })
@@ -1213,6 +1216,7 @@ pub(crate) struct ServerProxyDefaults {
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
+    pub proxy_method: Option<&'static [PreparedValuePart]>,
     pub cache: &'static crate::config::ProxyCacheConf,
     pub cache_ignore: crate::proxy_cache::Ignore,
     pub bind: Option<&'static PreparedBind>,
@@ -1291,6 +1295,7 @@ impl ServerProxyDefaults {
             redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
+            proxy_method: conf.proxy_method.map(prepare_value_parts),
             cache_ignore: cache_ignore(conf.ignore_headers.as_deref(), defaults.cache_ignore),
             cache: crate::arena::leak(Box::new(conf.cache)),
             bind: conf.bind.and_then(prepare_bind),
@@ -1399,6 +1404,10 @@ pub(crate) fn resolve_proxy_effective(
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
+        proxy_method: location
+            .proxy_method
+            .map(prepare_value_parts)
+            .or(server_defaults.proxy_method),
     }
 }
 

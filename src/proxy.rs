@@ -104,6 +104,9 @@ pub struct ProxyPlan {
     /// HEAD responses on the way back when the upstream sends one
     /// anyway.
     pub method: Method,
+    /// The method sent upstream is HEAD (compared case-insensitively, as
+    /// nginx sets `ctx->head`), so its response has no body.
+    pub upstream_head: bool,
     /// `Server:` header bytes for synthesized 502/504 errors.
     #[allow(dead_code)]
     pub server_bytes: &'static [u8],
@@ -1819,9 +1822,9 @@ async fn attempt(
     // does (ngx_http_proxy_module.c:1999), provided nothing was read past
     // the header.
     let skip_body = accel.as_ref().is_some_and(|a| a.redirect.is_some());
-    // A HEAD the cache sent as a GET (proxy_cache_convert_head) gets a body.
-    let upstream_head =
-        matches!(plan.method, Method::Head) && !plan.cache.as_ref().is_some_and(|c| c.head_as_get);
+    // No body follows when the method sent upstream was a HEAD: the
+    // client's, unless the cache sent it as a GET, or `proxy_method HEAD`.
+    let upstream_head = plan.upstream_head;
     let bodiless = upstream_head
         || status_code == 204
         || status_code == 304

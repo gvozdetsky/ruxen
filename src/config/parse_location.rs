@@ -1184,6 +1184,7 @@ pub(crate) fn parse_location_block(
                 | "proxy_redirect"
                 | "proxy_hide_header"
                 | "proxy_pass_header"
+                | "proxy_method"
                 | "location",
                 _,
             ) => {
