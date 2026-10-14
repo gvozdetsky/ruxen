@@ -109,7 +109,7 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         &self,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool;
 
@@ -120,17 +120,99 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// Wait until the socket accepts more data. Only used by the zero-copy
     /// path, which writes to the fd directly.
     async fn wait_writable(&self) -> std::io::Result<()>;
+
+    /// The connection is about to carry a tunnel (#87), where one read and
+    /// one write are in flight at once; after this, `read` must not write
+    /// to the socket itself.
+    fn begin_tunnel(&mut self) {}
+
+    /// Whether `send_file_body` may take a file body: a plain check, so
+    /// that HTTP/1 connections don't pay for the call.
+    fn sends_file_bodies(&self) -> bool {
+        false
+    }
+
+    /// Send a file body itself, when the transport can do better than
+    /// `stream_file`'s read-and-write loop: an HTTP/2 stream hands the
+    /// bytes to its DATA frames without copying them (#348). `None`: not
+    /// done, use the loop. Called only when `sends_file_bodies`.
+    async fn send_file_body(&mut self, _body: &phase::FileBody) -> Option<bool> {
+        None
+    }
+
+    /// An HTTP/2 stream (`h2::StreamIo`): its request line says `HTTP/2.0`.
+    fn h2(&self) -> bool {
+        false
+    }
+
+    /// For an HTTP/2 stream, its connection's start and the requests it
+    /// carried before this one (`$connection_time`, `$connection_requests`).
+    fn conn_counters(&self) -> Option<(Instant, u64)> {
+        None
+    }
+
+    /// Completes once the client has closed the connection (a read would
+    /// see EOF), for a response that waits between writes: nginx's
+    /// `ngx_http_test_reading` ends the request then (#383). Pending
+    /// otherwise, also once bytes arrive (a pipelined request, left for
+    /// the next read). Plain TCP watches; other transports never complete.
+    async fn peer_closed(&self) {
+        std::future::pending::<()>().await
+    }
+
+    /// The keep-alive wait for the next request, which may also read its
+    /// first bytes into `buf` (from offset 0). By default the readiness
+    /// wait of `idle_wait`, after which the caller reads.
+    async fn idle_read(
+        &mut self,
+        buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        let next = if self.idle_wait(state, idle, fresh, timers).await {
+            IdleRead::Ready
+        } else {
+            IdleRead::Close
+        };
+        (next, buf)
+    }
+}
+
+/// How a keep-alive wait ended.
+pub enum IdleRead {
+    /// Drop the connection (timeout, shutdown, reload, a slot needed, EOF).
+    Close,
+    /// A request may be there: read it.
+    Ready,
+    /// This many bytes of the next request are already in the buffer.
+    Read(usize),
 }
 
 impl ConnIo for TcpStream {
+    /// The read itself instead of a readiness poll and then a read: one
+    /// io_uring operation per keep-alive request instead of two (#145),
+    /// like nginx's `c->recv` on a read event.
+    async fn idle_read(
+        &mut self,
+        buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        read_first_or_shutdown(self, buf, state, idle, fresh, timers).await
+    }
+
     async fn idle_wait(
         &self,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool {
-        wait_readable_or_shutdown(self, state, idle, start_reload_gen, timers).await
+        wait_readable_or_shutdown(self, state, idle, fresh, timers).await
     }
 
     fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -141,6 +223,34 @@ impl ConnIo for TcpStream {
     async fn wait_writable(&self) -> std::io::Result<()> {
         self.writable(false).await
     }
+
+    async fn peer_closed(&self) {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            if self.readable(false).await.is_err() {
+                return;
+            }
+            let mut byte = 0u8;
+            // SAFETY: a one-byte peek into our own buffer; MSG_DONTWAIT
+            // keeps it from blocking whatever the socket's mode.
+            let n = unsafe {
+                libc::recv(
+                    self.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            match n {
+                0 => return,
+                // Bytes of a next request: no EOF to see behind them.
+                1.. => std::future::pending::<()>().await,
+                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => {}
+                // A reset or another error: the client is gone too.
+                _ => return,
+            }
+        }
+    }
 }
 
 impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
@@ -148,13 +258,13 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
         &self,
         state: &RuntimeState,
         idle: Option<Duration>,
-        start_reload_gen: u64,
+        fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool {
         if self.has_buffered_input() {
-            return !state.is_shutting_down() && state.reload_gen() == start_reload_gen;
+            return fresh || !state.is_shutting_down();
         }
-        wait_readable_or_shutdown(self.io(), state, idle, start_reload_gen, timers).await
+        wait_readable_or_shutdown(self.io(), state, idle, fresh, timers).await
     }
 
     fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -163,6 +273,136 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
 
     async fn wait_writable(&self) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    fn begin_tunnel(&mut self) {
+        crate::tls_stream::TlsStream::begin_tunnel(self);
+    }
+}
+
+/// A plain TCP connection whose first bytes are already read: plain HTTP
+/// sent to an `ssl` port, read by the TLS acceptor (#384). Those bytes
+/// come first, then the socket's.
+pub(crate) struct Preread {
+    io: TcpStream,
+    read: Vec<u8>,
+    pos: usize,
+}
+
+impl Preread {
+    pub(crate) fn new(io: TcpStream, read: Vec<u8>) -> Self {
+        Preread { io, read, pos: 0 }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pos < self.read.len()
+    }
+
+    /// Copy what is left of the read bytes to `dst`, as far as it fits.
+    ///
+    /// # Safety
+    /// `dst` is valid for writes of `len` bytes.
+    unsafe fn take_into(&mut self, dst: *mut u8, len: usize) -> usize {
+        let n = (self.read.len() - self.pos).min(len);
+        // SAFETY: `n` bytes from our own buffer into `dst`, which the
+        // caller vouches for; the two can't overlap.
+        unsafe { std::ptr::copy_nonoverlapping(self.read.as_ptr().add(self.pos), dst, n) };
+        self.pos += n;
+        n
+    }
+}
+
+impl AsyncReadRent for Preread {
+    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+        if !self.has_pending() {
+            return self.io.read(buf).await;
+        }
+        // SAFETY: `write_ptr` is valid for `bytes_total` bytes, and the
+        // first `n` are initialized once copied.
+        unsafe {
+            let n = self.take_into(buf.write_ptr(), buf.bytes_total());
+            buf.set_init(n);
+            (Ok(n), buf)
+        }
+    }
+
+    async fn readv<T: monoio::buf::IoVecBufMut>(
+        &mut self,
+        mut buf: T,
+    ) -> monoio::BufResult<usize, T> {
+        if !self.has_pending() {
+            return self.io.readv(buf).await;
+        }
+        // The first iovec only: a short read, which callers handle.
+        // SAFETY: `buf` is owned here and outlives `raw`.
+        let res = match unsafe { monoio::buf::RawBuf::new_from_iovec_mut(&mut buf) } {
+            Some(raw) => self.read(raw).await.0,
+            None => Ok(0),
+        };
+        if let Ok(n) = res {
+            // SAFETY: `n` bytes of the first iovec were just written.
+            unsafe { buf.set_init(n) };
+        }
+        (res, buf)
+    }
+}
+
+impl AsyncWriteRent for Preread {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        self.io.write(buf).await
+    }
+
+    async fn writev<T: monoio::buf::IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        self.io.writev(buf).await
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.io.flush().await
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.io.shutdown().await
+    }
+}
+
+impl ConnIo for Preread {
+    async fn idle_read(
+        &mut self,
+        mut buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        if !self.has_pending() {
+            return read_first_or_shutdown(&mut self.io, buf, state, idle, fresh, timers).await;
+        }
+        // As `read_first_or_shutdown`: into `buf[..buf.len()]`.
+        // SAFETY: `buf` holds `len` initialized bytes to overwrite.
+        let n = unsafe { self.take_into(buf.as_mut_ptr(), buf.len()) };
+        (IdleRead::Read(n), buf)
+    }
+
+    async fn idle_wait(
+        &self,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> bool {
+        if self.has_pending() {
+            return fresh || !state.is_shutting_down();
+        }
+        wait_readable_or_shutdown(&self.io, state, idle, fresh, timers).await
+    }
+
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.io.as_raw_fd())
+    }
+
+    async fn wait_writable(&self) -> std::io::Result<()> {
+        self.io.writable(false).await
     }
 }
 
@@ -268,16 +508,15 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
 /// A connection's long-lived timers. monoio extends a registered timer
 /// lazily when it is moved to a later deadline, so re-arming one of these
 /// costs a clock read, where a fresh `sleep`/`timeout` per operation costs
-/// a timer-wheel insert and remove. Each is only ever moved forward on the
-/// hot path: `io` by the same client timeouts, `idle` by keepalive_timeout,
-/// `tick` by 50 ms.
+/// a timer-wheel insert and remove. `io` is only ever moved forward on the
+/// hot path, by the same client timeouts; `idle` is moved only when it
+/// fires before the keep-alive deadline (`arm_idle`). Shutdown, reload and
+/// drains wake idle connections directly (#127), so there is no tick.
 pub(crate) struct ConnTimers<'a> {
     /// client_header_timeout / client_body_timeout / send_timeout.
     pub io: std::pin::Pin<&'a mut monoio::time::Sleep>,
     /// The keep-alive (or first-request) deadline while idle.
     pub idle: std::pin::Pin<&'a mut monoio::time::Sleep>,
-    /// The 50 ms poll for shutdown / reload while idle.
-    pub tick: std::pin::Pin<&'a mut monoio::time::Sleep>,
 }
 
 /// Run `fut` unless `deadline` passes first, using `timer` (see
@@ -462,27 +701,27 @@ impl Pacer {
         })
     }
 
-    /// Wait until some of `want` bytes may go; returns how many.
-    async fn allowance(&mut self, want: usize) -> usize {
-        loop {
-            let elapsed_ms = self.start.elapsed().as_millis() as u64;
-            let allowed = self
-                .after
-                .saturating_add(self.rate.saturating_mul(elapsed_ms + 1000) / 1000);
-            if self.sent < allowed {
-                // Small writes keep the pace even, as nginx's `limit`.
-                let step = self.rate.clamp(1, 64 * 1024);
-                return ((allowed - self.sent).min(step) as usize).min(want);
-            }
-            let over = self.sent - allowed + 1;
-            let wait_ms = (over.saturating_mul(1000)).div_ceil(self.rate).max(1);
-            monoio::time::sleep(Duration::from_millis(wait_ms)).await;
+    /// How many of `want` bytes may go now, or how long to wait first.
+    fn next(&self, want: usize) -> Result<usize, Duration> {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let allowed = self
+            .after
+            .saturating_add(self.rate.saturating_mul(elapsed_ms + 1000) / 1000);
+        if self.sent < allowed {
+            // Small writes keep the pace even, as nginx's `limit`.
+            let step = self.rate.clamp(1, 64 * 1024);
+            return Ok(((allowed - self.sent).min(step) as usize).min(want));
         }
+        let over = self.sent - allowed + 1;
+        let wait_ms = (over.saturating_mul(1000)).div_ceil(self.rate).max(1);
+        Err(Duration::from_millis(wait_ms))
     }
 }
 
-/// `write_all_timed` under `limit_rate`.
-pub(crate) async fn write_all_paced<S: monoio::io::AsyncWriteRent>(
+/// `write_all_timed` under `limit_rate`. A client that closes while the
+/// response waits for its next write ends it then, not at that write
+/// (`ConnIo::peer_closed`).
+pub(crate) async fn write_all_paced<S: ConnIo>(
     stream: &mut S,
     mut buf: Vec<u8>,
     len: usize,
@@ -492,7 +731,19 @@ pub(crate) async fn write_all_paced<S: monoio::io::AsyncWriteRent>(
 ) -> (std::io::Result<()>, Vec<u8>) {
     let mut written = 0;
     while written < len {
-        let n = pacer.allowance(len - written).await;
+        let n = match pacer.next(len - written) {
+            Ok(n) => n,
+            Err(wait) => {
+                let closed = monoio::select! {
+                    _ = monoio::time::sleep(wait) => false,
+                    _ = stream.peer_closed() => true,
+                };
+                if closed {
+                    return (Err(std::io::ErrorKind::ConnectionAborted.into()), buf);
+                }
+                continue;
+            }
+        };
         let slice = buf.slice(written..written + n);
         let Some((res, slice)) = with_timeout(timer.as_mut(), timeout, stream.write(slice)).await
         else {
@@ -511,7 +762,7 @@ pub(crate) async fn write_all_paced<S: monoio::io::AsyncWriteRent>(
     (Ok(()), buf)
 }
 
-pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
+pub(crate) async fn stream_file<S: ConnIo>(
     stream: &mut S,
     body: phase::FileBody,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
@@ -569,6 +820,93 @@ pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
     true
 }
 
+/// `stream_file` through the gzip filter: the file is read in 64 KiB
+/// blocks, compressed, and sent as HTTP/1.1 chunks (or raw for HTTP/1.0,
+/// where the connection closes after). Returns the bytes written, or
+/// `None` on an error or a file shorter than its stat said.
+pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
+    body: phase::FileBody,
+    gzip: super::gzip::GzipStream,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Option<u64> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::from(body.fd);
+    let mut deflater = super::gzip::Deflater::new(gzip);
+    let mut offset = body.offset;
+    let mut remaining = body.len;
+    let block = body.len.clamp(1, 65_536) as usize;
+    // Pooled buffers (see `gzip::BUFFER_POOL`): grown once, kept.
+    let mut input = std::mem::take(&mut deflater.input);
+    if input.len() < block {
+        input.resize(block, 0);
+    }
+    // Room for the chunk-size line in front of the compressed bytes.
+    const PREFIX: usize = 10;
+    let mut out = std::mem::take(&mut deflater.out);
+    out.reserve(PREFIX + block.min(16_384));
+    let mut sent = 0u64;
+    let result = loop {
+        let n = if remaining == 0 {
+            0
+        } else {
+            let want = remaining.min(block as u64) as usize;
+            match file.read_at(&mut input[..want], offset) {
+                Ok(0) | Err(_) => break None,
+                Ok(n) => n,
+            }
+        };
+        offset += n as u64;
+        remaining -= n as u64;
+        out.clear();
+        out.resize(PREFIX, 0);
+        deflater.push(&input[..n], &mut out, remaining == 0);
+        let data_len = out.len() - PREFIX;
+        let start = if gzip.chunked && data_len > 0 {
+            // "<hex>\r\n" right before the data, "\r\n" after it.
+            let digits = (usize::BITS - data_len.leading_zeros()).div_ceil(4).max(1) as usize;
+            let start = PREFIX - (digits + 2);
+            for i in 0..digits {
+                let nibble = (data_len >> (4 * (digits - 1 - i))) & 0xf;
+                out[start + i] = b"0123456789abcdef"[nibble];
+            }
+            out[PREFIX - 2..PREFIX].copy_from_slice(b"\r\n");
+            out.extend_from_slice(b"\r\n");
+            start
+        } else {
+            PREFIX
+        };
+        if remaining == 0 && gzip.chunked {
+            out.extend_from_slice(b"0\r\n\r\n");
+        }
+        if out.len() > start {
+            // Shift so the write starts at the chunk line (a few KiB).
+            out.drain(..start);
+            let len = out.len();
+            let (res, returned) = write_all_timed(
+                stream,
+                std::mem::take(&mut out),
+                len,
+                timer.as_mut(),
+                send_timeout,
+            )
+            .await;
+            out = returned;
+            if res.is_err() {
+                break None;
+            }
+            sent += len as u64;
+        }
+        if remaining == 0 {
+            break Some(sent);
+        }
+    };
+    deflater.input = input;
+    deflater.out = out;
+    result
+}
+
 /// Outcome of decoding a chunked request body.
 pub(crate) struct ChunkedBody {
     /// Bytes consumed from the caller's `initial` buffer (the slice we
@@ -604,11 +942,51 @@ pub(crate) const MAX_CHUNK_LINE_BYTES: usize = 8192;
 /// Maximum trailer block size in bytes. Bounds total trailer-line growth.
 pub(crate) const MAX_TRAILER_BLOCK_BYTES: usize = 16 * 1024;
 
+/// Read `len` more bytes of a body nothing will read and drop them, through
+/// one small pooled buffer (nginx's ngx_http_read_discarded_request_body):
+/// no body-sized buffer is held per request (#289). `false` on EOF, an
+/// error or `client_body_timeout`.
+pub(crate) async fn discard_request_body<S: ConnIo>(
+    stream: &mut S,
+    mut len: u64,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    read_timeout: Duration,
+) -> bool {
+    use monoio::buf::IoBufMut;
+    const DISCARD_CHUNK: usize = 16 * 1024;
+    if len == 0 {
+        return true;
+    }
+    let mut buf = super::take_body_buffer(DISCARD_CHUNK);
+    let ok = loop {
+        // Never past the body, so a pipelined request isn't consumed.
+        let want = len.min(DISCARD_CHUNK as u64) as usize;
+        let slice = std::mem::take(&mut buf).slice_mut(0..want);
+        let Some((res, returned)) =
+            with_timeout(timer.as_mut(), read_timeout, stream.read(slice)).await
+        else {
+            break false;
+        };
+        buf = returned.into_inner();
+        match res {
+            Ok(0) | Err(_) => break false,
+            Ok(n) => {
+                len -= n as u64;
+                if len == 0 {
+                    break true;
+                }
+            }
+        }
+    };
+    drop(super::PooledBody(buf));
+    ok
+}
+
 /// Read and decode a chunked request body from the connection into `sink`
 /// (memory, then a temp file for large bodies). Chunk data is passed on as
 /// it arrives and consumed input is dropped, so memory stays bounded
 /// whatever the chunk sizes.
-pub(crate) async fn read_chunked_request_body<S: ConnIo>(
+pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
     stream: &mut S,
     initial: &[u8],
     max_body: u64,

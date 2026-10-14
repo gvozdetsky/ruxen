@@ -4,13 +4,14 @@
 //! `0644` files with predictable names straight in the system temp
 //! directory, readable by every local user.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Server {
     child: Child,
@@ -27,6 +28,9 @@ impl Drop for Server {
 }
 
 fn start(tag: &str, http_extra: &str) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -44,19 +48,24 @@ fn start(tag: &str, http_extra: &str) -> Server {
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
-    Server { child, port, dir }
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        port,
+        dir,
+    };
+    let pid_file = server.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.child, &pid_file, Duration::from_secs(3));
+    drop(setup);
+    server
 }
 
 /// POSTs `body` and returns `$request_body_file`.

@@ -19,9 +19,14 @@
 use std::path::{Path, PathBuf};
 
 mod ast;
+pub mod compat;
 mod error;
 mod lexer;
 mod parse_access;
+mod parse_gzip;
+mod parse_http2;
+mod parse_limit_conn;
+mod parse_limit_req;
 mod parse_location;
 mod parse_log;
 mod parse_map;
@@ -32,6 +37,10 @@ mod values;
 
 pub use ast::*;
 pub use error::*;
+pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_http2::Http2Conf;
+pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
+pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
 pub use values::{SSL_SESSION_ID_USED, parse_value_with_vars};
 
 pub(crate) use lexer::*;
@@ -72,6 +81,17 @@ pub fn parse_with_main(
 }
 
 pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
+    parse_lexer_inner(&mut lx).map_err(|error| match lx.position() {
+        Some(position) if !matches!(error, Error::At { .. }) => Error::At {
+            error: Box::new(error),
+            position,
+        },
+        _ => error,
+    })
+}
+
+fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
+    let mut lx = lx;
     reset_variable_registry();
     let mut runtime = RuntimeOpts::default();
     let mut http: Option<HttpConfig> = None;
@@ -196,14 +216,23 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
                 runtime.worker_shutdown_timeout_ms =
                     Some(parse_duration_ms(raw, "worker_shutdown_timeout")?);
             }
-            // `user name [group];` — recorded so `main` can refuse a switch
-            // it can't make (see `check_privileges`).
+            // `user name [group];`: applied by `main` after binding (see
+            // `privileges`).
             ("user", Terminator::Semi) => {
                 if runtime.user.is_some() {
                     return Err(Error::Duplicate("user"));
                 }
-                let user = args.get(1).ok_or(Error::MissingArg("user"))?;
-                runtime.user = Some(user.clone());
+                let name = args.get(1).ok_or(Error::MissingArg("user"))?;
+                if args.len() > 3 {
+                    return Err(Error::BadValue {
+                        what: "user",
+                        got: args[1..].join(" "),
+                    });
+                }
+                runtime.user = Some(UserDirective {
+                    name: name.clone(),
+                    group: args.get(2).cloned(),
+                });
             }
             ("user", _) => {
                 return Err(Error::WrongTerminator {
@@ -211,19 +240,23 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(&mut lx)?,
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
             _ => {
-                return Err(Error::UnknownDirective {
-                    name: name.into(),
-                    ctx: "top-level",
-                });
+                compat::unknown(lx, &args, &term, "top-level")?;
             }
         }
     }
 
     let mut http = http.ok_or(Error::UnexpectedEof)?;
     http.warnings.extend(lx.take_warnings());
+    http.uses_request_body_file = values::request_body_file_used();
+    http.uses_request_body = values::request_body_used();
+    http.uses_stderr_log = values::stderr_log_used();
+    http.uses_stats = values::stats_used();
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -234,6 +267,12 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
 pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut servers: Vec<Server> = Vec::new();
     let mut proxy = ProxyConf::default();
+    let mut gzip = GzipConf::default();
+    let mut http2_conf = Http2Conf::default();
+    let mut limit_req = LimitReqConf::default();
+    let mut limit_req_zones: Vec<LimitReqZoneDef> = Vec::new();
+    let mut limit_conn = LimitConnConf::default();
+    let mut limit_conn_zones: Vec<LimitConnZoneDef> = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut log_formats: Vec<LogFormatDef> = Vec::new();
     let mut access_logs: Vec<AccessLog> = Vec::new();
@@ -249,8 +288,10 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_delay_ms: Option<u64> = None;
     let mut access = AccessConf::default();
     let mut client_max_body_size: Option<u64> = None;
+    let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
+    let mut http2: Option<bool> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
@@ -265,6 +306,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ignore_invalid_headers: Option<bool> = None;
     let mut underscores_in_headers: Option<bool> = None;
     let mut upstreams: Vec<UpstreamBlock> = Vec::new();
+    let mut proxy_cache_paths: Vec<ProxyCachePath> = Vec::new();
     // Server-level defaults set at http scope: servers without their own
     // inherit them once the block is closed (see `BlockClose`).
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -279,6 +321,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_ciphers: Option<String> = None;
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
+    let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut warnings: Vec<String> = Vec::new();
     loop {
@@ -290,6 +333,11 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     // below a server still applies to it, as in nginx.
                     for server in &mut servers {
                         server.proxy = std::mem::take(&mut server.proxy).inherit(&proxy);
+                        server.gzip = std::mem::take(&mut server.gzip).inherit(&gzip);
+                        server.limit_req =
+                            std::mem::take(&mut server.limit_req).inherit(&limit_req);
+                        server.limit_conn =
+                            std::mem::take(&mut server.limit_conn).inherit(&limit_conn);
                         if server.index.is_none() {
                             server.index.clone_from(&index);
                         }
@@ -329,7 +377,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ssl.prefer_server_ciphers =
                             ssl.prefer_server_ciphers.or(ssl_prefer_server_ciphers);
                         ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
-                        ssl.resumption = ssl.resumption.inherit(resumption);
+                        ssl.resumption = std::mem::take(&mut ssl.resumption).inherit(&resumption);
+                        ssl.reject_handshake = ssl.reject_handshake.or(ssl_reject_handshake);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -348,8 +397,16 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         auth_delay_ms,
                         access,
                         client_max_body_size,
+                        client_body_buffer_size,
+                        // Set once the whole config is read.
+                        uses_request_body_file: false,
+                        uses_request_body: false,
+                        uses_stderr_log: false,
+                        uses_stats: false,
                         client_body_temp_path,
                         sendfile,
+                        http2,
+                        http2_conf,
                         disable_symlinks,
                         limit_rate,
                         limit_rate_after,
@@ -357,7 +414,10 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         expires,
                         ignore_invalid_headers,
                         underscores_in_headers,
+                        proxy_cache_paths,
                         upstreams,
+                        limit_req_zones,
+                        limit_conn_zones,
                         warnings: warn_ssl_without_ssl_listen(&servers, warnings),
                         servers,
                         dump_files: Vec::new(),
@@ -469,6 +529,16 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ctx: "http",
                 });
             }
+            ("proxy_cache_path", Terminator::Semi) => {
+                let cache_path = parse_upstream::parse_proxy_cache_path(&args[1..])?;
+                if proxy_cache_paths.iter().any(|p| p.zone == cache_path.zone) {
+                    return Err(Error::BadValue {
+                        what: "proxy_cache_path duplicate zone",
+                        got: cache_path.zone,
+                    });
+                }
+                proxy_cache_paths.push(cache_path);
+            }
             ("upstream", Terminator::BlockOpen) => {
                 let block = parse_upstream_block(&args[1..], lx)?;
                 if upstreams.iter().any(|u| u.name == block.name) {
@@ -547,12 +617,23 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     .ok_or(Error::MissingArg("ssl_session_timeout"))?;
                 ssl_session_timeout_ms = Some(ssl_session_timeout_ms_arg(v)?);
             }
+            ("ssl_reject_handshake", Terminator::Semi) => {
+                if ssl_reject_handshake.is_some() {
+                    return Err(Error::Duplicate("ssl_reject_handshake"));
+                }
+                ssl_reject_handshake = Some(parse_on_off_args(&args[1..], "ssl_reject_handshake")?);
+            }
             (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
                 resumption.parse(name, &args)?;
             }
+            ("ssl_session_ticket_key", Terminator::Semi) => {
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_session_ticket_key"));
+                };
+                resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
+            }
             (
-                "ssl_session_ticket_key"
-                | "ssl_buffer_size"
+                "ssl_buffer_size"
                 | "ssl_dhparam"
                 | "ssl_ecdh_curve"
                 | "ssl_stapling"
@@ -566,7 +647,6 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_crl"
                 | "ssl_password_file"
                 | "ssl_early_data"
-                | "ssl_reject_handshake"
                 | "ssl_conf_command",
                 Terminator::Semi,
             ) => warn_ignored_tls_policy(&args, &mut warnings),
@@ -635,20 +715,26 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             (
                 "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
-                | "real_ip_recursive",
+                | "auth_request" | "auth_request_set" | "real_ip_recursive",
                 Terminator::Semi,
             ) => {
                 parse_access_directive(&mut access, &args, lx)?;
             }
             (
                 "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
-                | "real_ip_recursive",
+                | "auth_request" | "auth_request_set" | "real_ip_recursive",
                 _,
             ) => {
                 return Err(Error::WrongTerminator {
                     name: args[0].clone(),
                     ctx: "http",
                 });
+            }
+            ("client_body_buffer_size", Terminator::Semi) => {
+                if client_body_buffer_size.is_some() {
+                    return Err(Error::Duplicate("client_body_buffer_size"));
+                }
+                client_body_buffer_size = Some(parse_client_body_buffer_size_args(&args[1..])?);
             }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
@@ -680,6 +766,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     return Err(Error::Duplicate("disable_symlinks"));
                 }
                 disable_symlinks = Some(parse_disable_symlinks_args(&args[1..])?);
+            }
+            ("http2", Terminator::Semi) => {
+                if http2.is_some() {
+                    return Err(Error::Duplicate("http2"));
+                }
+                http2 = Some(parse_on_off_args(&args[1..], "http2")?);
             }
             ("sendfile", Terminator::Semi) => {
                 if sendfile.is_some() {
@@ -780,18 +872,45 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 client_timeouts.parse(name, &args)?;
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
+            (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
+            (name, Terminator::Semi) if Http2Conf::takes(name) => {
+                http2_conf.parse(&args, &mut warnings)?
+            }
+            (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
+            (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,
+            ("limit_conn_zone", Terminator::Semi) => {
+                let zone = parse_limit_conn::parse_limit_conn_zone(&args[1..])?;
+                if let Some(known) = limit_conn_zones.iter().find(|z| z.name == zone.name) {
+                    return Err(Error::BadValue {
+                        what: "limit_conn_zone (is already bound to key)",
+                        got: format!("\"{}\" bound to \"{}\"", zone.name, known.key_text),
+                    });
+                }
+                limit_conn_zones.push(zone);
+            }
+            ("limit_req_zone", Terminator::Semi) => {
+                let zone = parse_limit_req::parse_limit_req_zone(&args[1..])?;
+                // ngx_http_limit_req_zone: one key per zone name.
+                if let Some(known) = limit_req_zones.iter().find(|z| z.name == zone.name) {
+                    return Err(Error::BadValue {
+                        what: "limit_req_zone (is already bound to key)",
+                        got: format!("\"{}\" bound to \"{}\"", zone.name, known.key_text),
+                    });
+                }
+                limit_req_zones.push(zone);
+            }
             ("error_log", Terminator::Semi) => {
                 error_logs
                     .get_or_insert_with(Vec::new)
                     .push(parse_error_log_args(&args[1..])?);
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
-            (other, _) => {
-                return Err(Error::UnknownDirective {
-                    name: other.into(),
-                    ctx: "http",
-                });
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
+            (_, _) => {
+                compat::unknown(lx, &args, &term, "http")?;
             }
         }
     }
@@ -827,7 +946,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "log_subrequest",
     "rewrite_log",
     // Body / header buffer tuning
-    "client_body_buffer_size",
     "client_body_timeout",
     "client_body_in_file_only",
     "client_body_in_single_buffer",
@@ -896,18 +1014,11 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Caches the descriptors of access logs whose path has variables; ruxen
     // opens access logs once per worker anyway. Arguments are checked.
     "open_log_file_cache",
-    // Read only by the proxy cache (ngx_http_upstream_cache, when
-    // `proxy_cache` is set). Without it, which ruxen doesn't implement
-    // (`proxy_cache` stays unknown), nginx ignores them too. The WebSocket
-    // boilerplate `proxy_cache_bypass $http_upgrade;` is in many configs.
-    "proxy_cache_bypass",
-    "proxy_no_cache",
     "proxy_force_ranges",
     "proxy_cookie_domain",
     "proxy_cookie_path",
     "proxy_cookie_flags",
     "proxy_socket_keepalive",
-    "proxy_bind",
     "proxy_store",
     "proxy_store_access",
     // File I/O knobs (we use std::fs; these are nginx-only tuning)
@@ -957,20 +1068,27 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
         }
-        Some("ssl_reject_handshake") if value == Some("on") => {
-            "handshakes for unknown names would complete with the default certificate"
-        }
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
         // dropping them weakens what the config protects. Only `off` loads.
         Some("proxy_cookie_flags") if value != Some("off") || args.len() != 2 => {
             "upstream cookies would reach clients without the flags it sets"
         }
+        // Taken literally, `root /var/www/$host` or `alias /srv/$1` looks
+        // for a directory named `$host` (#232). Until the path is rendered
+        // per request, such a configuration is refused rather than served
+        // from the wrong place. nginx refuses a `$` that doesn't start a
+        // variable, so any `$` here is one.
+        Some("root" | "alias") if value.is_some_and(|v| v.contains('$')) => {
+            "variables in the path aren't expanded yet (#232), so other files would be served than nginx serves"
+        }
         _ => return Ok(()),
     };
-    Err(Error::Unenforced {
-        name: args[0].clone(),
-        consequence,
-    })
+    // For a path, the whole directive: "root" alone isn't what's missing.
+    let name = match args.first().map(String::as_str) {
+        Some("root" | "alias") => args.join(" "),
+        _ => args[0].clone(),
+    };
+    Err(Error::Unenforced { name, consequence })
 }
 
 /// Accepted with a warning: `ssl_ciphers` / `ssl_ecdh_curve`, because
@@ -1056,7 +1174,8 @@ pub(crate) fn is_ignored_stmt(name: &str) -> bool {
 /// Validate the arguments of the allowlisted directives whose grammar is
 /// cheap to check, so that a typo still fails `-t` as in nginx. The rest of
 /// `IGNORED_STMT` is accepted with any arguments.
-pub(crate) fn check_ignored_args(args: &[String]) -> Result<(), Error> {
+pub(crate) fn check_ignored_args(lx: &Lexer, args: &[String]) -> Result<(), Error> {
+    compat::ignored(lx, args);
     let what = match args[0].as_str() {
         "proxy_temp_path" => "proxy_temp_path",
         "fastcgi_temp_path" => "fastcgi_temp_path",
@@ -1794,6 +1913,27 @@ mod tests {
     }
 
     #[test]
+    fn variables_in_root_and_alias_are_refused() {
+        // #232: taken literally they serve other files than nginx does.
+        for src in [
+            "http { root /var/www/$host; server { listen 80; } }",
+            "http { server { listen 80; root /srv/$server_name; } }",
+            "http { server { listen 80; location / { root $document_root/x; } } }",
+            "http { server { listen 80; location ~ ^/i/(.+)$ { alias /srv/img/$1; } } }",
+        ] {
+            let e = unenforced_err(src);
+            assert!(e.contains("(#232)"), "{src}: {e}");
+        }
+        let e = unenforced_err("http { server { listen 80; root /var/www/$host; } }");
+        assert!(
+            e.starts_with("\"root /var/www/$host\" is not supported yet"),
+            "{e}"
+        );
+        // Without variables, as before.
+        parse("http { server { listen 80; root /srv; location /a/ { alias /srv/a/; } } }").unwrap();
+    }
+
+    #[test]
     fn access_restrictions_ruxen_cant_enforce_are_rejected() {
         // `limit_except` and `internal` are enforced now (phase::process).
         let cfg =
@@ -1806,7 +1946,9 @@ mod tests {
             )
         };
         unenforced_err(&tls("ssl_verify_client on;"));
-        unenforced_err(&tls("ssl_reject_handshake on;"));
+        // ssl_reject_handshake is enforced now (tls_stream::accept_or_reject).
+        let cfg = parse(&tls("ssl_reject_handshake on;")).unwrap();
+        assert_eq!(cfg.servers[0].ssl.reject_handshake, Some(true));
         // disable_symlinks is enforced now (fs_resolve), at every level.
         let symlinks = |value: &str| {
             parse(&format!(
@@ -2075,7 +2217,10 @@ mod tests {
             cfg.servers[0].ssl.resumption,
             SessionResumption {
                 cache: Some(true),
-                tickets: Some(false)
+                shared: true,
+                shared_zone: Some("shared:SSL:1m".to_string()),
+                tickets: Some(false),
+                ticket_keys: None,
             }
         );
         assert_eq!(cfg.servers[1].ssl.resumption.cache, Some(false));
@@ -2085,9 +2230,43 @@ mod tests {
     }
 
     #[test]
+    fn ssl_session_ticket_keys_parse_and_inherit() {
+        let cfg = parse(
+            "http { ssl_session_ticket_key /k/a.key; ssl_session_ticket_key /k/b.key;
+                    ssl_session_cache builtin;
+                    server { listen 443 ssl; ssl_certificate c; ssl_certificate_key k; }
+                    server { listen 444 ssl; ssl_certificate c; ssl_certificate_key k;
+                             ssl_session_ticket_key /k/c.key;
+                             ssl_session_cache shared:SSL:1m; } }",
+        )
+        .unwrap();
+        let first = &cfg.servers[0].ssl.resumption;
+        assert_eq!(
+            first.ticket_keys,
+            Some(vec![PathBuf::from("/k/a.key"), PathBuf::from("/k/b.key")])
+        );
+        assert!(!first.shared);
+        // A server's own lines replace the inherited list.
+        let second = &cfg.servers[1].ssl.resumption;
+        assert_eq!(second.ticket_keys, Some(vec![PathBuf::from("/k/c.key")]));
+        assert!(second.shared);
+        assert!(parse("http { ssl_session_ticket_key; }").is_err());
+    }
+
+    #[test]
     fn user_directive_is_recorded() {
-        let cfg = parse("user www-data www-data;\nhttp { }").unwrap();
-        assert_eq!(cfg.runtime.user.as_deref(), Some("www-data"));
+        let cfg = parse("user www-data adm;\nhttp { }").unwrap();
+        assert_eq!(
+            cfg.runtime.user,
+            Some(UserDirective {
+                name: "www-data".into(),
+                group: Some("adm".into()),
+            })
+        );
+        let cfg = parse("user www-data;\nhttp { }").unwrap();
+        assert_eq!(cfg.runtime.user.unwrap().group, None);
+        assert!(parse("user a b c;\nhttp { }").is_err());
+        assert!(parse("user;\nhttp { }").is_err());
     }
 
     #[test]
@@ -2408,6 +2587,36 @@ mod tests {
     }
 
     #[test]
+    fn access_log_buffer_flush_gzip() {
+        let parsed = |args: &str| {
+            let args: Vec<String> = args.split(' ').map(str::to_string).collect();
+            parse_log::parse_access_log_args(&args)
+        };
+        let Ok(parse_log::ParsedAccessLog::Entry(log)) =
+            parsed("/tmp/a.log main buffer=32k flush=5s if=$x")
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(
+            (log.buffer, log.flush_ms, log.gzip),
+            (Some(32 * 1024), Some(5000), None)
+        );
+        assert!(log.condition.is_some());
+        // `gzip` alone: level 1 and a 64k buffer.
+        let Ok(parse_log::ParsedAccessLog::Entry(log)) = parsed("/tmp/a.log main gzip") else {
+            panic!("not parsed");
+        };
+        assert_eq!((log.buffer, log.gzip), (Some(64 * 1024), Some(1)));
+        assert!(
+            parsed("/tmp/a.log main flush=1s").is_err(),
+            "flush without buffer"
+        );
+        assert!(parsed("/tmp/a.log main gzip=10").is_err());
+        assert!(parsed("/tmp/a.log main buffer=0").is_err());
+        assert!(parsed("syslog:server=127.0.0.1 main buffer=1k").is_err());
+    }
+
+    #[test]
     fn access_log_rejects_format_after_if_parameter() {
         let src = r#"
             http {
@@ -2416,10 +2625,12 @@ mod tests {
                 server { listen 80; location / { return 200 ""; } }
             }
         "#;
+        // The second argument is the format (`if=$arg_l`, as nginx reads
+        // it), and `test1` is then no parameter.
         assert!(matches!(
             parse(src),
             Err(Error::BadValue {
-                what: "access_log",
+                what: "access_log parameter",
                 ..
             })
         ));
@@ -2476,6 +2687,127 @@ mod tests {
             loc.auth_basic_user_file.as_deref(),
             Some(std::path::Path::new("/tmp/location.htpasswd"))
         );
+    }
+
+    #[test]
+    fn location_if_blocks_with_settings_are_anonymous_locations() {
+        // #137: `proxy_pass`, `add_header` and the like make the block an
+        // anonymous location that inherits the enclosing one; rewrite-only
+        // blocks stay as they were.
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    location /a {
+                        proxy_pass http://127.0.0.1:8081/outer;
+                        add_header X-Loc yes;
+                        if ($arg_p) { proxy_pass http://127.0.0.1:8081; }
+                        if ($arg_h) { add_header X-If yes; }
+                        if ($arg_r) { rewrite ^ /b; }
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let loc = &cfg.servers[0].locations[0];
+        let ifs: Vec<_> = loc
+            .rewrite_ops
+            .iter()
+            .map(|op| match op {
+                RewriteOp::If { location, .. } => location.clone(),
+                _ => panic!("{op:?}"),
+            })
+            .collect();
+        let Some(IfLocation::Parsed {
+            location: own,
+            own_handler: true,
+            ..
+        }) = &ifs[0]
+        else {
+            panic!("{:?}", ifs[0])
+        };
+        assert!(matches!(own.handler, Handler::Proxy(_)));
+        assert!(own.pattern.starts_with('@'), "{}", own.pattern);
+        assert_eq!(own.add_headers.as_ref().unwrap()[0].name, "X-Loc");
+        let Some(IfLocation::Parsed {
+            location: inherited,
+            own_handler: false,
+            ..
+        }) = &ifs[1]
+        else {
+            panic!("{:?}", ifs[1])
+        };
+        assert_eq!(inherited.pattern, "/a");
+        assert!(
+            matches!(&inherited.handler, Handler::Proxy(p) if format!("{p:?}").contains("/outer"))
+        );
+        assert_eq!(inherited.add_headers.as_ref().unwrap()[0].name, "X-If");
+        assert!(ifs[2].is_none());
+
+        for bad in [
+            "http { server { listen 80; location / { if ($a) { proxy_redirect off; } } } }",
+            "http { server { listen 80; location / { if ($a) { location /x { } } } } }",
+            "http { server { listen 80; location / { if ($a) { proxy_pass http://u/x; } } } }",
+        ] {
+            let parsed = parse(bad);
+            assert!(
+                parsed.is_err() || crate::worker::prepare(parsed.unwrap()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_locations_inherit_the_parents_final_settings() {
+        // #106: everything nginx merges from the parent location, also
+        // what the parent sets after the nested block; lists as a whole.
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    add_header X-Server s;
+                    location /p/ {
+                        proxy_set_header X-Up parent;
+                        add_header X-Parent yes;
+                        location /p/c/ { proxy_pass http://127.0.0.1:8081; }
+                        location /p/own/ {
+                            add_header X-Own yes;
+                            location /p/own/g/ { return 200; }
+                        }
+                        error_page 404 /nf;
+                        proxy_read_timeout 7s;
+                        gzip on;
+                        keepalive_requests 5;
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let loc = |p: &str| {
+            cfg.servers[0]
+                .locations
+                .iter()
+                .find(|l| l.pattern == p)
+                .unwrap_or_else(|| panic!("{p}"))
+        };
+        let names = |l: &Location| -> Vec<String> {
+            l.add_headers
+                .iter()
+                .flatten()
+                .map(|h| h.name.clone())
+                .collect()
+        };
+        let c = loc("/p/c/");
+        assert_eq!(names(c), ["X-Parent"]);
+        assert!(c.proxy.set_headers.is_some());
+        assert!(c.error_pages.is_some(), "after the nested block");
+        assert_eq!(c.proxy.read_timeout_ms, Some(7000));
+        assert_eq!(c.gzip.enable, Some(true));
+        assert_eq!(c.keepalive_requests, Some(5));
+        // A child's own list replaces the parent's, for its children too.
+        assert_eq!(names(loc("/p/own/")), ["X-Own"]);
+        assert_eq!(names(loc("/p/own/g/")), ["X-Own"]);
+        assert_eq!(loc("/p/own/g/").keepalive_requests, Some(5));
     }
 
     #[test]
@@ -2750,15 +3082,15 @@ mod tests {
             ),
             (
                 "location / { limit_except GET { satisfy any; } }",
-                "unknown directive `satisfy` in limit_except",
+                "unknown directive `satisfy` in a limit_except block",
             ),
             (
                 "location / { limit_except GET { location /x { } } }",
-                "unknown directive `location` in limit_except",
+                "unknown directive `location` in a limit_except block",
             ),
             (
                 "limit_except GET { }",
-                "unknown directive `limit_except` in server",
+                "unknown directive `limit_except` in a server block",
             ),
         ] {
             let conf = format!("http {{ server {{ listen 80; {src} }} }}");
@@ -3384,16 +3716,53 @@ mod tests {
     }
 
     #[test]
-    fn proxy_cache_bypass_and_no_cache_are_no_ops_without_a_cache() {
+    fn proxy_cache_directives_parse_at_every_level() {
         let src = r#"
-            http { proxy_cache_bypass $http_upgrade; server { listen 80; proxy_no_cache $arg_x;
-                location / { proxy_pass http://127.0.0.1:8080; proxy_cache_bypass $http_upgrade; }
+            http {
+                proxy_cache_path /tmp/c levels=1:2 keys_zone=one:1m inactive=1h max_size=1g
+                                 use_temp_path=off loader_files=10 manager_sleep=50ms;
+                proxy_cache_bypass $http_upgrade; proxy_cache_valid 1m;
+                server { listen 80; proxy_no_cache $arg_x $arg_y; proxy_cache one;
+                    location / { proxy_pass http://127.0.0.1:8080; proxy_cache_bypass $http_upgrade;
+                        proxy_cache_valid 200 301 10m; proxy_cache_valid any 1y;
+                        proxy_cache_key $uri; proxy_cache_methods GET POST;
+                        proxy_cache_min_uses 2; proxy_cache_convert_head off;
+                        proxy_cache_revalidate on;
+                        proxy_cache_use_stale error timeout updating http_500 http_429;
+                        proxy_cache_background_update on; proxy_cache_lock on;
+                        proxy_cache_lock_timeout 200ms; proxy_cache_lock_age 1s;
+                        proxy_ignore_headers Expires; proxy_ignore_headers Vary; }
+                    location /v { proxy_pass http://127.0.0.1:8080; proxy_cache $arg_c; }
+                    location /off { proxy_pass http://127.0.0.1:8080; proxy_cache off; }
             } }
         "#;
-        parse(src).unwrap();
-        // The cache itself is still unknown.
-        let cached = "http { server { listen 80; location / { proxy_cache one; } } }";
-        assert!(parse(cached).is_err());
+        let cfg = parse(src).unwrap();
+        let path = &cfg.proxy_cache_paths[0];
+        assert_eq!(path.zone, "one");
+        assert_eq!(path.levels, [1, 2, 0]);
+        assert_eq!(path.inactive_secs, 3600);
+        assert_eq!(path.max_size, Some(1 << 30));
+        assert_eq!(path.min_free, None);
+        for bad in [
+            "proxy_cache_path /tmp/c;",
+            "proxy_cache_path /tmp/c keys_zone=one;",
+            "proxy_cache_path /tmp/c keys_zone=one:1k;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m levels=3;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m levels=1:2:2:2;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m use_temp_path=maybe;",
+            "proxy_cache_path /tmp/c keys_zone=one:1m bogus=1;",
+            "proxy_cache_path /a keys_zone=one:1m; proxy_cache_path /b keys_zone=one:1m;",
+            "proxy_cache_valid 999 1m;",
+            "proxy_cache_valid 200 soon;",
+            "proxy_cache_methods PUT;",
+            "proxy_cache_use_stale http_418;",
+            "proxy_cache_use_stale bogus;",
+            "proxy_cache_lock maybe;",
+            "proxy_cache one; proxy_cache two;",
+        ] {
+            let src = format!("http {{ {bad} server {{ listen 80; }} }}");
+            assert!(parse(&src).is_err(), "{bad}");
+        }
     }
 
     #[test]

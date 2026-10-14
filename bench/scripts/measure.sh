@@ -67,18 +67,19 @@ duration="${scenario_fields[6]}"
 warmup="${scenario_fields[7]}"
 cooldown="${scenario_fields[8]}"
 conf_rel="${scenario_fields[9]}"
-_prepare="${scenario_fields[10]}"
+prepare="${scenario_fields[10]}"
 header_mode="${scenario_fields[11]}"
 headers_raw="${scenario_fields[12]}"
 scheme="${scenario_fields[13]}"
 
 conf_abs="${REPO_ROOT}/${conf_rel}"
 [[ -f "$conf_abs" ]] || die "missing config: $conf_abs"
+run_prepare "$prepare"
 
 config_dir="$(dirname "$conf_abs")"
 history_file="${config_dir}/history_${SCENARIO_ID}.tsv"
 
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 
 # Git context — works whether or not the working tree is clean.
 commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"

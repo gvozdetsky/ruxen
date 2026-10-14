@@ -92,6 +92,14 @@ pub(crate) async fn write_access_logs(
             .map(|i| &request_uri[..i])
             .unwrap_or(request_uri)
     });
+    // `$document_root` / `$request_filename` without a kept rewrite state:
+    // the location's root alone, only when a log reads them (#363).
+    let root_only = match meta {
+        Some(m) if m.rewrite_state.is_none() && logs.iter().any(|l| l.reads_doc_root) => {
+            super::response::root_only_state(m)
+        }
+        _ => None,
+    };
     let ctx = RenderCtx {
         uri,
         request_uri,
@@ -130,12 +138,17 @@ pub(crate) async fn write_access_logs(
         // empty here, which mirrors nginx (where regex captures are
         // discarded after request termination).
         server_name_captures: &[],
-        rewrite_state: meta.and_then(|m| m.rewrite_state.as_deref()),
+        rewrite_state: meta
+            .and_then(|m| m.rewrite_state.as_deref())
+            .or(root_only.as_ref()),
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.map_or(&[][..], |m| m.proxy_host),
         upstream_headers: meta.map_or(&[][..], |m| &m.upstream_headers),
         upstream_states: meta.map_or(&[][..], |m| &m.upstream_states),
+        upstream_cache_status: meta
+            .and_then(|m| m.upstream_cache_status)
+            .map_or(&[][..], |s| s.as_bytes()),
         sent_trailers: &[],
         tls,
         conn,
@@ -161,6 +174,19 @@ pub(crate) async fn write_access_logs(
         }
         line.push(b'\n');
 
+        // A path with variables: render, open, write, close (#303).
+        if let Some(path) = log.path_vars {
+            let error_logs = meta.map_or(&[][..], |m| m.log.error_logs);
+            write_access_line_by_path(path, meta.and_then(|m| m.doc_root), error_logs, &ctx, line)
+                .await;
+            continue;
+        }
+        // `buffer=`: into this worker's buffer for the file (#151).
+        if let Some(buffer) = log.buffer {
+            write_buffered_access_line(http, &files, log, buffer, &line).await;
+            continue;
+        }
+
         // `write_at(_, 0)` is safe because the fd was opened with
         // `O_APPEND`: on Linux, pwrite ignores the offset for O_APPEND fds
         // and performs an atomic append under the inode lock (see
@@ -173,6 +199,109 @@ pub(crate) async fn write_access_logs(
             continue;
         };
         let (res, _buf) = file.write_all_at(line, 0).await;
+        if let Err(e) = res {
+            eprintln!(
+                "ruxen: access_log write to {} failed: {e}",
+                log.path.display()
+            );
+        }
+    }
+}
+
+/// An access_log line for a path with variables, as nginx's
+/// ngx_http_log_script_write: only when the location's root exists (so a
+/// bogus `Host` can't make files), then to the rendered path, opened for
+/// this line and closed after it.
+#[cold]
+#[inline(never)]
+async fn write_access_line_by_path(
+    path: &'static [PreparedValuePart],
+    doc_root: Option<&'static DocRoot>,
+    error_logs: &'static [PreparedErrorLog],
+    ctx: &RenderCtx<'_>,
+    line: Vec<u8>,
+) {
+    if let Some(root) = doc_root
+        && let Err(e) = std::fs::metadata(root.path)
+    {
+        write_worker_log(
+            error_logs,
+            ErrorLogLevel::Error,
+            &format!(
+                "testing \"{}\" existence failed ({}) while logging request",
+                root.path.display(),
+                errno_text(&e)
+            ),
+        );
+        return;
+    }
+    let mut rendered = Vec::with_capacity(64);
+    render_parts(path, ctx, &mut rendered);
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&rendered));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(AsyncFile::from_std);
+    let file = match file {
+        Ok(file) => file,
+        Err(e) => {
+            write_worker_log(
+                error_logs,
+                ErrorLogLevel::Error,
+                &format!(
+                    "open() \"{}\" failed ({}) while logging request",
+                    path.display(),
+                    errno_text(&e)
+                ),
+            );
+            return;
+        }
+    };
+    let (res, _) = file.write_all_at(line, 0).await;
+    if let Err(e) = res {
+        eprintln!("ruxen: access_log write to {} failed: {e}", path.display());
+    }
+}
+
+/// A line for a buffered access_log: into the buffer, and whatever has to
+/// go out now (a full buffer, a line larger than it). Cold: buffered logs
+/// write rarely.
+#[cold]
+#[inline(never)]
+async fn write_buffered_access_line(
+    http: &'static PreparedHttp,
+    files: &[AccessLogSink],
+    log: &PreparedAccessLog,
+    buffer: &'static PreparedLogBuffer,
+    line: &[u8],
+) {
+    let appended = super::logbuf::append(buffer, log.file_index, line);
+    if appended.arm_timer
+        && let Some(ms) = buffer.flush_ms
+    {
+        monoio::spawn(async move {
+            monoio::time::sleep(Duration::from_millis(ms)).await;
+            if let Some((file_index, data)) = super::logbuf::take_for_timer(buffer)
+                && let Some(files) = access_log_files(http.access_logs)
+                && let Some(AccessLogSink::File(file)) = files.get(file_index)
+            {
+                let (res, _) = file.write_all_at(data, 0).await;
+                if let Err(e) = res {
+                    eprintln!(
+                        "ruxen: access_log write to {} failed: {e}",
+                        buffer.path.display()
+                    );
+                }
+            }
+        });
+    }
+    let Some(AccessLogSink::File(file)) = files.get(log.file_index) else {
+        return;
+    };
+    for data in appended.write {
+        let (res, _) = file.write_all_at(data, 0).await;
         if let Err(e) = res {
             eprintln!(
                 "ruxen: access_log write to {} failed: {e}",
@@ -320,7 +449,7 @@ async fn reject_request<S: ConnIo>(
 /// A response under `limit_rate`: the head, then the file body if any,
 /// paced as nginx's write filter does. `false` if the connection failed.
 #[allow(clippy::too_many_arguments)]
-async fn write_response_paced<S: monoio::io::AsyncWriteRent>(
+async fn write_response_paced<S: ConnIo>(
     stream: &mut S,
     scratch: &mut Vec<u8>,
     file_body: Option<phase::FileBody>,
@@ -357,6 +486,8 @@ async fn settle_proxy_response(
     let Response::Proxy(plan) = response else {
         return (response, process_meta);
     };
+    // `$uri` for the response's add_header / proxy_redirect / error page.
+    let uri = final_uri(&process_meta, url_scratch);
 
     // The first pass is inline (an `async fn` layer here costs on the
     // proxy hot path); later passes, after an internal redirect, are in
@@ -390,6 +521,7 @@ async fn settle_proxy_response(
             ctx,
             &process_meta,
             server_bytes,
+            uri,
         )
     };
     let mut carried = Vec::new();
@@ -412,12 +544,14 @@ async fn settle_proxy_response(
                     ctx,
                     &process_meta,
                     server_bytes,
+                    uri,
                 ) {
                     Response::Reroute(reroute) => (reroute, false),
                     response => {
                         let mut process_meta = process_meta;
                         process_meta.upstream_states = report.states;
                         process_meta.upstream_headers = report.upstream_headers;
+                        process_meta.upstream_cache_status = report.cache_status;
                         return (carry_accel_headers(response, &carried, false), process_meta);
                     }
                 },
@@ -431,6 +565,7 @@ async fn settle_proxy_response(
                 http,
                 ctx,
                 process_meta,
+                uri,
             );
         }
     };
@@ -439,8 +574,11 @@ async fn settle_proxy_response(
     let trail = crate::proxy::UpstreamTrail {
         states: report.states,
         headers: report.upstream_headers,
+        cache_status: report.cache_status,
     };
-    Box::pin(settle_redirected(
+    // The counts limit_conn took stay held through the redirect (#95).
+    let held = process_meta.limit_conn_held.clone();
+    let (response, mut meta) = Box::pin(settle_redirected(
         http,
         ctx,
         url_scratch,
@@ -450,7 +588,11 @@ async fn settle_proxy_response(
         as_get,
         limit_rate,
     ))
-    .await
+    .await;
+    if meta.limit_conn_held.is_none() {
+        meta.limit_conn_held = held;
+    }
+    (response, meta)
 }
 
 /// `intercept_proxy_error` with this pass's attempts and upstream headers
@@ -465,10 +607,12 @@ fn intercept_with_report(
     ctx: &phase::RequestCtx<'_>,
     process_meta: &phase::ProcessMeta,
     server_bytes: &'static [u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let trail = crate::proxy::UpstreamTrail {
         states: std::mem::take(&mut report.states),
         headers: std::mem::take(&mut report.upstream_headers),
+        cache_status: report.cache_status,
     };
     let pass_ctx = phase::RequestCtx {
         upstream: Some(&trail),
@@ -482,6 +626,7 @@ fn intercept_with_report(
         &pass_ctx,
         process_meta,
         server_bytes,
+        uri,
     );
     report.states = trail.states;
     report.upstream_headers = trail.headers;
@@ -498,8 +643,23 @@ fn finish_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     mut process_meta: phase::ProcessMeta,
+    // `$uri`: the current URI (`final_uri`).
+    uri: Option<&[u8]>,
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
+    process_meta.upstream_cache_status = report.cache_status;
+    // Not for the proxy's own 502/504 (prebuilt at startup, so its `Date`
+    // is old): nginx writes its own `Date` there.
+    process_meta.keep_upstream_date =
+        report.passes_date && !matches!(upstream_resp, Response::Prebuilt(_));
+    // A relayed body (#88): the head is filtered as an `Owned` response
+    // with no body, then goes back with the upstream connection.
+    let (upstream_resp, relayed) = match upstream_resp {
+        Response::ProxyStream(mut body) => {
+            (Response::Owned(std::mem::take(&mut body.head)), Some(body))
+        }
+        other => (other, None),
+    };
     // `X-Accel-Limit-Rate` is the response's `limit_rate`.
     if let Some(rate) = report.accel.as_ref().and_then(|a| a.limit_rate) {
         process_meta.limit_rate =
@@ -515,6 +675,7 @@ fn finish_proxy_response(
             ctx,
             &process_meta,
             &report.upstream_headers,
+            uri,
         )
     } else {
         upstream_resp
@@ -525,10 +686,21 @@ fn finish_proxy_response(
         ctx,
         &process_meta,
         &report.upstream_headers,
+        uri,
     );
-    // The header is filtered; the body is already read (responses are
-    // buffered whole), so the upstream request is over.
-    crate::proxy::finish_answer(&mut process_meta.upstream_states);
+    let response = match (response, relayed) {
+        (Response::Owned(head), Some(mut body)) => {
+            body.head = head;
+            Response::ProxyStream(body)
+        }
+        (response, _) => response,
+    };
+    // The header is filtered. A buffered body is already read, so the
+    // upstream request is over; a relayed one ends after the write, where
+    // its timing is filled in.
+    if !matches!(response, Response::ProxyStream(_)) {
+        crate::proxy::finish_answer(&mut process_meta.upstream_states);
+    }
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
 }
@@ -558,10 +730,14 @@ enum PassOutcome {
 async fn run_proxy_pass(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
-    plan: crate::proxy::ProxyPlan,
+    mut plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
+    uri: Option<&[u8]>,
 ) -> PassOutcome {
+    // After an internal redirect the answer's head is rewritten further
+    // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
+    plan.stream = false;
     let redirects = plan.response.redirects;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
@@ -592,6 +768,7 @@ async fn run_proxy_pass(
             &pass_request(ctx, as_get),
             &process_meta,
             server_bytes,
+            uri,
         )
     };
     let limit_rate = report.accel.as_ref().and_then(|a| a.limit_rate);
@@ -603,6 +780,7 @@ async fn run_proxy_pass(
             trail: crate::proxy::UpstreamTrail {
                 states: report.states,
                 headers: report.upstream_headers,
+                cache_status: report.cache_status,
             },
             carried: Vec::new(),
             as_get,
@@ -624,12 +802,14 @@ async fn run_proxy_pass(
                     &pass_request(ctx, as_get),
                     &process_meta,
                     server_bytes,
+                    uri,
                 ) {
                     Response::Reroute(reroute) => (reroute, as_get),
                     response => {
                         let mut process_meta = process_meta;
                         process_meta.upstream_states = report.states;
                         process_meta.upstream_headers = report.upstream_headers;
+                        process_meta.upstream_cache_status = report.cache_status;
                         let response = carry_accel_headers(response, &carried, false);
                         return PassOutcome::Done(response, process_meta);
                     }
@@ -640,6 +820,7 @@ async fn run_proxy_pass(
                 trail: crate::proxy::UpstreamTrail {
                     states: report.states,
                     headers: report.upstream_headers,
+                    cache_status: report.cache_status,
                 },
                 carried,
                 as_get,
@@ -647,8 +828,15 @@ async fn run_proxy_pass(
             }
         }
         upstream_resp => {
-            let (response, process_meta) =
-                finish_proxy_response(upstream_resp, report, redirects, http, ctx, process_meta);
+            let (response, process_meta) = finish_proxy_response(
+                upstream_resp,
+                report,
+                redirects,
+                http,
+                ctx,
+                process_meta,
+                uri,
+            );
             PassOutcome::Done(response, process_meta)
         }
     }
@@ -685,12 +873,15 @@ async fn settle_redirected(
         let Response::Proxy(plan) = response else {
             process_meta.upstream_states = trail.states;
             process_meta.upstream_headers = trail.headers;
+            process_meta.upstream_cache_status = trail.cache_status;
             return (carry_accel_headers(response, &carried, false), process_meta);
         };
-        match run_proxy_pass(http, ctx, plan, process_meta, as_get).await {
+        let uri = final_uri(&process_meta, url_scratch);
+        match run_proxy_pass(http, ctx, plan, process_meta, as_get, uri).await {
             PassOutcome::Done(response, mut meta) => {
                 trail.states.append(&mut meta.upstream_states);
                 meta.upstream_states = trail.states;
+                meta.upstream_cache_status = meta.upstream_cache_status.or(trail.cache_status);
                 return (carry_accel_headers(response, &carried, true), meta);
             }
             PassOutcome::Redirect {
@@ -702,6 +893,7 @@ async fn settle_redirected(
             } => {
                 trail.states.append(&mut more.states);
                 trail.headers = more.headers;
+                trail.cache_status = more.cache_status.or(trail.cache_status);
                 carried.extend_from_slice(&more_carried);
                 reroute = next;
                 as_get = next_as_get;
@@ -771,6 +963,7 @@ fn refuse_unsafe_accel(
     ctx: &phase::RequestCtx<'_>,
     process_meta: &phase::ProcessMeta,
     server_bytes: &'static [u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let mut message = b"unsafe URI \"".to_vec();
     message.extend_from_slice(target);
@@ -791,6 +984,7 @@ fn refuse_unsafe_accel(
         ctx,
         process_meta,
         server_bytes,
+        uri,
     )
 }
 
@@ -928,7 +1122,6 @@ async fn run_post_action(
     // the equivalent is structural — `run_post_action` is only invoked
     // from the main request handler, never from itself, and the inner
     // `post_meta.post_action` is intentionally discarded below.
-    let empty: &[u8] = &[];
     let post_path = if target.first() == Some(&b'/') {
         target
     } else {
@@ -936,7 +1129,7 @@ async fn run_post_action(
     };
     let post_ctx = phase::RequestCtx {
         path: post_path,
-        body: empty,
+        body: &phase::NO_BODY,
         body_len: 0,
         body_file: None,
         refuse: None,
@@ -969,7 +1162,10 @@ async fn run_post_action(
         Response::Prebuilt(bytes) => static_response = Some(bytes),
         Response::Owned(bytes) => owned_response = bytes,
         Response::File { headers, body: _ } => owned_response = headers,
-        Response::Reroute(_) | Response::Proxy(_) => return,
+        // post_action's answer isn't sent: the upstream connection closes.
+        Response::ProxyStream(s) => owned_response = s.head,
+        // nginx refuses an upgrade in a subrequest.
+        Response::Reroute(_) | Response::Proxy(_) | Response::Upgrade(_) => return,
     }
     let response_for_logs = static_response.unwrap_or(owned_response.as_slice());
     let log_request_uri = post_path;
@@ -1027,30 +1223,55 @@ async fn run_post_action(
 /// everything else — listeners, the io_uring ring, accepted sockets,
 /// per-request files, access-log handles — is opened by the worker that
 /// uses it. `RUXEN_UNSHARE_FILES=0` keeps the shared table (for A/B runs).
-fn unshare_fd_table() {
+fn unshare_fd_table() -> bool {
     if matches!(std::env::var("RUXEN_UNSHARE_FILES").as_deref(), Ok("0")) {
-        return;
+        return false;
     }
+    // Said once, not by every worker: they all fail the same way (a
+    // seccomp profile without the rule in contrib/docker, say).
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // SAFETY: plain syscall; affects only the calling thread's fd table.
-    if unsafe { libc::unshare(libc::CLONE_FILES) } != 0 {
+    if unsafe { libc::unshare(libc::CLONE_FILES) } == 0 {
+        return true;
+    }
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
-            "ruxen: unshare(CLONE_FILES) failed: {}; worker keeps the shared fd table",
+            "ruxen: unshare(CLONE_FILES) failed: {}; workers keep the shared fd table",
             std::io::Error::last_os_error()
         );
     }
+    false
 }
 
 /// Worker thread body. `ready` gets exactly one message once startup is
-/// done — `Ok` when every listener is bound, or the `[emerg]` text of the
-/// first failure, after which the worker exits. `main` waits for all of
-/// them before writing the pid file.
+/// done — `Ok` when the worker is ready to accept on `listeners` (opened
+/// by `main`, see `listeners`), or the `[emerg]` text of the first
+/// failure, after which the worker exits. `main` waits for all of them
+/// before writing the pid file, or before a reload retires the workers of
+/// the configuration before.
 pub fn run(
     http: &'static PreparedHttp,
     cpu: Option<usize>,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
+    listeners: super::listeners::WorkerListeners,
 ) {
-    unshare_fd_table();
+    let unshared = unshare_fd_table();
+    let adopted = match super::listeners::adopt(listeners, unshared) {
+        Ok(adopted) => adopted,
+        Err(e) => {
+            let _ = ready.send(Err(format!("dup() failed ({})", errno_text(&e))));
+            return;
+        }
+    };
+    // What `force_close` leaves alone: everything open now but the
+    // listeners. Only with a table of its own, where the rest is this
+    // worker's.
+    let inherited = unshared.then(|| {
+        use std::os::fd::AsRawFd;
+        let own: Vec<_> = adopted.iter().map(|(_, fd)| fd.as_raw_fd()).collect();
+        super::listeners::inherited_fds(&own)
+    });
     if let Some(c) = cpu {
         // Pin before building the runtime so io_uring setup + the submission
         // queue end up on the target CPU's kernel workers too.
@@ -1059,19 +1280,9 @@ pub fn run(
         }
     }
 
-    let mut rt = match RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .with_entries(4096)
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = ready.send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
-            return;
-        }
-    };
-
-    rt.block_on(async move {
+    // The worker's whole life; it runs on whichever driver `main` chose.
+    let ready_on_failure = ready.clone();
+    let body = async move {
         WORKER_CONNS.with(|w| w.http.set(Some(http)));
         // Open one fd per configured access_log for this worker. Kept in a
         // thread-local so `write_access_logs` can do io_uring writes without
@@ -1082,54 +1293,74 @@ pub fn run(
         }
 
         let mut listeners = Vec::with_capacity(http.listens.len());
-        for prepared in &http.listens {
-            let bound = listen_socket(http, prepared)
-                .and_then(|socket| TcpListener::from_std(socket.into()));
-            match bound {
-                Ok(listener) => listeners.push(listener),
-                Err(e) => {
-                    let _ = ready.send(Err(format!(
-                        "bind() to {} failed ({})",
-                        prepared.addr,
-                        errno_text(&e)
-                    )));
-                    return;
-                }
+        // `listen unix:` sockets (#263).
+        let mut unix_listeners = Vec::new();
+        for (listen_index, fd) in adopted {
+            let prepared = &http.listens[listen_index];
+            let made = if prepared.unix.is_some() {
+                monoio::net::UnixListener::from_std(std::os::unix::net::UnixListener::from(fd))
+                    .map(|l| unix_listeners.push((listen_index, l)))
+            } else {
+                TcpListener::from_std(std::net::TcpListener::from(fd))
+                    .map(|l| listeners.push((listen_index, l)))
+            };
+            if let Err(e) = made {
+                let _ = ready.send(Err(format!(
+                    "registering the listener of {} failed ({})",
+                    prepared.addr,
+                    errno_text(&e)
+                )));
+                return;
             }
         }
         let _ = ready.send(Ok(()));
         // Drop the sender so `main` sees a closed channel, not a hang, if
         // another worker dies before reporting.
         drop(ready);
+        // Accept only once `main` has switched to the configured `user`.
+        state.wait_released();
+        if test_panic() == TestPanic::Worker {
+            panic!("{TEST_PANIC_ENV}=worker");
+        }
 
-        if listeners.len() == 1 {
+        if listeners.len() == 1 && unix_listeners.is_empty() {
             // Single-listen fast path: keep the accept loop in this top-level
             // task (the pre-m36 shape) to avoid an extra scheduler hop on
             // every accepted connection.
-            let prepared = &http.listens[0];
-            let listener = listeners.pop().expect("one listener");
+            let (listen_index, listener) = listeners.pop().expect("one listener");
+            let prepared = &http.listens[listen_index];
+            let mut tick = AcceptTick::new();
             loop {
+                // Shutdown or a reload wakes the idle connections.
+                notice_runtime_events(&state);
                 if state.is_shutting_down() {
-                    while state.active_connections() != 0 {
-                        monoio::time::sleep(Duration::from_millis(10)).await;
-                    }
+                    // Stop accepting at once: after a reload, the socket
+                    // goes on with the next generation's worker, or is
+                    // closed if the address went away.
+                    drop(listener);
+                    drain(state, inherited.as_deref()).await;
+                    flush_access_log_buffers();
                     return;
                 }
-                match accept_or_tick(&listener).await {
+                match accept_or_tick(&listener, &mut tick, state).await {
                     Ok(Some((stream, addr))) => {
-                        if !admit_connection(http) {
+                        let admitted = admit_connection(http);
+                        if http.stats {
+                            super::stats::accepted(admitted);
+                        }
+                        if !admitted {
                             continue;
                         }
                         let _ = stream.set_nodelay(true);
-                        state.connection_started();
+                        connection_started();
                         let connection_id = state.next_connection_id();
                         spawn_connection(
                             prepared,
                             stream,
                             addr,
-                            0,
+                            listen_index,
                             http,
-                            state.clone(),
+                            state,
                             connection_id,
                         );
                     }
@@ -1138,38 +1369,384 @@ pub fn run(
                 }
             }
         } else {
-            for (listen_index, listener) in listeners.into_iter().enumerate() {
-                monoio::spawn(run_listener(listener, listen_index, http, state.clone()));
+            let mut accepting = Vec::with_capacity(listeners.len() + unix_listeners.len());
+            for (listen_index, listener) in listeners {
+                accepting.push(monoio::spawn(run_listener(
+                    listener,
+                    listen_index,
+                    http,
+                    state,
+                )));
+            }
+            for (listen_index, listener) in unix_listeners {
+                accepting.push(monoio::spawn(run_unix_listener(
+                    listener,
+                    listen_index,
+                    http,
+                    state,
+                )));
             }
 
             loop {
-                if state.is_shutting_down() && state.active_connections() == 0 {
+                // Shutdown or a reload wakes the idle connections.
+                notice_runtime_events(&state);
+                if state.is_shutting_down() {
+                    // The accept loops cancel their accepts and close their
+                    // sockets. Dropped with the runtime instead, an accept
+                    // left in the ring kept the socket listening after a
+                    // reload removed its address.
+                    for task in accepting {
+                        task.await;
+                    }
+                    drain(state, inherited.as_deref()).await;
+                    flush_access_log_buffers();
                     return;
                 }
                 monoio::time::sleep(Duration::from_millis(10)).await;
             }
         }
-    });
+    };
+
+    match driver() {
+        Driver::IoUring => match RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .with_entries(4096)
+            .build()
+        {
+            Ok(mut rt) => rt.block_on(body),
+            Err(e) => {
+                let _ = ready_on_failure
+                    .send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
+            }
+        },
+        Driver::Epoll => match RuntimeBuilder::<monoio::LegacyDriver>::new()
+            .enable_timer()
+            .build()
+        {
+            Ok(mut rt) => rt.block_on(body),
+            Err(e) => {
+                let _ = ready_on_failure
+                    .send(Err(format!("epoll_create() failed ({})", errno_text(&e))));
+            }
+        },
+    }
+}
+
+/// The I/O driver every worker runs on, chosen once by `main` (#215).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Driver {
+    IoUring,
+    /// monoio's legacy driver: epoll, for where io_uring is unavailable.
+    Epoll,
+}
+
+static EPOLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set before the workers start.
+pub fn set_driver(driver: Driver) {
+    EPOLL.store(
+        driver == Driver::Epoll,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn driver() -> Driver {
+    if EPOLL.load(std::sync::atomic::Ordering::Relaxed) {
+        Driver::Epoll
+    } else {
+        Driver::IoUring
+    }
+}
+
+/// Wait for this worker's connections to finish once shutdown began. When
+/// `main` forces the end (`worker_shutdown_timeout` after a reload), shut
+/// their sockets down, again every second for connections opened since
+/// (an upstream retry); `inherited` is `None` without a private fd table,
+/// where that can't be told apart.
+async fn drain(state: &RuntimeState, inherited: Option<&[std::os::fd::RawFd]>) {
+    let mut swept: Option<Instant> = None;
+    while worker_clients() != 0 {
+        if state.is_forced()
+            && let Some(inherited) = inherited
+            && swept.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            super::listeners::shut_down_sockets(inherited);
+            swept = Some(Instant::now());
+        }
+        monoio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The accept loop of a `listen unix:` socket (#263). A connection is
+/// carried as a `TcpStream`, as unix upstreams are (#101): its I/O is plain
+/// recv/send on the descriptor, so the connection code is the same; the
+/// listen's `unix` marks the peer as `unix:`.
+pub(crate) async fn run_unix_listener(
+    listener: monoio::net::UnixListener,
+    listen_index: usize,
+    http: &'static PreparedHttp,
+    state: &'static RuntimeState,
+) {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let prepared = &http.listens[listen_index];
+    let mut tick = AcceptTick::new();
+    loop {
+        if state.is_shutting_down() {
+            return;
+        }
+        match unix_accept_or_tick(&listener, &mut tick, state).await {
+            Ok(Some(stream)) => {
+                let admitted = admit_connection(http);
+                if http.stats {
+                    super::stats::accepted(admitted);
+                }
+                if !admitted {
+                    continue;
+                }
+                let fd = stream.into_raw_fd();
+                // SAFETY: a connected stream socket nothing else owns.
+                let Ok(stream) =
+                    TcpStream::from_std(unsafe { std::net::TcpStream::from_raw_fd(fd) })
+                else {
+                    continue;
+                };
+                connection_started();
+                let connection_id = state.next_connection_id();
+                spawn_connection(
+                    prepared,
+                    stream,
+                    SocketAddr::from(([0, 0, 0, 0], 0)),
+                    listen_index,
+                    http,
+                    state,
+                    connection_id,
+                );
+            }
+            Ok(None) => {}
+            Err(e) => accept_failed(http, &e).await,
+        }
+    }
+}
+
+/// `accept_or_tick` for a `listen unix:` socket: the same tick, and the
+/// same cancel on shutdown.
+async fn unix_accept_or_tick(
+    listener: &monoio::net::UnixListener,
+    tick: &mut AcceptTick,
+    state: &RuntimeState,
+) -> std::io::Result<Option<monoio::net::UnixStream>> {
+    use std::pin::pin;
+
+    let mut accept = pin!(listener.cancelable_accept(tick.canceller.handle()));
+    loop {
+        monoio::select! {
+            res = &mut accept => return res.map(|(stream, _)| Some(stream)),
+            _ = tick.timer.as_mut() => {
+                tick.timer
+                    .as_mut()
+                    .reset(monoio::time::Instant::now() + ACCEPT_TICK);
+                notice_runtime_events(state);
+                if !state.is_shutting_down() {
+                    continue;
+                }
+                tick.canceller = std::mem::take(&mut tick.canceller).cancel();
+                return match accept.await {
+                    Ok((stream, _)) => Ok(Some(stream)),
+                    Err(_) => Ok(None),
+                };
+            }
+        }
+    }
+}
+
+/// A request limit_req delayed (#94): wait, then run it again past
+/// limit_req, as nginx resumes its phases after the delay timer: the
+/// handler, the upstream and `$request_time` come after the delay.
+#[cold]
+#[inline(never)]
+/// `auth_request` (#358): run the subrequests the request needs, then
+/// process it again with their outcomes (`phase::resume_auth_request`), as
+/// nginx re-enters its access phase. Processing starts over each time, so
+/// a location reached after an internal redirect may need another one;
+/// the outcomes so far go along, by URI. The first pass's limit_conn
+/// counts stay with the request.
+async fn auth_subrequest(
+    http: &'static PreparedHttp,
+    ctx: &mut phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    first: phase::ProcessMeta,
+    request_start: Instant,
+) -> (Response, phase::ProcessMeta) {
+    let held = first.limit_conn_held.clone();
+    let mut meta = first;
+    let mut outcomes: Vec<(&'static [u8], phase::AuthResume)> = Vec::new();
+    // More subrequests than this means a loop of redirects.
+    for _ in 0..8 {
+        let Some(pending) = meta.auth_request.take() else {
+            break;
+        };
+        let outcome = run_auth_subrequest(http, ctx, url_scratch, &pending, request_start).await;
+        outcomes.push((pending.uri, outcome));
+        phase::resume_auth_request(outcomes.clone());
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        let (response, next) = phase::process_with_meta(http, ctx, url_scratch);
+        phase::resume_auth_request(Vec::new());
+        meta = next;
+        if meta.limit_conn_held.is_none() {
+            meta.limit_conn_held = held.clone();
+        }
+        if meta.auth_request.is_none() {
+            return (response, meta);
+        }
+    }
+    meta.auth_request = None;
+    (
+        Response::Prebuilt(http.internal_error.pick(ctx.method)),
+        meta,
+    )
+}
+
+/// One `auth_request` subrequest: a GET to its URI with the request's
+/// headers and no body, through the internal-redirect path (so `internal`
+/// locations answer). Its body isn't wanted (`header_only`); its status,
+/// `WWW-Authenticate` and `auth_request_set` values are.
+async fn run_auth_subrequest(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    pending: &phase::AuthPending,
+    request_start: Instant,
+) -> phase::AuthResume {
+    // `$request_uri` stays the request's, as for an nginx subrequest; the
+    // auth URI is where it is routed, with its own arguments only.
+    let sub_ctx = phase::RequestCtx {
+        method: Method::Get,
+        method_bytes: b"GET",
+        body: &phase::NO_BODY,
+        body_len: 0,
+        body_file: None,
+        refuse: None,
+        upstream: None,
+        ..*ctx
+    };
+    let (response, sub_meta) =
+        phase::process_with_meta_from_reroute(http, &sub_ctx, url_scratch, {
+            let (path, args) = match pending.uri.iter().position(|&b| b == b'?') {
+                Some(q) => (&pending.uri[..q], pending.uri[q + 1..].to_vec()),
+                None => (pending.uri, Vec::new()),
+            };
+            phase::Reroute {
+                target: phase::RerouteTarget::Uri(path.to_vec()),
+                args: Some(args),
+                error_page_status: None,
+                enters_error_page: false,
+                preserved_location: None,
+                preserved_www_authenticate: Vec::new(),
+            }
+        });
+    // `auth_request_set` reads the upstream's header (`$upstream_http_*`):
+    // keep it, whatever the subrequest's location reads itself.
+    let response = match response {
+        Response::Proxy(mut plan) => {
+            plan.keep_upstream_headers = true;
+            Response::Proxy(plan)
+        }
+        other => other,
+    };
+    let (response, sub_meta) =
+        settle_proxy_response(http, &sub_ctx, url_scratch, response, sub_meta).await;
+    let head: &[u8] = match &response {
+        Response::Prebuilt(b) => b,
+        Response::Owned(b) => b,
+        Response::File { headers, .. } => headers,
+        Response::ProxyStream(stream) => &stream.head,
+        _ => &[],
+    };
+    let head = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(head, |end| &head[..end + 4]);
+    let status = super::response_status(head);
+    // nginx takes the subrequest's own `WWW-Authenticate`, else its
+    // upstream's.
+    let mut www_authenticate = super::response_header_values_all(head, b"www-authenticate");
+    if www_authenticate.is_empty() && !sub_meta.upstream_headers.is_empty() {
+        www_authenticate =
+            super::response_header_values_all(&sub_meta.upstream_headers, b"www-authenticate");
+    }
+    let trail = crate::proxy::UpstreamTrail {
+        states: sub_meta.upstream_states.clone(),
+        headers: sub_meta.upstream_headers.clone(),
+        cache_status: None,
+    };
+    let render_req = phase::RequestCtx {
+        upstream: Some(&trail),
+        request_time_us: request_start.elapsed().as_micros() as u64,
+        ..sub_ctx
+    };
+    let vars = pending
+        .sets
+        .iter()
+        .map(|(name, parts)| {
+            let value = super::render_in_subrequest(
+                http,
+                &render_req,
+                sub_meta.server_name,
+                sub_meta.server_port,
+                status,
+                head,
+                parts,
+            );
+            (*name, value)
+        })
+        .collect();
+    phase::AuthResume {
+        status,
+        www_authenticate,
+        vars,
+        limit_req_status: pending.limit_req_status,
+        limit_conn_status: pending.limit_conn_status,
+    }
+}
+
+async fn limit_req_delayed(
+    http: &'static PreparedHttp,
+    ctx: &mut phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    delay_ms: u64,
+    request_start: Instant,
+) -> (Response, phase::ProcessMeta) {
+    monoio::time::sleep(Duration::from_millis(delay_ms)).await;
+    ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+    super::limit_req::resume_after_delay(true);
+    let out = phase::process_with_meta(http, ctx, url_scratch);
+    super::limit_req::resume_after_delay(false);
+    out
 }
 
 pub(crate) async fn run_listener(
     listener: TcpListener,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
 ) {
     let prepared = &http.listens[listen_index];
+    let mut tick = AcceptTick::new();
     loop {
         if state.is_shutting_down() {
             return;
         }
-        match accept_or_tick(&listener).await {
+        match accept_or_tick(&listener, &mut tick, state).await {
             Ok(Some((stream, addr))) => {
-                if !admit_connection(http) {
+                let admitted = admit_connection(http);
+                if http.stats {
+                    super::stats::accepted(admitted);
+                }
+                if !admitted {
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
-                state.connection_started();
+                connection_started();
                 let connection_id = state.next_connection_id();
                 spawn_connection(
                     prepared,
@@ -1177,7 +1754,7 @@ pub(crate) async fn run_listener(
                     addr,
                     listen_index,
                     http,
-                    state.clone(),
+                    state,
                     connection_id,
                 );
             }
@@ -1198,52 +1775,68 @@ pub(crate) fn spawn_connection(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
 ) {
     // The connection was counted on accept; whatever path it takes from
     // here, dropping the guard un-counts it.
-    let guard = ConnectionGuard(state.clone());
+    let guard = ConnectionGuard;
     if prepared.proxy_protocol {
         // Cold: `listen … proxy_protocol`.
-        monoio::spawn(handle_proxy_protocol(
-            prepared,
-            stream,
-            peer_addr,
-            listen_index,
+        monoio::spawn(Contained::new(
+            handle_proxy_protocol(
+                prepared,
+                stream,
+                peer_addr,
+                listen_index,
+                http,
+                state,
+                connection_id,
+                guard,
+            ),
             http,
-            state,
             connection_id,
-            guard,
+            peer_addr,
         ));
         return;
     }
     match &prepared.tls {
         None => {
-            monoio::spawn(handle_plain(
-                stream,
-                peer_addr,
-                listen_index,
+            // A panic ends this connection only (#130).
+            monoio::spawn(Contained::new(
+                handle_plain(
+                    stream,
+                    peer_addr,
+                    listen_index,
+                    http,
+                    state,
+                    connection_id,
+                    None,
+                    guard,
+                ),
                 http,
-                state,
                 connection_id,
-                None,
-                guard,
+                peer_addr,
             ));
         }
         Some(acceptor) => {
             let acceptor = acceptor.clone();
-            monoio::spawn(handle_tls(
-                stream,
-                acceptor,
-                peer_addr,
-                listen_index,
+            monoio::spawn(Contained::new(
+                handle_tls(
+                    stream,
+                    acceptor,
+                    peer_addr,
+                    listen_index,
+                    http,
+                    state,
+                    connection_id,
+                    None,
+                    Instant::now(),
+                    guard,
+                ),
                 http,
-                state,
                 connection_id,
-                None,
-                Instant::now(),
-                guard,
+                peer_addr,
             ));
         }
     }
@@ -1259,7 +1852,7 @@ async fn handle_proxy_protocol(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     guard: ConnectionGuard,
 ) {
@@ -1315,6 +1908,59 @@ async fn handle_proxy_protocol(
     }
 }
 
+/// Before the workers bind: makes sure no other process holds a listen
+/// address. Each worker binds its own `SO_REUSEPORT` socket, which a
+/// second ruxen (or anything else with `SO_REUSEPORT`, same user) could
+/// join, splitting the traffic without a word. nginx binds once without
+/// `SO_REUSEPORT` unless `reuseport` is set, so a second instance fails
+/// with `EADDRINUSE`. Here each such address is bound once without it and
+/// closed again, which fails the same way. Like nginx's
+/// ngx_open_listening_sockets: up to five tries 500 ms apart (an old
+/// instance may still be letting go), an `[emerg]` per failed bind, then
+/// `still could not bind()`. Addresses with `reuseport` are skipped, as
+/// nginx shares them too.
+pub(crate) fn claim_addresses(listens: &[&PreparedListen]) -> Result<(), String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    for tries in (0..5).rev() {
+        let mut busy = false;
+        for prepared in listens.iter().filter(|l| !l.socket.reuseport) {
+            let addr = prepared.addr;
+            let domain = if addr.is_ipv6() {
+                Domain::IPV6
+            } else {
+                Domain::IPV4
+            };
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+                .map_err(|e| format!("socket() {addr} failed ({})", errno_text(&e)))?;
+            // nginx sets SO_REUSEADDR, so sockets in TIME_WAIT don't count.
+            let _ = socket.set_reuse_address(true);
+            if addr.is_ipv6() {
+                let _ = socket.set_only_v6(prepared.socket.ipv6only);
+            }
+            match socket.bind(&addr.into()) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EADDRINUSE) => {
+                    eprintln!(
+                        "ruxen: [emerg] bind() to {addr} failed ({})",
+                        errno_text(&e)
+                    );
+                    busy = true;
+                }
+                // Anything else (EADDRNOTAVAIL, EACCES) the workers' own
+                // bind reports with the same words.
+                Err(_) => {}
+            }
+        }
+        if !busy {
+            return Ok(());
+        }
+        if tries > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    Err("still could not bind()".to_string())
+}
+
 /// The listening socket for `prepared`, with its `listen` options, as
 /// nginx's ngx_open_listening_sockets and ngx_configure_listening_sockets:
 /// `IPV6_V6ONLY` before bind, the rest before listen. A failed option is an
@@ -1335,22 +1981,44 @@ pub(crate) fn listen_socket(
     socket.set_nonblocking(true)?;
     socket.set_reuse_port(true)?;
     socket.set_reuse_address(true)?;
-    let alert = |what: String, e: std::io::Error| {
-        write_worker_log(
-            http.error_logs,
-            ErrorLogLevel::Alert,
-            &format!(
-                "setsockopt({what}) {addr} failed ({}), ignored",
-                errno_text(&e)
-            ),
-        );
-    };
     if addr.is_ipv6()
         && let Err(e) = socket.set_only_v6(o.ipv6only)
     {
-        alert(format!("IPV6_V6ONLY, {}", o.ipv6only as i32), e);
+        listen_alert(
+            http,
+            prepared,
+            format!("IPV6_V6ONLY, {}", o.ipv6only as i32),
+            e,
+        );
     }
     socket.bind(&addr.into())?;
+    set_listen_options(http, prepared, &socket);
+    socket.listen(o.backlog)?;
+    set_deferred(http, prepared, &socket, false);
+    Ok(socket)
+}
+
+fn listen_alert(http: &PreparedHttp, prepared: &PreparedListen, what: String, e: std::io::Error) {
+    write_worker_log(
+        http.error_logs,
+        ErrorLogLevel::Alert,
+        &format!(
+            "setsockopt({what}) {} failed ({}), ignored",
+            prepared.addr,
+            errno_text(&e)
+        ),
+    );
+}
+
+/// The options set between bind and listen. Also for a socket a reload
+/// keeps (`listeners`).
+pub(crate) fn set_listen_options(
+    http: &PreparedHttp,
+    prepared: &PreparedListen,
+    socket: &socket2::Socket,
+) {
+    let o = &prepared.socket;
+    let alert = |what: String, e| listen_alert(http, prepared, what, e);
     if let Some(n) = o.rcvbuf
         && let Err(e) = socket.set_recv_buffer_size(n)
     {
@@ -1373,7 +2041,7 @@ pub(crate) fn listen_socket(
                 (libc::TCP_KEEPCNT, "TCP_KEEPCNT", cnt),
             ] {
                 if let Some(v) = value
-                    && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, opt, v as i32)
+                    && let Err(e) = setsockopt_int(socket, libc::IPPROTO_TCP, opt, v as i32)
                 {
                     alert(format!("{name}, {v}"), e);
                 }
@@ -1381,18 +2049,28 @@ pub(crate) fn listen_socket(
         }
     }
     if let Some(n) = o.fastopen
-        && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, n as i32)
+        && let Err(e) = setsockopt_int(socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, n as i32)
     {
         alert(format!("TCP_FASTOPEN, {n}"), e);
     }
-    socket.listen(o.backlog)?;
-    // nginx: a 1 s defer, since how long a connection queued can't be known.
-    if o.deferred
-        && let Err(e) = setsockopt_int(&socket, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, 1)
-    {
-        alert("TCP_DEFER_ACCEPT, 1".to_string(), e);
+}
+
+/// `deferred`, set after listen. nginx: a 1 s defer, since how long a
+/// connection queued can't be known. `kept`: a socket a reload keeps, on
+/// which the option is cleared again when the new `listen` drops it.
+pub(crate) fn set_deferred(
+    http: &PreparedHttp,
+    prepared: &PreparedListen,
+    socket: &socket2::Socket,
+    kept: bool,
+) {
+    if !prepared.socket.deferred && !kept {
+        return;
     }
-    Ok(socket)
+    let on = prepared.socket.deferred as i32;
+    if let Err(e) = setsockopt_int(socket, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, on) {
+        listen_alert(http, prepared, format!("TCP_DEFER_ACCEPT, {on}"), e);
+    }
 }
 
 fn setsockopt_int(
@@ -1419,46 +2097,125 @@ fn setsockopt_int(
     }
 }
 
-/// Out of file descriptors, `accept` fails at once while the connection
-/// stays queued, so retrying immediately spins a core until fds free up.
-/// nginx logs it and stops accepting for `accept_mutex_delay` (500 ms,
-/// `ngx_event_accept.c`); do the same. Other errors (a client that reset
-/// before we accepted) are per-connection: just carry on.
+/// A failed `accept`, logged as nginx's ngx_event_accept does: `crit` when
+/// out of file descriptors, `error` for a connection the client aborted
+/// before it was accepted, `alert` for anything else. An aborted connection
+/// is just skipped. Any other error would come back on the next accept at
+/// once: io_uring has no readiness gate (nginx only calls accept again when
+/// epoll reports a pending connection), so the worker waits 500 ms, as
+/// nginx's `accept_mutex_delay` does for EMFILE, instead of spinning. A
+/// denied `IORING_OP_ACCEPT` under an io_uring restriction policy fails
+/// that way on every call with no client at all (#280).
 pub(crate) async fn accept_failed(http: &PreparedHttp, err: &std::io::Error) {
-    if matches!(
-        err.raw_os_error(),
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
-    ) {
-        write_worker_log(
-            http.error_logs,
-            ErrorLogLevel::Crit,
-            &format!("accept() failed ({})", errno_text(err)),
-        );
+    let level = match err.raw_os_error() {
+        Some(libc::EAGAIN | libc::EINTR | libc::ECANCELED) => return,
+        Some(libc::ECONNABORTED) => ErrorLogLevel::Error,
+        Some(libc::EMFILE | libc::ENFILE) => ErrorLogLevel::Crit,
+        _ => ErrorLogLevel::Alert,
+    };
+    let message = format!("accept() failed ({})", errno_text(err));
+    if level == ErrorLogLevel::Alert {
+        // The same error twice a second from every worker would flood the
+        // log: say it once a minute, with how often it happened since.
+        if let Some(message) = ACCEPT_ALERTS.with(|a| a.borrow_mut().take(Instant::now(), message))
+        {
+            write_worker_log(http.error_logs, level, &message);
+        }
+    } else {
+        write_worker_log(http.error_logs, level, &message);
+    }
+    if level != ErrorLogLevel::Error {
         monoio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+thread_local! {
+    static ACCEPT_ALERTS: std::cell::RefCell<RepeatedLine> =
+        const { std::cell::RefCell::new(RepeatedLine { last: None, since: 0 }) };
+}
+
+/// One log line that may repeat: the first goes out, then at most one a
+/// minute, which says how many were held back.
+struct RepeatedLine {
+    last: Option<Instant>,
+    since: u64,
+}
+
+impl RepeatedLine {
+    const EVERY: Duration = Duration::from_secs(60);
+
+    fn take(&mut self, now: Instant, message: String) -> Option<String> {
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Self::EVERY)
+        {
+            self.since += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(match std::mem::take(&mut self.since) {
+            0 => message,
+            n => format!("{message}, {n} more like it since the last one"),
+        })
     }
 }
 
 pub(crate) async fn accept_or_tick(
     listener: &TcpListener,
+    tick: &mut AcceptTick,
+    state: &RuntimeState,
 ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
     use std::pin::pin;
 
-    let canceler = monoio::io::Canceller::new();
-    let mut accept = pin!(listener.cancelable_accept(canceler.handle()));
-    let mut tick = pin!(monoio::time::sleep(Duration::from_millis(50)));
-    monoio::select! {
-        res = &mut accept => res.map(Some),
-        _ = &mut tick => {
-            // If the accept SQE completed in the same poll batch as the
-            // timer, dropping it here closes the accepted fd and the client
-            // sees EOF. Cancel the op, then keep whatever the kernel already
-            // handed back: a real success (race with cancel) hands us the
-            // connection; a genuine cancel returns the canceled-op error.
-            canceler.cancel();
-            match accept.await {
-                Ok(pair) => Ok(Some(pair)),
-                Err(_) => Ok(None),
+    let mut accept = pin!(listener.cancelable_accept(tick.canceller.handle()));
+    loop {
+        monoio::select! {
+            res = &mut accept => return res.map(Some),
+            _ = tick.timer.as_mut() => {
+                tick.timer
+                    .as_mut()
+                    .reset(monoio::time::Instant::now() + ACCEPT_TICK);
+                // Shutdown or a reload wakes the idle connections.
+                notice_runtime_events(state);
+                if !state.is_shutting_down() {
+                    // The accept stays in flight: cancelling and submitting
+                    // it again on every tick cost each idle worker CPU.
+                    continue;
+                }
+                // If the accept SQE completed in the same poll batch as the
+                // timer, dropping it here closes the accepted fd and the
+                // client sees EOF. Cancel the op, then keep whatever the
+                // kernel already handed back: a real success (race with
+                // cancel) hands us the connection; a genuine cancel returns
+                // the canceled-op error. `cancel` hands back a fresh
+                // canceller.
+                tick.canceller = std::mem::take(&mut tick.canceller).cancel();
+                return match accept.await {
+                    Ok(pair) => Ok(Some(pair)),
+                    Err(_) => Ok(None),
+                };
             }
+        }
+    }
+}
+
+/// How often an accept loop wakes without a connection, to notice
+/// shutdown and reloads.
+const ACCEPT_TICK: Duration = Duration::from_millis(50);
+
+/// An accept loop's tick timer and canceller, kept across accepts: a
+/// fresh timer and canceller per accepted connection cost a timer-wheel
+/// insert and remove and an allocation each (#128).
+pub(crate) struct AcceptTick {
+    timer: std::pin::Pin<Box<monoio::time::Sleep>>,
+    canceller: monoio::io::Canceller,
+}
+
+impl AcceptTick {
+    pub(crate) fn new() -> Self {
+        AcceptTick {
+            timer: Box::pin(monoio::time::sleep(ACCEPT_TICK)),
+            canceller: monoio::io::Canceller::new(),
         }
     }
 }
@@ -1467,64 +2224,189 @@ pub(crate) async fn wait_readable_or_shutdown(
     stream: &TcpStream,
     state: &RuntimeState,
     idle_timeout: Option<Duration>,
-    start_reload_gen: u64,
+    fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> bool {
     use std::task::Poll;
 
-    if let Some(timeout) = idle_timeout {
-        timers
-            .idle
-            .as_mut()
-            .reset(monoio::time::Instant::now() + timeout);
+    let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
+    if let Some(due) = due {
+        arm_idle(timers.idle.as_mut(), due);
     }
-
     let idle = IdleMark::new();
-    loop {
-        if state.is_shutting_down() || idle.asked_to_close() {
-            return false;
+    let mut readable = std::pin::pin!(stream.readable(false));
+    // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
+    // no per-connection tick.
+    std::future::poll_fn(|cx| {
+        if (!fresh && state.is_shutting_down()) || idle.asked_to_close() {
+            return Poll::Ready(false);
         }
-        // SIGHUP-driven reload while this connection was idle: bail out so
-        // the worker can close it. New connections accepted after the
-        // reload start with the bumped generation, so they keep waiting.
-        if state.reload_gen() != start_reload_gen {
-            return false;
+        if let Poll::Ready(res) = readable.as_mut().poll(cx) {
+            return Poll::Ready(res.is_ok());
         }
+        if let Some(due) = due
+            && idle_expired(timers.idle.as_mut(), due, cx)
+        {
+            return Poll::Ready(false);
+        }
+        idle.register(cx.waker());
+        Poll::Pending
+    })
+    .await
+}
 
-        // Wake every 50 ms to re-check shutdown / reload / room-making; the
-        // idle deadline
-        // ends the wait. Both are the connection's long-lived timers.
-        timers
-            .tick
-            .as_mut()
-            .reset(monoio::time::Instant::now() + Duration::from_millis(50));
-        let mut readable = std::pin::pin!(stream.readable(false));
-        let woke = std::future::poll_fn(|cx| {
-            if let Poll::Ready(res) = readable.as_mut().poll(cx) {
-                return Poll::Ready(Some(res.is_ok()));
-            }
-            if idle_timeout.is_some() && timers.idle.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Some(false));
-            }
-            if timers.tick.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(None);
-            }
-            Poll::Pending
-        })
-        .await;
-        if let Some(proceed) = woke {
-            return proceed;
+/// `wait_readable_or_shutdown` with the request read in place of the
+/// readiness poll: the read is submitted once and raced against the idle
+/// deadline and the 50 ms tick. A tick that finds nothing to do leaves
+/// the read in flight. The read is cancelled only when the connection is
+/// to close. A read that completes while being cancelled still hands its
+/// bytes back, and a timeout that loses that race serves the request.
+pub(crate) async fn read_first_or_shutdown(
+    stream: &mut TcpStream,
+    buf: Vec<u8>,
+    state: &RuntimeState,
+    idle_timeout: Option<Duration>,
+    fresh: bool,
+    timers: &mut ConnTimers<'_>,
+) -> (IdleRead, Vec<u8>) {
+    use monoio::io::CancelableAsyncReadRent;
+    use std::task::Poll;
+
+    let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
+    if let Some(due) = due {
+        arm_idle(timers.idle.as_mut(), due);
+    }
+    let idle = IdleMark::new();
+    let canceller = monoio::io::Canceller::new();
+    let len = buf.len();
+    let mut read =
+        std::pin::pin!(stream.cancelable_read(buf.slice_mut(0..len), canceller.handle()));
+    let outcome = |res: std::io::Result<usize>| match res {
+        Ok(n) if n > 0 => IdleRead::Read(n),
+        _ => IdleRead::Close,
+    };
+    enum Woke<T> {
+        Read(T),
+        Close,
+        Timeout,
+    }
+    // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
+    // no per-connection tick.
+    let woke = std::future::poll_fn(|cx| {
+        if (!fresh && state.is_shutting_down()) || idle.asked_to_close() {
+            return Poll::Ready(Woke::Close);
+        }
+        if let Poll::Ready(done) = read.as_mut().poll(cx) {
+            return Poll::Ready(Woke::Read(done));
+        }
+        if let Some(due) = due
+            && idle_expired(timers.idle.as_mut(), due, cx)
+        {
+            return Poll::Ready(Woke::Timeout);
+        }
+        idle.register(cx.waker());
+        Poll::Pending
+    })
+    .await;
+    match woke {
+        Woke::Read((res, returned)) => (outcome(res), returned.into_inner()),
+        Woke::Close => {
+            canceller.cancel();
+            let (_, returned) = read.as_mut().await;
+            (IdleRead::Close, returned.into_inner())
+        }
+        Woke::Timeout => {
+            canceller.cancel();
+            let (res, returned) = read.as_mut().await;
+            (outcome(res), returned.into_inner())
         }
     }
 }
 
-pub(crate) struct ConnectionGuard(Arc<RuntimeState>);
+/// A connection's read buffer and scratch buffers (see `handle`).
+struct ConnBufs {
+    buf: Vec<u8>,
+    scratch: Vec<u8>,
+    url_scratch: Vec<u8>,
+}
+
+thread_local! {
+    /// Buffers of finished connections, for the next ones.
+    static CONN_BUFS: RefCell<Vec<ConnBufs>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Sets kept per worker; beyond that, finished connections free theirs.
+const CONN_BUFS_KEPT: usize = 64;
+/// A scratch buffer that grew past this (a large response) isn't kept.
+const CONN_SCRATCH_KEEP: usize = 64 * 1024;
+
+impl ConnBufs {
+    fn take() -> ConnBufs {
+        CONN_BUFS
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| ConnBufs {
+                buf: vec![0u8; READ_BUF],
+                scratch: Vec::with_capacity(READ_BUF),
+                url_scratch: Vec::with_capacity(256),
+            })
+    }
+}
+
+impl Drop for ConnBufs {
+    fn drop(&mut self) {
+        // A buffer still lent to an I/O operation (empty here) or grown
+        // large isn't kept.
+        if self.buf.len() != READ_BUF
+            || !(READ_BUF..=CONN_SCRATCH_KEEP).contains(&self.scratch.capacity())
+            || self.url_scratch.capacity() > CONN_SCRATCH_KEEP
+        {
+            return;
+        }
+        // `try_with`: the pool itself may be going away with the thread.
+        let _ = CONN_BUFS.try_with(|pool| {
+            let Ok(mut pool) = pool.try_borrow_mut() else {
+                return;
+            };
+            if pool.len() >= CONN_BUFS_KEPT {
+                return;
+            }
+            let mut kept = ConnBufs {
+                buf: std::mem::take(&mut self.buf),
+                scratch: std::mem::take(&mut self.scratch),
+                url_scratch: std::mem::take(&mut self.url_scratch),
+            };
+            kept.scratch.clear();
+            kept.url_scratch.clear();
+            pool.push(kept);
+        });
+    }
+}
+
+pub(crate) struct ConnectionGuard;
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0.connection_finished();
-        WORKER_CONNS.with(|w| w.active.set(w.active.get().saturating_sub(1)));
+        WORKER_CONNS.with(|w| {
+            w.active.set(w.active.get().saturating_sub(1));
+            w.clients.set(w.clients.get().saturating_sub(1));
+        });
     }
+}
+
+/// This worker's accepted connections that haven't finished: a shutting
+/// down worker waits for them. Per worker, so an accept touches no cache
+/// line another worker writes (#128).
+/// The configuration this worker thread serves; `None` outside a worker.
+pub(crate) fn worker_http() -> Option<&'static PreparedHttp> {
+    WORKER_CONNS.with(|w| w.http.get())
+}
+
+fn worker_clients() -> usize {
+    WORKER_CONNS.with(|w| w.clients.get())
+}
+
+fn connection_started() {
+    WORKER_CONNS.with(|w| w.clients.set(w.clients.get() + 1));
 }
 
 /// This worker's share of `worker_connections`, and nginx's reuse of idle
@@ -1535,10 +2417,21 @@ struct WorkerConns {
     /// connections (`UpstreamSlot`): nginx takes both from the worker's
     /// one connection table.
     active: Cell<usize>,
+    /// Accepted connections that haven't finished (`worker_clients`).
+    clients: Cell<usize>,
     /// Connections waiting for a request — nginx's "reusable" ones.
     idle: Cell<usize>,
     /// How many idle connections are asked to close to make room.
     drain: Cell<usize>,
+    /// The wakers of the idle connections (`IdleMark` slots), woken when
+    /// one of the events they wait for happens: a drain, shutdown or a
+    /// reload. Pushed to them like nginx's ngx_drain_connections /
+    /// ngx_close_idle_connections, instead of each one polling (#127).
+    idle_wakers: std::cell::RefCell<Vec<Option<std::task::Waker>>>,
+    idle_free: std::cell::RefCell<Vec<usize>>,
+    /// Shutdown and the reload generation as this worker last saw them.
+    seen_shutdown: Cell<bool>,
+    seen_reload_gen: Cell<u64>,
     /// UNIX second of the last "not enough" line: log once a second.
     logged_at: Cell<u64>,
     /// This worker's configuration, for upstream connections, which are
@@ -1550,8 +2443,13 @@ thread_local! {
     static WORKER_CONNS: WorkerConns = const {
         WorkerConns {
             active: Cell::new(0),
+            clients: Cell::new(0),
             idle: Cell::new(0),
             drain: Cell::new(0),
+            idle_wakers: std::cell::RefCell::new(Vec::new()),
+            idle_free: std::cell::RefCell::new(Vec::new()),
+            seen_shutdown: Cell::new(false),
+            seen_reload_gen: Cell::new(0),
             logged_at: Cell::new(0),
             http: Cell::new(None),
         }
@@ -1588,6 +2486,7 @@ pub(crate) fn take_upstream_slot() -> Option<UpstreamSlot> {
             let idle = w.idle.get();
             if idle > 0 {
                 w.drain.set(w.drain.get().max((idle / 8).clamp(1, 32)));
+                wake_idle_in(w);
             }
             log_connections_not_enough(w, http, ErrorLogLevel::Alert, "");
             return None;
@@ -1628,6 +2527,7 @@ pub(crate) fn admit_connection(http: &PreparedHttp) -> bool {
         let full = active >= slots;
         if slots - active.min(slots) <= slots / 16 && idle > 0 {
             w.drain.set(w.drain.get().max((idle / 8).clamp(1, 32)));
+            wake_idle_in(w);
             if !full {
                 log_connections_not_enough(w, http, ErrorLogLevel::Warn, ", reusing connections");
             }
@@ -1663,14 +2563,61 @@ fn log_connections_not_enough(
     }
 }
 
+/// Wakes this worker's idle connections, to look at what changed.
+fn wake_idle_in(w: &WorkerConns) {
+    for waker in w.idle_wakers.borrow().iter().flatten() {
+        waker.wake_by_ref();
+    }
+}
+
+/// Called by the accept loops on every turn (they wake at least every
+/// 50 ms): when shutdown began or a reload came since this worker last
+/// looked, its idle connections are woken to close. Two atomic loads when
+/// nothing changed.
+pub(crate) fn notice_runtime_events(state: &RuntimeState) {
+    WORKER_CONNS.with(|w| {
+        let shutdown = state.is_shutting_down();
+        let generation = state.reload_gen();
+        if shutdown != w.seen_shutdown.get() || generation != w.seen_reload_gen.get() {
+            w.seen_shutdown.set(shutdown);
+            w.seen_reload_gen.set(generation);
+            wake_idle_in(w);
+        }
+    })
+}
+
 /// Marks a connection idle (waiting for a request) while alive, so
-/// `admit_connection` can ask it to make room.
-struct IdleMark;
+/// `admit_connection` can ask it to make room, and holds its slot in the
+/// worker's list of idle wakers.
+struct IdleMark {
+    slot: usize,
+}
 
 impl IdleMark {
     fn new() -> Self {
-        WORKER_CONNS.with(|w| w.idle.set(w.idle.get() + 1));
-        IdleMark
+        WORKER_CONNS.with(|w| {
+            w.idle.set(w.idle.get() + 1);
+            let slot = match w.idle_free.borrow_mut().pop() {
+                Some(slot) => slot,
+                None => {
+                    let mut wakers = w.idle_wakers.borrow_mut();
+                    wakers.push(None);
+                    wakers.len() - 1
+                }
+            };
+            IdleMark { slot }
+        })
+    }
+
+    /// The waker the events above wake.
+    fn register(&self, waker: &std::task::Waker) {
+        WORKER_CONNS.with(|w| {
+            let mut wakers = w.idle_wakers.borrow_mut();
+            match &mut wakers[self.slot] {
+                Some(old) if old.will_wake(waker) => {}
+                slot => *slot = Some(waker.clone()),
+            }
+        })
     }
 
     /// Whether this idle connection should close to free a slot.
@@ -1686,10 +2633,83 @@ impl IdleMark {
     }
 }
 
+/// Wakes a task on shutdown or reload like an idle connection, without
+/// counting it as idle: an upgraded connection is busy, and isn't one to
+/// close to make room.
+pub(crate) struct EventWatch {
+    slot: usize,
+}
+
+impl EventWatch {
+    pub(crate) fn new() -> Self {
+        WORKER_CONNS.with(|w| {
+            let slot = match w.idle_free.borrow_mut().pop() {
+                Some(slot) => slot,
+                None => {
+                    let mut wakers = w.idle_wakers.borrow_mut();
+                    wakers.push(None);
+                    wakers.len() - 1
+                }
+            };
+            EventWatch { slot }
+        })
+    }
+
+    pub(crate) fn register(&self, waker: &std::task::Waker) {
+        WORKER_CONNS.with(|w| {
+            let mut wakers = w.idle_wakers.borrow_mut();
+            match &mut wakers[self.slot] {
+                Some(old) if old.will_wake(waker) => {}
+                slot => *slot = Some(waker.clone()),
+            }
+        })
+    }
+}
+
+impl Drop for EventWatch {
+    fn drop(&mut self) {
+        WORKER_CONNS.with(|w| {
+            w.idle_wakers.borrow_mut()[self.slot] = None;
+            w.idle_free.borrow_mut().push(self.slot);
+        });
+    }
+}
+
 impl Drop for IdleMark {
     fn drop(&mut self) {
-        WORKER_CONNS.with(|w| w.idle.set(w.idle.get().saturating_sub(1)));
+        WORKER_CONNS.with(|w| {
+            w.idle.set(w.idle.get().saturating_sub(1));
+            w.idle_wakers.borrow_mut()[self.slot] = None;
+            w.idle_free.borrow_mut().push(self.slot);
+        });
     }
+}
+
+/// Arms the idle timer for `due` without moving it on every request: a
+/// timer already set for earlier stays, and when it fires early the wait
+/// moves it to `due` (`idle_expired`). Moving a timer per keep-alive
+/// request cost several percent (#127, #272).
+fn arm_idle(mut timer: std::pin::Pin<&mut monoio::time::Sleep>, due: monoio::time::Instant) {
+    if timer.is_elapsed() || timer.deadline() > due {
+        timer.as_mut().reset(due);
+    }
+}
+
+/// Whether the idle deadline `due` has passed; a timer that fired before
+/// it is moved to it and polled again.
+fn idle_expired(
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    due: monoio::time::Instant,
+    cx: &mut std::task::Context<'_>,
+) -> bool {
+    if timer.as_mut().poll(cx).is_pending() {
+        return false;
+    }
+    if monoio::time::Instant::now() < due {
+        timer.as_mut().reset(due);
+        return timer.as_mut().poll(cx).is_ready();
+    }
+    true
 }
 
 /// `$server_addr` for a connection: the listen address, formatted at
@@ -1722,7 +2742,7 @@ pub(crate) async fn handle_plain(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     _guard: ConnectionGuard,
@@ -1730,10 +2750,36 @@ pub(crate) async fn handle_plain(
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
         peer_ip: peer_addr.ip(),
+        peer_unix: http.listens[listen_index].unix.is_some(),
         realip: None,
         proxy_protocol,
+        plain_http: false,
     };
-    handle(
+    let listen = &http.listens[listen_index];
+    // Boxed, here and in `handle_tls`: awaited in place, the HTTP/2
+    // futures would make every connection's task larger.
+    if listen.h2_plain {
+        let wait = listen.servers[listen.default_server].timeouts.header;
+        if Box::pin(super::h2::starts_with_preface(&stream, wait)).await {
+            return serve_h2(
+                stream,
+                peer_addr,
+                listen_index,
+                None,
+                None,
+                conn,
+                http,
+                state,
+                connection_id,
+            )
+            .await;
+        }
+    }
+    // Boxed: the connection's future is about 10 KiB, and the task that
+    // `spawn_connection` builds would otherwise be moved, all of it, into
+    // the runtime on every accept. Here the task stays small and the big
+    // future is placed once (#128).
+    Box::pin(handle(
         &mut stream,
         peer_addr,
         listen_index,
@@ -1743,7 +2789,7 @@ pub(crate) async fn handle_plain(
         http,
         state,
         connection_id,
-    )
+    ))
     .await;
 }
 
@@ -1753,7 +2799,7 @@ pub(crate) async fn handle_tls(
     peer_addr: SocketAddr,
     listen_index: usize,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
     accepted_at: Instant,
@@ -1767,17 +2813,50 @@ pub(crate) async fn handle_tls(
     let conn = phase::ConnInfo {
         server_addr: server_addr_text(&http.listens[listen_index], &stream),
         peer_ip: peer_addr.ip(),
+        peer_unix: http.listens[listen_index].unix.is_some(),
         realip: None,
         proxy_protocol,
+        plain_http: false,
     };
-    let (mut tls_stream, info) = match crate::tls::accept_with_timeout(
-        &acceptor,
-        stream,
-        budget.saturating_sub(accepted_at.elapsed()),
-    )
-    .await
-    {
-        Ok(p) => p,
+    let budget = budget.saturating_sub(accepted_at.elapsed());
+    let accepted = if listen.reject_handshake.is_some() || listen.h2_by_sni {
+        crate::tls::accept_choosing_with_timeout(&acceptor, stream, budget, |sni| {
+            phase::tls_choice(listen, sni)
+        })
+        .await
+    } else {
+        crate::tls::accept_with_timeout(&acceptor, stream, budget).await
+    };
+    let (mut tls_stream, info) = match accepted {
+        Ok(crate::tls::Handshake::Tls(stream, info)) => (stream, info),
+        Ok(crate::tls::Handshake::Plain(stream, read)) => {
+            // Plain HTTP on the `ssl` port (#384): read as HTTP/1, then
+            // answered with 497 (`conn.plain_http`).
+            let conn = phase::ConnInfo {
+                plain_http: true,
+                ..conn
+            };
+            let mut stream = super::connection::Preread::new(stream, read);
+            Box::pin(handle(
+                &mut stream,
+                peer_addr,
+                listen_index,
+                None,
+                None,
+                &conn,
+                http,
+                state,
+                connection_id,
+            ))
+            .await;
+            return;
+        }
+        // `ssl_reject_handshake`: nginx logs nothing above debug for it.
+        Err(crate::tls::AcceptError::Tls(e))
+            if e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            return;
+        }
         Err(e) => {
             // nginx logs SSL handshake failures at info level. We don't have
             // a structured logging sink yet (m33's error_log only fires from
@@ -1797,7 +2876,25 @@ pub(crate) async fn handle_tls(
             .map(|b| b.to_ascii_lowercase())
             .collect()
     });
-    handle(
+    if info.alpn_protocol.as_deref() == Some(b"h2") {
+        // A read and a write run at once on an HTTP/2 connection.
+        tls_stream.begin_tunnel();
+        let sni = sni.clone();
+        return serve_h2(
+            tls_stream,
+            peer_addr,
+            listen_index,
+            sni,
+            Some(info),
+            conn,
+            http,
+            state,
+            connection_id,
+        )
+        .await;
+    }
+    // Boxed, as in `handle_plain`.
+    Box::pin(handle(
         &mut tls_stream,
         peer_addr,
         listen_index,
@@ -1807,11 +2904,51 @@ pub(crate) async fn handle_tls(
         http,
         state,
         connection_id,
-    )
+    ))
     .await;
     // close_notify before TCP FIN. Best-effort: peer may already have gone
-    // away; we don't have anything useful to do with the error.
-    let _ = monoio::io::AsyncWriteRent::shutdown(&mut tls_stream).await;
+    // away; we don't have anything useful to do with the error. A client
+    // that doesn't read (a tunnel that ended on send_timeout) gets 3 s, as
+    // ngx_ssl_shutdown gives it.
+    let _ = monoio::time::timeout(
+        Duration::from_secs(3),
+        monoio::io::AsyncWriteRent::shutdown(&mut tls_stream),
+    )
+    .await;
+}
+
+/// An HTTP/2 connection (#144), cold: boxed so its future isn't part of
+/// the HTTP/1.1 connection's.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn serve_h2<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    listen_index: usize,
+    sni: Option<Vec<u8>>,
+    tls: Option<crate::tls::HandshakeInfo>,
+    conn: phase::ConnInfo,
+    http: &'static PreparedHttp,
+    state: &'static RuntimeState,
+    connection_id: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+where
+    S: ConnIo + 'static,
+{
+    Box::pin(super::h2::serve(
+        stream,
+        super::h2::ConnCtx {
+            peer_addr,
+            listen_index,
+            sni,
+            tls,
+            conn,
+            http,
+            state,
+            connection_id,
+        },
+    ))
 }
 
 pub(crate) async fn handle<S: ConnIo>(
@@ -1822,7 +2959,7 @@ pub(crate) async fn handle<S: ConnIo>(
     tls: Option<&crate::tls::HandshakeInfo>,
     conn: &phase::ConnInfo,
     http: &'static PreparedHttp,
-    state: Arc<RuntimeState>,
+    state: &'static RuntimeState,
     connection_id: u64,
 ) {
     // Mirrors nginx's keepalive_handler ↔ wait_request_handler dance: no
@@ -1833,7 +2970,10 @@ pub(crate) async fn handle<S: ConnIo>(
     // Outer loop = idle ↔ active cycle; inner loop = within an active
     // session, read more / parse / write until the session drains back to
     // empty (→ idle) or the request-line overflows the buffer (→ close).
-    let mut parse_state = ParseState::default();
+    let mut parse_state = ParseState {
+        h2: stream.h2(),
+        ..ParseState::default()
+    };
 
     // Per-connection counters surfaced via `$connection*` variables.
     // `connection_id` is assigned once in the accept loop. `request_count` tracks
@@ -1841,14 +2981,25 @@ pub(crate) async fn handle<S: ConnIo>(
     // nginx increments `r->connection->requests` at request init, so
     // `$connection_requests` reads 1 on the first request, 2 on the
     // second, etc. Incrementing before rendering matches that contract.
-    let connection_start = Instant::now();
-    let remote_addr = peer_addr.ip().to_string().into_bytes();
-    let remote_port = peer_addr.port();
-    let mut request_count: u64 = 0;
-    // Client timeouts come from the address's default server for the whole
-    // connection: the header is read before a virtual server is chosen (as
-    // in nginx), and the body here too. nginx switches client_body_timeout
-    // and send_timeout to the chosen server / location afterwards.
+    let (connection_start, mut request_count) = stream
+        .conn_counters()
+        .unwrap_or_else(|| (Instant::now(), 0));
+    let mut remote_addr_buf = [0u8; 48];
+    let (remote_addr, remote_port): (&[u8], u16) = if http.listens[listen_index].unix.is_some() {
+        // A unix-domain client is `unix:`, with no port (#263).
+        (b"unix:", 0)
+    } else {
+        // `$remote_addr`, written once into the connection's own state
+        // rather than a heap string per connection (#128).
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(&mut remote_addr_buf[..]);
+        let _ = write!(cursor, "{}", peer_addr.ip());
+        let n = cursor.position() as usize;
+        (&remote_addr_buf[..n], peer_addr.port())
+    };
+    // The default server's client timeouts: the header is read before a
+    // virtual server is chosen (as in nginx). A request's body and response
+    // use its location's client_body_timeout and send_timeout (#147).
     let timeouts = {
         let listen = &http.listens[listen_index];
         listen.servers[listen.default_server].timeouts
@@ -1864,14 +3015,15 @@ pub(crate) async fn handle<S: ConnIo>(
     let mut timers = ConnTimers {
         io: std::pin::pin!(monoio::time::sleep(far)),
         idle: std::pin::pin!(monoio::time::sleep(far)),
-        tick: std::pin::pin!(monoio::time::sleep(far)),
     };
-    // Snapshot the reload generation at accept time. SIGHUP bumps the
-    // counter; idle keepalive waits and post-request keepalive checks both
-    // bail when the live value drifts above this snapshot, which makes
-    // existing connections close on reload while new ones (accepted after
-    // the bump) keep their fresh snapshot and stay open.
+    // A reload bumps the retired generation's counter: an upgraded
+    // connection then lives until `worker_shutdown_timeout` (`tunnel`).
     let start_reload_gen = state.reload_gen();
+    // Waiting for the first request: a shutdown or reload doesn't close
+    // the connection, as nginx's ngx_close_idle_connections closes only
+    // keep-alive ones; client_header_timeout bounds the wait. A connection
+    // an old worker accepted just before it stopped is served, not reset.
+    let mut fresh = true;
 
     // Per-connection scratch buffers — allocated once and reused across
     // every request on this connection. `mem::take` during `write_all`
@@ -1880,15 +3032,18 @@ pub(crate) async fn handle<S: ConnIo>(
     // because non-pipelining clients (wrk, curl) drain `buf` after each
     // response and `continue 'idle`, so a per-iteration alloc here was
     // showing up as ~3% memset / ~1% calloc in the proxy bench profile.
-    let mut scratch_owned: Vec<u8> = Vec::with_capacity(READ_BUF);
-    let mut url_scratch_owned: Vec<u8> = Vec::with_capacity(256);
+    // Taken from this worker's pool and given back when the connection
+    // ends: a connection per request doesn't allocate (and zero) them each
+    // time (#128).
+    let mut bufs = ConnBufs::take();
     // Set once the zero-copy `sendfile` path has put the socket in
     // O_NONBLOCK mode; see `send_head_and_file`.
     let mut sock_nonblocking = false;
-    let mut buf_owned: Vec<u8> = vec![0u8; READ_BUF];
-    let scratch = &mut scratch_owned;
-    let url_scratch = &mut url_scratch_owned;
-    let buf = &mut buf_owned;
+    let ConnBufs {
+        buf,
+        scratch,
+        url_scratch,
+    } = &mut bufs;
 
     // Context for `reject_request`'s access-log line.
     macro_rules! conn_log {
@@ -1906,45 +3061,62 @@ pub(crate) async fn handle<S: ConnIo>(
         };
     }
 
+    // stub_status / $connections_* (#96); inert unless the config reads them.
+    let mut conn_stats = super::stats::ConnStats::new(http.stats);
+
     'idle: loop {
-        if !stream
-            .idle_wait(
+        conn_stats.set(super::stats::Phase::Waiting);
+        let (next, returned) = stream
+            .idle_read(
+                std::mem::take(&mut *buf),
                 &state,
                 keepalive_idle_timeout,
-                start_reload_gen,
+                std::mem::take(&mut fresh),
                 &mut timers,
             )
-            .await
-        {
-            return;
-        }
+            .await;
+        *buf = returned;
+        let mut filled: usize = match next {
+            IdleRead::Close => return,
+            IdleRead::Ready => 0,
+            IdleRead::Read(n) => n,
+        };
+        conn_stats.set(super::stats::Phase::Reading);
         keepalive_idle_timeout = None;
-        header_deadline = None;
+        // The header's time starts with its first bytes, as nginx's
+        // client_header_timeout after the keep-alive read.
+        header_deadline = (filled > 0).then(|| monoio::time::Instant::now() + timeouts.header);
 
         let mut read_start: usize = 0; // first unread byte of the current request
-        let mut filled: usize = 0; // one past the last received byte
+        // The first bytes came with the idle wait: parse before reading.
+        let mut skip_read = filled > 0;
 
         loop {
-            let taken = std::mem::take(&mut *buf);
-            let slice = taken.slice_mut(filled..READ_BUF);
-            let deadline = *header_deadline
-                .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
-            let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
-            // client_header_timeout: nginx closes without a response.
-            let Some((res, returned)) = read.await else {
-                return;
-            };
-            *buf = returned.into_inner();
-            match res {
-                Ok(0) => return,
-                Ok(n) => filled += n,
-                Err(_) => return,
+            if std::mem::take(&mut skip_read) {
+                // Fall through to the parse loop with what idle_read read.
+            } else {
+                let taken = std::mem::take(&mut *buf);
+                let slice = taken.slice_mut(filled..READ_BUF);
+                let deadline = *header_deadline
+                    .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
+                let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
+                // client_header_timeout: nginx closes without a response.
+                let Some((res, returned)) = read.await else {
+                    return;
+                };
+                *buf = returned.into_inner();
+                match res {
+                    Ok(0) => return,
+                    Ok(n) => filled += n,
+                    Err(_) => return,
+                }
             }
 
             loop {
                 let view = &buf[read_start..filled];
                 match http::parse_request(view, &mut parse_state) {
                     Parse::Complete(req) => {
+                        conn_stats.request();
                         let request_start = Instant::now();
                         // Counted up front so a request refused below logs
                         // `$connection_requests` as nginx does.
@@ -2092,6 +3264,13 @@ pub(crate) async fn handle<S: ConnIo>(
                         let if_match = req.if_match.map(|(s, e)| &buf[base + s..base + e]);
                         let range = req.range.map(|(s, e)| &buf[base + s..base + e]);
                         let if_range = req.if_range.map(|(s, e)| &buf[base + s..base + e]);
+                        // Plain HTTP on an `ssl` port (#384): once its head is
+                        // read, nginx finalizes the request with 497
+                        // (ngx_http_process_request), unless it was refused
+                        // already.
+                        if conn.plain_http && refuse.is_none() {
+                            refuse = Some(497);
+                        }
                         let headers_raw = &buf[base + req.headers_start..base + req.headers_end];
                         let keep_alive = req.keep_alive && refuse.is_none();
                         // `as u64` saturates only at ~584k years of uptime;
@@ -2157,17 +3336,33 @@ pub(crate) async fn handle<S: ConnIo>(
                         // `client_body_in_file_only on` where the request goes:
                         // a temp file holding the body outlives it.
                         let mut persistent_body = false;
+                        // Bodies above it go to a temp file (#246).
+                        let mut body_buffer = crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE;
                         // And its `client_body_temp_path`, else the http one.
                         let mut body_temp = &http.body_temp;
+                        // Nothing will read the body: drop it as it comes.
+                        let mut discard_body = false;
+                        // The routed location's client_body_timeout (#147).
+                        let mut body_timeout = timeouts.body;
                         let has_body = req.content_length.is_some_and(|cl| cl > 0)
                             || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
                             let cl = req.content_length.unwrap_or(0);
-                            let probe = request_ctx!(&[], cl, None, req.consumed as u64 + cl, 0, 0);
+                            let probe = request_ctx!(
+                                &phase::NO_BODY,
+                                cl,
+                                None,
+                                req.consumed as u64 + cl,
+                                0,
+                                0
+                            );
                             if let Some(first) =
                                 phase::first_body_limit(http, &probe, &mut *url_scratch)
                             {
                                 persistent_body = first.persistent;
+                                discard_body = first.discard;
+                                body_timeout = first.body_timeout;
+                                body_buffer = first.buffer;
                                 body_temp = first.body_temp.unwrap_or(body_temp);
                                 max_body = match first.max {
                                     0 => u64::MAX,
@@ -2222,7 +3417,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // that (`BodySink`), within `max_body` above.
                         let mut pipelined_tail: Vec<u8> = Vec::new();
                         let mut sink = BodySink::with_capacity(
-                            req.content_length.unwrap_or(0),
+                            if discard_body {
+                                0
+                            } else {
+                                req.content_length.unwrap_or(0)
+                            },
                             body_temp,
                             persistent_body,
                         );
@@ -2243,14 +3442,55 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let body_start = base + req.consumed;
                                 let already = filled.saturating_sub(body_start);
                                 let take = (already as u64).min(cl) as usize;
+                                if discard_body {
+                                    if !discard_request_body(
+                                        stream,
+                                        cl - take as u64,
+                                        timers.io.as_mut(),
+                                        body_timeout,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    break 'read (take, cl);
+                                }
                                 if !sink.extend(&buf[body_start..body_start + take]) {
                                     return;
                                 }
-                                // One read buffer for the whole body; each read
-                                // stops at the body's end so a pipelined next
-                                // request isn't consumed.
-                                let mut chunk: Vec<u8> = Vec::with_capacity(64 * 1024);
+                                // Each read stops at the body's end so a
+                                // pipelined next request isn't consumed. A body
+                                // that stays in memory is read straight into
+                                // its buffer: no copy, no second buffer (#289).
+                                let mut chunk: Vec<u8> = Vec::new();
                                 while sink.len() < cl {
+                                    if let Some(mem) = sink.take_read_buf() {
+                                        let start = mem.len();
+                                        let end = (start as u64 + (cl - sink.len()))
+                                            .min(mem.capacity() as u64)
+                                            as usize;
+                                        let slice = mem.slice_mut(start..end);
+                                        // client_body_timeout between reads.
+                                        let Some((res, returned)) = with_timeout(
+                                            timers.io.as_mut(),
+                                            body_timeout,
+                                            stream.read(slice),
+                                        )
+                                        .await
+                                        else {
+                                            return;
+                                        };
+                                        match res {
+                                            Ok(0) | Err(_) => return,
+                                            Ok(n) => sink.put_read_buf(returned.into_inner(), n),
+                                        }
+                                        continue;
+                                    }
+                                    // Past the in-memory part: through a read
+                                    // buffer into the temp file.
+                                    if chunk.capacity() == 0 {
+                                        chunk.reserve(64 * 1024);
+                                    }
                                     let want =
                                         (cl - sink.len()).min(chunk.capacity() as u64) as usize;
                                     chunk.clear();
@@ -2258,7 +3498,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // client_body_timeout between reads.
                                     let Some((res, returned)) = with_timeout(
                                         timers.io.as_mut(),
-                                        timeouts.body,
+                                        body_timeout,
                                         stream.read(slice),
                                     )
                                     .await
@@ -2286,7 +3526,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 max_body,
                                 &mut sink,
                                 timers.io.as_mut(),
-                                timeouts.body,
+                                body_timeout,
                             )
                             .await
                             {
@@ -2317,19 +3557,38 @@ pub(crate) async fn handle<S: ConnIo>(
                         // Over the limit: big enough for the location's check.
                         let body_len = if body_too_large {
                             request_body_len.max(max_body.saturating_add(1))
+                        } else if discard_body && req.content_length.is_some() {
+                            request_body_len
                         } else {
                             sink.len()
                         };
                         let (body_vec, spooled) = sink.finish();
+                        // Shared, so a proxied request sends it from here
+                        // instead of a copy (#289); the buffer goes back to
+                        // the pool when the last holder is done.
+                        let body_vec = if body_vec.is_empty() {
+                            bytes::Bytes::new()
+                        } else {
+                            bytes::Bytes::from_owner(body_vec)
+                        };
                         // Bound to this request iteration; holds the
                         // temp-file path bytes for `$request_body_file`.
                         let request_body_file = match spooled {
                             Some(file) => Some(file),
-                            None => maybe_spill_request_body_to_file(
-                                &body_vec,
-                                body_temp,
-                                persistent_body,
-                            ),
+                            // A body in memory goes to a file only when
+                            // something reads it there: `$request_body_file`
+                            // in the config, or client_body_in_file_only
+                            // (buffer 0). Otherwise the file would only cost
+                            // a create, write, unlink and close (#246).
+                            None if http.uses_request_body_file || body_buffer == 0 => {
+                                maybe_spill_request_body_to_file(
+                                    &body_vec,
+                                    body_temp,
+                                    persistent_body,
+                                    body_buffer,
+                                )
+                            }
+                            None => None,
                         };
                         let body_file = request_body_file.as_ref();
                         let request_total_consumed = req.consumed + body_in_buf;
@@ -2340,16 +3599,43 @@ pub(crate) async fn handle<S: ConnIo>(
                         let epoch_secs = now.as_secs();
                         let epoch_ms = (now.subsec_millis() as u16) % 1000;
 
-                        let ctx = request_ctx!(
-                            body_vec.as_slice(),
+                        let mut ctx = request_ctx!(
+                            &body_vec,
                             body_len,
                             body_file,
                             request_length,
                             epoch_secs,
                             epoch_ms
                         );
-                        let (response, mut process_meta) =
+                        let (mut response, mut process_meta) =
                             phase::process_with_meta(http, &ctx, &mut *url_scratch);
+                        // limit_req delayed the request (#94): processing
+                        // stopped before the content handler. Boxed, so the
+                        // wait's timer isn't part of every connection's
+                        // future.
+                        if process_meta.limit_req_delay_ms > 0 {
+                            (response, process_meta) = Box::pin(limit_req_delayed(
+                                http,
+                                &mut ctx,
+                                &mut *url_scratch,
+                                process_meta.limit_req_delay_ms,
+                                request_start,
+                            ))
+                            .await;
+                        }
+
+                        // auth_request's subrequest (#358): the request is
+                        // processed again with its outcome.
+                        if process_meta.auth_request.is_some() {
+                            (response, process_meta) = Box::pin(auth_subrequest(
+                                http,
+                                &mut ctx,
+                                &mut *url_scratch,
+                                process_meta,
+                                request_start,
+                            ))
+                            .await;
+                        }
 
                         let (response, settled_meta) = settle_proxy_response(
                             http,
@@ -2360,6 +3646,123 @@ pub(crate) async fn handle<S: ConnIo>(
                         )
                         .await;
                         process_meta = settled_meta;
+                        // The location's send_timeout for this response (#147);
+                        // the next request's header waits use the default
+                        // server's values again, as in nginx.
+                        let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
+
+                        // An upstream 101 to a client that asked to upgrade:
+                        // the head goes out, then the connection is a tunnel
+                        // until either side closes, and then it closes.
+                        if let Response::Upgrade(upgraded) = response {
+                            let crate::proxy::Upgraded {
+                                head,
+                                upstream,
+                                leftover,
+                                slot,
+                                read_timeout,
+                                send_timeout,
+                                upstream_url,
+                                lease,
+                            } = *upgraded;
+                            let head_len = head.len();
+                            let (res, head) = write_all_timed(
+                                stream,
+                                head,
+                                head_len,
+                                timers.io.as_mut(),
+                                timeouts.send,
+                            )
+                            .await;
+                            if res.is_err() {
+                                return;
+                            }
+                            let early: &[u8] = if pipelined_tail.is_empty() {
+                                &buf[read_start + request_total_consumed..filled]
+                            } else {
+                                &pipelined_tail
+                            };
+                            let tunnelled = Box::pin(run_tunnel(
+                                stream,
+                                upstream,
+                                early,
+                                leftover,
+                                TunnelConf {
+                                    read_timeout,
+                                    upstream_send_timeout: send_timeout,
+                                    client_send_timeout: timeouts.send,
+                                    http,
+                                    state: &state,
+                                    start_reload_gen,
+                                },
+                            ))
+                            .await;
+                            drop(slot);
+                            drop(lease);
+                            if tunnelled.end == TunnelEnd::ClientTimedOut {
+                                // ngx_http_upstream_process_upgraded, at info.
+                                write_error_log(
+                                    process_meta.log.error_logs,
+                                    ErrorLogLevel::Info,
+                                    &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                        .with_realip(&process_meta),
+                                    b"client timed out (110: Connection timed out) while proxying upgraded connection",
+                                    Some(&upstream_url),
+                                );
+                            }
+                            if tunnelled.end == TunnelEnd::UpstreamTimedOut {
+                                write_upstream_error_log(
+                                    &process_meta.log,
+                                    &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                        .with_realip(&process_meta),
+                                    &[crate::proxy::AttemptFailure {
+                                        error: crate::proxy::UpstreamError::TimedOut(
+                                            crate::proxy::Stage::Upgraded,
+                                        ),
+                                        upstream: upstream_url,
+                                    }],
+                                );
+                            }
+                            if let Some(last) = process_meta.upstream_states.last_mut() {
+                                last.bytes_received += tunnelled.from_upstream;
+                                last.bytes_sent += tunnelled.to_upstream;
+                            }
+                            if !process_meta.access_logs.is_empty() {
+                                let request_time_us = request_start.elapsed().as_micros() as u64;
+                                let bytes_sent = head_len as u64 + tunnelled.to_client;
+                                write_access_logs(
+                                    process_meta.access_logs,
+                                    path,
+                                    method_bytes,
+                                    request_line,
+                                    host,
+                                    &remote_addr,
+                                    remote_port,
+                                    process_meta.remote_user.as_deref(),
+                                    headers_raw,
+                                    &head,
+                                    connection_id,
+                                    request_count,
+                                    connection_time_us,
+                                    request_time_us,
+                                    process_meta.server_port,
+                                    request_port,
+                                    pipe_byte,
+                                    request_length,
+                                    bytes_sent,
+                                    tunnelled.to_client,
+                                    epoch_secs,
+                                    epoch_ms,
+                                    tls,
+                                    conn,
+                                    http,
+                                    Some(&process_meta),
+                                    final_uri(&process_meta, url_scratch),
+                                )
+                                .await;
+                            }
+                            return;
+                        }
 
                         // Defer the response write per `auth_delay`. We
                         // sleep on the runtime, not the OS thread, so other
@@ -2369,6 +3772,66 @@ pub(crate) async fn handle<S: ConnIo>(
                                 process_meta.response_delay_ms,
                             ))
                             .await;
+                        }
+
+                        // gzip (`gzip on` in the location): a body in memory
+                        // is compressed here, a file on its way out below.
+                        let (response, gzip_stream) = match process_meta.gzip {
+                            Some(gz) => super::gzip::filter(
+                                gz,
+                                &super::gzip::GzipRequest::from_headers(req.http_11, headers_raw),
+                                response,
+                            ),
+                            None => (response, None),
+                        };
+
+                        // `return 444;` (no text) is nginx's NGX_HTTP_CLOSE: no
+                        // response at all; the connection closes after the
+                        // log line (#397). With text it is an ordinary response.
+                        let closes = match &response {
+                            Response::Prebuilt(b) => super::closes_unanswered(b),
+                            Response::Owned(b) => super::closes_unanswered(b),
+                            _ => false,
+                        };
+                        if closes {
+                            if !process_meta.access_logs.is_empty() {
+                                let logged: &[u8] = match &response {
+                                    Response::Prebuilt(b) => b,
+                                    Response::Owned(b) => b,
+                                    _ => &[],
+                                };
+                                Box::pin(write_access_logs(
+                                    process_meta.access_logs,
+                                    path,
+                                    method_bytes,
+                                    request_line,
+                                    host,
+                                    &remote_addr,
+                                    remote_port,
+                                    process_meta.remote_user.as_deref(),
+                                    headers_raw,
+                                    logged,
+                                    connection_id,
+                                    request_count,
+                                    connection_time_us,
+                                    request_start.elapsed().as_micros() as u64,
+                                    process_meta.server_port,
+                                    request_port,
+                                    pipe_byte,
+                                    request_length,
+                                    0,
+                                    0,
+                                    epoch_secs,
+                                    epoch_ms,
+                                    tls,
+                                    conn,
+                                    http,
+                                    Some(&process_meta),
+                                    final_uri(&process_meta, url_scratch),
+                                ))
+                                .await;
+                            }
+                            return;
                         }
 
                         // Funnel the response bytes into `scratch`. Owned and
@@ -2381,6 +3844,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // once per worker and avoid per-request Vec copies.
                         scratch.clear();
                         let mut prebuilt_base: Option<&'static [u8]> = None;
+                        // An upstream body relayed after the head (#88).
+                        let mut proxy_body: Option<Box<crate::proxy_stream::ProxyStream>> = None;
                         let mut file_body: Option<phase::FileBody> = match response {
                             Response::Prebuilt(bytes) => {
                                 prebuilt_base = Some(bytes);
@@ -2402,6 +3867,16 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                                 Some(body)
                             }
+                            Response::ProxyStream(mut body) => {
+                                let head = std::mem::take(&mut body.head);
+                                if head.capacity() > scratch.capacity() {
+                                    *scratch = head;
+                                } else {
+                                    scratch.extend_from_slice(&head);
+                                }
+                                proxy_body = Some(body);
+                                None
+                            }
                             // phase::process consumes Reroute internally
                             // via its hop loop; a Reroute reaching the
                             // worker means the loop terminated without a
@@ -2412,6 +3887,8 @@ pub(crate) async fn handle<S: ConnIo>(
                             // `run_proxy` before this match runs; reaching
                             // here is a logic bug.
                             Response::Proxy(_) => return,
+                            // Tunnelled above.
+                            Response::Upgrade(_) => return,
                         };
                         // Single walk over the response header block replaces
                         // what used to be three separate scans. For static
@@ -2421,7 +3898,9 @@ pub(crate) async fn handle<S: ConnIo>(
                             Some(bytes) => cached_scan_response_headers(bytes),
                             None => {
                                 let mut scan = scan_response_headers(&scratch).unwrap_or_default();
-                                stamp_date(&mut *scratch, &mut scan);
+                                if !process_meta.keep_upstream_date {
+                                    stamp_date(&mut *scratch, &mut scan);
+                                }
                                 scan
                             }
                         };
@@ -2432,8 +3911,26 @@ pub(crate) async fn handle<S: ConnIo>(
                             || connection_time_us / 1_000 > process_meta.keepalive.max_time_ms
                             || matches!(method, Method::Trace | Method::Connect)
                             || state.is_shutting_down()
-                            || state.reload_gen() != start_reload_gen
-                            || (scan.has_connection && scan.connection_is_close);
+                            || (scan.has_connection && scan.connection_is_close)
+                            // A compressed file to an HTTP/1.0 client has no
+                            // length or chunks: the close ends it.
+                            || gzip_stream.is_some_and(|g| !g.chunked);
+                        // A relayed body of unknown length: chunked to an
+                        // HTTP/1.1 client, ended by the close otherwise.
+                        let mut chunked_out = false;
+                        if proxy_body.as_ref().is_some_and(|b| !b.length_known()) {
+                            if req.http_11 {
+                                insert_header_at(
+                                    &mut *scratch,
+                                    &mut scan.head_end,
+                                    b"Transfer-Encoding: chunked\r\n",
+                                );
+                                chunked_out = true;
+                            } else {
+                                close_after = true;
+                            }
+                        }
+                        let mut relay_failed = false;
                         // Only scan the raw headers for User-Agent when a
                         // policy could actually trigger. disable_safari fires
                         // on any method; disable_msie6 only on POST. Skipping
@@ -2455,7 +3952,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         // consumes the value — `$bytes_sent` and
                         // `$body_bytes_sent` need it after the write
                         // completes.
-                        let streamed_body_len = file_body.as_ref().map(|b| b.len).unwrap_or(0);
+                        let mut streamed_body_len = file_body.as_ref().map(|b| b.len).unwrap_or(0);
                         let response_for_logs: &[u8];
                         if let Some(base) = prebuilt_base {
                             let variant = cached_prebuilt_variant(
@@ -2479,7 +3976,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 taken,
                                 len,
                                 timers.io.as_mut(),
-                                timeouts.send,
+                                send_timeout,
                             )
                             .await;
                             *scratch = returned;
@@ -2505,8 +4002,43 @@ pub(crate) async fn handle<S: ConnIo>(
                                 };
                                 insert_header_at(&mut *scratch, &mut scan.head_end, header);
                             }
-                            if let Some(limit) = process_meta.limit_rate.as_deref()
+                            if let Some(body) = proxy_body.take() {
+                                let pacer = process_meta.limit_rate.as_deref().and_then(|l| {
+                                    super::Pacer::new(l.rate, l.after, request_start)
+                                });
+                                let head = std::mem::take(&mut *scratch);
+                                let (end, head) = Box::pin(crate::proxy_stream::relay(
+                                    body,
+                                    stream,
+                                    head,
+                                    chunked_out,
+                                    pacer,
+                                    timers.io.as_mut(),
+                                    send_timeout,
+                                ))
+                                .await;
+                                *scratch = head;
+                                streamed_body_len = end.body_sent;
+                                if let Some(state) = process_meta.upstream_states.last_mut() {
+                                    state.bytes_received += end.upstream_read;
+                                    state.response_length += end.upstream_body;
+                                    state.response_ms = Some(end.response_ms);
+                                    state.in_flight = false;
+                                }
+                                if let Some(failure) = end.failure {
+                                    write_upstream_error_log(
+                                        &process_meta.log,
+                                        &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                            .with_realip(&process_meta),
+                                        &[failure],
+                                    );
+                                }
+                                // Cut short: the client can't tell, so the
+                                // connection closes (nginx closes it too).
+                                relay_failed = !end.complete;
+                            } else if let Some(limit) = process_meta.limit_rate.as_deref()
                                 && limit.rate > 0
+                                && gzip_stream.is_none()
                             {
                                 // Cold: `limit_rate`. Boxed so the pacer
                                 // doesn't grow every connection's future.
@@ -2519,7 +4051,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     limit.after,
                                     request_start,
                                     timers.io.as_mut(),
-                                    timeouts.send,
+                                    send_timeout,
                                 ))
                                 .await
                                 {
@@ -2527,6 +4059,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             } else if process_meta.sendfile
                                 && file_body.is_some()
+                                && gzip_stream.is_none()
                                 && stream.sendfile_fd().is_some()
                             {
                                 let body = file_body.take().expect("checked is_some");
@@ -2536,7 +4069,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     scratch,
                                     body,
                                     timers.io.as_mut(),
-                                    timeouts.send,
+                                    send_timeout,
                                 )
                                 .await
                                 {
@@ -2554,7 +4087,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     taken,
                                     len,
                                     timers.io.as_mut(),
-                                    timeouts.send,
+                                    send_timeout,
                                 )
                                 .await;
                                 *scratch = returned;
@@ -2563,17 +4096,39 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             }
                             response_for_logs = &*scratch;
-                            if let Some(body) = file_body.take()
-                                && !stream_file(
-                                    stream,
-                                    body,
-                                    timers.io.as_mut(),
-                                    timeouts.send,
-                                    None,
-                                )
-                                .await
-                            {
-                                return;
+                            if let Some(body) = file_body.take() {
+                                let sent = match gzip_stream {
+                                    Some(gz) => {
+                                        stream_file_gzip(
+                                            stream,
+                                            body,
+                                            gz,
+                                            timers.io.as_mut(),
+                                            send_timeout,
+                                        )
+                                        .await
+                                    }
+                                    None => match if stream.sends_file_bodies() {
+                                        stream.send_file_body(&body).await
+                                    } else {
+                                        None
+                                    } {
+                                        Some(sent) => sent.then_some(streamed_body_len),
+                                        None => stream_file(
+                                            stream,
+                                            body,
+                                            timers.io.as_mut(),
+                                            send_timeout,
+                                            None,
+                                        )
+                                        .await
+                                        .then_some(streamed_body_len),
+                                    },
+                                };
+                                match sent {
+                                    Some(n) => streamed_body_len = n,
+                                    None => return,
+                                }
                             }
                         }
 
@@ -2624,6 +4179,9 @@ pub(crate) async fn handle<S: ConnIo>(
                         if let Some(target) = process_meta.post_action {
                             run_post_action(http, &ctx, target, request_start, &mut *url_scratch)
                                 .await;
+                        }
+                        if relay_failed {
+                            return;
                         }
 
                         read_start += request_total_consumed;
@@ -2709,5 +4267,28 @@ pub(crate) async fn handle<S: ConnIo>(
                 read_start = 0;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_accept_error_is_logged_once_a_minute() {
+        let mut line = RepeatedLine {
+            last: None,
+            since: 0,
+        };
+        let t0 = Instant::now();
+        let msg = || "accept() failed (13: Permission denied)".to_string();
+        assert_eq!(line.take(t0, msg()).as_deref(), Some(msg().as_str()));
+        assert_eq!(line.take(t0 + Duration::from_millis(500), msg()), None);
+        assert_eq!(line.take(t0 + Duration::from_secs(59), msg()), None);
+        assert_eq!(
+            line.take(t0 + Duration::from_secs(60), msg()).as_deref(),
+            Some("accept() failed (13: Permission denied), 2 more like it since the last one")
+        );
+        assert_eq!(line.take(t0 + Duration::from_secs(61), msg()), None);
     }
 }

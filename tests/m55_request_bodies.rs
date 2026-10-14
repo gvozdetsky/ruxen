@@ -14,7 +14,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Server {
     child: Child,
@@ -82,7 +82,9 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 fn start(conf_http: &str) -> Server {
-    let _setup = common::ports::setup_lock();
+    // Held until ruxen listens: released earlier, another test could take
+    // the same free port, and ruxen would fail to bind it.
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -99,22 +101,27 @@ fn start(conf_http: &str) -> Server {
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        // Its private body-temp directory goes under `dir`, which is
-        // removed afterwards; a killed ruxen can't remove it itself.
-        .env("TMPDIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
-    Server { child, port, dir }
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            // Its private body-temp directory goes under `dir`, which is
+            // removed afterwards; a killed ruxen can't remove it itself.
+            .env("TMPDIR", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        port,
+        dir,
+    };
+    let pid_file = server.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.child, &pid_file, Duration::from_secs(3));
+    drop(setup);
+    server
 }
 
 fn exchange(port: u16, head: &str, body: &[u8]) -> String {
@@ -376,4 +383,52 @@ fn oversized_body_gets_the_locations_error_page() {
     let resp = post_cl(server.port, "/plain", &body);
     assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
     assert!(resp.contains("\r\nX-Always: yes\r\n"), "{resp}");
+}
+
+/// Bodies kept in memory, below and above the size from which the proxy
+/// sends the body from its own buffer after the header block (16 KiB,
+/// #289), arrive intact; also through an upstream with a tiny receive
+/// buffer that reads slowly, so the writes to it come back short.
+#[test]
+fn in_memory_bodies_are_proxied_intact_through_short_writes() {
+    let listener = {
+        let _setup = common::ports::setup_lock();
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    };
+    let small: libc::c_int = 4096;
+    // SAFETY: setsockopt on a socket this test owns, with a c_int value.
+    let rc = unsafe {
+        use std::os::fd::AsRawFd;
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &small as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0);
+    let slow = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                // Let the proxy's writes fill the small window first.
+                sleep(Duration::from_millis(50));
+                serve_one(stream)
+            });
+        }
+    });
+    let fast = spawn_echo_upstream();
+    for upstream in [fast, slow] {
+        let server = start(&proxy_conf(upstream));
+        for len in [16 * 1024, 16 * 1024 + 1, 64 * 1024, 1024 * 1024] {
+            let body = payload(len);
+            let resp = post_cl(server.port, "/default/", &body);
+            assert!(
+                resp.ends_with(&format!("len={} sum={}", body.len(), checksum(&body))),
+                "{len} bytes via {upstream}: {}",
+                &resp[..resp.len().min(300)]
+            );
+        }
+    }
 }

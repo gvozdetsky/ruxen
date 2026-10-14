@@ -9,8 +9,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// `METHOD path` → "status body".
 fn request(port: u16, line: &str) -> String {
@@ -61,22 +60,18 @@ fn error_page_redirects_continue_as_get() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(d.join("nginx.conf"))
-        .env("TMPDIR", &d)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !d.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(d.join("nginx.conf"))
+            .env("TMPDIR", &d)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &d.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let cases = [
@@ -92,8 +87,7 @@ fn error_page_redirects_continue_as_get() {
         ("POST /proxied", "418 GET"),
     ];
     let got: Vec<String> = cases.iter().map(|(r, _)| request(port, r)).collect();
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&d);
     for ((req, want), got) in cases.iter().zip(&got) {
         assert_eq!(got, want, "{req}");

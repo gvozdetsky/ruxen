@@ -11,11 +11,12 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod arena;
 mod auth;
 mod autoindex;
 mod config;
@@ -24,13 +25,17 @@ mod fs_resolve;
 mod http;
 mod http_date;
 mod phase;
+mod privileges;
 mod proxy;
+mod proxy_cache;
 mod proxy_protocol;
+mod proxy_stream;
 mod syslog;
 mod tls;
 mod tls_certs;
 mod tls_session;
 mod tls_stream;
+mod tls_ticket;
 mod upstream;
 mod uri;
 mod worker;
@@ -94,6 +99,7 @@ extern "C" fn sigusr1_handler(_sig: i32) {
     SIGUSR1_SEEN.store(true, Ordering::SeqCst);
 }
 
+#[derive(Clone)]
 struct Cli {
     config_path: PathBuf,
     prefix: Option<PathBuf>,
@@ -104,6 +110,9 @@ struct Cli {
     dump: bool,
     show_version: bool,
     signal: Option<String>,
+    /// `--compat`: report everything in the configuration ruxen doesn't
+    /// do as nginx (#278).
+    compat: bool,
 }
 
 impl Default for Cli {
@@ -117,6 +126,7 @@ impl Default for Cli {
             quiet: false,
             dump: false,
             show_version: false,
+            compat: false,
             signal: None,
         }
     }
@@ -171,36 +181,6 @@ fn report_emerg(msg: &str, cli: &Cli, main_path: &Path) -> Failure {
     Failure::Reported
 }
 
-/// nginx started as root switches its workers to `user` (default
-/// `nobody`). ruxen can't switch users yet, so running as root is allowed
-/// only when the config says so with `user root;`; anything else would
-/// quietly serve every request with root's file access.
-fn check_privileges(euid: u32, user: Option<&str>) -> Result<(), String> {
-    const UNPRIVILEGED: &str = "start ruxen as an unprivileged user instead \
-        (setcap cap_net_bind_service=+ep allows ports below 1024)";
-    match (euid, user) {
-        (0, Some("root")) => Ok(()),
-        (0, Some(user)) => Err(format!(
-            "\"user {user}\" is not supported yet, and ignoring it is unsafe: requests \
-             would be served as root; {UNPRIVILEGED}"
-        )),
-        (0, None) => Err(format!(
-            "running as root without \"user root;\": nginx would switch workers to \
-             \"nobody\", but ruxen doesn't switch users yet; add \"user root;\" to run as \
-             root on purpose, or {UNPRIVILEGED}"
-        )),
-        (_, Some(_)) => {
-            // nginx's wording (ngx_set_user) for the same situation.
-            eprintln!(
-                "ruxen: [warn] the \"user\" directive makes sense only if the master \
-                 process runs with super-user privileges, ignored"
-            );
-            Ok(())
-        }
-        (_, None) => Ok(()),
-    }
-}
-
 fn real_main() -> Result<(), Failure> {
     let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
 
@@ -237,6 +217,10 @@ fn real_main() -> Result<(), Failure> {
         Some(merged)
     };
 
+    if cli.compat {
+        return check_compat(main_path, file_src, globals_src);
+    }
+
     let cfg = config::parse_with_main(main_path.clone(), file_src, globals_src)
         .map_err(|e| report_emerg(&e.to_string(), &cli, &main_path))?;
 
@@ -255,9 +239,11 @@ fn real_main() -> Result<(), Failure> {
             main_path.display()
         );
     }
+    // `user`: resolved now, so `-t` reports an unknown user like nginx;
+    // switched to once the listeners are bound.
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
-    check_privileges(euid, cfg.runtime.user.as_deref())
+    let switch_to = privileges::resolve(euid, cfg.runtime.user.as_ref())
         .map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
     if cli.dump {
@@ -271,31 +257,17 @@ fn real_main() -> Result<(), Failure> {
         }
     }
 
-    let pid_path = cfg.runtime.pid.clone();
-    // Resolve `worker_processes` (or `auto`) from the config; nginx
-    // defaults to 1 when unset. RUXEN_WORKERS still overrides for
-    // benchmarking convenience.
-    let config_workers = match cfg.runtime.worker_processes {
-        Some(config::WorkerProcesses::Count(n)) => n,
-        Some(config::WorkerProcesses::Auto) => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-        None => 1,
-    };
-    let worker_connections = cfg.runtime.worker_connections.unwrap_or(512);
-    let rlimit_nofile = cfg.runtime.worker_rlimit_nofile;
-    let rlimit_core = cfg.runtime.worker_rlimit_core;
-    // nginx's 0 is "no limit", the same as unset.
-    let shutdown_timeout = cfg
-        .runtime
-        .worker_shutdown_timeout_ms
-        .filter(|&ms| ms != 0)
-        .map(Duration::from_millis);
+    let settings = Settings::from_config(&cfg);
     // Load certificates, open roots and log files. `-t` does this too, so
     // it catches everything short of a busy port, like `nginx -t`.
+    // What `prepare` leaks is recorded, to be freed once a reload has
+    // retired this generation (#343).
+    arena::open();
+    let prepared = worker::prepare(cfg);
+    let arena = arena::close();
     let http: &'static worker::PreparedHttp =
-        worker::prepare(cfg).map_err(|e| report_emerg(&e, &cli, &main_path))?;
-    warn_if_fd_limit_too_low(http, worker_connections, rlimit_nofile);
+        prepared.map_err(|e| report_emerg(&e, &cli, &main_path))?;
+    warn_if_fd_limit_too_low(http, settings.worker_connections, settings.rlimit_nofile);
     if cli.test_only {
         if report_test {
             eprintln!(
@@ -306,90 +278,302 @@ fn real_main() -> Result<(), Failure> {
         return Ok(());
     }
 
+    // `-e` takes over stderr, unless the configuration logs to stderr
+    // itself: then stderr stays, and lines without an error_log of their
+    // own go to the `-e` file (nginx's log_use_stderr, ngx_log_redirect_stderr).
     if let Some(errlog) = &cli.errlog {
-        redirect_stderr(errlog)?;
-        let _ = worker::STDERR_LOG_PATH.set(errlog.clone());
+        if http.uses_stderr_log {
+            worker::default_error_log_file(errlog);
+        } else {
+            redirect_stderr(errlog)?;
+            let _ = worker::STDERR_LOG_PATH.set(errlog.clone());
+        }
     }
     // Workers are threads, so the limits are set once for the process.
     // Each worker's fd table is its own (unshare), so RLIMIT_NOFILE then
     // bounds every worker, as nginx's per-worker setrlimit does.
-    set_rlimit(true, rlimit_nofile);
-    set_rlimit(false, rlimit_core);
+    settings.set_rlimits();
 
-    // Workers can't run without io_uring; say why up front instead of
-    // letting every worker thread panic on runtime setup.
-    if !monoio::utils::detect_uring() {
-        eprintln!(
-            "ruxen: [emerg] io_uring is not available: it is blocked by seccomp \
-             (Docker's default profile denies it: use contrib/docker/seccomp-io_uring.json \
-             from the ruxen repository), disabled via the kernel.io_uring_disabled sysctl, \
-             or the kernel is too old"
-        );
-        return Err(Failure::Reported);
-    }
+    // io_uring, else epoll (monoio's legacy driver, #215). Chosen once, up
+    // front, so every worker runs on the same one.
+    let driver = choose_driver(http)?;
+    worker::set_driver(driver);
 
     install_signal_handlers()?;
 
-    let runtime = Arc::new(worker::RuntimeState::default());
+    // The listening sockets, kept across reloads (#89). Fails like nginx
+    // when another process already listens on a port.
+    let mut listeners = worker::listeners::ListenerSet::default();
+    let worker_listeners = listeners
+        .open(http, settings.workers)
+        .map_err(|e| report_emerg(&e, &cli, &main_path))?;
 
-    let n_workers: usize = std::env::var("RUXEN_WORKERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(config_workers);
-    let pin = matches!(std::env::var("RUXEN_PIN").as_deref(), Ok("1"));
-
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let mut handles = Vec::with_capacity(n_workers);
-    for i in 0..n_workers {
-        let cpu = if pin { Some(i) } else { None };
-        let runtime = runtime.clone();
-        let ready = ready_tx.clone();
-        let handle = thread::Builder::new()
-            .name(format!("ruxen-worker-{i}"))
-            .spawn(move || worker::run(http, cpu, runtime, ready))?;
-        handles.push(handle);
+    // Still one thread here, which the fork needs.
+    if let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0) {
+        let extra: Vec<&Path> = cli.errlog.iter().map(PathBuf::as_path).collect();
+        privileges::start_helper(creds, settings.pid.as_deref(), &extra)
+            .map_err(|e| report_emerg(&e, &cli, &main_path))?;
     }
-    drop(ready_tx);
 
-    // Each worker reports once its listeners are bound. Wait for all of
-    // them: a busy port becomes one `[emerg]` and exit 1 instead of a
-    // panic per worker, and the pid file (which Test::Nginx polls for)
-    // appears only once the server accepts connections.
-    let mut startup_error = None;
-    for _ in 0..n_workers {
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                startup_error.get_or_insert(e);
+    // Panic messages go to the error log (#130).
+    worker::install_panic_hook(http);
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+
+    // Each worker reports once it is ready to accept. Wait for all of
+    // them: a failure becomes one `[emerg]` and exit 1 instead of a panic
+    // per worker, and the pid file (which Test::Nginx polls for) appears
+    // only once the server accepts connections.
+    let generation = Generation::start(0, http, arena, &settings, worker_listeners, &exited_tx);
+    let mut startup_error = generation.as_ref().err().cloned();
+    // The pid file goes where root may write (/run), so before the switch.
+    let mut pid_written = false;
+    if startup_error.is_none()
+        && let Some(path) = &settings.pid
+    {
+        match write_pid_file(path) {
+            Ok(()) => {
+                pid_written = true;
+                privileges::pid_written();
             }
-            // A worker died before reporting; the join below says so.
-            Err(_) => break,
+            Err(e) => startup_error = Some(e.to_string()),
         }
+    }
+    // Every listener is bound and every log open: drop root for good
+    // before a single connection is accepted.
+    if startup_error.is_none()
+        && let Some(creds) = &switch_to
+        && let Err(e) = privileges::switch(creds)
+    {
+        startup_error = Some(e);
     }
     if let Some(e) = startup_error {
         eprintln!("ruxen: [emerg] {e}");
-        runtime.begin_shutdown();
-        for handle in handles {
-            let _ = handle.join();
+        if let Ok(generation) = generation {
+            generation.stop();
         }
+        if pid_written && let Some(path) = &settings.pid {
+            privileges::remove_pid_file_on_exit(path);
+        }
+        listeners.remove_unix_files();
         return Err(Failure::Reported);
     }
-
-    if let Some(path) = &pid_path {
-        write_pid_file(path)?;
+    let generation = generation.unwrap_or_else(|_| unreachable!("checked above"));
+    generation.state.release_workers();
+    // nginx's cache loader and manager, a thread per zone, as the user
+    // the workers run as.
+    for zone in http.cache_zones {
+        proxy_cache::start_manager(zone);
     }
 
-    let signal_runtime = runtime.clone();
-    let reopen_stderr = cli.errlog.clone();
-    let monitor_pid_path = pid_path.clone();
-    // Runs until the workers have finished (main drops `workers_done`),
-    // so SIGTERM still works during a graceful shutdown.
-    let (workers_done, monitor_rx) = std::sync::mpsc::channel::<()>();
-    let signal_monitor = thread::spawn(move || {
+    let reopen_stderr = cli.errlog.clone().filter(|_| !http.uses_stderr_log);
+    let mut master = Master {
+        cli,
+        settings,
+        current: generation,
+        retiring: Vec::new(),
+        listeners,
+        exited_tx,
+        next_id: 1,
+    };
+    master.run(exited_rx, reopen_stderr)
+}
+
+/// What the main context of a configuration decides, read again on each
+/// reload.
+struct Settings {
+    /// `worker_processes` (or `auto`; nginx's default 1), unless
+    /// `RUXEN_WORKERS` overrides it for benchmarks.
+    workers: usize,
+    pin: bool,
+    worker_connections: usize,
+    rlimit_nofile: Option<u64>,
+    rlimit_core: Option<u64>,
+    /// `worker_shutdown_timeout`; nginx's 0 is "no limit", the same as unset.
+    shutdown_timeout: Option<Duration>,
+    pid: Option<PathBuf>,
+}
+
+impl Settings {
+    fn from_config(cfg: &config::HttpConfig) -> Settings {
+        let config_workers = match cfg.runtime.worker_processes {
+            Some(config::WorkerProcesses::Count(n)) => n,
+            Some(config::WorkerProcesses::Auto) => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            None => 1,
+        };
+        Settings {
+            workers: std::env::var("RUXEN_WORKERS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(config_workers),
+            pin: matches!(std::env::var("RUXEN_PIN").as_deref(), Ok("1")),
+            worker_connections: cfg.runtime.worker_connections.unwrap_or(512),
+            rlimit_nofile: cfg.runtime.worker_rlimit_nofile,
+            rlimit_core: cfg.runtime.worker_rlimit_core,
+            shutdown_timeout: cfg
+                .runtime
+                .worker_shutdown_timeout_ms
+                .filter(|&ms| ms != 0)
+                .map(Duration::from_millis),
+            pid: cfg.runtime.pid.clone(),
+        }
+    }
+
+    fn set_rlimits(&self) {
+        set_rlimit(true, self.rlimit_nofile);
+        set_rlimit(false, self.rlimit_core);
+    }
+}
+
+/// The workers of one configuration: the one ruxen started with, or one a
+/// reload loaded (#89).
+struct Generation {
+    id: u64,
+    http: &'static worker::PreparedHttp,
+    /// Lives as long as the process: workers and connections borrow it
+    /// instead of counting references on every accept (#128). One per
+    /// generation, leaked like its configuration.
+    state: &'static worker::RuntimeState,
+    workers: usize,
+    handles: Vec<thread::JoinHandle<()>>,
+    /// Workers not yet gone.
+    alive: usize,
+    shutdown_timeout: Option<Duration>,
+    /// When a reload retired it.
+    retired_at: Option<Instant>,
+    /// What preparing `http` leaked: freed once the workers are joined.
+    /// `None` once freed, or when it must stay (a generation that failed
+    /// to start).
+    arena: Option<arena::Arena>,
+}
+
+impl Generation {
+    /// Start the workers and wait until each is ready to accept (or failed:
+    /// then the ones started are stopped again, and the first failure is
+    /// the error). They accept once `release_workers` lets them.
+    fn start(
+        id: u64,
+        http: &'static worker::PreparedHttp,
+        arena: arena::Arena,
+        settings: &Settings,
+        listeners: Vec<worker::listeners::WorkerListeners>,
+        exited_tx: &std::sync::mpsc::Sender<(u64, usize, bool)>,
+    ) -> Result<Generation, String> {
+        let state: &'static worker::RuntimeState = Box::leak(Box::default());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut generation = Generation {
+            id,
+            http,
+            state,
+            workers: settings.workers,
+            handles: Vec::with_capacity(settings.workers),
+            alive: 0,
+            shutdown_timeout: settings.shutdown_timeout,
+            retired_at: None,
+            arena: Some(arena),
+        };
+        let mut error = None;
+        for (i, own) in listeners.into_iter().enumerate() {
+            let cpu = if settings.pin { Some(i) } else { None };
+            let ready = ready_tx.clone();
+            let exited = WorkerExit(id, i, exited_tx.clone());
+            let spawned = thread::Builder::new()
+                .name(format!("ruxen-worker-{i}"))
+                .spawn(move || {
+                    let _exited = exited;
+                    worker::run(http, cpu, state, ready, own)
+                });
+            match spawned {
+                Ok(handle) => generation.handles.push(handle),
+                Err(e) => {
+                    error = Some(format!("spawning a worker thread failed ({e})"));
+                    break;
+                }
+            }
+        }
+        drop(ready_tx);
+        generation.alive = generation.handles.len();
+        for _ in 0..generation.handles.len() {
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error.get_or_insert(e);
+                }
+                // A worker died before reporting; the join below says so.
+                Err(_) => break,
+            }
+        }
+        match error {
+            None => Ok(generation),
+            Some(e) => {
+                generation.stop();
+                Err(e)
+            }
+        }
+    }
+
+    /// Stop workers that never accepted and wait for them.
+    fn stop(self) {
+        self.state.begin_shutdown();
+        self.state.release_workers();
+        for handle in self.handles {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// `main` once the workers run: nginx's master process loop. It waits for
+/// signals and for workers to end, and reloads.
+struct Master {
+    cli: Cli,
+    settings: Settings,
+    current: Generation,
+    /// Generations a reload retired whose workers haven't all finished.
+    retiring: Vec<Generation>,
+    listeners: worker::listeners::ListenerSet,
+    exited_tx: std::sync::mpsc::Sender<(u64, usize, bool)>,
+    next_id: u64,
+}
+
+impl Master {
+    fn run(
+        &mut self,
+        exited_rx: std::sync::mpsc::Receiver<(u64, usize, bool)>,
+        reopen_stderr: Option<PathBuf>,
+    ) -> Result<(), Failure> {
         let mut quit_at = None;
-        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-            monitor_rx.recv_timeout(Duration::from_millis(10))
-        {
+        let mut worker_panicked = false;
+        loop {
+            // Workers say when they are gone, in any order. One that
+            // panicked ends the server: the others stop as on SIGQUIT, and
+            // ruxen exits 1 for a supervisor to restart it (#130; see
+            // worker/panics.rs).
+            match exited_rx.recv_timeout(Duration::from_millis(10)) {
+                // A generation that failed to start was joined already.
+                Ok((id, i, panicked)) => {
+                    let Some(generation) = self.generation(id) else {
+                        continue;
+                    };
+                    generation.alive -= 1;
+                    let http = generation.http;
+                    if panicked && !worker_panicked {
+                        worker_panicked = true;
+                        worker::write_worker_log(
+                            http.error_logs,
+                            config::ErrorLogLevel::Alert,
+                            &format!("worker {i} exited after a panic, stopping"),
+                        );
+                        self.begin_shutdown();
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            self.finish_retired();
+            if self.current.alive == 0 && self.retiring.is_empty() {
+                break;
+            }
             // SIGTERM / SIGINT: nginx's fast shutdown. Its workers exit
             // without waiting for their requests, and the master deletes
             // the pid file and exits 0. Leaving the process does both.
@@ -397,31 +581,33 @@ fn real_main() -> Result<(), Failure> {
             // way: nginx closes the connections still open when it fires
             // (ngx_shutdown_timer_handler), and its workers then exit.
             let timed_out = matches!(
-                (quit_at, shutdown_timeout),
+                (quit_at, self.settings.shutdown_timeout),
                 (Some(at), Some(limit)) if Instant::now().duration_since(at) >= limit
             );
             if SIGTERM_SEEN.load(Ordering::SeqCst) || timed_out {
-                signal_runtime.begin_shutdown();
-                if let Some(path) = &monitor_pid_path {
-                    let _ = std::fs::remove_file(path);
+                self.begin_shutdown();
+                if let Some(path) = &self.settings.pid {
+                    privileges::remove_pid_file_on_exit(path);
                 }
                 // Request-body temp files in flight have no names (they
                 // were unlinked at creation), so the private directory is
                 // empty unless `client_body_in_file_only on` kept some.
-                http.body_temp.remove_private_if_empty();
+                for generation in self.retiring.iter().chain([&self.current]) {
+                    generation.http.body_temp.remove_private_if_empty();
+                }
+                // Buffered access_log lines (#151): nginx's workers write
+                // them on their way out.
+                worker::logbuf::flush_at_exit();
+                self.listeners.remove_unix_files();
                 std::process::exit(0);
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
-                signal_runtime.begin_shutdown();
+                self.begin_shutdown();
                 quit_at = Some(Instant::now());
             }
-            // Drain any pending SIGHUP into a reload-gen bump. The signal
-            // handler stores `true`; clearing it here means we coalesce
-            // multiple HUPs that arrive within one tick into a single
-            // bump, which is fine — the per-connection check is just
-            // `gen != start_gen`.
-            if SIGHUP_SEEN.swap(false, Ordering::SeqCst) {
-                signal_runtime.bump_reload_gen();
+            // Several HUPs within one turn make one reload.
+            if SIGHUP_SEEN.swap(false, Ordering::SeqCst) && quit_at.is_none() && !worker_panicked {
+                self.reload();
             }
             // SIGUSR1 reopens the log files, as nginx does after logrotate
             // moved them: the `-e` file for this thread here, and in each
@@ -429,6 +615,9 @@ fn real_main() -> Result<(), Failure> {
             // access_log files before a worker's next write. error_log
             // files are opened per write already.
             if SIGUSR1_SEEN.swap(false, Ordering::SeqCst) {
+                // After a switch to `user`, the root helper recreates the
+                // files logrotate moved, for the user to open.
+                privileges::reopen_logs();
                 if let Some(path) = &reopen_stderr
                     && let Err(e) = redirect_stderr(path)
                 {
@@ -437,22 +626,246 @@ fn real_main() -> Result<(), Failure> {
                 worker::LOG_REOPEN_GEN.fetch_add(1, Ordering::Relaxed);
             }
         }
-    });
+        // The loop ends once every generation's workers are gone.
+        for handle in std::mem::take(&mut self.current.handles) {
+            let _ = handle.join();
+        }
+        self.current.http.body_temp.remove_private_if_empty();
+        self.listeners.remove_unix_files();
+        if let Some(path) = &self.settings.pid {
+            privileges::remove_pid_file_on_exit(path);
+        }
+        if worker_panicked {
+            return Err(Failure::Reported);
+        }
+        Ok(())
+    }
 
-    for handle in handles {
-        if handle.join().is_err() {
-            runtime.begin_shutdown();
-            return Err(io::Error::other("worker thread panicked").into());
+    fn generation(&mut self, id: u64) -> Option<&mut Generation> {
+        if self.current.id == id {
+            return Some(&mut self.current);
+        }
+        self.retiring.iter_mut().find(|g| g.id == id)
+    }
+
+    fn begin_shutdown(&self) {
+        for generation in self.retiring.iter().chain([&self.current]) {
+            generation.state.begin_shutdown();
         }
     }
 
-    runtime.begin_shutdown();
-    drop(workers_done);
-    let _ = signal_monitor.join();
-    http.body_temp.remove_private_if_empty();
+    /// Retired generations: end their connections once
+    /// `worker_shutdown_timeout` has passed, and join the ones whose
+    /// workers are all gone.
+    fn finish_retired(&mut self) {
+        let now = Instant::now();
+        for generation in &self.retiring {
+            if let (Some(at), Some(limit)) = (generation.retired_at, generation.shutdown_timeout)
+                && now.duration_since(at) >= limit
+                && !generation.state.is_forced()
+            {
+                generation.state.force_close();
+            }
+        }
+        let (done, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retiring)
+            .into_iter()
+            .partition(|g| g.alive == 0);
+        self.retiring = live;
+        for mut generation in done {
+            for handle in std::mem::take(&mut generation.handles) {
+                let _ = handle.join();
+            }
+            generation.http.close_root_fds();
+            // Keyed by peer address: a freed peer's entry could match a
+            // later one at the same address.
+            syslog::forget_error_log_sockets();
+            if let Some(arena) = generation.arena.take() {
+                // SAFETY: its workers are joined, and what a later
+                // generation keeps (zone state, cache zones, the buffered
+                // log registry) is leaked outside the arena.
+                unsafe { arena.free() };
+            }
+        }
+    }
 
-    if let Some(path) = &pid_path {
-        let _ = std::fs::remove_file(path);
+    /// SIGHUP: nginx's reconfiguration (ngx_master_process_cycle). Read
+    /// and prepare the configuration again, start a generation of workers
+    /// with it on the same listening sockets, then retire the running one:
+    /// it stops accepting, closes idle connections and finishes its
+    /// requests. A configuration that fails anywhere on the way is logged,
+    /// and the running one stays, as nginx keeps its old cycle.
+    fn reload(&mut self) {
+        let log = |http: &worker::PreparedHttp, level, message: &str| {
+            worker::write_worker_log(http.error_logs, level, message)
+        };
+        let old_http = self.current.http;
+        log(
+            old_http,
+            config::ErrorLogLevel::Notice,
+            "signal 1 (SIGHUP) received, reconfiguring",
+        );
+        let cli = self.cli.clone();
+        // Its own thread: parsing and preparing keep state in thread
+        // locals, which then start empty, as at startup.
+        let loaded = thread::Builder::new()
+            .name("ruxen-reload".into())
+            .spawn(move || load_for_reload(&cli))
+            .map_err(|e| format!("spawning a thread failed ({e})"))
+            .and_then(|t| {
+                t.join()
+                    .unwrap_or_else(|_| Err("reading the configuration panicked".into()))
+            });
+        let (settings, http, arena, warnings) = match loaded {
+            Ok(loaded) => loaded,
+            Err(e) => return log(old_http, config::ErrorLogLevel::Emerg, &e),
+        };
+        for w in &warnings {
+            log(old_http, config::ErrorLogLevel::Warn, w);
+        }
+        let worker_listeners = match self.listeners.open(http, settings.workers) {
+            Ok(l) => l,
+            Err(e) => {
+                http.close_root_fds();
+                return log(old_http, config::ErrorLogLevel::Emerg, &e);
+            }
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let generation = match Generation::start(
+            id,
+            http,
+            arena,
+            &settings,
+            worker_listeners,
+            &self.exited_tx,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                self.listeners
+                    .retain(self.current.http, self.current.workers);
+                http.close_root_fds();
+                return log(old_http, config::ErrorLogLevel::Emerg, &e);
+            }
+        };
+        generation.state.release_workers();
+        worker::set_panic_hook_config(http);
+        let mut old = std::mem::replace(&mut self.current, generation);
+        old.state.begin_shutdown();
+        old.state.bump_reload_gen();
+        old.retired_at = Some(Instant::now());
+        self.retiring.push(old);
+        self.listeners.retain(http, settings.workers);
+        for zone in http.cache_zones {
+            proxy_cache::start_manager(zone);
+        }
+        proxy_cache::retire_zones_but(http.cache_zones);
+        settings.set_rlimits();
+        if settings.pid != self.settings.pid {
+            if let Some(path) = &settings.pid
+                && let Err(e) = write_pid_file(path)
+            {
+                log(http, config::ErrorLogLevel::Alert, &e.to_string());
+            }
+            if let Some(path) = &self.settings.pid
+                && !privileges::helper_running()
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        self.settings = settings;
+    }
+}
+
+/// Read, parse and prepare the configuration as at startup, for a reload.
+fn load_for_reload(
+    cli: &Cli,
+) -> Result<
+    (
+        Settings,
+        &'static worker::PreparedHttp,
+        arena::Arena,
+        Vec<String>,
+    ),
+    String,
+> {
+    let (main_path, file_src) = read_main_config(cli).map_err(|e| e.to_string())?;
+    let globals_src = (!cli.globals.is_empty()).then(|| {
+        cli.globals
+            .iter()
+            .map(|g| {
+                if g.ends_with('\n') {
+                    g.clone()
+                } else {
+                    format!("{g}\n")
+                }
+            })
+            .collect::<String>()
+    });
+    let cfg =
+        config::parse_with_main(main_path, file_src, globals_src).map_err(|e| e.to_string())?;
+    let settings = Settings::from_config(&cfg);
+    let warnings = cfg.warnings.clone();
+    arena::open();
+    let prepared = worker::prepare(cfg);
+    // On an error the arena is dropped: what was leaked stays.
+    let arena = arena::close();
+    Ok((settings, prepared?, arena, warnings))
+}
+
+/// Held by a worker thread: tells `main` the worker (generation, index) is
+/// gone, and whether it unwound from a panic, when the thread ends either
+/// way.
+struct WorkerExit(u64, usize, std::sync::mpsc::Sender<(u64, usize, bool)>);
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        let _ = self.2.send((self.0, self.1, thread::panicking()));
+    }
+}
+
+/// `ruxen --compat`: parse the whole configuration, collecting what ruxen
+/// doesn't support or does differently instead of stopping at the first
+/// unknown directive, then load it as `-t` does (certificates, roots,
+/// logs) if nothing unsupported was found. The report goes to stdout;
+/// the exit status is 0 when ruxen starts with the configuration.
+fn check_compat(
+    main_path: PathBuf,
+    file_src: String,
+    globals_src: Option<String>,
+) -> Result<(), Failure> {
+    println!(
+        "ruxen {}: checking {}",
+        env!("CARGO_PKG_VERSION"),
+        main_path.display()
+    );
+    config::compat::begin();
+    let parsed = config::parse_with_main(main_path, file_src, globals_src);
+    let findings = config::compat::finish();
+    let cfg = match parsed {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            print!(
+                "{}",
+                config::compat::report(&findings, &[], Some(&e.to_string()), None)
+            );
+            return Err(Failure::Reported);
+        }
+    };
+    let warnings = cfg.warnings.clone();
+    let unsupported = findings
+        .iter()
+        .any(|f| f.severity == config::compat::Severity::Unsupported);
+    let prepare_error = if unsupported {
+        None
+    } else {
+        worker::prepare(cfg).err()
+    };
+    print!(
+        "{}",
+        config::compat::report(&findings, &warnings, None, prepare_error.as_deref())
+    );
+    if unsupported || prepare_error.is_some() {
+        return Err(Failure::Reported);
     }
     Ok(())
 }
@@ -491,6 +904,10 @@ where
                 cli.dump = true;
             }
             "-V" => cli.show_version = true,
+            "--compat" => {
+                cli.compat = true;
+                cli.test_only = true;
+            }
             "-s" => {
                 let value = args.next().ok_or("option `-s` requires a signal name")?;
                 cli.signal = Some(value);
@@ -531,10 +948,11 @@ fn version_output() -> &'static str {
         "configure arguments:",
         " --with-http_ssl_module",
         " --with-http_realip_module",
+        " --with-http_stub_status_module",
+        " --with-http_auth_request_module",
+        " --with-http_v2_module",
         " --without-pcre",
-        " --without-http-cache",
         " --without-http_charset_module",
-        " --without-http_gzip_module",
         " --without-http_ssi_module",
         " --without-http_mirror_module",
         " --without-http_userid_module",
@@ -545,14 +963,9 @@ fn version_output() -> &'static str {
         " --without-http_scgi_module",
         " --without-http_grpc_module",
         " --without-http_memcached_module",
-        " --without-http_limit_conn_module",
-        " --without-http_limit_req_module",
         " --without-http_empty_gif_module",
         " --without-http_browser_module",
-        " --without-http_upstream_hash_module",
-        " --without-http_upstream_ip_hash_module",
         " --without-http_upstream_random_module",
-        " --without-http_upstream_zone_module",
         " --without-http_upstream_sticky_module",
         " --without-mail_pop3_module",
         " --without-mail_imap_module",
@@ -561,8 +974,6 @@ fn version_output() -> &'static str {
     )
 }
 
-/// `-s NAME`: the signal nginx sends for it. `reload` is refused: SIGHUP
-/// only closes idle keep-alive connections, ruxen can't re-read its config.
 /// nginx's ngx_event_module_init warning: more `worker_connections` than
 /// file descriptors (the `worker_rlimit_nofile` to be set, else the
 /// current soft limit). A `[warn]` in the top-level error log, so with
@@ -589,6 +1000,42 @@ fn warn_if_fd_limit_too_low(
             &format!("{connections} worker_connections exceed open file resource limit: {limit}"),
         );
     }
+}
+
+/// The I/O driver (#215): io_uring where the kernel and seccomp allow it,
+/// else epoll, with a `[notice]` saying why. `RUXEN_DRIVER=epoll` picks
+/// epoll anyway; `RUXEN_DRIVER=io_uring` refuses to start without
+/// io_uring. `events { use epoll; }` doesn't choose: configurations
+/// written for nginx set it because it's the best method nginx has on
+/// Linux.
+fn choose_driver(http: &worker::PreparedHttp) -> Result<worker::Driver, Failure> {
+    const WHY: &str = "it is blocked by seccomp (Docker's default profile denies it: \
+                       use contrib/docker/seccomp-io_uring.json from the ruxen repository), \
+                       disabled via the kernel.io_uring_disabled sysctl, or the kernel is too old";
+    let wanted = std::env::var("RUXEN_DRIVER").unwrap_or_default();
+    match wanted.as_str() {
+        "epoll" => return Ok(worker::Driver::Epoll),
+        "io_uring" | "" => {}
+        other => {
+            eprintln!(
+                "ruxen: [emerg] RUXEN_DRIVER=\"{other}\" is not a driver (io_uring or epoll)"
+            );
+            return Err(Failure::Reported);
+        }
+    }
+    if monoio::utils::detect_uring() {
+        return Ok(worker::Driver::IoUring);
+    }
+    if wanted == "io_uring" {
+        eprintln!("ruxen: [emerg] io_uring is not available: {WHY}");
+        return Err(Failure::Reported);
+    }
+    worker::write_worker_log(
+        http.error_logs,
+        config::ErrorLogLevel::Notice,
+        &format!("io_uring is not available, using epoll: {WHY}"),
+    );
+    Ok(worker::Driver::Epoll)
 }
 
 /// `worker_rlimit_nofile` / `worker_rlimit_core`: both soft and hard limits
@@ -624,16 +1071,13 @@ fn set_rlimit(nofile: bool, value: Option<u64>) {
     }
 }
 
+/// `-s NAME`: the signal nginx sends for it.
 fn signal_for(name: &str) -> Result<i32, String> {
     match name {
         "stop" => Ok(libc::SIGTERM),
         "quit" => Ok(libc::SIGQUIT),
         "reopen" => Ok(libc::SIGUSR1),
-        "reload" => Err(
-            "`-s reload` is not supported yet: ruxen can't re-read its configuration; \
-             restart it instead"
-                .into(),
-        ),
+        "reload" => Ok(libc::SIGHUP),
         _ => Err(format!("invalid option: \"-s {name}\"")),
     }
 }
@@ -717,11 +1161,7 @@ fn install_signal_handlers() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    // SIGHUP triggers a "reload" — we don't actually re-read config or
-    // re-exec workers, but we do bump the reload generation so that
-    // already-accepted connections close (idle keepalive bails out, the
-    // post-request keepalive check sets `Connection: close`). New
-    // connections accepted after the bump keep going.
+    // SIGHUP: reload the configuration (`Master::reload`).
     if unsafe { signal(SIGHUP, sighup_handler as *const () as usize) } == usize::MAX {
         return Err(io::Error::last_os_error());
     }
@@ -741,7 +1181,7 @@ fn install_signal_handlers() -> io::Result<()> {
     // but the kernel can't find a thread with it unblocked. Runs on the main
     // thread before workers spawn, so children inherit the unblocked mask.
     let mut set: SigSet = [0; 16];
-    set[0] = [SIGQUIT, SIGTERM, SIGINT]
+    set[0] = [SIGQUIT, SIGTERM, SIGINT, SIGHUP, SIGUSR1]
         .iter()
         .fold(0, |bits, sig| bits | 1u64 << (sig - 1));
     if unsafe { sigprocmask(SIG_UNBLOCK, &set, std::ptr::null_mut()) } != 0 {
@@ -760,23 +1200,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn root_needs_explicit_user_root() {
-        assert!(check_privileges(0, Some("root")).is_ok());
-        let err = check_privileges(0, None).unwrap_err();
-        assert!(
-            err.starts_with("running as root without \"user root;\""),
-            "{err}"
-        );
-        let err = check_privileges(0, Some("www-data")).unwrap_err();
-        assert!(
-            err.starts_with("\"user www-data\" is not supported yet"),
-            "{err}"
-        );
-        assert!(check_privileges(1000, None).is_ok());
-        assert!(check_privileges(1000, Some("www-data")).is_ok());
-    }
-
-    #[test]
     fn version_output_is_pinned() {
         assert_eq!(
             version_output(),
@@ -789,10 +1212,11 @@ mod tests {
                 "configure arguments:",
                 " --with-http_ssl_module",
                 " --with-http_realip_module",
+                " --with-http_stub_status_module",
+                " --with-http_auth_request_module",
+                " --with-http_v2_module",
                 " --without-pcre",
-                " --without-http-cache",
                 " --without-http_charset_module",
-                " --without-http_gzip_module",
                 " --without-http_ssi_module",
                 " --without-http_mirror_module",
                 " --without-http_userid_module",
@@ -803,14 +1227,9 @@ mod tests {
                 " --without-http_scgi_module",
                 " --without-http_grpc_module",
                 " --without-http_memcached_module",
-                " --without-http_limit_conn_module",
-                " --without-http_limit_req_module",
                 " --without-http_empty_gif_module",
                 " --without-http_browser_module",
-                " --without-http_upstream_hash_module",
-                " --without-http_upstream_ip_hash_module",
                 " --without-http_upstream_random_module",
-                " --without-http_upstream_zone_module",
                 " --without-http_upstream_sticky_module",
                 " --without-mail_pop3_module",
                 " --without-mail_imap_module",

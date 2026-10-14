@@ -10,8 +10,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// "status connection-header body".
 fn get(port: u16, path: &str) -> String {
@@ -49,6 +48,7 @@ fn http_settings_below_a_server_apply_to_it() {
     std::fs::create_dir_all(d.join("server-root")).unwrap();
     std::fs::write(d.join("http-root/f"), "from http root").unwrap();
     std::fs::write(d.join("server-root/g"), "from server root").unwrap();
+    std::fs::write(d.join("server-root/r"), "rewrite only").unwrap();
     let dd = d.display();
     std::fs::write(
         d.join("nginx.conf"),
@@ -56,7 +56,8 @@ fn http_settings_below_a_server_apply_to_it() {
             "pid {dd}/ruxen.pid;\nevents {{}}\nhttp {{\n\
              access_log off;\n\
              server {{ listen 127.0.0.1:{}; location /f {{ }} }}\n\
-             server {{ listen 127.0.0.1:{}; location / {{ }} root {dd}/server-root; }}\n\
+             server {{ listen 127.0.0.1:{}; location / {{ }} \
+             location /r {{ if ($arg_z) {{ return 403; }} }} root {dd}/server-root; }}\n\
              root {dd}/http-root;\n\
              keepalive_timeout 0;\n\
              }}\n",
@@ -64,29 +65,27 @@ fn http_settings_below_a_server_apply_to_it() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(d.join("nginx.conf"))
-        .env("TMPDIR", &d)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !d.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(d.join("nginx.conf"))
+            .env("TMPDIR", &d)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &d.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let first = get(ports[0], "/f");
     let second = get(ports[1], "/g");
-    let _ = child.kill();
-    let _ = child.wait();
+    // Rewrite directives alone leave the static handler (#364).
+    let rewrite_only = get(ports[1], "/r");
+    drop(child);
     let _ = std::fs::remove_dir_all(&d);
     assert_eq!(first, "200 close from http root");
     assert_eq!(second, "200 close from server root");
+    assert_eq!(rewrite_only, "200 close rewrite only");
 }

@@ -8,8 +8,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{Ipv6Addr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn get(addr: &str) -> Option<String> {
     let mut s = TcpStream::connect(addr).ok()?;
@@ -52,28 +51,23 @@ fn a_wildcard_ipv6_listen_is_ipv6_only_by_default() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let v4_to_v6only = get(&format!("127.0.0.1:{v6only}"));
     let v6_to_v6only = get(&format!("[::1]:{v6only}"));
     let v4_to_dual = get(&format!("127.0.0.1:{dual}"));
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(v4_to_v6only, None, "an IPv4 client reached [::]:{v6only}");

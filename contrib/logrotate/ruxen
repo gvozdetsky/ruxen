@@ -1,7 +1,6 @@
 # Rotate the log files ruxen writes under /var/log/ruxen (the systemd
 # unit's LogsDirectory). After moving them, SIGUSR1 makes ruxen reopen its
-# logs: `systemctl reload ruxen` sends it (the unit's ExecReload), as
-# `ruxen -s reopen` does when the configuration has a `pid` file.
+# logs, as `ruxen -s reopen` does when the configuration has a `pid` file.
 #
 #   install -m 644 contrib/logrotate/ruxen /etc/logrotate.d/ruxen
 
@@ -14,6 +13,6 @@
     delaycompress
     sharedscripts
     postrotate
-        systemctl reload ruxen >/dev/null 2>&1 || true
+        systemctl kill --kill-who=main --signal=USR1 ruxen >/dev/null 2>&1 || true
     endscript
 }

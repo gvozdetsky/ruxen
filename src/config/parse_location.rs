@@ -266,17 +266,222 @@ pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<()
         })
 }
 
+/// What a nested location takes from its parent where it sets nothing
+/// itself (#106), as nginx's `merge_loc_conf` of each module: a list
+/// directive (`add_header`, `error_page`, `proxy_set_header`, …) comes as a
+/// whole. The content handler, rewrites, `try_files`, `internal` and
+/// `limit_except` belong to the location itself.
+fn inherit_from_parent(child: &mut Location, parent: &Location) {
+    fn or<T: Clone>(child: &mut Option<T>, parent: &Option<T>) {
+        if child.is_none() {
+            child.clone_from(parent);
+        }
+    }
+    or(&mut child.index, &parent.index);
+    or(&mut child.add_headers, &parent.add_headers);
+    or(&mut child.add_trailers, &parent.add_trailers);
+    or(&mut child.error_pages, &parent.error_pages);
+    or(&mut child.keepalive_timeout, &parent.keepalive_timeout);
+    or(&mut child.keepalive_requests, &parent.keepalive_requests);
+    or(&mut child.keepalive_time_ms, &parent.keepalive_time_ms);
+    or(&mut child.keepalive_disable, &parent.keepalive_disable);
+    or(&mut child.error_logs, &parent.error_logs);
+    or(&mut child.log_not_found, &parent.log_not_found);
+    or(
+        &mut child.recursive_error_pages,
+        &parent.recursive_error_pages,
+    );
+    or(&mut child.server_tokens, &parent.server_tokens);
+    or(&mut child.autoindex, &parent.autoindex);
+    or(
+        &mut child.autoindex_exact_size,
+        &parent.autoindex_exact_size,
+    );
+    or(&mut child.autoindex_localtime, &parent.autoindex_localtime);
+    or(&mut child.autoindex_format, &parent.autoindex_format);
+    or(&mut child.access_logs, &parent.access_logs);
+    or(&mut child.auth_basic, &parent.auth_basic);
+    or(
+        &mut child.auth_basic_user_file,
+        &parent.auth_basic_user_file,
+    );
+    or(&mut child.auth_delay_ms, &parent.auth_delay_ms);
+    or(
+        &mut child.client_max_body_size,
+        &parent.client_max_body_size,
+    );
+    or(
+        &mut child.client_body_buffer_size,
+        &parent.client_body_buffer_size,
+    );
+    or(&mut child.sendfile, &parent.sendfile);
+    or(
+        &mut child.client_body_temp_path,
+        &parent.client_body_temp_path,
+    );
+    or(&mut child.disable_symlinks, &parent.disable_symlinks);
+    or(&mut child.limit_rate, &parent.limit_rate);
+    or(&mut child.limit_rate_after, &parent.limit_rate_after);
+    or(
+        &mut child.client_body_in_file_only,
+        &parent.client_body_in_file_only,
+    );
+    or(&mut child.post_action, &parent.post_action);
+    or(&mut child.expires, &parent.expires);
+    or(
+        &mut child.chunked_transfer_encoding,
+        &parent.chunked_transfer_encoding,
+    );
+    child.access = child.access.inherit(&parent.access);
+    child.proxy = std::mem::take(&mut child.proxy).inherit(&parent.proxy);
+    child.gzip = std::mem::take(&mut child.gzip).inherit(&parent.gzip);
+    child.limit_req = std::mem::take(&mut child.limit_req).inherit(&parent.limit_req);
+    child.limit_conn = std::mem::take(&mut child.limit_conn).inherit(&parent.limit_conn);
+    child.client_timeouts = child.client_timeouts.inherit(parent.client_timeouts);
+    // Its `if` blocks' anonymous locations, merged with it before it had
+    // the parent's settings, get them too (an unset field takes them).
+    if has_if_locations(&child.rewrite_ops) {
+        let snapshot = child.clone();
+        merge_if_locations(&mut child.rewrite_ops, &snapshot);
+    }
+}
+
+/// Whether `ops` has an `if` block with an anonymous location (#137), at
+/// the top: nested ones are inside one that has.
+fn has_if_locations(ops: &[RewriteOp]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            RewriteOp::If {
+                location: Some(_),
+                ..
+            }
+        )
+    })
+}
+
+/// What `parse_location_block` found in an `if` block's body.
+#[derive(Default)]
+pub(crate) struct IfBody {
+    /// Something besides rewrite directives: the block is an anonymous
+    /// location (#137).
+    settings: bool,
+    /// `proxy_pass` of its own.
+    own_handler: bool,
+    /// `root` of its own.
+    own_root: bool,
+}
+
+/// A location-level `if (…) { … }` (#137): its rewrite directives, and,
+/// when the block sets anything else, the anonymous location the request
+/// switches to when the condition holds, as nginx's `ngx_http_rewrite_if`
+/// parses the block with location context.
+fn parse_location_if(args: &[String], lx: &mut Lexer) -> Result<RewriteOp, Error> {
+    let guard = parse_if_guard(args)?;
+    let mut sink = Vec::with_capacity(1);
+    let mut info = IfBody::default();
+    let spec = LocationSpec {
+        mode: MatchMode::Prefix,
+        pattern: String::new(),
+        noregex: false,
+    };
+    parse_location_block(
+        spec,
+        lx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &AccessConf::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &mut sink,
+        Some(&mut info),
+    )?;
+    let mut location = sink.pop().expect("an if block makes one location");
+    let body = std::mem::take(&mut location.rewrite_ops);
+    let location = info.settings.then(|| IfLocation::Parsed {
+        location: Box::new(location),
+        own_handler: info.own_handler,
+        own_root: info.own_root,
+    });
+    Ok(RewriteOp::If {
+        guard,
+        body,
+        location,
+    })
+}
+
+/// Give the anonymous locations of `ops`' `if` blocks what they inherit
+/// from `parent` (nested ones from their enclosing block): everything
+/// `inherit_from_parent` passes on, the parent's root unless the block
+/// sets `root`, and the parent's content handler unless the block has a
+/// `proxy_pass`, or a `root` for what would be a static handler: nginx
+/// keeps the location's handler when the `if` configuration sets none
+/// (`ngx_http_update_location_config`). The parent's own `return` runs
+/// after the `if` in the same code array, so it is the handler whatever
+/// the block sets. With a `proxy_pass` of its own, the pattern starts with
+/// `@`: like a named location, there is no location prefix for a
+/// `proxy_pass` URI to replace (nginx: "cannot have URI part … inside
+/// "if" statement").
+fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
+    for op in ops {
+        let RewriteOp::If { body, location, .. } = op else {
+            continue;
+        };
+        match location {
+            Some(IfLocation::Parsed {
+                location,
+                own_handler,
+                own_root,
+            }) => {
+                inherit_from_parent(location, parent);
+                location.mode = parent.mode;
+                if !*own_root {
+                    location.document_root = parent.document_root.clone();
+                    location.alias_prefix_override = parent.alias_prefix_override.clone();
+                    location.inherits_root = parent.inherits_root;
+                }
+                let static_parent =
+                    !matches!(parent.handler, Handler::Proxy(_) | Handler::StubStatus);
+                let keeps_own =
+                    !parent.explicit_return && (*own_handler || (*own_root && static_parent));
+                if keeps_own && *own_handler {
+                    location.pattern = format!("@if:{}", parent.pattern);
+                } else {
+                    location.pattern = parent.pattern.clone();
+                }
+                if !keeps_own {
+                    location.handler = parent.handler.clone();
+                    location.explicit_return = parent.explicit_return;
+                }
+                let snapshot = (**location).clone();
+                merge_if_locations(body, &snapshot);
+            }
+            _ => merge_if_locations(body, parent),
+        }
+    }
+}
+
 /// Parse one `location {}` block and push the resulting `Location` into
 /// `sink`. Nested `location` blocks inside this one get flattened into the
 /// same sink — nginx's own matcher (`ngx_http_core_find_static_location`)
 /// descends into children only after the parent prefix matches, but since
 /// all sibling/child patterns live in the same absolute URI space, a
 /// flattened peer list + longest-prefix win produces the same routing
-/// decision for the cases our tests exercise. Directives on the parent
-/// (root/alias/add_header/error_page/return) do not cascade onto nested
-/// children beyond what the explicit inherited arguments propagate — that's
-/// a deliberate scope limit; if a test needs fuller nested inheritance,
-/// revisit here.
+/// decision for the cases our tests exercise. The parent's settings reach
+/// them through `inherit_from_parent` when the parent's block ends (#106).
 pub(crate) fn parse_location_block(
     spec: LocationSpec,
     lx: &mut Lexer,
@@ -292,12 +497,14 @@ pub(crate) fn parse_location_block(
     inherited_auth_delay_ms: Option<u64>,
     inherited_access: &AccessConf,
     inherited_client_max_body_size: Option<u64>,
+    inherited_client_body_buffer_size: Option<u64>,
     inherited_post_action: Option<String>,
     inherited_expires: Option<ExpiresDirective>,
     inherited_sendfile: Option<bool>,
     inherited_client_body_temp_path: Option<TempPath>,
     inherited_disable_symlinks: Option<DisableSymlinks>,
     sink: &mut Vec<Location>,
+    mut if_body: Option<&mut IfBody>,
 ) -> Result<(), Error> {
     let mut ret: Option<(u16, Vec<ValuePart>)> = None;
     let mut rewrite_ops: Vec<RewriteOp> = Vec::new();
@@ -339,16 +546,22 @@ pub(crate) fn parse_location_block(
     let mut access = AccessConf::default();
     let mut limit_except: Option<LimitExcept> = None;
     let mut client_max_body_size: Option<u64> = None;
+    let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_in_file_only: Option<ClientBodyInFileOnly> = None;
     let mut post_action: Option<String> = None;
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
+    let mut stub_status = false;
     let mut proxy = ProxyConf::default();
+    let mut gzip = GzipConf::default();
+    let mut limit_req = LimitReqConf::default();
+    let mut limit_conn = LimitConnConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
+    let mut client_timeouts = ClientTimeouts::default();
     let mut limit_rate_after: Option<Vec<ValuePart>> = None;
     // Children parsed inside this block — appended to `sink` after the
     // parent so the parent's entry appears first in declaration order.
@@ -356,9 +569,34 @@ pub(crate) fn parse_location_block(
 
     loop {
         let (args, term) = lx.read_directive()?;
+        if let (Some(info), Some(name)) = (if_body.as_deref_mut(), args.first()) {
+            match name.as_str() {
+                "set" | "rewrite" | "break" | "return" | "if" => {}
+                // What nginx allows in an `if` in a location
+                // (`NGX_HTTP_LIF_CONF`) and ruxen implements.
+                "proxy_pass" | "root" | "add_header" | "add_trailer" | "error_page"
+                | "access_log" | "expires" | "gzip" | "limit_rate" | "limit_rate_after"
+                | "post_action" | "sendfile" => info.settings = true,
+                // Accepted and ignored anywhere, as they were in `if`.
+                n if term == Terminator::Semi && is_ignored_stmt(n) => {
+                    check_ignored_args(lx, &args)?;
+                    continue;
+                }
+                // nginx: "… directive is not allowed here". While
+                // collecting, `unknown` skips a block itself.
+                _ => {
+                    compat::unknown(lx, &args, &term, "if")?;
+                    continue;
+                }
+            }
+        }
         if args.is_empty() {
             return match term {
                 Terminator::BlockClose => {
+                    if let Some(info) = if_body.as_deref_mut() {
+                        info.own_handler = proxy_pass.is_some();
+                        info.own_root = local_path_mapping.is_some();
+                    }
                     // `return` short-circuits the rewrite phase in nginx, so
                     // it wins over `root` / `alias` / `proxy_pass` if both
                     // are set. `proxy_pass` wins over `root`/`alias`
@@ -368,23 +606,21 @@ pub(crate) fn parse_location_block(
                     let document_root = root
                         .clone()
                         .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
+                    let explicit_return = ret.is_some();
                     let handler = if let Some((status, body)) = ret {
                         Handler::Return { status, body }
+                    } else if stub_status {
+                        Handler::StubStatus
                     } else if let Some(pp) = proxy_pass {
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
                         Handler::Root { path, mapping }
-                    } else if !rewrite_ops.is_empty() {
-                        // Location-level rewrite directives are valid even
-                        // without an explicit content handler. Match nginx by
-                        // falling through to the default 404 content path.
-                        Handler::Return {
-                            status: 404,
-                            body: Vec::new(),
-                        }
                     } else {
                         // nginx's default `root`: `html` under the prefix
-                        // (ruxen's working directory, set by `-p`).
+                        // (ruxen's working directory, set by `-p`), or the
+                        // server's, set below the location
+                        // (`inherits_root`). Rewrite directives don't change
+                        // the static handler (#364).
                         Handler::Root {
                             path: PathBuf::from("html"),
                             mapping: PathMapping::Root,
@@ -410,6 +646,8 @@ pub(crate) fn parse_location_block(
                     let effective_access = access.inherit(inherited_access);
                     let effective_client_max_body_size =
                         client_max_body_size.or(inherited_client_max_body_size);
+                    let effective_client_body_buffer_size =
+                        client_body_buffer_size.or(inherited_client_body_buffer_size);
                     let effective_post_action = post_action.or(inherited_post_action);
                     let effective_expires = expires.or(inherited_expires);
                     let effective_sendfile = sendfile.or(inherited_sendfile);
@@ -419,7 +657,7 @@ pub(crate) fn parse_location_block(
                     let effective_disable_symlinks = disable_symlinks
                         .clone()
                         .or_else(|| inherited_disable_symlinks.clone());
-                    sink.push(Location {
+                    let location = Location {
                         mode: spec.mode,
                         pattern: spec.pattern,
                         noregex: spec.noregex,
@@ -450,6 +688,7 @@ pub(crate) fn parse_location_block(
                         access: effective_access,
                         limit_except,
                         client_max_body_size: effective_client_max_body_size,
+                        client_body_buffer_size: effective_client_body_buffer_size,
                         sendfile: effective_sendfile,
                         document_root,
                         client_body_temp_path: effective_client_body_temp_path,
@@ -460,10 +699,29 @@ pub(crate) fn parse_location_block(
                         post_action: effective_post_action,
                         expires: effective_expires,
                         proxy,
+                        gzip,
+                        limit_req,
+                        limit_conn,
                         chunked_transfer_encoding,
+                        client_timeouts,
                         alias_prefix_override,
                         inherits_root,
-                    });
+                        explicit_return,
+                    };
+                    // The anonymous locations of its `if` blocks (#137).
+                    let mut location = location;
+                    if if_body.is_none() && has_if_locations(&location.rewrite_ops) {
+                        let snapshot = location.clone();
+                        merge_if_locations(&mut location.rewrite_ops, &snapshot);
+                    }
+                    // nginx merges each nested location with its parent's
+                    // final configuration (ngx_http_merge_locations), so a
+                    // directive after the nested block counts too. The
+                    // children already hold their own descendants' merge.
+                    for child in &mut children {
+                        inherit_from_parent(child, &location);
+                    }
+                    sink.push(location);
                     sink.extend(children);
                     Ok(())
                 }
@@ -488,7 +746,12 @@ pub(crate) fn parse_location_block(
                 rewrite_ops.push(RewriteOp::Break);
             }
             ("if", Terminator::BlockOpen) => {
-                rewrite_ops.push(parse_if_op(&args[1..], lx)?);
+                rewrite_ops.push(parse_location_if(&args[1..], lx)?);
+            }
+            // In an `if` block, `return` is one of its rewrite directives.
+            ("return", Terminator::Semi) if if_body.is_some() => {
+                let (status, body) = parse_return_args(&args[1..])?;
+                rewrite_ops.push(RewriteOp::Return { status, body });
             }
             ("return", Terminator::Semi) => {
                 if ret.is_some() {
@@ -620,7 +883,7 @@ pub(crate) fn parse_location_block(
             }
             (
                 "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
-                | "real_ip_recursive",
+                | "auth_request" | "auth_request_set" | "real_ip_recursive",
                 Terminator::Semi,
             ) => {
                 parse_access_directive(&mut access, &args, lx)?;
@@ -630,6 +893,12 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("limit_except"));
                 }
                 limit_except = Some(parse_limit_except_block(&args, lx)?);
+            }
+            ("client_body_buffer_size", Terminator::Semi) => {
+                if client_body_buffer_size.is_some() {
+                    return Err(Error::Duplicate("client_body_buffer_size"));
+                }
+                client_body_buffer_size = Some(parse_client_body_buffer_size_args(&args[1..])?);
             }
             ("client_max_body_size", Terminator::Semi) => {
                 if client_max_body_size.is_some() {
@@ -711,6 +980,16 @@ pub(crate) fn parse_location_block(
                 }
                 try_files = Some(parse_try_files(&args[1..])?);
             }
+            // Location settings in nginx; `client_header_timeout` is not.
+            (name @ ("client_body_timeout" | "send_timeout"), Terminator::Semi) => {
+                client_timeouts.parse(name, &args)?;
+            }
+            // An optional argument is ignored, as nginx does for old
+            // configurations (`stub_status on;`).
+            ("stub_status", Terminator::Semi) if args.len() <= 2 => {
+                stub_status = true;
+                crate::config::values::note_stats_used();
+            }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {
                     return Err(Error::Duplicate("proxy_pass"));
@@ -718,6 +997,9 @@ pub(crate) fn parse_location_block(
                 proxy_pass = Some(parse_proxy_pass_arg(&args[1..])?);
             }
             (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
+            (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
+            (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
+            (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,
             ("limit_rate", Terminator::Semi) => {
                 if limit_rate.is_some() {
                     return Err(Error::Duplicate("limit_rate"));
@@ -776,6 +1058,8 @@ pub(crate) fn parse_location_block(
                 let pass_access = access.inherit(inherited_access);
                 let pass_client_max_body_size =
                     client_max_body_size.or(inherited_client_max_body_size);
+                let pass_client_body_buffer_size =
+                    client_body_buffer_size.or(inherited_client_body_buffer_size);
                 let pass_post_action = post_action.clone().or(inherited_post_action.clone());
                 let pass_expires = expires.clone().or(inherited_expires.clone());
                 let pass_sendfile = sendfile.or(inherited_sendfile);
@@ -817,12 +1101,14 @@ pub(crate) fn parse_location_block(
                     pass_auth_delay_ms,
                     &pass_access,
                     pass_client_max_body_size,
+                    pass_client_body_buffer_size,
                     pass_post_action,
                     pass_expires,
                     pass_sendfile,
                     pass_client_body_temp_path,
                     pass_disable_symlinks,
                     &mut children,
+                    None,
                 )?;
             }
             (
@@ -860,6 +1146,8 @@ pub(crate) fn parse_location_block(
                 | "set_real_ip_from"
                 | "real_ip_header"
                 | "real_ip_recursive"
+                | "auth_request"
+                | "auth_request_set"
                 | "limit_except"
                 | "client_max_body_size"
                 | "client_body_temp_path"
@@ -894,13 +1182,13 @@ pub(crate) fn parse_location_block(
                     ctx: "location",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
-            (other, _) => {
-                return Err(Error::UnknownDirective {
-                    name: other.into(),
-                    ctx: "location",
-                });
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
+            (_, _) => {
+                compat::unknown(lx, &args, &term, "location")?;
             }
         }
     }

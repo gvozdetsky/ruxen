@@ -44,6 +44,11 @@ pub enum Error {
     /// `$name` that is neither a variable nginx knows nor one the config
     /// defines (`set`, `map`, `split_clients`, a named regex capture).
     UnknownVariable(String),
+    /// Any of the above with where it happened, nginx's ` in file:line`.
+    At {
+        error: Box<Error>,
+        position: String,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -54,7 +59,7 @@ impl std::fmt::Display for Error {
             Error::UnclosedBlock => write!(f, "unclosed block"),
             Error::UnexpectedToken(s) => write!(f, "unexpected token: {s}"),
             Error::UnknownDirective { name, ctx } => {
-                write!(f, "unknown directive `{name}` in {ctx}")
+                write!(f, "unknown directive `{name}` {}", in_block(ctx))
             }
             Error::WrongTerminator { name, ctx } => {
                 write!(f, "directive `{name}` in {ctx} has wrong terminator")
@@ -76,6 +81,7 @@ impl std::fmt::Display for Error {
                 "\"{name}\" is not supported yet, and ignoring it is unsafe: {consequence}"
             ),
             Error::UnknownVariable(name) => write!(f, "unknown \"{name}\" variable"),
+            Error::At { error, position } => write!(f, "{error} in {position}"),
         }
     }
 }
@@ -88,4 +94,13 @@ pub(crate) enum Terminator {
     BlockOpen,
     BlockClose,
     Eof,
+}
+
+/// Where a directive was, for messages: `in a server block`, `at the top
+/// level`. A position may follow (` in /etc/nginx/nginx.conf:12`).
+pub(crate) fn in_block(ctx: &str) -> String {
+    match ctx {
+        "top-level" => "at the top level".to_string(),
+        ctx => format!("in a {ctx} block"),
+    }
 }

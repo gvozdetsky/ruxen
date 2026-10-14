@@ -217,6 +217,24 @@ fn body(resp: &[u8]) -> &[u8] {
         .unwrap_or(&[])
 }
 
+/// A chunked body, decoded (no extensions or trailers in these tests).
+fn dechunked(mut body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let nl = body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("size line");
+        let size = usize::from_str_radix(std::str::from_utf8(&body[..nl]).unwrap(), 16).unwrap();
+        body = &body[nl + 2..];
+        if size == 0 {
+            return out;
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+}
+
 fn has_header(resp: &[u8], name: &str) -> bool {
     let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n");
     let head = match head_end {
@@ -438,10 +456,10 @@ http {
 /// reserved up front and aborted the process on allocation.
 #[test]
 fn m40_malformed_upstream_framing_is_502_and_server_survives() {
-    let responses: [&[u8]; 2] = [
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 1000000000000\r\n\r\nabc",
-    ];
+    // A `Content-Length` too large to buffer is relayed, not refused
+    // (#88, `m72_upstream_body_cap`).
+    let responses: [&[u8]; 1] =
+        [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n"];
     for response in responses {
         let backend = Backend::spawn(response.to_vec());
         let conf = format!(
@@ -575,10 +593,37 @@ fn m40_close_delimited_upstream_body_is_framed_for_keepalive_clients() {
     let (first, second) = text
         .split_once("body-until-eof")
         .unwrap_or_else(|| panic!("no proxied body in: {text}"));
+    // Relayed as it comes (#88): chunked, as nginx frames a body of
+    // unknown length for an HTTP/1.1 client.
     assert!(first.starts_with("HTTP/1.1 200"), "{text}");
-    assert!(first.contains("\r\nContent-Length: 14\r\n"), "{text}");
-    assert!(second.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(
+        first.contains("\r\nTransfer-Encoding: chunked\r\n"),
+        "{text}"
+    );
+    assert!(first.ends_with("\r\n\r\ne\r\n"), "{text}");
+    assert!(second.starts_with("\r\n0\r\n\r\nHTTP/1.1 200"), "{text}");
     assert!(second.ends_with("alive"), "{text}");
+}
+
+/// A status line followed directly by the empty line, with no header
+/// fields, is a valid response (#323; proxy_merge_headers.t). Its CRLF
+/// is part of the head's terminator, which used to make it a 502.
+#[test]
+fn m40_status_line_without_header_fields() {
+    let cases: [(&[u8], &str); 3] = [
+        (b"HTTP/1.0 200 OK\r\n\r\nbare", "bare"),
+        (b"HTTP/1.0 200 OK\r\n\r\n", ""),
+        (b"HTTP/1.0 200 OK\n\nlf", "lf"),
+    ];
+    for (response, want) in cases {
+        let backend = Backend::spawn(response.to_vec());
+        let (_guard, port, _dir) = spawn_ruxen(&proxy_conf(backend.addr.port()));
+        let resp = http_get_close(port, "/up/");
+        let text = String::from_utf8_lossy(&resp);
+        assert_eq!(status_code(&resp), 200, "{text}");
+        // Close-delimited, so relayed chunked (#88).
+        assert_eq!(dechunked(body(&resp)), want.as_bytes(), "{text}");
+    }
 }
 
 /// nginx's proxy hides the upstream's Server, Date, X-Pad and X-Accel-*
@@ -798,4 +843,88 @@ http {{
     let h = head("/own/");
     assert!(!h.contains("X-Keep"), "{h}");
     assert!(h.contains("\r\nX-Hide: secret"), "{h}");
+}
+
+/// proxy_pass_header Date: the upstream's Date goes out as it is, and
+/// none at all when the upstream sent none (#360), as in nginx, where an
+/// empty passed Date keeps the header filter from writing its own.
+#[test]
+fn m40_proxy_pass_header_date() {
+    let dated = Backend::spawn(
+        b"HTTP/1.0 200 OK\r\nDate: Mon, 01 Jan 2001 00:00:00 GMT\r\nContent-Length: 2\r\n\r\nok"
+            .to_vec(),
+    );
+    let undated = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location /dated/ {{ proxy_pass http://127.0.0.1:{d}; proxy_pass_header Date; }}
+        location /undated/ {{ proxy_pass http://127.0.0.1:{u}; proxy_pass_header Date; }}
+        location /hidden/ {{ proxy_pass http://127.0.0.1:{d}; }}
+        location /down/ {{
+            proxy_pass http://127.0.0.1:1;
+            proxy_pass_header Date;
+            add_header X-A a;
+        }}
+    }}
+}}
+"#,
+        d = dated.addr.port(),
+        u = undated.addr.port()
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let dates = |path: &str| {
+        let resp = String::from_utf8_lossy(&http_get_close(port, path)).into_owned();
+        let head = resp.split("\r\n\r\n").next().unwrap().to_string();
+        head.lines()
+            .filter(|l| l.starts_with("Date:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(dates("/dated/"), ["Date: Mon, 01 Jan 2001 00:00:00 GMT"]);
+    assert!(dates("/undated/").is_empty());
+    let own = dates("/hidden/");
+    assert_eq!(own.len(), 1);
+    assert_ne!(own[0], "Date: Mon, 01 Jan 2001 00:00:00 GMT");
+    // The proxy's own 502 is not the upstream's: it gets a current Date,
+    // not the one from when its page was built at startup.
+    let first = dates("/down/");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = dates("/down/");
+    assert_eq!((first.len(), second.len()), (1, 1));
+    assert_ne!(first, second);
+}
+
+/// `$document_root` / `$request_filename` in a proxied response's
+/// `add_header`: the location's root, as for any other response (#363).
+#[test]
+fn m40_proxy_add_header_document_root() {
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location /p {{
+            root /srv/www;
+            proxy_pass http://127.0.0.1:{p};
+            add_header X-Root $document_root;
+            add_header X-File $request_filename;
+            add_header X-Uri $uri;
+        }}
+    }}
+}}
+"#,
+        p = backend.addr.port()
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let resp = String::from_utf8_lossy(&http_get_close(port, "/p/a")).into_owned();
+    assert!(resp.contains("\r\nX-Root: /srv/www\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-File: /srv/www/p/a\r\n"), "{resp}");
+    // The current URI, normalized, not the request's raw path (#373).
+    let resp = String::from_utf8_lossy(&http_get_close(port, "/p/%61//b?x=1")).into_owned();
+    assert!(resp.contains("\r\nX-Uri: /p/a/b\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-File: /srv/www/p/a/b\r\n"), "{resp}");
 }

@@ -62,9 +62,15 @@ pub struct ConnInfo {
     pub server_addr: std::borrow::Cow<'static, [u8]>,
     /// The client's address, which `allow` / `deny` match.
     pub peer_ip: IpAddr,
+    /// The client came over a `listen unix:` socket (#263): `peer_ip` is a
+    /// placeholder, and only `all` / `unix:` rules match it.
+    pub peer_unix: bool,
     /// The connection's own peer, once the realip module replaced
     /// `peer_ip` for a request (`$realip_remote_addr`, `$realip_remote_port`).
     pub realip: Option<Box<RealIpPeer>>,
+    /// Plain HTTP on an `ssl` port (#384): the request is refused with
+    /// nginx's 497, sent as 400 unless `error_page 497` says otherwise.
+    pub plain_http: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -80,9 +86,51 @@ impl ConnInfo {
         proxy_protocol: None,
         server_addr: std::borrow::Cow::Borrowed(b""),
         peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        peer_unix: false,
         realip: None,
+        plain_http: false,
     };
 }
+
+/// An `auth_request` subrequest to run before the request goes on (#358).
+#[derive(Debug, Clone)]
+pub struct AuthPending {
+    pub uri: &'static [u8],
+    pub sets: &'static [(&'static [u8], &'static [crate::worker::PreparedValuePart])],
+    /// What limit_req and limit_conn noted on this pass: the pass after
+    /// the subrequest doesn't count the request again.
+    pub limit_req_status: u8,
+    pub limit_conn_status: u8,
+}
+
+/// A subrequest's outcome, for the passes that follow it.
+#[derive(Debug, Default, Clone)]
+pub struct AuthResume {
+    pub status: u16,
+    pub www_authenticate: Vec<Vec<u8>>,
+    /// `auth_request_set` values, rendered in the subrequest's context.
+    pub vars: Vec<(&'static [u8], Vec<u8>)>,
+    pub limit_req_status: u8,
+    pub limit_conn_status: u8,
+}
+
+thread_local! {
+    /// The outcomes so far, by auth_request URI: processing starts over
+    /// after each subrequest, and a location after an internal redirect
+    /// may need another one (`auth_request_set.t`, "set on second auth").
+    static AUTH_RESUME: std::cell::RefCell<Vec<(&'static [u8], AuthResume)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The worker hands the next `process` call the subrequests' outcomes,
+/// and takes them back after (an empty list), so no other request sees
+/// them.
+pub(crate) fn resume_auth_request(resume: Vec<(&'static [u8], AuthResume)>) {
+    AUTH_RESUME.with(|r| *r.borrow_mut() = resume);
+}
+
+/// The body of a request that has none.
+pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
 
 /// Per-request inputs the pipeline needs from the parser + connection.
 /// Narrow on purpose — each field added here is a new dependency between
@@ -161,7 +209,8 @@ pub struct RequestCtx<'a> {
     /// request had no body or when `proxy_pass_request_body off;` is set.
     /// Both Content-Length and chunked client bodies arrive here decoded
     /// as plain bytes; proxy forwarding recomputes `Content-Length`.
-    pub body: &'a [u8],
+    /// Shared (`Bytes`) so the proxy can send it without a copy (#289).
+    pub body: &'a bytes::Bytes,
     /// Length of the request body: `body.len()`, unless the body was too
     /// large to keep in memory and is only in `body_file` (then `body` is
     /// empty, and `$request_body` too, as in nginx).
@@ -235,6 +284,21 @@ pub struct ProcessMeta {
     /// access_logs` — so location-scope `access_log` directives fire
     /// against the right format/path for the request that landed.
     pub access_logs: &'static [crate::worker::PreparedAccessLog],
+    /// `limit_req` holds the request this long before its content handler
+    /// (#94).
+    pub limit_req_delay_ms: u64,
+    /// The counts `limit_conn` took for this request, given back when the
+    /// last copy of the meta goes, after the response is written (#95).
+    pub limit_conn_held: Option<std::rc::Rc<crate::worker::limit_conn::Held>>,
+    /// `auth_request` needs its subrequest (#358): the worker runs it and
+    /// processes the request again with the result (`AuthResume`).
+    pub auth_request: Option<Box<AuthPending>>,
+    /// The location's root, which an access_log path with variables
+    /// checks before it writes (#303).
+    pub doc_root: Option<&'static crate::worker::DocRoot>,
+    /// The location's `send_timeout` (and `client_body_timeout`) for this
+    /// request; `None` before routing (#147).
+    pub timeouts: Option<&'static crate::worker::PreparedClientTimeouts>,
     /// Authenticated user from HTTP Basic auth, for `$remote_user`.
     pub remote_user: Option<Vec<u8>>,
     /// The client address the realip module set, for the log lines the
@@ -275,6 +339,12 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// A proxied response under `proxy_pass_header Date`: its `Date` is
+    /// the upstream's, or there is none, and the worker doesn't stamp one
+    /// (#360).
+    pub keep_upstream_date: bool,
+    /// The matched location's gzip settings; `None` when gzip is off.
+    pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// `limit_rate` / `limit_rate_after` for this response. Boxed: `None`
     /// (one word) in the common case.
     pub limit_rate: Option<Box<ResponseLimit>>,
@@ -282,6 +352,8 @@ pub struct ProcessMeta {
     /// The worker runs this after the client response is written and
     /// suppresses its output.
     pub post_action: Option<&'static [u8]>,
+    /// `$upstream_cache_status` (#233).
+    pub upstream_cache_status: Option<crate::proxy_cache::CacheStatus>,
     /// One entry per upstream attempt (`$upstream_addr` and friends), set
     /// by `settle_proxy_response`. Empty when the request wasn't proxied.
     pub upstream_states: Vec<crate::proxy::UpstreamState>,
@@ -309,6 +381,11 @@ impl Default for ProcessMeta {
             log: LogMeta::default(),
             server_port: 0,
             access_logs: &[],
+            limit_req_delay_ms: 0,
+            limit_conn_held: None,
+            auth_request: None,
+            doc_root: None,
+            timeouts: None,
             remote_user: None,
             realip: None,
             proxy_add_headers: &[],
@@ -320,9 +397,12 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            keep_upstream_date: false,
+            gzip: None,
             limit_rate: None,
             post_action: None,
             upstream_states: Vec::new(),
+            upstream_cache_status: None,
             upstream_headers: Vec::new(),
             proxy_expires: crate::worker::PreparedExpires::Off,
             invalid_uri: false,
@@ -359,6 +439,9 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
 /// `error_page` for the status if it has one (nginx's special response
 /// handler runs with the server's configuration here), else `response`.
 /// `close` ends the connection afterwards, as nginx does for 400 and 501.
+/// `code` is the status `error_page` is looked up by, when it isn't the
+/// response's own (497).
+#[allow(clippy::too_many_arguments)]
 fn refuse(
     http: &'static PreparedHttp,
     req: &RequestCtx<'_>,
@@ -367,14 +450,21 @@ fn refuse(
     response: Response,
     close: bool,
     in_error_page: bool,
+    code: Option<u16>,
 ) -> (Response, ProcessMeta) {
-    let (response, mut meta) =
-        match crate::worker::finish_server_response(http, req, server, response, in_error_page) {
-            Response::Reroute(reroute) => {
-                process_with_meta_inner(http, req, url_scratch, Some(reroute))
-            }
-            response => (response, refused_meta(server, false)),
-        };
+    let (response, mut meta) = match crate::worker::finish_server_response(
+        http,
+        req,
+        server,
+        response,
+        in_error_page,
+        code,
+    ) {
+        Response::Reroute(reroute) => {
+            process_with_meta_inner(http, req, url_scratch, Some(reroute))
+        }
+        response => (response, refused_meta(server, false)),
+    };
     if close {
         meta.keepalive.allow = false;
     }
@@ -426,7 +516,14 @@ pub enum Response {
     /// `proxy::run_proxy(plan)` to perform the upstream connect/send/recv,
     /// then re-enters the existing write path with `Owned` / `Prebuilt`
     /// bytes. Mirrors how `File` carries an fd that the worker streams.
-    Proxy(crate::proxy::ProxyPlan),
+    Proxy(Box<crate::proxy::ProxyPlan>),
+    /// An upstream 101 to a client that asked to upgrade: the head to
+    /// send, then the connection becomes a tunnel (#87).
+    Upgrade(Box<crate::proxy::Upgraded>),
+    /// An upstream response whose body is relayed as it arrives (#88): the
+    /// head is filtered like `Owned`, then the worker writes it and relays
+    /// the body.
+    ProxyStream(Box<crate::proxy_stream::ProxyStream>),
 }
 
 pub struct FileBody {
@@ -568,27 +665,43 @@ fn process_with_meta_inner(
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
         let server = &listen.servers[listen.default_server];
         let response = Response::Prebuilt(http.bad_request.pick(req.method));
-        return refuse(http, req, url_scratch, server, response, true, false);
+        return refuse(http, req, url_scratch, server, response, true, false, None);
     }
 
     let (server, regex_captures) = find_config(listen, req.host, req.sni);
 
     if refusing {
         if let Some(status) = req.refuse {
-            let canned = if status == 501 {
-                &http.not_implemented
-            } else {
-                &http.bad_request
+            let canned = match status {
+                501 => &http.not_implemented,
+                // nginx's 497: plain HTTP on an `ssl` port, sent as 400
+                // unless `error_page 497` takes it (#384).
+                497 => &http.plain_http,
+                _ => &http.bad_request,
             };
             let response = Response::Prebuilt(canned.pick(req.method));
-            return refuse(http, req, url_scratch, server, response, true, false);
+            return refuse(
+                http,
+                req,
+                url_scratch,
+                server,
+                response,
+                true,
+                false,
+                Some(status),
+            );
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if req.method == Method::Trace
+                && crate::worker::test_panic() == crate::worker::TestPanic::Trace
+            {
+                panic!("{}=trace", crate::worker::TEST_PANIC_ENV);
+            }
             let response = Response::Owned(crate::file::method_not_allowed(
                 req.method,
                 server.server_header,
             ));
-            return refuse(http, req, url_scratch, server, response, false, false);
+            return refuse(http, req, url_scratch, server, response, false, false, None);
         }
     }
     let mut named_target: Option<Vec<u8>> = None;
@@ -744,6 +857,7 @@ fn process_with_meta_inner(
                     response,
                     false,
                     in_error_page,
+                    None,
                 );
                 if refused.realip.is_none() {
                     refused.realip = meta.realip.take();
@@ -767,15 +881,21 @@ fn process_with_meta_inner(
                         meta.access_logs = server.access_logs;
                         meta.post_action = server.post_action;
                         meta.remote_user = None;
+                        let auth_resume = take_auth_resume(&server.access, &mut rewrite_state);
                         match run_access_control(
                             http,
                             req,
                             &server.access,
                             server.server_header,
                             &meta,
+                            auth_resume.as_ref(),
                         ) {
                             AccessControl::Allow { remote_user } => {
                                 meta.remote_user = remote_user;
+                            }
+                            AccessControl::Subrequest => {
+                                meta.auth_request = auth_pending(&server.access, &rewrite_state);
+                                return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
                             }
                             AccessControl::Deny { response, delay_ms } => {
                                 // The server's error_page applies.
@@ -786,6 +906,7 @@ fn process_with_meta_inner(
                                     server,
                                     response,
                                     in_error_page,
+                                    None,
                                 ) {
                                     Response::Reroute(reroute) => process_with_meta_inner(
                                         http,
@@ -802,22 +923,7 @@ fn process_with_meta_inner(
                 },
             }
         };
-        rewrite_state.doc_root = Some(loc.doc_root);
-        meta.keepalive = KeepaliveMeta {
-            allow: loc.keepalive.allow,
-            idle_timeout_ms: loc.keepalive.idle_timeout_ms,
-            header_timeout_secs: loc.keepalive.header_timeout_secs,
-            max_requests: loc.keepalive.max_requests,
-            max_time_ms: loc.keepalive.max_time_ms,
-            disable_msie6: loc.keepalive.disable_msie6,
-            disable_safari: loc.keepalive.disable_safari,
-        };
-        meta.access_logs = loc.access_logs;
-        meta.post_action = loc.post_action;
-        meta.log = LogMeta {
-            error_logs: loc.error_logs,
-            log_not_found: loc.log_not_found,
-        };
+        apply_location_meta(&loc, &mut meta, &mut rewrite_state);
         if loc.internal && !internal_request {
             // ngx_http_core_find_config_phase: an `internal` location is
             // not found for an external request.
@@ -837,6 +943,14 @@ fn process_with_meta_inner(
         {
             loc = loc.limited(le);
         }
+        rewrite_state.if_location = None;
+        // A response from the rewrite program (`return` in an `if`, a
+        // `rewrite … redirect`) goes on to the location's response
+        // filters, `error_page` and `add_header`, as nginx finalizes it
+        // like a handler's (#362).
+        let mut rewrite_response = None;
+        // A `return` with text is sent as it is: no `error_page` for it.
+        let mut takes_error_page = true;
         let rewrite_broke = match run_rewrite_program(
             http,
             server,
@@ -850,8 +964,19 @@ fn process_with_meta_inner(
             RewriteOutcome::Continue => false,
             RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
-            RewriteOutcome::Respond(response) => return (response, meta),
+            RewriteOutcome::Respond(response, finalized) => {
+                rewrite_response = Some(response);
+                takes_error_page = finalized;
+                false
+            }
         };
+        // An `if` block with settings of its own held: the request goes on
+        // with its anonymous location (#137), as nginx's
+        // `ngx_http_script_if_code` switches `r->loc_conf`; a response
+        // from inside the block too (its `access_log`, `error_page`, …).
+        if let Some(n) = rewrite_state.if_location {
+            loc = switch_to_if_location(server, n, &mut meta, &mut rewrite_state);
+        }
         // Access-control phase (allow/deny, auth_basic): runs after
         // rewrite and before content dispatch. A top-level `return` is a
         // rewrite-module directive in nginx, so it answers in the rewrite
@@ -859,8 +984,9 @@ fn process_with_meta_inner(
         // ended the rewrite program first, in which case nginx never reaches
         // the `return` and does run access control.
         meta.remote_user = None;
-        let answered_in_rewrite_phase =
-            !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
+        let answered_in_rewrite_phase = rewrite_response.is_some()
+            || (!rewrite_broke
+                && matches!(loc.handler, crate::worker::PreparedHandler::Return(..)));
         // The realip module's pre-access handler, with the location's
         // settings, unless the post-read one already set the address.
         if !answered_in_rewrite_phase
@@ -873,15 +999,97 @@ fn process_with_meta_inner(
             req_now = Some(with_real_ip(req, state));
         }
         let req = req_now.as_ref().unwrap_or(req_in);
-        let mut denied = None;
-        if !answered_in_rewrite_phase {
-            match run_access_control(http, req, loc.access, loc.server_header, &meta) {
+        // The access phase doesn't run for it: it is finished like a
+        // denial, with the location's filters.
+        let mut denied = rewrite_response;
+        // After an auth_request subrequest (#358): its outcome, and what
+        // the first pass noted, so limit_req and limit_conn don't count
+        // the request again.
+        let auth_resume = take_auth_resume(loc.access, &mut rewrite_state);
+        // `auth_request_set $args …`: the variable's setter replaces the
+        // request's arguments (auth_request_set.t, "variable with
+        // set_handler").
+        if let Some(args) = auth_resume
+            .as_ref()
+            .and_then(|r| r.vars.iter().find(|(name, _)| *name == b"args"))
+        {
+            current_args = Some(args.1.clone());
+        }
+        // The limit_req module's pre-access handler (#94), once per
+        // request (nginx's `r->main->limit_req_status`); not again on the
+        // way to an error page.
+        if !answered_in_rewrite_phase
+            && let Some(lr) = loc.limit_req
+            && rewrite_state.limit_req_status == 0
+            && !in_error_page
+        {
+            let (rejected, delay_ms) = crate::worker::limit_req::run(
+                http,
+                server,
+                req,
+                url_scratch,
+                current_args.as_deref(),
+                &mut rewrite_state,
+                regex_captures.as_ref(),
+                lr,
+                &meta.log,
+                meta.server_name,
+                loc.server_header,
+            );
+            denied = rejected;
+            if delay_ms > 0 {
+                // The worker waits, then processes the request again
+                // (`limit_req::resume_after_delay`): nothing past this
+                // point runs now.
+                meta.limit_req_delay_ms = delay_ms;
+                return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+            }
+        }
+        // limit_conn's handler, after limit_req's as nginx runs them (#95),
+        // once per request.
+        if !answered_in_rewrite_phase
+            && denied.is_none()
+            && let Some(lc) = loc.limit_conn
+            && rewrite_state.limit_conn_status == 0
+            && !in_error_page
+        {
+            let (rejected, held) = crate::worker::limit_conn::run(
+                http,
+                server,
+                req,
+                url_scratch,
+                current_args.as_deref(),
+                &mut rewrite_state,
+                regex_captures.as_ref(),
+                lc,
+                &meta.log,
+                meta.server_name,
+                loc.server_header,
+            );
+            meta.limit_conn_held = Some(std::rc::Rc::new(held));
+            denied = rejected;
+        }
+        if !answered_in_rewrite_phase && denied.is_none() {
+            match run_access_control(
+                http,
+                req,
+                loc.access,
+                loc.server_header,
+                &meta,
+                auth_resume.as_ref(),
+            ) {
                 AccessControl::Allow { remote_user } => {
                     meta.remote_user = remote_user;
                 }
                 AccessControl::Deny { response, delay_ms } => {
                     meta.response_delay_ms = delay_ms;
                     denied = Some(response);
+                }
+                AccessControl::Subrequest => {
+                    // The worker runs the subrequest, then processes the
+                    // request again (`resume_auth_request`).
+                    meta.auth_request = auth_pending(loc.access, &rewrite_state);
+                    return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
                 }
             }
         }
@@ -898,6 +1106,7 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
+        meta.gzip = loc.gzip;
         // `set $limit_rate` wins over the directive, as nginx's
         // r->limit_rate_set. Rendered only when something is set.
         meta.limit_rate = if loc.limit_rate.is_none() && !rewrite_state.has_user_vars() {
@@ -915,7 +1124,11 @@ fn process_with_meta_inner(
             );
             ResponseLimit::new(rate, after)
         };
-        if let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler {
+        // `$proxy_host` exists once the proxy handler runs: not for a
+        // response from the rewrite or access phase.
+        if denied.is_none()
+            && let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler
+        {
             meta.proxy_host = proxy.host_header;
         }
         let response = match denied {
@@ -948,6 +1161,7 @@ fn process_with_meta_inner(
                 &preserved_www_authenticate,
                 regex_captures.as_ref(),
                 response,
+                takes_error_page,
             ),
         };
         match response {
@@ -1047,7 +1261,7 @@ fn real_ip(req: &RequestCtx<'_>, conf: &crate::worker::PreparedRealIp) -> Option
     let (ip, port) = match conf.header {
         H::ProxyProtocol => {
             let source = req.conn.proxy_protocol.as_ref()?.source?;
-            if !real_ip_trusted(conf.from, req.conn.peer_ip) {
+            if !peer_trusted(conf.from, req.conn) {
                 return None;
             }
             (source.ip(), source.port())
@@ -1066,11 +1280,12 @@ fn real_ip(req: &RequestCtx<'_>, conf: &crate::worker::PreparedRealIp) -> Option
                     &joined
                 }
             };
-            forwarded_addr(req.conn.peer_ip, value, conf.from, conf.recursive)?
+            forwarded_addr(req.conn, value, conf.from, conf.recursive)?
         }
     };
     let mut conn = req.conn.clone();
     conn.peer_ip = ip;
+    conn.peer_unix = false;
     conn.realip = Some(Box::new(RealIpPeer {
         addr: req.remote_addr.to_vec(),
         port: req.remote_port,
@@ -1098,17 +1313,24 @@ fn with_real_ip<'a>(req: &RequestCtx<'a>, state: &'a RealIpState) -> RequestCtx<
 /// `recursive`, only the last entry is taken. `None` when the peer isn't
 /// trusted or the last entry doesn't parse.
 fn forwarded_addr(
-    peer: IpAddr,
+    peer: &ConnInfo,
     list: &[u8],
     from: &[AccessAddr],
     recursive: bool,
 ) -> Option<(IpAddr, u16)> {
     let is_sep = |b: u8| b == b' ' || b == b',';
-    let mut current = peer;
+    let mut current = peer.peer_ip;
+    // The connection's own peer may be a unix-domain one.
+    let mut first = true;
     let mut found = None;
     let mut len = list.len();
     loop {
-        if !real_ip_trusted(from, current) || len == 0 {
+        let trusted = if std::mem::take(&mut first) {
+            peer_trusted(from, peer)
+        } else {
+            real_ip_trusted(from, current)
+        };
+        if !trusted || len == 0 {
             return found;
         }
         let mut p = len - 1;
@@ -1161,6 +1383,16 @@ fn parse_addr_port(text: &[u8]) -> Option<(IpAddr, u16)> {
     Some((addr(host)?, port))
 }
 
+/// The connection's peer against `set_real_ip_from`: `unix:` for a
+/// unix-domain client, the address otherwise.
+fn peer_trusted(from: &[AccessAddr], conn: &ConnInfo) -> bool {
+    if conn.peer_unix {
+        from.iter().any(|a| matches!(a, AccessAddr::Unix))
+    } else {
+        real_ip_trusted(from, conn.peer_ip)
+    }
+}
+
 /// `ngx_cidr_match` against `set_real_ip_from`; IPv4-mapped addresses
 /// match the IPv4 entries.
 fn real_ip_trusted(from: &[AccessAddr], ip: IpAddr) -> bool {
@@ -1206,11 +1438,14 @@ enum AccessControl {
         response: Response,
         delay_ms: u64,
     },
+    /// `auth_request` needs its subrequest first (#358).
+    Subrequest,
 }
 
-/// The access phase: `allow` / `deny`, then auth_basic, combined as
-/// `satisfy` says (`ngx_http_core_access_phase`). The common case, no
-/// checks at all, stays inline.
+/// The access phase: `allow` / `deny`, then auth_basic, then
+/// auth_request, combined as `satisfy` says (`ngx_http_core_access_phase`).
+/// The common case, no checks at all, stays inline. `auth`: the
+/// subrequest's outcome, on the pass after it.
 #[inline]
 fn run_access_control(
     http: &PreparedHttp,
@@ -1218,13 +1453,53 @@ fn run_access_control(
     access: &PreparedAccess,
     server_header: &'static [u8],
     meta: &ProcessMeta,
+    auth: Option<&AuthResume>,
 ) -> AccessControl {
-    if access.rules.is_empty() && matches!(access.auth_basic, PreparedAuthBasic::Off) {
+    if access.rules.is_empty()
+        && matches!(access.auth_basic, PreparedAuthBasic::Off)
+        && access.auth_request.is_none()
+    {
         return AccessControl::Allow { remote_user: None };
     }
-    check_access(http, req, access, server_header, meta)
+    check_access(http, req, access, server_header, meta, auth)
 }
 
+/// The pass after an `auth_request` subrequest: its outcome, with its
+/// variables set and the first pass's limit_req / limit_conn statuses
+/// restored. `None` on any other pass, or where auth_request is off.
+#[inline]
+fn take_auth_resume(access: &PreparedAccess, state: &mut RewriteState) -> Option<AuthResume> {
+    if access.auth_request.is_none() {
+        return None;
+    }
+    let uri = access.auth_request?;
+    let resume = AUTH_RESUME.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|(u, _)| *u == uri)
+            .map(|(_, resume)| resume.clone())
+    })?;
+    state.limit_req_status = resume.limit_req_status;
+    state.limit_conn_status = resume.limit_conn_status;
+    for (name, value) in &resume.vars {
+        state.set_user_var(name, value.clone());
+    }
+    Some(resume)
+}
+
+fn auth_pending(access: &PreparedAccess, state: &RewriteState) -> Option<Box<AuthPending>> {
+    Some(Box::new(AuthPending {
+        uri: access.auth_request?,
+        sets: access.auth_request_set,
+        limit_req_status: state.limit_req_status,
+        limit_conn_status: state.limit_conn_status,
+    }))
+}
+
+/// The handlers in nginx's order: the access module's, auth_basic's, then
+/// auth_request's (the reverse of the module list). With `satisfy all` the
+/// first that refuses answers; with `any` the first that allows does, and
+/// otherwise a 401 wins over a 403 (`r->access_code`).
 #[inline(never)]
 fn check_access(
     http: &PreparedHttp,
@@ -1232,28 +1507,132 @@ fn check_access(
     access: &PreparedAccess,
     server_header: &'static [u8],
     meta: &ProcessMeta,
+    auth: Option<&AuthResume>,
 ) -> AccessControl {
-    // The access module's handler runs before auth_basic's. With `satisfy
-    // all` a deny answers at once; with `any` an allow does, and a deny
-    // only counts if auth_basic doesn't pass either.
-    let forbidden = match match_access_rules(access.rules, req.conn.peer_ip) {
-        Some(false) if access.satisfy_any => return AccessControl::Allow { remote_user: None },
-        Some(true) if !access.satisfy_any => return access_forbidden(http, req, meta),
+    let any = access.satisfy_any;
+    // `satisfy any`'s pending refusal: 403, or a 401 with its response.
+    let mut unauthorized: Option<(Response, u64)> = None;
+    let mut forbidden = match match_access_rules(access.rules, req.conn.peer_ip, req.conn.peer_unix)
+    {
+        Some(false) if any => return AccessControl::Allow { remote_user: None },
+        Some(true) if !any => return access_forbidden(http, req, meta),
         found => found == Some(true),
     };
+    let mut remote_user = None;
     match run_auth_basic(http, req, access, server_header) {
-        // auth_basic off: only the rules decided.
-        None if forbidden => access_forbidden(http, req, meta),
-        None => AccessControl::Allow { remote_user: None },
-        // A 401 wins over the rules' 403, and errors end the phase.
-        Some(outcome) => outcome,
+        None => {}
+        Some(AccessControl::Allow { remote_user: user }) => {
+            if any {
+                return AccessControl::Allow { remote_user: user };
+            }
+            remote_user = user;
+        }
+        Some(AccessControl::Deny { response, delay_ms }) if is_unauthorized(&response) && any => {
+            unauthorized = Some((response, delay_ms));
+        }
+        // A refusal under `satisfy all`, or an error.
+        Some(outcome) => return outcome,
     }
+    if access.auth_request.is_some() {
+        let Some(auth) = auth else {
+            return AccessControl::Subrequest;
+        };
+        match auth.status {
+            200..=299 => {
+                if any {
+                    return AccessControl::Allow { remote_user };
+                }
+            }
+            401 => {
+                let response = Response::Owned(crate::auth::build_unauthorized_with(
+                    req.method,
+                    server_header,
+                    &auth.www_authenticate,
+                ));
+                if !any {
+                    return AccessControl::Deny {
+                        response,
+                        delay_ms: access.auth_delay_ms,
+                    };
+                }
+                // Both handlers' challenges, as nginx keeps the list.
+                unauthorized = Some(match unauthorized.take() {
+                    Some((basic, delay_ms)) => (merge_challenges(basic, response), delay_ms),
+                    None => (response, access.auth_delay_ms),
+                });
+            }
+            403 => {
+                if !any {
+                    return AccessControl::Deny {
+                        response: Response::Prebuilt(http.forbidden.pick(req.method)),
+                        delay_ms: 0,
+                    };
+                }
+                forbidden = true;
+            }
+            status => {
+                crate::worker::write_error_log(
+                    meta.log.error_logs,
+                    crate::config::ErrorLogLevel::Error,
+                    &crate::worker::ErrorLogRequest::new(req, meta.server_name),
+                    format!("auth request unexpected status: {status}").as_bytes(),
+                    None,
+                );
+                return AccessControl::Deny {
+                    response: Response::Prebuilt(http.internal_error.pick(req.method)),
+                    delay_ms: 0,
+                };
+            }
+        }
+    }
+    // The post-access phase: what `satisfy any` kept, a 401 first.
+    match unauthorized {
+        Some((response, delay_ms)) => AccessControl::Deny { response, delay_ms },
+        None if forbidden => access_forbidden(http, req, meta),
+        None => AccessControl::Allow { remote_user },
+    }
+}
+
+fn is_unauthorized(response: &Response) -> bool {
+    match response {
+        Response::Owned(b) => crate::worker::response_status(b) == 401,
+        Response::Prebuilt(b) => crate::worker::response_status(b) == 401,
+        _ => false,
+    }
+}
+
+/// auth_basic's 401 with auth_request's `WWW-Authenticate` lines added.
+fn merge_challenges(basic: Response, other: Response) -> Response {
+    let (Response::Owned(mut basic), Response::Owned(other)) = (basic, other) else {
+        unreachable!("both 401s are built owned");
+    };
+    let lines: Vec<u8> = other
+        .split(|&b| b == b'\n')
+        .filter(|l| l.len() > 18 && l[..18].eq_ignore_ascii_case(b"www-authenticate: "))
+        .flat_map(|l| {
+            b"\r\n"
+                .iter()
+                .chain(l.strip_suffix(b"\r").unwrap_or(l))
+                .copied()
+        })
+        .collect();
+    if let Some(head_end) = basic.windows(4).position(|w| w == b"\r\n\r\n") {
+        basic.splice(head_end..head_end, lines);
+    }
+    Response::Owned(basic)
 }
 
 /// The first `allow` / `deny` rule matching `peer`: `Some(deny)`, or
 /// `None` when none does (`ngx_http_access_handler`). An IPv4-mapped IPv6
 /// peer is matched as IPv4.
-fn match_access_rules(rules: &[AccessRule], peer: IpAddr) -> Option<bool> {
+fn match_access_rules(rules: &[AccessRule], peer: IpAddr, unix: bool) -> Option<bool> {
+    // A unix-domain client matches only `all` and `unix:`
+    // (ngx_http_access_handler by address family).
+    if unix {
+        return rules.iter().find_map(|rule| {
+            matches!(rule.addr, AccessAddr::All | AccessAddr::Unix).then_some(rule.deny)
+        });
+    }
     let peer = match peer {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
         v4 => v4,
@@ -1448,6 +1827,9 @@ pub struct ServerNameCaptures {
 pub(crate) struct FirstBodyLimit {
     /// In bytes; `0` turns the check off.
     pub max: u64,
+    /// `client_body_buffer_size`: a body above it goes to a temp file;
+    /// with `client_body_in_file_only on|clean`, 0: every body does.
+    pub buffer: u64,
     pub error_logs: &'static [PreparedErrorLog],
     pub server_name: &'static [u8],
     /// `client_body_in_file_only on`: a temp file holding the body
@@ -1456,6 +1838,14 @@ pub(crate) struct FirstBodyLimit {
     /// The location's `client_body_temp_path` directory, if it (or its
     /// server) has its own.
     pub body_temp: Option<&'static crate::worker::BodyTempDir>,
+    /// Nothing can read the body: the location answers with `return`, has
+    /// no rewrite, `if`, `error_page`, `post_action` or `limit_except` that
+    /// could take the request elsewhere, and neither `$request_body` nor
+    /// `$request_body_file` appears anywhere. The body is then read into a small buffer and dropped, as
+    /// nginx's ngx_http_discard_request_body does, instead of being kept.
+    pub discard: bool,
+    /// The location's `client_body_timeout` (#147).
+    pub body_timeout: std::time::Duration,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -1510,6 +1900,14 @@ pub(crate) fn first_body_limit(
         max: loc
             .client_max_body_size
             .unwrap_or(crate::worker::DEFAULT_CLIENT_MAX_BODY_SIZE),
+        // nginx writes the body to a file whatever its size when
+        // `request_body_in_file_only` is set (ngx_http_read_client_request_body).
+        buffer: match loc.client_body_in_file_only {
+            crate::config::ClientBodyInFileOnly::Off => loc
+                .client_body_buffer_size
+                .unwrap_or(crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE),
+            _ => 0,
+        },
         error_logs: loc.error_logs,
         server_name: server.primary_server_name,
         persistent: matches!(
@@ -1517,6 +1915,14 @@ pub(crate) fn first_body_limit(
             crate::config::ClientBodyInFileOnly::On
         ),
         body_temp: loc.body_temp,
+        discard: !http.uses_request_body
+            && !http.uses_request_body_file
+            && matches!(loc.handler, crate::worker::PreparedHandler::Return(..))
+            && loc.rewrite_program.is_empty()
+            && loc.error_pages.is_empty()
+            && loc.post_action.is_none()
+            && loc.limit_except.is_none(),
+        body_timeout: loc.timeouts.body,
     })
 }
 
@@ -1574,6 +1980,99 @@ fn find_config<'h, 'r>(
     (&listen.servers[listen.default_server], None)
 }
 
+/// The anonymous location of an `if` block (#137) as the request's
+/// location from here on: its handler, headers, limits and logs. Cold.
+#[cold]
+#[inline(never)]
+fn switch_to_if_location(
+    server: &'static PreparedServer,
+    n: u32,
+    meta: &mut ProcessMeta,
+    rewrite_state: &mut RewriteState,
+) -> MatchedLocation<'static> {
+    let loc = MatchedLocation::from_prefix(&server.if_locations[n as usize]);
+    // What the location sets in the request's meta before its rewrite
+    // program, again for the new one.
+    apply_location_meta(&loc, meta, rewrite_state);
+    loc
+}
+
+/// The request's meta from the location it is in: what the location sets
+/// before its rewrite program, and an `if` location again (#137).
+#[inline(always)]
+fn apply_location_meta(
+    loc: &MatchedLocation<'static>,
+    meta: &mut ProcessMeta,
+    rewrite_state: &mut RewriteState,
+) {
+    rewrite_state.doc_root = Some(loc.doc_root);
+    meta.keepalive = KeepaliveMeta {
+        allow: loc.keepalive.allow,
+        idle_timeout_ms: loc.keepalive.idle_timeout_ms,
+        header_timeout_secs: loc.keepalive.header_timeout_secs,
+        max_requests: loc.keepalive.max_requests,
+        max_time_ms: loc.keepalive.max_time_ms,
+        disable_msie6: loc.keepalive.disable_msie6,
+        disable_safari: loc.keepalive.disable_safari,
+    };
+    meta.access_logs = loc.access_logs;
+    meta.doc_root = Some(loc.doc_root);
+    meta.timeouts = Some(loc.timeouts);
+    meta.post_action = loc.post_action;
+    meta.log = LogMeta {
+        error_logs: loc.error_logs,
+        log_not_found: loc.log_not_found,
+    };
+}
+
+/// Whether a ClientHello with this SNI name is to be refused
+/// (`ssl_reject_handshake`): the server the name selects, as nginx's
+/// servername callback finds it, else the address's TLS default server.
+pub(crate) fn rejects_handshake(listen: &PreparedListen, sni: Option<&str>) -> bool {
+    let Some((rejecting, default)) = &listen.reject_handshake else {
+        return false;
+    };
+    let index = sni
+        .and_then(|name| match_server_name(listen, name.as_bytes()))
+        .and_then(|(server, _)| listen.servers.iter().position(|s| std::ptr::eq(s, server)))
+        .unwrap_or(*default);
+    rejecting.get(index).copied().unwrap_or(false)
+}
+
+/// The handshake for a ClientHello with this SNI name: refused
+/// (`rejects_handshake`), or accepted with `h2` offered only when the
+/// server the name selects (else the TLS default server) has HTTP/2 on,
+/// as ngx_http_ssl_alpn_select asks the server the servername callback
+/// chose (#144).
+pub(crate) fn tls_choice(listen: &PreparedListen, sni: Option<&str>) -> crate::tls_stream::Choice {
+    use crate::tls_stream::Choice;
+    if rejects_handshake(listen, sni) {
+        return Choice::Reject;
+    }
+    if !listen.h2_by_sni {
+        return Choice::Accept;
+    }
+    let server = sni
+        .and_then(|name| match_server_name(listen, name.as_bytes()))
+        .map(|(server, _)| server)
+        .unwrap_or(&listen.servers[listen.tls_default_server]);
+    if server.http2 {
+        Choice::Accept
+    } else {
+        Choice::AcceptWithoutH2
+    }
+}
+
+/// The server a request with this `Host` (else SNI name) goes to, as
+/// `process` chooses it.
+pub(crate) fn server_for(
+    listen: &'static PreparedListen,
+    host: Option<&[u8]>,
+    sni: Option<&[u8]>,
+) -> &'static PreparedServer {
+    find_config(listen, host, sni).0
+}
+
 /// Run the exact / leading-wildcard / trailing-wildcard / regex ladder
 /// for one candidate hostname. Used both for the HTTP `Host` header pass
 /// and the TLS SNI fallback pass — the matching logic is identical, only
@@ -1588,11 +2087,14 @@ fn match_server_name<'h, 'r>(
     // already-lowercased prepared names. Hot path is the all-lowercase
     // input; falls back to a 256-byte stack buffer, then a heap Vec for
     // the rare oversized hostnames seen in pathological clients.
-    let mut host_lc_buf: [u8; 256] = [0; 256];
+    // Initialized only when used: zeroing it on every request showed in
+    // the profile.
+    let mut host_lc_buf: [u8; 256];
     let owned_lc: Vec<u8>;
     let host_lc: &[u8] = if host_raw.iter().all(|b| !b.is_ascii_uppercase()) {
         host_raw
-    } else if host_raw.len() <= host_lc_buf.len() {
+    } else if host_raw.len() <= 256 {
+        host_lc_buf = [0; 256];
         for (i, &b) in host_raw.iter().enumerate() {
             host_lc_buf[i] = b.to_ascii_lowercase();
         }
@@ -1602,13 +2104,9 @@ fn match_server_name<'h, 'r>(
         &owned_lc[..]
     };
 
-    // 1. Exact match.
-    for server in &listen.servers {
-        for name in &server.exact_names {
-            if *name == host_lc {
-                return Some((server, None));
-            }
-        }
+    // 1. Exact match: one hash lookup (nginx's server-name hash).
+    if let Some(&si) = listen.exact_names.get(host_lc) {
+        return Some((&listen.servers[si as usize], None));
     }
 
     // 2. Longest leading-wildcard. Each list is sorted by descending
@@ -1646,8 +2144,20 @@ fn match_server_name<'h, 'r>(
 
     // 4. First regex match in declaration order. Captures are surfaced
     // for `$name` rendering on the request that landed.
-    for server in &listen.servers {
-        for rn in &server.regex_names {
+    // One pass over every regex name of the listen (#248); without a set,
+    // each in turn.
+    let first = match &listen.regex_name_set {
+        Some((set, index)) => match set.matches(host_raw).iter().next() {
+            Some(i) => Some(index[i]),
+            None => return None,
+        },
+        None => None,
+    };
+    for (si, server) in listen.servers.iter().enumerate() {
+        for (ni, rn) in server.regex_names.iter().enumerate() {
+            if first.is_some_and(|(s, n)| (s as usize, n as usize) != (si, ni)) {
+                continue;
+            }
             if let Some(caps) = rn.regex.captures(host_raw) {
                 let mut names: Vec<(&'static str, Vec<u8>)> = Vec::new();
                 for &cn in &rn.capture_names {
@@ -1753,7 +2263,18 @@ pub(crate) fn match_location<'a>(
         // Going through `from_utf8` would silently skip the regex pass for
         // any non-UTF-8 sequence — nginx matches PCRE against
         // `r->uri.data` as raw bytes, and so do we.
-        for rloc in &server.regex_locations {
+        // One pass over all of them finds the first match in declaration
+        // order (#248); only that one's captures are taken.
+        let first = match &server.regex_location_set {
+            Some(set) => set.matches(path).iter().next(),
+            None => None,
+        };
+        let candidates: &[crate::worker::PreparedRegexLocation] = match first {
+            Some(i) => &server.regex_locations[i..=i],
+            None if server.regex_location_set.is_some() => &[],
+            None => &server.regex_locations,
+        };
+        for rloc in candidates {
             if let Some(captures) = rloc.regex.captures(path) {
                 rewrite_state.set_numbered_from_regex_captures(&captures, path);
                 return Some(MatchedLocation::from_regex(rloc));
@@ -1900,7 +2421,9 @@ mod tests {
                 panic!("phase::process test helper expected buffered response")
             }
             Response::Reroute(_) => panic!("phase::process must consume Reroute"),
-            Response::Proxy(_) => panic!("phase::process test helper expected buffered response"),
+            Response::Proxy(_) | Response::Upgrade(_) | Response::ProxyStream(_) => {
+                panic!("phase::process test helper expected buffered response")
+            }
         }
     }
 
@@ -1956,7 +2479,7 @@ mod tests {
             request_length: 0,
             epoch_secs: 0,
             epoch_ms: 0,
-            body: &[],
+            body: &NO_BODY,
             body_len: 0,
             body_file: None,
             tls: None,
@@ -1984,8 +2507,12 @@ mod tests {
                 mask: 0xffff_ff00,
             },
         ];
-        let peer = ip("127.0.0.1");
-        let get = |list: &str, recursive| forwarded_addr(peer, list.as_bytes(), &from, recursive);
+        let conn = |peer| ConnInfo {
+            peer_ip: peer,
+            ..ConnInfo::NONE
+        };
+        let peer = conn(ip("127.0.0.1"));
+        let get = |list: &str, recursive| forwarded_addr(&peer, list.as_bytes(), &from, recursive);
         // Off: the last entry, trusted or not.
         assert_eq!(
             get("10.0.0.1, 192.0.2.7", false),
@@ -2009,12 +2536,23 @@ mod tests {
         assert_eq!(get("", false), None);
         // An untrusted peer: the header is ignored.
         assert_eq!(
-            forwarded_addr(ip("10.9.9.9"), b"1.2.3.4", &from, false),
+            forwarded_addr(&conn(ip("10.9.9.9")), b"1.2.3.4", &from, false),
             None
         );
         // An IPv4-mapped peer matches the IPv4 entries.
         assert_eq!(
-            forwarded_addr(ip("::ffff:127.0.0.1"), b"1.2.3.4", &from, false),
+            forwarded_addr(&conn(ip("::ffff:127.0.0.1")), b"1.2.3.4", &from, false),
+            Some((ip("1.2.3.4"), 0))
+        );
+        // A unix-domain peer is trusted only by `unix:`.
+        let unix_peer = ConnInfo {
+            peer_unix: true,
+            ..ConnInfo::NONE
+        };
+        assert_eq!(forwarded_addr(&unix_peer, b"1.2.3.4", &from, false), None);
+        let with_unix = [crate::config::AccessAddr::Unix];
+        assert_eq!(
+            forwarded_addr(&unix_peer, b"1.2.3.4", &with_unix, false),
             Some((ip("1.2.3.4"), 0))
         );
     }
@@ -2043,21 +2581,37 @@ mod tests {
             rule(true, V4 { addr: 0, mask: 0 }),
         ];
         // `unix:` never matches a TCP peer; the first matching rule wins.
-        assert_eq!(match_access_rules(&rules, ip("127.0.0.2")), Some(false));
-        assert_eq!(match_access_rules(&rules, ip("10.0.0.1")), Some(true));
-        assert_eq!(match_access_rules(&rules, ip("::1")), Some(true));
-        // IPv4 rules don't match IPv6 peers…
-        assert_eq!(match_access_rules(&rules, ip("::2")), None);
-        // …but IPv4-mapped peers are matched as IPv4.
         assert_eq!(
-            match_access_rules(&rules, ip("::ffff:127.0.0.1")),
+            match_access_rules(&rules, ip("127.0.0.2"), false),
             Some(false)
         );
         assert_eq!(
-            match_access_rules(&[rule(true, All)], ip("::2")),
+            match_access_rules(&rules, ip("10.0.0.1"), false),
             Some(true)
         );
-        assert_eq!(match_access_rules(&[], ip("127.0.0.1")), None);
+        assert_eq!(match_access_rules(&rules, ip("::1"), false), Some(true));
+        // IPv4 rules don't match IPv6 peers…
+        assert_eq!(match_access_rules(&rules, ip("::2"), false), None);
+        // …but IPv4-mapped peers are matched as IPv4.
+        assert_eq!(
+            match_access_rules(&rules, ip("::ffff:127.0.0.1"), false),
+            Some(false)
+        );
+        assert_eq!(
+            match_access_rules(&[rule(true, All)], ip("::2"), false),
+            Some(true)
+        );
+        assert_eq!(match_access_rules(&[], ip("127.0.0.1"), false), None);
+        // A unix-domain client: only `all` and `unix:` rules apply.
+        let rules = [rule(false, V4 { addr: 0, mask: 0 }), rule(true, Unix)];
+        assert_eq!(
+            match_access_rules(&rules, ip("127.0.0.1"), true),
+            Some(true)
+        );
+        assert_eq!(
+            match_access_rules(&[rule(false, All)], ip("127.0.0.1"), true),
+            Some(false)
+        );
     }
 
     #[test]

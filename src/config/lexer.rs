@@ -14,6 +14,12 @@ use super::*;
 pub(crate) struct LexerFrame {
     bytes: Vec<u8>,
     pos: usize,
+    /// Where errors say they are: the file, or `None` for `-g` (nginx's
+    /// "command line") and inline test parses.
+    name: Option<std::rc::Rc<str>>,
+    /// Offset of the last directive's terminator, for its line number
+    /// (nginx reports the line it was reading when the error came up).
+    last_end: usize,
 }
 
 pub(crate) struct Lexer {
@@ -34,6 +40,8 @@ impl Lexer {
             frames: vec![LexerFrame {
                 bytes: src.as_bytes().to_vec(),
                 pos: 0,
+                name: None,
+                last_end: 0,
             }],
             conf_prefix: None,
             dump_files: Vec::new(),
@@ -51,6 +59,7 @@ impl Lexer {
             warnings: Vec::new(),
         };
         s.dump_seen.insert(path.clone());
+        let name = Some(std::rc::Rc::from(path.display().to_string()));
         s.dump_files.push(DumpFile {
             path,
             contents: src.clone(),
@@ -58,6 +67,8 @@ impl Lexer {
         s.frames.push(LexerFrame {
             bytes: src.into_bytes(),
             pos: 0,
+            name,
+            last_end: 0,
         });
         s
     }
@@ -70,7 +81,23 @@ impl Lexer {
         self.frames.push(LexerFrame {
             bytes: src.into_bytes(),
             pos: 0,
+            name: None,
+            last_end: 0,
         });
+    }
+
+    /// Where the directive just read is, as nginx's `ngx_conf_log_error`
+    /// puts it after a message: `/etc/nginx/nginx.conf:12`, or
+    /// `command line` for `-g`. `None` for inline test parses.
+    pub(crate) fn position(&self) -> Option<String> {
+        let f = self.frames.last()?;
+        let Some(name) = &f.name else {
+            return (self.frames.len() > 1 || self.conf_prefix.is_some())
+                .then(|| "command line".to_string());
+        };
+        let end = f.last_end.min(f.bytes.len());
+        let line = 1 + f.bytes[..end].iter().filter(|&&b| b == b'\n').count();
+        Some(format!("{name}:{line}"))
     }
 
     pub(crate) fn conf_prefix(&self) -> Option<&Path> {
@@ -106,6 +133,14 @@ impl Lexer {
     }
 
     fn push_include(&mut self, raw_path: &str) -> Result<(), Error> {
+        // The fuzz targets parse untrusted text: reading the files it names
+        // (`include /dev/zero`) would only test the filesystem, or hang.
+        if cfg!(feature = "fuzzing") {
+            return Err(Error::IncludeOpen {
+                path: raw_path.to_string(),
+                reason: "include is disabled for fuzzing".to_string(),
+            });
+        }
         let path = PathBuf::from(raw_path);
         let resolved = if path.is_absolute() {
             path
@@ -124,6 +159,7 @@ impl Lexer {
             path: resolved.display().to_string(),
             reason: format!("{e}"),
         })?;
+        let name = Some(std::rc::Rc::from(resolved.display().to_string()));
         let canonical = resolved.canonicalize().unwrap_or(resolved);
         let contents = String::from_utf8_lossy(&bytes).into_owned();
         if self.dump_seen.insert(canonical.clone()) {
@@ -132,7 +168,12 @@ impl Lexer {
                 contents,
             });
         }
-        self.frames.push(LexerFrame { bytes, pos: 0 });
+        self.frames.push(LexerFrame {
+            bytes,
+            pos: 0,
+            name,
+            last_end: 0,
+        });
         Ok(())
     }
 
@@ -158,10 +199,16 @@ impl Lexer {
                         got: args.join(" "),
                     });
                 }
-                self.push_include(&args[1])?;
+                if let Err(err) = self.push_include(&args[1]) {
+                    super::compat::include_failed(self, &args, err)?;
+                }
                 continue;
             }
-            super::reject_unenforced(&args)?;
+            let mut args = args;
+            super::compat::precheck(self, &mut args);
+            if let Err(err) = super::reject_unenforced(&args) {
+                super::compat::unenforced(self, &args, err)?;
+            }
             return Ok((args, term));
         }
     }
@@ -173,6 +220,7 @@ impl Lexer {
             self.skip_ws_and_comments();
             let f = self.frames.last_mut().unwrap();
             if f.pos >= f.bytes.len() {
+                f.last_end = f.pos;
                 return if args.is_empty() {
                     Ok((args, Terminator::Eof))
                 } else {
@@ -182,14 +230,17 @@ impl Lexer {
 
             match f.bytes[f.pos] {
                 b';' => {
+                    f.last_end = f.pos;
                     f.pos += 1;
                     return Ok((args, Terminator::Semi));
                 }
                 b'{' => {
+                    f.last_end = f.pos;
                     f.pos += 1;
                     return Ok((args, Terminator::BlockOpen));
                 }
                 b'}' => {
+                    f.last_end = f.pos;
                     if !args.is_empty() {
                         return Err(Error::UnexpectedToken("}".into()));
                     }
@@ -208,6 +259,7 @@ impl Lexer {
                         f.pos += 1;
                     }
                     if f.pos >= f.bytes.len() {
+                        f.last_end = f.pos;
                         return Err(Error::UnterminatedString);
                     }
                     args.push(unescape(&f.bytes[start..f.pos]));

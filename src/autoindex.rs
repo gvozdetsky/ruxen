@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -16,44 +15,40 @@ pub fn render_html(
     localtime: bool,
 ) -> std::io::Result<Vec<u8>> {
     let entries = read_sorted_entries(dir_path)?;
+    // nginx adds its cached UTC offset (`tp->gmtoff`) to every entry with
+    // `autoindex_localtime on`: one lookup per listing, not per entry
+    // (`localtime_r` and `gmtime_r` take glibc's process-wide timezone
+    // lock, which serialized the workers, #250).
+    let offset = if localtime { local_utc_offset() } else { 0 };
 
-    let uri_text = String::from_utf8_lossy(uri);
-    let uri_escaped = escape_html(&uri_text);
-
-    let mut out = Vec::with_capacity(2048);
+    // ngx_http_autoindex_html sizes its buffer up front; so does this,
+    // with room for the longest line nginx writes per entry.
+    let names: usize = entries.iter().map(|e| e.file_name.len()).sum();
+    let mut out = Vec::with_capacity(256 + 6 * uri.len() + entries.len() * 150 + 9 * names);
     out.extend_from_slice(b"<html>\r\n<head><title>Index of ");
-    out.extend_from_slice(uri_escaped.as_bytes());
+    escape_html_into(&mut out, uri);
     out.extend_from_slice(b"</title></head>\r\n<body>\r\n<h1>Index of ");
-    out.extend_from_slice(uri_escaped.as_bytes());
-    out.extend_from_slice(b"</h1><hr><pre>");
-
-    if uri != b"/" {
-        write_entry_line(&mut out, b"../", "../", true, 0, 0, true, localtime);
+    escape_html_into(&mut out, uri);
+    out.extend_from_slice(b"</h1><hr><pre><a href=\"../\">../</a>\r\n");
+    for entry in &entries {
+        write_entry_line(&mut out, entry, exact_size, offset);
     }
-
-    for entry in entries {
-        let raw_name = entry.file_name.as_os_str().as_bytes();
-        let mut href = percent_encode(raw_name);
-        let mut display = String::from_utf8_lossy(raw_name).into_owned();
-        if entry.is_dir {
-            href.push(b'/');
-            display.push('/');
-        }
-
-        write_entry_line(
-            &mut out,
-            &href,
-            &display,
-            entry.is_dir,
-            entry.size,
-            entry.mtime,
-            exact_size,
-            localtime,
-        );
-    }
-
     out.extend_from_slice(b"</pre><hr></body>\r\n</html>\r\n");
     Ok(out)
+}
+
+/// The current offset of local time from UTC, in seconds.
+fn local_utc_offset() -> i64 {
+    // SAFETY: `time(NULL)` and `localtime_r` with out-pointers to locals.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff
+        }
+    }
 }
 
 pub fn render_xml(dir_path: &Path) -> std::io::Result<Vec<u8>> {
@@ -154,6 +149,12 @@ fn read_sorted_entries(dir_path: &Path) -> std::io::Result<Vec<Entry>> {
             Err(_) => continue,
         };
         let file_name = item.file_name();
+        // nginx leaves out every name that starts with a dot (`.htpasswd`,
+        // `.git`, `.env`, and `.`/`..`): ngx_http_autoindex_handler skips
+        // `ngx_de_name(&dir)[0] == '.'`.
+        if file_name.as_os_str().as_bytes().first() == Some(&b'.') {
+            continue;
+        }
         // `fs::metadata` follows symlinks (vs. `DirEntry::metadata`,
         // which does not). nginx's autoindex follows symlinks too —
         // `ngx_http_autoindex_module.c` calls `ngx_de_info` which is
@@ -180,89 +181,168 @@ fn read_sorted_entries(dir_path: &Path) -> std::io::Result<Vec<Entry>> {
         });
     }
 
+    // ngx_http_autoindex_cmp_entries: directories first, then by name.
     entries.sort_by(|a, b| {
-        a.file_name
-            .as_os_str()
-            .as_bytes()
-            .cmp(b.file_name.as_os_str().as_bytes())
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            a.file_name
+                .as_os_str()
+                .as_bytes()
+                .cmp(b.file_name.as_os_str().as_bytes())
+        })
     });
     Ok(entries)
 }
 
-fn write_entry_line(
-    out: &mut Vec<u8>,
-    href: &[u8],
-    display: &str,
-    is_dir: bool,
-    size: u64,
-    mtime: u64,
-    exact_size: bool,
-    localtime: bool,
-) {
+/// Width of the name column (`NGX_HTTP_AUTOINDEX_NAME_LEN`).
+const NAME_LEN: usize = 50;
+
+/// One line of nginx's HTML listing, written in place. Names are measured
+/// in bytes, as nginx does without `charset utf-8`.
+fn write_entry_line(out: &mut Vec<u8>, entry: &Entry, exact_size: bool, offset: i64) {
+    let name = entry.file_name.as_os_str().as_bytes();
     out.extend_from_slice(b"<a href=\"");
-    out.extend_from_slice(href);
+    percent_encode_into(out, name);
+    if entry.is_dir {
+        out.push(b'/');
+    }
     out.extend_from_slice(b"\">");
-
-    let (shown, width) = truncate_name(display, 50);
-    let shown_escaped = escape_html(&shown);
-    out.extend_from_slice(shown_escaped.as_bytes());
-    out.extend_from_slice(b"</a>");
-
-    for _ in width..50 {
-        out.push(b' ');
-    }
-    out.push(b' ');
-
-    let ts = format_timestamp(mtime, localtime);
-    out.extend_from_slice(ts.as_bytes());
-
-    out.push(b' ');
-    let size_text = if is_dir {
-        Cow::Borrowed("-")
+    let mut len = name.len();
+    if len > NAME_LEN {
+        escape_html_into(out, &name[..NAME_LEN - 3]);
+        out.extend_from_slice(b"..&gt;</a>");
     } else {
-        Cow::Owned(format_size(size, exact_size))
-    };
-
-    for _ in size_text.len()..19 {
-        out.push(b' ');
+        escape_html_into(out, name);
+        if entry.is_dir && NAME_LEN > len {
+            out.push(b'/');
+            len += 1;
+        }
+        out.extend_from_slice(b"</a>");
+        out.resize(out.len() + (NAME_LEN - len), b' ');
     }
-    out.extend_from_slice(size_text.as_bytes());
+    out.push(b' ');
+    write_listing_time(out, entry.mtime as i64 + offset);
+    out.push(b' ');
+    match (exact_size, entry.is_dir) {
+        (true, true) => out.extend_from_slice(b"                  -"),
+        (true, false) => write_right(out, entry.size, None, 19),
+        (false, true) => out.extend_from_slice(b"      -"),
+        (false, false) => {
+            const K: u64 = 1024;
+            const M: u64 = 1024 * K;
+            const G: u64 = 1024 * M;
+            let size = entry.size;
+            // Rounded to the nearest unit, as nginx does.
+            let (n, scale) = if size > G - 1 {
+                (size / G + u64::from(size % G > G / 2 - 1), Some(b'G'))
+            } else if size > M - 1 {
+                (size / M + u64::from(size % M > M / 2 - 1), Some(b'M'))
+            } else if size > 9999 {
+                (size / K + u64::from(size % K > 511), Some(b'K'))
+            } else {
+                (size, None)
+            };
+            if scale.is_none() {
+                out.push(b' ');
+            }
+            write_right(out, n, scale, 6);
+        }
+    }
     out.extend_from_slice(b"\r\n");
 }
 
-fn truncate_name(name: &str, limit: usize) -> (String, usize) {
-    let count = name.chars().count();
-    if count <= limit {
-        return (name.to_string(), count);
+/// `n` right-aligned in `width` columns, then `suffix` (nginx's `%6i%c`).
+fn write_right(out: &mut Vec<u8>, n: u64, suffix: Option<u8>, width: usize) {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut v = n;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
     }
+    let text = &digits[i..];
+    out.resize(out.len() + width.saturating_sub(text.len()), b' ');
+    out.extend_from_slice(text);
+    if let Some(c) = suffix {
+        out.push(c);
+    }
+}
 
-    let keep = limit.saturating_sub(3);
-    let mut out = String::new();
-    for ch in name.chars().take(keep) {
-        out.push(ch);
+const MONTHS: [&[u8; 3]; 12] = [
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
+];
+
+/// (year, month 0..=11, day, hour, minute, second) of a time in seconds
+/// since the epoch, before 1970 clamped to it.
+fn split_time(secs: i64) -> (u32, usize, u8, u8, u8, u8) {
+    let secs = secs.max(0) as u64;
+    let (year, mon, day) = crate::file::civil_from_days(secs / 86_400);
+    let hms = secs % 86_400;
+    (
+        year,
+        mon,
+        day,
+        (hms / 3600) as u8,
+        ((hms % 3600) / 60) as u8,
+        (hms % 60) as u8,
+    )
+}
+
+fn two(out: &mut Vec<u8>, n: u8) {
+    out.push(b'0' + n / 10);
+    out.push(b'0' + n % 10);
+}
+
+/// `05-Mar-2024 07:08` (nginx's `%02d-%s-%d %02d:%02d`).
+fn write_listing_time(out: &mut Vec<u8>, secs: i64) {
+    let (year, mon, day, hour, min, _) = split_time(secs);
+    two(out, day);
+    out.push(b'-');
+    out.extend_from_slice(MONTHS[mon]);
+    out.push(b'-');
+    write_right(out, u64::from(year), None, 0);
+    out.push(b' ');
+    two(out, hour);
+    out.push(b':');
+    two(out, min);
+}
+
+/// `2024-03-05T07:08:09Z` for the XML listing.
+fn format_xml_timestamp(secs: u64) -> String {
+    let (year, mon, day, hour, min, sec) = split_time(secs.min(i64::MAX as u64) as i64);
+    format!(
+        "{year:04}-{:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z",
+        mon + 1
+    )
+}
+
+/// The JSON listing's IMF-fixdate.
+fn format_httpdate(secs: u64) -> String {
+    String::from_utf8_lossy(&crate::file::format_http_date(secs)).into_owned()
+}
+
+fn escape_html_into(out: &mut Vec<u8>, input: &[u8]) {
+    for &b in input {
+        match b {
+            b'&' => out.extend_from_slice(b"&amp;"),
+            b'<' => out.extend_from_slice(b"&lt;"),
+            b'>' => out.extend_from_slice(b"&gt;"),
+            b'"' => out.extend_from_slice(b"&quot;"),
+            _ => out.push(b),
+        }
     }
-    out.push('.');
-    out.push('.');
-    out.push('>');
-    (out, limit)
 }
 
 fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(ch),
-        }
-    }
-    out
+    let mut out = Vec::with_capacity(input.len());
+    escape_html_into(&mut out, input.as_bytes());
+    String::from_utf8(out).unwrap_or_default()
 }
 
-fn percent_encode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn percent_encode_into(out: &mut Vec<u8>, input: &[u8]) {
     for &b in input {
         if is_unreserved(b) {
             out.push(b);
@@ -272,6 +352,12 @@ fn percent_encode(input: &[u8]) -> Vec<u8> {
             out.push(hex(b & 0x0f));
         }
     }
+}
+
+#[cfg(test)]
+fn percent_encode(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    percent_encode_into(&mut out, input);
     out
 }
 
@@ -284,125 +370,6 @@ fn hex(n: u8) -> u8 {
         0..=9 => b'0' + n,
         _ => b'A' + (n - 10),
     }
-}
-
-fn format_size(size: u64, exact: bool) -> String {
-    if exact {
-        return size.to_string();
-    }
-
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if size < KB {
-        size.to_string()
-    } else if size < MB {
-        format!("{}K", size.saturating_add(KB - 1) / KB)
-    } else if size < GB {
-        format!("{}M", size.saturating_add(MB - 1) / MB)
-    } else {
-        format!("{}G", size.saturating_add(GB - 1) / GB)
-    }
-}
-
-fn format_timestamp(secs: u64, localtime: bool) -> String {
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t: libc::time_t = if secs > libc::time_t::MAX as u64 {
-        libc::time_t::MAX
-    } else {
-        secs as libc::time_t
-    };
-
-    let tm_ptr = unsafe {
-        if localtime {
-            libc::localtime_r(&t, &mut tm)
-        } else {
-            libc::gmtime_r(&t, &mut tm)
-        }
-    };
-
-    if tm_ptr.is_null() {
-        return "01-Jan-1970 00:00".to_string();
-    }
-
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
-    let mon = if (0..12).contains(&tm.tm_mon) {
-        MONTHS[tm.tm_mon as usize]
-    } else {
-        "Jan"
-    };
-
-    format!(
-        "{:02}-{}-{:04} {:02}:{:02}",
-        tm.tm_mday,
-        mon,
-        tm.tm_year + 1900,
-        tm.tm_hour,
-        tm.tm_min
-    )
-}
-
-fn format_xml_timestamp(secs: u64) -> String {
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t: libc::time_t = if secs > libc::time_t::MAX as u64 {
-        libc::time_t::MAX
-    } else {
-        secs as libc::time_t
-    };
-    let tm_ptr = unsafe { libc::gmtime_r(&t, &mut tm) };
-    if tm_ptr.is_null() {
-        return "1970-01-01T00:00:00Z".to_string();
-    }
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
-    )
-}
-
-fn format_httpdate(secs: u64) -> String {
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t: libc::time_t = if secs > libc::time_t::MAX as u64 {
-        libc::time_t::MAX
-    } else {
-        secs as libc::time_t
-    };
-    let tm_ptr = unsafe { libc::gmtime_r(&t, &mut tm) };
-    if tm_ptr.is_null() {
-        return "Thu, 01 Jan 1970 00:00:00 GMT".to_string();
-    }
-    const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let wday = if (0..7).contains(&tm.tm_wday) {
-        WDAYS[tm.tm_wday as usize]
-    } else {
-        "Thu"
-    };
-    let mon = if (0..12).contains(&tm.tm_mon) {
-        MONTHS[tm.tm_mon as usize]
-    } else {
-        "Jan"
-    };
-    format!(
-        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
-        wday,
-        tm.tm_mday,
-        mon,
-        tm.tm_year + 1900,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
-    )
 }
 
 fn write_json_string(out: &mut Vec<u8>, s: &str) {
@@ -487,17 +454,51 @@ mod tests {
         assert_eq!(percent_encode(b"abc:de?f%"), b"abc%3Ade%3Ff%25");
     }
 
-    #[test]
-    fn truncate_marks_long_names_with_dot_dot_gt() {
-        let (shown, width) =
-            truncate_name("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 50);
-        assert_eq!(width, 50);
-        assert!(shown.ends_with("..>"));
+    fn line(name: &str, is_dir: bool, size: u64, exact: bool) -> String {
+        let entry = Entry {
+            file_name: OsString::from(name),
+            is_dir,
+            size,
+            mtime: 1_709_622_489, // 2024-03-05 07:08:09 UTC
+        };
+        let mut out = Vec::new();
+        write_entry_line(&mut out, &entry, exact, 0);
+        String::from_utf8(out).unwrap()
     }
 
     #[test]
-    fn format_size_rounds_units_when_exact_is_off() {
-        assert_eq!(format_size(1_100, false), "2K");
-        assert_eq!(format_size(1_048_577, false), "2M");
+    fn lines_match_nginx() {
+        assert_eq!(
+            line("a&b<c>.html", false, 0, true),
+            "<a href=\"a%26b%3Cc%3E.html\">a&amp;b&lt;c&gt;.html</a>                                        \
+             05-Mar-2024 07:08                   0\r\n"
+        );
+        assert_eq!(
+            line("dir", true, 4096, true),
+            "<a href=\"dir/\">dir/</a>                                               \
+             05-Mar-2024 07:08                   -\r\n"
+        );
+        let long = "very_long_name_that_goes_past_the_fifty_character_column.txt";
+        assert_eq!(
+            line(long, false, 3_000_000, false),
+            format!(
+                "<a href=\"{long}\">{}..&gt;</a> 05-Mar-2024 07:08      3M\r\n",
+                &long[..47]
+            )
+        );
+    }
+
+    #[test]
+    fn sizes_round_like_nginx_when_not_exact() {
+        let size = |n| {
+            let l = line("f", false, n, false);
+            l[l.len() - 9..l.len() - 2].to_string()
+        };
+        assert_eq!(size(1_500), "   1500");
+        assert_eq!(size(9_999), "   9999");
+        assert_eq!(size(10_000), "    10K");
+        assert_eq!(size(15_000), "    15K");
+        assert_eq!(size(1_048_576), "     1M");
+        assert_eq!(size(3_000_000), "     3M");
     }
 }

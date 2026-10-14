@@ -37,21 +37,17 @@ fn renegotiation_is_refused_at_once() {
         ),
     )
     .unwrap();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && server.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut server = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut server, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     // Half a request, then `R`: s_client renegotiates (a new ClientHello on
@@ -80,8 +76,7 @@ fn renegotiation_is_refused_at_once() {
     let hung = done.is_none();
     let _ = client.kill();
     let out = client.wait_with_output().unwrap();
-    let _ = server.kill();
-    let _ = server.wait();
+    drop(server);
     let _ = std::fs::remove_dir_all(&dir);
     drop(stdin);
 

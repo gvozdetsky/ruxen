@@ -1,0 +1,77 @@
+# Fuzz targets for the parsers that see untrusted bytes (#217). Run with
+# cargo-fuzz on nightly, from the repository root:
+#
+#   cargo +nightly fuzz run request -- -max_total_time=60
+#
+# They call the parsers through ruxen's `fuzzing` feature (src/lib.rs).
+
+[package]
+name = "ruxen-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ruxen = { path = "..", features = ["fuzzing"] }
+
+# Not part of the ruxen package's workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host"
+path = "fuzz_targets/host.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uri"
+path = "fuzz_targets/uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_protocol"
+path = "fuzz_targets/proxy_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked"
+path = "fuzz_targets/chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upstream_head"
+path = "fuzz_targets/upstream_head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "upstream_chunked"
+path = "fuzz_targets/upstream_chunked.rs"
+test = false
+doc = false

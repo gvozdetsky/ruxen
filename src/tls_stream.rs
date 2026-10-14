@@ -36,18 +36,59 @@ const READ_BUF_SIZE: usize = 17 * 1024;
 /// outgoing limit) for the rest of its keepalive life.
 const WRITE_BUF_KEEP: usize = 32 * 1024;
 
+/// What a client opened on a TLS port with.
+pub enum Accepted<IO> {
+    /// A completed handshake.
+    Tls(TlsStream<IO>),
+    /// The first bytes aren't a TLS record: plain HTTP sent to an `ssl`
+    /// port (#384). The transport comes back with the bytes already read,
+    /// for the caller to answer as nginx does (`NGX_HTTP_TO_HTTPS`).
+    Plain(IO, Vec<u8>),
+}
+
+/// nginx's test in `ngx_http_ssl_handshake`: an SSLv2 ClientHello has the
+/// top bit set, a TLS record starts with the handshake type (22). Anything
+/// else is taken for plain HTTP.
+fn starts_tls(first: u8) -> bool {
+    first & 0x80 != 0 || first == 0x16
+}
+
+/// The first read on a TLS port: `None` at EOF.
+async fn first_read<IO: AsyncReadRent>(io: &mut IO) -> io::Result<Option<Vec<u8>>> {
+    let (res, buf) = io.read(Vec::with_capacity(READ_BUF_SIZE)).await;
+    Ok((res? > 0).then_some(buf))
+}
+
+fn handshake_eof() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof")
+}
+
 /// Per-listen handshake entry point, built once from the listen's
 /// `ServerConfig`.
 #[derive(Clone)]
 pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
+    /// `config` without `h2` in ALPN, for the servers of an address that
+    /// have HTTP/2 off when others have it on (#144).
+    without_h2: Option<Arc<ServerConfig>>,
     session_ids: bool,
+}
+
+/// What `accept_choosing` does after the ClientHello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// `ssl_reject_handshake`: an `unrecognized_name` alert.
+    Reject,
+    Accept,
+    /// Accept, without offering HTTP/2 through ALPN.
+    AcceptWithoutH2,
 }
 
 impl From<Arc<ServerConfig>> for TlsAcceptor {
     fn from(config: Arc<ServerConfig>) -> Self {
         Self {
             config,
+            without_h2: None,
             session_ids: false,
         }
     }
@@ -59,6 +100,15 @@ impl TlsAcceptor {
     /// ID nor the TLS 1.3 ticket, so a full handshake draws 32 random bytes
     /// and stores them in the session as its resumption data (see
     /// `TlsStream::session_id`).
+    /// Keep `config` without `h2` in its ALPN list too, for
+    /// `Choice::AcceptWithoutH2`.
+    pub fn with_choice_of_h2(mut self) -> Self {
+        let mut config = (*self.config).clone();
+        config.alpn_protocols.retain(|p| p != b"h2");
+        self.without_h2 = Some(Arc::new(config));
+        self
+    }
+
     pub fn with_session_ids(mut self) -> Self {
         self.session_ids =
             self.config.session_storage.can_cache() || self.config.ticketer.enabled();
@@ -67,11 +117,110 @@ impl TlsAcceptor {
 
     /// Run the server handshake over `io`. rustls errors surface as
     /// `InvalidData`, a peer that hangs up mid-handshake as `UnexpectedEof`.
-    pub async fn accept<IO>(&self, io: IO) -> io::Result<TlsStream<IO>>
+    /// A first byte that can't start TLS gives `Accepted::Plain`.
+    pub async fn accept<IO>(&self, mut io: IO) -> io::Result<Accepted<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
     {
-        let mut conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
+        let Some(first) = first_read(&mut io).await? else {
+            return Err(handshake_eof());
+        };
+        if !starts_tls(first[0]) {
+            return Ok(Accepted::Plain(io, first));
+        }
+        let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
+        self.handshake_with(io, conn, first)
+            .await
+            .map(Accepted::Tls)
+    }
+
+    /// `accept`, but the ClientHello is read first and `choose` sees its
+    /// SNI name (nginx's servername callback). `Choice::Reject` ends the
+    /// handshake with a fatal `unrecognized_name` alert before any
+    /// certificate is chosen (`ssl_reject_handshake`, #112), and the error
+    /// is `ConnectionRefused`; `Choice::AcceptWithoutH2` doesn't offer
+    /// `h2` (the server the name selects has HTTP/2 off, #144). Plain HTTP
+    /// is `Accepted::Plain`, as in `accept`.
+    pub async fn accept_choosing<IO>(
+        &self,
+        mut io: IO,
+        choose: impl FnOnce(Option<&str>) -> Choice,
+    ) -> io::Result<Accepted<IO>>
+    where
+        IO: AsyncReadRent + AsyncWriteRent,
+    {
+        let mut acceptor = rustls::server::Acceptor::default();
+        let Some(mut buf) = first_read(&mut io).await? else {
+            return Err(handshake_eof());
+        };
+        if !starts_tls(buf[0]) {
+            return Ok(Accepted::Plain(io, buf));
+        }
+        let mut first = true;
+        let accepted = loop {
+            if !mem::take(&mut first) {
+                buf.clear();
+                let (res, returned) = io.read(buf).await;
+                buf = returned;
+                if res? == 0 {
+                    return Err(handshake_eof());
+                }
+            }
+            let mut pending = &buf[..];
+            while !pending.is_empty() {
+                acceptor.read_tls(&mut pending)?;
+            }
+            match acceptor.accept() {
+                Ok(Some(accepted)) => break accepted,
+                Ok(None) => {}
+                Err((e, mut alert)) => {
+                    let mut out = Vec::new();
+                    let _ = alert.write_all(&mut out);
+                    let _ = io.write_all(out).await;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+            }
+        };
+        let choice = choose(accepted.client_hello().server_name());
+        if choice == Choice::Reject {
+            // A plaintext fatal alert record, unrecognized_name (112): no
+            // keys exist yet, for TLS 1.2 and 1.3 alike.
+            let _ = io
+                .write_all(vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70])
+                .await;
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "handshake rejected (ssl_reject_handshake)",
+            ));
+        }
+        let config = match (choice, &self.without_h2) {
+            (Choice::AcceptWithoutH2, Some(config)) => config.clone(),
+            _ => self.config.clone(),
+        };
+        let conn = match accepted.into_connection(config) {
+            Ok(conn) => conn,
+            Err((e, mut alert)) => {
+                let mut out = Vec::new();
+                let _ = alert.write_all(&mut out);
+                let _ = io.write_all(out).await;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        };
+        self.handshake_with(io, conn, Vec::new())
+            .await
+            .map(Accepted::Tls)
+    }
+
+    /// The handshake, with `rbuf` holding ciphertext already read.
+    async fn handshake_with<IO>(
+        &self,
+        io: IO,
+        mut conn: ServerConnection,
+        rbuf: Vec<u8>,
+    ) -> io::Result<TlsStream<IO>>
+    where
+        IO: AsyncReadRent + AsyncWriteRent,
+    {
         let session_id = if self.session_ids {
             let mut id = [0; 32];
             self.config
@@ -87,10 +236,11 @@ impl TlsAcceptor {
         let mut stream = TlsStream {
             io,
             conn,
-            rbuf: Vec::new(),
+            rbuf,
             rpos: 0,
             wbuf: Vec::new(),
             session_id,
+            tunnel: false,
         };
         stream.handshake().await?;
         Ok(stream)
@@ -110,6 +260,9 @@ pub struct TlsStream<IO> {
     wbuf: Vec<u8>,
     /// The session's `$ssl_session_id` bytes, with `with_session_ids`.
     session_id: Option<[u8; 32]>,
+    /// Carrying a tunnel: a read and a write may be in flight at once, so
+    /// only writes put records on the socket (`begin_tunnel`).
+    tunnel: bool,
 }
 
 impl<IO> TlsStream<IO> {
@@ -128,6 +281,16 @@ impl<IO> TlsStream<IO> {
             return None;
         }
         self.session_id.as_ref()
+    }
+
+    /// From now on a read may run while a write is in flight (the tunnel
+    /// after a proxied 101). Both touch the session only between awaits;
+    /// the socket write is the one thing that can't happen twice at once.
+    /// So a read no longer flushes what rustls queued in answer (an alert,
+    /// a KeyUpdate): the next write sends it, as `write_tls` drains the
+    /// queue until it is empty.
+    pub fn begin_tunnel(&mut self) {
+        self.tunnel = true;
     }
 
     /// The underlying transport, for waiting on the socket directly.
@@ -157,10 +320,7 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
                 return Ok(());
             }
             if self.read_tls().await? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "tls handshake eof",
-                ));
+                return Err(handshake_eof());
             }
             // A resumed TLS 1.3 session keeps its id, also in the tickets
             // issued now (after the client's Finished, a later flight).
@@ -197,7 +357,9 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
         self.rpos += n;
         if let Err(e) = self.conn.process_new_packets() {
             // Best effort: get the alert rustls queued out to the peer.
-            let _ = self.write_tls().await;
+            if !self.tunnel {
+                let _ = self.write_tls().await;
+            }
             return Err(io::Error::new(io::ErrorKind::InvalidData, e));
         }
         // What rustls queued in answer (the `no_renegotiation` alert for a
@@ -206,7 +368,7 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
         // waiting for request bytes and not write anything else. OpenSSL
         // writes these from inside SSL_read. The handshake loop flushes on
         // its own.
-        if self.conn.wants_write() && !self.conn.is_handshaking() {
+        if self.conn.wants_write() && !self.conn.is_handshaking() && !self.tunnel {
             self.write_tls().await?;
         }
         Ok(n)
@@ -214,20 +376,22 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
 
     /// Move everything rustls has queued for the peer onto the socket.
     async fn write_tls(&mut self) -> io::Result<()> {
-        if !self.conn.wants_write() {
-            return Ok(());
-        }
-        let mut buf = mem::take(&mut self.wbuf);
-        buf.clear();
-        // A `Vec` sink never pushes back, so this drains the whole queue.
+        // Again after each write: in a tunnel, a read may queue records
+        // while the write is in flight.
         while self.conn.wants_write() {
-            self.conn.write_tls(&mut buf)?;
+            let mut buf = mem::take(&mut self.wbuf);
+            buf.clear();
+            // A `Vec` sink never pushes back, so this drains the whole queue.
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut buf)?;
+            }
+            let (res, buf) = self.io.write_all(buf).await;
+            if buf.capacity() <= WRITE_BUF_KEEP {
+                self.wbuf = buf;
+            }
+            res?;
         }
-        let (res, buf) = self.io.write_all(buf).await;
-        if buf.capacity() <= WRITE_BUF_KEEP {
-            self.wbuf = buf;
-        }
-        res.map(drop)
+        Ok(())
     }
 
     /// Encrypt as much of `bufs` as rustls accepts (its outgoing limit is
@@ -397,11 +561,18 @@ mod tests {
         });
     }
 
+    fn tls<IO>(accepted: Accepted<IO>) -> TlsStream<IO> {
+        match accepted {
+            Accepted::Tls(s) => s,
+            Accepted::Plain(..) => panic!("plain bytes on the TLS port"),
+        }
+    }
+
     #[test]
     fn roundtrip_writev_and_close_notify() {
         run(
             |acceptor, sock| async move {
-                let mut s = acceptor.accept(sock).await.unwrap();
+                let mut s = tls(acceptor.accept(sock).await.unwrap());
                 assert_eq!(s.connection().server_name(), Some("localhost"));
                 let (res, buf) = s.read(Vec::with_capacity(64)).await;
                 assert_eq!(res.unwrap(), 4);
@@ -432,7 +603,7 @@ mod tests {
         let expect = body.clone();
         run(
             |acceptor, sock| async move {
-                let mut s = acceptor.accept(sock).await.unwrap();
+                let mut s = tls(acceptor.accept(sock).await.unwrap());
                 // Longer than rustls's 64 KiB outgoing limit: `write_all`
                 // has to loop over partial writes.
                 let (res, _) = s.write_all(body).await;
@@ -467,7 +638,9 @@ mod tests {
     fn handshake_eof() {
         run(
             |acceptor, sock| async move {
-                let err = acceptor.accept(sock).await.unwrap_err();
+                let Err(err) = acceptor.accept(sock).await else {
+                    panic!("accepted a closed connection");
+                };
                 assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
             },
             |c| c.sock.shutdown(std::net::Shutdown::Both).unwrap(),

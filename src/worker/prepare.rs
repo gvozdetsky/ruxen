@@ -1,6 +1,9 @@
-//! Configuration → `&'static PreparedHttp` build pass. Owns every
-//! `Box::leak` on the startup path; nothing here runs after the workers
-//! spawn.
+//! Configuration → `&'static PreparedHttp` build pass, at startup and on
+//! each reload. Its allocations go through `crate::arena::leak`, so `main`
+//! can free a configuration once its workers are gone (#343). What a later
+//! configuration keeps (zone state, cache zones, the buffered access-log
+//! registry) is leaked with plain `Box::leak` instead. Nothing here runs
+//! after the workers spawn.
 
 #![allow(unused_imports)]
 
@@ -57,6 +60,12 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
+        limit_req_zones,
+        limit_conn_zones,
+        uses_request_body_file,
+        uses_request_body,
+        uses_stderr_log,
+        uses_stats,
         runtime,
         error_logs: http_error_logs,
         log_formats,
@@ -73,8 +82,11 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         auth_delay_ms,
         access,
         client_max_body_size,
+        client_body_buffer_size,
         client_body_temp_path,
         sendfile,
+        http2,
+        http2_conf,
         disable_symlinks,
         limit_rate,
         limit_rate_after,
@@ -83,6 +95,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         ignore_invalid_headers,
         underscores_in_headers,
         upstreams,
+        proxy_cache_paths,
         servers,
         warnings: _,
         dump_files: _,
@@ -93,13 +106,14 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     // to listen on and idle until shutdown.
     // Group server blocks by listen address while preserving declaration
     // order both across listen buckets and within each bucket.
-    let mut grouped: Vec<(SocketAddr, Vec<Server>)> = Vec::new();
+    // A `unix:` socket is its own address (#263).
+    let mut grouped: Vec<((SocketAddr, Option<std::path::PathBuf>), Vec<Server>)> = Vec::new();
     for server in servers {
-        let addr = server.listen.addr;
-        if let Some((_, bucket)) = grouped.iter_mut().find(|(a, _)| *a == addr) {
+        let key = (server.listen.addr, server.listen.unix.clone());
+        if let Some((_, bucket)) = grouped.iter_mut().find(|(k, _)| *k == key) {
             bucket.push(server);
         } else {
-            grouped.push((addr, vec![server]));
+            grouped.push((key, vec![server]));
         }
     }
 
@@ -119,7 +133,9 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         PreparedAccess::NONE,
     );
     let http_client_max_body_size = client_max_body_size;
+    let http_client_body_buffer_size = client_body_buffer_size;
     let http_sendfile = sendfile;
+    let http_http2 = http2;
     let http_disable_symlinks = disable_symlinks;
     let http_limit_rate =
         PreparedLimitRate::inherit(limit_rate, limit_rate_after, PreparedLimitRate::default());
@@ -150,11 +166,15 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_access_logs: &'static [PreparedAccessLog] = alp.prepare_list(&access_logs)?;
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
+    prepare_cache_zones(proxy_cache_paths)?;
+    prepare_limit_req_zones(limit_req_zones)?;
+    prepare_limit_conn_zones(limit_conn_zones)?;
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
         prepare_upstreams(upstreams);
 
     let mut listens: Vec<PreparedListen> = Vec::with_capacity(grouped.len());
-    for (addr, servers_for_addr) in grouped {
+    for ((addr, unix), servers_for_addr) in grouped {
+        let unix: Option<&'static Path> = unix.map(|p| &*crate::arena::leak(p.into_boxed_path()));
         // Snapshot the TLS-relevant fields up front: prepare_server consumes
         // each `Server`, and we want to feed the SNI resolver in the same
         // declaration order.
@@ -168,6 +188,22 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             })
             .collect();
         let proxy_protocol = servers_for_addr.iter().any(|s| s.listen.proxy_protocol);
+        // HTTP/2 (#144): `listen … http2` for the address, `http2 on` per
+        // server (server, else http).
+        let http2_listen = servers_for_addr.iter().any(|s| s.listen.http2);
+        let server_http2: Vec<bool> = servers_for_addr
+            .iter()
+            .map(|s| http2_listen || s.http2.or(http_http2).unwrap_or(false))
+            .collect();
+        let http2 = server_http2.iter().any(|&on| on);
+        let server_h2: Vec<crate::config::Http2Conf> = servers_for_addr
+            .iter()
+            .map(|s| s.http2_conf.inherit(&http2_conf))
+            .collect();
+        let tls_default_server = servers_for_addr
+            .iter()
+            .position(|s| s.listen.default_server)
+            .unwrap_or(0);
         // Socket options belong to the address: one server may set them
         // (nginx's "duplicate listen options").
         let mut with_options = servers_for_addr
@@ -179,7 +215,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             return Err(format!("duplicate listen options for {addr}"));
         }
         let socket = ListenSocket::from_listen(options);
-        let servers: Vec<PreparedServer> = servers_for_addr
+        let mut servers: Vec<PreparedServer> = servers_for_addr
             .into_iter()
             .map(|s| {
                 prepare_server(
@@ -193,6 +229,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                     http_autoindex_format,
                     http_access,
                     http_client_max_body_size,
+                    http_client_body_buffer_size,
                     http_sendfile,
                     http_disable_symlinks.clone(),
                     http_limit_rate,
@@ -205,18 +242,72 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 )
             })
             .collect::<Result<_, _>>()?;
-        let tls = build_listen_tls(addr, &tls_inputs)?;
+        for ((server, on), h2) in servers.iter_mut().zip(&server_http2).zip(&server_h2) {
+            server.http2 = *on;
+            server.h2 = *h2;
+        }
+        let h2_by_sni = server_http2.iter().any(|&on| on != http2);
+        let tls = build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)?;
+        let h2_by_sni = h2_by_sni && tls.is_some();
+        let reject_handshake = (tls.is_some()
+            && tls_inputs
+                .iter()
+                .any(|i| i.ssl.reject_handshake == Some(true)))
+        .then(|| {
+            let flags = tls_inputs
+                .iter()
+                .map(|i| i.ssl.reject_handshake == Some(true))
+                .collect();
+            let default = tls_inputs
+                .iter()
+                .position(|i| i.default_server)
+                .unwrap_or(0);
+            (flags, default)
+        });
+        let mut name_index: Vec<(u32, u32)> = Vec::new();
+        for (si, server) in servers.iter().enumerate() {
+            for ni in 0..server.regex_names.len() {
+                name_index.push((si as u32, ni as u32));
+            }
+        }
+        let regex_name_set = first_match_set(
+            servers
+                .iter()
+                .flat_map(|s| s.regex_names.iter().map(|n| n.set_pattern.as_str())),
+        )
+        .map(|set| (set, name_index));
+        let mut exact_names = std::collections::HashMap::new();
+        for (si, server) in servers.iter().enumerate() {
+            for &name in &server.exact_names {
+                // The first server with a name keeps it (nginx warns about
+                // the conflict and does the same).
+                exact_names.entry(name).or_insert(si as u32);
+            }
+        }
         listens.push(PreparedListen {
+            exact_names,
+            regex_name_set,
             addr,
-            addr_text: if addr.ip().is_unspecified() {
+            unix,
+            // nginx shows a unix socket's address as `unix:` (the client
+            // side has no path).
+            addr_text: if unix.is_some() {
+                b"unix:"
+            } else if addr.ip().is_unspecified() {
                 b""
             } else {
-                Box::leak(addr.ip().to_string().into_bytes().into_boxed_slice())
+                crate::arena::leak(addr.ip().to_string().into_bytes().into_boxed_slice())
             },
             servers,
             default_server: 0,
             tls,
+            reject_handshake,
             proxy_protocol,
+            http2_listen,
+            // The default server is the first (`default_server: 0`).
+            h2_plain: server_http2.first().copied().unwrap_or(false),
+            h2_by_sni,
+            tls_default_server,
             socket,
         });
     }
@@ -224,10 +315,14 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let canonical_access_logs = alp.finish();
 
     let max_request_body = largest_body_limit(&listens);
-    Ok(Box::leak(Box::new(PreparedHttp {
+    Ok(crate::arena::leak(Box::new(PreparedHttp {
         worker_connections: runtime.worker_connections.unwrap_or(512),
         error_logs: main_error_logs,
         max_request_body,
+        uses_request_body_file,
+        uses_request_body,
+        uses_stderr_log,
+        stats: uses_stats,
         body_temp: BodyTempDir::new(client_body_temp_path),
         listens,
         access_logs: canonical_access_logs,
@@ -235,13 +330,27 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         maps: prepared_maps,
         not_found: Prebuilt::leak(404, "Not Found\n", http_server_bytes),
         bad_request: Prebuilt::leak(400, "Bad Request\n", http_server_bytes),
+        plain_http: Prebuilt::leak(
+            400,
+            "The plain HTTP request was sent to HTTPS port\n",
+            http_server_bytes,
+        ),
         not_implemented: Prebuilt::leak(501, "Not Implemented\n", http_server_bytes),
         forbidden: Prebuilt::leak(403, "Forbidden\n", http_server_bytes),
         bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),
         gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
         internal_error: Prebuilt::leak(500, "Internal Server Error\n", http_server_bytes),
         upstreams: prepared_upstreams,
+        cache_zones: CACHE_ZONES
+            .with(|z| &*crate::arena::leak(z.borrow().clone().into_boxed_slice())),
+        implicit_upstreams: IMPLICIT_UPSTREAMS
+            .with(|i| crate::arena::leak(i.take().into_boxed_slice())),
+        root_fds: ROOT_FDS.with(|fds| crate::arena::leak(fds.take().into_boxed_slice())),
         conf_prefix: conf_prefix.map(leak_path_buf),
+        shutdown_timeout: runtime
+            .worker_shutdown_timeout_ms
+            .filter(|&ms| ms != 0)
+            .map(Duration::from_millis),
     })))
 }
 
@@ -289,6 +398,8 @@ pub(crate) struct TlsServerInput {
 pub(crate) fn build_listen_tls(
     addr: SocketAddr,
     inputs: &[TlsServerInput],
+    http2: bool,
+    h2_by_sni: bool,
 ) -> Result<Option<Arc<crate::tls::TlsAcceptor>>, String> {
     use crate::config::ServerNameSpec;
 
@@ -303,7 +414,12 @@ pub(crate) fn build_listen_tls(
     // when they have one and otherwise get the default's.
     let default_idx = inputs.iter().position(|i| i.default_server).unwrap_or(0);
     let default = &inputs[default_idx];
-    if default.ssl.certs.is_empty() {
+    // Unless it rejects every handshake that comes to it; then each other
+    // server needs a certificate or to reject too.
+    let rejects = |i: &TlsServerInput| i.ssl.reject_handshake == Some(true);
+    if default.ssl.certs.is_empty()
+        && (!rejects(default) || inputs.iter().any(|i| i.ssl.certs.is_empty() && !rejects(i)))
+    {
         return Err(format!(
             "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive \
              (listen {addr})"
@@ -372,14 +488,43 @@ pub(crate) fn build_listen_tls(
     }
 
     resolver.set_default(default_keys);
-    let cfg = crate::tls_certs::build_server_config(
+    // `ssl_session_ticket_key` files: 48 or 80 bytes each
+    // (ngx_ssl_session_ticket_keys).
+    let ticket_keys = match &default.ssl.resumption.ticket_keys {
+        Some(paths) => {
+            let mut keys = Vec::with_capacity(paths.len());
+            for path in paths {
+                let buf = std::fs::read(path).map_err(|e| {
+                    format!("open() \"{}\" failed ({})", path.display(), errno_text(&e))
+                })?;
+                keys.push(
+                    crate::tls_ticket::TicketKey::from_file_bytes(&buf)
+                        .ok_or_else(|| format!("\"{}\" must be 48 or 80 bytes", path.display()))?,
+                );
+            }
+            Some(keys)
+        }
+        None => None,
+    };
+    let mut cfg = crate::tls_certs::build_server_config(
         resolver,
         protocols,
         session_timeout_secs,
-        default.ssl.resumption,
+        default.ssl.resumption.clone(),
+        ticket_keys,
     )
     .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
-    Ok(Some(Arc::new(crate::tls::acceptor_from_config(cfg))))
+    // ALPN offers h2 first where HTTP/2 is on (#144), as
+    // ngx_http_ssl_alpn_select prefers it.
+    if http2 && let Some(cfg) = Arc::get_mut(&mut cfg) {
+        cfg.alpn_protocols.insert(0, b"h2".to_vec());
+    }
+    let acceptor = crate::tls::acceptor_from_config(cfg);
+    Ok(Some(Arc::new(if h2_by_sni {
+        acceptor.with_choice_of_h2()
+    } else {
+        acceptor
+    })))
 }
 
 pub(crate) fn prepare_upstreams(
@@ -387,33 +532,273 @@ pub(crate) fn prepare_upstreams(
 ) -> std::collections::HashMap<&'static str, &'static PreparedUpstream> {
     let mut out = std::collections::HashMap::new();
     for u in upstreams {
-        let name_static: &'static str = Box::leak(u.name.into_boxed_str());
+        let name_static: &'static str = crate::arena::leak(u.name.into_boxed_str());
         let mut peers_vec: Vec<PreparedPeer> = Vec::with_capacity(u.servers.len());
         for s in u.servers {
-            let display: &'static [u8] = Box::leak(s.display.into_bytes().into_boxed_slice());
+            let display: &'static [u8] =
+                crate::arena::leak(s.display.into_bytes().into_boxed_slice());
             peers_vec.push(PreparedPeer {
-                addr: s.addr,
+                addr: PeerAddr::from_config(s.addr),
                 display,
                 weight: s.weight,
                 max_fails: s.max_fails,
                 fail_timeout_ms: (s.fail_timeout_secs as u64) * 1_000,
+                max_conns: s.max_conns,
                 down: s.down,
                 backup: s.backup,
             });
         }
-        let peers: &'static [PreparedPeer] = Box::leak(peers_vec.into_boxed_slice());
-        let prepared = Box::leak(Box::new(PreparedUpstream {
+        let peers: &'static [PreparedPeer] = crate::arena::leak(peers_vec.into_boxed_slice());
+        let prepared = crate::arena::leak(Box::new(PreparedUpstream {
             name: name_static.as_bytes(),
             peers,
             keepalive_max_idle: u.keepalive_max_idle,
             keepalive_requests: u.keepalive_requests.unwrap_or(1000),
             keepalive_idle_timeout_ms: u.keepalive_idle_timeout_ms.unwrap_or(60_000),
             keepalive_max_lifetime_ms: u.keepalive_max_lifetime_ms.unwrap_or(3_600_000),
-            lb: u.lb,
+            lb: crate::upstream::Lb::prepare(u.lb, peers),
+            shared: u
+                .zone
+                .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
         }));
         out.insert(name_static, &*prepared);
     }
     out
+}
+
+thread_local! {
+    /// The http block's `proxy_cache_path` zones while a config is
+    /// prepared (#233).
+    static CACHE_ZONES: std::cell::RefCell<Vec<&'static crate::proxy_cache::CacheZone>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Filled by `build_proxy` while a config is prepared, taken into
+    /// `PreparedHttp::implicit_upstreams`.
+    static IMPLICIT_UPSTREAMS: std::cell::Cell<
+        Vec<(&'static [u8], u16, &'static PreparedUpstream)>,
+    > = const { std::cell::Cell::new(Vec::new()) };
+    /// The root directories opened while a config is prepared, taken into
+    /// `PreparedHttp::root_fds`.
+    static ROOT_FDS: std::cell::RefCell<Vec<std::os::unix::io::RawFd>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The http block's `limit_req_zone`s by name while a config is
+    /// prepared (#94).
+    static LIMIT_REQ_ZONES: std::cell::RefCell<
+        std::collections::HashMap<String, &'static super::limit_req::LimitReqZone>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Build the zones of `proxy_cache_path` (#233). The directories are made
+/// at startup, as nginx's ngx_create_paths does.
+fn prepare_cache_zones(paths: Vec<crate::config::ProxyCachePath>) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut zones = Vec::with_capacity(paths.len());
+    for p in paths {
+        match std::fs::DirBuilder::new().mode(0o700).create(&p.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "mkdir() \"{}\" failed ({})",
+                    p.path.display(),
+                    errno_text(&e)
+                ));
+            }
+            _ => {}
+        }
+        crate::privileges::note_temp_dir(&p.path);
+        zones.push(crate::proxy_cache::zone_for(crate::proxy_cache::ZoneConf {
+            name: p.zone,
+            path: p.path,
+            levels: p.levels,
+            size: p.size,
+            inactive_secs: p.inactive_secs,
+            max_size: p.max_size,
+            min_free: p.min_free,
+        }));
+    }
+    CACHE_ZONES.with(|z| *z.borrow_mut() = zones);
+    Ok(())
+}
+
+/// A location's resolved `proxy_cache*` (`None` without `proxy_cache` or
+/// with `proxy_cache off`). A zone no `proxy_cache_path` declares is
+/// nginx's startup error.
+fn prepare_proxy_cache(
+    conf: &'static crate::config::ProxyCacheConf,
+    ignore: crate::proxy_cache::Ignore,
+) -> Result<Option<&'static PreparedProxyCache>, String> {
+    use crate::config::ProxyCacheSetting;
+    let zone = match &conf.cache {
+        None | Some(ProxyCacheSetting::Off) => return Ok(None),
+        Some(ProxyCacheSetting::Zone(name)) => {
+            let zone = CACHE_ZONES
+                .with(|z| z.borrow().iter().find(|z| z.name == name.as_str()).copied())
+                .ok_or_else(|| format!("\"proxy_cache\" zone \"{name}\" is unknown"))?;
+            PreparedCacheZone::Zone(zone)
+        }
+        Some(ProxyCacheSetting::Var(parts)) => {
+            let zones: Vec<_> = CACHE_ZONES.with(|z| z.borrow().clone());
+            PreparedCacheZone::Var(
+                prepare_value_parts(parts.clone()),
+                crate::arena::leak(zones.into_boxed_slice()),
+            )
+        }
+    };
+    let conditions = |list: &Option<Vec<Vec<crate::config::ValuePart>>>| {
+        let list: Vec<&'static [PreparedValuePart]> = list
+            .iter()
+            .flatten()
+            .map(|parts| prepare_value_parts(parts.clone()))
+            .collect();
+        &*crate::arena::leak(list.into_boxed_slice())
+    };
+    Ok(Some(crate::arena::leak(Box::new(PreparedProxyCache {
+        zone,
+        key: conf.key.clone().map(prepare_value_parts),
+        valid: conf.valid.as_deref().unwrap_or(&[]),
+        methods_post: conf.methods_post.unwrap_or(false),
+        min_uses: conf.min_uses.unwrap_or(1),
+        bypass: conditions(&conf.bypass),
+        no_cache: conditions(&conf.no_cache),
+        convert_head: conf.convert_head.unwrap_or(true),
+        revalidate: conf.revalidate.unwrap_or(false),
+        // ngx_http_proxy_merge_loc_conf: `error` covers "no live upstreams".
+        use_stale: conf.use_stale.unwrap_or_default(),
+        background_update: conf.background_update.unwrap_or(false),
+        lock: conf.lock.unwrap_or(false),
+        lock_timeout_ms: conf.lock_timeout_ms.unwrap_or(5000),
+        lock_age_ms: conf.lock_age_ms.unwrap_or(5000),
+        ignore,
+    }))))
+}
+
+/// Build the zones of `limit_req_zone` (#94).
+fn prepare_limit_req_zones(zones: Vec<crate::config::LimitReqZoneDef>) -> Result<(), String> {
+    let built = zones
+        .into_iter()
+        .map(|z| {
+            let name: &'static str = crate::arena::leak(z.name.into_boxed_str());
+            let zone: &'static super::limit_req::LimitReqZone =
+                crate::arena::leak(Box::new(super::limit_req::LimitReqZone::declare(
+                    name,
+                    prepare_value_parts(z.key),
+                    &z.key_text,
+                    z.size,
+                    z.rate,
+                )?));
+            Ok((name.to_string(), zone))
+        })
+        .collect::<Result<_, String>>()?;
+    LIMIT_REQ_ZONES.with(|m| *m.borrow_mut() = built);
+    Ok(())
+}
+
+/// A location's resolved `limit_req*` (`None` without `limit_req`). A zone
+/// no `limit_req_zone` declares is nginx's startup error.
+fn prepare_limit_req(
+    conf: crate::config::LimitReqConf,
+) -> Result<Option<&'static super::limit_req::PreparedLimitReq>, String> {
+    use super::limit_req::{PreparedLimit, PreparedLimitReq};
+    let Some(limits) = conf.limits.filter(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let limits = limits
+        .into_iter()
+        .map(|l| {
+            let zone = LIMIT_REQ_ZONES
+                .with(|m| m.borrow().get(&l.zone).copied())
+                .ok_or_else(|| format!("zero size shared memory zone \"{}\"", l.zone))?;
+            Ok(PreparedLimit {
+                zone,
+                burst: l.burst,
+                delay: l.delay,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let log_level = conf.log_level.unwrap_or(ErrorLogLevel::Error);
+    Ok(Some(crate::arena::leak(Box::new(PreparedLimitReq {
+        limits: crate::arena::leak(limits.into_boxed_slice()),
+        status: conf.status.unwrap_or(503),
+        log_level,
+        // ngx_http_limit_req_merge_conf: delays log one level lower.
+        delay_log_level: match log_level {
+            ErrorLogLevel::Info => ErrorLogLevel::Info,
+            ErrorLogLevel::Notice => ErrorLogLevel::Info,
+            ErrorLogLevel::Warn => ErrorLogLevel::Notice,
+            _ => ErrorLogLevel::Warn,
+        },
+        dry_run: conf.dry_run.unwrap_or(false),
+    }))))
+}
+
+thread_local! {
+    /// The http block's `limit_conn_zone`s by name while a config is
+    /// prepared (#95).
+    static LIMIT_CONN_ZONES: std::cell::RefCell<
+        std::collections::HashMap<String, &'static super::limit_conn::LimitConnZone>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Build the zones of `limit_conn_zone` (#95).
+fn prepare_limit_conn_zones(zones: Vec<crate::config::LimitConnZoneDef>) -> Result<(), String> {
+    let built = zones
+        .into_iter()
+        .map(|z| {
+            let name: &'static str = crate::arena::leak(z.name.into_boxed_str());
+            let zone: &'static super::limit_conn::LimitConnZone =
+                crate::arena::leak(Box::new(super::limit_conn::LimitConnZone::declare(
+                    name,
+                    prepare_value_parts(z.key),
+                    crate::arena::leak(z.key_text.into_boxed_str()),
+                    z.size,
+                )?));
+            Ok((name.to_string(), zone))
+        })
+        .collect::<Result<_, String>>()?;
+    LIMIT_CONN_ZONES.with(|m| *m.borrow_mut() = built);
+    Ok(())
+}
+
+/// A location's resolved `limit_conn*` (`None` without `limit_conn`).
+fn prepare_limit_conn(
+    conf: crate::config::LimitConnConf,
+) -> Result<Option<&'static super::limit_conn::PreparedLimitConns>, String> {
+    use super::limit_conn::{PreparedLimitConn, PreparedLimitConns};
+    let Some(limits) = conf.limits.filter(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let limits = limits
+        .into_iter()
+        .map(|l| {
+            let zone = LIMIT_CONN_ZONES
+                .with(|m| m.borrow().get(&l.zone).copied())
+                .ok_or_else(|| format!("zero size shared memory zone \"{}\"", l.zone))?;
+            Ok(PreparedLimitConn { zone, conn: l.conn })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(crate::arena::leak(Box::new(PreparedLimitConns {
+        limits: crate::arena::leak(limits.into_boxed_slice()),
+        status: conf.status.unwrap_or(503),
+        log_level: conf.log_level.unwrap_or(ErrorLogLevel::Error),
+        dry_run: conf.dry_run.unwrap_or(false),
+    }))))
+}
+
+/// Note the upstream of `proxy_pass http://<authority>` by host and port.
+fn note_implicit_upstream(authority: &str, upstream: &'static PreparedUpstream) {
+    // `[::1]` has colons of its own; its port parse fails and it keeps 80.
+    let (host, port) = match authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+    {
+        Some((host, port)) if !host.is_empty() => (host, port),
+        _ => (authority, 80),
+    };
+    let host: &'static [u8] =
+        crate::arena::leak(host.to_ascii_lowercase().into_bytes().into_boxed_slice());
+    IMPLICIT_UPSTREAMS.with(|i| {
+        let mut all = i.take();
+        all.push((host, port, upstream));
+        i.set(all);
+    });
 }
 
 pub(crate) type UpstreamMap = std::collections::HashMap<&'static str, &'static PreparedUpstream>;
@@ -454,7 +839,7 @@ pub(crate) fn build_proxy(
             if location_pattern.first() == Some(&b'@') {
                 return Err(URI_PART_NOT_ALLOWED.to_string());
             }
-            let path: &'static [u8] = Box::leak(p.clone().into_bytes().into_boxed_slice());
+            let path: &'static [u8] = crate::arena::leak(p.clone().into_bytes().into_boxed_slice());
             (path, location_pattern)
         }
         (
@@ -475,8 +860,8 @@ pub(crate) fn build_proxy(
         }
         _ => (b"".as_slice(), b"".as_slice()),
     };
-    let redirects = {
-        let (ProxyPass::Direct {
+    let redirects = match &pp {
+        ProxyPass::Direct {
             host_header,
             request_path,
             ..
@@ -485,14 +870,32 @@ pub(crate) fn build_proxy(
             host_header,
             request_path,
             ..
-        }) = &pp;
-        prepare_redirects(
+        } => prepare_redirects(
             eff.redirect,
             host_header,
             request_path.as_deref(),
             location_pattern,
-        )?
+        )?,
+        // With variables there is no URL to derive `default` from: no
+        // implicit rule, and an explicit one is an error
+        // (ngx_http_proxy_redirect, ngx_http_proxy_merge_loc_conf).
+        ProxyPass::Variable { .. } => match eff.redirect {
+            None | Some(crate::config::ProxyRedirect::Off) => &[],
+            Some(crate::config::ProxyRedirect::Rules(rules))
+                if rules
+                    .iter()
+                    .any(|r| matches!(r, crate::config::ProxyRedirectRule::Default)) =>
+            {
+                return Err(
+                    "\"proxy_redirect default\" cannot be used with \"proxy_pass\" \
+                     directive with variables"
+                        .to_string(),
+                );
+            }
+            Some(_) => prepare_redirects(eff.redirect, "", None, location_pattern)?,
+        },
     };
+    let cache = prepare_proxy_cache(eff.cache, eff.cache_ignore)?;
     let response = prepare_response_rules(
         redirects,
         eff.hide_headers,
@@ -504,31 +907,44 @@ pub(crate) fn build_proxy(
     );
     Ok(match pp {
         ProxyPass::Direct {
-            addr, host_header, ..
+            addrs, host_header, ..
         } => {
+            let inet = matches!(addrs.first(), Some(crate::config::UpstreamAddr::Inet(_)));
             let display: &'static [u8] =
-                Box::leak(host_header.clone().into_bytes().into_boxed_slice());
-            let peer = PreparedPeer {
-                addr,
-                display,
-                weight: 1,
-                max_fails: 1,
-                fail_timeout_ms: 10_000,
-                down: false,
-                backup: false,
-            };
-            let peers: &'static [PreparedPeer] = Box::leak(Box::new([peer]));
+                crate::arena::leak(host_header.clone().into_bytes().into_boxed_slice());
+            // A peer per address, as nginx's implicit upstream
+            // (ngx_http_upstream_init_round_robin, `u.naddrs`; #330).
+            let peers: Box<[PreparedPeer]> = addrs
+                .into_iter()
+                .map(|addr| PreparedPeer {
+                    addr: PeerAddr::from_config(addr),
+                    display,
+                    weight: 1,
+                    max_fails: 1,
+                    fail_timeout_ms: 10_000,
+                    max_conns: 0,
+                    down: false,
+                    backup: false,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let peers: &'static [PreparedPeer] = crate::arena::leak(peers);
             let host_header_static: &'static [u8] =
-                Box::leak(host_header.into_bytes().into_boxed_slice());
-            let upstream: &'static PreparedUpstream = Box::leak(Box::new(PreparedUpstream {
-                name: host_header_static,
-                peers,
-                keepalive_max_idle: None,
-                keepalive_requests: 1000,
-                keepalive_idle_timeout_ms: 60_000,
-                keepalive_max_lifetime_ms: 3_600_000,
-                lb: crate::config::LbAlgorithm::RoundRobin,
-            }));
+                crate::arena::leak(host_header.into_bytes().into_boxed_slice());
+            let upstream: &'static PreparedUpstream =
+                crate::arena::leak(Box::new(PreparedUpstream {
+                    name: host_header_static,
+                    peers,
+                    keepalive_max_idle: None,
+                    keepalive_requests: 1000,
+                    keepalive_idle_timeout_ms: 60_000,
+                    keepalive_max_lifetime_ms: 3_600_000,
+                    lb: crate::upstream::Lb::RoundRobin,
+                    shared: None,
+                }));
+            if inet && let Ok(authority) = std::str::from_utf8(host_header_static) {
+                note_implicit_upstream(authority, upstream);
+            }
             PreparedProxy {
                 upstream,
                 host_header: without_default_port(host_header_static),
@@ -551,6 +967,9 @@ pub(crate) fn build_proxy(
                 request_path,
                 response,
                 proxy_method: eff.proxy_method,
+                cache,
+                url: None,
+                bind: eff.bind,
             }
         }
         ProxyPass::UpstreamRef {
@@ -563,7 +982,7 @@ pub(crate) fn build_proxy(
                 panic!("ruxen: upstream {name} has no servers (parser invariant violated)");
             }
             let host_header_static: &'static [u8] =
-                Box::leak(host_header.into_bytes().into_boxed_slice());
+                crate::arena::leak(host_header.into_bytes().into_boxed_slice());
             PreparedProxy {
                 upstream,
                 host_header: host_header_static,
@@ -585,6 +1004,62 @@ pub(crate) fn build_proxy(
                 location_prefix,
                 request_path,
                 response,
+                proxy_method: eff.proxy_method,
+                cache,
+                url: None,
+                bind: eff.bind,
+            }
+        }
+        ProxyPass::Variable { url } => {
+            // One peer, never marked down (`max_fails=0`): each request
+            // brings its own address, as nginx creates a peer per request
+            // (ngx_http_upstream_create_round_robin_peer).
+            let peer = PreparedPeer {
+                addr: PeerAddr::Inet(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+                display: b"",
+                weight: 1,
+                max_fails: 0,
+                fail_timeout_ms: 10_000,
+                max_conns: 0,
+                down: false,
+                backup: false,
+            };
+            let peers: &'static [PreparedPeer] = crate::arena::leak(Box::new([peer]));
+            let upstream: &'static PreparedUpstream =
+                crate::arena::leak(Box::new(PreparedUpstream {
+                    name: b"",
+                    peers,
+                    keepalive_max_idle: None,
+                    keepalive_requests: 1000,
+                    keepalive_idle_timeout_ms: 60_000,
+                    keepalive_max_lifetime_ms: 3_600_000,
+                    lb: crate::upstream::Lb::RoundRobin,
+                    shared: None,
+                }));
+            PreparedProxy {
+                upstream,
+                host_header: b"",
+                set_headers: eff.set_headers,
+                pass_request_headers: eff.pass_request_headers,
+                pass_request_body: eff.pass_request_body,
+                set_body: eff.set_body,
+                connect_timeout_ms: eff.connect_timeout_ms,
+                read_timeout_ms: eff.read_timeout_ms,
+                send_timeout_ms: eff.send_timeout_ms,
+                limit_rate: eff.limit_rate,
+                http_version: eff.http_version,
+                next_upstream: eff.next_upstream,
+                next_upstream_tries: eff.next_upstream_tries,
+                next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
+                intercept_errors: eff.intercept_errors,
+                ignore_invalid_headers: eff.ignore_invalid_headers,
+                underscores_in_headers: eff.underscores_in_headers,
+                location_prefix: b"",
+                request_path: b"",
+                response,
+                cache,
+                url: Some(prepare_value_parts(url)),
+                bind: eff.bind,
                 proxy_method: eff.proxy_method,
             }
         }
@@ -639,13 +1114,15 @@ fn prepare_response_rules(
         .filter(|h| !passed(h) && crate::proxy::default_hidden_bit(h.as_bytes()).is_none())
         .map(|h| leak_bytes(h.to_ascii_lowercase().as_bytes()))
         .collect();
-    Box::leak(Box::new(ProxyResponseRules {
+    crate::arena::leak(Box::new(ProxyResponseRules {
         redirects,
         error_pages,
         recursive_error_pages,
         ignore_accel_redirect,
         ignore_accel_limit_rate,
-        hide: Box::leak(hide.into_boxed_slice()),
+        hide: crate::arena::leak(hide.into_boxed_slice()),
+        passes_date: crate::proxy::default_hidden_bit(b"date")
+            .is_some_and(|bit| pass_mask & bit != 0),
         pass_mask,
     }))
 }
@@ -705,7 +1182,7 @@ fn prepare_redirects(
             })
             .collect::<Result<_, String>>()?,
     };
-    Ok(Box::leak(rules.into_boxed_slice()))
+    Ok(crate::arena::leak(rules.into_boxed_slice()))
 }
 
 /// Server-scope proxy defaults — used as the parent in location-scope
@@ -733,6 +1210,28 @@ pub(crate) struct ServerProxyDefaults {
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
     pub proxy_method: Option<&'static [PreparedValuePart]>,
+    pub cache: &'static crate::config::ProxyCacheConf,
+    pub cache_ignore: crate::proxy_cache::Ignore,
+    pub bind: Option<&'static PreparedBind>,
+}
+
+/// The cache fields of `proxy_ignore_headers` at one scope, the unset ones
+/// from `parent`.
+fn cache_ignore(
+    list: Option<&[String]>,
+    parent: crate::proxy_cache::Ignore,
+) -> crate::proxy_cache::Ignore {
+    if list.is_none() {
+        return parent;
+    }
+    let has = |field| ignores(list, field).unwrap_or(false);
+    crate::proxy_cache::Ignore {
+        x_accel_expires: has("x-accel-expires"),
+        expires: has("expires"),
+        cache_control: has("cache-control"),
+        set_cookie: has("set-cookie"),
+        vary: has("vary"),
+    }
 }
 
 /// `proxy_ignore_headers` as set at one scope: whether it lists `field`
@@ -743,7 +1242,7 @@ fn ignores(list: Option<&[String]>, field: &str) -> Option<bool> {
 
 /// Leak a directive's list for the lifetime of the config.
 fn leak_list(list: Option<Vec<String>>) -> Option<&'static [String]> {
-    list.map(|l| &*Box::leak(l.into_boxed_slice()))
+    list.map(|l| &*crate::arena::leak(l.into_boxed_slice()))
 }
 
 impl ServerProxyDefaults {
@@ -785,12 +1284,32 @@ impl ServerProxyDefaults {
             intercept_errors: conf.intercept_errors.unwrap_or(defaults.intercept_errors),
             ignore_invalid_headers,
             underscores_in_headers,
-            redirect: conf.redirect.map(|r| &*Box::leak(Box::new(r))),
+            redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
             proxy_method: conf.proxy_method.map(prepare_value_parts),
+            cache_ignore: cache_ignore(conf.ignore_headers.as_deref(), defaults.cache_ignore),
+            cache: crate::arena::leak(Box::new(conf.cache)),
+            bind: conf.bind.and_then(prepare_bind),
         }
     }
+}
+
+/// `proxy_bind`, `None` for `off`. A literal address was checked by the
+/// parser.
+fn prepare_bind(bind: crate::config::ProxyBind) -> Option<&'static PreparedBind> {
+    let crate::config::ProxyBind::Addr { value, transparent } = bind else {
+        return None;
+    };
+    let addr = match value.as_slice() {
+        [ValuePart::Literal(text)] => crate::config::parse_bind_addr(text),
+        _ => None,
+    };
+    Some(crate::arena::leak(Box::new(PreparedBind {
+        addr,
+        value: prepare_value_parts(value),
+        transparent,
+    })))
 }
 
 pub(crate) fn prepare_proxy_set_headers(
@@ -798,11 +1317,11 @@ pub(crate) fn prepare_proxy_set_headers(
 ) -> &'static [PreparedProxySetHeader] {
     let mut out: Vec<PreparedProxySetHeader> = Vec::with_capacity(list.len());
     for h in list {
-        let name: &'static [u8] = Box::leak(h.name.into_bytes().into_boxed_slice());
+        let name: &'static [u8] = crate::arena::leak(h.name.into_bytes().into_boxed_slice());
         let value: &'static [PreparedValuePart] = prepare_value_parts(h.value);
         out.push(PreparedProxySetHeader { name, value });
     }
-    Box::leak(out.into_boxed_slice())
+    crate::arena::leak(out.into_boxed_slice())
 }
 
 pub(crate) fn resolve_proxy_effective(
@@ -857,11 +1376,20 @@ pub(crate) fn resolve_proxy_effective(
         ignore_invalid_headers: server_defaults.ignore_invalid_headers,
         underscores_in_headers: server_defaults.underscores_in_headers,
         redirect: match location.redirect {
-            Some(r) => Some(&*Box::leak(Box::new(r))),
+            Some(r) => Some(&*crate::arena::leak(Box::new(r))),
             None => server_defaults.redirect,
         },
+        cache_ignore: cache_ignore(
+            location.ignore_headers.as_deref(),
+            server_defaults.cache_ignore,
+        ),
+        cache: crate::arena::leak(Box::new(location.cache.inherit(server_defaults.cache))),
         hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
+        bind: match location.bind {
+            Some(bind) => prepare_bind(bind),
+            None => server_defaults.bind,
+        },
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
@@ -883,6 +1411,7 @@ pub(crate) fn prepare_server(
     http_autoindex_format: AutoindexFormat,
     http_access: PreparedAccess,
     http_client_max_body_size: Option<u64>,
+    http_client_body_buffer_size: Option<u64>,
     http_sendfile: Option<bool>,
     http_disable_symlinks: Option<crate::config::DisableSymlinks>,
     http_limit_rate: PreparedLimitRate,
@@ -901,6 +1430,7 @@ pub(crate) fn prepare_server(
     let server_underscores_in_headers = server
         .underscores_in_headers
         .unwrap_or(http_underscores_in_headers);
+    let server_gzip = std::mem::take(&mut server.gzip);
     let server_proxy_defaults = ServerProxyDefaults::build(
         std::mem::take(&mut server.proxy),
         server_ignore_invalid_headers,
@@ -926,7 +1456,7 @@ pub(crate) fn prepare_server(
             ServerNameSpec::Exact(s) => {
                 let mut b = s.into_bytes();
                 b.make_ascii_lowercase();
-                exact_names.push(Box::leak(b.into_boxed_slice()));
+                exact_names.push(crate::arena::leak(b.into_boxed_slice()));
             }
             ServerNameSpec::WildcardLeading { suffix, .. } => {
                 wildcard_leading.push(leak_bytes(suffix.as_bytes()));
@@ -951,11 +1481,12 @@ pub(crate) fn prepare_server(
                 let capture_names: Vec<&'static str> = regex
                     .capture_names()
                     .flatten()
-                    .map(|n| &*Box::leak(n.to_string().into_boxed_str()))
+                    .map(|n| &*crate::arena::leak(n.to_string().into_boxed_str()))
                     .collect();
                 regex_names.push(PreparedRegexName {
                     regex,
                     capture_names,
+                    set_pattern: set_pattern(&pattern, case_insensitive),
                 });
             }
             ServerNameSpec::Empty => {
@@ -1015,6 +1546,9 @@ pub(crate) fn prepare_server(
         http_access,
     );
     let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
+    let server_client_body_buffer_size = server
+        .client_body_buffer_size
+        .or(http_client_body_buffer_size);
     let server_sendfile = server.sendfile.or(http_sendfile).unwrap_or(false);
     // A server's own `client_body_temp_path`; without one its locations
     // use the http-level directory (`PreparedHttp::body_temp`).
@@ -1066,7 +1600,52 @@ pub(crate) fn prepare_server(
     let mut prefix: Vec<PreparedLocation> = Vec::new();
     let mut regex: Vec<PreparedRegexLocation> = Vec::new();
     let mut named: Vec<PreparedLocation> = Vec::new();
-    for l in server.locations {
+    // The anonymous locations of location-level `if` blocks (#137), into
+    // a list of their own: no request finds them by URI, the `if` that
+    // holds switches to one by index.
+    let mut locations = server.locations;
+    let mut if_parsed: Vec<Location> = Vec::new();
+    for l in &mut locations {
+        take_if_locations(&mut l.rewrite_ops, &mut if_parsed, None);
+    }
+    let mut if_locations: Vec<PreparedLocation> = Vec::with_capacity(if_parsed.len());
+    for l in if_parsed {
+        if_locations.push(build_prefix_or_exact(
+            l,
+            server_index,
+            server_add_headers,
+            server_add_trailers,
+            server_error_pages,
+            server_keepalive,
+            server_error_logs,
+            server_log_not_found,
+            server_recursive_error_pages,
+            server_tokens_value,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            server_access_logs,
+            server_access,
+            server_client_max_body_size,
+            server_client_body_buffer_size,
+            server_sendfile,
+            server_body_temp,
+            server_disable_symlinks.clone(),
+            server_limit_rate,
+            server_post_action,
+            server_expires,
+            server_chunked_transfer_encoding,
+            &server.limit_req,
+            &server.limit_conn,
+            server.client_timeouts,
+            server_proxy_defaults,
+            &server_gzip,
+            upstreams,
+            alp,
+        )?);
+    }
+    for l in locations {
         match l.mode {
             MatchMode::Exact => exact.push(build_prefix_or_exact(
                 l,
@@ -1086,6 +1665,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1093,7 +1673,11 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
+                &server.limit_conn,
+                server.client_timeouts,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1115,6 +1699,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1122,7 +1707,11 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
+                &server.limit_conn,
+                server.client_timeouts,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1144,6 +1733,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1151,7 +1741,11 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
+                &server.limit_conn,
+                server.client_timeouts,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1174,6 +1768,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
                 server_disable_symlinks.clone(),
@@ -1181,7 +1776,11 @@ pub(crate) fn prepare_server(
                 server_post_action,
                 server_expires,
                 server_chunked_transfer_encoding,
+                &server.limit_req,
+                &server.limit_conn,
+                server.client_timeouts,
                 server_proxy_defaults,
+                &server_gzip,
                 upstreams,
                 alp,
             )?),
@@ -1260,7 +1859,9 @@ pub(crate) fn prepare_server(
             access: server_access,
             limit_except: None,
             client_max_body_size: server_client_max_body_size,
+            client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
+            gzip: prepare_gzip(server_gzip.clone())?,
             limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             body_temp: server_body_temp,
@@ -1268,6 +1869,11 @@ pub(crate) fn prepare_server(
             post_action: server_post_action,
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
+            limit_req: prepare_limit_req(server.limit_req.clone())?,
+            limit_conn: prepare_limit_conn(server.limit_conn.clone())?,
+            timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
+                server.client_timeouts,
+            ))),
         })
     } else {
         None
@@ -1275,6 +1881,10 @@ pub(crate) fn prepare_server(
 
     Ok(PreparedServer {
         doc_root: server_doc_root,
+        // Set by the caller, which knows the http scope.
+        http2: false,
+        h2: Default::default(),
+        keepalive: server_keepalive,
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
         exact_names,
         wildcard_leading,
@@ -1285,8 +1895,10 @@ pub(crate) fn prepare_server(
         listen_port,
         exact_locations: exact,
         prefix_locations: prefix,
+        regex_location_set: first_match_set(regex.iter().map(|r| r.set_pattern.as_str())),
         regex_locations: regex,
         named_locations: named,
+        if_locations,
         server_default,
         error_logs: server_error_logs,
         log_not_found: server_log_not_found,
@@ -1311,7 +1923,7 @@ pub(crate) fn prepare_add_headers(list: Vec<AddHeader>) -> &'static [PreparedAdd
             always: h.always,
         })
         .collect();
-    Box::leak(prepared.into_boxed_slice())
+    crate::arena::leak(prepared.into_boxed_slice())
 }
 
 pub(crate) fn prepare_index_entries(list: Vec<IndexEntry>) -> &'static [PreparedIndexEntry] {
@@ -1321,7 +1933,7 @@ pub(crate) fn prepare_index_entries(list: Vec<IndexEntry>) -> &'static [Prepared
             parts: prepare_value_parts(entry.parts),
         })
         .collect();
-    Box::leak(prepared.into_boxed_slice())
+    crate::arena::leak(prepared.into_boxed_slice())
 }
 
 pub(crate) fn prepare_error_pages(list: Vec<ErrorPage>) -> &'static [PreparedErrorPage] {
@@ -1337,7 +1949,7 @@ pub(crate) fn prepare_error_pages(list: Vec<ErrorPage>) -> &'static [PreparedErr
             target: prepare_value_parts(ep.target),
         })
         .collect();
-    Box::leak(prepared.into_boxed_slice())
+    crate::arena::leak(prepared.into_boxed_slice())
 }
 
 pub(crate) fn prepare_expires(d: ExpiresDirective) -> PreparedExpires {
@@ -1363,11 +1975,11 @@ pub(crate) fn prepare_value_parts(parts: Vec<ValuePart>) -> &'static [PreparedVa
             ValuePart::Var(v) => PreparedValuePart::Var(v),
         })
         .collect();
-    Box::leak(v.into_boxed_slice())
+    crate::arena::leak(v.into_boxed_slice())
 }
 
 pub(crate) fn leak_regex(regex: regex::bytes::Regex) -> &'static regex::bytes::Regex {
-    Box::leak(Box::new(regex))
+    crate::arena::leak(Box::new(regex))
 }
 
 pub(crate) fn prepare_guard(guard: IfGuard) -> PreparedGuard {
@@ -1409,6 +2021,31 @@ pub(crate) fn prepare_guard(guard: IfGuard) -> PreparedGuard {
     }
 }
 
+/// Move the anonymous locations of `ops`' `if` blocks (nested ones too)
+/// into `out`, leaving their index there (#137). A block of rewrite
+/// directives only inside one gets that one's index: nginx gives every
+/// location-level `if` a configuration, merged from the enclosing one, so
+/// the request goes on with the configuration it was in.
+fn take_if_locations(ops: &mut [RewriteOp], out: &mut Vec<Location>, enclosing: Option<usize>) {
+    use crate::config::IfLocation;
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            let slot = match location.take() {
+                Some(IfLocation::Parsed {
+                    location: parsed, ..
+                }) => {
+                    out.push(*parsed);
+                    Some(out.len() - 1)
+                }
+                Some(IfLocation::Slot(n)) => Some(n),
+                None => enclosing,
+            };
+            *location = slot.map(IfLocation::Slot);
+            take_if_locations(body, out, slot);
+        }
+    }
+}
+
 pub(crate) fn prepare_rewrite_ops(
     ops: Vec<RewriteOp>,
     tokens: crate::config::ServerTokens,
@@ -1423,9 +2060,19 @@ pub(crate) fn prepare_rewrite_ops(
                 name: leak_bytes(name.as_bytes()),
                 value: prepare_value_parts(value),
             },
-            RewriteOp::If { guard, body } => PreparedRewriteOp::If {
+            RewriteOp::If {
+                guard,
+                body,
+                location,
+            } => PreparedRewriteOp::If {
                 guard: prepare_guard(guard),
                 body: prepare_rewrite_ops(body, tokens),
+                // `prepare_server` moved every parsed one into the server's
+                // list first.
+                location: match location {
+                    Some(crate::config::IfLocation::Slot(n)) => Some(n as u32),
+                    _ => None,
+                },
             },
             RewriteOp::Rewrite(RewriteRule {
                 regex,
@@ -1452,13 +2099,14 @@ pub(crate) fn prepare_rewrite_ops(
                 }
             }
             RewriteOp::Return { status, body } => {
-                PreparedRewriteOp::Return(prepare_return(status, body, tokens))
+                let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
+                PreparedRewriteOp::Return(prepare_return(status, body, tokens), finalized)
             }
             RewriteOp::Break => PreparedRewriteOp::Break,
         };
         prepared.push(prepared_op);
     }
-    Box::leak(prepared.into_boxed_slice())
+    crate::arena::leak(prepared.into_boxed_slice())
 }
 
 pub(crate) fn prepare_split_clients(
@@ -1475,9 +2123,9 @@ pub(crate) fn prepare_split_clients(
         }
         let prepared = PreparedSplitClients {
             key: prepare_value_parts(block.key),
-            parts: Box::leak(parts.into_boxed_slice()),
+            parts: crate::arena::leak(parts.into_boxed_slice()),
         };
-        let key: &'static str = Box::leak(block.variable.into_boxed_str());
+        let key: &'static str = crate::arena::leak(block.variable.into_boxed_str());
         out.insert(key, prepared);
     }
     out
@@ -1536,12 +2184,14 @@ pub(crate) fn prepare_maps(
             }
         }
         let mut regex_entries: Vec<PreparedMapRegex> = Vec::with_capacity(regex.len());
+        let mut regex_set_patterns: Vec<String> = Vec::with_capacity(regex.len());
         for MapRegexEntry {
             pattern,
             case_insensitive,
             value,
         } in regex
         {
+            regex_set_patterns.push(set_pattern(&pattern, case_insensitive));
             // Already validated at parse time; a failure here is a bug.
             let compiled = regex::bytes::RegexBuilder::new(&pattern)
                 .case_insensitive(case_insensitive)
@@ -1552,18 +2202,20 @@ pub(crate) fn prepare_maps(
                 value: prepare_value_parts(value),
             });
         }
+        let regex_set = first_match_set(regex_set_patterns.iter().map(String::as_str));
         let prepared = PreparedMap {
+            regex_set,
             key: prepare_value_parts(key),
             exact: exact_map,
             hostnames,
-            wildcard_head: Box::leak(wildcard_head.into_boxed_slice()),
-            wildcard_tail: Box::leak(wildcard_tail.into_boxed_slice()),
-            regex: Box::leak(regex_entries.into_boxed_slice()),
+            wildcard_head: crate::arena::leak(wildcard_head.into_boxed_slice()),
+            wildcard_tail: crate::arena::leak(wildcard_tail.into_boxed_slice()),
+            regex: crate::arena::leak(regex_entries.into_boxed_slice()),
             default: default.map(prepare_value_parts),
             cached,
             slot,
         };
-        let var_key: &'static str = Box::leak(variable.into_boxed_str());
+        let var_key: &'static str = crate::arena::leak(variable.into_boxed_str());
         out.insert(var_key, prepared);
     }
     out
@@ -1582,6 +2234,7 @@ fn request_constant(parts: &[ValuePart]) -> bool {
             Variable::RequestUri
                 | Variable::Host
                 | Variable::Scheme
+                | Variable::Https
                 | Variable::Http(_)
                 | Variable::Cookie(_)
                 | Variable::ContentLength
@@ -1597,6 +2250,7 @@ fn request_constant(parts: &[ValuePart]) -> bool {
                 | Variable::IsRequestPort
                 | Variable::Request
                 | Variable::ServerProtocol
+                | Variable::Http2
                 | Variable::SslProtocol
                 | Variable::SslCipher
                 | Variable::SslCiphers
@@ -1626,18 +2280,20 @@ fn prepare_syslog_peer(
 ) -> Result<&'static PreparedSyslogPeer, String> {
     let server = match &peer.server {
         ErrorLogSyslogServer::Unix(path) => {
-            PreparedErrorLogSyslogServer::Unix(Box::leak(path.clone().into_boxed_path()))
+            PreparedErrorLogSyslogServer::Unix(crate::arena::leak(path.clone().into_boxed_path()))
         }
         ErrorLogSyslogServer::Udp(addr) => {
             crate::syslog::resolve(addr).map_err(|e| format!("syslog server \"{addr}\": {e}"))?;
-            PreparedErrorLogSyslogServer::Udp(Box::leak(addr.clone().into_boxed_str()))
+            PreparedErrorLogSyslogServer::Udp(crate::arena::leak(addr.clone().into_boxed_str()))
         }
     };
+    // nginx's default tag is `nginx`; ruxen's own name, unless it presents
+    // itself as nginx (RUXEN_NGINX_IDENTITY, as for `Server:`).
     let tag: &'static [u8] = match &peer.tag {
-        Some(tag) => Box::leak(tag.clone().into_bytes().into_boxed_slice()),
-        None => b"ruxen",
+        Some(tag) => crate::arena::leak(tag.clone().into_bytes().into_boxed_slice()),
+        None => crate::http::identity().plain,
     };
-    Ok(Box::leak(Box::new(PreparedSyslogPeer {
+    Ok(crate::arena::leak(Box::new(PreparedSyslogPeer {
         server,
         facility: peer.facility,
         severity: peer.severity,
@@ -1649,6 +2305,8 @@ fn prepare_syslog_peer(
 pub(crate) struct AccessLogPrep<'a> {
     format_map: std::collections::HashMap<&'a str, &'a LogFormatDef>,
     canonical: Vec<PreparedAccessLog>,
+    /// Buffered files by path.
+    buffers: std::collections::HashMap<std::path::PathBuf, &'static PreparedLogBuffer>,
 }
 
 impl<'a> AccessLogPrep<'a> {
@@ -1661,6 +2319,7 @@ impl<'a> AccessLogPrep<'a> {
         Self {
             format_map,
             canonical: Vec::new(),
+            buffers: std::collections::HashMap::new(),
         }
     }
 
@@ -1686,15 +2345,61 @@ impl<'a> AccessLogPrep<'a> {
         // the log don't hit ENOENT when no request matches `if=...`.
         let syslog = match &log.syslog {
             Some(peer) => Some(prepare_syslog_peer(peer)?),
+            // Opened per line, under a name only a request gives.
+            None if log.path_vars.is_some() => None,
             None => {
                 open_log_file(&log.path)?;
                 None
             }
         };
 
+        let buffer = match log.buffer {
+            None => None,
+            Some(size) => {
+                let wanted = (size as usize, log.flush_ms, log.gzip);
+                if let Some(known) = self.buffers.get(&log.path) {
+                    if (known.size, known.flush_ms, known.gzip) != wanted {
+                        return Err(format!(
+                            "access_log \"{}\" already defined with conflicting parameters",
+                            log.path.display()
+                        ));
+                    }
+                    Some(*known)
+                } else {
+                    // Not in the arena: `logbuf`'s registry keeps it for
+                    // the SIGTERM write after a reload too.
+                    let buffer: &'static PreparedLogBuffer =
+                        Box::leak(Box::new(PreparedLogBuffer {
+                            slot: self.buffers.len(),
+                            size: wanted.0,
+                            flush_ms: wanted.1,
+                            gzip: wanted.2,
+                            path: Box::leak(log.path.clone().into_boxed_path()),
+                        }));
+                    self.buffers.insert(log.path.clone(), buffer);
+                    Some(buffer)
+                }
+            }
+        };
         let file_index = self.canonical.len();
+        let path_vars = log.path_vars.clone().map(prepare_value_parts);
+        let condition = log.condition.clone().map(prepare_value_parts);
+        let reads_doc_root = [Some(format), path_vars, condition]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|p| {
+                matches!(
+                    p,
+                    PreparedValuePart::Var(
+                        Variable::DocumentRoot | Variable::RequestFilename | Variable::RealpathRoot
+                    )
+                )
+            });
         let prepared = PreparedAccessLog {
-            path: Box::leak(log.path.clone().into_boxed_path()),
+            buffer,
+            path_vars,
+            path: crate::arena::leak(log.path.clone().into_boxed_path()),
             format,
             escape,
             reads_upstream_headers: format.iter().any(|p| {
@@ -1703,7 +2408,8 @@ impl<'a> AccessLogPrep<'a> {
                     PreparedValuePart::Var(Variable::UpstreamHttp(_) | Variable::UpstreamCookie(_))
                 )
             }),
-            condition: log.condition.clone().map(prepare_value_parts),
+            reads_doc_root,
+            condition,
             file_index,
             syslog,
         };
@@ -1722,11 +2428,11 @@ impl<'a> AccessLogPrep<'a> {
             .iter()
             .map(|l| self.prepare_one(l))
             .collect::<Result<_, _>>()?;
-        Ok(Box::leak(prepared.into_boxed_slice()))
+        Ok(crate::arena::leak(prepared.into_boxed_slice()))
     }
 
     pub(crate) fn finish(self) -> &'static [PreparedAccessLog] {
-        Box::leak(self.canonical.into_boxed_slice())
+        crate::arena::leak(self.canonical.into_boxed_slice())
     }
 }
 
@@ -1775,12 +2481,14 @@ pub(crate) fn prepare_keepalive(
 pub(crate) fn prepare_auth_basic(raw: AuthBasic) -> PreparedAuthBasic {
     match raw {
         AuthBasic::Off => PreparedAuthBasic::Off,
-        AuthBasic::Realm(bytes) => PreparedAuthBasic::Realm(Box::leak(bytes.into_boxed_slice())),
+        AuthBasic::Realm(bytes) => {
+            PreparedAuthBasic::Realm(crate::arena::leak(bytes.into_boxed_slice()))
+        }
     }
 }
 
 pub(crate) fn leak_path_buf(path: std::path::PathBuf) -> &'static Path {
-    Box::leak(path.into_boxed_path())
+    crate::arena::leak(path.into_boxed_path())
 }
 
 pub(crate) fn resolve_keepalive(
@@ -1839,7 +2547,10 @@ pub(crate) fn prepare_return(
     let server_bytes = http::server_header_value(tokens);
     if all_literal(&body) {
         let concatenated = concat_literals(&body);
-        PreparedReturn::Static(if is_redirect_return(status, &body) {
+        // A redirect status is a redirect whatever its URL, an empty one
+        // included: nginx's `ngx_http_send_response` sends an empty
+        // `Location` then (#374).
+        PreparedReturn::Static(if is_redirect_status(status) {
             Prebuilt::leak_redirect(status, concatenated.as_bytes(), server_bytes)
         } else if body.is_empty() {
             // `return STATUS;` with no body: when the status has a canned
@@ -1903,7 +2614,7 @@ pub(crate) fn leak_doc_root(
     } else {
         path
     };
-    Box::leak(Box::new(DocRoot {
+    crate::arena::leak(Box::new(DocRoot {
         path: leak_path_buf(path),
         mapping: prepare_path_mapping(
             mapping,
@@ -1928,7 +2639,7 @@ fn resolve_access(
         rules: if access.rules.is_empty() {
             parent.rules
         } else {
-            Box::leak(access.rules.into_boxed_slice())
+            crate::arena::leak(access.rules.into_boxed_slice())
         },
         satisfy_any: access
             .satisfy
@@ -1940,11 +2651,28 @@ fn resolve_access(
             .map(leak_path_buf)
             .or(parent.auth_basic_user_file),
         auth_delay_ms: auth_delay_ms.unwrap_or(parent.auth_delay_ms),
+        auth_request: match access.auth_request {
+            Some(Some(uri)) => Some(leak_bytes(uri.as_bytes())),
+            Some(None) => None,
+            None => parent.auth_request,
+        },
+        auth_request_set: if access.auth_request_set.is_empty() {
+            parent.auth_request_set
+        } else {
+            crate::arena::leak(
+                access
+                    .auth_request_set
+                    .into_iter()
+                    .map(|(name, parts)| (leak_bytes(name.as_bytes()), prepare_value_parts(parts)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        },
         realip: PreparedRealIp {
             from: if access.realip.from.is_empty() {
                 parent.realip.from
             } else {
-                Box::leak(access.realip.from.into_boxed_slice())
+                crate::arena::leak(access.realip.from.into_boxed_slice())
             },
             header: access
                 .realip
@@ -1968,7 +2696,7 @@ fn resolve_access(
 /// the static handler, or with the location's `proxy_pass`.
 fn limit_except_rebuilds_handler(handler: &Handler, try_files: &Option<TryFiles>) -> bool {
     match handler {
-        Handler::Proxy(_) => false,
+        Handler::Proxy(_) | Handler::StubStatus => false,
         Handler::Root { .. } => try_files.is_some(),
         Handler::Return { .. } => true,
     }
@@ -1990,7 +2718,7 @@ fn build_limit_except(
         None,
         location_access,
     );
-    Box::leak(Box::new(PreparedLimitExcept {
+    crate::arena::leak(Box::new(PreparedLimitExcept {
         methods: le.methods,
         handler,
         access,
@@ -2020,8 +2748,10 @@ pub(crate) fn build_handler(
 ) -> Result<PreparedHandler, String> {
     Ok(match handler {
         Handler::Return { status, body } => {
-            PreparedHandler::Return(prepare_return(status, body, tokens))
+            let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
+            PreparedHandler::Return(prepare_return(status, body, tokens), finalized)
         }
+        Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
             pp,
             upstreams,
@@ -2034,8 +2764,11 @@ pub(crate) fn build_handler(
             // missing root is a 404 at request time. ruxen opens the root
             // as an `openat2(RESOLVE_BENEATH)` anchor, at startup when it
             // exists, else on first use (`PreparedRoot::fd`).
-            let root: &'static Path = Box::leak(path.into_boxed_path());
+            let root: &'static Path = crate::arena::leak(path.into_boxed_path());
             let root_fd = open_root(root).unwrap_or(-1);
+            if root_fd != -1 {
+                ROOT_FDS.with(|fds| fds.borrow_mut().push(root_fd));
+            }
             let path_mapping = prepare_path_mapping(
                 mapping,
                 location_pattern,
@@ -2108,7 +2841,10 @@ fn open_log_file(path: &Path) -> Result<(), String> {
         .append(true)
         .open(path)
         .map(drop)
-        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))
+        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))?;
+    // Reopened after logrotate by the `user` ruxen switches to.
+    crate::privileges::note_file(path);
+    Ok(())
 }
 
 pub(crate) fn prepare_error_log_target(
@@ -2119,7 +2855,7 @@ pub(crate) fn prepare_error_log_target(
             // Match access_log behavior: create eagerly so "no writes happened"
             // still leaves a readable file for assertions.
             open_log_file(&path)?;
-            PreparedErrorLogTarget::File(Box::leak(path.into_boxed_path()))
+            PreparedErrorLogTarget::File(crate::arena::leak(path.into_boxed_path()))
         }
         ErrorLogTarget::Stderr => PreparedErrorLogTarget::Stderr,
         ErrorLogTarget::Syslog(peer) => PreparedErrorLogTarget::Syslog(prepare_syslog_peer(&peer)?),
@@ -2136,7 +2872,7 @@ pub(crate) fn prepare_error_logs(
             level: log.level,
         });
     }
-    Ok(Box::leak(out.into_boxed_slice()))
+    Ok(crate::arena::leak(out.into_boxed_slice()))
 }
 
 pub(crate) fn resolve_error_logs(
@@ -2167,6 +2903,7 @@ pub(crate) fn build_prefix_or_exact(
     server_access_logs: &'static [PreparedAccessLog],
     server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
+    server_client_body_buffer_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
     server_disable_symlinks: Option<crate::config::DisableSymlinks>,
@@ -2174,12 +2911,16 @@ pub(crate) fn build_prefix_or_exact(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_limit_req: &crate::config::LimitReqConf,
+    server_limit_conn: &crate::config::LimitConnConf,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
+    server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedLocation, String> {
     let Location {
-        mode: _,
+        mode,
         pattern,
         noregex,
         rewrite_ops,
@@ -2209,24 +2950,34 @@ pub(crate) fn build_prefix_or_exact(
         access: location_access,
         limit_except,
         client_max_body_size: location_client_max_body_size,
+        client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
         document_root,
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        limit_req: location_limit_req,
+        limit_conn: location_limit_conn,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
         proxy: location_proxy,
+        gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
+        explicit_return: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
-    let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
+    let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
+    // Only an `if` block's anonymous location in a regex location is
+    // built here with a regex mode (#137): its alias takes the captures.
+    let is_regex = matches!(mode, MatchMode::Regex { .. });
+    let pattern: &'static [u8] = crate::arena::leak(pattern.into_bytes().into_boxed_slice());
     let alias_prefix_override: Option<&'static [u8]> = alias_prefix_override
-        .map(|s| Box::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
+        .map(|s| crate::arena::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
     let keepalive = resolve_keepalive(
         keepalive_timeout,
         keepalive_requests,
@@ -2251,7 +3002,7 @@ pub(crate) fn build_prefix_or_exact(
                 mapping: document_root.1,
             },
             pattern,
-            false,
+            is_regex,
             alias_prefix_override,
             index.clone(),
             None,
@@ -2276,7 +3027,7 @@ pub(crate) fn build_prefix_or_exact(
     let doc_root = leak_doc_root(
         document_root,
         pattern,
-        false,
+        is_regex,
         alias_prefix_override,
         location_disable_symlinks
             .clone()
@@ -2285,7 +3036,7 @@ pub(crate) fn build_prefix_or_exact(
     let handler = build_handler(
         handler,
         pattern,
-        false,
+        is_regex,
         alias_prefix_override,
         index,
         try_files,
@@ -2321,6 +3072,8 @@ pub(crate) fn build_prefix_or_exact(
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let client_body_buffer_size =
+        location_client_body_buffer_size.or(server_client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
@@ -2357,7 +3110,9 @@ pub(crate) fn build_prefix_or_exact(
         access,
         limit_except,
         client_max_body_size,
+        client_body_buffer_size,
         sendfile,
+        gzip,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
@@ -2366,6 +3121,11 @@ pub(crate) fn build_prefix_or_exact(
         post_action,
         expires,
         chunked_transfer_encoding,
+        limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
+        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
+        timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 
@@ -2388,6 +3148,7 @@ pub(crate) fn build_regex_location(
     server_access_logs: &'static [PreparedAccessLog],
     server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
+    server_client_body_buffer_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
     server_disable_symlinks: Option<crate::config::DisableSymlinks>,
@@ -2395,7 +3156,11 @@ pub(crate) fn build_regex_location(
     server_post_action: Option<&'static [u8]>,
     server_expires: PreparedExpires,
     server_chunked_transfer_encoding: bool,
+    server_limit_req: &crate::config::LimitReqConf,
+    server_limit_conn: &crate::config::LimitConnConf,
+    server_client_timeouts: crate::config::ClientTimeouts,
     server_proxy_defaults: ServerProxyDefaults,
+    server_gzip: &crate::config::GzipConf,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedRegexLocation, String> {
@@ -2430,21 +3195,28 @@ pub(crate) fn build_regex_location(
         access: location_access,
         limit_except,
         client_max_body_size: location_client_max_body_size,
+        client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
         document_root,
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
         limit_rate: location_limit_rate,
+        limit_req: location_limit_req,
+        limit_conn: location_limit_conn,
+        client_timeouts: location_client_timeouts,
         limit_rate_after: location_limit_rate_after,
         client_body_in_file_only: location_client_body_in_file_only,
         post_action: location_post_action,
         expires: location_expires,
         proxy: location_proxy,
+        gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
+        explicit_return: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
+    let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
     // The parser already validated this with the same flags + the same
     // `regex::bytes` builder; rebuild here because the compiled `Regex`
     // doesn't survive the AST.
@@ -2459,7 +3231,7 @@ pub(crate) fn build_regex_location(
         });
     let location_pattern: &'static [u8] = b"";
     let alias_prefix_override: Option<&'static [u8]> = alias_prefix_override
-        .map(|s| Box::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
+        .map(|s| crate::arena::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
     let keepalive = resolve_keepalive(
         keepalive_timeout,
         keepalive_requests,
@@ -2553,6 +3325,8 @@ pub(crate) fn build_regex_location(
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let client_body_buffer_size =
+        location_client_body_buffer_size.or(server_client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
@@ -2572,6 +3346,7 @@ pub(crate) fn build_regex_location(
         location_chunked_transfer_encoding.unwrap_or(server_chunked_transfer_encoding);
     Ok(PreparedRegexLocation {
         regex,
+        set_pattern: set_pattern(&pattern, case_insensitive),
         handler,
         rewrite_program,
         add_headers,
@@ -2587,7 +3362,9 @@ pub(crate) fn build_regex_location(
         access,
         limit_except,
         client_max_body_size,
+        client_body_buffer_size,
         sendfile,
+        gzip,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
@@ -2596,6 +3373,11 @@ pub(crate) fn build_regex_location(
         post_action,
         expires,
         chunked_transfer_encoding,
+        limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
+        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
+        timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
+            location_client_timeouts.inherit(server_client_timeouts),
+        ))),
     })
 }
 
@@ -2628,7 +3410,7 @@ pub(crate) fn prepare_try_files(
         }
         TryFilesFallback::Named(u) => PreparedFallback::Named(leak_bytes(u.as_bytes())),
     };
-    Box::leak(Box::new(PreparedTryFiles { probes, fallback }))
+    crate::arena::leak(Box::new(PreparedTryFiles { probes, fallback }))
 }
 
 #[cfg(test)]
@@ -2647,8 +3429,77 @@ mod tests {
             ("[::1]", "[::1]"),
             ("u", "u"),
         ] {
-            let got = without_default_port(Box::leak(authority.as_bytes().into()));
+            let got = without_default_port(crate::arena::leak(authority.as_bytes().into()));
             assert_eq!(got, want.as_bytes(), "{authority}");
         }
     }
+}
+
+/// The effective `gzip*` settings of a location, or `None` when gzip is
+/// off there: the filter then costs one check per response.
+pub(crate) fn prepare_gzip(
+    conf: crate::config::GzipConf,
+) -> Result<Option<&'static PreparedGzip>, String> {
+    if conf.enable != Some(true) {
+        return Ok(None);
+    }
+    let mut any_type = false;
+    // nginx always compresses text/html (ngx_http_html_default_types).
+    let mut types: Vec<&'static str> = vec!["text/html"];
+    for t in conf.types.unwrap_or_default() {
+        if t == "*" {
+            any_type = true;
+        } else if !types.contains(&t.as_str()) {
+            types.push(crate::arena::leak(t.into_boxed_str()));
+        }
+    }
+    let mut disable_msie6 = false;
+    let mut patterns = Vec::new();
+    for d in conf.disable.unwrap_or_default() {
+        match d.as_str() {
+            "msie6" => disable_msie6 = true,
+            "degradation" => {}
+            _ => patterns.push(format!("(?i){d}")),
+        }
+    }
+    let disable = if patterns.is_empty() {
+        None
+    } else {
+        Some(regex::RegexSet::new(&patterns).map_err(|e| format!("gzip_disable: {e}"))?)
+    };
+    Ok(Some(crate::arena::leak(Box::new(PreparedGzip {
+        any_type,
+        types: crate::arena::leak(types.into_boxed_slice()),
+        min_length: conf.min_length.unwrap_or(20),
+        comp_level: conf.comp_level.unwrap_or(1),
+        vary: conf.vary.unwrap_or(false),
+        http_10: conf.http_version == Some(10),
+        proxied: conf.proxied.unwrap_or(crate::config::gzip_proxied::OFF),
+        disable_msie6,
+        disable,
+    }))))
+}
+
+/// `pattern` as a `RegexSet` member, with the case flag its own `Regex`
+/// was built with.
+pub(crate) fn set_pattern(pattern: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        format!("(?i:{pattern})")
+    } else {
+        pattern.to_string()
+    }
+}
+
+/// One `RegexSet` over a list of regexes nginx tries in order: the lowest
+/// matching index is the first match, found in one pass (#248). `None`
+/// for fewer than two (a set gains nothing), or if the set doesn't build
+/// (size limits): the caller then tries the regexes one by one.
+pub(crate) fn first_match_set<'a>(
+    patterns: impl IntoIterator<Item = &'a str>,
+) -> Option<regex::bytes::RegexSet> {
+    let patterns: Vec<&str> = patterns.into_iter().collect();
+    if patterns.len() < 2 {
+        return None;
+    }
+    regex::bytes::RegexSet::new(&patterns).ok()
 }

@@ -218,15 +218,15 @@ http {
 }
 "#;
     let (_g, port, dir) = spawn_server(conf);
-    std::fs::write(dir.join("big.bin"), vec![b'x'; 1100]).unwrap();
+    // As nginx: exact up to 9999 bytes, then rounded to the nearest unit.
+    std::fs::write(dir.join("small.bin"), vec![b'x'; 1100]).unwrap();
+    std::fs::write(dir.join("big.bin"), vec![b'x'; 15_000]).unwrap();
 
     let r = http_get(port, "/");
     assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
     let b = std::str::from_utf8(body(&r)).unwrap();
-    assert!(
-        b.contains("2K"),
-        "expected rounded size in K units, got: {b}"
-    );
+    assert!(b.contains("    15K\r\n"), "expected 15K, got: {b}");
+    assert!(b.contains("   1100\r\n"), "expected 1100, got: {b}");
 }
 
 #[test]
@@ -357,4 +357,28 @@ http {
     let r = http_get(port, "/");
     let b = std::str::from_utf8(body(&r)).unwrap();
     assert!(b.starts_with('[') && b.ends_with(']'), "body: {b}");
+}
+
+#[test]
+fn autoindex_leaves_out_dot_names_like_nginx() {
+    for format in ["html", "json", "xml"] {
+        let conf = format!(
+            "events {{}}\nhttp {{\n  server {{\n    listen 127.0.0.1:%%PORT%%;\n    \
+             location / {{\n      root %%DIR%%;\n      autoindex on;\n      \
+             autoindex_format {format};\n    }}\n  }}\n}}\n"
+        );
+        let (_g, port, dir) = spawn_server(&conf);
+        std::fs::write(dir.join(".htpasswd"), b"secret").unwrap();
+        std::fs::write(dir.join(".env"), b"secret").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("visible.txt"), b"v").unwrap();
+
+        let r = http_get(port, "/");
+        assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+        let b = std::str::from_utf8(body(&r)).unwrap();
+        assert!(b.contains("visible.txt"), "{format}: {b}");
+        for hidden in [".htpasswd", ".env", ".git"] {
+            assert!(!b.contains(hidden), "{format} lists {hidden}: {b}");
+        }
+    }
 }

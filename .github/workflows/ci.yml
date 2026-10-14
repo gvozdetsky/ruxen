@@ -25,12 +25,40 @@ jobs:
         run: cargo build --release --all-targets --locked
       - name: Test
         run: cargo test --release --locked
+      - name: Test on the epoll driver
+        # monoio's legacy driver, used where io_uring is unavailable (#215).
+        run: RUXEN_DRIVER=epoll cargo test --release --locked
       - name: Keep the binary for nginx-tests
         uses: actions/upload-artifact@v4
         with:
           name: ruxen-release
           path: target/release/ruxen
           retention-days: 3
+
+  fuzz:
+    # Each parser fuzz target (fuzz/, #217) for 30 s, from the seeds in
+    # fuzz/seeds. Short on purpose: it catches what a change breaks. Longer
+    # runs happen privately, so a crash that might be a vulnerability is
+    # handled through SECURITY.md before it shows up in public logs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Fuzz each target
+        run: |
+          for t in request host uri proxy_protocol config chunked upstream_head upstream_chunked; do
+            mkdir -p "fuzz/corpus/$t"
+            # The prebuilt cargo-fuzz is a musl binary and defaults to its
+            # own target, where the sanitizer can't run: say gnu.
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$t" \
+              "fuzz/corpus/$t" "fuzz/seeds/$t" -- -max_total_time=30
+          done
 
   nginx-tests:
     # The files NGINX_TEST_PROGRESS.md lists as passing, against the
@@ -48,7 +76,7 @@ jobs:
       - name: Perl modules
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends libio-socket-ssl-perl
+          sudo apt-get install -y -q --no-install-recommends libio-socket-ssl-perl libprotocol-websocket-perl
       - name: Fetch nginx-tests
         run: |
           git init -q ../nginx-tests
@@ -69,7 +97,8 @@ jobs:
 
   container:
     # contrib/docker: the image builds, and serves under the io_uring
-    # seccomp profile it ships with.
+    # seccomp profile it ships with, and under Docker's default profile
+    # (epoll, #215).
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +112,13 @@ jobs:
             | grep -q "hello from ruxen"
           docker stop ruxen
           test "$(docker inspect ruxen --format '{{.State.ExitCode}}')" = 0
+      - name: Smoke test, default seccomp profile
+        run: |
+          docker run -d --name ruxen-epoll -p 8081:8080 ruxen:ci
+          for i in $(seq 50); do curl -sf http://127.0.0.1:8081/ && break; sleep 0.2; done \
+            | grep -q "hello from ruxen"
+          docker stop ruxen-epoll
+          test "$(docker inspect ruxen-epoll --format '{{.State.ExitCode}}')" = 0
 
   msrv:
     # Keeps `rust-version` in Cargo.toml honest.

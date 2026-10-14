@@ -1,7 +1,7 @@
-//! M72 — an upstream body larger than ruxen buffers is refused with a 502
-//! however it is framed. Chunked and close-delimited bodies already were;
-//! a `Content-Length` body used to be read into memory whole, whatever its
-//! size, until the response streams (#88).
+//! M72 — an upstream body larger than ruxen could buffer is relayed as it
+//! arrives (#88), as nginx does: the head and the first bytes reach the
+//! client at once, and when the upstream then stalls, `proxy_read_timeout`
+//! ends the response by closing the connection. It used to be a 502.
 
 mod common;
 
@@ -12,7 +12,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 #[test]
-fn an_oversized_content_length_body_is_refused() {
+fn a_body_too_large_to_buffer_is_relayed() {
     let setup = common::ports::setup_lock();
     let backend = TcpListener::bind("127.0.0.1:0").unwrap();
     let backend_port = backend.local_addr().unwrap().port();
@@ -48,21 +48,17 @@ fn an_oversized_content_length_body_is_refused() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let started = Instant::now();
@@ -70,20 +66,33 @@ fn an_oversized_content_length_body_is_refused() {
     s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
     s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .unwrap();
-    let mut resp = String::new();
-    let _ = s.read_to_string(&mut resp);
-    let elapsed = started.elapsed();
+    // The head and the first body bytes come before the upstream is done.
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !resp.ends_with(b"start") {
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "{}", String::from_utf8_lossy(&resp));
+        resp.extend_from_slice(&buf[..n]);
+    }
+    let first_bytes = started.elapsed();
+    // Then proxy_read_timeout (5 s) ends it: the connection closes.
+    let _ = s.read_to_end(&mut resp);
+    let closed = started.elapsed();
     sleep(Duration::from_millis(50));
     let log = std::fs::read_to_string(dir.join("error.log")).unwrap_or_default();
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
-    // Refused on the header, not after a read timeout.
-    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     assert!(
-        log.contains("upstream response is too big to buffer"),
+        resp.contains("\r\nContent-Length: 1073741824\r\n"),
+        "{resp}"
+    );
+    assert!(first_bytes < Duration::from_secs(2), "{first_bytes:?}");
+    assert!(closed >= Duration::from_secs(4), "{closed:?}");
+    assert!(
+        log.contains("upstream timed out (110: Connection timed out) while reading upstream"),
         "{log}"
     );
 }

@@ -40,14 +40,16 @@ pub enum RewriteOutcome {
     /// `return`, must not run.
     Break,
     Reroute,
-    Respond(Response),
+    /// The response, and whether `error_page` can take it.
+    Respond(Response, bool),
 }
 
 pub(crate) enum RewriteControl {
     Continue,
     Stop,
     Reroute,
-    Respond(Response),
+    /// The response, and whether `error_page` can take it.
+    Respond(Response, bool),
 }
 
 pub(crate) fn guard_file_test(kind: FileTestKind, path: &[u8]) -> bool {
@@ -322,6 +324,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
         proxy_host: &[],
         upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
         upstream_states: req.upstream.map_or(&[], |u| &u.states),
+        upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
         sent_trailers: &[],
         tls: req.tls,
         conn: req.conn,
@@ -366,7 +369,11 @@ pub(crate) fn execute_rewrite_ops(
                 render_parts(value, &ctx, &mut rendered);
                 rewrite_state.set_user_var(name, rendered);
             }
-            PreparedRewriteOp::If { guard, body } => {
+            PreparedRewriteOp::If {
+                guard,
+                body,
+                location,
+            } => {
                 let args = current_args
                     .as_deref()
                     .unwrap_or_else(|| request_args(request_uri));
@@ -388,6 +395,10 @@ pub(crate) fn execute_rewrite_ops(
                     }
                 }
                 if holds {
+                    // Every location-level `if` has a configuration of its
+                    // own in nginx: one with rewrite directives only goes
+                    // back to the enclosing one's.
+                    rewrite_state.if_location = *location;
                     match execute_rewrite_ops(
                         body,
                         http,
@@ -464,9 +475,15 @@ pub(crate) fn execute_rewrite_ops(
                         rendered.extend_from_slice(args);
                     }
                     let location = escape_redirect_location(&rendered);
-                    return RewriteControl::Respond(Response::Owned(
-                        http::build_redirect_response(status, &location, req.method, server_header),
-                    ));
+                    return RewriteControl::Respond(
+                        Response::Owned(http::build_redirect_response(
+                            status,
+                            &location,
+                            req.method,
+                            server_header,
+                        )),
+                        true,
+                    );
                 }
 
                 if new_uri.is_empty() {
@@ -500,7 +517,7 @@ pub(crate) fn execute_rewrite_ops(
                     PreparedRewriteFlag::Redirect | PreparedRewriteFlag::Permanent => {}
                 }
             }
-            PreparedRewriteOp::Return(prepared) => {
+            PreparedRewriteOp::Return(prepared, finalized) => {
                 let args = current_args
                     .as_deref()
                     .unwrap_or_else(|| request_args(request_uri));
@@ -521,7 +538,7 @@ pub(crate) fn execute_rewrite_ops(
                         build_templated_return(*status, parts, &ctx, req.method, server_header),
                     ),
                 };
-                return RewriteControl::Respond(response);
+                return RewriteControl::Respond(response, *finalized);
             }
             PreparedRewriteOp::Break => return RewriteControl::Stop,
         }
@@ -554,7 +571,7 @@ pub(crate) fn run_server_rewrite(
         rewrite_state,
         server_name_captures,
     ) {
-        RewriteControl::Respond(response) => Some(response),
+        RewriteControl::Respond(response, _) => Some(response),
         RewriteControl::Continue | RewriteControl::Stop | RewriteControl::Reroute => None,
     }
 }
@@ -587,7 +604,7 @@ pub(crate) fn run_rewrite_program(
         RewriteControl::Continue => RewriteOutcome::Continue,
         RewriteControl::Stop => RewriteOutcome::Break,
         RewriteControl::Reroute => RewriteOutcome::Reroute,
-        RewriteControl::Respond(resp) => RewriteOutcome::Respond(resp),
+        RewriteControl::Respond(resp, finalized) => RewriteOutcome::Respond(resp, finalized),
     }
 }
 

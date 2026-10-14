@@ -49,24 +49,35 @@ use crate::phase::{self, Response};
 use crate::{autoindex, file, fs_resolve, uri};
 
 mod connection;
+pub(crate) mod gzip;
+mod h2;
 mod handler;
+pub(crate) mod limit_conn;
+pub(crate) mod limit_req;
+pub(crate) mod listeners;
 mod log;
+pub(crate) mod logbuf;
+mod panics;
 mod prepare;
 mod prepared;
 mod render;
 mod response;
 mod rewrite;
 mod runtime;
+pub(crate) mod stats;
+mod tunnel;
 
 pub(crate) use connection::*;
 pub(crate) use handler::*;
 pub(crate) use log::*;
+pub(crate) use panics::*;
 pub(crate) use prepare::*;
 pub(crate) use prepared::*;
 pub(crate) use render::*;
 pub(crate) use response::*;
 pub(crate) use rewrite::*;
 pub(crate) use runtime::*;
+pub(crate) use tunnel::*;
 
 /// Bumped on SIGUSR1; each worker reopens its access_log files before the
 /// next write once it sees a new value (logrotate's `kill -USR1`).
@@ -122,11 +133,17 @@ thread_local! {
 pub(crate) enum AccessLogSink {
     File(AsyncFile),
     Syslog(crate::syslog::SyslogSocket),
+    /// A path with variables: opened per line (#303).
+    PerLine,
 }
 
 fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AccessLogSink]>, String> {
     let mut opened: Vec<AccessLogSink> = Vec::with_capacity(logs.len());
     for log in logs {
+        if log.path_vars.is_some() {
+            opened.push(AccessLogSink::PerLine);
+            continue;
+        }
         if let Some(peer) = log.syslog {
             let sock = crate::syslog::SyslogSocket::open(peer).map_err(|e| {
                 format!(
@@ -178,6 +195,10 @@ pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc
         let mut cell = cell.borrow_mut();
         if cell.1.is_some() && cell.0 != generation {
             cell.0 = generation;
+            // The buffered lines belong to the files being rotated away.
+            if let Some(old) = &cell.1 {
+                logbuf::flush_all(old);
+            }
             match open_access_logs(logs) {
                 Ok(files) => cell.1 = Some(files),
                 // nginx keeps writing to the old file when a reopen fails.
@@ -186,6 +207,15 @@ pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc
         }
         cell.1.clone()
     })
+}
+
+/// The worker is stopping: write its access_log buffers out.
+pub(crate) fn flush_access_log_buffers() {
+    ACCESS_LOG_FILES.with(|cell| {
+        if let Some(files) = &cell.borrow().1 {
+            logbuf::flush_all(files);
+        }
+    });
 }
 
 /// Machine hostname, resolved once at startup for `$hostname` expansion.
@@ -209,9 +239,11 @@ pub(crate) fn hostname() -> &'static [u8] {
         .as_slice()
 }
 
-/// Body size above which we spill to a temp file so `$request_body_file`
-/// can be populated for nginx-tests cases.
-pub(crate) const REQUEST_BODY_FILE_THRESHOLD: usize = 2 * 1024;
+/// nginx's default `client_body_buffer_size` on 64-bit platforms (two
+/// pages): bodies up to this size stay in memory, larger ones go to a temp
+/// file (`$request_body_file`), as `ngx_http_write_request_body` does once
+/// the buffer is full.
+pub(crate) const DEFAULT_CLIENT_BODY_BUFFER_SIZE: u64 = 16 * 1024;
 
 /// Next request-body temp file number, nginx's `ngx_temp_number`: seeded
 /// once per process, bumped by a jump when a name is taken.
@@ -230,20 +262,28 @@ pub(crate) struct BodyTempDir {
     /// away (a temp-directory cleaner): a new one, never the old name,
     /// which someone else could have taken by then.
     private: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// The configured directory exists (made, or found, once): a `mkdir`
+    /// per request body was most of the spill cost (#246).
+    made: std::sync::atomic::AtomicBool,
 }
 
 impl BodyTempDir {
     pub(crate) fn new(configured: Option<crate::config::TempPath>) -> Self {
+        if let Some(t) = &configured {
+            // Made and handed to the `user` at startup (ngx_create_paths).
+            crate::privileges::note_temp_dir(&t.path);
+        }
         BodyTempDir {
             configured: configured.map(|t| (prepare::leak_path_buf(t.path), t.levels)),
             private: std::sync::Mutex::new(None),
+            made: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// The directory of a server's or location's own
     /// `client_body_temp_path`.
     pub(crate) fn leak(configured: crate::config::TempPath) -> &'static BodyTempDir {
-        Box::leak(Box::new(BodyTempDir::new(Some(configured))))
+        crate::arena::leak(Box::new(BodyTempDir::new(Some(configured))))
     }
 
     /// Where a file named `name` goes: nginx's ngx_create_hashed_filename.
@@ -271,11 +311,15 @@ impl BodyTempDir {
         use std::os::unix::fs::DirBuilderExt;
         if let Some((dir, _)) = self.configured {
             // nginx's ngx_create_paths: one level, 0700; an existing
-            // directory is fine.
-            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
+            // directory is fine. Once it exists, only a missing directory
+            // (`gone`) makes it again.
+            if gone || !self.made.load(Ordering::Relaxed) {
+                match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return None,
+                }
+                self.made.store(true, Ordering::Relaxed);
             }
             return Some(dir.to_path_buf());
         }
@@ -425,8 +469,9 @@ pub(crate) fn maybe_spill_request_body_to_file(
     body: &[u8],
     temp: &BodyTempDir,
     persistent: bool,
+    buffer_size: u64,
 ) -> Option<SpilledBody> {
-    if body.len() <= REQUEST_BODY_FILE_THRESHOLD {
+    if body.len() as u64 <= buffer_size {
         return None;
     }
     let spilled = new_body_file(temp, persistent)?;
@@ -445,6 +490,62 @@ pub(crate) const REQUEST_BODY_IN_MEMORY: usize = 1 << 20;
 /// nginx's default `client_max_body_size`.
 pub(crate) const DEFAULT_CLIENT_MAX_BODY_SIZE: u64 = 1 << 20;
 
+thread_local! {
+    /// This worker's spare request-body buffers. A body buffer is sized to
+    /// the Content-Length (64 KiB for a 64 KiB POST); allocated and freed
+    /// per request, glibc's thread arenas give the pages back and fault
+    /// them in again on the next one, as the gzip buffers did (#289).
+    static BODY_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Buffers kept per worker, and the largest kept: an idle worker holds at
+/// most 16 × 256 KiB.
+const BODY_POOL_MAX: usize = 16;
+const BODY_POOL_KEEP: usize = 256 * 1024;
+
+/// An empty buffer with room for `capacity` bytes, from the pool if one is
+/// there.
+pub(crate) fn take_body_buffer(capacity: usize) -> Vec<u8> {
+    let mut buf = BODY_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    buf.reserve(capacity);
+    buf
+}
+
+/// A request body held in memory (or the upstream request built around
+/// one); its buffer goes back to the worker's pool when the request is
+/// done.
+pub(crate) struct PooledBody(pub(crate) Vec<u8>);
+
+impl AsRef<[u8]> for PooledBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for PooledBody {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl Drop for PooledBody {
+    fn drop(&mut self) {
+        let mut buf = std::mem::take(&mut self.0);
+        if buf.capacity() == 0 || buf.capacity() > BODY_POOL_KEEP {
+            return;
+        }
+        buf.clear();
+        BODY_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < BODY_POOL_MAX {
+                p.push(buf);
+            }
+        });
+    }
+}
+
 /// Collects a request body: in memory up to `REQUEST_BODY_IN_MEMORY`, then
 /// in a temp file (see `SpilledBody`).
 pub(crate) struct BodySink<'t> {
@@ -459,7 +560,7 @@ pub(crate) struct BodySink<'t> {
 impl<'t> BodySink<'t> {
     pub(crate) fn with_capacity(expected: u64, temp: &'t BodyTempDir, persistent: bool) -> Self {
         BodySink {
-            mem: Vec::with_capacity(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
+            mem: take_body_buffer(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
             file: None,
             len: 0,
             temp,
@@ -502,11 +603,25 @@ impl<'t> BodySink<'t> {
     }
 
     /// The in-memory body (empty when spilled) and the file, if any.
-    pub(crate) fn finish(self) -> (Vec<u8>, Option<SpilledBody>) {
+    pub(crate) fn finish(self) -> (PooledBody, Option<SpilledBody>) {
         match self.file {
-            Some(spilled) => (Vec::new(), Some(spilled)),
-            None => (self.mem, None),
+            Some(spilled) => (PooledBody(self.mem), Some(spilled)),
+            None => (PooledBody(self.mem), None),
         }
+    }
+
+    /// The in-memory buffer to read the rest of the body into, in place:
+    /// `Some` while the body is in memory and the buffer has room. Hand it
+    /// back with `put_read_buf`.
+    pub(crate) fn take_read_buf(&mut self) -> Option<Vec<u8>> {
+        (self.file.is_none() && self.mem.capacity() > self.mem.len())
+            .then(|| std::mem::take(&mut self.mem))
+    }
+
+    /// The buffer from `take_read_buf`, `n` bytes longer.
+    pub(crate) fn put_read_buf(&mut self, buf: Vec<u8>, n: usize) {
+        self.mem = buf;
+        self.len += n as u64;
     }
 }
 
@@ -923,6 +1038,7 @@ mod tests {
             proxy_host: &[],
             upstream_headers: &[],
             upstream_states: &[],
+            upstream_cache_status: &[],
             sent_trailers: &[],
             tls: None,
             conn: &phase::ConnInfo::NONE,
@@ -976,7 +1092,7 @@ mod tests {
             request_length: 0,
             epoch_secs: 0,
             epoch_ms: 0,
-            body: &[],
+            body: &crate::phase::NO_BODY,
             body_len: 0,
             body_file: None,
             tls: None,
@@ -1004,7 +1120,9 @@ mod tests {
             Response::Prebuilt(bytes) => bytes.to_vec(),
             Response::File { .. } => panic!("error path should not return streamed file body"),
             Response::Reroute(_) => panic!("root handler should not reroute on metadata failure"),
-            Response::Proxy(_) => panic!("root handler should not return proxy plan"),
+            Response::Proxy(_) | Response::Upgrade(_) | Response::ProxyStream(_) => {
+                panic!("root handler should not return proxy plan")
+            }
         };
         assert!(
             std::str::from_utf8(&r)
@@ -1117,6 +1235,7 @@ mod tests {
             proxy_host: &[],
             upstream_headers: &[],
             upstream_states: &[],
+            upstream_cache_status: &[],
             sent_trailers: &[],
             tls: None,
             conn: &phase::ConnInfo::NONE,
@@ -1173,6 +1292,7 @@ mod tests {
             proxy_host: &[],
             upstream_headers: &[],
             upstream_states: &[],
+            upstream_cache_status: &[],
             sent_trailers: &[],
             tls: None,
             conn: &phase::ConnInfo::NONE,
@@ -1237,6 +1357,7 @@ mod tests {
             proxy_host: &[],
             upstream_headers: &[],
             upstream_states: &[],
+            upstream_cache_status: &[],
             sent_trailers: &[],
             tls: None,
             conn: &phase::ConnInfo::NONE,

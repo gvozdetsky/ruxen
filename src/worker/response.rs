@@ -37,10 +37,6 @@ pub(crate) fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-pub(crate) fn is_redirect_return(status: u16, body: &[ValuePart]) -> bool {
-    is_redirect_status(status) && !body.is_empty()
-}
-
 pub(crate) fn build_templated_return(
     status: u16,
     parts: &[PreparedValuePart],
@@ -50,7 +46,7 @@ pub(crate) fn build_templated_return(
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(64);
     render_parts(parts, ctx, &mut body);
-    if is_redirect_status(status) && !body.is_empty() {
+    if is_redirect_status(status) {
         http::build_redirect_response(status, &body, method, server)
     } else if matches!(method, Method::Head) {
         http::build_head_response(status, body.len(), server)
@@ -183,6 +179,13 @@ pub(crate) fn response_header_values_all(response: &[u8], name: &[u8]) -> Vec<Ve
         block = &block[advance..];
     }
     values
+}
+
+/// A 444 without a body: nginx's NGX_HTTP_CLOSE, which closes the
+/// connection instead of answering (#397).
+#[inline]
+pub(crate) fn closes_unanswered(bytes: &[u8]) -> bool {
+    bytes.get(9..12) == Some(b"444") && bytes.ends_with(b"\r\n\r\n")
 }
 
 pub(crate) fn response_status(bytes: &[u8]) -> u16 {
@@ -451,7 +454,16 @@ pub(crate) fn apply_expires(
         PreparedExpires::Variable(parts) | PreparedExpires::VariableModified(parts) => {
             let modified = matches!(expires, PreparedExpires::VariableModified(_));
             let mut buf = Vec::with_capacity(32);
-            render_parts(parts, ctx, &mut buf);
+            // `$sent_http_*` (a `map $sent_http_content_type $expires`)
+            // reads the response's headers, as nginx's headers filter sees
+            // `r->headers_out` by then.
+            let sep_pos = response.windows(4).position(|w| w == b"\r\n\r\n");
+            let mut local_ctx = *ctx;
+            local_ctx.sent_headers = match sep_pos {
+                Some(p) => &response[..p + 2],
+                None => &response[..],
+            };
+            render_parts(parts, &local_ctx, &mut buf);
             let s = match std::str::from_utf8(&buf) {
                 Ok(v) => v,
                 Err(_) => return response,
@@ -679,6 +691,7 @@ pub(crate) fn apply_proxy_add_headers(
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
     upstream_headers: &[u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let needs_expires = !matches!(meta.proxy_expires, PreparedExpires::Off);
     if meta.proxy_add_headers.is_empty() && meta.proxy_add_trailers.is_empty() && !needs_expires {
@@ -689,11 +702,28 @@ pub(crate) fn apply_proxy_add_headers(
         // A 502/504 the proxy produced itself: `add_header ... always`
         // applies to it too.
         Response::Prebuilt(bytes) => bytes.to_vec(),
+        // A 101's head: `add_header ... always`.
+        Response::Upgrade(mut upgraded) => {
+            let root_only = root_only_state(meta);
+            let render_ctx =
+                proxy_render_ctx(http, ctx, meta, 101, upstream_headers, &root_only, uri);
+            upgraded.head = inject_add_headers(upgraded.head, meta.proxy_add_headers, &render_ctx);
+            return Response::Upgrade(upgraded);
+        }
         other => return other,
     };
     // `$upstream_http_*` read the upstream's own header lines, which still
     // include the ones hidden from the client (Server, Date, X-Accel-*).
-    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(&bytes), upstream_headers);
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_headers,
+        &root_only,
+        uri,
+    );
     let mut out = bytes;
     if needs_expires {
         out = apply_expires(out, meta.proxy_expires, &render_ctx);
@@ -735,6 +765,7 @@ pub(crate) fn intercept_proxy_error(
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
     server: &'static [u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     if error_pages.is_empty() {
         return response;
@@ -742,7 +773,16 @@ pub(crate) fn intercept_proxy_error(
     let Response::Prebuilt(bytes) = response else {
         return response;
     };
-    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(bytes), &[]);
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(bytes),
+        &[],
+        &root_only,
+        uri,
+    );
     maybe_intercept_error_page(
         Response::Prebuilt(bytes),
         error_pages,
@@ -754,6 +794,20 @@ pub(crate) fn intercept_proxy_error(
     )
 }
 
+/// The location's root alone, for `$document_root` / `$request_filename`
+/// in a proxied response's `add_header`, or in an access log line, when
+/// the request kept no rewrite state (#363). Cold: only past a check that
+/// something reads them.
+#[cold]
+pub(crate) fn root_only_state(meta: &phase::ProcessMeta) -> Option<RewriteState> {
+    if meta.rewrite_state.is_some() {
+        return None;
+    }
+    let mut state = RewriteState::default();
+    state.doc_root = Some(meta.doc_root?);
+    Some(state)
+}
+
 /// The variable context for rendering against a proxied response
 /// (`add_header`, `proxy_redirect`).
 fn proxy_render_ctx<'a>(
@@ -762,14 +816,20 @@ fn proxy_render_ctx<'a>(
     meta: &'a phase::ProcessMeta,
     status: u16,
     upstream_headers: &'a [u8],
+    root_only: &'a Option<RewriteState>,
+    // The current URI (normalized, rewritten), when the caller has it;
+    // else the request's own path (#373).
+    uri: Option<&'a [u8]>,
 ) -> RenderCtx<'a> {
     let request_uri = ctx.path;
     let args = request_args(request_uri);
-    let uri = request_uri
-        .iter()
-        .position(|&b| b == b'?')
-        .map(|i| &request_uri[..i])
-        .unwrap_or(request_uri);
+    let uri = uri.unwrap_or_else(|| {
+        request_uri
+            .iter()
+            .position(|&b| b == b'?')
+            .map(|i| &request_uri[..i])
+            .unwrap_or(request_uri)
+    });
     RenderCtx {
         uri,
         request_uri,
@@ -806,12 +866,13 @@ fn proxy_render_ctx<'a>(
         epoch_secs: ctx.epoch_secs,
         epoch_ms: ctx.epoch_ms,
         server_name_captures: &[],
-        rewrite_state: meta.rewrite_state.as_deref(),
+        rewrite_state: meta.rewrite_state.as_deref().or(root_only.as_ref()),
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.proxy_host,
         upstream_headers,
         upstream_states: &meta.upstream_states,
+        upstream_cache_status: meta.upstream_cache_status.map_or(&[][..], |s| s.as_bytes()),
         sent_trailers: &[],
         tls: ctx.tls,
         conn: ctx.conn,
@@ -823,12 +884,84 @@ fn proxy_render_ctx<'a>(
 /// rewrite program's `return`. nginx's special response handler and
 /// header filter run with the server's configuration then: its
 /// `error_page` (a match becomes a `Reroute`), else its `add_header`s.
+/// `parts` rendered in an `auth_request` subrequest's context (#358): its
+/// URI, its status, the head it answered with (`$sent_http_*`) and its
+/// upstream (`req.upstream`, `$upstream_*`), as nginx evaluates
+/// `auth_request_set` with the subrequest.
+pub(crate) fn render_in_subrequest(
+    http: &'static PreparedHttp,
+    req: &phase::RequestCtx<'_>,
+    server_name: &'static [u8],
+    server_port: u16,
+    status: u16,
+    sent_headers: &[u8],
+    parts: &[PreparedValuePart],
+) -> Vec<u8> {
+    let request_uri = req.path;
+    let args = request_args(request_uri);
+    let uri = request_uri
+        .iter()
+        .position(|&b| b == b'?')
+        .map(|i| &request_uri[..i])
+        .unwrap_or(request_uri);
+    let ctx = RenderCtx {
+        uri,
+        request_uri,
+        request_method: req.method_bytes,
+        request_line: req.request_line,
+        host: req.host.unwrap_or(server_name),
+        remote_addr: req.remote_addr,
+        remote_port: req.remote_port,
+        remote_user: b"",
+        server_name,
+        status,
+        args,
+        is_args: if args.is_empty() { b"" } else { b"?" },
+        scheme: if req.tls.is_some() { b"https" } else { b"http" },
+        hostname: hostname(),
+        headers_raw: req.headers_raw,
+        underscores_in_headers: false,
+        sent_headers,
+        connection_id: req.connection_id,
+        connection_requests: req.connection_requests,
+        connection_time_us: req.connection_time_us,
+        request_time_us: req.request_time_us,
+        server_port,
+        request_port: req.request_port,
+        pipe: req.pipe,
+        request_length: req.request_length,
+        request_body: req.body,
+        request_body_file: &[],
+        bytes_sent: 0,
+        body_bytes_sent: 0,
+        epoch_secs: req.epoch_secs,
+        epoch_ms: req.epoch_ms,
+        server_name_captures: &[],
+        rewrite_state: None,
+        split_clients: Some(&http.split_clients),
+        maps: Some(&http.maps),
+        proxy_host: &[],
+        upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
+        upstream_states: req.upstream.map_or(&[], |u| &u.states),
+        upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
+        sent_trailers: &[],
+        tls: req.tls,
+        conn: req.conn,
+    };
+    let mut out = Vec::new();
+    render_parts(parts, &ctx, &mut out);
+    out
+}
+
 pub(crate) fn finish_server_response(
     http: &'static PreparedHttp,
     req: &phase::RequestCtx<'_>,
     server: &'static PreparedServer,
     response: Response,
     in_error_page: bool,
+    // The status `error_page` is looked up by, when it isn't the
+    // response's own: 497 (plain HTTP on an `ssl` port, sent as 400).
+    code: Option<u16>,
 ) -> Response {
     if server.error_pages.is_empty() && server.add_headers.is_empty() {
         return response;
@@ -879,11 +1012,13 @@ pub(crate) fn finish_server_response(
         proxy_host: &[],
         upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
         upstream_states: req.upstream.map_or(&[], |u| &u.states),
+        upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
         sent_trailers: &[],
         tls: req.tls,
         conn: req.conn,
     };
-    let response = maybe_intercept_error_page(
+    let response = maybe_intercept_error_page_as(
+        code,
         response,
         server.error_pages,
         req,
@@ -921,6 +1056,7 @@ pub(crate) fn rewrite_proxy_redirects(
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
     upstream_headers: &[u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let Response::Owned(bytes) = response else {
         return response;
@@ -928,7 +1064,16 @@ pub(crate) fn rewrite_proxy_redirects(
     let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
         return Response::Owned(bytes);
     };
-    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(&bytes), upstream_headers);
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_headers,
+        &root_only,
+        uri,
+    );
 
     let mut out = Vec::with_capacity(bytes.len() + 64);
     let mut changed = false;
@@ -1230,6 +1375,31 @@ pub(crate) fn maybe_intercept_error_page(
     recursive: bool,
     server: &[u8],
 ) -> Response {
+    maybe_intercept_error_page_as(
+        None,
+        response,
+        error_pages,
+        req,
+        render_ctx_base,
+        in_error_page,
+        recursive,
+        server,
+    )
+}
+
+/// `maybe_intercept_error_page`, with the rule looked up by `code` when
+/// given instead of the response's status.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn maybe_intercept_error_page_as(
+    code: Option<u16>,
+    response: Response,
+    error_pages: &[PreparedErrorPage],
+    req: &phase::RequestCtx<'_>,
+    render_ctx_base: &RenderCtx<'_>,
+    in_error_page: bool,
+    recursive: bool,
+    server: &[u8],
+) -> Response {
     if in_error_page || error_pages.is_empty() {
         return response;
     }
@@ -1241,8 +1411,12 @@ pub(crate) fn maybe_intercept_error_page(
         Response::Reroute(_) => return response,
         // Proxy intercept is handled inside `proxy::run_proxy` from
         // pre-rendered plan rules; unresolved proxy plans pass through here.
-        Response::Proxy(_) => return response,
+        // A relayed body is only chosen when no intercept rule matched.
+        Response::Proxy(_) | Response::ProxyStream(_) => return response,
+        // A 101 isn't an error.
+        Response::Upgrade(_) => return response,
     };
+    let status = code.unwrap_or(status);
     let Some(rule) = error_pages.iter().find(|rule| rule.status == status) else {
         return response;
     };
@@ -1343,7 +1517,7 @@ pub(crate) fn fallback_body(code: u16) -> &'static str {
 }
 
 pub(crate) fn leak_bytes(b: &[u8]) -> &'static [u8] {
-    Box::leak(b.to_vec().into_boxed_slice())
+    crate::arena::leak(b.to_vec().into_boxed_slice())
 }
 
 pub(crate) fn response_has_header(bytes: &[u8], name: &[u8]) -> bool {

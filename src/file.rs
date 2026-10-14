@@ -291,7 +291,7 @@ fn resolve_conditional_last_modified(
 /// side make any concrete compare fail. `*` always matches a resource that
 /// exists. Our emitted ETag is syntactically strong (`"hex-hex"`), though
 /// its semantics are only weak-ish because it is derived from mtime+size.
-fn etag_list_matches_strong(value: &[u8], current: &[u8]) -> bool {
+pub(crate) fn etag_list_matches_strong(value: &[u8], current: &[u8]) -> bool {
     let value = trim_ows(value);
     if value == b"*" {
         return true;
@@ -465,7 +465,7 @@ fn read_at_into(
 /// respecting quoted-string boundaries so that a comma inside a tag body
 /// does not split the entry. Comparison is weak per RFC 9110: strip any
 /// `W/` prefix on both sides, then byte-compare the opaque-tag.
-fn etag_list_matches(value: &[u8], current: &[u8]) -> bool {
+pub(crate) fn etag_list_matches(value: &[u8], current: &[u8]) -> bool {
     let value = trim_ows(value);
     if value == b"*" {
         return true;
@@ -767,7 +767,7 @@ pub(crate) fn format_http_date(secs: u64) -> [u8; 29] {
 /// calendar, restricted to non-negative day counts (`days` is unsigned).
 /// Replaces a year-by-year walk from 1970 that ran on every response
 /// (`format_http_date` was ~1.3% of CPU on the 304 bench).
-fn civil_from_days(days: u64) -> (u32, usize, u8) {
+pub(crate) fn civil_from_days(days: u64) -> (u32, usize, u8) {
     // Shift the epoch to 0000-03-01 so leap days fall at the end of each
     // 400-year era.
     let z = days + 719_468;
@@ -1093,7 +1093,9 @@ mod tests {
             Response::Owned(_)
             | Response::Prebuilt(_)
             | Response::Reroute(_)
-            | Response::Proxy(_) => {
+            | Response::Proxy(_)
+            | Response::Upgrade(_)
+            | Response::ProxyStream(_) => {
                 panic!("expected streamed file response")
             }
         }
@@ -1124,7 +1126,9 @@ mod tests {
             Response::File { .. }
             | Response::Prebuilt(_)
             | Response::Reroute(_)
-            | Response::Proxy(_) => {
+            | Response::Proxy(_)
+            | Response::Upgrade(_)
+            | Response::ProxyStream(_) => {
                 panic!("expected buffered headers-only response")
             }
         }
@@ -1155,7 +1159,9 @@ mod tests {
             Response::File { .. }
             | Response::Prebuilt(_)
             | Response::Reroute(_)
-            | Response::Proxy(_) => {
+            | Response::Proxy(_)
+            | Response::Upgrade(_)
+            | Response::ProxyStream(_) => {
                 panic!("expected inlined small response")
             }
         }
@@ -1186,7 +1192,9 @@ mod tests {
             Response::File { .. }
             | Response::Prebuilt(_)
             | Response::Reroute(_)
-            | Response::Proxy(_) => {
+            | Response::Proxy(_)
+            | Response::Upgrade(_)
+            | Response::ProxyStream(_) => {
                 panic!("expected buffered headers-only response for zero-length file")
             }
         }

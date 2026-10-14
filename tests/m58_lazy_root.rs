@@ -4,12 +4,13 @@
 //! nginx's default `root html` (relative to the prefix, ruxen's working
 //! directory). Both used to be startup errors.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Server {
     child: Child,
@@ -30,6 +31,9 @@ fn start(tag: &str, http_body: &str) -> Server {
 }
 
 fn start_with_workers(tag: &str, http_body: &str, workers: usize) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -47,24 +51,29 @@ fn start_with_workers(tag: &str, http_body: &str, workers: usize) -> Server {
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-p")
-        .arg(&dir)
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .arg("-e")
-        .arg(dir.join("error.log"))
-        .env("RUXEN_WORKERS", workers.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
-    Server { child, port, dir }
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-p")
+            .arg(&dir)
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            .arg("-e")
+            .arg(dir.join("error.log"))
+            .env("RUXEN_WORKERS", workers.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        port,
+        dir,
+    };
+    let pid_file = server.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.child, &pid_file, Duration::from_secs(3));
+    drop(setup);
+    server
 }
 
 fn get(port: u16, path: &str) -> String {

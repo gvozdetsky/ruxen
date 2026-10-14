@@ -28,19 +28,18 @@ See [`DESIGN.md`](DESIGN.md) for the architecture notes and the reasoning behind
 The v0.1 scope is deliberately limited:
 
 - Linux only
-- HTTP/1.1 only
+- HTTP/1.1, and HTTP/2 for clients (`http2 on`; over TLS through ALPN, and cleartext with prior knowledge)
 - hand-written HTTP parser
 - thread-per-core workers
-- `io_uring` via monoio
+- `io_uring` via monoio (epoll where `io_uring` is unavailable)
 - nginx-style configuration
 - static file serving
 - reverse proxying and upstreams
 - TLS 1.2/1.3 termination via rustls
 - no module system
-- no HTTP cache
-- no HTTP/2 yet
+- a proxy cache (`proxy_cache`)
 
-The upstream `nginx-tests` suite is used as a compatibility test. **63 of the 105 test files that ruxen currently opts into pass end-to-end** (v0.1.1).
+The upstream `nginx-tests` suite is used as a compatibility test. **122 of the 190 test files that ruxen currently opts into pass end-to-end** (main; v0.1.3: 105 of 159).
 
 See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, and [`ROADMAP.md`](ROADMAP.md) for where ruxen is going: first a memory-safe edge server (TLS termination, reverse proxy, static files) that takes your nginx configuration.
 
@@ -48,7 +47,7 @@ See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, 
 
 ### Requirements
 
-- Linux on x86_64 with `io_uring` available. ruxen is developed and tested on kernels 6.x–7.0. `io_uring` must not be turned off with the `kernel.io_uring_disabled` sysctl.
+- Linux on x86_64 or aarch64. ruxen runs on `io_uring` and is developed and tested on kernels 6.x–7.0. Where `io_uring` is unavailable (denied by a seccomp profile, turned off with the `kernel.io_uring_disabled` sysctl, or an old kernel), it runs on epoll instead, which is slower, and says so once in the error log at `notice`. `RUXEN_DRIVER=epoll` picks epoll anyway; `RUXEN_DRIVER=io_uring` refuses to start without `io_uring`.
 - To build from source (including `cargo install`): Rust 1.88 or newer, plus `cmake` and a C compiler for the `aws-lc-rs` crypto backend that rustls uses. aws-lc refuses GCC 9 (`Your compiler (cc) is not supported due to a memcmp related bug`); on Ubuntu 20.04, install `gcc-10 g++-10` and build with `CC=gcc-10 CXX=g++-10`.
 - `curl` to try the server.
 
@@ -71,6 +70,17 @@ cd ruxen-v*-x86_64-linux-gnu
 
 On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`) and a `SHA256SUMS` file.
 
+**Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), published with every release after 0.1.2:
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/gvozdetsky/ruxen
+curl http://127.0.0.1:8080/      # hello from ruxen
+# your configuration (listen on a port above 1024):
+docker run --rm -p 8080:8080 -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ghcr.io/gvozdetsky/ruxen
+```
+
+Under Docker's default seccomp profile ruxen runs on epoll; for `io_uring`, see Docker under [Run as a service](#run-as-a-service).
+
 **From crates.io:**
 
 ```bash
@@ -86,7 +96,7 @@ cargo build --release
 # the binary is target/release/ruxen
 ```
 
-ruxen does not switch to an unprivileged user the way nginx's `user` directive does, so it refuses to start as root unless the configuration says `user root;`. Start it as an unprivileged user instead; the service and container setups below do.
+Started as root, ruxen binds its ports, opens certificates and logs, then switches to the configured `user` (nginx's default `nobody`) before it accepts a connection, as nginx's workers do. ruxen's workers are threads of one process, so the whole server process switches. What nginx's master still does as root afterwards, a small helper process does: it stays root, recreates the log files logrotate moved away and gives them to the user on `SIGUSR1`, and removes the pid file when ruxen exits. It takes only fixed one-byte commands from the server and exits with it. Started as an unprivileged user, as the service and container setups below do, ruxen ignores `user` with nginx's warning.
 
 ### Run
 
@@ -136,22 +146,47 @@ hello from ruxen
 
 You are now serving an nginx-style configuration with ruxen.
 
+### Check your nginx configuration
+
+`--compat` reads a whole configuration and lists everything ruxen doesn't do as nginx, with the file and line, instead of stopping at the first problem the way `-t` does:
+
+```bash
+ruxen --compat -c /etc/nginx/nginx.conf
+```
+
+```text
+ruxen 0.1.3: checking /etc/nginx/nginx.conf
+/etc/nginx/nginx.conf:33: unsupported: ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3 — TLSv1, TLSv1.1 rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old names with a warning)
+/etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
+/etc/nginx/nginx.conf:27: differs: default_type application/octet-stream — files of unknown types get ruxen's built-in default (#38)
+ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
+ruxen does not start with this configuration: 2 unsupported, 1 behaving differently
+```
+
+- **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
+- **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `ssi off`, is not listed.
+- **ignored:** tuning knobs with no visible effect.
+
+With nothing unsupported, the configuration is then loaded the way `-t` does it (certificates, roots, log files). The exit status is 0 when ruxen starts with the configuration. A `#N` refers to the GitHub issue that tracks the gap. `-t` errors also carry nginx's ` in file:line`.
+
 ### Run as a service
 
 ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it gracefully, `SIGTERM` at once, `SIGUSR1` reopens the log files; it can't re-read its configuration yet, so restart it to apply a change.
 
-**systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to the log reopen. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` with it.
+**systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to a configuration reload. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` and has ruxen reopen them with `SIGUSR1`.
 
-**Docker:** the default seccomp profile denies `io_uring`, which ruxen runs on. [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json) is Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`; use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
+**Docker:** the default seccomp profile denies `io_uring`, so there ruxen runs on epoll. For `io_uring`, use [`contrib/docker/seccomp-io_uring.json`](contrib/docker/seccomp-io_uring.json): Docker's default profile ([moby/profiles](https://github.com/moby/profiles) `6fe7deb`) plus `io_uring_setup`, `io_uring_enter` and `io_uring_register`, and `unshare` with `CLONE_FILES` alone (each worker's own fd table; no namespaces); use it rather than `seccomp=unconfined`, which turns filtering off. [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) builds an image that runs ruxen as an unprivileged user on port 8080:
 
 ```bash
 docker build -f contrib/docker/Dockerfile -t ruxen .
+docker run --rm -p 8080:8080 ruxen       # epoll
+curl http://127.0.0.1:8080/              # hello from ruxen
 docker run --rm -p 8080:8080 \
     --security-opt seccomp=contrib/docker/seccomp-io_uring.json \
-    -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ruxen
+    -v "$PWD/my.conf:/etc/ruxen/ruxen.conf:ro" ruxen    # io_uring, your config
 ```
 
-**Kubernetes:** the `RuntimeDefault` seccomp profile denies `io_uring` too. Install `seccomp-io_uring.json` on the nodes (under the kubelet's `seccomp/` directory) and refer to it with `securityContext.seccompProfile: {type: Localhost, localhostProfile: seccomp-io_uring.json}`.
+**Kubernetes:** the `RuntimeDefault` seccomp profile denies `io_uring` too, so ruxen runs on epoll there. For `io_uring`, install `seccomp-io_uring.json` on the nodes (under the kubelet's `seccomp/` directory) and refer to it with `securityContext.seccompProfile: {type: Localhost, localhostProfile: seccomp-io_uring.json}`.
 
 ## What works
 
@@ -172,6 +207,7 @@ docker run --rm -p 8080:8080 \
 - `worker_connections`, `client_header_timeout`, `client_body_timeout`, `send_timeout`
 - request bodies of any `client_max_body_size`, spilled to private temp files (`client_body_temp_path`), with an early 413
 - `limit_rate`, `limit_rate_after` and `$limit_rate`
+- gzip compression (`gzip`, `gzip_types`, `gzip_min_length`, `gzip_comp_level`, `gzip_vary`, `gzip_http_version`, `gzip_proxied`, `gzip_disable`) of static files, `return`, error pages and proxied responses, as nginx decides it: the same statuses, types, `Accept-Encoding` q-values, weak `ETag`, no `Accept-Ranges`. A file gzip compresses is sent whole even for a `Range` request, as from nginx. Not yet: `gzip_static`, `gunzip`, `$gzip_ratio`, and gzip under `limit_rate` (such a response goes out unpaced).
 
 ### Static files
 
@@ -211,6 +247,7 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - `proxy_hide_header` / `proxy_pass_header`
 - `X-Accel-Redirect`, `X-Accel-Limit-Rate` and `proxy_ignore_headers`
 - `$upstream_*` per-attempt variables, `$proxy_host`, `$proxy_port`
+- `proxy_cache` on `proxy_cache_path` zones: `proxy_cache_key`, `proxy_cache_valid`, `proxy_cache_methods`, `proxy_cache_min_uses`, `proxy_cache_bypass`, `proxy_no_cache`, `proxy_cache_convert_head`, `proxy_cache_revalidate`, `proxy_cache_use_stale`, `proxy_cache_background_update`, `proxy_cache_lock` (`_timeout`, `_age`), `Vary`, and `$upstream_cache_status`
 
 ### TLS
 
@@ -227,7 +264,7 @@ Currently supported:
 - `ssl_session_cache` (in memory, shared by the workers), `ssl_session_tickets`, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 
-ALPN currently advertises HTTP/1.1 only.
+ALPN offers `h2` where the server has `http2 on` (or `listen … http2`), else HTTP/1.1.
 
 ### Configuration and request processing
 
@@ -246,6 +283,7 @@ A growing nginx-compatible configuration surface is implemented, including:
 - `split_clients`
 - `auth_basic`
 - `auth_basic_user_file`
+- `auth_request`, `auth_request_set` (authentication by a subrequest, e.g. to oauth2-proxy or Authelia)
 - `log_format`
 - `access_log` and `error_log`, including `syslog:` targets
 
@@ -267,11 +305,13 @@ The currently implemented nginx-style command-line surface includes:
 -s stop | quit | reopen
 ```
 
+and one option nginx doesn't have: `--compat`, the configuration check described in [Check your nginx configuration](#check-your-nginx-configuration).
+
 `-V` starts with `nginx version: nginx/1.29.2`, followed by `ruxen version: ruxen/<version>`. The nginx line and the `configure arguments` list are what the nginx-tests harness reads to decide which tests apply, so they describe ruxen as an nginx build: the arguments list only the modules ruxen actually implements.
 
 Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.29.2` instead, because the upstream tests assert nginx's header.
 
-ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) and log reopening via `SIGUSR1`. `-s stop|quit|reopen` send `SIGTERM`/`SIGQUIT`/`SIGUSR1` to the PID in the config's `pid` file, as nginx does. `-s reload` is refused: ruxen can't re-read its configuration yet, so restart it instead.
+ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) log reopening via `SIGUSR1`, and configuration reload via `SIGHUP`. `-s stop|quit|reopen|reload` send `SIGTERM`/`SIGQUIT`/`SIGUSR1`/`SIGHUP` to the PID in the config's `pid` file, as nginx does. A reload starts new workers with the new configuration (certificates included) on the same listening sockets, so connections aren't refused or reset in the handover, and the old workers finish their requests, within `worker_shutdown_timeout` if set; a configuration that fails to load is logged and the running one stays. After a switch to `user`, a reload reads the configuration as that user and can't bind new ports below 1024.
 
 ## Compatibility philosophy
 
@@ -298,6 +338,24 @@ cargo test --release
 ```
 
 The HTTPS integration tests use the system `curl` binary and generate temporary certificates at runtime.
+
+### Fuzzing
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the parsers that read untrusted bytes:
+- `request`: the HTTP request parser, which must also give the same answer when its input arrives in two pieces;
+- `host`: `Host` validation;
+- `uri`: path normalization;
+- `proxy_protocol`: PROXY protocol v1/v2;
+- `config`: the configuration parser.
+
+They need a nightly toolchain:
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run request fuzz/corpus/request fuzz/seeds/request
+```
+
+CI runs each target for 30 seconds on every pull request. If a crash could be a vulnerability, report it as `SECURITY.md` describes, not in a public issue.
 
 ### nginx-tests
 
@@ -345,20 +403,18 @@ See [`DESIGN.md`](DESIGN.md) for the current baseline and performance notes.
 
 The following are intentionally outside the current v0.1 scope:
 
-- HTTP/2
+- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
 - nginx's module ecosystem
-- HTTP caching
+- a proxy cache file per `Vary` variant (another variant replaces the stored one)
 - TLS to upstream servers (`proxy_ssl_*`)
 - OCSP stapling
 - client certificate authentication
 - 0-RTT / TLS early data
 - persistent TLS session caches (the cache lives in memory and is lost on restart)
-- hot certificate reload
 - password-protected private keys
 - full nginx process supervision and binary upgrade behaviour
-- switching workers to an unprivileged `user`
 
-Access restrictions that ruxen can't enforce yet — `limit_except`, `ssl_verify_client on`, `ssl_reject_handshake on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders it per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
 Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
 

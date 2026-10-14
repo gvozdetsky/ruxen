@@ -37,6 +37,37 @@ pub(crate) fn parse_access_directive(
             });
         }
         "set_real_ip_from" => parse_real_ip_from(&mut conf.realip, args, lx)?,
+        // ngx_http_auth_request_module (#358).
+        "auth_request" => {
+            if conf.auth_request.is_some() {
+                return Err(Error::Duplicate("auth_request"));
+            }
+            let [_, uri] = args else {
+                return Err(Error::BadValue {
+                    what: "auth_request",
+                    got: args[1..].join(" "),
+                });
+            };
+            conf.auth_request = Some((uri != "off").then(|| uri.clone()));
+        }
+        "auth_request_set" => {
+            let [_, var, value] = args else {
+                return Err(Error::BadValue {
+                    what: "auth_request_set",
+                    got: args[1..].join(" "),
+                });
+            };
+            let Some(name) = var.strip_prefix('$').filter(|n| !n.is_empty()) else {
+                return Err(Error::BadValue {
+                    what: "auth_request_set variable",
+                    got: var.clone(),
+                });
+            };
+            conf.auth_request_set.push((
+                name.to_string(),
+                super::values::parse_value_with_vars(value)?,
+            ));
+        }
         "real_ip_header" => {
             if conf.realip.header.is_some() {
                 return Err(Error::Duplicate("real_ip_header"));
@@ -250,7 +281,7 @@ pub(crate) fn parse_limit_except_block(
                 _ => Err(Error::UnexpectedEof),
             };
         };
-        match (name.as_str(), term) {
+        match (name.as_str(), &term) {
             ("allow" | "deny", Terminator::Semi) => {
                 parse_access_directive(&mut access, &args, lx)?;
             }
@@ -276,10 +307,7 @@ pub(crate) fn parse_limit_except_block(
                 });
             }
             _ => {
-                return Err(Error::UnknownDirective {
-                    name: name.clone(),
-                    ctx: "limit_except",
-                });
+                super::compat::unknown(lx, &args, &term, "limit_except")?;
             }
         }
     }

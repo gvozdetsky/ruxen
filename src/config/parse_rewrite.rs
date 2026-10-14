@@ -96,7 +96,11 @@ pub(crate) fn split_replacement_at_question(
 pub(crate) fn parse_if_op(args: &[String], lx: &mut Lexer) -> Result<RewriteOp, Error> {
     let guard = parse_if_guard(args)?;
     let body = parse_rewrite_block(lx)?;
-    Ok(RewriteOp::If { guard, body })
+    Ok(RewriteOp::If {
+        guard,
+        body,
+        location: None,
+    })
 }
 
 pub(crate) fn parse_rewrite_block(lx: &mut Lexer) -> Result<Vec<RewriteOp>, Error> {
@@ -136,13 +140,13 @@ pub(crate) fn parse_rewrite_block(lx: &mut Lexer) -> Result<Vec<RewriteOp>, Erro
                     ctx: "if",
                 });
             }
-            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(&args)?,
-            (n, Terminator::BlockOpen) if is_ignored_block(n) => skip_block(lx)?,
-            (other, _) => {
-                return Err(Error::UnknownDirective {
-                    name: other.into(),
-                    ctx: "if",
-                });
+            (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
+            (n, Terminator::BlockOpen) if is_ignored_block(n) => {
+                compat::ignored_block(lx, &args);
+                skip_block(lx)?
+            }
+            (_, _) => {
+                compat::unknown(lx, &args, &term, "if")?;
             }
         }
     }

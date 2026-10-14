@@ -4,12 +4,14 @@
 //! asks idle connections (waiting for a request) to close so later clients
 //! get in: idle sockets can't hold the server hostage until they time out.
 
+mod common;
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Server {
     child: Child,
@@ -26,6 +28,9 @@ impl Drop for Server {
 }
 
 fn start(events: &str) -> Server {
+    // Held from the port pick until ruxen listens: a parallel test's
+    // backend can't take the port in between (#230).
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -43,6 +48,8 @@ fn start(events: &str) -> Server {
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg("-c")
         .arg(dir.join("nginx.conf"))
+        .arg("-g")
+        .arg(format!("pid {}/ruxen.pid;", dir.display()))
         .arg("-e")
         .arg(dir.join("error.log"))
         .env("RUXEN_WORKERS", "1")
@@ -50,12 +57,10 @@ fn start(events: &str) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let server = Server { child, port, dir };
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while get(port).is_none() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
+    let mut server = Server { child, port, dir };
+    let pid_file = server.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.child, &pid_file, Duration::from_secs(3));
+    drop(setup);
     server
 }
 

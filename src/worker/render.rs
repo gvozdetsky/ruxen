@@ -123,6 +123,8 @@ pub(crate) struct RenderCtx<'a> {
     /// `$upstream_status`, `$upstream_response_time` and the rest. Empty
     /// outside a proxy context.
     pub upstream_states: &'a [crate::proxy::UpstreamState],
+    /// `$upstream_cache_status`; empty when no cache was looked at.
+    pub upstream_cache_status: &'a [u8],
     /// Pre-rendered `add_trailer` lines, joined with CRLF and rendered as
     /// `Name: value\r\n` per entry. Used by `$sent_trailer_*` lookups via
     /// the same scanner that handles request/response headers.
@@ -209,8 +211,26 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::ServerProtocol => out.extend_from_slice(server_protocol(self.request_line)),
+            // An HTTP/2 stream's request line says `HTTP/2.0` (`worker::h2`).
+            Variable::Http2 => {
+                if server_protocol(self.request_line) == b"HTTP/2.0" {
+                    out.extend_from_slice(if self.tls.is_some() { b"h2" } else { b"h2c" });
+                }
+            }
             Variable::Host => out.extend_from_slice(self.host),
             Variable::RemoteAddr => out.extend_from_slice(self.remote_addr),
+            // ngx_http_variable_binary_remote_addr: the address bytes; a
+            // unix-domain peer gives its text (`unix:`).
+            Variable::BinaryRemoteAddr => {
+                match std::str::from_utf8(self.remote_addr)
+                    .ok()
+                    .and_then(|a| a.parse::<std::net::IpAddr>().ok())
+                {
+                    Some(std::net::IpAddr::V4(ip)) => out.extend_from_slice(&ip.octets()),
+                    Some(std::net::IpAddr::V6(ip)) => out.extend_from_slice(&ip.octets()),
+                    None => out.extend_from_slice(self.remote_addr),
+                }
+            }
             // Empty when the realip module took an address without a port.
             Variable::RemotePort if self.remote_port == 0 => {}
             Variable::RemotePort => write_u16_decimal(out, self.remote_port),
@@ -252,6 +272,11 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::Scheme => out.extend_from_slice(self.scheme),
+            Variable::Https => {
+                if self.tls.is_some() {
+                    out.extend_from_slice(b"on");
+                }
+            }
             Variable::SslProtocol => {
                 if let Some(info) = self.tls
                     && let Some(v) = info.protocol_version
@@ -325,6 +350,26 @@ impl RenderCtx<'_> {
             Variable::SslClientVEnd => {}
             Variable::SslClientVRemain => {}
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            Variable::LimitConnStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_conn::status::text(state.limit_conn_status));
+                }
+            }
+            Variable::LimitReqStatus => {
+                if let Some(state) = self.rewrite_state {
+                    out.extend_from_slice(super::limit_req::status::text(state.limit_req_status));
+                }
+            }
+            Variable::Connections(gauge) => {
+                let t = super::stats::totals();
+                let n = match gauge {
+                    crate::config::ConnectionsGauge::Active => t.active,
+                    crate::config::ConnectionsGauge::Reading => t.reading,
+                    crate::config::ConnectionsGauge::Writing => t.writing,
+                    crate::config::ConnectionsGauge::Waiting => t.waiting,
+                };
+                write_u64_decimal(out, n);
+            }
             Variable::RequestBody => {
                 // nginx leaves `$request_body` empty whenever the body was
                 // spilled to disk — readers consult `$request_body_file`
@@ -393,6 +438,7 @@ impl RenderCtx<'_> {
             Variable::UpstreamBytesSent => {
                 self.write_upstream_list(out, |out, s| write_u64_decimal(out, s.bytes_sent))
             }
+            Variable::UpstreamCacheStatus => out.extend_from_slice(self.upstream_cache_status),
             Variable::SentTrailer(name) => {
                 write_all_request_header_values(out, self.sent_trailers, name.as_bytes());
             }
@@ -877,10 +923,21 @@ fn render_map(program: &PreparedMap, ctx: &RenderCtx<'_>, out: &mut Vec<u8>) {
         render_parts(value, ctx, out);
         return;
     }
-    for entry in program.regex {
-        if entry.regex.is_match(&key) {
-            render_parts(entry.value, ctx, out);
-            return;
+    // One pass over the regex keys (#248), else each in turn.
+    match &program.regex_set {
+        Some(set) => {
+            if let Some(i) = set.matches(&key).iter().next() {
+                render_parts(program.regex[i].value, ctx, out);
+                return;
+            }
+        }
+        None => {
+            for entry in program.regex {
+                if entry.regex.is_match(&key) {
+                    render_parts(entry.value, ctx, out);
+                    return;
+                }
+            }
         }
     }
     if let Some(default) = program.default {
@@ -969,6 +1026,8 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::ContentType
             | Variable::RemoteUser
             | Variable::RequestBody
+            | Variable::LimitReqStatus
+            | Variable::LimitConnStatus
             | Variable::RequestBodyFile
             | Variable::ProxyHost
             | Variable::ProxyPort
@@ -982,6 +1041,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::UpstreamHeaderTime
             | Variable::UpstreamBytesReceived
             | Variable::UpstreamBytesSent
+            | Variable::UpstreamCacheStatus
             | Variable::SslProtocol
             | Variable::SslCipher
             | Variable::SslCiphers

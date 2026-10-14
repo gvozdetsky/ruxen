@@ -10,8 +10,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::ports::{DeadPort, setup_lock};
 
@@ -30,12 +29,14 @@ impl Drop for Server {
 }
 
 fn start(tag: &str, server_body: &str) -> Server {
-    let _ports = setup_lock();
+    // Held from the port pick until ruxen listens.
+    let ports = setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
     };
     let dir = std::env::temp_dir().join(format!("ruxen-m52-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("www")).unwrap();
     let body = server_body.replace("%%DIR%%", dir.to_str().unwrap());
     std::fs::write(
@@ -46,21 +47,26 @@ fn start(tag: &str, server_body: &str) -> Server {
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .arg("-e")
-        .arg(dir.join("stderr.log"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
-    Server { child, port, dir }
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-e")
+            .arg(dir.join("stderr.log"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        port,
+        dir,
+    };
+    let pid_file = server.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.child, &pid_file, Duration::from_secs(3));
+    drop(ports);
+    server
 }
 
 fn get(port: u16, path: &str) -> String {
@@ -178,7 +184,8 @@ fn upstream_failures_are_logged_like_nginx() {
         line.contains("no live upstreams while connecting to upstream, client: 127.0.0.1"),
         "{line}"
     );
-    assert!(!line.contains("upstream: \""), "{line}");
+    // The balancer names the group (nginx's `pc->name = peers->name`).
+    assert!(line.contains("upstream: \"http://down/down/2\""), "{line}");
     // A lone server is never marked unavailable (nginx's `peers->single`):
     // both requests try it.
     for path in ["GET /single/1 ", "GET /single/2 "] {
@@ -231,6 +238,7 @@ fn error_log_inherits_from_http_and_top_level() {
         probe.local_addr().unwrap().port()
     };
     let dir = std::env::temp_dir().join(format!("ruxen-m52-inherit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("www")).unwrap();
     let d = dir.display();
     std::fs::write(
@@ -258,21 +266,25 @@ fn error_log_inherits_from_http_and_top_level() {
         ),
     )
     .unwrap();
-    let spawn = |conf: &str, port: u16| {
-        let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-            .arg("-c")
-            .arg(dir.join(conf))
-            .arg("-e")
-            .arg(dir.join("stderr.log"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "ruxen did not start");
-            sleep(Duration::from_millis(20));
-        }
+    // Each instance has its own pid file: the first one's would pass for
+    // the second.
+    let spawn = |conf: &str| {
+        let pid_file = dir.join(format!("{conf}.pid"));
+        // Owned by the guard before the wait: if it panics, ruxen still stops.
+        let mut child = common::KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_ruxen"))
+                .arg("-c")
+                .arg(dir.join(conf))
+                .arg("-e")
+                .arg(dir.join("stderr.log"))
+                .arg("-g")
+                .arg(format!("pid {};", pid_file.display()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        common::ports::wait_for_pid_file(&mut child, &pid_file, Duration::from_secs(3));
         child
     };
     let get_host = |port: u16, host: &str, path: &str| {
@@ -288,16 +300,13 @@ fn error_log_inherits_from_http_and_top_level() {
         out
     };
 
-    let mut one = spawn("nginx.conf", port);
+    let one = spawn("nginx.conf");
     assert!(get_host(port, "main", "/from-main").starts_with("HTTP/1.1 404"));
-    let mut two = spawn("nginx2.conf", port2);
+    let two = spawn("nginx2.conf");
     drop(ports);
     assert!(get_host(port2, "a", "/from-http").starts_with("HTTP/1.1 404"));
     assert!(get_host(port2, "b", "/from-server").starts_with("HTTP/1.1 404"));
-    for c in [&mut one, &mut two] {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
+    drop((one, two));
 
     let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
     // Top level only: it takes the request errors.
