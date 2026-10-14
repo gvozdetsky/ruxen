@@ -965,6 +965,7 @@ pub(crate) fn build_proxy(
                 next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
                 intercept_errors: eff.intercept_errors,
                 force_ranges: eff.force_ranges,
+                ignore_client_abort: eff.ignore_client_abort,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -1004,6 +1005,7 @@ pub(crate) fn build_proxy(
                 next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
                 intercept_errors: eff.intercept_errors,
                 force_ranges: eff.force_ranges,
+                ignore_client_abort: eff.ignore_client_abort,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -1058,6 +1060,7 @@ pub(crate) fn build_proxy(
                 next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
                 intercept_errors: eff.intercept_errors,
                 force_ranges: eff.force_ranges,
+                ignore_client_abort: eff.ignore_client_abort,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix: b"",
@@ -1211,6 +1214,7 @@ pub(crate) struct ServerProxyDefaults {
     pub next_upstream_timeout_ms: u64,
     pub intercept_errors: bool,
     pub force_ranges: bool,
+    pub ignore_client_abort: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
@@ -1290,6 +1294,9 @@ impl ServerProxyDefaults {
                 .unwrap_or(defaults.next_upstream_timeout_ms),
             intercept_errors: conf.intercept_errors.unwrap_or(defaults.intercept_errors),
             force_ranges: conf.force_ranges.unwrap_or(defaults.force_ranges),
+            ignore_client_abort: conf
+                .ignore_client_abort
+                .unwrap_or(defaults.ignore_client_abort),
             ignore_invalid_headers,
             underscores_in_headers,
             redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
@@ -1384,6 +1391,9 @@ pub(crate) fn resolve_proxy_effective(
         force_ranges: location
             .force_ranges
             .unwrap_or(server_defaults.force_ranges),
+        ignore_client_abort: location
+            .ignore_client_abort
+            .unwrap_or(server_defaults.ignore_client_abort),
         ignore_invalid_headers: server_defaults.ignore_invalid_headers,
         underscores_in_headers: server_defaults.underscores_in_headers,
         redirect: match location.redirect {

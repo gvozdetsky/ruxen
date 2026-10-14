@@ -684,6 +684,7 @@ pub(crate) fn parse_server_block(
                 | "proxy_next_upstream_timeout"
                 | "proxy_intercept_errors"
                 | "proxy_force_ranges"
+                | "proxy_ignore_client_abort"
                 | "proxy_redirect"
                 | "proxy_hide_header"
                 | "proxy_pass_header"

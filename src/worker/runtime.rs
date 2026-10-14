@@ -476,12 +476,29 @@ async fn write_response_paced<S: ConnIo>(
     }
 }
 
+/// nginx's `[info]` line when the client goes away while the upstream is
+/// awaited (ngx_http_upstream_check_broken_connection).
+#[cold]
+#[inline(never)]
+fn client_closed_log(meta: &phase::ProcessMeta, ctx: &phase::RequestCtx<'_>) {
+    write_error_log(
+        meta.log.error_logs,
+        ErrorLogLevel::Info,
+        &ErrorLogRequest::new(ctx, meta.server_name).with_realip(meta),
+        b"client prematurely closed connection, so upstream connection is closed too while sending request to upstream",
+        None,
+    );
+}
+
 async fn settle_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     url_scratch: &mut Vec<u8>,
     response: Response,
     process_meta: phase::ProcessMeta,
+    // The client, watched while the upstream is awaited (`None`: nobody
+    // waits for the answer, as for post_action).
+    client: Option<&dyn super::client_watch::WatchClient>,
 ) -> (Response, phase::ProcessMeta) {
     let Response::Proxy(plan) = response else {
         return (response, process_meta);
@@ -501,7 +518,27 @@ async fn settle_proxy_response(
         plan.response.error_pages
     };
     let mut report = crate::proxy::ProxyReport::default();
-    let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
+    // nginx's ngx_http_upstream_check_broken_connection: a client that
+    // closes ends the exchange, and with it the upstream connection (the
+    // proxy future is dropped).
+    let client = client.filter(|_| !plan.ignore_client_abort);
+    let upstream_resp = {
+        let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report));
+        super::client_watch::Watched::new(proxy, client).await
+    };
+    let Some(upstream_resp) = upstream_resp else {
+        client_closed_log(&process_meta, ctx);
+        // The attempt cut short is in the log, `$upstream_response_time`
+        // up to the close, as ngx_http_upstream_finalize_request fills it.
+        if let (Some(state), Some(started)) = (report.states.last_mut(), report.attempt_started)
+            && state.response_ms.is_none()
+        {
+            state.response_ms = Some(started.elapsed().as_millis() as u64);
+        }
+        let mut process_meta = process_meta;
+        process_meta.upstream_states = report.states;
+        return (Response::Prebuilt(super::CLIENT_CLOSED), process_meta);
+    };
     if !report.failures.is_empty() {
         write_upstream_error_log(
             &process_meta.log,
@@ -1238,7 +1275,7 @@ async fn run_post_action(
         )
     };
     let (response, post_meta) =
-        settle_proxy_response(http, &post_ctx, url_scratch, initial.0, initial.1).await;
+        settle_proxy_response(http, &post_ctx, url_scratch, initial.0, initial.1, None).await;
 
     let mut owned_response = Vec::new();
     let mut static_response: Option<&'static [u8]> = None;
@@ -1738,7 +1775,7 @@ async fn run_auth_subrequest(
         other => other,
     };
     let (response, sub_meta) =
-        settle_proxy_response(http, &sub_ctx, url_scratch, response, sub_meta).await;
+        settle_proxy_response(http, &sub_ctx, url_scratch, response, sub_meta, None).await;
     let head: &[u8] = match &response {
         Response::Prebuilt(b) => b,
         Response::Owned(b) => b,
@@ -3727,6 +3764,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             &mut *url_scratch,
                             response,
                             process_meta,
+                            Some(&*stream as &dyn super::client_watch::WatchClient),
                         )
                         .await;
                         process_meta = settled_meta;

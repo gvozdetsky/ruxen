@@ -181,6 +181,9 @@ pub struct ProxyPlan {
     /// `proxy_force_ranges`: the range filter may cut the response whatever
     /// the upstream says (#370).
     pub force_ranges: bool,
+    /// `proxy_ignore_client_abort`: when off, a client that closes while
+    /// the upstream is awaited ends the exchange with 499 (#136).
+    pub ignore_client_abort: bool,
 }
 
 /// An upstream that answered 101 to a client asking to upgrade: the
@@ -556,6 +559,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
     let range_allow = &mut report.range_allow;
     let accel = &mut report.accel;
     let states = &mut report.states;
+    let attempt_started = &mut report.attempt_started;
     let upstream = plan.upstream;
     // nginx's `peer.tries`: the servers not marked `down`
     // (ngx_http_upstream_tries).
@@ -599,8 +603,13 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
     loop {
         attempts += 1;
         let started = Instant::now();
-        let mut state =
-            UpstreamState::new(UpstreamPeerName::Addr(plan.peer_addr(current.peer_idx)));
+        // In place from the start: if the exchange is dropped mid-attempt
+        // (the client went away, #136), the attempt still reaches the log.
+        *attempt_started = Some(started);
+        states.push(UpstreamState::new(UpstreamPeerName::Addr(
+            plan.peer_addr(current.peer_idx),
+        )));
+        let state = states.last_mut().expect("just pushed");
         // 1. Try the pool first for this peer. On any failure before the
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
@@ -615,7 +624,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 redirect_header,
                 range_allow,
                 accel,
-                &mut state,
+                &mut *state,
                 started,
                 &mut storable,
             )
@@ -625,7 +634,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                     // M43: only retry the same peer with a fresh socket
                     // if the body can be safely re-sent. The stale socket
                     // isn't an attempt of its own in nginx's terms.
-                    state = UpstreamState::new(state.peer);
+                    *state = UpstreamState::new(state.peer);
                     if sent_may_retry {
                         attempt(
                             &plan,
@@ -635,7 +644,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                             redirect_header,
                             range_allow,
                             accel,
-                            &mut state,
+                            &mut *state,
                             started,
                             &mut storable,
                         )
@@ -659,7 +668,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 redirect_header,
                 range_allow,
                 accel,
-                &mut state,
+                &mut *state,
                 started,
                 &mut storable,
             )
@@ -673,7 +682,6 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 502
             };
         }
-        states.push(state);
 
         match outcome {
             AttemptOutcome::Ok(resp) => {
@@ -1247,6 +1255,9 @@ pub struct ProxyReport {
     pub passes_date: bool,
     /// Whether the range filter may cut the response (#370).
     pub range_allow: RangeAllow,
+    /// When the last attempt started: an attempt cut short by a client
+    /// that went away (#136) gets its `$upstream_response_time` from it.
+    pub attempt_started: Option<Instant>,
 }
 
 /// The answer's upstream request is over (its header filtered, or the

@@ -1069,6 +1069,7 @@ pub(crate) fn run_location_handler(
                 && !(force_ranges && req.range.is_some()),
             gzip: loc.gzip,
             force_ranges,
+            ignore_client_abort: proxy.ignore_client_abort,
             cache,
             hash,
             bind,

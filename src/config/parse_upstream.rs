@@ -647,6 +647,7 @@ impl ProxyConf {
         "proxy_next_upstream_timeout",
         "proxy_intercept_errors",
         "proxy_force_ranges",
+        "proxy_ignore_client_abort",
         "proxy_bind",
         "proxy_redirect",
         "proxy_hide_header",
@@ -827,6 +828,13 @@ impl ProxyConf {
                         });
                     }
                 });
+            }
+            "proxy_ignore_client_abort" => {
+                if self.ignore_client_abort.is_some() {
+                    return Err(Error::Duplicate("proxy_ignore_client_abort"));
+                }
+                self.ignore_client_abort =
+                    Some(parse_on_off_args(&args[1..], "proxy_ignore_client_abort")?);
             }
             "proxy_intercept_errors" => {
                 if self.intercept_errors.is_some() {

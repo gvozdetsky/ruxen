@@ -681,6 +681,9 @@ pub struct PreparedProxy {
     /// `proxy_force_ranges on;` (#370): the range filter may cut the
     /// response even when the upstream doesn't say it takes ranges.
     pub force_ranges: bool,
+    /// `proxy_ignore_client_abort`: keep the upstream exchange when the
+    /// client goes away (#136).
+    pub ignore_client_abort: bool,
     /// Effective `ignore_invalid_headers` policy from the matched server.
     /// When true, headers with non-fatal invalid names are dropped before
     /// forwarding upstream.
@@ -797,6 +800,8 @@ pub(crate) struct ProxyEffective {
     pub next_upstream_timeout_ms: u64,
     pub intercept_errors: bool,
     pub force_ranges: bool,
+    /// `proxy_ignore_client_abort` (#136).
+    pub ignore_client_abort: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     /// The nearest scope's `proxy_redirect` lines; `None` = nginx's
@@ -857,6 +862,7 @@ impl ProxyEffective {
             next_upstream_timeout_ms: 0,
             intercept_errors: false,
             force_ranges: false,
+            ignore_client_abort: false,
             ignore_invalid_headers: true,
             underscores_in_headers: false,
             redirect: None,

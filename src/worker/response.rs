@@ -182,11 +182,16 @@ pub(crate) fn response_header_values_all(response: &[u8], name: &[u8]) -> Vec<Ve
 }
 
 /// A 444 without a body: nginx's NGX_HTTP_CLOSE, which closes the
-/// connection instead of answering (#397).
+/// connection instead of answering (#397); and the 499 of a client that
+/// went away while the upstream was awaited (#136).
 #[inline]
 pub(crate) fn closes_unanswered(bytes: &[u8]) -> bool {
-    bytes.get(9..12) == Some(b"444") && bytes.ends_with(b"\r\n\r\n")
+    matches!(bytes.get(9..12), Some(b"444" | b"499")) && bytes.ends_with(b"\r\n\r\n")
 }
+
+/// What `settle_proxy_response` hands back when the client closed while
+/// the upstream was awaited: never sent, logged as 499 (#136).
+pub(crate) const CLIENT_CLOSED: &[u8] = b"HTTP/1.1 499 Client Closed Request\r\n\r\n";
 
 pub(crate) fn response_status(bytes: &[u8]) -> u16 {
     if bytes.len() < 12 {
