@@ -164,8 +164,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
     prepare_cache_zones(proxy_cache_paths)?;
-    prepare_limit_req_zones(limit_req_zones);
-    prepare_limit_conn_zones(limit_conn_zones);
+    prepare_limit_req_zones(limit_req_zones)?;
+    prepare_limit_conn_zones(limit_conn_zones)?;
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
         prepare_upstreams(upstreams);
 
@@ -660,22 +660,24 @@ fn prepare_proxy_cache(
 }
 
 /// Build the zones of `limit_req_zone` (#94).
-fn prepare_limit_req_zones(zones: Vec<crate::config::LimitReqZoneDef>) {
+fn prepare_limit_req_zones(zones: Vec<crate::config::LimitReqZoneDef>) -> Result<(), String> {
     let built = zones
         .into_iter()
         .map(|z| {
             let name: &'static str = Box::leak(z.name.into_boxed_str());
             let zone: &'static super::limit_req::LimitReqZone =
-                Box::leak(Box::new(super::limit_req::LimitReqZone::new(
+                Box::leak(Box::new(super::limit_req::LimitReqZone::declare(
                     name,
                     prepare_value_parts(z.key),
+                    &z.key_text,
                     z.size,
                     z.rate,
-                )));
-            (name.to_string(), zone)
+                )?));
+            Ok((name.to_string(), zone))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     LIMIT_REQ_ZONES.with(|m| *m.borrow_mut() = built);
+    Ok(())
 }
 
 /// A location's resolved `limit_req*` (`None` without `limit_req`). A zone
@@ -725,22 +727,23 @@ thread_local! {
 }
 
 /// Build the zones of `limit_conn_zone` (#95).
-fn prepare_limit_conn_zones(zones: Vec<crate::config::LimitConnZoneDef>) {
+fn prepare_limit_conn_zones(zones: Vec<crate::config::LimitConnZoneDef>) -> Result<(), String> {
     let built = zones
         .into_iter()
         .map(|z| {
             let name: &'static str = Box::leak(z.name.into_boxed_str());
             let zone: &'static super::limit_conn::LimitConnZone =
-                Box::leak(Box::new(super::limit_conn::LimitConnZone::new(
+                Box::leak(Box::new(super::limit_conn::LimitConnZone::declare(
                     name,
                     prepare_value_parts(z.key),
                     Box::leak(z.key_text.into_boxed_str()),
                     z.size,
-                )));
-            (name.to_string(), zone)
+                )?));
+            Ok((name.to_string(), zone))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     LIMIT_CONN_ZONES.with(|m| *m.borrow_mut() = built);
+    Ok(())
 }
 
 /// A location's resolved `limit_conn*` (`None` without `limit_conn`).
@@ -1100,6 +1103,8 @@ fn prepare_response_rules(
         ignore_accel_redirect,
         ignore_accel_limit_rate,
         hide: Box::leak(hide.into_boxed_slice()),
+        passes_date: crate::proxy::default_hidden_bit(b"date")
+            .is_some_and(|bit| pass_mask & bit != 0),
         pass_mask,
     }))
 }
@@ -1571,7 +1576,52 @@ pub(crate) fn prepare_server(
     let mut prefix: Vec<PreparedLocation> = Vec::new();
     let mut regex: Vec<PreparedRegexLocation> = Vec::new();
     let mut named: Vec<PreparedLocation> = Vec::new();
-    for l in server.locations {
+    // The anonymous locations of location-level `if` blocks (#137), into
+    // a list of their own: no request finds them by URI, the `if` that
+    // holds switches to one by index.
+    let mut locations = server.locations;
+    let mut if_parsed: Vec<Location> = Vec::new();
+    for l in &mut locations {
+        take_if_locations(&mut l.rewrite_ops, &mut if_parsed, None);
+    }
+    let mut if_locations: Vec<PreparedLocation> = Vec::with_capacity(if_parsed.len());
+    for l in if_parsed {
+        if_locations.push(build_prefix_or_exact(
+            l,
+            server_index,
+            server_add_headers,
+            server_add_trailers,
+            server_error_pages,
+            server_keepalive,
+            server_error_logs,
+            server_log_not_found,
+            server_recursive_error_pages,
+            server_tokens_value,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            server_access_logs,
+            server_access,
+            server_client_max_body_size,
+            server_client_body_buffer_size,
+            server_sendfile,
+            server_body_temp,
+            server_disable_symlinks.clone(),
+            server_limit_rate,
+            server_post_action,
+            server_expires,
+            server_chunked_transfer_encoding,
+            &server.limit_req,
+            &server.limit_conn,
+            server.client_timeouts,
+            server_proxy_defaults,
+            &server_gzip,
+            upstreams,
+            alp,
+        )?);
+    }
+    for l in locations {
         match l.mode {
             MatchMode::Exact => exact.push(build_prefix_or_exact(
                 l,
@@ -1824,6 +1874,7 @@ pub(crate) fn prepare_server(
         regex_location_set: first_match_set(regex.iter().map(|r| r.set_pattern.as_str())),
         regex_locations: regex,
         named_locations: named,
+        if_locations,
         server_default,
         error_logs: server_error_logs,
         log_not_found: server_log_not_found,
@@ -1946,6 +1997,31 @@ pub(crate) fn prepare_guard(guard: IfGuard) -> PreparedGuard {
     }
 }
 
+/// Move the anonymous locations of `ops`' `if` blocks (nested ones too)
+/// into `out`, leaving their index there (#137). A block of rewrite
+/// directives only inside one gets that one's index: nginx gives every
+/// location-level `if` a configuration, merged from the enclosing one, so
+/// the request goes on with the configuration it was in.
+fn take_if_locations(ops: &mut [RewriteOp], out: &mut Vec<Location>, enclosing: Option<usize>) {
+    use crate::config::IfLocation;
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            let slot = match location.take() {
+                Some(IfLocation::Parsed {
+                    location: parsed, ..
+                }) => {
+                    out.push(*parsed);
+                    Some(out.len() - 1)
+                }
+                Some(IfLocation::Slot(n)) => Some(n),
+                None => enclosing,
+            };
+            *location = slot.map(IfLocation::Slot);
+            take_if_locations(body, out, slot);
+        }
+    }
+}
+
 pub(crate) fn prepare_rewrite_ops(
     ops: Vec<RewriteOp>,
     tokens: crate::config::ServerTokens,
@@ -1960,9 +2036,19 @@ pub(crate) fn prepare_rewrite_ops(
                 name: leak_bytes(name.as_bytes()),
                 value: prepare_value_parts(value),
             },
-            RewriteOp::If { guard, body } => PreparedRewriteOp::If {
+            RewriteOp::If {
+                guard,
+                body,
+                location,
+            } => PreparedRewriteOp::If {
                 guard: prepare_guard(guard),
                 body: prepare_rewrite_ops(body, tokens),
+                // `prepare_server` moved every parsed one into the server's
+                // list first.
+                location: match location {
+                    Some(crate::config::IfLocation::Slot(n)) => Some(n as u32),
+                    _ => None,
+                },
             },
             RewriteOp::Rewrite(RewriteRule {
                 regex,
@@ -1989,7 +2075,8 @@ pub(crate) fn prepare_rewrite_ops(
                 }
             }
             RewriteOp::Return { status, body } => {
-                PreparedRewriteOp::Return(prepare_return(status, body, tokens))
+                let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
+                PreparedRewriteOp::Return(prepare_return(status, body, tokens), finalized)
             }
             RewriteOp::Break => PreparedRewriteOp::Break,
         };
@@ -2269,9 +2356,23 @@ impl<'a> AccessLogPrep<'a> {
             }
         };
         let file_index = self.canonical.len();
+        let path_vars = log.path_vars.clone().map(prepare_value_parts);
+        let condition = log.condition.clone().map(prepare_value_parts);
+        let reads_doc_root = [Some(format), path_vars, condition]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|p| {
+                matches!(
+                    p,
+                    PreparedValuePart::Var(
+                        Variable::DocumentRoot | Variable::RequestFilename | Variable::RealpathRoot
+                    )
+                )
+            });
         let prepared = PreparedAccessLog {
             buffer,
-            path_vars: log.path_vars.clone().map(prepare_value_parts),
+            path_vars,
             path: Box::leak(log.path.clone().into_boxed_path()),
             format,
             escape,
@@ -2281,7 +2382,8 @@ impl<'a> AccessLogPrep<'a> {
                     PreparedValuePart::Var(Variable::UpstreamHttp(_) | Variable::UpstreamCookie(_))
                 )
             }),
-            condition: log.condition.clone().map(prepare_value_parts),
+            reads_doc_root,
+            condition,
             file_index,
             syslog,
         };
@@ -2417,7 +2519,10 @@ pub(crate) fn prepare_return(
     let server_bytes = http::server_header_value(tokens);
     if all_literal(&body) {
         let concatenated = concat_literals(&body);
-        PreparedReturn::Static(if is_redirect_return(status, &body) {
+        // A redirect status is a redirect whatever its URL, an empty one
+        // included: nginx's `ngx_http_send_response` sends an empty
+        // `Location` then (#374).
+        PreparedReturn::Static(if is_redirect_status(status) {
             Prebuilt::leak_redirect(status, concatenated.as_bytes(), server_bytes)
         } else if body.is_empty() {
             // `return STATUS;` with no body: when the status has a canned
@@ -2598,7 +2703,8 @@ pub(crate) fn build_handler(
 ) -> Result<PreparedHandler, String> {
     Ok(match handler {
         Handler::Return { status, body } => {
-            PreparedHandler::Return(prepare_return(status, body, tokens))
+            let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
+            PreparedHandler::Return(prepare_return(status, body, tokens), finalized)
         }
         Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
@@ -2769,7 +2875,7 @@ pub(crate) fn build_prefix_or_exact(
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedLocation, String> {
     let Location {
-        mode: _,
+        mode,
         pattern,
         noregex,
         rewrite_ops,
@@ -2817,9 +2923,13 @@ pub(crate) fn build_prefix_or_exact(
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
+        explicit_return: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
+    // Only an `if` block's anonymous location in a regex location is
+    // built here with a regex mode (#137): its alias takes the captures.
+    let is_regex = matches!(mode, MatchMode::Regex { .. });
     let pattern: &'static [u8] = Box::leak(pattern.into_bytes().into_boxed_slice());
     let alias_prefix_override: Option<&'static [u8]> = alias_prefix_override
         .map(|s| Box::leak(s.into_bytes().into_boxed_slice()) as &'static [u8]);
@@ -2847,7 +2957,7 @@ pub(crate) fn build_prefix_or_exact(
                 mapping: document_root.1,
             },
             pattern,
-            false,
+            is_regex,
             alias_prefix_override,
             index.clone(),
             None,
@@ -2872,7 +2982,7 @@ pub(crate) fn build_prefix_or_exact(
     let doc_root = leak_doc_root(
         document_root,
         pattern,
-        false,
+        is_regex,
         alias_prefix_override,
         location_disable_symlinks
             .clone()
@@ -2881,7 +2991,7 @@ pub(crate) fn build_prefix_or_exact(
     let handler = build_handler(
         handler,
         pattern,
-        false,
+        is_regex,
         alias_prefix_override,
         index,
         try_files,
@@ -3058,6 +3168,7 @@ pub(crate) fn build_regex_location(
         chunked_transfer_encoding: location_chunked_transfer_encoding,
         alias_prefix_override,
         inherits_root: _,
+        explicit_return: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;

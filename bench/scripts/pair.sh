@@ -25,6 +25,7 @@ A_BIN=""
 B_BIN=""
 A_ENV=""
 B_ENV=""
+CHECK_ONLY=0
 
 usage() {
     cat <<'USAGE'
@@ -50,6 +51,14 @@ Options:
   --b-bin PATH       ruxen binary for B (default target/release/ruxen)
   --a-env "K=V ..."  extra env for A when it is ruxen
   --b-env "K=V ..."  extra env for B when it is ruxen
+  --check            only run the scenario's generator and the pre-check
+                     below, then exit (0 when both sides pass)
+
+Before measuring, the scenario's generator (manifest column 11) runs, and
+each side is started once for a single request: both must answer 2xx/3xx
+with the same status, or nothing is measured (a different body size is
+only a warning). Two 404s from missing fixtures would otherwise give a
+plausible-looking ratio (#380).
 
 Examples:
   # ruxen vs nginx
@@ -75,6 +84,7 @@ while [[ $# -gt 0 ]]; do
         --b-bin)    B_BIN="${2:-}"; B_KIND="ruxen"; shift 2 ;;
         --a-env)    A_ENV="${2:-}"; shift 2 ;;
         --b-env)    B_ENV="${2:-}"; shift 2 ;;
+        --check)    CHECK_ONLY=1; shift ;;
         -h|--help)  usage; exit 0 ;;
         --*) die "unknown option: $1" ;;
         *)
@@ -93,17 +103,19 @@ require_cmd wrk
 require_cmd curl
 require_cmd awk
 default_bin="${REPO_ROOT}/target/release/ruxen"
-for bin in "${A_BIN:-$default_bin}" "${B_BIN:-$default_bin}"; do
-    [[ -x "$bin" ]] || die "missing ruxen binary: $bin (run: cargo build --release)"
-done
+# Only a ruxen side needs a binary: an nginx A side runs without one.
+[[ "$A_KIND" != "ruxen" || -x "${A_BIN:-$default_bin}" ]] \
+    || die "missing ruxen binary: ${A_BIN:-$default_bin} (run: cargo build --release)"
+[[ "$B_KIND" != "ruxen" || -x "${B_BIN:-$default_bin}" ]] \
+    || die "missing ruxen binary: ${B_BIN:-$default_bin} (run: cargo build --release)"
 
 mapfile -t f < <(lookup_scenario "$SCENARIO_ID") \
     || die "unknown scenario: $SCENARIO_ID (see bench/scenarios/manifest.tsv)"
 port="${f[2]}" path="${f[3]}" threads="${f[4]}" connections="${f[5]}"
-warmup="${f[7]}" conf_abs="${REPO_ROOT}/${f[9]}" header_mode="${f[11]}"
+warmup="${f[7]}" conf_abs="${REPO_ROOT}/${f[9]}" prepare="${f[10]}" header_mode="${f[11]}"
 headers_raw="${f[12]}" scheme="${f[13]}"
 [[ -f "$conf_abs" ]] || die "missing config: $conf_abs"
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 
 work_dir="$(mktemp -d -t ruxen-pair-XXXXXX)"
 trap 'rm -rf "$work_dir"' EXIT
@@ -134,6 +146,27 @@ run_side() {
 }
 
 log "scenario=${SCENARIO_ID} url=${url} A=${A_LABEL}${A_ENV:+ [$A_ENV]} B=${B_LABEL}${B_ENV:+ [$B_ENV]} pairs=${PAIRS} duration=${DURATION}"
+run_prepare "$prepare"
+# Pre-check: one request per side, no load. run_side's `die` would only end
+# the process substitution, so the probes run directly.
+for side in A B; do
+    if [[ "$side" == "A" ]]; then kind="$A_KIND" bin="$A_BIN" env_line="$A_ENV"
+    else kind="$B_KIND" bin="$B_BIN" env_line="$B_ENV"; fi
+    PROBE_FILE="${work_dir}/${side}.probe" RUXEN_BIN="${bin:-$default_bin}" run_iteration \
+        "$kind" "$conf_abs" "${work_dir}/${side}.probe.log" "$url" "$threads" "$connections" \
+        "$warmup" "$DURATION" "$header_mode" "$headers_raw" "$scheme" /dev/null "$env_line"
+done
+a_probe="$(<"${work_dir}/A.probe")" b_probe="$(<"${work_dir}/B.probe")"
+log "pre-check: A ${a_probe}, B ${b_probe} (status, body bytes)"
+# Same status, or the two sides do different work. Body sizes may differ
+# legitimately (server tokens in built-in pages, gzip output), so a size
+# difference is only reported.
+[[ "${a_probe%% *}" == "${b_probe%% *}" ]] \
+    || die "A and B answer ${url} with different statuses: ${a_probe%% *} vs ${b_probe%% *}"
+[[ "$a_probe" == "$b_probe" ]] \
+    || log "warning: A and B send different body sizes: ${a_probe#* } vs ${b_probe#* } bytes"
+(( CHECK_ONLY )) && exit 0
+
 log "throwaway warm-up run (A, ${WARM_DURATION})"
 DURATION_SAVED="$DURATION"; DURATION="$WARM_DURATION"
 run_side A warm >/dev/null

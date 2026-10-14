@@ -115,10 +115,64 @@ pub struct LimitReqZone {
     pub key: &'static [PreparedValuePart],
     /// Requests per second × 1000.
     pub rate: u64,
-    shards: Box<[Mutex<Shard>]>,
+    shards: &'static [Mutex<Shard>],
+}
+
+/// The zones' state, by name, for the next configuration: a reload that
+/// declares a zone of the same name and size gets its state, as nginx
+/// keeps a shared memory zone (`ngx_init_cycle`,
+/// `ngx_http_limit_req_init_zone`) (#342).
+static KEPT: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+
+struct Kept {
+    name: String,
+    size: u64,
+    key_text: String,
+    shards: &'static [Mutex<Shard>],
 }
 
 impl LimitReqZone {
+    /// The zone `limit_req_zone` declares, with the state of the one
+    /// declared the same way before a reload. A different key for a kept
+    /// zone is nginx's error.
+    pub(crate) fn declare(
+        name: &'static str,
+        key: &'static [PreparedValuePart],
+        key_text: &str,
+        size: u64,
+        rate: u64,
+    ) -> Result<LimitReqZone, String> {
+        // Unit tests prepare many configurations in one process.
+        if cfg!(test) {
+            return Ok(LimitReqZone::new(name, key, size, rate));
+        }
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = kept.iter().find(|k| k.name == name && k.size == size) {
+            if k.key_text != key_text {
+                return Err(format!(
+                    "limit_req \"{name}\" uses the \"{key_text}\" key while previously it used the \"{}\" key",
+                    k.key_text
+                ));
+            }
+            // The rate isn't part of the state: the new one applies.
+            return Ok(LimitReqZone {
+                name,
+                key,
+                rate,
+                shards: k.shards,
+            });
+        }
+        let zone = LimitReqZone::new(name, key, size, rate);
+        kept.retain(|k| k.name != name);
+        kept.push(Kept {
+            name: name.to_string(),
+            size,
+            key_text: key_text.to_string(),
+            shards: zone.shards,
+        });
+        Ok(zone)
+    }
+
     pub(crate) fn new(
         name: &'static str,
         key: &'static [PreparedValuePart],
@@ -129,7 +183,7 @@ impl LimitReqZone {
         const SHARDS: usize = 64;
         let entries = (size / 128).max(SHARDS as u64) as usize;
         let capacity = entries.div_ceil(SHARDS);
-        let shards = (0..SHARDS)
+        let shards: Box<[Mutex<Shard>]> = (0..SHARDS)
             .map(|_| {
                 Mutex::new(Shard {
                     map: HashMap::new(),
@@ -145,7 +199,7 @@ impl LimitReqZone {
             name,
             key,
             rate,
-            shards,
+            shards: Box::leak(shards),
         }
     }
 

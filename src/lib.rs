@@ -132,6 +132,64 @@ pub mod fuzzing {
         })
     }
 
+    /// An upstream's response head as the proxy reads it (#217): where it
+    /// ends, found in one read and in two split at `at` (the second search
+    /// resumes 3 bytes back, as `proxy::attempt` does), which must agree;
+    /// then the status and each field as the proxy classifies it. A
+    /// summary for the target's checks: (head end, terminator length,
+    /// status, field count, content length).
+    pub fn upstream_head(
+        data: &[u8],
+        at: usize,
+    ) -> Option<(usize, usize, u16, usize, Option<u64>)> {
+        use crate::proxy::*;
+        let whole = find_head_end(data, 0);
+        let at = at.min(data.len());
+        let split =
+            find_head_end(&data[..at], 0).or_else(|| find_head_end(data, at.saturating_sub(3)));
+        assert_eq!(whole, split, "split at {at}");
+        let (end, term) = whole?;
+        let head = &data[..end];
+        let (first_len, _) = find_line_end(head).unwrap_or((head.len(), 0));
+        let status = parse_status_code(&head[..first_len]);
+        let mut pos = headers_start(data, first_len, end);
+        let mut fields = 0;
+        let mut length = None;
+        while pos < end {
+            let (len, t) = find_line_end(&head[pos..]).unwrap_or((end - pos, 0));
+            let line = &head[pos..pos + len];
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                fields += 1;
+                if classify_upstream_header(&line[..colon]) == UpstreamHeader::ContentLength {
+                    length = parse_content_length(line[colon + 1..].trim_ascii());
+                }
+            }
+            if t == 0 {
+                break;
+            }
+            pos += len + t;
+        }
+        Some((end, term, status, fields, length))
+    }
+
+    /// The decoder of a chunked upstream body relayed to the client
+    /// (`proxy_stream::ChunkedDecoder`, #88) over `data` in pieces of
+    /// `piece` bytes: (decoded body, whether it ended, bytes used), or
+    /// `Err` for a refused body.
+    pub fn upstream_chunked(data: &[u8], piece: usize) -> Result<(Vec<u8>, bool, usize), ()> {
+        let mut dec = crate::proxy_stream::ChunkedDecoder::default();
+        let mut out = Vec::new();
+        let mut used = 0;
+        for part in data.chunks(piece.max(1)) {
+            let (done, n) = dec.feed(part, &mut out)?;
+            used += n;
+            if done {
+                return Ok((out, true, used));
+            }
+        }
+        Ok((out, false, used))
+    }
+
     /// In-memory input delivered at most `piece` bytes per read; EOF after.
     struct Pieces {
         data: Vec<u8>,

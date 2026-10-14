@@ -22,7 +22,20 @@ pub struct LimitConnZone {
     pub key_text: &'static str,
     /// Keys a shard may hold at once (from the zone size).
     capacity: usize,
-    shards: Box<[Mutex<HashMap<Box<[u8]>, u32>>]>,
+    shards: &'static [Mutex<HashMap<Box<[u8]>, u32>>],
+}
+
+/// The zones' counts, by name, for the next configuration, as for
+/// `limit_req` (#342): connections the old workers still serve keep
+/// counting against the new configuration's limits, as in nginx.
+static KEPT: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+
+struct Kept {
+    name: String,
+    size: u64,
+    key_text: &'static str,
+    capacity: usize,
+    shards: &'static [Mutex<HashMap<Box<[u8]>, u32>>],
 }
 
 impl std::fmt::Debug for LimitConnZone {
@@ -32,6 +45,47 @@ impl std::fmt::Debug for LimitConnZone {
 }
 
 impl LimitConnZone {
+    /// The zone `limit_conn_zone` declares, with the counts of the one
+    /// declared the same way before a reload. A different key for a kept
+    /// zone is nginx's error (ngx_http_limit_conn_init_zone).
+    pub(crate) fn declare(
+        name: &'static str,
+        key: &'static [PreparedValuePart],
+        key_text: &'static str,
+        size: u64,
+    ) -> Result<LimitConnZone, String> {
+        // Unit tests prepare many configurations in one process.
+        if cfg!(test) {
+            return Ok(LimitConnZone::new(name, key, key_text, size));
+        }
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = kept.iter().find(|k| k.name == name && k.size == size) {
+            if k.key_text != key_text {
+                return Err(format!(
+                    "limit_conn_zone \"{name}\" uses the \"{key_text}\" key while previously it used the \"{}\" key",
+                    k.key_text
+                ));
+            }
+            return Ok(LimitConnZone {
+                name,
+                key,
+                key_text,
+                capacity: k.capacity,
+                shards: k.shards,
+            });
+        }
+        let zone = LimitConnZone::new(name, key, key_text, size);
+        kept.retain(|k| k.name != name);
+        kept.push(Kept {
+            name: name.to_string(),
+            size,
+            key_text,
+            capacity: zone.capacity,
+            shards: zone.shards,
+        });
+        Ok(zone)
+    }
+
     pub(crate) fn new(
         name: &'static str,
         key: &'static [PreparedValuePart],
@@ -45,7 +99,7 @@ impl LimitConnZone {
             key,
             key_text,
             capacity: entries.div_ceil(SHARDS),
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            shards: Box::leak((0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect()),
         }
     }
 

@@ -146,10 +146,15 @@ http {
 
         location /preserve {
             error_page 404 /body200;
-            return 404 "first";
+            return 404;
         }
 
         location /override {
+            error_page 404 =200 /body200;
+            return 404;
+        }
+
+        location /text {
             error_page 404 =200 /body200;
             return 404 "first";
         }
@@ -161,11 +166,19 @@ http {
 
         location /redir {
             error_page 405 /return302;
-            return 405 "first";
+            return 405;
         }
 
         location /return302 {
             return 302 "http://example.com/";
+        }
+
+        location /empty301 {
+            return 301;
+        }
+
+        location /empty302 {
+            return 302 $arg_to;
         }
 
         location /varredir {
@@ -189,6 +202,26 @@ fn m12_return_redirect_form_uses_location_header() {
     assert_eq!(header_value(&resp, "Location"), Some("http://example.com/"));
 }
 
+/// A redirect status without a URL (or with one that renders empty) is
+/// still a redirect, with an empty `Location`, as nginx's
+/// `ngx_http_send_response` (#374).
+#[test]
+fn m12_return_redirect_without_url_has_empty_location() {
+    let (_g, port) = spawn_server(M12_CONF);
+
+    let bare = http_get(port, "/empty301");
+    assert_eq!(status_line(&bare), "HTTP/1.1 301 Moved Permanently");
+    assert_eq!(header_value(&bare, "Location"), Some(""));
+    assert!(!body(&bare).is_empty());
+
+    let empty = http_get(port, "/empty302");
+    assert_eq!(status_line(&empty), "HTTP/1.1 302 Moved Temporarily");
+    assert_eq!(header_value(&empty, "Location"), Some(""));
+
+    let set = http_get(port, "/empty302?to=/x");
+    assert_eq!(header_value(&set, "Location"), Some("/x"));
+}
+
 #[test]
 fn m12_error_page_preserves_or_overrides_status_for_success_targets() {
     let (_g, port) = spawn_server(M12_CONF);
@@ -202,6 +235,13 @@ fn m12_error_page_preserves_or_overrides_status_for_success_targets() {
     assert_eq!(status_line(&override_200), "HTTP/1.1 200 OK");
     assert_eq!(header_value(&override_200, "X-Status"), Some("200"));
     assert_eq!(body(&override_200), b"replacement");
+
+    // A `return` with text is sent as it is: nginx's
+    // ngx_http_script_return_code doesn't finalize it with the status
+    // (#372).
+    let text = http_get(port, "/text");
+    assert_eq!(status_line(&text), "HTTP/1.1 404 Not Found");
+    assert_eq!(body(&text), b"first");
 }
 
 #[test]

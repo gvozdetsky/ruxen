@@ -373,3 +373,96 @@ fn no_connection_fails_across_reloads() {
         assert_eq!(kill(s.child.id() as i32, SIGQUIT), 0);
     }
 }
+
+/// `limit_req` zones keep their state across a reload when declared the
+/// same way, as nginx keeps a shared zone of the same name and size (#342);
+/// another key for the zone fails the reload, as in nginx.
+#[test]
+fn limit_req_state_survives_a_reload() {
+    let port = free_port();
+    let s = start("limitreq", "", "");
+    std::fs::write(s.dir.join("index.html"), "x").unwrap();
+    let conf = |key: &str, text: &str| {
+        format!(
+            "limit_req_zone {key} zone=one:1m rate=1r/m;\n\
+             server {{ listen 127.0.0.1:{port}; root {d};\n\
+               location / {{ limit_req zone=one; add_header X-T {text} always; }} }}",
+            d = s.dir.display()
+        )
+    };
+    let status = || get(port, "/").unwrap()[9..12].to_string();
+    s.write_conf("", &conf("$binary_remote_addr", "a"));
+    s.reload();
+    s.wait_threads(2);
+    assert_eq!(status(), "200");
+    assert_eq!(status(), "503");
+
+    s.write_conf("", &conf("$binary_remote_addr", "b"));
+    s.reload();
+    assert!(
+        get(port, "/").unwrap().contains("503"),
+        "the bucket was reset"
+    );
+
+    s.write_conf("", &conf("$remote_addr", "c"));
+    s.hup();
+    assert!(
+        s.error_log()
+            .contains("limit_req \"one\" uses the \"$remote_addr\" key while previously it used the \"$binary_remote_addr\" key"),
+        "{}",
+        s.error_log()
+    );
+    let response = get(port, "/").unwrap();
+    assert!(
+        response.contains("503") && response.contains("X-T: b"),
+        "{response}"
+    );
+}
+
+/// `ssl_session_cache shared:NAME:SIZE` keeps its sessions across a
+/// reload, as nginx keeps the shared zone (#342): a session saved before
+/// the reload resumes after it. TLS 1.2, so the session ID cache is used.
+#[test]
+fn shared_ssl_session_cache_survives_a_reload() {
+    let certs = common::tls::make_self_signed("localhost");
+    let port = free_port();
+    let s = start("tlscache", "", "");
+    let conf = |text: &str| {
+        format!(
+            "server {{ listen 127.0.0.1:{port} ssl; ssl_protocols TLSv1.2;\n\
+               ssl_certificate {c}; ssl_certificate_key {k};\n\
+               ssl_session_cache shared:SSL:1m; ssl_session_tickets off;\n\
+               location / {{ return 200 \"{text}\\n\"; }} }}",
+            c = certs.cert_path().display(),
+            k = certs.key_path().display()
+        )
+    };
+    s.write_conf("", &conf("one"));
+    s.reload();
+    s.wait_threads(2);
+    let sess = s.dir.join("sess.pem");
+    let connect = |flag: &str| -> String {
+        let out = Command::new("openssl")
+            .args([
+                "s_client",
+                "-connect",
+                &format!("127.0.0.1:{port}"),
+                "-tls1_2",
+            ])
+            .args([flag, sess.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("openssl");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let first = connect("-sess_out");
+    assert!(first.contains("New, "), "{first}");
+    let again = connect("-sess_in");
+    assert!(again.contains("Reused, "), "{again}");
+
+    s.write_conf("", &conf("two"));
+    s.reload();
+    s.wait_threads(2);
+    let after = connect("-sess_in");
+    assert!(after.contains("Reused, "), "after the reload: {after}");
+}

@@ -240,3 +240,63 @@ fn m116_expiry_vary_and_restart() {
     let r = get(s.port, "/keep.txt");
     assert_eq!((status_of(&r), body_of(&r)), ("HIT", "KEPT"), "{r}");
 }
+
+/// A conditional request answered from the cache (#349): 304 when every
+/// condition says "unchanged", 412 for a failed precondition, the full
+/// response otherwise, as nginx's not-modified filter on a cacheable
+/// upstream response.
+#[test]
+fn m116_conditional_hits() {
+    let _setup_lock = common::ports::setup_lock();
+    let s = setup("cond");
+    std::fs::write(s.dir.join("html").join("c.txt"), "COND").unwrap();
+    let _server = start(&s.dir.join("nginx.conf"), s.port);
+    drop(_setup_lock);
+
+    let r = get(s.port, "/c.txt");
+    assert_eq!(status_of(&r), "MISS", "{r}");
+    let header = |name: &str| {
+        r.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} in {r}"))
+            .trim()
+            .to_string()
+    };
+    let (etag, last_modified) = (header("ETag:"), header("Last-Modified:"));
+    let conditional = |h: &str| {
+        request(
+            s.port,
+            &format!("GET /c.txt HTTP/1.0\r\nHost: x\r\n{h}\r\n\r\n"),
+        )
+    };
+
+    let r = conditional(&format!("If-None-Match: {etag}"));
+    assert!(r.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{r}");
+    assert!(r.contains(&format!("ETag: {etag}")), "{r}");
+    assert!(
+        !r.contains("Content-Length") && !r.contains("Content-Type"),
+        "{r}"
+    );
+    assert_eq!(body_of(&r), "", "{r}");
+    let r = conditional(&format!("If-Modified-Since: {last_modified}"));
+    assert!(r.starts_with("HTTP/1.1 304"), "{r}");
+    // `if_modified_since exact`: another date is "modified".
+    let r = conditional("If-Modified-Since: Fri, 01 Jan 2100 00:00:00 GMT");
+    assert_eq!(body_of(&r), "COND", "{r}");
+    let r = conditional("If-None-Match: \"other\"");
+    assert_eq!(body_of(&r), "COND", "{r}");
+    let r = conditional("If-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT");
+    assert!(r.starts_with("HTTP/1.1 412"), "{r}");
+    let r = conditional("If-Match: \"other\"");
+    assert!(r.starts_with("HTTP/1.1 412"), "{r}");
+
+    // A response fetched now and stored (a bypass refreshes the cache)
+    // gets the same answer.
+    let r = request(
+        s.port,
+        &format!("GET /c.txt?bypass=1 HTTP/1.0\r\nHost: x\r\nIf-None-Match: {etag}\r\n\r\n"),
+    );
+    assert!(r.starts_with("HTTP/1.1 304"), "{r}");
+    assert_eq!(status_of(&r), "BYPASS", "{r}");
+    assert_eq!(body_of(&r), "", "{r}");
+}

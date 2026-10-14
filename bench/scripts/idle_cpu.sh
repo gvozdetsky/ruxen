@@ -54,7 +54,7 @@ mapfile -t f < <(lookup_scenario "$SCENARIO_ID") \
     || die "unknown scenario: $SCENARIO_ID (see bench/scenarios/manifest.tsv)"
 port="${f[2]}" path="${f[3]}" conf_abs="${REPO_ROOT}/${f[9]}" scheme="${f[13]}"
 [[ "$scheme" == "http" ]] || die "idle_cpu.sh needs a plain-HTTP scenario"
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 work_dir="$(mktemp -d -t ruxen-idle-XXXXXX)"
 pid=""
 holder=""

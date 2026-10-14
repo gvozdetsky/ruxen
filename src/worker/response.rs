@@ -37,10 +37,6 @@ pub(crate) fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-pub(crate) fn is_redirect_return(status: u16, body: &[ValuePart]) -> bool {
-    is_redirect_status(status) && !body.is_empty()
-}
-
 pub(crate) fn build_templated_return(
     status: u16,
     parts: &[PreparedValuePart],
@@ -50,7 +46,7 @@ pub(crate) fn build_templated_return(
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(64);
     render_parts(parts, ctx, &mut body);
-    if is_redirect_status(status) && !body.is_empty() {
+    if is_redirect_status(status) {
         http::build_redirect_response(status, &body, method, server)
     } else if matches!(method, Method::Head) {
         http::build_head_response(status, body.len(), server)
@@ -688,6 +684,7 @@ pub(crate) fn apply_proxy_add_headers(
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
     upstream_headers: &[u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let needs_expires = !matches!(meta.proxy_expires, PreparedExpires::Off);
     if meta.proxy_add_headers.is_empty() && meta.proxy_add_trailers.is_empty() && !needs_expires {
@@ -700,7 +697,9 @@ pub(crate) fn apply_proxy_add_headers(
         Response::Prebuilt(bytes) => bytes.to_vec(),
         // A 101's head: `add_header ... always`.
         Response::Upgrade(mut upgraded) => {
-            let render_ctx = proxy_render_ctx(http, ctx, meta, 101, upstream_headers);
+            let root_only = root_only_state(meta);
+            let render_ctx =
+                proxy_render_ctx(http, ctx, meta, 101, upstream_headers, &root_only, uri);
             upgraded.head = inject_add_headers(upgraded.head, meta.proxy_add_headers, &render_ctx);
             return Response::Upgrade(upgraded);
         }
@@ -708,7 +707,16 @@ pub(crate) fn apply_proxy_add_headers(
     };
     // `$upstream_http_*` read the upstream's own header lines, which still
     // include the ones hidden from the client (Server, Date, X-Accel-*).
-    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(&bytes), upstream_headers);
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_headers,
+        &root_only,
+        uri,
+    );
     let mut out = bytes;
     if needs_expires {
         out = apply_expires(out, meta.proxy_expires, &render_ctx);
@@ -750,6 +758,7 @@ pub(crate) fn intercept_proxy_error(
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
     server: &'static [u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     if error_pages.is_empty() {
         return response;
@@ -757,7 +766,16 @@ pub(crate) fn intercept_proxy_error(
     let Response::Prebuilt(bytes) = response else {
         return response;
     };
-    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(bytes), &[]);
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(bytes),
+        &[],
+        &root_only,
+        uri,
+    );
     maybe_intercept_error_page(
         Response::Prebuilt(bytes),
         error_pages,
@@ -769,6 +787,20 @@ pub(crate) fn intercept_proxy_error(
     )
 }
 
+/// The location's root alone, for `$document_root` / `$request_filename`
+/// in a proxied response's `add_header`, or in an access log line, when
+/// the request kept no rewrite state (#363). Cold: only past a check that
+/// something reads them.
+#[cold]
+pub(crate) fn root_only_state(meta: &phase::ProcessMeta) -> Option<RewriteState> {
+    if meta.rewrite_state.is_some() {
+        return None;
+    }
+    let mut state = RewriteState::default();
+    state.doc_root = Some(meta.doc_root?);
+    Some(state)
+}
+
 /// The variable context for rendering against a proxied response
 /// (`add_header`, `proxy_redirect`).
 fn proxy_render_ctx<'a>(
@@ -777,14 +809,20 @@ fn proxy_render_ctx<'a>(
     meta: &'a phase::ProcessMeta,
     status: u16,
     upstream_headers: &'a [u8],
+    root_only: &'a Option<RewriteState>,
+    // The current URI (normalized, rewritten), when the caller has it;
+    // else the request's own path (#373).
+    uri: Option<&'a [u8]>,
 ) -> RenderCtx<'a> {
     let request_uri = ctx.path;
     let args = request_args(request_uri);
-    let uri = request_uri
-        .iter()
-        .position(|&b| b == b'?')
-        .map(|i| &request_uri[..i])
-        .unwrap_or(request_uri);
+    let uri = uri.unwrap_or_else(|| {
+        request_uri
+            .iter()
+            .position(|&b| b == b'?')
+            .map(|i| &request_uri[..i])
+            .unwrap_or(request_uri)
+    });
     RenderCtx {
         uri,
         request_uri,
@@ -821,7 +859,7 @@ fn proxy_render_ctx<'a>(
         epoch_secs: ctx.epoch_secs,
         epoch_ms: ctx.epoch_ms,
         server_name_captures: &[],
-        rewrite_state: meta.rewrite_state.as_deref(),
+        rewrite_state: meta.rewrite_state.as_deref().or(root_only.as_ref()),
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.proxy_host,
@@ -938,6 +976,7 @@ pub(crate) fn rewrite_proxy_redirects(
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
     upstream_headers: &[u8],
+    uri: Option<&[u8]>,
 ) -> Response {
     let Response::Owned(bytes) = response else {
         return response;
@@ -945,7 +984,16 @@ pub(crate) fn rewrite_proxy_redirects(
     let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
         return Response::Owned(bytes);
     };
-    let render_ctx = proxy_render_ctx(http, ctx, meta, response_status(&bytes), upstream_headers);
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_headers,
+        &root_only,
+        uri,
+    );
 
     let mut out = Vec::with_capacity(bytes.len() + 64);
     let mut changed = false;

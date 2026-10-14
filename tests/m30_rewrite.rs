@@ -194,3 +194,61 @@ http {
     assert_eq!(status_line(&captured), "HTTP/1.1 200 OK");
     assert_eq!(body(&captured), b"value");
 }
+
+/// A response from the location's rewrite program goes through the
+/// location's `add_header` and `error_page` like a handler's (#362); one
+/// from inside an `if` with settings, through the block's. A `return` with
+/// text skips `error_page`, as nginx sends it directly.
+#[test]
+fn rewrite_responses_get_the_location_filters() {
+    let conf = r#"
+events {}
+http {
+  access_log off;
+  server {
+    listen 127.0.0.1:%%PORT%%;
+
+    location /hdr {
+      add_header X-A a always;
+      if ($arg_a) { return 200 "if"; }
+      rewrite ^/hdr/r$ http://example.com/ redirect;
+      return 200 "loc";
+    }
+
+    location /err {
+      error_page 403 /page;
+      if ($arg_a) { return 403; }
+      if ($arg_b) { error_page 403 /other; return 403; }
+      if ($arg_t) { return 403 "text"; }
+      return 200 "ok";
+    }
+
+    location = /page { return 200 "page"; }
+    location = /other { return 200 "other"; }
+  }
+}
+"#;
+
+    let (_guard, port) = spawn_server(conf);
+
+    let in_if = http_get(port, "/hdr?a=1");
+    assert_eq!(header_value(&in_if, "X-A"), Some("a"));
+    assert_eq!(body(&in_if), b"if");
+
+    let redirect = http_get(port, "/hdr/r");
+    assert_eq!(status_line(&redirect), "HTTP/1.1 302 Moved Temporarily");
+    assert_eq!(header_value(&redirect, "X-A"), Some("a"));
+
+    let page = http_get(port, "/err?a=1");
+    assert_eq!(status_line(&page), "HTTP/1.1 403 Forbidden");
+    assert_eq!(body(&page), b"page");
+
+    let other = http_get(port, "/err?b=1");
+    assert_eq!(status_line(&other), "HTTP/1.1 403 Forbidden");
+    assert_eq!(body(&other), b"other");
+
+    // A `return` with text is sent as it is, error_page or not.
+    let text = http_get(port, "/err?t=1");
+    assert_eq!(status_line(&text), "HTTP/1.1 403 Forbidden");
+    assert_eq!(body(&text), b"text");
+}

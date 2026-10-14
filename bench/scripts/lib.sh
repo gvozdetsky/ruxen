@@ -19,14 +19,31 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || die "missing required command: ${cmd}"
 }
 
+# The URL scheme of a manifest `scheme`: `h2c` (HTTP/2 with prior
+# knowledge) is http, `h2` (HTTP/2 over TLS) is https.
+url_scheme() {
+    case "$1" in
+        h2c) echo http ;;
+        h2) echo https ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# curl options for a manifest `scheme`, one per line.
+curl_scheme_opts() {
+    case "$1" in
+        https) echo -k ;;
+        h2) printf '%s\n' -k --http2 ;;
+        h2c) echo --http2-prior-knowledge ;;
+    esac
+}
+
 wait_for_http() {
     local url="$1"
     local attempts="${2:-100}"
     local scheme="${3:-http}"
     local -a tls_opts=()
-    if [[ "$scheme" == "https" ]]; then
-        tls_opts=(-k)
-    fi
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
     local i
     for ((i = 0; i < attempts; i++)); do
         if curl -sS -m 1 "${tls_opts[@]}" -o /dev/null "$url" >/dev/null 2>&1; then
@@ -47,15 +64,33 @@ conf_prefix() {
 start_nginx() {
     local conf="$1"
     local server_log="$2"
-    local prefix
-    prefix="$(conf_prefix "$conf")"
-    nginx -p "$prefix" -c "$conf" -s quit >/dev/null 2>&1 || true
-    nginx -p "$prefix" -c "$conf" >"$server_log" 2>&1
+    stop_nginx "$conf"
+    nginx -p "$(conf_prefix "$conf")" -c "$conf" >"$server_log" 2>&1
 }
 
+# The master's pid from the config's `pid` file (every bench config sets
+# an absolute one), or nothing.
+nginx_master_pid() {
+    local conf="$1" pid_file
+    pid_file="$(awk '$1 == "pid" { sub(/;$/, "", $2); print $2; exit }' "$conf")"
+    [[ -n "$pid_file" ]] && cat "$pid_file" 2>/dev/null
+    return 0
+}
+
+# Graceful stop that waits for the master to exit (up to 10 s). `-s quit`
+# only sends the signal: a server started right after it (ruxen on the
+# same config) would race the old master for the port and the pid file,
+# and a master left running keeps answering in its place.
 stop_nginx() {
-    local conf="$1"
+    local conf="$1" pid i
+    pid="$(nginx_master_pid "$conf")"
     nginx -p "$(conf_prefix "$conf")" -c "$conf" -s quit >/dev/null 2>&1 || true
+    [[ -n "$pid" ]] || return 0
+    for ((i = 0; i < 100; i++)); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    log "warning: nginx master $pid still running 10 s after quit"
 }
 
 start_ruxen() {
@@ -81,16 +116,21 @@ stop_ruxen() {
     fi
 
     kill -QUIT "$pid" >/dev/null 2>&1 || true
-    wait "$pid" 2>/dev/null || true
+    # start_ruxen forks inside `$(...)`, so the server is not our child and
+    # `wait` returns at once: poll until it is gone (up to 10 s).
+    local i
+    for ((i = 0; i < 100; i++)); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    log "warning: ruxen $pid still running 10 s after SIGQUIT"
 }
 
 extract_etag() {
     local url="$1"
     local scheme="${2:-http}"
     local -a tls_opts=()
-    if [[ "$scheme" == "https" ]]; then
-        tls_opts=(-k)
-    fi
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
     curl -fsSI "${tls_opts[@]}" "$url" \
         | tr -d '\r' \
         | awk 'BEGIN { IGNORECASE=1 } $1=="ETag:" { print $2; exit }'
@@ -100,9 +140,7 @@ extract_last_modified() {
     local url="$1"
     local scheme="${2:-http}"
     local -a tls_opts=()
-    if [[ "$scheme" == "https" ]]; then
-        tls_opts=(-k)
-    fi
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
     curl -fsSI "${tls_opts[@]}" "$url" \
         | tr -d '\r' \
         | awk 'BEGIN { IGNORECASE=1 } tolower($1)=="last-modified:" { sub(/^[^:]*: */, ""); print; exit }'
@@ -137,7 +175,7 @@ wrk_metric_elapsed() {
 wrk_metric_non2xx() {
     local file="$1"
     awk '
-        /^Non-2xx or 3xx responses:/ { print $4; found=1; exit }
+        /Non-2xx or 3xx responses:/ { print $NF; found=1; exit }
         END { if (!found) print 0 }
     ' "$file"
 }
@@ -267,9 +305,44 @@ resolve_wrk_headers() {
     esac
 }
 
+# Run a scenario's fixture generator (manifest column 11, repo-relative).
+# The generators are idempotent, so this is cheap when the fixtures exist.
+# Without them a file scenario measures two 404s (#380).
+run_prepare() {
+    local prepare="$1"
+    [[ -n "$prepare" ]] || return 0
+    [[ -x "${REPO_ROOT}/${prepare}" ]] || die "missing generator: ${REPO_ROOT}/${prepare}"
+    "${REPO_ROOT}/${prepare}" >/dev/null || die "generator failed: ${prepare}"
+}
+
+# One request the way the load generator sends it, minus conditional and
+# scripted parts: prints "<status> <body bytes>". A `lua` scenario (a POST
+# script) is not probed and prints "- -"; wrk's non-2xx count covers it.
+probe_url() {
+    local url="$1" scheme="$2" header_mode="$3" headers_raw="$4"
+    if [[ "$header_mode" == "lua" ]]; then
+        echo "- -"
+        return 0
+    fi
+    local -a opts=()
+    mapfile -t opts < <(curl_scheme_opts "$scheme")
+    if [[ "$header_mode" == "static" && -n "$headers_raw" ]]; then
+        local IFS=';' h
+        for h in $headers_raw; do
+            opts+=(-H "$h")
+        done
+    fi
+    curl -sS -m 5 "${opts[@]}" -o /dev/null -w '%{http_code} %{size_download}\n' "$url" \
+        || echo "000 0"
+}
+
 # Run one (warmup + measurement) cycle against the chosen server. Writes the
 # measurement wrk output to $wrk_log. Caller is responsible for cooldown
 # between iterations.
+#
+# With PROBE_FILE set, there is no load: the server gets one probe_url
+# request, its "<status> <bytes>" goes to PROBE_FILE, and a status other
+# than 2xx/3xx is an error.
 #
 # Args: server_kind conf server_log url threads connections warmup duration
 #       header_mode headers_raw scheme wrk_log [env_line]
@@ -306,7 +379,7 @@ run_iteration() {
     }
 
     local -a tls_opts=()
-    [[ "$scheme" == "https" ]] && tls_opts=(-k)
+    mapfile -t tls_opts < <(curl_scheme_opts "$scheme")
 
     local ready=0 attempt
     for ((attempt = 0; attempt < 120; attempt++)); do
@@ -325,7 +398,25 @@ run_iteration() {
             tail -n 40 "$server_log" >&2
         fi
         _stop_server
-        die "server did not become ready: $url"
+        die "$server_kind did not become ready: $url"
+    fi
+
+    if [[ -n "${PROBE_FILE:-}" ]]; then
+        local probe status
+        probe="$(probe_url "$url" "$scheme" "$header_mode" "$headers_raw")"
+        _stop_server
+        echo "$probe" >"$PROBE_FILE"
+        status="${probe%% *}"
+        [[ "$status" == "-" || "$status" =~ ^[23][0-9][0-9]$ ]] \
+            || die "$server_kind answers $url with status $status, not 2xx/3xx (fixtures or a backend missing?)"
+        return 0
+    fi
+
+    if [[ "$scheme" == "h2" || "$scheme" == "h2c" ]]; then
+        run_h2load "$url" "$threads" "$connections" "$warmup" "$duration" "$wrk_log"
+        local h2_rc=$?
+        _stop_server
+        return $h2_rc
     fi
 
     local -a headers=()
@@ -357,4 +448,39 @@ run_iteration() {
         tail -n 40 "$wrk_log" >&2 || true
         return $wrk_rc
     fi
+}
+
+# HTTP/2 load (#348): h2load with 10 streams per connection, its summary
+# rewritten into the wrk lines the metric functions read (Requests/sec,
+# Non-2xx, Socket errors with failed + errored + timed-out requests as
+# `timeout`). h2load's own output is kept next to it (`.h2load`).
+run_h2load() {
+    local url="$1" threads="$2" connections="$3" warmup="$4" duration="$5" out="$6"
+    command -v h2load >/dev/null 2>&1 || die "h2load not found (apt install nghttp2-client)"
+    local -a cmd=(h2load -t "$threads" -c "$connections" -m 10)
+    set +e
+    "${cmd[@]}" -D "${warmup%s}" "$url" >/dev/null 2>&1
+    "${cmd[@]}" -D "${duration%s}" "$url" >"${out}.h2load" 2>&1
+    local rc=$?
+    set -e
+    h2load_as_wrk "${out}.h2load" >"$out"
+    if [[ $rc -ne 0 ]]; then
+        echo "h2load failed (rc=$rc) for $url:" >&2
+        tail -n 20 "${out}.h2load" >&2 || true
+    fi
+    return $rc
+}
+
+h2load_as_wrk() {
+    awk '
+        /^finished in/ { secs = $3; sub(/s,$/, "", secs); rps = $4 }
+        /^requests:/ { total = $2; failed = $10; errored = $12; timeout = $14 }
+        /^status codes:/ { c4 = $7; c5 = $9 }
+        END {
+            printf "  %s requests in %ss, 0MB read\n", total, secs
+            printf "Requests/sec: %s\n", rps
+            if (c4 + c5 > 0) printf "Non-2xx or 3xx responses: %d\n", c4 + c5
+            printf "Socket errors: connect 0, read 0, write 0, timeout %d\n", failed + errored + timeout
+        }
+    ' "$1"
 }

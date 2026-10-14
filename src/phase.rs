@@ -295,6 +295,10 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// A proxied response under `proxy_pass_header Date`: its `Date` is
+    /// the upstream's, or there is none, and the worker doesn't stamp one
+    /// (#360).
+    pub keep_upstream_date: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// `limit_rate` / `limit_rate_after` for this response. Boxed: `None`
@@ -348,6 +352,7 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            keep_upstream_date: false,
             gzip: None,
             limit_rate: None,
             post_action: None,
@@ -844,24 +849,7 @@ fn process_with_meta_inner(
                 },
             }
         };
-        rewrite_state.doc_root = Some(loc.doc_root);
-        meta.keepalive = KeepaliveMeta {
-            allow: loc.keepalive.allow,
-            idle_timeout_ms: loc.keepalive.idle_timeout_ms,
-            header_timeout_secs: loc.keepalive.header_timeout_secs,
-            max_requests: loc.keepalive.max_requests,
-            max_time_ms: loc.keepalive.max_time_ms,
-            disable_msie6: loc.keepalive.disable_msie6,
-            disable_safari: loc.keepalive.disable_safari,
-        };
-        meta.access_logs = loc.access_logs;
-        meta.doc_root = Some(loc.doc_root);
-        meta.timeouts = Some(loc.timeouts);
-        meta.post_action = loc.post_action;
-        meta.log = LogMeta {
-            error_logs: loc.error_logs,
-            log_not_found: loc.log_not_found,
-        };
+        apply_location_meta(&loc, &mut meta, &mut rewrite_state);
         if loc.internal && !internal_request {
             // ngx_http_core_find_config_phase: an `internal` location is
             // not found for an external request.
@@ -881,6 +869,14 @@ fn process_with_meta_inner(
         {
             loc = loc.limited(le);
         }
+        rewrite_state.if_location = None;
+        // A response from the rewrite program (`return` in an `if`, a
+        // `rewrite … redirect`) goes on to the location's response
+        // filters, `error_page` and `add_header`, as nginx finalizes it
+        // like a handler's (#362).
+        let mut rewrite_response = None;
+        // A `return` with text is sent as it is: no `error_page` for it.
+        let mut takes_error_page = true;
         let rewrite_broke = match run_rewrite_program(
             http,
             server,
@@ -894,8 +890,19 @@ fn process_with_meta_inner(
             RewriteOutcome::Continue => false,
             RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
-            RewriteOutcome::Respond(response) => return (response, meta),
+            RewriteOutcome::Respond(response, finalized) => {
+                rewrite_response = Some(response);
+                takes_error_page = finalized;
+                false
+            }
         };
+        // An `if` block with settings of its own held: the request goes on
+        // with its anonymous location (#137), as nginx's
+        // `ngx_http_script_if_code` switches `r->loc_conf`; a response
+        // from inside the block too (its `access_log`, `error_page`, …).
+        if let Some(n) = rewrite_state.if_location {
+            loc = switch_to_if_location(server, n, &mut meta, &mut rewrite_state);
+        }
         // Access-control phase (allow/deny, auth_basic): runs after
         // rewrite and before content dispatch. A top-level `return` is a
         // rewrite-module directive in nginx, so it answers in the rewrite
@@ -903,8 +910,9 @@ fn process_with_meta_inner(
         // ended the rewrite program first, in which case nginx never reaches
         // the `return` and does run access control.
         meta.remote_user = None;
-        let answered_in_rewrite_phase =
-            !rewrite_broke && matches!(loc.handler, crate::worker::PreparedHandler::Return(_));
+        let answered_in_rewrite_phase = rewrite_response.is_some()
+            || (!rewrite_broke
+                && matches!(loc.handler, crate::worker::PreparedHandler::Return(..)));
         // The realip module's pre-access handler, with the location's
         // settings, unless the post-read one already set the address.
         if !answered_in_rewrite_phase
@@ -917,7 +925,9 @@ fn process_with_meta_inner(
             req_now = Some(with_real_ip(req, state));
         }
         let req = req_now.as_ref().unwrap_or(req_in);
-        let mut denied = None;
+        // The access phase doesn't run for it: it is finished like a
+        // denial, with the location's filters.
+        let mut denied = rewrite_response;
         // The limit_req module's pre-access handler (#94), once per
         // request (nginx's `r->main->limit_req_status`); not again on the
         // way to an error page.
@@ -1014,7 +1024,11 @@ fn process_with_meta_inner(
             );
             ResponseLimit::new(rate, after)
         };
-        if let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler {
+        // `$proxy_host` exists once the proxy handler runs: not for a
+        // response from the rewrite or access phase.
+        if denied.is_none()
+            && let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler
+        {
             meta.proxy_host = proxy.host_header;
         }
         let response = match denied {
@@ -1047,6 +1061,7 @@ fn process_with_meta_inner(
                 &preserved_www_authenticate,
                 regex_captures.as_ref(),
                 response,
+                takes_error_page,
             ),
         };
         match response {
@@ -1662,7 +1677,7 @@ pub(crate) fn first_body_limit(
         body_temp: loc.body_temp,
         discard: !http.uses_request_body
             && !http.uses_request_body_file
-            && matches!(loc.handler, crate::worker::PreparedHandler::Return(_))
+            && matches!(loc.handler, crate::worker::PreparedHandler::Return(..))
             && loc.rewrite_program.is_empty()
             && loc.error_pages.is_empty()
             && loc.post_action.is_none()
@@ -1723,6 +1738,51 @@ fn find_config<'h, 'r>(
     }
 
     (&listen.servers[listen.default_server], None)
+}
+
+/// The anonymous location of an `if` block (#137) as the request's
+/// location from here on: its handler, headers, limits and logs. Cold.
+#[cold]
+#[inline(never)]
+fn switch_to_if_location(
+    server: &'static PreparedServer,
+    n: u32,
+    meta: &mut ProcessMeta,
+    rewrite_state: &mut RewriteState,
+) -> MatchedLocation<'static> {
+    let loc = MatchedLocation::from_prefix(&server.if_locations[n as usize]);
+    // What the location sets in the request's meta before its rewrite
+    // program, again for the new one.
+    apply_location_meta(&loc, meta, rewrite_state);
+    loc
+}
+
+/// The request's meta from the location it is in: what the location sets
+/// before its rewrite program, and an `if` location again (#137).
+#[inline(always)]
+fn apply_location_meta(
+    loc: &MatchedLocation<'static>,
+    meta: &mut ProcessMeta,
+    rewrite_state: &mut RewriteState,
+) {
+    rewrite_state.doc_root = Some(loc.doc_root);
+    meta.keepalive = KeepaliveMeta {
+        allow: loc.keepalive.allow,
+        idle_timeout_ms: loc.keepalive.idle_timeout_ms,
+        header_timeout_secs: loc.keepalive.header_timeout_secs,
+        max_requests: loc.keepalive.max_requests,
+        max_time_ms: loc.keepalive.max_time_ms,
+        disable_msie6: loc.keepalive.disable_msie6,
+        disable_safari: loc.keepalive.disable_safari,
+    };
+    meta.access_logs = loc.access_logs;
+    meta.doc_root = Some(loc.doc_root);
+    meta.timeouts = Some(loc.timeouts);
+    meta.post_action = loc.post_action;
+    meta.log = LogMeta {
+        error_logs: loc.error_logs,
+        log_not_found: loc.log_not_found,
+    };
 }
 
 /// Whether a ClientHello with this SNI name is to be refused

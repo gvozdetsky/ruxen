@@ -6,13 +6,13 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 188 of 238 configurations nginx accepts (79%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 193 of 238 configurations nginx accepts (81%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 173 | 81% |
+| github | 214 | 177 | 83% |
 | php | 3 | 0 | 0% |
-| proxy | 17 | 12 | 71% |
+| proxy | 17 | 13 | 76% |
 | static | 4 | 3 | 75% |
 
 ## What blocks the rest
@@ -20,12 +20,10 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | configurations | first error in ruxen | examples |
 |---:|---|---|
 | 14 | open() "…" failed (No such file or directory (os error N)) in <sandbox>…:N | h5bp:nginx.conf, gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:ocftw/OpenGovReport14-16/nginx.config, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt … |
-| 5 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf, gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf … |
+| 7 | unknown directive `http2` | mastodon, vaultwarden#1, vaultwarden#2, vaultwarden#3 … |
 | 4 | bad value for ssl_protocols (insecure version rejected): TLSvN in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:EstudioNexos/flautodiscover/fla_nginx.conf, gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf |
-| 4 | unknown directive `http2` | mastodon, gh:refluxdb/influxdb3-community/iox-nginx.conf, gh:qida/gohp/jsonx/nginx.conf.txt, gh:exp0logy/familycal/frontend/nginx.conf |
-| 4 | unknown directive `proxy_pass` | puma#1, gh:limingxinleo/phalcon/swoole.nginx.conf, gh:limingxinleo/basic-phalcon/swoole.nginx.conf, gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf |
+| 4 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf, gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
-| 3 | unknown directive `zone` | vaultwarden#1, vaultwarden#2, vaultwarden#3 |
 | 2 | bad value for ssl_protocols (insecure version rejected): TLSvN.N in <sandbox>…:N | gh:decred/dcrstakepool/sample-nginx.conf, gh:TetAlius/GoSyncMyCalendars/.nginx.conf |
 | 2 | unknown directive `auth_request` | gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in, gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf |
 | 2 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir |
@@ -56,11 +54,11 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | synapse#5 | proxy | — | — | (nginx: [emerg] unexpected "}" in <sandbox>/conf/nginx.conf:24) |
 | synapse#6 | proxy | — | — | (nginx: [emerg] unknown directive "table" in <sandbox>/conf/nginx.conf:3) |
 | synapse#7 | proxy | — | — | (nginx: [emerg] unexpected "," in <sandbox>/conf/nginx.conf:7) |
-| vaultwarden#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in a upstream block in <sandbox>/conf/nginx.conf:12 |
-| vaultwarden#2 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in a upstream block in <sandbox>/conf/nginx.conf:12 |
-| vaultwarden#3 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in a upstream block in <sandbox>/conf/nginx.conf:19 |
+| vaultwarden#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `http2` in a server block in <sandbox>/conf/nginx.conf:39 |
+| vaultwarden#2 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `http2` in a server block in <sandbox>/conf/nginx.conf:46 |
+| vaultwarden#3 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `http2` in a server block in <sandbox>/conf/nginx.conf:45 |
 | laravel#1 | php | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_pass` in a location block in <sandbox>/conf/nginx.conf:27 |
-| puma#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `proxy_pass` in a if block in <sandbox>/conf/nginx.conf:60 |
+| puma#1 | proxy | ok | ok |  |
 | immich#1 | proxy | ok | ok |  |
 | uptime-kuma#1 | proxy | ok | ok |  |
 | uptime-kuma#2 | proxy | ok | ok |  |
@@ -80,7 +78,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:lijiejie/eyes.sh/dnslog_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass_request_headers` in a server block in <sandbox>/conf/nginx.conf:7 |
 | gh:caktus/django-project-template/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:11) |
 | gh:jakearchibald/big-web-quiz/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
-| gh:limingxinleo/phalcon/swoole.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_pass` in a if block in <sandbox>/conf/nginx.conf:32 |
+| gh:limingxinleo/phalcon/swoole.nginx.conf | github | ok | ok |  |
 | gh:tulayang/okdoc/docs/Nginx/nginx.conf.md | github | — | — | (nginx: [emerg] unknown directive "```" in <sandbox>/conf/nginx.conf:2) |
 | gh:cqfn/jpeek/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:pclubiitk/puppy-love/puppy.nginx.conf | github | ok | ok |  |
@@ -177,7 +175,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:yegor256/rehttp/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:yegor256/mailanes/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:bakery/openmic/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
-| gh:limingxinleo/basic-phalcon/swoole.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_pass` in a if block in <sandbox>/conf/nginx.conf:32 |
+| gh:limingxinleo/basic-phalcon/swoole.nginx.conf | github | ok | ok |  |
 | gh:lizardsystem/lizard-efcis/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in <sandbox) |
 | gh:feross/play.cash/nginx.conf | github | — | ok | (nginx: [emerg] bind() to 50.116.11.184:18080 failed (99: Cannot assign requested) |
 | gh:flowerinheart/VisualNN/ide_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in a location block in <sandbox>/conf/nginx.conf:33 |
@@ -188,7 +186,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:ddsc/ddsc-worker/etc/nginx.conf.in | github | — | — | (nginx: [emerg] the closing bracket in "buildout" variable is missing in <sandbox) |
 | gh:llong2195/nest-starter/nginx.conf.d | github | ok | ok |  |
 | gh:fabiocicerchia/nginx-lua/nginx/1.18.0/ubuntu/18.04/tpl/nginx.conf | github | ok | ok |  |
-| gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_pass` in a if block in <sandbox>/conf/nginx.conf:32 |
+| gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf | github | ok | ok |  |
 | gh:TautvydasDerzinskas/Thingport/frontend/nginx.conf | github | ok | ok |  |
 | gh:nicholas-b-carter/progressive-react/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
 | gh:yashab-cyber/metasploit-ai/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:49 |
@@ -252,7 +250,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:Athenavi/chiron/frontend-vue/nginx.conf | github | ok | ok |  |
 | gh:QuantumBitstream/travelplanner_vue/nginx/nginx.conf | github | ok | ok |  |
 | gh:mohamed-azd/sonidle/nginx/nginx.conf | github | ok | ok |  |
-| gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a if block in <sandbox>/conf/nginx.conf:84 |
+| gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | ok |  |
 | gh:Amitkushwaha328/CivicSense-AI/nginx/nginx.conf | github | ok | ok |  |
 | gh:zumassh/foodgram-st/infra/nginx.conf | github | ok | ok |  |
 | gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | ok |  |

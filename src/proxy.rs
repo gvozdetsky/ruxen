@@ -520,6 +520,7 @@ impl ProxyPlan {
 /// the request's context; on the happy path nothing is pushed and the
 /// caller's empty `Vec` never allocates.
 pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Response {
+    report.passes_date = plan.response.passes_date;
     if let Some(cache) = plan.cache.as_deref_mut() {
         if cache.wait_until.is_some() {
             Box::pin(wait_for_lock(cache)).await;
@@ -725,6 +726,11 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 if let Some(cache) = plan.cache.as_deref() {
                     if let Some(storable) = storable.take() {
                         store_response(cache, storable, status, intercepted.is_some(), &resp);
+                        // The client may already have it (#349): the
+                        // not-modified filter of a cacheable response.
+                        if status == 200 && intercepted.is_none() {
+                            conditional_fresh(&plan, cache, &mut resp);
+                        }
                     }
                     if cache.head_as_get {
                         strip_body(&mut resp);
@@ -1217,6 +1223,9 @@ pub struct ProxyReport {
     pub states: Vec<UpstreamState>,
     /// `$upstream_cache_status`, when the location has a `proxy_cache`.
     pub cache_status: Option<crate::proxy_cache::CacheStatus>,
+    /// `proxy_pass_header Date`: the response's `Date` is the upstream's,
+    /// or there is none, and the worker doesn't stamp one (#360).
+    pub passes_date: bool,
 }
 
 /// The answer's upstream request is over (its header filtered, or the
@@ -2481,6 +2490,36 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
     let head = entry.head();
     let first_line_end = find_line_end(head).map_or(head.len(), |(end, _)| end);
     let status = parse_status_code(&head[..first_line_end]);
+    // nginx's not-modified filter runs for a cacheable upstream response
+    // (#349): a conditional request gets 304 or 412 instead of the body.
+    if status == 200
+        && let Some(cache) = plan.cache.as_deref()
+        && let Some(answer) = not_modified(head, &cache.request_headers)
+    {
+        // A failed precondition is an error response
+        // (ngx_http_filter_finalize_request), with the server's own head.
+        if answer == 412 {
+            let body = format!("{}\n", crate::http::reason_phrase(412));
+            return Response::Owned(crate::http::build_response_for_method(
+                412,
+                &body,
+                plan.method,
+                plan.server_bytes,
+            ));
+        }
+        let head = conditional_head(head, answer);
+        let first_line_end = find_line_end(&head).map_or(head.len(), |(end, _)| end);
+        return Response::Owned(client_head(
+            plan,
+            &head,
+            first_line_end,
+            None,
+            false,
+            false,
+            &mut report.upstream_headers,
+            &mut report.redirect_header,
+        ));
+    }
     for (name, value) in crate::proxy_cache::header_lines(head) {
         if name.len() >= 16 && name[..8].eq_ignore_ascii_case(b"x-accel-") {
             note_accel_header(&mut report.accel, plan.response, name, value);
@@ -2503,6 +2542,113 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         out.extend_from_slice(body);
     }
     Response::Owned(out)
+}
+
+/// nginx's `ngx_http_not_modified_header_filter` (1.24) for a 200 the
+/// cache answers, against the request's conditional headers:
+/// `If-Unmodified-Since` / `If-Match` that fail give 412; `If-Modified-Since`
+/// (`if_modified_since exact`, the default: unmodified only on the same
+/// date) and `If-None-Match` that all say "unchanged" give 304.
+fn not_modified(head: &[u8], request_headers: &[u8]) -> Option<u16> {
+    let response = |name: &[u8]| {
+        crate::proxy_cache::header_lines(head)
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    };
+    let request = |name: &[u8]| {
+        crate::proxy_cache::header_lines(request_headers)
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    };
+    let last_modified = response(b"last-modified").and_then(crate::file::parse_http_date);
+    let etag = response(b"etag");
+    if let Some(since) = request(b"if-unmodified-since") {
+        // ngx_http_test_if_unmodified: no date to compare is a failure.
+        let unmodified = match (crate::file::parse_http_date(since), last_modified) {
+            (Some(since), Some(lm)) => lm <= since,
+            _ => false,
+        };
+        if !unmodified {
+            return Some(412);
+        }
+    }
+    if let Some(if_match) = request(b"if-match")
+        && !etag.is_some_and(|e| crate::file::etag_list_matches_strong(if_match, e))
+    {
+        return Some(412);
+    }
+    let ims = request(b"if-modified-since");
+    let inm = request(b"if-none-match");
+    if ims.is_none() && inm.is_none() {
+        return None;
+    }
+    if let Some(ims) = ims {
+        let same = matches!(
+            (crate::file::parse_http_date(ims), last_modified),
+            (Some(a), Some(b)) if a == b
+        );
+        if !same {
+            return None;
+        }
+    }
+    if let Some(inm) = inm
+        && !etag.is_some_and(|e| crate::file::etag_list_matches(inm, e))
+    {
+        return None;
+    }
+    Some(304)
+}
+
+/// `not_modified` for a response just fetched and stored: `resp` (the
+/// client's response, buffered with a cache) becomes the 304 or 412.
+#[cold]
+#[inline(never)]
+fn conditional_fresh(plan: &ProxyPlan, cache: &CachePlan, resp: &mut Response) {
+    let Response::Owned(out) = resp else {
+        return;
+    };
+    let Some((end, terminator)) = find_head_end(out, 0) else {
+        return;
+    };
+    match not_modified(&out[..end + terminator], &cache.request_headers) {
+        Some(412) => {
+            let body = format!("{}\n", crate::http::reason_phrase(412));
+            *out =
+                crate::http::build_response_for_method(412, &body, plan.method, plan.server_bytes);
+        }
+        Some(status) => *out = conditional_head(&out[..end], status),
+        None => {}
+    }
+}
+
+/// The cached head as the not-modified filter sends a 304: without
+/// `Content-Type`, `Content-Length` and `Accept-Ranges`
+/// (ngx_http_not_modified_header_filter clears them).
+fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len());
+    out.extend_from_slice(
+        format!("HTTP/1.1 {status} {}", crate::http::reason_phrase(status)).as_bytes(),
+    );
+    for line in head.split(|&b| b == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let name = line
+            .split(|&b| b == b':')
+            .next()
+            .unwrap_or(line)
+            .trim_ascii();
+        let cleared = [&b"content-length"[..], b"content-type", b"accept-ranges"]
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h));
+        if status != 304 || !cleared {
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(line);
+        }
+    }
+    out.extend_from_slice(b"\r\n\r\n");
+    out
 }
 
 /// The 101 to a client that asked to upgrade (ngx_http_upstream_upgrade):
@@ -2780,7 +2926,7 @@ const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 
 /// How the response stitch treats one upstream header.
 #[derive(Debug, PartialEq, Eq)]
-enum UpstreamHeader {
+pub(crate) enum UpstreamHeader {
     /// Hop-by-hop: never forwarded.
     HopByHop,
     /// Hidden by default like nginx's `ngx_http_proxy_hide_headers` (Date,
@@ -2805,7 +2951,7 @@ const HIDDEN_X_ACCEL_LIMIT_RATE: u16 = 1 << 7;
 
 /// One dispatch on the name's length, then at most a few compares: this
 /// runs for every upstream header line on the proxy hot path.
-fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
+pub(crate) fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
     use UpstreamHeader::*;
     let is = |h: &[u8]| name.eq_ignore_ascii_case(h);
     match name.len() {
@@ -2845,7 +2991,7 @@ pub fn default_hidden_bit(name: &[u8]) -> Option<u16> {
 
 /// `Content-Length` value as nginx's `ngx_atoof` accepts it: decimal
 /// digits only, no sign, no overflow.
-fn parse_content_length(value: &[u8]) -> Option<u64> {
+pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return None;
     }
@@ -2862,7 +3008,7 @@ fn trim_crlf(s: &[u8]) -> &[u8] {
     &s[..end]
 }
 
-fn parse_status_code(status_line: &[u8]) -> u16 {
+pub(crate) fn parse_status_code(status_line: &[u8]) -> u16 {
     if status_line.len() < 12 {
         return 0;
     }
@@ -2899,7 +3045,7 @@ fn u64_to_decimal(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
 /// terminators contain, stopping at the first that ends the head: the body
 /// bytes read along with the head aren't scanned, nor the bytes an earlier
 /// read already looked at.
-fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+pub(crate) fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     let mut i = from;
     while let Some(p) = buf[i..].iter().position(|&b| b == b'\n') {
         let lf = i + p;
@@ -2917,7 +3063,7 @@ fn find_head_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
 
 /// Find the next line terminator (`\r\n` or `\n`). Returns
 /// `(line_len, terminator_len)`.
-fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
     for (i, &b) in buf.iter().enumerate() {
         if b == b'\n' {
             if i > 0 && buf[i - 1] == b'\r' {
@@ -2931,7 +3077,7 @@ fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
 
 /// Where the header fields start: past the status line's terminator, or
 /// at `head_end` when there are none.
-fn headers_start(buf: &[u8], first_line_end: usize, head_end: usize) -> usize {
+pub(crate) fn headers_start(buf: &[u8], first_line_end: usize, head_end: usize) -> usize {
     (first_line_end + first_line_terminator_len(buf, first_line_end)).min(head_end)
 }
 

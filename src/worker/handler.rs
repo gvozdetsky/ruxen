@@ -418,8 +418,15 @@ fn cache_plan(
         hash,
         status,
         store,
-        // A hit needs neither, unless it is updated in the background.
-        request_headers: if hit.is_some() && !background {
+        // A hit needs neither, unless it is updated in the background, or
+        // the request is conditional (the not-modified check, #349).
+        request_headers: if hit.is_some()
+            && !background
+            && req.if_none_match.is_none()
+            && req.if_modified_since.is_none()
+            && req.if_match.is_none()
+            && req.if_unmodified_since.is_none()
+        {
             Vec::new()
         } else {
             req.headers_raw.to_vec()
@@ -595,6 +602,9 @@ pub(crate) fn finish_access_denial(
     preserved_www_authenticate: &[Vec<u8>],
     server_name_captures: Option<&phase::ServerNameCaptures>,
     response: Response,
+    // False for a `return` with text from the rewrite phase, which nginx
+    // sends without `error_page` (#362).
+    takes_error_page: bool,
 ) -> Response {
     let render_ctx_base = location_render_ctx(
         http,
@@ -619,15 +629,19 @@ pub(crate) fn finish_access_denial(
             preserved_www_authenticate,
         );
     }
-    let intercepted = maybe_intercept_error_page(
-        response,
-        loc.error_pages,
-        req,
-        &render_ctx_base,
-        in_error_page,
-        loc.recursive_error_pages,
-        loc.server_header,
-    );
+    let intercepted = if takes_error_page {
+        maybe_intercept_error_page(
+            response,
+            loc.error_pages,
+            req,
+            &render_ctx_base,
+            in_error_page,
+            loc.recursive_error_pages,
+            loc.server_header,
+        )
+    } else {
+        response
+    };
     let trailers_allowed =
         req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
     finalize_location_response(
@@ -1039,10 +1053,10 @@ pub(crate) fn run_location_handler(
         }));
     }
     let inner = match loc.handler {
-        PreparedHandler::Return(PreparedReturn::Static(response)) => {
+        PreparedHandler::Return(PreparedReturn::Static(response), _) => {
             Response::Prebuilt(response.pick(req.method))
         }
-        PreparedHandler::Return(PreparedReturn::Template { status, parts }) => Response::Owned(
+        PreparedHandler::Return(PreparedReturn::Template { status, parts }, _) => Response::Owned(
             build_templated_return(*status, parts, &render_ctx_base, req.method, server_bytes),
         ),
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
@@ -1284,15 +1298,19 @@ pub(crate) fn run_location_handler(
             }
         }
     };
-    let intercepted = maybe_intercept_error_page(
-        inner,
-        loc.error_pages,
-        req,
-        &render_ctx_base,
-        in_error_page,
-        loc.recursive_error_pages,
-        server_bytes,
-    );
+    let intercepted = if matches!(loc.handler, PreparedHandler::Return(_, false)) {
+        inner
+    } else {
+        maybe_intercept_error_page(
+            inner,
+            loc.error_pages,
+            req,
+            &render_ctx_base,
+            in_error_page,
+            loc.recursive_error_pages,
+            server_bytes,
+        )
+    };
     let trailers_allowed =
         req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
     finalize_location_response(

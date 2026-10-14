@@ -31,7 +31,7 @@ From repo root:
 cargo build --release
 ```
 
-Required in `PATH`: `wrk`, `curl`, `nginx`.
+Required in `PATH`: `wrk`, `curl`, `nginx`; for the HTTP/2 scenarios (`scheme` `h2c` / `h2` in the manifest: `h2c_hello`, `h2c_static_8k`, `h2_tls_hello`), `h2load` (package `nghttp2-client`), which runs them with 10 streams per connection, and a ruxen with HTTP/2 (#144).
 
 Some scenarios need fixtures (the `m19` 1MiB / 128MiB blobs, TLS certs,
 htpasswd files). `baseline.sh` / `measure.sh` don't create them — run
@@ -113,7 +113,15 @@ bench/scripts/pair.sh m5_conditional_304 --a ruxen \
     --a-env RUXEN_UNSHARE_FILES=0                           # one binary, env toggle
 ```
 
-It runs a 20 s throwaway warm-up of A, then 6 pairs in alternating order
+First it runs the scenario's generator (manifest column 11) and sends one
+request to each side: both must answer 2xx/3xx with the same status, or
+nothing is measured. Without that, a checkout that never generated its
+fixtures measures 404 against 404 and still prints a ratio (#380).
+`--check` stops after this step, which is a cheap way to vet a whole
+campaign's scenario list before a long run. The `proxy_ext_*` scenarios
+need their backend nginx running (see `bench/proxy_ext/backend.conf`).
+
+Then it runs a 20 s throwaway warm-up of A, then 6 pairs in alternating order
 (A B, B A, …), each with the scenario's warmup before a 10 s measurement.
 It prints every pair and the **geometric mean of B/A**. Runs that saw any
 error response or wrk timeout make it exit 1, because their ratio means

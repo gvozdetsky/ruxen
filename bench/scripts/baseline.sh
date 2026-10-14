@@ -67,7 +67,7 @@ duration="${scenario_fields[6]}"
 warmup="${scenario_fields[7]}"
 cooldown="${scenario_fields[8]}"
 conf_rel="${scenario_fields[9]}"
-_prepare="${scenario_fields[10]}"
+prepare="${scenario_fields[10]}"
 header_mode="${scenario_fields[11]}"
 headers_raw="${scenario_fields[12]}"
 scheme="${scenario_fields[13]}"
@@ -76,6 +76,7 @@ scheme="${scenario_fields[13]}"
 
 conf_abs="${REPO_ROOT}/${conf_rel}"
 [[ -f "$conf_abs" ]] || die "missing config: $conf_abs"
+run_prepare "$prepare"
 
 config_dir="$(dirname "$conf_abs")"
 baseline_file="${config_dir}/baseline_${SCENARIO_ID}.tsv"
@@ -84,7 +85,7 @@ if [[ -f "$baseline_file" && "$FORCE" != "1" ]]; then
     die "baseline already exists: $baseline_file (pass --force to recapture)"
 fi
 
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 work_dir="$(mktemp -d -t ruxen-baseline-XXXXXX)"
 trap 'rm -rf "$work_dir"' EXIT
 

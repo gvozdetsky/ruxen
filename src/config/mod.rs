@@ -2188,6 +2188,7 @@ mod tests {
             SessionResumption {
                 cache: Some(true),
                 shared: true,
+                shared_zone: Some("shared:SSL:1m".to_string()),
                 tickets: Some(false),
                 ticket_keys: None,
             }
@@ -2656,6 +2657,127 @@ mod tests {
             loc.auth_basic_user_file.as_deref(),
             Some(std::path::Path::new("/tmp/location.htpasswd"))
         );
+    }
+
+    #[test]
+    fn location_if_blocks_with_settings_are_anonymous_locations() {
+        // #137: `proxy_pass`, `add_header` and the like make the block an
+        // anonymous location that inherits the enclosing one; rewrite-only
+        // blocks stay as they were.
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    location /a {
+                        proxy_pass http://127.0.0.1:8081/outer;
+                        add_header X-Loc yes;
+                        if ($arg_p) { proxy_pass http://127.0.0.1:8081; }
+                        if ($arg_h) { add_header X-If yes; }
+                        if ($arg_r) { rewrite ^ /b; }
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let loc = &cfg.servers[0].locations[0];
+        let ifs: Vec<_> = loc
+            .rewrite_ops
+            .iter()
+            .map(|op| match op {
+                RewriteOp::If { location, .. } => location.clone(),
+                _ => panic!("{op:?}"),
+            })
+            .collect();
+        let Some(IfLocation::Parsed {
+            location: own,
+            own_handler: true,
+            ..
+        }) = &ifs[0]
+        else {
+            panic!("{:?}", ifs[0])
+        };
+        assert!(matches!(own.handler, Handler::Proxy(_)));
+        assert!(own.pattern.starts_with('@'), "{}", own.pattern);
+        assert_eq!(own.add_headers.as_ref().unwrap()[0].name, "X-Loc");
+        let Some(IfLocation::Parsed {
+            location: inherited,
+            own_handler: false,
+            ..
+        }) = &ifs[1]
+        else {
+            panic!("{:?}", ifs[1])
+        };
+        assert_eq!(inherited.pattern, "/a");
+        assert!(
+            matches!(&inherited.handler, Handler::Proxy(p) if format!("{p:?}").contains("/outer"))
+        );
+        assert_eq!(inherited.add_headers.as_ref().unwrap()[0].name, "X-If");
+        assert!(ifs[2].is_none());
+
+        for bad in [
+            "http { server { listen 80; location / { if ($a) { proxy_redirect off; } } } }",
+            "http { server { listen 80; location / { if ($a) { location /x { } } } } }",
+            "http { server { listen 80; location / { if ($a) { proxy_pass http://u/x; } } } }",
+        ] {
+            let parsed = parse(bad);
+            assert!(
+                parsed.is_err() || crate::worker::prepare(parsed.unwrap()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_locations_inherit_the_parents_final_settings() {
+        // #106: everything nginx merges from the parent location, also
+        // what the parent sets after the nested block; lists as a whole.
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    add_header X-Server s;
+                    location /p/ {
+                        proxy_set_header X-Up parent;
+                        add_header X-Parent yes;
+                        location /p/c/ { proxy_pass http://127.0.0.1:8081; }
+                        location /p/own/ {
+                            add_header X-Own yes;
+                            location /p/own/g/ { return 200; }
+                        }
+                        error_page 404 /nf;
+                        proxy_read_timeout 7s;
+                        gzip on;
+                        keepalive_requests 5;
+                    }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let loc = |p: &str| {
+            cfg.servers[0]
+                .locations
+                .iter()
+                .find(|l| l.pattern == p)
+                .unwrap_or_else(|| panic!("{p}"))
+        };
+        let names = |l: &Location| -> Vec<String> {
+            l.add_headers
+                .iter()
+                .flatten()
+                .map(|h| h.name.clone())
+                .collect()
+        };
+        let c = loc("/p/c/");
+        assert_eq!(names(c), ["X-Parent"]);
+        assert!(c.proxy.set_headers.is_some());
+        assert!(c.error_pages.is_some(), "after the nested block");
+        assert_eq!(c.proxy.read_timeout_ms, Some(7000));
+        assert_eq!(c.gzip.enable, Some(true));
+        assert_eq!(c.keepalive_requests, Some(5));
+        // A child's own list replaces the parent's, for its children too.
+        assert_eq!(names(loc("/p/own/")), ["X-Own"]);
+        assert_eq!(names(loc("/p/own/g/")), ["X-Own"]);
+        assert_eq!(loc("/p/own/g/").keepalive_requests, Some(5));
     }
 
     #[test]

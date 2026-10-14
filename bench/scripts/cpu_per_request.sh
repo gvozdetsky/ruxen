@@ -51,7 +51,7 @@ mapfile -t f < <(lookup_scenario "$SCENARIO_ID") \
 port="${f[2]}" path="${f[3]}" threads="${f[4]}" connections="${f[5]}"
 warmup="${f[7]}" conf_abs="${REPO_ROOT}/${f[9]}" header_mode="${f[11]}"
 headers_raw="${f[12]}" scheme="${f[13]}"
-url="${scheme}://127.0.0.1:${port}${path}"
+url="$(url_scheme "$scheme")://127.0.0.1:${port}${path}"
 work_dir="$(mktemp -d -t ruxen-cpu-XXXXXX)"
 pid=""
 
