@@ -64,6 +64,16 @@ impl Server {
             .count()
     }
 
+    /// Until `port` accepts: after a reload that added it, before the
+    /// port lock goes.
+    fn wait_listening(&self, port: u16) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "port {port} isn't listening");
+            sleep(Duration::from_millis(10));
+        }
+    }
+
     fn wait_threads(&self, n: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.threads() != n {
@@ -101,11 +111,21 @@ fn write_conf(dir: &Path, main: &str, http: &str) {
     .unwrap();
 }
 
+/// `spawn` under the port lock, for a configuration whose ports are
+/// picked by `spawn`'s caller only later.
 fn start(name: &str, main: &str, http: &str) -> Server {
+    let _setup = common::ports::setup_lock();
+    spawn(name, main, http)
+}
+
+/// Start ruxen and wait for its pid file (written once every worker is
+/// bound). The caller holds the port lock from picking the ports this
+/// configuration listens on until here: released earlier, another test
+/// could take the same port, and requests would reach its server.
+fn spawn(name: &str, main: &str, http: &str) -> Server {
     let dir = std::env::temp_dir().join(format!("ruxen-m119-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let setup = common::ports::setup_lock();
     write_conf(&dir, main, http);
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg("-c")
@@ -126,7 +146,6 @@ fn start(name: &str, main: &str, http: &str) -> Server {
         );
         sleep(Duration::from_millis(10));
     }
-    drop(setup);
     s
 }
 
@@ -156,8 +175,10 @@ fn returning(port: u16, text: &str) -> String {
 
 #[test]
 fn reload_applies_the_new_configuration() {
+    let setup = common::ports::setup_lock();
     let port = free_port();
-    let s = start("apply", "worker_processes 2;", &returning(port, "one"));
+    let s = spawn("apply", "worker_processes 2;", &returning(port, "one"));
+    drop(setup);
     assert_eq!(body(port), "one\n");
 
     s.write_conf("worker_processes 2;", &returning(port, "two"));
@@ -204,8 +225,9 @@ fn reload_applies_the_new_configuration() {
 
 #[test]
 fn reload_moves_listen_addresses() {
+    let setup = common::ports::setup_lock();
     let (a, b) = (free_port(), free_port());
-    let s = start("listen", "worker_processes 2;", &returning(a, "a"));
+    let s = spawn("listen", "worker_processes 2;", &returning(a, "a"));
     let unix = s.dir.join("u.sock");
     let both = format!(
         "{}\n{}\nserver {{ listen unix:{}; location / {{ return 200 \"unix\\n\"; }} }}",
@@ -215,6 +237,8 @@ fn reload_moves_listen_addresses() {
     );
     s.write_conf("worker_processes 2;", &both);
     s.reload();
+    s.wait_listening(b);
+    drop(setup);
     assert_eq!(body(a), "a2\n");
     assert_eq!(body(b), "b\n");
     assert!(unix.exists());
@@ -276,15 +300,18 @@ const BIG: u64 = 64 << 20;
 
 #[test]
 fn in_flight_requests_finish_on_the_old_workers() {
-    let port = free_port();
     let s = start("inflight", "", "");
     std::fs::File::create(s.dir.join("big.bin"))
         .unwrap()
         .set_len(BIG)
         .unwrap();
+    let setup = common::ports::setup_lock();
+    let port = free_port();
     s.write_conf("", &static_server(&s.dir, port, "one"));
     s.reload();
     s.wait_threads(2);
+    s.wait_listening(port);
+    drop(setup);
 
     let mut download = stalled_download(port);
     s.write_conf("", &static_server(&s.dir, port, "two"));
@@ -303,16 +330,19 @@ fn in_flight_requests_finish_on_the_old_workers() {
 
 #[test]
 fn worker_shutdown_timeout_ends_the_old_workers_connections() {
-    let port = free_port();
     let s = start("timeout", "", "");
     std::fs::File::create(s.dir.join("big.bin"))
         .unwrap()
         .set_len(BIG)
         .unwrap();
     let main = "worker_shutdown_timeout 300ms;";
+    let setup = common::ports::setup_lock();
+    let port = free_port();
     s.write_conf(main, &static_server(&s.dir, port, "one"));
     s.reload();
     s.wait_threads(2);
+    s.wait_listening(port);
+    drop(setup);
 
     let mut download = stalled_download(port);
     let reloaded = Instant::now();
@@ -339,8 +369,10 @@ fn worker_shutdown_timeout_ends_the_old_workers_connections() {
 /// ruxen keeps each worker's accept queue).
 #[test]
 fn no_connection_fails_across_reloads() {
+    let setup = common::ports::setup_lock();
     let port = free_port();
-    let s = start("handoff", "worker_processes 2;", &returning(port, "0"));
+    let s = spawn("handoff", "worker_processes 2;", &returning(port, "0"));
+    drop(setup);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let clients: Vec<_> = (0..4)
         .map(|_| {
@@ -379,9 +411,10 @@ fn no_connection_fails_across_reloads() {
 /// another key for the zone fails the reload, as in nginx.
 #[test]
 fn limit_req_state_survives_a_reload() {
-    let port = free_port();
     let s = start("limitreq", "", "");
     std::fs::write(s.dir.join("index.html"), "x").unwrap();
+    let setup = common::ports::setup_lock();
+    let port = free_port();
     let conf = |key: &str, text: &str| {
         format!(
             "limit_req_zone {key} zone=one:1m rate=1r/m;\n\
@@ -394,6 +427,8 @@ fn limit_req_state_survives_a_reload() {
     s.write_conf("", &conf("$binary_remote_addr", "a"));
     s.reload();
     s.wait_threads(2);
+    s.wait_listening(port);
+    drop(setup);
     assert_eq!(status(), "200");
     assert_eq!(status(), "503");
 
@@ -425,8 +460,9 @@ fn limit_req_state_survives_a_reload() {
 #[test]
 fn shared_ssl_session_cache_survives_a_reload() {
     let certs = common::tls::make_self_signed("localhost");
-    let port = free_port();
     let s = start("tlscache", "", "");
+    let setup = common::ports::setup_lock();
+    let port = free_port();
     let conf = |text: &str| {
         format!(
             "server {{ listen 127.0.0.1:{port} ssl; ssl_protocols TLSv1.2;\n\
@@ -440,6 +476,8 @@ fn shared_ssl_session_cache_survives_a_reload() {
     s.write_conf("", &conf("one"));
     s.reload();
     s.wait_threads(2);
+    s.wait_listening(port);
+    drop(setup);
     let sess = s.dir.join("sess.pem");
     let connect = |flag: &str| -> String {
         let out = Command::new("openssl")
