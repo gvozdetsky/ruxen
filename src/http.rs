@@ -1356,24 +1356,24 @@ pub fn write_server_and_date(out: &mut Vec<u8>, server: &[u8]) {
 /// `ngx_http_special_response.c`). The footer is the `Server` value, so
 /// it follows `server_tokens` and the identity (see `identity`).
 pub fn default_error_page_body(status: u16, t: crate::config::ServerTokens) -> Option<Vec<u8>> {
+    default_error_page_body_for(status, server_header_value(t))
+}
+
+/// `default_error_page_body` with the `Server` value at hand.
+pub fn default_error_page_body_for(status: u16, server: &[u8]) -> Option<Vec<u8>> {
     let (title, h1) = error_page_title(status)?;
     let mut body = Vec::with_capacity(title.len() + h1.len() + 96);
-    write_default_error_page_into(&mut body, title, h1, t);
+    write_default_error_page_into(&mut body, title, h1, server);
     Some(body)
 }
 
-fn write_default_error_page_into(
-    out: &mut Vec<u8>,
-    title: &str,
-    h1: &str,
-    t: crate::config::ServerTokens,
-) {
+fn write_default_error_page_into(out: &mut Vec<u8>, title: &str, h1: &str, server: &[u8]) {
     out.extend_from_slice(b"<html>\r\n<head><title>");
     out.extend_from_slice(title.as_bytes());
     out.extend_from_slice(b"</title></head>\r\n<body>\r\n<center><h1>");
     out.extend_from_slice(h1.as_bytes());
     out.extend_from_slice(b"</h1></center>\r\n<hr><center>");
-    out.extend_from_slice(server_header_value(t));
+    out.extend_from_slice(server);
     out.extend_from_slice(b"</center>\r\n</body>\r\n</html>\r\n");
 }
 

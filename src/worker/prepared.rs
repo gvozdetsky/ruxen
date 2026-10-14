@@ -678,6 +678,9 @@ pub struct PreparedProxy {
     /// status that matches a configured `error_page` rule turns into the
     /// rule's target instead of being forwarded.
     pub intercept_errors: bool,
+    /// `proxy_force_ranges on;` (#370): the range filter may cut the
+    /// response even when the upstream doesn't say it takes ranges.
+    pub force_ranges: bool,
     /// Effective `ignore_invalid_headers` policy from the matched server.
     /// When true, headers with non-fatal invalid names are dropped before
     /// forwarding upstream.
@@ -790,6 +793,7 @@ pub(crate) struct ProxyEffective {
     pub next_upstream_tries: u32,
     pub next_upstream_timeout_ms: u64,
     pub intercept_errors: bool,
+    pub force_ranges: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     /// The nearest scope's `proxy_redirect` lines; `None` = nginx's
@@ -848,6 +852,7 @@ impl ProxyEffective {
             next_upstream_tries: 0,
             next_upstream_timeout_ms: 0,
             intercept_errors: false,
+            force_ranges: false,
             ignore_invalid_headers: true,
             underscores_in_headers: false,
             redirect: None,
@@ -1209,6 +1214,9 @@ pub struct PreparedLocation {
     /// `None` means "unlimited"; `Some(0)` also disables the limit to
     /// mirror nginx's directive semantics.
     pub client_max_body_size: Option<u64>,
+    /// Effective `max_ranges` (location → server → http, #370): `None` is
+    /// no limit, `Some(0)` turns byte ranges off.
+    pub max_ranges: Option<u32>,
     /// Effective `client_body_buffer_size`: bodies up to this size stay in
     /// memory. `None` is nginx's default, 16k.
     pub client_body_buffer_size: Option<u64>,
@@ -1274,6 +1282,7 @@ pub struct PreparedRegexLocation {
     pub access: PreparedAccess,
     pub limit_except: Option<&'static PreparedLimitExcept>,
     pub client_max_body_size: Option<u64>,
+    pub max_ranges: Option<u32>,
     pub client_body_buffer_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
@@ -1318,6 +1327,7 @@ pub struct MatchedLocation<'a> {
     pub access: &'a PreparedAccess,
     pub limit_except: Option<&'static PreparedLimitExcept>,
     pub client_max_body_size: Option<u64>,
+    pub max_ranges: Option<u32>,
     pub client_body_buffer_size: Option<u64>,
     pub client_body_in_file_only: crate::config::ClientBodyInFileOnly,
     pub body_temp: Option<&'static BodyTempDir>,
@@ -1359,6 +1369,7 @@ impl<'a> MatchedLocation<'a> {
             access: &loc.access,
             limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
+            max_ranges: loc.max_ranges,
             client_body_buffer_size: loc.client_body_buffer_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,
@@ -1411,6 +1422,7 @@ impl<'a> MatchedLocation<'a> {
             access: &loc.access,
             limit_except: loc.limit_except,
             client_max_body_size: loc.client_max_body_size,
+            max_ranges: loc.max_ranges,
             client_body_buffer_size: loc.client_body_buffer_size,
             client_body_in_file_only: loc.client_body_in_file_only,
             body_temp: loc.body_temp,

@@ -82,6 +82,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         auth_delay_ms,
         access,
         client_max_body_size,
+        max_ranges,
         client_body_buffer_size,
         client_body_temp_path,
         sendfile,
@@ -133,6 +134,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         PreparedAccess::NONE,
     );
     let http_client_max_body_size = client_max_body_size;
+    let http_max_ranges = max_ranges;
     let http_client_body_buffer_size = client_body_buffer_size;
     let http_sendfile = sendfile;
     let http_http2 = http2;
@@ -229,6 +231,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                     http_autoindex_format,
                     http_access,
                     http_client_max_body_size,
+                    http_max_ranges,
                     http_client_body_buffer_size,
                     http_sendfile,
                     http_disable_symlinks.clone(),
@@ -961,6 +964,7 @@ pub(crate) fn build_proxy(
                 next_upstream_tries: eff.next_upstream_tries,
                 next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
                 intercept_errors: eff.intercept_errors,
+                force_ranges: eff.force_ranges,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -998,6 +1002,7 @@ pub(crate) fn build_proxy(
                 next_upstream_tries: eff.next_upstream_tries,
                 next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
                 intercept_errors: eff.intercept_errors,
+                force_ranges: eff.force_ranges,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -1050,6 +1055,7 @@ pub(crate) fn build_proxy(
                 next_upstream_tries: eff.next_upstream_tries,
                 next_upstream_timeout_ms: eff.next_upstream_timeout_ms,
                 intercept_errors: eff.intercept_errors,
+                force_ranges: eff.force_ranges,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix: b"",
@@ -1201,6 +1207,7 @@ pub(crate) struct ServerProxyDefaults {
     pub next_upstream_tries: u32,
     pub next_upstream_timeout_ms: u64,
     pub intercept_errors: bool,
+    pub force_ranges: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
@@ -1278,6 +1285,7 @@ impl ServerProxyDefaults {
                 .next_upstream_timeout_ms
                 .unwrap_or(defaults.next_upstream_timeout_ms),
             intercept_errors: conf.intercept_errors.unwrap_or(defaults.intercept_errors),
+            force_ranges: conf.force_ranges.unwrap_or(defaults.force_ranges),
             ignore_invalid_headers,
             underscores_in_headers,
             redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
@@ -1368,6 +1376,9 @@ pub(crate) fn resolve_proxy_effective(
         intercept_errors: location
             .intercept_errors
             .unwrap_or(server_defaults.intercept_errors),
+        force_ranges: location
+            .force_ranges
+            .unwrap_or(server_defaults.force_ranges),
         ignore_invalid_headers: server_defaults.ignore_invalid_headers,
         underscores_in_headers: server_defaults.underscores_in_headers,
         redirect: match location.redirect {
@@ -1402,6 +1413,7 @@ pub(crate) fn prepare_server(
     http_autoindex_format: AutoindexFormat,
     http_access: PreparedAccess,
     http_client_max_body_size: Option<u64>,
+    http_max_ranges: Option<u32>,
     http_client_body_buffer_size: Option<u64>,
     http_sendfile: Option<bool>,
     http_disable_symlinks: Option<crate::config::DisableSymlinks>,
@@ -1537,6 +1549,7 @@ pub(crate) fn prepare_server(
         http_access,
     );
     let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
+    let server_max_ranges = server.max_ranges.or(http_max_ranges);
     let server_client_body_buffer_size = server
         .client_body_buffer_size
         .or(http_client_body_buffer_size);
@@ -1619,6 +1632,7 @@ pub(crate) fn prepare_server(
             server_access_logs,
             server_access,
             server_client_max_body_size,
+            server_max_ranges,
             server_client_body_buffer_size,
             server_sendfile,
             server_body_temp,
@@ -1656,6 +1670,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_max_ranges,
                 server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
@@ -1690,6 +1705,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_max_ranges,
                 server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
@@ -1724,6 +1740,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_max_ranges,
                 server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
@@ -1759,6 +1776,7 @@ pub(crate) fn prepare_server(
                 server_access_logs,
                 server_access,
                 server_client_max_body_size,
+                server_max_ranges,
                 server_client_body_buffer_size,
                 server_sendfile,
                 server_body_temp,
@@ -1850,6 +1868,7 @@ pub(crate) fn prepare_server(
             access: server_access,
             limit_except: None,
             client_max_body_size: server_client_max_body_size,
+            max_ranges: server_max_ranges,
             client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
             gzip: prepare_gzip(server_gzip.clone())?,
@@ -2894,6 +2913,7 @@ pub(crate) fn build_prefix_or_exact(
     server_access_logs: &'static [PreparedAccessLog],
     server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
+    server_max_ranges: Option<u32>,
     server_client_body_buffer_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
@@ -2941,6 +2961,7 @@ pub(crate) fn build_prefix_or_exact(
         access: location_access,
         limit_except,
         client_max_body_size: location_client_max_body_size,
+        max_ranges: location_max_ranges,
         client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
         document_root,
@@ -3063,6 +3084,7 @@ pub(crate) fn build_prefix_or_exact(
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let max_ranges = location_max_ranges.or(server_max_ranges);
     let client_body_buffer_size =
         location_client_body_buffer_size.or(server_client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
@@ -3101,6 +3123,7 @@ pub(crate) fn build_prefix_or_exact(
         access,
         limit_except,
         client_max_body_size,
+        max_ranges,
         client_body_buffer_size,
         sendfile,
         gzip,
@@ -3139,6 +3162,7 @@ pub(crate) fn build_regex_location(
     server_access_logs: &'static [PreparedAccessLog],
     server_access: PreparedAccess,
     server_client_max_body_size: Option<u64>,
+    server_max_ranges: Option<u32>,
     server_client_body_buffer_size: Option<u64>,
     server_sendfile: bool,
     server_body_temp: Option<&'static BodyTempDir>,
@@ -3186,6 +3210,7 @@ pub(crate) fn build_regex_location(
         access: location_access,
         limit_except,
         client_max_body_size: location_client_max_body_size,
+        max_ranges: location_max_ranges,
         client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
         document_root,
@@ -3316,6 +3341,7 @@ pub(crate) fn build_regex_location(
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
     let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
+    let max_ranges = location_max_ranges.or(server_max_ranges);
     let client_body_buffer_size =
         location_client_body_buffer_size.or(server_client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server_sendfile);
@@ -3353,6 +3379,7 @@ pub(crate) fn build_regex_location(
         access,
         limit_except,
         client_max_body_size,
+        max_ranges,
         client_body_buffer_size,
         sendfile,
         gzip,
@@ -3423,6 +3450,107 @@ mod tests {
             let got = without_default_port(crate::arena::leak(authority.as_bytes().into()));
             assert_eq!(got, want.as_bytes(), "{authority}");
         }
+    }
+
+    fn prepare_src(src: &str) -> &'static crate::worker::PreparedHttp {
+        super::prepare(crate::config::parse(src).unwrap()).expect("prepare")
+    }
+
+    /// The prefix location `pattern` of the first server on listen `listen`.
+    fn prefix<'a>(
+        http: &'a crate::worker::PreparedHttp,
+        listen: usize,
+        pattern: &[u8],
+    ) -> &'a crate::worker::PreparedLocation {
+        http.listens[listen].servers[0]
+            .prefix_locations
+            .iter()
+            .find(|l| l.pattern == pattern)
+            .unwrap()
+    }
+
+    #[test]
+    fn max_ranges_resolves_location_server_http() {
+        // An http-level line below the servers still applies (nginx's merge
+        // runs after the whole block).
+        let http = prepare_src(
+            r#"
+            http {
+                server {
+                    listen 127.0.0.1:8080;
+                    location /http { return 200; }
+                    location /own { max_ranges 0; return 200; }
+                    location /outer {
+                        max_ranges 5;
+                        location /outer/inner { return 200; }
+                    }
+                    location /if {
+                        max_ranges 0;
+                        if ($arg_a) { root /tmp; }
+                    }
+                }
+                server {
+                    listen 127.0.0.1:8081;
+                    max_ranges 2;
+                    location /srv { return 200; }
+                }
+                max_ranges 1;
+            }
+            "#,
+        );
+        assert_eq!(prefix(http, 0, b"/http").max_ranges, Some(1));
+        assert_eq!(prefix(http, 0, b"/own").max_ranges, Some(0));
+        assert_eq!(prefix(http, 0, b"/outer/inner").max_ranges, Some(5));
+        assert_eq!(prefix(http, 0, b"/if").max_ranges, Some(0));
+        let server = &http.listens[0].servers[0];
+        assert_eq!(server.if_locations.len(), 1);
+        assert_eq!(server.if_locations[0].max_ranges, Some(0));
+        assert_eq!(prefix(http, 1, b"/srv").max_ranges, Some(2));
+        // The server's implicit location for unmatched URIs.
+        let implicit = http.listens[1].servers[0].server_default.as_ref().unwrap();
+        assert_eq!(implicit.max_ranges, Some(2));
+
+        let default = prepare_src("http { server { listen 127.0.0.1:8082; location / { } } }");
+        assert_eq!(prefix(default, 0, b"/").max_ranges, None);
+    }
+
+    #[test]
+    fn proxy_force_ranges_resolves_location_server_http() {
+        let http = prepare_src(
+            r#"
+            http {
+                server {
+                    listen 127.0.0.1:8080;
+                    location /http { proxy_pass http://127.0.0.1:9; }
+                    location /off { proxy_force_ranges off; proxy_pass http://127.0.0.1:9; }
+                }
+                server {
+                    listen 127.0.0.1:8081;
+                    proxy_force_ranges off;
+                    location /srv { proxy_pass http://127.0.0.1:9; }
+                    location /loc { proxy_force_ranges on; proxy_pass http://127.0.0.1:9; }
+                }
+                proxy_force_ranges on;
+            }
+            "#,
+        );
+        let force = |listen: usize, pattern: &[u8]| match &prefix(http, listen, pattern).handler {
+            crate::worker::PreparedHandler::Proxy(p) => p.force_ranges,
+            _ => panic!("a proxy location"),
+        };
+        assert!(force(0, b"/http"));
+        assert!(!force(0, b"/off"));
+        assert!(!force(1, b"/srv"));
+        assert!(force(1, b"/loc"));
+
+        let default = prepare_src(
+            "http { server { listen 127.0.0.1:8082; \
+             location / { proxy_pass http://127.0.0.1:9; } } }",
+        );
+        let crate::worker::PreparedHandler::Proxy(p) = &prefix(default, 0, b"/").handler else {
+            panic!("a proxy location");
+        };
+        assert!(!p.force_ranges);
     }
 }
 

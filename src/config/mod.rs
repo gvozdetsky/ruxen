@@ -288,6 +288,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut auth_delay_ms: Option<u64> = None;
     let mut access = AccessConf::default();
     let mut client_max_body_size: Option<u64> = None;
+    let mut max_ranges: Option<u32> = None;
     let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
@@ -397,6 +398,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         auth_delay_ms,
                         access,
                         client_max_body_size,
+                        max_ranges,
                         client_body_buffer_size,
                         // Set once the whole config is read.
                         uses_request_body_file: false,
@@ -742,6 +744,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 client_max_body_size = Some(parse_client_max_body_size_args(&args[1..])?);
             }
+            ("max_ranges", Terminator::Semi) => {
+                if max_ranges.is_some() {
+                    return Err(Error::Duplicate("max_ranges"));
+                }
+                max_ranges = Some(parse_max_ranges_args(&args[1..])?);
+            }
             ("limit_rate", Terminator::Semi) => {
                 if limit_rate.is_some() {
                     return Err(Error::Duplicate("limit_rate"));
@@ -817,7 +825,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ctx: "http",
                 });
             }
-            ("client_max_body_size", _) => {
+            ("client_max_body_size" | "max_ranges", _) => {
                 return Err(Error::WrongTerminator {
                     name: args[0].clone(),
                     ctx: "http",
@@ -1015,7 +1023,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // opens access logs once per worker anyway. Arguments are checked.
     "open_log_file_cache",
     "proxy_method",
-    "proxy_force_ranges",
     "proxy_cookie_domain",
     "proxy_cookie_path",
     "proxy_cookie_flags",
@@ -1385,6 +1392,164 @@ mod tests {
             "http { proxy_http_version 2.0; server { listen 80; } }",
             "proxy_read_timeout 1s; http { server { listen 80; } }",
             "http { server { listen 80; location / { if ($arg_a) { proxy_redirect off; } } } }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn proxy_force_ranges_parses_and_inherits() {
+        let cfg = parse(
+            r#"
+            http {
+                server {
+                    listen 80;
+                    location /own { proxy_force_ranges off; proxy_pass http://127.0.0.1:81; }
+                    location /up {
+                        proxy_pass http://127.0.0.1:81;
+                        location /up/nested { proxy_pass http://127.0.0.1:81; }
+                    }
+                }
+                server { listen 81; proxy_force_ranges off; }
+                proxy_force_ranges on;
+            }
+            "#,
+        )
+        .unwrap();
+        // The http-level line below the servers still reaches them.
+        assert_eq!(cfg.servers[0].proxy.force_ranges, Some(true));
+        assert_eq!(cfg.servers[1].proxy.force_ranges, Some(false));
+        let loc = |p: &str| {
+            cfg.servers[0]
+                .locations
+                .iter()
+                .find(|l| l.pattern == p)
+                .unwrap()
+        };
+        assert_eq!(loc("/own").proxy.force_ranges, Some(false));
+        // Locations keep their own; prepare merges them with the server.
+        assert_eq!(loc("/up").proxy.force_ranges, None);
+        assert_eq!(loc("/up/nested").proxy.force_ranges, None);
+
+        let nested = parse(
+            "http { server { listen 80; location /a { proxy_force_ranges on; \
+             location /a/b { proxy_pass http://127.0.0.1:81; } } } }",
+        )
+        .unwrap();
+        let b = nested.servers[0]
+            .locations
+            .iter()
+            .find(|l| l.pattern == "/a/b")
+            .unwrap();
+        assert_eq!(b.proxy.force_ranges, Some(true));
+
+        assert!(matches!(
+            parse("http { proxy_force_ranges on; proxy_force_ranges off; }"),
+            Err(Error::Duplicate("proxy_force_ranges"))
+        ));
+        for bad in [
+            "http { proxy_force_ranges yes; }",
+            "http { proxy_force_ranges; }",
+            "http { proxy_force_ranges on off; }",
+            "http { server { listen 80; proxy_force_ranges on; proxy_force_ranges on; } }",
+            "http { server { listen 80; location / { proxy_force_ranges on; proxy_force_ranges off; } } }",
+            "http { server { listen 80; proxy_force_ranges on { } } }",
+            "http { server { listen 80; location / { proxy_force_ranges on { } } } }",
+            // Not one of the directives nginx allows in `if`.
+            "http { server { listen 80; location / { if ($arg_a) { proxy_force_ranges on; } } } }",
+            "proxy_force_ranges on; http { }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn max_ranges_parses_at_every_scope_and_inherits_into_nested_blocks() {
+        let cfg = parse(
+            r#"
+            http {
+                server {
+                    listen 80;
+                    max_ranges 2;
+                    location /own { max_ranges 0; }
+                    location /plain { }
+                    location /outer {
+                        location /outer/inner { }
+                        max_ranges 7;
+                    }
+                    location /if {
+                        max_ranges 3;
+                        if ($arg_a) { root /tmp; }
+                    }
+                }
+                server { listen 81; }
+                max_ranges 1;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_ranges, Some(1));
+        assert_eq!(cfg.servers[0].max_ranges, Some(2));
+        // The server keeps its own: prepare falls back to http.
+        assert_eq!(cfg.servers[1].max_ranges, None);
+        let loc = |p: &str| {
+            cfg.servers[0]
+                .locations
+                .iter()
+                .find(|l| l.pattern == p)
+                .unwrap()
+        };
+        assert_eq!(loc("/own").max_ranges, Some(0));
+        assert_eq!(loc("/plain").max_ranges, None);
+        // A nested location takes its parent's, even one set after it.
+        assert_eq!(loc("/outer/inner").max_ranges, Some(7));
+        let RewriteOp::If {
+            location: Some(IfLocation::Parsed { location, .. }),
+            ..
+        } = &loc("/if").rewrite_ops[0]
+        else {
+            panic!("an if location");
+        };
+        assert_eq!(location.max_ranges, Some(3));
+
+        // ngx_conf_set_num_slot: digits only; a value past u32 is no limit.
+        let at_http = |v: &str| parse(&format!("http {{ max_ranges {v}; }}")).map(|c| c.max_ranges);
+        assert_eq!(at_http("0").unwrap(), Some(0));
+        assert_eq!(at_http("4294967295").unwrap(), Some(u32::MAX));
+        assert_eq!(at_http("99999999999").unwrap(), Some(u32::MAX));
+        for bad in [
+            "-1",
+            "+1",
+            "1k",
+            "abc",
+            "\"\"",
+            "9223372036854775808",
+            "1 2",
+        ] {
+            let err = at_http(bad).unwrap_err().to_string();
+            assert!(err.contains("max_ranges"), "{bad}: {err}");
+        }
+        let err = at_http("x").unwrap_err().to_string();
+        assert!(err.contains("invalid number"), "{err}");
+        assert!(parse("http { max_ranges; }").is_err());
+
+        for dup in [
+            "http { max_ranges 1; max_ranges 2; }",
+            "http { server { listen 80; max_ranges 1; max_ranges 2; } }",
+            "http { server { listen 80; location / { max_ranges 1; max_ranges 2; } } }",
+        ] {
+            assert!(
+                matches!(parse(dup), Err(Error::Duplicate("max_ranges"))),
+                "{dup}"
+            );
+        }
+        for bad in [
+            "http { max_ranges 1 { } }",
+            "http { server { listen 80; max_ranges 1 { } } }",
+            "http { server { listen 80; location / { max_ranges 1 { } } } }",
+            // Not one of the directives nginx allows in `if`.
+            "http { server { listen 80; location / { if ($arg_a) { max_ranges 1; } } } }",
+            "max_ranges 1; http { }",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

@@ -32,6 +32,7 @@ use crate::upstream;
 use crate::upstream::LeasedPeer;
 use crate::worker::PeerAddr;
 use crate::worker::PreparedUpstream;
+use crate::worker::range::RangeAllow;
 
 // Per-worker reusable scratch buffers for proxy::attempt. The proxy hot path
 // otherwise allocates `accum` (~4 KiB) and `read_buf` (4 KiB zero-filled) on
@@ -174,6 +175,9 @@ pub struct ProxyPlan {
     /// The location's gzip, which needs a body whole when it compresses
     /// it: such a response isn't relayed as it comes (`gzip::passes`).
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
+    /// `proxy_force_ranges`: the range filter may cut the response whatever
+    /// the upstream says (#370).
+    pub force_ranges: bool,
 }
 
 /// An upstream that answered 101 to a client asking to upgrade: the
@@ -206,6 +210,11 @@ pub struct CachePlan {
     /// The response may be stored (`proxy_cache_min_uses` reached, no
     /// `proxy_no_cache` condition holds).
     pub store: bool,
+    /// nginx's `u->cacheable` before `proxy_no_cache` is tested:
+    /// `proxy_cache_min_uses` is reached. The upstream then gets no
+    /// conditional or range headers, and an `Accept-Ranges` from it lets
+    /// the range filter cut the response (#370).
+    pub cacheable: bool,
     /// The answer the cache already has.
     pub hit: Option<CacheHit>,
     /// The stale response, kept with `proxy_cache_revalidate` to answer
@@ -541,6 +550,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
     let failures = &mut report.failures;
     let upstream_headers = &mut report.upstream_headers;
     let redirect_header = &mut report.redirect_header;
+    let range_allow = &mut report.range_allow;
     let accel = &mut report.accel;
     let states = &mut report.states;
     let upstream = plan.upstream;
@@ -600,6 +610,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 Some(c),
                 upstream_headers,
                 redirect_header,
+                range_allow,
                 accel,
                 &mut state,
                 started,
@@ -619,6 +630,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                             None,
                             upstream_headers,
                             redirect_header,
+                            range_allow,
                             accel,
                             &mut state,
                             started,
@@ -642,6 +654,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 None,
                 upstream_headers,
                 redirect_header,
+                range_allow,
                 accel,
                 &mut state,
                 started,
@@ -1229,6 +1242,8 @@ pub struct ProxyReport {
     /// `proxy_pass_header Date`: the response's `Date` is the upstream's,
     /// or there is none, and the worker doesn't stamp one (#360).
     pub passes_date: bool,
+    /// Whether the range filter may cut the response (#370).
+    pub range_allow: RangeAllow,
 }
 
 /// The answer's upstream request is over (its header filtered, or the
@@ -1453,6 +1468,7 @@ async fn attempt(
     pooled: Option<upstream::PooledConn>,
     upstream_headers: &mut Vec<u8>,
     redirect_header: &mut bool,
+    range_allow: &mut RangeAllow,
     accel: &mut Option<Box<AccelHeaders>>,
     state: &mut UpstreamState,
     started: Instant,
@@ -1854,8 +1870,10 @@ async fn attempt(
             None,
             body_has_content,
             skip_body,
+            false,
             upstream_headers,
             redirect_header,
+            range_allow,
         );
         let pool =
             (plan.keepalive_eligible && status_code != 101 && !upstream_close && upstream_is_11)
@@ -2047,8 +2065,10 @@ async fn attempt(
         Some(body_len),
         body_has_content,
         skip_body,
+        false,
         upstream_headers,
         redirect_header,
+        range_allow,
     );
     let client_head_len = out.len();
     if let Some(decoded) = decoded_chunked_body.as_ref() {
@@ -2137,6 +2157,57 @@ fn stream_framing(
     }
 }
 
+/// How a response's ranges are decided (`ngx_http_upstream_process_headers`
+/// with `proxy_force_ranges`, `ngx_http_upstream_copy_allow_ranges`).
+#[derive(Clone, Copy)]
+struct RangePolicy {
+    /// Without an `Accept-Ranges` from the upstream.
+    allow: RangeAllow,
+    /// With one: what it allows, and it is dropped (the range filter
+    /// writes its own). `None`: it goes to the client as it is.
+    on_accept_ranges: Option<RangeAllow>,
+}
+
+impl RangePolicy {
+    #[inline]
+    fn new(plan: &ProxyPlan, cached: bool) -> Self {
+        if !plan.force_ranges && plan.cache.is_none() {
+            return Self {
+                allow: RangeAllow::No,
+                on_accept_ranges: None,
+            };
+        }
+        Self::cold(plan, cached)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cold(plan: &ProxyPlan, cached: bool) -> Self {
+        if plan.force_ranges {
+            let allow = if cached {
+                RangeAllow::Multi
+            } else {
+                RangeAllow::Single
+            };
+            return Self {
+                allow,
+                on_accept_ranges: Some(allow),
+            };
+        }
+        let on_accept_ranges = if cached {
+            Some(RangeAllow::Multi)
+        } else if plan.cache.as_deref().is_some_and(|c| c.cacheable) {
+            Some(RangeAllow::Single)
+        } else {
+            None
+        };
+        Self {
+            allow: RangeAllow::No,
+            on_accept_ranges,
+        }
+    }
+}
+
 /// Step 7 of `attempt`, also run on a cached response: the client's
 /// header block from the upstream's `head` (status line and header lines,
 /// without the empty line), ready for a body of `body_len` bytes.
@@ -2148,9 +2219,13 @@ fn client_head(
     body_len: Option<usize>,
     body_has_content: bool,
     skip_body: bool,
+    cached: bool,
     upstream_headers: &mut Vec<u8>,
     redirect_header: &mut bool,
+    range_allow: &mut RangeAllow,
 ) -> Vec<u8> {
+    let ranges = RangePolicy::new(plan, cached);
+    *range_allow = ranges.allow;
     let mut out = Vec::with_capacity(head.len() + 64 + body_len.unwrap_or(0));
     out.extend_from_slice(b"HTTP/1.1");
     out.extend_from_slice(&head[8..first_line_end]);
@@ -2232,6 +2307,12 @@ fn client_head(
             // Step 5 rejected Content-Length together with chunked, so a
             // Content-Length here is the upstream's own framing: keep it.
             UpstreamHeader::ContentLength => have_content_length = true,
+            UpstreamHeader::AcceptRanges => {
+                if let Some(allow) = ranges.on_accept_ranges {
+                    *range_allow = allow;
+                    continue;
+                }
+            }
             UpstreamHeader::Other => {}
         }
         out.extend_from_slice(line);
@@ -2239,6 +2320,11 @@ fn client_head(
         if t == 0 {
             break;
         }
+    }
+    // nginx's range filter needs the upstream's length
+    // (`content_length_n`), cached or not; a chunked body has none.
+    if !have_content_length {
+        *range_allow = RangeAllow::No;
     }
     if body_has_content
         && !have_content_length
@@ -2522,8 +2608,10 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
             None,
             false,
             false,
+            true,
             &mut report.upstream_headers,
             &mut report.redirect_header,
+            &mut report.range_allow,
         ));
     }
     for (name, value) in crate::proxy_cache::header_lines(head) {
@@ -2541,8 +2629,10 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         Some(body.len()),
         body_has_content,
         skip_body,
+        true,
         &mut report.upstream_headers,
         &mut report.redirect_header,
+        &mut report.range_allow,
     );
     if body_has_content && !matches!(plan.method, Method::Head) {
         out.extend_from_slice(body);
@@ -2947,6 +3037,9 @@ pub(crate) enum UpstreamHeader {
     /// `proxy_redirect`.
     Redirect(u16),
     ContentLength,
+    /// `Accept-Ranges`: dropped where ruxen's range filter decides
+    /// (`RangePolicy`).
+    AcceptRanges,
     Other,
 }
 
@@ -2974,6 +3067,7 @@ pub(crate) fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
         10 if is(b"connection") || is(b"keep-alive") => HopByHop,
         12 if is(b"content-type") => Single(1 << 4),
         13 if is(b"last-modified") => Single(1 << 5),
+        13 if is(b"accept-ranges") => AcceptRanges,
         14 if is(b"content-length") => ContentLength,
         15 if is(b"x-accel-expires") => Hidden(1 << 3),
         15 if is(b"x-accel-charset") => Hidden(1 << 4),
