@@ -496,6 +496,11 @@ pub struct PreparedAccess {
     /// `auth_delay` in milliseconds.
     pub auth_delay_ms: u64,
     pub realip: PreparedRealIp,
+    /// `auth_request`'s URI (#358); `None`: off.
+    pub auth_request: Option<&'static [u8]>,
+    /// `auth_request_set`: each variable and the value rendered in the
+    /// subrequest's context. Inherited apart from the URI, as nginx's.
+    pub auth_request_set: &'static [(&'static [u8], &'static [PreparedValuePart])],
 }
 
 impl PreparedAccess {
@@ -511,6 +516,8 @@ impl PreparedAccess {
             header: PreparedRealIpHeader::XRealIp,
             recursive: false,
         },
+        auth_request: None,
+        auth_request_set: &[],
     };
 }
 

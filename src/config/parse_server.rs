@@ -491,7 +491,7 @@ pub(crate) fn parse_server_block(
             }
             (
                 "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
-                | "real_ip_recursive",
+                | "auth_request" | "auth_request_set" | "real_ip_recursive",
                 Terminator::Semi,
             ) => {
                 parse_access_directive(&mut access, &args, lx)?;
@@ -653,6 +653,8 @@ pub(crate) fn parse_server_block(
                 | "set_real_ip_from"
                 | "real_ip_header"
                 | "real_ip_recursive"
+                | "auth_request"
+                | "auth_request_set"
                 | "client_max_body_size"
                 | "client_body_temp_path"
                 | "disable_symlinks"

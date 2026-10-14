@@ -7,13 +7,13 @@ Last run: 2026-10-14 against `nginx-tests` 0b70854 (2026-09-30).
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 119
-- **Intentionally skipped (`-V` banner excludes the module):** 318
+- **Passing in ruxen:** 122
+- **Intentionally skipped (`-V` banner excludes the module):** 315
 - **Failing — work in progress:** 68
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (119)
+## Passing in ruxen (122)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -21,12 +21,15 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `access_log_variables.t`
 - `auth_basic.t`
 - `auth_delay.t`
+- `auth_request_satisfy.t`
+- `auth_request_set.t`
 - `autoindex_format.t`
 - `body.t`
 - `body_chunked.t`
 - `config_dump.t`
 - `error_log.t`
 - `gzip.t`
+- `h2_auth_request.t`
 - `h2_http2.t`
 - `h2_limit_conn.t`
 - `h2_limit_req.t`
@@ -152,7 +155,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `h2_proxy_request_buffering_ssl.t` — 40/42
 - `h2_proxy_ssl.t` — 1/3
 - `h2_request_body.t` — 8/51
-- `h2_request_body_extra.t` — 1/52
+- `h2_request_body_extra.t` — 4/52
 - `h2_request_body_preread.t` — 1/11
 - `h2_ssl_verify_client.t` — 0/0
 - `h2_variables.t` — 2/8
@@ -210,7 +213,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `upstream_zone_ssl.t` — 9/11
 - `worker_shutdown_timeout_h2.t` — 1/4
 
-## Intentionally skipped (318)
+## Intentionally skipped (315)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
@@ -528,12 +531,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `debug_connection.t`
 - `debug_connection_syslog.t`
 - `debug_connection_unix.t`
-
-### no auth_request available (3)
-
-- `auth_request_satisfy.t`
-- `auth_request_set.t`
-- `h2_auth_request.t`
 
 ### no dav available (3)
 

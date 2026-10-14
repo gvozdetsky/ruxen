@@ -2642,6 +2642,23 @@ fn resolve_access(
             .map(leak_path_buf)
             .or(parent.auth_basic_user_file),
         auth_delay_ms: auth_delay_ms.unwrap_or(parent.auth_delay_ms),
+        auth_request: match access.auth_request {
+            Some(Some(uri)) => Some(leak_bytes(uri.as_bytes())),
+            Some(None) => None,
+            None => parent.auth_request,
+        },
+        auth_request_set: if access.auth_request_set.is_empty() {
+            parent.auth_request_set
+        } else {
+            crate::arena::leak(
+                access
+                    .auth_request_set
+                    .into_iter()
+                    .map(|(name, parts)| (leak_bytes(name.as_bytes()), prepare_value_parts(parts)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        },
         realip: PreparedRealIp {
             from: if access.realip.from.is_empty() {
                 parent.realip.from

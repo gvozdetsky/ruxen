@@ -715,14 +715,14 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             (
                 "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
-                | "real_ip_recursive",
+                | "auth_request" | "auth_request_set" | "real_ip_recursive",
                 Terminator::Semi,
             ) => {
                 parse_access_directive(&mut access, &args, lx)?;
             }
             (
                 "allow" | "deny" | "satisfy" | "set_real_ip_from" | "real_ip_header"
-                | "real_ip_recursive",
+                | "auth_request" | "auth_request_set" | "real_ip_recursive",
                 _,
             ) => {
                 return Err(Error::WrongTerminator {

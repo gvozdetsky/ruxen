@@ -1251,6 +1251,12 @@ pub struct AccessConf {
     /// The realip module, which sets the client address before the
     /// access phase.
     pub realip: RealIpConf,
+    /// `auth_request URI | off` (#358): `Some(None)` is `off`; `None`
+    /// inherits.
+    pub auth_request: Option<Option<String>>,
+    /// `auth_request_set $var value`, in order. Empty inherits the
+    /// enclosing scope's list whole, as nginx's `vars` array.
+    pub auth_request_set: Vec<(String, Vec<ValuePart>)>,
 }
 
 impl AccessConf {
@@ -1264,6 +1270,15 @@ impl AccessConf {
             },
             satisfy: self.satisfy.or(parent.satisfy),
             realip: self.realip.inherit(&parent.realip),
+            auth_request: self
+                .auth_request
+                .clone()
+                .or_else(|| parent.auth_request.clone()),
+            auth_request_set: if self.auth_request_set.is_empty() {
+                parent.auth_request_set.clone()
+            } else {
+                self.auth_request_set.clone()
+            },
         }
     }
 }
