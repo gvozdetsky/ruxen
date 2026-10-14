@@ -27,20 +27,25 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn start(conf: &Path, port: u16) -> Server {
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(conf)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let server = Server(child);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+/// Start ruxen and wait for its pid file, written once every worker is
+/// bound. A killed server leaves its pid file behind: a restart removes
+/// it first.
+fn start(conf: &Path) -> Server {
+    let pid_file = conf.with_file_name("ruxen.pid");
+    let _ = std::fs::remove_file(&pid_file);
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(conf)
+            .arg("-g")
+            .arg(format!("pid {};", pid_file.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut server.0, &pid_file, Duration::from_secs(5));
     server
 }
 
@@ -127,7 +132,7 @@ fn m116_store_hit_bypass_and_errors() {
     let html = s.dir.join("html");
     std::fs::write(html.join("t.txt"), "ONE").unwrap();
     std::fs::write(html.join("cc"), "CC1").unwrap();
-    let _server = start(&s.dir.join("nginx.conf"), s.port);
+    let _server = start(&s.dir.join("nginx.conf"));
     drop(_setup_lock);
 
     let r = get(s.port, "/t.txt");
@@ -191,7 +196,7 @@ fn m116_expiry_vary_and_restart() {
     std::fs::write(html.join("s.txt"), "OLD").unwrap();
     std::fs::create_dir_all(html.join("vary")).unwrap();
     std::fs::write(html.join("vary/v.txt"), "V").unwrap();
-    let server = start(&s.dir.join("nginx.conf"), s.port);
+    let server = start(&s.dir.join("nginx.conf"));
     drop(setup_lock);
 
     std::fs::write(html.join("r.txt"), "SAME").unwrap();
@@ -235,7 +240,7 @@ fn m116_expiry_vary_and_restart() {
     }
     std::fs::write(html.join("keep.txt"), "CHANGED").unwrap();
     let setup_lock = common::ports::setup_lock();
-    let _server = start(&s.dir.join("nginx.conf"), s.port);
+    let _server = start(&s.dir.join("nginx.conf"));
     drop(setup_lock);
     let r = get(s.port, "/keep.txt");
     assert_eq!((status_of(&r), body_of(&r)), ("HIT", "KEPT"), "{r}");
@@ -250,7 +255,7 @@ fn m116_conditional_hits() {
     let _setup_lock = common::ports::setup_lock();
     let s = setup("cond");
     std::fs::write(s.dir.join("html").join("c.txt"), "COND").unwrap();
-    let _server = start(&s.dir.join("nginx.conf"), s.port);
+    let _server = start(&s.dir.join("nginx.conf"));
     drop(_setup_lock);
 
     let r = get(s.port, "/c.txt");

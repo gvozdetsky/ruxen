@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -37,14 +37,15 @@ fn get(port: u16, path: &str) -> String {
 
 #[test]
 fn if_blocks_switch_the_location() {
-    let (port, up) = (free_port(), free_port());
     let dir = std::env::temp_dir().join(format!("ruxen-m121-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html/static")).unwrap();
     std::fs::create_dir_all(dir.join("other/static")).unwrap();
     std::fs::write(dir.join("html/static/index.html"), "main\n").unwrap();
     std::fs::write(dir.join("other/static/index.html"), "other\n").unwrap();
+    // Held from the port pick until ruxen listens.
     let setup = common::ports::setup_lock();
+    let (port, up) = (free_port(), free_port());
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
@@ -70,21 +71,17 @@ fn if_blocks_switch_the_location() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let outer = get(port, "/variables");
@@ -93,8 +90,7 @@ fn if_blocks_switch_the_location() {
     let keep_if = get(port, "/keep?h=1");
     let main = get(port, "/static/");
     let other = get(port, "/static/?o=1");
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(outer.ends_with("uri:/outer\n"), "{outer}");
@@ -123,13 +119,14 @@ fn if_blocks_switch_the_location() {
 /// block of rewrite directives only goes back to the location's settings.
 #[test]
 fn if_locations_follow_nginx() {
-    let (port, up) = (free_port(), free_port());
     let dir = std::env::temp_dir().join(format!("ruxen-m121b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html/static")).unwrap();
     std::fs::create_dir_all(dir.join("other")).unwrap();
     std::fs::write(dir.join("html/static/index.html"), "main\n").unwrap();
+    // Held from the port pick until ruxen listens.
     let setup = common::ports::setup_lock();
+    let (port, up) = (free_port(), free_port());
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
@@ -167,21 +164,17 @@ fn if_locations_follow_nginx() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let guard = get(port, "/guard?x=1");
@@ -195,8 +188,7 @@ fn if_locations_follow_nginx() {
     let late = get(port, "/late/?h=1");
     sleep(Duration::from_millis(100));
     let log = std::fs::read_to_string(dir.join("access.log")).unwrap_or_default();
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(guard.starts_with("HTTP/1.1 403"), "{guard}");

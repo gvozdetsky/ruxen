@@ -7,8 +7,7 @@ mod common;
 
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[test]
 fn a_trusted_certificate_block_is_served() {
@@ -63,21 +62,17 @@ fn a_trusted_certificate_block_is_served() {
         String::from_utf8_lossy(&check.stderr)
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
     let out = Command::new("curl")
         .args(["-sk", "--resolve"])
@@ -85,8 +80,7 @@ fn a_trusted_certificate_block_is_served() {
         .arg(format!("https://localhost:{port}/"))
         .output()
         .expect("curl");
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
 }

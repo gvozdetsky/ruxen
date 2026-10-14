@@ -10,6 +10,32 @@
 pub mod ports;
 pub mod tls;
 
+/// Owns a ruxen process and stops it when the test ends, also when an
+/// assertion panics: an orphaned ruxen otherwise keeps its ports and CPU
+/// after the run. Wrap the child before waiting for it to be ready.
+/// Derefs to the `Child`, for signals and `try_wait`.
+pub struct KillOnDrop(pub std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// An errno as ruxen (and nginx) print it, `98: Address already in use`,
 /// in this libc's words: musl says `Address in use`.
 pub fn errno_text(code: i32) -> String {

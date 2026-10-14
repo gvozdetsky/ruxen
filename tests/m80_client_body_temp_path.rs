@@ -11,8 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// POSTs a 4 KiB body (past ruxen's in-memory threshold) and returns the
 /// response body: the `$request_body_file` the location renders.
@@ -86,29 +85,24 @@ fn temp_files_go_to_the_locations_directory_and_levels() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     let up = post(a, "/up");
     let http = post(a, "/h");
     let srv = post(b, "/x");
     let nested = post(b, "/in");
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
 
     assert_placed(&up, &dir.join("up"), &[1, 2]);
     assert_placed(&http, &dir.join("http"), &[2]);

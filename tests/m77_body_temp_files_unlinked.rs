@@ -70,22 +70,18 @@ fn a_spilled_body_leaves_nothing_behind_a_fast_shutdown() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .env("TMPDIR", &tmp)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .env("TMPDIR", &tmp)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
 
     // 2 MiB: over the 1 MiB kept in memory, so it is spilled to a file.

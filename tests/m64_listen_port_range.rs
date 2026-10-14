@@ -7,8 +7,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Two consecutive free ports.
 fn free_pair() -> (u16, TcpListener, TcpListener) {
@@ -53,26 +52,21 @@ fn every_port_of_the_range_is_served() {
     )
     .unwrap();
     drop((a, b));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
-        assert!(
-            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
-            "ruxen did not start"
-        );
-        sleep(Duration::from_millis(10));
-    }
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
     drop(setup);
     let first = get(port);
     let second = get(port + 1);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(first.ends_with(&port.to_string()), "{first}");
     assert!(second.ends_with(&(port + 1).to_string()), "{second}");
