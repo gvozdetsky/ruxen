@@ -406,6 +406,10 @@ pub struct PreparedAccessLog {
     /// The format uses `$upstream_http_*` / `$upstream_cookie_*`, so the
     /// upstream's header block has to be kept for the log line.
     pub reads_upstream_headers: bool,
+    /// The format, condition or path uses `$document_root`,
+    /// `$request_filename` or `$realpath_root`: the line needs the
+    /// location's root even when the request kept no rewrite state (#363).
+    pub reads_doc_root: bool,
     pub condition: Option<&'static [PreparedValuePart]>,
     pub file_index: usize,
     /// `access_log syslog:…`: lines go to this peer, not to `path`.

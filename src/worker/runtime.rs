@@ -92,6 +92,14 @@ pub(crate) async fn write_access_logs(
             .map(|i| &request_uri[..i])
             .unwrap_or(request_uri)
     });
+    // `$document_root` / `$request_filename` without a kept rewrite state:
+    // the location's root alone, only when a log reads them (#363).
+    let root_only = match meta {
+        Some(m) if m.rewrite_state.is_none() && logs.iter().any(|l| l.reads_doc_root) => {
+            super::response::root_only_state(m)
+        }
+        _ => None,
+    };
     let ctx = RenderCtx {
         uri,
         request_uri,
@@ -130,7 +138,9 @@ pub(crate) async fn write_access_logs(
         // empty here, which mirrors nginx (where regex captures are
         // discarded after request termination).
         server_name_captures: &[],
-        rewrite_state: meta.and_then(|m| m.rewrite_state.as_deref()),
+        rewrite_state: meta
+            .and_then(|m| m.rewrite_state.as_deref())
+            .or(root_only.as_ref()),
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.map_or(&[][..], |m| m.proxy_host),

@@ -418,8 +418,15 @@ fn cache_plan(
         hash,
         status,
         store,
-        // A hit needs neither, unless it is updated in the background.
-        request_headers: if hit.is_some() && !background {
+        // A hit needs neither, unless it is updated in the background, or
+        // the request is conditional (the not-modified check, #349).
+        request_headers: if hit.is_some()
+            && !background
+            && req.if_none_match.is_none()
+            && req.if_modified_since.is_none()
+            && req.if_match.is_none()
+            && req.if_unmodified_since.is_none()
+        {
             Vec::new()
         } else {
             req.headers_raw.to_vec()

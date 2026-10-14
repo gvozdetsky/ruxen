@@ -291,7 +291,7 @@ fn resolve_conditional_last_modified(
 /// side make any concrete compare fail. `*` always matches a resource that
 /// exists. Our emitted ETag is syntactically strong (`"hex-hex"`), though
 /// its semantics are only weak-ish because it is derived from mtime+size.
-fn etag_list_matches_strong(value: &[u8], current: &[u8]) -> bool {
+pub(crate) fn etag_list_matches_strong(value: &[u8], current: &[u8]) -> bool {
     let value = trim_ows(value);
     if value == b"*" {
         return true;
@@ -465,7 +465,7 @@ fn read_at_into(
 /// respecting quoted-string boundaries so that a comma inside a tag body
 /// does not split the entry. Comparison is weak per RFC 9110: strip any
 /// `W/` prefix on both sides, then byte-compare the opaque-tag.
-fn etag_list_matches(value: &[u8], current: &[u8]) -> bool {
+pub(crate) fn etag_list_matches(value: &[u8], current: &[u8]) -> bool {
     let value = trim_ows(value);
     if value == b"*" {
         return true;
