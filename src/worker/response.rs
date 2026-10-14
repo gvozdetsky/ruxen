@@ -37,10 +37,6 @@ pub(crate) fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-pub(crate) fn is_redirect_return(status: u16, body: &[ValuePart]) -> bool {
-    is_redirect_status(status) && !body.is_empty()
-}
-
 pub(crate) fn build_templated_return(
     status: u16,
     parts: &[PreparedValuePart],
@@ -50,7 +46,7 @@ pub(crate) fn build_templated_return(
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(64);
     render_parts(parts, ctx, &mut body);
-    if is_redirect_status(status) && !body.is_empty() {
+    if is_redirect_status(status) {
         http::build_redirect_response(status, &body, method, server)
     } else if matches!(method, Method::Head) {
         http::build_head_response(status, body.len(), server)

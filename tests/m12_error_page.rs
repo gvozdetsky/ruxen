@@ -168,6 +168,14 @@ http {
             return 302 "http://example.com/";
         }
 
+        location /empty301 {
+            return 301;
+        }
+
+        location /empty302 {
+            return 302 $arg_to;
+        }
+
         location /varredir {
             error_page 302 /return302args?$arg_a;
             return 302 "first";
@@ -187,6 +195,26 @@ fn m12_return_redirect_form_uses_location_header() {
     let resp = http_get(port, "/return302");
     assert_eq!(status_line(&resp), "HTTP/1.1 302 Moved Temporarily");
     assert_eq!(header_value(&resp, "Location"), Some("http://example.com/"));
+}
+
+/// A redirect status without a URL (or with one that renders empty) is
+/// still a redirect, with an empty `Location`, as nginx's
+/// `ngx_http_send_response` (#374).
+#[test]
+fn m12_return_redirect_without_url_has_empty_location() {
+    let (_g, port) = spawn_server(M12_CONF);
+
+    let bare = http_get(port, "/empty301");
+    assert_eq!(status_line(&bare), "HTTP/1.1 301 Moved Permanently");
+    assert_eq!(header_value(&bare, "Location"), Some(""));
+    assert!(!body(&bare).is_empty());
+
+    let empty = http_get(port, "/empty302");
+    assert_eq!(status_line(&empty), "HTTP/1.1 302 Moved Temporarily");
+    assert_eq!(header_value(&empty, "Location"), Some(""));
+
+    let set = http_get(port, "/empty302?to=/x");
+    assert_eq!(header_value(&set, "Location"), Some("/x"));
 }
 
 #[test]

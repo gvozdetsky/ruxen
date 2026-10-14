@@ -2470,7 +2470,10 @@ pub(crate) fn prepare_return(
     let server_bytes = http::server_header_value(tokens);
     if all_literal(&body) {
         let concatenated = concat_literals(&body);
-        PreparedReturn::Static(if is_redirect_return(status, &body) {
+        // A redirect status is a redirect whatever its URL, an empty one
+        // included: nginx's `ngx_http_send_response` sends an empty
+        // `Location` then (#374).
+        PreparedReturn::Static(if is_redirect_status(status) {
             Prebuilt::leak_redirect(status, concatenated.as_bytes(), server_bytes)
         } else if body.is_empty() {
             // `return STATUS;` with no body: when the status has a canned
