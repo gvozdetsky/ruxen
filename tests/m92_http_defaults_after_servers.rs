@@ -49,6 +49,7 @@ fn http_settings_below_a_server_apply_to_it() {
     std::fs::create_dir_all(d.join("server-root")).unwrap();
     std::fs::write(d.join("http-root/f"), "from http root").unwrap();
     std::fs::write(d.join("server-root/g"), "from server root").unwrap();
+    std::fs::write(d.join("server-root/r"), "rewrite only").unwrap();
     let dd = d.display();
     std::fs::write(
         d.join("nginx.conf"),
@@ -56,7 +57,8 @@ fn http_settings_below_a_server_apply_to_it() {
             "pid {dd}/ruxen.pid;\nevents {{}}\nhttp {{\n\
              access_log off;\n\
              server {{ listen 127.0.0.1:{}; location /f {{ }} }}\n\
-             server {{ listen 127.0.0.1:{}; location / {{ }} root {dd}/server-root; }}\n\
+             server {{ listen 127.0.0.1:{}; location / {{ }} \
+             location /r {{ if ($arg_z) {{ return 403; }} }} root {dd}/server-root; }}\n\
              root {dd}/http-root;\n\
              keepalive_timeout 0;\n\
              }}\n",
@@ -84,9 +86,12 @@ fn http_settings_below_a_server_apply_to_it() {
 
     let first = get(ports[0], "/f");
     let second = get(ports[1], "/g");
+    // Rewrite directives alone leave the static handler (#364).
+    let rewrite_only = get(ports[1], "/r");
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&d);
     assert_eq!(first, "200 close from http root");
     assert_eq!(second, "200 close from server root");
+    assert_eq!(rewrite_only, "200 close rewrite only");
 }

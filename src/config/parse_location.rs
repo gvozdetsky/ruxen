@@ -615,17 +615,12 @@ pub(crate) fn parse_location_block(
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
                         Handler::Root { path, mapping }
-                    } else if !rewrite_ops.is_empty() {
-                        // Location-level rewrite directives are valid even
-                        // without an explicit content handler. Match nginx by
-                        // falling through to the default 404 content path.
-                        Handler::Return {
-                            status: 404,
-                            body: Vec::new(),
-                        }
                     } else {
                         // nginx's default `root`: `html` under the prefix
-                        // (ruxen's working directory, set by `-p`).
+                        // (ruxen's working directory, set by `-p`), or the
+                        // server's, set below the location
+                        // (`inherits_root`). Rewrite directives don't change
+                        // the static handler (#364).
                         Handler::Root {
                             path: PathBuf::from("html"),
                             mapping: PathMapping::Root,
