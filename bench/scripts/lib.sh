@@ -64,15 +64,33 @@ conf_prefix() {
 start_nginx() {
     local conf="$1"
     local server_log="$2"
-    local prefix
-    prefix="$(conf_prefix "$conf")"
-    nginx -p "$prefix" -c "$conf" -s quit >/dev/null 2>&1 || true
-    nginx -p "$prefix" -c "$conf" >"$server_log" 2>&1
+    stop_nginx "$conf"
+    nginx -p "$(conf_prefix "$conf")" -c "$conf" >"$server_log" 2>&1
 }
 
+# The master's pid from the config's `pid` file (every bench config sets
+# an absolute one), or nothing.
+nginx_master_pid() {
+    local conf="$1" pid_file
+    pid_file="$(awk '$1 == "pid" { sub(/;$/, "", $2); print $2; exit }' "$conf")"
+    [[ -n "$pid_file" ]] && cat "$pid_file" 2>/dev/null
+    return 0
+}
+
+# Graceful stop that waits for the master to exit (up to 10 s). `-s quit`
+# only sends the signal: a server started right after it (ruxen on the
+# same config) would race the old master for the port and the pid file,
+# and a master left running keeps answering in its place.
 stop_nginx() {
-    local conf="$1"
+    local conf="$1" pid i
+    pid="$(nginx_master_pid "$conf")"
     nginx -p "$(conf_prefix "$conf")" -c "$conf" -s quit >/dev/null 2>&1 || true
+    [[ -n "$pid" ]] || return 0
+    for ((i = 0; i < 100; i++)); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    log "warning: nginx master $pid still running 10 s after quit"
 }
 
 start_ruxen() {
@@ -98,7 +116,14 @@ stop_ruxen() {
     fi
 
     kill -QUIT "$pid" >/dev/null 2>&1 || true
-    wait "$pid" 2>/dev/null || true
+    # start_ruxen forks inside `$(...)`, so the server is not our child and
+    # `wait` returns at once: poll until it is gone (up to 10 s).
+    local i
+    for ((i = 0; i < 100; i++)); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    log "warning: ruxen $pid still running 10 s after SIGQUIT"
 }
 
 extract_etag() {
@@ -280,9 +305,44 @@ resolve_wrk_headers() {
     esac
 }
 
+# Run a scenario's fixture generator (manifest column 11, repo-relative).
+# The generators are idempotent, so this is cheap when the fixtures exist.
+# Without them a file scenario measures two 404s (#380).
+run_prepare() {
+    local prepare="$1"
+    [[ -n "$prepare" ]] || return 0
+    [[ -x "${REPO_ROOT}/${prepare}" ]] || die "missing generator: ${REPO_ROOT}/${prepare}"
+    "${REPO_ROOT}/${prepare}" >/dev/null || die "generator failed: ${prepare}"
+}
+
+# One request the way the load generator sends it, minus conditional and
+# scripted parts: prints "<status> <body bytes>". A `lua` scenario (a POST
+# script) is not probed and prints "- -"; wrk's non-2xx count covers it.
+probe_url() {
+    local url="$1" scheme="$2" header_mode="$3" headers_raw="$4"
+    if [[ "$header_mode" == "lua" ]]; then
+        echo "- -"
+        return 0
+    fi
+    local -a opts=()
+    mapfile -t opts < <(curl_scheme_opts "$scheme")
+    if [[ "$header_mode" == "static" && -n "$headers_raw" ]]; then
+        local IFS=';' h
+        for h in $headers_raw; do
+            opts+=(-H "$h")
+        done
+    fi
+    curl -sS -m 5 "${opts[@]}" -o /dev/null -w '%{http_code} %{size_download}\n' "$url" \
+        || echo "000 0"
+}
+
 # Run one (warmup + measurement) cycle against the chosen server. Writes the
 # measurement wrk output to $wrk_log. Caller is responsible for cooldown
 # between iterations.
+#
+# With PROBE_FILE set, there is no load: the server gets one probe_url
+# request, its "<status> <bytes>" goes to PROBE_FILE, and a status other
+# than 2xx/3xx is an error.
 #
 # Args: server_kind conf server_log url threads connections warmup duration
 #       header_mode headers_raw scheme wrk_log [env_line]
@@ -338,7 +398,18 @@ run_iteration() {
             tail -n 40 "$server_log" >&2
         fi
         _stop_server
-        die "server did not become ready: $url"
+        die "$server_kind did not become ready: $url"
+    fi
+
+    if [[ -n "${PROBE_FILE:-}" ]]; then
+        local probe status
+        probe="$(probe_url "$url" "$scheme" "$header_mode" "$headers_raw")"
+        _stop_server
+        echo "$probe" >"$PROBE_FILE"
+        status="${probe%% *}"
+        [[ "$status" == "-" || "$status" =~ ^[23][0-9][0-9]$ ]] \
+            || die "$server_kind answers $url with status $status, not 2xx/3xx (fixtures or a backend missing?)"
+        return 0
     fi
 
     if [[ "$scheme" == "h2" || "$scheme" == "h2c" ]]; then
