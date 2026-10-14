@@ -33,7 +33,8 @@ static KEPT: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
 struct Kept {
     name: String,
     size: u64,
-    key_text: &'static str,
+    // Owned: a reload frees the configuration `key_text` came from (#343).
+    key_text: String,
     capacity: usize,
     shards: &'static [Mutex<HashMap<Box<[u8]>, u32>>],
 }
@@ -79,7 +80,7 @@ impl LimitConnZone {
         kept.push(Kept {
             name: name.to_string(),
             size,
-            key_text,
+            key_text: key_text.to_string(),
             capacity: zone.capacity,
             shards: zone.shards,
         });

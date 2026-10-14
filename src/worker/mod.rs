@@ -282,7 +282,7 @@ impl BodyTempDir {
     /// The directory of a server's or location's own
     /// `client_body_temp_path`.
     pub(crate) fn leak(configured: crate::config::TempPath) -> &'static BodyTempDir {
-        Box::leak(Box::new(BodyTempDir::new(Some(configured))))
+        crate::arena::leak(Box::new(BodyTempDir::new(Some(configured))))
     }
 
     /// Where a file named `name` goes: nginx's ngx_create_hashed_filename.

@@ -1441,7 +1441,7 @@ pub(crate) fn fallback_body(code: u16) -> &'static str {
 }
 
 pub(crate) fn leak_bytes(b: &[u8]) -> &'static [u8] {
-    Box::leak(b.to_vec().into_boxed_slice())
+    crate::arena::leak(b.to_vec().into_boxed_slice())
 }
 
 pub(crate) fn response_has_header(bytes: &[u8], name: &[u8]) -> bool {

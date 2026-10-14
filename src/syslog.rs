@@ -104,6 +104,14 @@ thread_local! {
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Forget this thread's `error_log` sockets. They are keyed by peer
+/// address, so before a retired configuration is freed (#343) the main
+/// thread drops what it opened for it: a later peer may land at the same
+/// address. They are opened again on first use.
+pub(crate) fn forget_error_log_sockets() {
+    ERROR_LOG_SOCKETS.with(|cell| cell.borrow_mut().clear());
+}
+
 /// Send one error-log line (without its newline) to `peer`, as nginx's
 /// ngx_syslog_writer: the whole line after the header, the PRI's severity
 /// from the line's level.

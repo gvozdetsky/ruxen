@@ -44,8 +44,8 @@ pub struct Prebuilt {
 
 impl Prebuilt {
     pub(crate) fn from_built(full: Vec<u8>, head: Vec<u8>) -> Self {
-        let full = Box::leak(full.into_boxed_slice());
-        let head = Box::leak(head.into_boxed_slice());
+        let full = crate::arena::leak(full.into_boxed_slice());
+        let head = crate::arena::leak(head.into_boxed_slice());
         Prebuilt { full, head }
     }
 
@@ -901,7 +901,7 @@ impl PeerAddr {
         match addr {
             crate::config::UpstreamAddr::Inet(addr) => PeerAddr::Inet(addr),
             crate::config::UpstreamAddr::Unix(path) => {
-                PeerAddr::Unix(Box::leak(path.into_boxed_path()))
+                PeerAddr::Unix(crate::arena::leak(path.into_boxed_path()))
             }
         }
     }
@@ -949,7 +949,7 @@ impl PreparedLimitRate {
     /// For a location: `None` (the common case, one word to copy per
     /// request) unless something is set.
     pub(crate) fn for_location(self) -> Option<&'static PreparedLimitRate> {
-        (self.rate.is_some() || self.after.is_some()).then(|| &*Box::leak(Box::new(self)))
+        (self.rate.is_some() || self.after.is_some()).then(|| &*crate::arena::leak(Box::new(self)))
     }
 
     /// This scope's own directives over the parent's.
@@ -1034,7 +1034,7 @@ impl PreparedSymlinks {
             None => PreparedSymlinkFrom::None,
             Some(crate::config::SymlinkFrom::DocumentRoot) => PreparedSymlinkFrom::DocumentRoot,
             Some(crate::config::SymlinkFrom::Path(p)) => {
-                PreparedSymlinkFrom::Path(Box::leak(p.as_os_str().as_bytes().into()))
+                PreparedSymlinkFrom::Path(crate::arena::leak(p.as_os_str().as_bytes().into()))
             }
         };
         PreparedSymlinks {
