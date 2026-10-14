@@ -3870,15 +3870,18 @@ pub(crate) async fn handle<S: ConnIo>(
                                         )
                                         .await
                                     }
-                                    None => stream_file(
-                                        stream,
-                                        body,
-                                        timers.io.as_mut(),
-                                        send_timeout,
-                                        None,
-                                    )
-                                    .await
-                                    .then_some(streamed_body_len),
+                                    None => match stream.send_file_body(&body).await {
+                                        Some(sent) => sent.then_some(streamed_body_len),
+                                        None => stream_file(
+                                            stream,
+                                            body,
+                                            timers.io.as_mut(),
+                                            send_timeout,
+                                            None,
+                                        )
+                                        .await
+                                        .then_some(streamed_body_len),
+                                    },
                                 };
                                 match sent {
                                     Some(n) => streamed_body_len = n,

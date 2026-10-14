@@ -348,6 +348,36 @@ impl StreamIo {
     }
 
     /// Send `data` as DATA frames as the flow-control windows open.
+    /// The whole body, owned, as the stream's last DATA frames: split,
+    /// not copied.
+    async fn send_data_owned(&mut self, mut data: Bytes) -> io::Result<()> {
+        let Some(send) = self.send.as_mut() else {
+            return Ok(());
+        };
+        let broken = |e: h2::Error| io::Error::new(io::ErrorKind::BrokenPipe, e);
+        if data.is_empty() {
+            return send.send_data(Bytes::new(), true).map_err(broken);
+        }
+        while !data.is_empty() {
+            send.reserve_capacity(data.len());
+            let granted = match send.capacity() {
+                0 => match poll_fn(|cx| send.poll_capacity(cx)).await {
+                    Some(Ok(n)) => n,
+                    Some(Err(e)) => return Err(broken(e)),
+                    None => return Err(io::ErrorKind::BrokenPipe.into()),
+                },
+                n => n,
+            };
+            if granted == 0 {
+                continue;
+            }
+            let k = granted.min(data.len()).min(self.chunk);
+            let piece = data.split_to(k);
+            send.send_data(piece, data.is_empty()).map_err(broken)?;
+        }
+        Ok(())
+    }
+
     async fn send_data(&mut self, mut data: &[u8], end: bool) -> io::Result<()> {
         let Some(send) = self.send.as_mut() else {
             return Ok(());
@@ -594,6 +624,44 @@ impl super::super::ConnIo for StreamIo {
 
     fn h2(&self) -> bool {
         true
+    }
+
+    /// The file read straight into the `Bytes` its DATA frames carry: no
+    /// zeroed buffer per request and no copy into the frames (#348). Only
+    /// for a body the head announced with its length, up to 1 MiB.
+    async fn send_file_body(&mut self, body: &crate::phase::FileBody) -> Option<bool> {
+        use std::os::fd::AsRawFd;
+        const MAX: u64 = 1 << 20;
+        if self.head_request
+            || body.len > MAX
+            || !matches!(self.out, Out::Length(n) if n == body.len)
+        {
+            return None;
+        }
+        let len = body.len as usize;
+        let mut buf = bytes::BytesMut::with_capacity(len);
+        let mut filled = 0;
+        while filled < len {
+            // SAFETY: `pread` writes at most `len - filled` bytes into the
+            // spare capacity, which `with_capacity(len)` reserved.
+            let n = unsafe {
+                libc::pread(
+                    body.fd.as_raw_fd(),
+                    buf.as_mut_ptr().add(filled).cast(),
+                    len - filled,
+                    (body.offset + filled as u64) as libc::off_t,
+                )
+            };
+            if n <= 0 {
+                // An error, or a file shorter than its stat said.
+                return Some(false);
+            }
+            filled += n as usize;
+        }
+        // SAFETY: `filled == len` bytes were written above.
+        unsafe { buf.set_len(len) };
+        self.out = Out::Done;
+        Some(self.send_data_owned(buf.freeze()).await.is_ok())
     }
 
     fn conn_counters(&self) -> Option<(std::time::Instant, u64)> {
