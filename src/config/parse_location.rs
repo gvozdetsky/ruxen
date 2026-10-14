@@ -310,6 +310,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
         &mut child.client_max_body_size,
         &parent.client_max_body_size,
     );
+    or(&mut child.max_ranges, &parent.max_ranges);
     or(
         &mut child.client_body_buffer_size,
         &parent.client_body_buffer_size,
@@ -546,6 +547,7 @@ pub(crate) fn parse_location_block(
     let mut access = AccessConf::default();
     let mut limit_except: Option<LimitExcept> = None;
     let mut client_max_body_size: Option<u64> = None;
+    let mut max_ranges: Option<u32> = None;
     let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_in_file_only: Option<ClientBodyInFileOnly> = None;
     let mut post_action: Option<String> = None;
@@ -688,6 +690,7 @@ pub(crate) fn parse_location_block(
                         access: effective_access,
                         limit_except,
                         client_max_body_size: effective_client_max_body_size,
+                        max_ranges,
                         client_body_buffer_size: effective_client_body_buffer_size,
                         sendfile: effective_sendfile,
                         document_root,
@@ -905,6 +908,12 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("client_max_body_size"));
                 }
                 client_max_body_size = Some(parse_client_max_body_size_args(&args[1..])?);
+            }
+            ("max_ranges", Terminator::Semi) => {
+                if max_ranges.is_some() {
+                    return Err(Error::Duplicate("max_ranges"));
+                }
+                max_ranges = Some(parse_max_ranges_args(&args[1..])?);
             }
             ("client_body_in_file_only", Terminator::Semi) => {
                 if client_body_in_file_only.is_some() {
@@ -1150,6 +1159,7 @@ pub(crate) fn parse_location_block(
                 | "auth_request_set"
                 | "limit_except"
                 | "client_max_body_size"
+                | "max_ranges"
                 | "client_body_temp_path"
                 | "disable_symlinks"
                 | "client_body_in_file_only"
@@ -1170,6 +1180,7 @@ pub(crate) fn parse_location_block(
                 | "proxy_next_upstream_tries"
                 | "proxy_next_upstream_timeout"
                 | "proxy_intercept_errors"
+                | "proxy_force_ranges"
                 | "proxy_redirect"
                 | "proxy_hide_header"
                 | "proxy_pass_header"

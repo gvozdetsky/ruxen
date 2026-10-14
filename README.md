@@ -219,7 +219,7 @@ Supported functionality includes:
 - `try_files`
 - ETag and `Last-Modified`
 - conditional requests
-- byte ranges
+- byte ranges (one range per request; `max_ranges 0` turns them off)
 - streamed large files
 - zero-copy `sendfile on|off` (plain TCP)
 - URI decoding and normalization
@@ -243,6 +243,7 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - request-body forwarding and `proxy_set_body`
 - `proxy_next_upstream` (including `_tries` / `_timeout`)
 - `proxy_intercept_errors`
+- byte ranges on proxied responses as nginx allows them: `proxy_force_ranges`, cacheable and cached responses (multipart from the cache), `max_ranges`
 - `proxy_redirect`, including the implicit default
 - `proxy_hide_header` / `proxy_pass_header`
 - `X-Accel-Redirect`, `X-Accel-Limit-Rate` and `proxy_ignore_headers`

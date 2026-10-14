@@ -322,6 +322,8 @@ fn cache_plan(
     let mut hit = None;
     let mut stale = None;
     let mut store = !no_cache;
+    // nginx's NGX_HTTP_CACHE_SCARCE: below proxy_cache_min_uses.
+    let mut cacheable = true;
     let mut token = None;
     let mut wait_until = None;
     let mut background = false;
@@ -383,10 +385,12 @@ fn cache_plan(
                 probe,
             } => {
                 store &= enough;
+                cacheable = enough;
                 // A file from before a restart (nginx's cold cache).
                 if probe && let Some(entry) = Entry::read(&path(), &key) {
                     zone.adopt(&hash, &entry);
                     store = !no_cache;
+                    cacheable = true;
                     if entry.valid_sec < now {
                         status = CacheStatus::Expired;
                         stale = Some(entry);
@@ -418,6 +422,7 @@ fn cache_plan(
         hash,
         status,
         store,
+        cacheable,
         // A hit needs neither, unless it is updated in the background, or
         // the request is conditional (the not-modified check, #349).
         request_headers: if hit.is_some()
@@ -873,8 +878,9 @@ pub(crate) fn run_location_handler(
             overrides_buf.push((b"Connection", value.to_vec()));
         }
 
-        if cache.is_some() {
-            // ngx_http_proxy_cache_headers: with a cache the upstream gets no
+        if cache.as_ref().is_some_and(|c| c.cacheable) {
+            // ngx_http_proxy_cache_headers: with a cache (once
+            // proxy_cache_min_uses is reached) the upstream gets no
             // conditional or range request headers, so what comes back can
             // be stored whole; a revalidation asks with the stale entry's
             // validators.
@@ -1001,6 +1007,8 @@ pub(crate) fn run_location_handler(
         // (its borrowed slices wouldn't survive into the worker await
         // anyway). Only build the list when both flags are set —
         // intercept off, or no rules, means no extra work per request.
+        // `proxy_force_ranges` (#370).
+        let force_ranges = proxy.force_ranges;
         let intercept = if proxy.intercept_errors && !loc.error_pages.is_empty() {
             let mut rules = Vec::with_capacity(loc.error_pages.len());
             for ep in loc.error_pages {
@@ -1046,8 +1054,12 @@ pub(crate) fn run_location_handler(
             in_error_page,
             intercept,
             upgrade: client_upgrade,
-            stream: cache.is_none() && loc.add_trailers.is_empty(),
+            // A response the range filter may cut is read whole (#370).
+            stream: cache.is_none()
+                && loc.add_trailers.is_empty()
+                && !(force_ranges && req.range.is_some()),
             gzip: loc.gzip,
+            force_ranges,
             cache,
             hash,
             bind,
@@ -1092,9 +1104,12 @@ pub(crate) fn run_location_handler(
                     Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
                 fs_resolve::Outcome::Serve(opened) => {
+                    // `max_ranges 0`: nginx's range filter declines, so
+                    // the file goes whole, without `Accept-Ranges` (#370).
+                    let accept_ranges = loc.max_ranges != Some(0);
                     // A file gzip will compress is sent whole, as nginx's
                     // range filter (after gzip) finds no length to cut.
-                    let range = match (req.range, loc.gzip) {
+                    let range = match (req.range.filter(|_| accept_ranges), loc.gzip) {
                         (Some(_), Some(gz))
                             if super::gzip::would_compress(
                                 gz,
@@ -1121,6 +1136,7 @@ pub(crate) fn run_location_handler(
                             range,
                             if_range: req.if_range,
                             last_modified_override: last_modified_override.as_deref(),
+                            accept_ranges,
                         },
                         server_bytes,
                         loc.sendfile,

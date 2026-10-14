@@ -60,6 +60,7 @@ pub(crate) mod logbuf;
 mod panics;
 mod prepare;
 mod prepared;
+pub(crate) mod range;
 mod render;
 mod response;
 mod rewrite;

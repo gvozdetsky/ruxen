@@ -521,6 +521,31 @@ pub(crate) fn parse_client_max_body_size_args(args: &[String]) -> Result<u64, Er
     })
 }
 
+/// `max_ranges N` (#370), nginx's `ngx_conf_set_num_slot`: decimal digits
+/// only (`ngx_atoi`: no sign, no suffix), up to `NGX_MAX_INT_T_VALUE`, else
+/// "invalid number". A value past `u32::MAX` allows more ranges than any
+/// request can have, so it is kept as `u32::MAX`.
+pub(crate) fn parse_max_ranges_args(args: &[String]) -> Result<u32, Error> {
+    let [raw] = args else {
+        return Err(Error::BadValue {
+            what: "max_ranges (invalid number of arguments)",
+            got: args.join(" "),
+        });
+    };
+    let invalid = || Error::BadValue {
+        what: "max_ranges (invalid number)",
+        got: raw.clone(),
+    };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let n: u64 = raw.parse().map_err(|_| invalid())?;
+    if n > i64::MAX as u64 {
+        return Err(invalid());
+    }
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 /// `client_body_temp_path path [level1 [level2 [level3]]]`, validated as
 /// nginx's ngx_conf_set_path_slot (each level at least 1, ten digits in
 /// all).
@@ -621,6 +646,7 @@ impl ProxyConf {
         "proxy_next_upstream_tries",
         "proxy_next_upstream_timeout",
         "proxy_intercept_errors",
+        "proxy_force_ranges",
         "proxy_bind",
         "proxy_redirect",
         "proxy_hide_header",
@@ -807,6 +833,12 @@ impl ProxyConf {
                 }
                 self.intercept_errors =
                     Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
+            }
+            "proxy_force_ranges" => {
+                if self.force_ranges.is_some() {
+                    return Err(Error::Duplicate("proxy_force_ranges"));
+                }
+                self.force_ranges = Some(parse_on_off_args(&args[1..], "proxy_force_ranges")?);
             }
             "proxy_cache" => {
                 if self.cache.cache.is_some() {

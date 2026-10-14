@@ -345,6 +345,12 @@ pub struct ProcessMeta {
     pub keep_upstream_date: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
+    /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
+    /// for the range filter on a proxied or cached response (#370).
+    pub max_ranges: Option<u32>,
+    /// Whether the range filter may cut the response (#370): set for a
+    /// proxied or cached response by the proxy.
+    pub range_allow: crate::worker::range::RangeAllow,
     /// `limit_rate` / `limit_rate_after` for this response. Boxed: `None`
     /// (one word) in the common case.
     pub limit_rate: Option<Box<ResponseLimit>>,
@@ -399,6 +405,8 @@ impl Default for ProcessMeta {
             sendfile: false,
             keep_upstream_date: false,
             gzip: None,
+            max_ranges: None,
+            range_allow: crate::worker::range::RangeAllow::No,
             limit_rate: None,
             post_action: None,
             upstream_states: Vec::new(),
@@ -1107,6 +1115,7 @@ fn process_with_meta_inner(
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
         meta.gzip = loc.gzip;
+        meta.max_ranges = loc.max_ranges;
         // `set $limit_rate` wins over the directive, as nginx's
         // r->limit_rate_set. Rendered only when something is set.
         meta.limit_rate = if loc.limit_rate.is_none() && !rewrite_state.has_user_vars() {
