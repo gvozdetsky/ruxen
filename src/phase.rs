@@ -844,24 +844,7 @@ fn process_with_meta_inner(
                 },
             }
         };
-        rewrite_state.doc_root = Some(loc.doc_root);
-        meta.keepalive = KeepaliveMeta {
-            allow: loc.keepalive.allow,
-            idle_timeout_ms: loc.keepalive.idle_timeout_ms,
-            header_timeout_secs: loc.keepalive.header_timeout_secs,
-            max_requests: loc.keepalive.max_requests,
-            max_time_ms: loc.keepalive.max_time_ms,
-            disable_msie6: loc.keepalive.disable_msie6,
-            disable_safari: loc.keepalive.disable_safari,
-        };
-        meta.access_logs = loc.access_logs;
-        meta.doc_root = Some(loc.doc_root);
-        meta.timeouts = Some(loc.timeouts);
-        meta.post_action = loc.post_action;
-        meta.log = LogMeta {
-            error_logs: loc.error_logs,
-            log_not_found: loc.log_not_found,
-        };
+        apply_location_meta(&loc, &mut meta, &mut rewrite_state);
         if loc.internal && !internal_request {
             // ngx_http_core_find_config_phase: an `internal` location is
             // not found for an external request.
@@ -881,6 +864,7 @@ fn process_with_meta_inner(
         {
             loc = loc.limited(le);
         }
+        rewrite_state.if_location = None;
         let rewrite_broke = match run_rewrite_program(
             http,
             server,
@@ -894,8 +878,22 @@ fn process_with_meta_inner(
             RewriteOutcome::Continue => false,
             RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
-            RewriteOutcome::Respond(response) => return (response, meta),
+            RewriteOutcome::Respond(response) => {
+                // Answered inside (or after) an `if` that holds: with its
+                // configuration, as nginx has switched `r->loc_conf` by
+                // then (its `access_log`, …).
+                if let Some(n) = rewrite_state.if_location {
+                    switch_to_if_location(server, n, &mut meta, &mut rewrite_state);
+                }
+                return (response, meta);
+            }
         };
+        // An `if` block with settings of its own held: the request goes on
+        // with its anonymous location (#137), as nginx's
+        // `ngx_http_script_if_code` switches `r->loc_conf`.
+        if let Some(n) = rewrite_state.if_location {
+            loc = switch_to_if_location(server, n, &mut meta, &mut rewrite_state);
+        }
         // Access-control phase (allow/deny, auth_basic): runs after
         // rewrite and before content dispatch. A top-level `return` is a
         // rewrite-module directive in nginx, so it answers in the rewrite
@@ -1723,6 +1721,51 @@ fn find_config<'h, 'r>(
     }
 
     (&listen.servers[listen.default_server], None)
+}
+
+/// The anonymous location of an `if` block (#137) as the request's
+/// location from here on: its handler, headers, limits and logs. Cold.
+#[cold]
+#[inline(never)]
+fn switch_to_if_location(
+    server: &'static PreparedServer,
+    n: u32,
+    meta: &mut ProcessMeta,
+    rewrite_state: &mut RewriteState,
+) -> MatchedLocation<'static> {
+    let loc = MatchedLocation::from_prefix(&server.if_locations[n as usize]);
+    // What the location sets in the request's meta before its rewrite
+    // program, again for the new one.
+    apply_location_meta(&loc, meta, rewrite_state);
+    loc
+}
+
+/// The request's meta from the location it is in: what the location sets
+/// before its rewrite program, and an `if` location again (#137).
+#[inline(always)]
+fn apply_location_meta(
+    loc: &MatchedLocation<'static>,
+    meta: &mut ProcessMeta,
+    rewrite_state: &mut RewriteState,
+) {
+    rewrite_state.doc_root = Some(loc.doc_root);
+    meta.keepalive = KeepaliveMeta {
+        allow: loc.keepalive.allow,
+        idle_timeout_ms: loc.keepalive.idle_timeout_ms,
+        header_timeout_secs: loc.keepalive.header_timeout_secs,
+        max_requests: loc.keepalive.max_requests,
+        max_time_ms: loc.keepalive.max_time_ms,
+        disable_msie6: loc.keepalive.disable_msie6,
+        disable_safari: loc.keepalive.disable_safari,
+    };
+    meta.access_logs = loc.access_logs;
+    meta.doc_root = Some(loc.doc_root);
+    meta.timeouts = Some(loc.timeouts);
+    meta.post_action = loc.post_action;
+    meta.log = LogMeta {
+        error_logs: loc.error_logs,
+        log_not_found: loc.log_not_found,
+    };
 }
 
 /// Whether a ClientHello with this SNI name is to be refused

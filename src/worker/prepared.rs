@@ -118,6 +118,11 @@ pub enum PreparedRewriteOp {
     If {
         guard: PreparedGuard,
         body: &'static [PreparedRewriteOp],
+        /// The block's anonymous location, as an index into
+        /// `PreparedServer::if_locations` (#137); for a block of rewrite
+        /// directives only, the enclosing block's, or `None` for the
+        /// location itself.
+        location: Option<u32>,
     },
     Rewrite {
         regex: &'static regex::bytes::Regex,
@@ -237,6 +242,10 @@ pub struct RewriteState {
     pub(crate) limit_req_status: u8,
     /// `$limit_conn_status` (`limit_conn::status`), likewise (#95).
     pub(crate) limit_conn_status: u8,
+    /// The anonymous location of the last `if` whose condition held in the
+    /// location's rewrite program (#137): the request goes on with its
+    /// configuration, as nginx's `r->loc_conf = code->loc_conf`.
+    pub(crate) if_location: Option<u32>,
 }
 
 impl Default for RewriteState {
@@ -249,6 +258,7 @@ impl Default for RewriteState {
             doc_root: None,
             limit_req_status: 0,
             limit_conn_status: 0,
+            if_location: None,
         }
     }
 }
@@ -1493,6 +1503,9 @@ pub struct PreparedServer {
     /// (#248). `None` for fewer than two, or if the set didn't build.
     pub regex_location_set: Option<regex::bytes::RegexSet>,
     pub named_locations: Vec<PreparedLocation>,
+    /// The anonymous locations of its locations' `if` blocks, by the
+    /// index `PreparedRewriteOp::If` carries (#137).
+    pub if_locations: Vec<PreparedLocation>,
     /// Server-scope `return STATUS [body]`. Fires when no explicit location
     /// matches, instead of the default 404. Inherits the server-level
     /// `add_header` list so `add_header X-Foo $uri;` at server scope still
