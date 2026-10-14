@@ -10,20 +10,33 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 
-fn setup(name: &str) -> (PathBuf, u16) {
+/// The server stops when the test ends, also when an assertion panics:
+/// an orphaned ruxen otherwise keeps its port and CPU after the run.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The directory, the port, and the port lock, held until ruxen listens:
+/// released earlier, another test could take the same free port, and the
+/// readiness probe would reach its server.
+fn setup(name: &str) -> (PathBuf, u16, MutexGuard<'static, ()>) {
     let dir = std::env::temp_dir().join(format!("ruxen-m104-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let port = {
-        let _setup = common::ports::setup_lock();
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
+    let setup = common::ports::setup_lock();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let d = dir.display();
     std::fs::write(
         dir.join("nginx.conf"),
@@ -39,22 +52,31 @@ fn setup(name: &str) -> (PathBuf, u16) {
         ),
     )
     .unwrap();
-    (dir, port)
+    (dir, port, setup)
 }
 
-fn start(dir: &Path, port: u16) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+/// Start ruxen and wait for its pid file, which it writes once every
+/// worker is bound; then the port lock goes.
+fn start(dir: &Path, setup: MutexGuard<'static, ()>) -> KillOnDrop {
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !dir.join("ruxen.pid").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "ruxen exited at startup"
+        );
         assert!(Instant::now() < deadline, "ruxen did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
+    drop(setup);
     child
 }
 
@@ -71,17 +93,17 @@ fn lines(path: &Path) -> usize {
     std::fs::read_to_string(path).map_or(0, |t| t.lines().count())
 }
 
-fn signal(child: &Child, sig: &str) {
+fn signal(child: &KillOnDrop, sig: &str) {
     Command::new("kill")
-        .args([sig, &child.id().to_string()])
+        .args([sig, &child.0.id().to_string()])
         .status()
         .unwrap();
 }
 
 #[test]
 fn m104_buffer_flush_and_gzip() {
-    let (dir, port) = setup("buf");
-    let mut child = start(&dir, port);
+    let (dir, port, setup) = setup("buf");
+    let mut child = start(&dir, setup);
     // 1k buffer, 45-byte lines: 22 fit, the 23rd makes them go out.
     for i in 0..30 {
         get(port, &format!("/b/{i:041}"));
@@ -97,7 +119,7 @@ fn m104_buffer_flush_and_gzip() {
     }
     // SIGQUIT: the worker writes its buffers on its way out.
     signal(&child, "-QUIT");
-    child.wait().unwrap();
+    child.0.wait().unwrap();
     assert_eq!(lines(&dir.join("b.log")), 30);
     let gz = std::fs::read(dir.join("z.log")).unwrap();
     let mut text = String::new();
@@ -110,8 +132,8 @@ fn m104_buffer_flush_and_gzip() {
 
 #[test]
 fn m104_reopen_and_sigterm_write_the_buffer() {
-    let (dir, port) = setup("term");
-    let mut child = start(&dir, port);
+    let (dir, port, setup) = setup("term");
+    let mut child = start(&dir, setup);
     get(port, "/k/before-reopen");
     // logrotate: move the file, then SIGUSR1. The buffered line belongs
     // to the old file.
@@ -126,7 +148,7 @@ fn m104_reopen_and_sigterm_write_the_buffer() {
     );
     // SIGTERM: the lines still buffered aren't lost.
     signal(&child, "-TERM");
-    child.wait().unwrap();
+    child.0.wait().unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.join("k.log")).unwrap(),
         "/k/after-reopen\n"
