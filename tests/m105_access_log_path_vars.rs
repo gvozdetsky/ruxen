@@ -9,21 +9,38 @@ mod common;
 use std::io::Read;
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+/// The server stops when the test ends, also when an assertion panics:
+/// an orphaned ruxen otherwise keeps its port and CPU after the run.
+struct KillOnDrop(std::process::Child);
+
+impl KillOnDrop {
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 #[test]
 fn m105_access_log_path_is_rendered_per_request() {
     let dir = std::env::temp_dir().join(format!("ruxen-m105-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html")).unwrap();
-    let port = {
-        let _setup = common::ports::setup_lock();
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
+    // Held until ruxen listens: released earlier, another test could take
+    // the same free port, and ruxen would fail to bind it.
+    let setup = common::ports::setup_lock();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let d = dir.display();
     std::fs::write(
         dir.join("nginx.conf"),
@@ -36,18 +53,19 @@ fn m105_access_log_path_is_rendered_per_request() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child.0, &dir.join("ruxen.pid"), Duration::from_secs(5));
+    drop(setup);
     let get = |target: &str| {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         use std::io::Write;
@@ -61,8 +79,7 @@ fn m105_access_log_path_is_rendered_per_request() {
     get("/c?n=1");
     get("/gone/x?n=3");
     std::thread::sleep(Duration::from_millis(200));
-    let _ = child.kill();
-    let _ = child.wait();
+    child.stop();
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
     assert_eq!(read("v_1.log"), "/a\n/c\n");
     assert_eq!(read("v_2.log"), "/b\n");

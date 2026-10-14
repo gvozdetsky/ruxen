@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Server(Child, PathBuf);
 
@@ -77,7 +77,9 @@ fn start(conf: impl FnOnce(&str, u16) -> String) -> (Server, u16) {
     }));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let _setup = common::ports::setup_lock();
+    // Held until ruxen listens: released earlier, another test could take
+    // the same free port, and ruxen would fail to bind it.
+    let setup = common::ports::setup_lock();
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -88,19 +90,23 @@ fn start(conf: impl FnOnce(&str, u16) -> String) -> (Server, u16) {
         conf(&dir.display().to_string(), port),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (Server(child, dir), port)
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        dir,
+    );
+    let pid_file = server.1.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.0, &pid_file, Duration::from_secs(5));
+    drop(setup);
+    (server, port)
 }
 
 fn get(port: u16, target: &str) -> (u16, String) {

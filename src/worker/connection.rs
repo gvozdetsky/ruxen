@@ -126,6 +126,15 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// to the socket itself.
     fn begin_tunnel(&mut self) {}
 
+    /// Completes once the client has closed the connection (a read would
+    /// see EOF), for a response that waits between writes: nginx's
+    /// `ngx_http_test_reading` ends the request then (#383). Pending
+    /// otherwise, also once bytes arrive (a pipelined request, left for
+    /// the next read). Plain TCP watches; other transports never complete.
+    async fn peer_closed(&self) {
+        std::future::pending::<()>().await
+    }
+
     /// The keep-alive wait for the next request, which may also read its
     /// first bytes into `buf` (from offset 0). By default the readiness
     /// wait of `idle_wait`, after which the caller reads.
@@ -188,6 +197,34 @@ impl ConnIo for TcpStream {
 
     async fn wait_writable(&self) -> std::io::Result<()> {
         self.writable(false).await
+    }
+
+    async fn peer_closed(&self) {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            if self.readable(false).await.is_err() {
+                return;
+            }
+            let mut byte = 0u8;
+            // SAFETY: a one-byte peek into our own buffer; MSG_DONTWAIT
+            // keeps it from blocking whatever the socket's mode.
+            let n = unsafe {
+                libc::recv(
+                    self.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            match n {
+                0 => return,
+                // Bytes of a next request: no EOF to see behind them.
+                1.. => std::future::pending::<()>().await,
+                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => {}
+                // A reset or another error: the client is gone too.
+                _ => return,
+            }
+        }
     }
 }
 
@@ -639,27 +676,27 @@ impl Pacer {
         })
     }
 
-    /// Wait until some of `want` bytes may go; returns how many.
-    async fn allowance(&mut self, want: usize) -> usize {
-        loop {
-            let elapsed_ms = self.start.elapsed().as_millis() as u64;
-            let allowed = self
-                .after
-                .saturating_add(self.rate.saturating_mul(elapsed_ms + 1000) / 1000);
-            if self.sent < allowed {
-                // Small writes keep the pace even, as nginx's `limit`.
-                let step = self.rate.clamp(1, 64 * 1024);
-                return ((allowed - self.sent).min(step) as usize).min(want);
-            }
-            let over = self.sent - allowed + 1;
-            let wait_ms = (over.saturating_mul(1000)).div_ceil(self.rate).max(1);
-            monoio::time::sleep(Duration::from_millis(wait_ms)).await;
+    /// How many of `want` bytes may go now, or how long to wait first.
+    fn next(&self, want: usize) -> Result<usize, Duration> {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let allowed = self
+            .after
+            .saturating_add(self.rate.saturating_mul(elapsed_ms + 1000) / 1000);
+        if self.sent < allowed {
+            // Small writes keep the pace even, as nginx's `limit`.
+            let step = self.rate.clamp(1, 64 * 1024);
+            return Ok(((allowed - self.sent).min(step) as usize).min(want));
         }
+        let over = self.sent - allowed + 1;
+        let wait_ms = (over.saturating_mul(1000)).div_ceil(self.rate).max(1);
+        Err(Duration::from_millis(wait_ms))
     }
 }
 
-/// `write_all_timed` under `limit_rate`.
-pub(crate) async fn write_all_paced<S: monoio::io::AsyncWriteRent>(
+/// `write_all_timed` under `limit_rate`. A client that closes while the
+/// response waits for its next write ends it then, not at that write
+/// (`ConnIo::peer_closed`).
+pub(crate) async fn write_all_paced<S: ConnIo>(
     stream: &mut S,
     mut buf: Vec<u8>,
     len: usize,
@@ -669,7 +706,19 @@ pub(crate) async fn write_all_paced<S: monoio::io::AsyncWriteRent>(
 ) -> (std::io::Result<()>, Vec<u8>) {
     let mut written = 0;
     while written < len {
-        let n = pacer.allowance(len - written).await;
+        let n = match pacer.next(len - written) {
+            Ok(n) => n,
+            Err(wait) => {
+                let closed = monoio::select! {
+                    _ = monoio::time::sleep(wait) => false,
+                    _ = stream.peer_closed() => true,
+                };
+                if closed {
+                    return (Err(std::io::ErrorKind::ConnectionAborted.into()), buf);
+                }
+                continue;
+            }
+        };
         let slice = buf.slice(written..written + n);
         let Some((res, slice)) = with_timeout(timer.as_mut(), timeout, stream.write(slice)).await
         else {
@@ -688,7 +737,7 @@ pub(crate) async fn write_all_paced<S: monoio::io::AsyncWriteRent>(
     (Ok(()), buf)
 }
 
-pub(crate) async fn stream_file<S: monoio::io::AsyncWriteRent>(
+pub(crate) async fn stream_file<S: ConnIo>(
     stream: &mut S,
     body: phase::FileBody,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
