@@ -860,6 +860,7 @@ http {{
             proxy_pass http://127.0.0.1:{p};
             add_header X-Root $document_root;
             add_header X-File $request_filename;
+            add_header X-Uri $uri;
         }}
     }}
 }}
@@ -870,4 +871,8 @@ http {{
     let resp = String::from_utf8_lossy(&http_get_close(port, "/p/a")).into_owned();
     assert!(resp.contains("\r\nX-Root: /srv/www\r\n"), "{resp}");
     assert!(resp.contains("\r\nX-File: /srv/www/p/a\r\n"), "{resp}");
+    // The current URI, normalized, not the request's raw path (#373).
+    let resp = String::from_utf8_lossy(&http_get_close(port, "/p/%61//b?x=1")).into_owned();
+    assert!(resp.contains("\r\nX-Uri: /p/a/b\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-File: /srv/www/p/a/b\r\n"), "{resp}");
 }
