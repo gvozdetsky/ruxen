@@ -449,7 +449,7 @@ async fn reject_request<S: ConnIo>(
 /// A response under `limit_rate`: the head, then the file body if any,
 /// paced as nginx's write filter does. `false` if the connection failed.
 #[allow(clippy::too_many_arguments)]
-async fn write_response_paced<S: monoio::io::AsyncWriteRent>(
+async fn write_response_paced<S: ConnIo>(
     stream: &mut S,
     scratch: &mut Vec<u8>,
     file_body: Option<phase::FileBody>,

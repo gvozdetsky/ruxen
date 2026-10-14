@@ -98,7 +98,7 @@ const RELAY_BUF: usize = 64 * 1024;
 /// client write is held to `send_timeout` (and `limit_rate` through
 /// `pacer`), each upstream read to `proxy_read_timeout`. Returns `head`
 /// as written, for the access log.
-pub(crate) async fn relay<S: monoio::io::AsyncWriteRent>(
+pub(crate) async fn relay<S: crate::worker::ConnIo>(
     mut s: Box<ProxyStream>,
     client: &mut S,
     mut head: Vec<u8>,
@@ -377,7 +377,7 @@ fn push_body(out: &mut Vec<u8>, data: &[u8], chunked_out: bool) {
 }
 
 /// Write `buf[..len]` with `send_timeout`, under `limit_rate` if any.
-async fn write_out<S: monoio::io::AsyncWriteRent>(
+async fn write_out<S: crate::worker::ConnIo>(
     client: &mut S,
     buf: Vec<u8>,
     len: usize,
