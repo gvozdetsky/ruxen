@@ -168,9 +168,12 @@ pub struct ProxyPlan {
     /// connections are bound to. Pooled ones are reused as they are.
     pub bind: Option<LocalBind>,
     /// A body that doesn't arrive with the header may be relayed as it
-    /// comes (#88): nothing on this location needs it whole (no cache,
-    /// gzip or `add_trailer`), and this is the request's first pass.
+    /// comes (#88): nothing on this location needs it whole (no cache or
+    /// `add_trailer`), and this is the request's first pass.
     pub stream: bool,
+    /// The location's gzip, which needs a body whole when it compresses
+    /// it: such a response isn't relayed as it comes (`gzip::passes`).
+    pub gzip: Option<&'static crate::worker::PreparedGzip>,
 }
 
 /// An upstream that answered 101 to a client asking to upgrade: the
@@ -1827,6 +1830,9 @@ async fn attempt(
     // unless something needs it whole: a status that may fail over or be
     // intercepted (decided after the body today), or the plan says so.
     if plan.stream
+        && plan
+            .gzip
+            .is_none_or(|gz| crate::worker::gzip::passes(gz, &accum[..head_end]))
         && body_has_content
         && !plan.next_upstream.matches_status(status_code)
         && !plan

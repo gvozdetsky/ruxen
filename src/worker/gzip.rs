@@ -39,6 +39,29 @@ impl<'a> GzipRequest<'a> {
     }
 }
 
+/// Whether gzip leaves a proxied response with this head (the upstream's)
+/// as it is, whoever asks: not a status, type or encoding it compresses,
+/// or shorter than `gzip_min_length`. Then its body may be relayed as it
+/// comes (#88). The upstream's own framing doesn't count: the buffered
+/// path re-frames the body before the filter sees it, so an unknown
+/// length (chunked) leaves the response a candidate.
+pub(crate) fn passes(gz: &PreparedGzip, upstream_head: &[u8]) -> bool {
+    let Some(mut head) = parse_head(upstream_head) else {
+        return false;
+    };
+    head.transfer_encoding = false;
+    !candidate(gz, &head)
+}
+
+/// `ngx_http_gzip_header_filter`'s checks on the response alone.
+fn candidate(gz: &PreparedGzip, head: &Head<'_>) -> bool {
+    matches!(head.status, 200 | 403 | 404)
+        && !head.content_encoding
+        && !head.transfer_encoding
+        && !head.content_length.is_some_and(|l| l < gz.min_length)
+        && type_matches(gz, head.content_type)
+}
+
 /// Whether a whole static file of this type and size would be
 /// compressed: then a `Range` is ignored and the client gets the whole
 /// file, compressed, with a 200, as from nginx (its range filter runs
@@ -422,12 +445,7 @@ enum Decision {
 
 /// `ngx_http_gzip_header_filter`'s checks, then `ngx_http_gzip_ok`.
 fn decide(gz: &PreparedGzip, req: &GzipRequest<'_>, head: &Head<'_>) -> Decision {
-    if !matches!(head.status, 200 | 403 | 404)
-        || head.content_encoding
-        || head.transfer_encoding
-        || head.content_length.is_some_and(|l| l < gz.min_length)
-        || !type_matches(gz, head.content_type)
-    {
+    if !candidate(gz, head) {
         return Decision::Pass;
     }
     if gzip_ok(gz, req, head) {
