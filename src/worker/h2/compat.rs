@@ -23,6 +23,10 @@ use tokio::io::ReadBuf;
 /// Read size: one maximum-size TLS record, or a few HTTP/2 frames.
 const READ_BUF: usize = 16 * 1024;
 
+/// How much `poll_write` takes while a write is in flight, for the next
+/// one: `h2` keeps encoding frames instead of waiting (#348).
+const PENDING_MAX: usize = 256 * 1024;
+
 type Op<T> = Pin<Box<dyn Future<Output = T>>>;
 
 pub(crate) struct PollIo<S: 'static> {
@@ -36,6 +40,8 @@ pub(crate) struct PollIo<S: 'static> {
     rpos: usize,
     /// The write buffer between writes.
     wbuf: Vec<u8>,
+    /// Bytes taken while a write was in flight, written next.
+    pending: Vec<u8>,
     /// A failed write, reported by the next `poll_write` or `poll_flush`.
     write_error: Option<io::Error>,
     /// When the write in flight started; `None` while none is.
@@ -54,6 +60,7 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
             rbuf: Vec::new(),
             rpos: 0,
             wbuf: Vec::new(),
+            pending: Vec::new(),
             write_error: None,
             writing_since: Default::default(),
             stream: Rc::new(UnsafeCell::new(stream)),
@@ -82,17 +89,48 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
         unsafe { &mut *self.stream.get() }
     }
 
-    /// Wait for the write in flight, if any.
-    fn poll_written(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(op) = self.writing.as_mut() {
+    /// Start writing `buf` and poll it once: on io_uring, the submission
+    /// is what gets it going.
+    fn start_write(&mut self, buf: Vec<u8>, cx: &mut Context<'_>) {
+        // SAFETY: see `stream`.
+        let stream = unsafe { self.stream() };
+        self.writing = Some(Box::pin(async move { stream.write_all(buf).await }));
+        self.writing_since.set(Some(std::time::Instant::now()));
+        let _ = self.poll_in_flight(cx);
+    }
+
+    /// Poll the write in flight; when it is done, start the pending bytes.
+    /// `Ready` once nothing is in flight.
+    fn poll_in_flight(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            let Some(op) = self.writing.as_mut() else {
+                return Poll::Ready(());
+            };
             let (res, buf) = ready!(op.as_mut().poll(cx));
             self.writing = None;
             self.writing_since.set(None);
             self.wbuf = buf;
             if let Err(e) = res {
                 self.write_error = Some(e);
+                self.pending.clear();
+                return Poll::Ready(());
             }
+            if self.pending.is_empty() {
+                return Poll::Ready(());
+            }
+            let mut next = std::mem::take(&mut self.wbuf);
+            next.clear();
+            std::mem::swap(&mut next, &mut self.pending);
+            // SAFETY: see `stream`.
+            let stream = unsafe { self.stream() };
+            self.writing = Some(Box::pin(async move { stream.write_all(next).await }));
+            self.writing_since.set(Some(std::time::Instant::now()));
         }
+    }
+
+    /// Wait until everything taken is written.
+    fn poll_written(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.poll_in_flight(cx));
         match self.write_error.take() {
             Some(e) => Poll::Ready(Err(e)),
             None => Poll::Ready(Ok(())),
@@ -155,22 +193,26 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for Poll
         data: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        ready!(this.poll_written(cx))?;
+        let len: usize = data.iter().map(|s| s.len()).sum();
+        if this.poll_in_flight(cx).is_pending() {
+            // Taken for the next write while this one runs, up to a bound.
+            if this.pending.len() + len > PENDING_MAX {
+                return Poll::Pending;
+            }
+            for slice in data {
+                this.pending.extend_from_slice(slice);
+            }
+            return Poll::Ready(Ok(len));
+        }
+        if let Some(e) = this.write_error.take() {
+            return Poll::Ready(Err(e));
+        }
         let mut buf = std::mem::take(&mut this.wbuf);
         buf.clear();
         for slice in data {
             buf.extend_from_slice(slice);
         }
-        let len = buf.len();
-        // SAFETY: see `stream`.
-        let stream = unsafe { this.stream() };
-        this.writing = Some(Box::pin(async move { stream.write_all(buf).await }));
-        this.writing_since.set(Some(std::time::Instant::now()));
-        // Start it now: on io_uring, the submission is what gets it going.
-        if let Poll::Ready(Err(e)) = this.poll_written(cx) {
-            // Taken already: reported as this write's error.
-            return Poll::Ready(Err(e));
-        }
+        this.start_write(buf, cx);
         Poll::Ready(Ok(len))
     }
 
