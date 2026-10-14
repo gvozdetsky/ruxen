@@ -7,7 +7,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Server(Child, std::path::PathBuf);
 
@@ -35,7 +35,7 @@ fn m115_map_on_sent_http_content_type() {
     std::fs::create_dir_all(dir.join("html")).unwrap();
     std::fs::write(dir.join("html/a.png"), "x").unwrap();
     std::fs::write(dir.join("html/b.txt"), "x").unwrap();
-    let _setup = common::ports::setup_lock();
+    let setup = common::ports::setup_lock();
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -57,17 +57,16 @@ fn m115_map_on_sent_http_content_type() {
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg("-c")
         .arg(dir.join("nginx.conf"))
+        .arg("-g")
+        .arg(format!("pid {}/ruxen.pid;", dir.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let _server = Server(child, dir);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    drop(_setup);
+    let mut server = Server(child, dir);
+    let pid_file = server.1.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.0, &pid_file, Duration::from_secs(5));
+    drop(setup);
 
     let png = head(port, "/a.png");
     assert!(png.contains("\r\nCache-Control: max-age=3600\r\n"), "{png}");

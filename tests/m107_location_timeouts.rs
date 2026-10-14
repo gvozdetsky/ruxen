@@ -22,11 +22,19 @@ impl Drop for Server {
 }
 
 fn start() -> (Server, u16) {
-    let dir = std::env::temp_dir().join(format!("ruxen-m107-{}", std::process::id()));
+    // A directory per server: both tests start one at the same time, and
+    // one's pid file must not pass for the other's.
+    let dir = std::env::temp_dir().join(format!("ruxen-m107-{}-{}", std::process::id(), {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html")).unwrap();
     std::fs::write(dir.join("html/big"), vec![b'x'; 32 << 20]).unwrap();
-    let _setup = common::ports::setup_lock();
+    // Held until ruxen listens: released earlier, another test could take
+    // the same free port, and ruxen would fail to bind it.
+    let setup = common::ports::setup_lock();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -47,19 +55,23 @@ fn start() -> (Server, u16) {
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (Server(child, dir), port)
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        dir,
+    );
+    let pid_file = server.1.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.0, &pid_file, Duration::from_secs(5));
+    drop(setup);
+    (server, port)
 }
 
 /// Send 2 of 10 body bytes and stall; how long until the server closes.

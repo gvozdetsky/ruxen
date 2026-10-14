@@ -39,7 +39,7 @@ fn start(tag: &str, listen_extra: &str, server_extra: &str) -> Server {
 fn start_with(tag: &str, events: &str, listen_extra: &str, server_extra: &str) -> Server {
     // Held from the port pick until ruxen listens: a parallel test's
     // backend can't take the port in between (#230).
-    let _setup = common::ports::setup_lock();
+    let setup = common::ports::setup_lock();
     let port = {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
@@ -57,22 +57,28 @@ fn start_with(tag: &str, events: &str, listen_extra: &str, server_extra: &str) -
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .arg("-e")
-        .arg(dir.join("error.log"))
-        .env("RUXEN_WORKERS", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-e")
+            .arg(dir.join("error.log"))
+            .env("RUXEN_WORKERS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        port,
+        dir,
+    };
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
+    while !server.dir.join("ruxen.pid").exists() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(10));
     }
-    Server { child, port, dir }
+    drop(setup);
+    server
 }
 
 fn exchange(port: u16, parts: &[&[u8]]) -> String {

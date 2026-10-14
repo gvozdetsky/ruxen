@@ -39,7 +39,9 @@ fn free_ports<const N: usize>() -> [u16; N] {
 /// error pages. The backends answer `/bad` with `a_bad` / `b_bad` and
 /// everything else with their name.
 fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u16, [u16; 2]) {
-    let _setup = common::ports::setup_lock();
+    // Held until ruxen listens on all three: released earlier, another
+    // test could take one of these free ports.
+    let setup = common::ports::setup_lock();
     let [front, a, b] = free_ports::<3>();
     let dir = std::env::temp_dir().join(format!("ruxen-m65-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -61,20 +63,25 @@ fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u1
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .env("RUXEN_WORKERS", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .env("RUXEN_WORKERS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        dir,
+    };
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
+    while !server.dir.join("ruxen.pid").exists() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(10));
     }
-    (Server { child, dir }, front, [a, b])
+    drop(setup);
+    (server, front, [a, b])
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -188,24 +195,26 @@ fn failover_reaches_every_peer_of_a_large_upstream() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .arg("-c")
-        .arg(dir.join("nginx.conf"))
-        .env("RUXEN_WORKERS", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .env("RUXEN_WORKERS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        dir,
+    };
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !dir.join("ruxen.pid").exists() {
+    while !server.dir.join("ruxen.pid").exists() {
         assert!(Instant::now() < deadline, "ruxen did not start");
         sleep(Duration::from_millis(10));
     }
     drop(setup);
     let results: Vec<(u16, String)> = (0..10).map(|_| get(front, "/")).collect();
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(server);
     assert!(
         results
             .iter()
