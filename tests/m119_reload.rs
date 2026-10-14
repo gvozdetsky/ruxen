@@ -510,6 +510,7 @@ fn shared_ssl_session_cache_survives_a_reload() {
 /// this configuration kept about 25 KiB: 200 reloads added some 5 MiB.
 #[test]
 fn reloads_free_the_retired_configuration() {
+    let setup = common::ports::setup_lock();
     let port = free_port();
     let http = format!(
         "server {{ listen 127.0.0.1:{port};\n\
@@ -517,7 +518,8 @@ fn reloads_free_the_retired_configuration() {
            location ~ \\.php$ {{ return 403; }}\n\
            location /p/ {{ proxy_pass http://127.0.0.1:{port}/; }} }}"
     );
-    let s = start("memory", "", &http);
+    let s = spawn("memory", "", &http);
+    drop(setup);
     let rss_kib = || {
         let status = std::fs::read_to_string(format!("/proc/{}/status", s.child.id())).unwrap();
         status
