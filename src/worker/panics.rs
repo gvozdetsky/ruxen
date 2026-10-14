@@ -40,9 +40,22 @@ pub(crate) fn test_panic() -> TestPanic {
     })
 }
 
+/// The configuration whose error log takes panics outside a worker's own
+/// (the main thread, the reload thread, cache managers). Held while a
+/// panic is logged, so `set_panic_hook_config` waits for a writer still
+/// using the configuration it replaces, which a reload then frees (#343).
+static HOOK_HTTP: std::sync::Mutex<Option<&'static PreparedHttp>> = std::sync::Mutex::new(None);
+
+/// The configuration the panic hook logs with when the panicking thread
+/// has none of its own: the running generation's.
+pub fn set_panic_hook_config(http: &'static PreparedHttp) {
+    *HOOK_HTTP.lock().unwrap_or_else(|e| e.into_inner()) = Some(http);
+}
+
 /// Send panic messages to the error log. With `RUST_BACKTRACE` set, Rust's
 /// own report (with the backtrace) follows on stderr.
 pub fn install_panic_hook(http: &'static PreparedHttp) {
+    set_panic_hook_config(http);
     let previous = std::panic::take_hook();
     let backtrace = std::env::var_os("RUST_BACKTRACE").is_some();
     std::panic::set_hook(Box::new(move |info| {
@@ -57,8 +70,12 @@ pub fn install_panic_hook(http: &'static PreparedHttp) {
             .location()
             .map(|l| format!(" at {}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
-        // A worker logs where its generation's configuration says (#89).
-        let logs = super::worker_http().map_or(http.error_logs, |h| h.error_logs);
+        // A worker logs where its generation's configuration says (#89);
+        // other threads where the running one does.
+        let current = HOOK_HTTP.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(logs) = super::worker_http().or(*current).map(|h| h.error_logs) else {
+            return;
+        };
         write_worker_log(
             logs,
             ErrorLogLevel::Alert,

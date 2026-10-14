@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use crate::tls_stream::{TlsAcceptor, TlsStream as ServerTlsStream};
+pub use crate::tls_stream::{Accepted, TlsAcceptor, TlsStream as ServerTlsStream};
 pub use rustls::ServerConfig;
 
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
@@ -38,6 +38,26 @@ impl std::fmt::Display for AcceptError {
 
 impl std::error::Error for AcceptError {}
 
+/// A finished accept on a TLS port.
+pub enum Handshake<IO> {
+    /// The established stream plus its `HandshakeInfo` snapshot.
+    Tls(ServerTlsStream<IO>, HandshakeInfo),
+    /// Plain HTTP on the TLS port, with the bytes already read (#384).
+    Plain(IO, Vec<u8>),
+}
+
+impl<IO> From<Accepted<IO>> for Handshake<IO> {
+    fn from(accepted: Accepted<IO>) -> Self {
+        match accepted {
+            Accepted::Tls(s) => {
+                let info = HandshakeInfo::from_stream(&s);
+                Handshake::Tls(s, info)
+            }
+            Accepted::Plain(io, read) => Handshake::Plain(io, read),
+        }
+    }
+}
+
 /// Drive a TLS handshake to completion or abort after `timeout`.
 ///
 /// On success returns the established stream plus a `HandshakeInfo`
@@ -47,15 +67,12 @@ pub async fn accept_with_timeout<IO>(
     acceptor: &TlsAcceptor,
     stream: IO,
     timeout: Duration,
-) -> Result<(ServerTlsStream<IO>, HandshakeInfo), AcceptError>
+) -> Result<Handshake<IO>, AcceptError>
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
     match monoio::time::timeout(timeout, acceptor.accept(stream)).await {
-        Ok(Ok(s)) => {
-            let info = HandshakeInfo::from_stream(&s);
-            Ok((s, info))
-        }
+        Ok(Ok(accepted)) => Ok(accepted.into()),
         Ok(Err(e)) => Err(AcceptError::Tls(e)),
         Err(_elapsed) => Err(AcceptError::Timeout),
     }
@@ -69,15 +86,12 @@ pub async fn accept_choosing_with_timeout<IO>(
     stream: IO,
     timeout: Duration,
     choose: impl FnOnce(Option<&str>) -> crate::tls_stream::Choice,
-) -> Result<(ServerTlsStream<IO>, HandshakeInfo), AcceptError>
+) -> Result<Handshake<IO>, AcceptError>
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
     match monoio::time::timeout(timeout, acceptor.accept_choosing(stream, choose)).await {
-        Ok(Ok(s)) => {
-            let info = HandshakeInfo::from_stream(&s);
-            Ok((s, info))
-        }
+        Ok(Ok(accepted)) => Ok(accepted.into()),
         Ok(Err(e)) => Err(AcceptError::Tls(e)),
         Err(_elapsed) => Err(AcceptError::Timeout),
     }

@@ -449,7 +449,7 @@ async fn reject_request<S: ConnIo>(
 /// A response under `limit_rate`: the head, then the file body if any,
 /// paced as nginx's write filter does. `false` if the connection failed.
 #[allow(clippy::too_many_arguments)]
-async fn write_response_paced<S: monoio::io::AsyncWriteRent>(
+async fn write_response_paced<S: ConnIo>(
     stream: &mut S,
     scratch: &mut Vec<u8>,
     file_body: Option<phase::FileBody>,
@@ -2608,6 +2608,7 @@ pub(crate) async fn handle_plain(
         peer_unix: http.listens[listen_index].unix.is_some(),
         realip: None,
         proxy_protocol,
+        plain_http: false,
     };
     let listen = &http.listens[listen_index];
     // Boxed, here and in `handle_tls`: awaited in place, the HTTP/2
@@ -2670,6 +2671,7 @@ pub(crate) async fn handle_tls(
         peer_unix: http.listens[listen_index].unix.is_some(),
         realip: None,
         proxy_protocol,
+        plain_http: false,
     };
     let budget = budget.saturating_sub(accepted_at.elapsed());
     let accepted = if listen.reject_handshake.is_some() || listen.h2_by_sni {
@@ -2681,7 +2683,29 @@ pub(crate) async fn handle_tls(
         crate::tls::accept_with_timeout(&acceptor, stream, budget).await
     };
     let (mut tls_stream, info) = match accepted {
-        Ok(p) => p,
+        Ok(crate::tls::Handshake::Tls(stream, info)) => (stream, info),
+        Ok(crate::tls::Handshake::Plain(stream, read)) => {
+            // Plain HTTP on the `ssl` port (#384): read as HTTP/1, then
+            // answered with 497 (`conn.plain_http`).
+            let conn = phase::ConnInfo {
+                plain_http: true,
+                ..conn
+            };
+            let mut stream = super::connection::Preread::new(stream, read);
+            Box::pin(handle(
+                &mut stream,
+                peer_addr,
+                listen_index,
+                None,
+                None,
+                &conn,
+                http,
+                state,
+                connection_id,
+            ))
+            .await;
+            return;
+        }
         // `ssl_reject_handshake`: nginx logs nothing above debug for it.
         Err(crate::tls::AcceptError::Tls(e))
             if e.kind() == std::io::ErrorKind::ConnectionRefused =>
@@ -3095,6 +3119,13 @@ pub(crate) async fn handle<S: ConnIo>(
                         let if_match = req.if_match.map(|(s, e)| &buf[base + s..base + e]);
                         let range = req.range.map(|(s, e)| &buf[base + s..base + e]);
                         let if_range = req.if_range.map(|(s, e)| &buf[base + s..base + e]);
+                        // Plain HTTP on an `ssl` port (#384): once its head is
+                        // read, nginx finalizes the request with 497
+                        // (ngx_http_process_request), unless it was refused
+                        // already.
+                        if conn.plain_http && refuse.is_none() {
+                            refuse = Some(497);
+                        }
                         let headers_raw = &buf[base + req.headers_start..base + req.headers_end];
                         let keep_alive = req.keep_alive && refuse.is_none();
                         // `as u64` saturates only at ~584k years of uptime;

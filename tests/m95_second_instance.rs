@@ -4,8 +4,7 @@
 
 mod common;
 
-use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -39,26 +38,32 @@ fn conf(tag: &str, listen: &str) -> (PathBuf, u16) {
     (path, port)
 }
 
-fn start(path: &PathBuf, port: u16) -> Server {
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
-        .args(["-c", path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    Server(child)
+fn start(path: &Path) -> Server {
+    let pid_file = path.with_file_name("ruxen.pid");
+    // Owned by `Server` before the wait: if it panics, ruxen still stops.
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .args(["-c", path.to_str().unwrap()])
+            .arg("-g")
+            .arg(format!("pid {};", pid_file.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut server.0, &pid_file, Duration::from_secs(5));
+    server
 }
 
 #[test]
 fn m95_second_instance_fails_with_address_in_use() {
-    let _setup = common::ports::setup_lock();
+    // Held until the first instance listens; from then on the port is
+    // its, and the second instance's two and a half seconds of retries
+    // needn't hold up the other tests.
+    let setup = common::ports::setup_lock();
     let (path, port) = conf("busy", "");
-    let _first = start(&path, port);
+    let _first = start(&path);
+    drop(setup);
 
     let started = Instant::now();
     let second = Command::new(env!("CARGO_BIN_EXE_ruxen"))
@@ -89,9 +94,11 @@ fn m95_second_instance_fails_with_address_in_use() {
 
 #[test]
 fn m95_reuseport_lets_a_second_instance_share_the_port() {
-    let _setup = common::ports::setup_lock();
-    let (path, port) = conf("reuseport", " reuseport");
-    let _first = start(&path, port);
+    // Held until the first instance listens, as above.
+    let setup = common::ports::setup_lock();
+    let (path, _port) = conf("reuseport", " reuseport");
+    let _first = start(&path);
+    drop(setup);
     let mut second = Server(
         Command::new(env!("CARGO_BIN_EXE_ruxen"))
             .args(["-c", path.to_str().unwrap()])

@@ -5,7 +5,10 @@
 // answer on the address this test expected to be dead.
 
 use std::io;
+use std::path::Path;
+use std::process::Child;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// Held from picking a port (bind :0, then drop) until the server under
 /// test listens on it, and while a test binds its own listeners or
@@ -15,6 +18,23 @@ use std::sync::{Mutex, MutexGuard};
 pub fn setup_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Wait until ruxen has written `pid_file` (start it with
+/// `-g "pid <path>;"` if its configuration has none). ruxen writes it once
+/// every worker is bound, so unlike "the port accepts" it can't be another
+/// process that took the port (the lock only covers this test binary),
+/// and ruxen's own bind retries ride out a port held for a moment.
+pub fn wait_for_pid_file(child: &mut Child, pid_file: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !pid_file.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "ruxen exited at startup"
+        );
+        assert!(Instant::now() < deadline, "ruxen did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A `DeadPort`, made under `setup_lock`.

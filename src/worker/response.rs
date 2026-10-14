@@ -883,6 +883,9 @@ pub(crate) fn finish_server_response(
     server: &'static PreparedServer,
     response: Response,
     in_error_page: bool,
+    // The status `error_page` is looked up by, when it isn't the
+    // response's own: 497 (plain HTTP on an `ssl` port, sent as 400).
+    code: Option<u16>,
 ) -> Response {
     if server.error_pages.is_empty() && server.add_headers.is_empty() {
         return response;
@@ -938,7 +941,8 @@ pub(crate) fn finish_server_response(
         tls: req.tls,
         conn: req.conn,
     };
-    let response = maybe_intercept_error_page(
+    let response = maybe_intercept_error_page_as(
+        code,
         response,
         server.error_pages,
         req,
@@ -1295,6 +1299,31 @@ pub(crate) fn maybe_intercept_error_page(
     recursive: bool,
     server: &[u8],
 ) -> Response {
+    maybe_intercept_error_page_as(
+        None,
+        response,
+        error_pages,
+        req,
+        render_ctx_base,
+        in_error_page,
+        recursive,
+        server,
+    )
+}
+
+/// `maybe_intercept_error_page`, with the rule looked up by `code` when
+/// given instead of the response's status.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn maybe_intercept_error_page_as(
+    code: Option<u16>,
+    response: Response,
+    error_pages: &[PreparedErrorPage],
+    req: &phase::RequestCtx<'_>,
+    render_ctx_base: &RenderCtx<'_>,
+    in_error_page: bool,
+    recursive: bool,
+    server: &[u8],
+) -> Response {
     if in_error_page || error_pages.is_empty() {
         return response;
     }
@@ -1311,6 +1340,7 @@ pub(crate) fn maybe_intercept_error_page(
         // A 101 isn't an error.
         Response::Upgrade(_) => return response,
     };
+    let status = code.unwrap_or(status);
     let Some(rule) = error_pages.iter().find(|rule| rule.status == status) else {
         return response;
     };
@@ -1411,7 +1441,7 @@ pub(crate) fn fallback_body(code: u16) -> &'static str {
 }
 
 pub(crate) fn leak_bytes(b: &[u8]) -> &'static [u8] {
-    Box::leak(b.to_vec().into_boxed_slice())
+    crate::arena::leak(b.to_vec().into_boxed_slice())
 }
 
 pub(crate) fn response_has_header(bytes: &[u8], name: &[u8]) -> bool {

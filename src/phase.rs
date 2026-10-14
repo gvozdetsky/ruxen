@@ -68,6 +68,9 @@ pub struct ConnInfo {
     /// The connection's own peer, once the realip module replaced
     /// `peer_ip` for a request (`$realip_remote_addr`, `$realip_remote_port`).
     pub realip: Option<Box<RealIpPeer>>,
+    /// Plain HTTP on an `ssl` port (#384): the request is refused with
+    /// nginx's 497, sent as 400 unless `error_page 497` says otherwise.
+    pub plain_http: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +88,7 @@ impl ConnInfo {
         peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         peer_unix: false,
         realip: None,
+        plain_http: false,
     };
 }
 
@@ -394,6 +398,9 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
 /// `error_page` for the status if it has one (nginx's special response
 /// handler runs with the server's configuration here), else `response`.
 /// `close` ends the connection afterwards, as nginx does for 400 and 501.
+/// `code` is the status `error_page` is looked up by, when it isn't the
+/// response's own (497).
+#[allow(clippy::too_many_arguments)]
 fn refuse(
     http: &'static PreparedHttp,
     req: &RequestCtx<'_>,
@@ -402,14 +409,21 @@ fn refuse(
     response: Response,
     close: bool,
     in_error_page: bool,
+    code: Option<u16>,
 ) -> (Response, ProcessMeta) {
-    let (response, mut meta) =
-        match crate::worker::finish_server_response(http, req, server, response, in_error_page) {
-            Response::Reroute(reroute) => {
-                process_with_meta_inner(http, req, url_scratch, Some(reroute))
-            }
-            response => (response, refused_meta(server, false)),
-        };
+    let (response, mut meta) = match crate::worker::finish_server_response(
+        http,
+        req,
+        server,
+        response,
+        in_error_page,
+        code,
+    ) {
+        Response::Reroute(reroute) => {
+            process_with_meta_inner(http, req, url_scratch, Some(reroute))
+        }
+        response => (response, refused_meta(server, false)),
+    };
     if close {
         meta.keepalive.allow = false;
     }
@@ -610,20 +624,31 @@ fn process_with_meta_inner(
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
         let server = &listen.servers[listen.default_server];
         let response = Response::Prebuilt(http.bad_request.pick(req.method));
-        return refuse(http, req, url_scratch, server, response, true, false);
+        return refuse(http, req, url_scratch, server, response, true, false, None);
     }
 
     let (server, regex_captures) = find_config(listen, req.host, req.sni);
 
     if refusing {
         if let Some(status) = req.refuse {
-            let canned = if status == 501 {
-                &http.not_implemented
-            } else {
-                &http.bad_request
+            let canned = match status {
+                501 => &http.not_implemented,
+                // nginx's 497: plain HTTP on an `ssl` port, sent as 400
+                // unless `error_page 497` takes it (#384).
+                497 => &http.plain_http,
+                _ => &http.bad_request,
             };
             let response = Response::Prebuilt(canned.pick(req.method));
-            return refuse(http, req, url_scratch, server, response, true, false);
+            return refuse(
+                http,
+                req,
+                url_scratch,
+                server,
+                response,
+                true,
+                false,
+                Some(status),
+            );
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
             if req.method == Method::Trace
@@ -635,7 +660,7 @@ fn process_with_meta_inner(
                 req.method,
                 server.server_header,
             ));
-            return refuse(http, req, url_scratch, server, response, false, false);
+            return refuse(http, req, url_scratch, server, response, false, false, None);
         }
     }
     let mut named_target: Option<Vec<u8>> = None;
@@ -791,6 +816,7 @@ fn process_with_meta_inner(
                     response,
                     false,
                     in_error_page,
+                    None,
                 );
                 if refused.realip.is_none() {
                     refused.realip = meta.realip.take();
@@ -833,6 +859,7 @@ fn process_with_meta_inner(
                                     server,
                                     response,
                                     in_error_page,
+                                    None,
                                 ) {
                                     Response::Reroute(reroute) => process_with_meta_inner(
                                         http,
