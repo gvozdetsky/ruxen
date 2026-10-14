@@ -266,17 +266,6 @@ pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<()
         })
 }
 
-/// Parse one `location {}` block and push the resulting `Location` into
-/// `sink`. Nested `location` blocks inside this one get flattened into the
-/// same sink — nginx's own matcher (`ngx_http_core_find_static_location`)
-/// descends into children only after the parent prefix matches, but since
-/// all sibling/child patterns live in the same absolute URI space, a
-/// flattened peer list + longest-prefix win produces the same routing
-/// decision for the cases our tests exercise. Directives on the parent
-/// (root/alias/add_header/error_page/return) do not cascade onto nested
-/// children beyond what the explicit inherited arguments propagate — that's
-/// a deliberate scope limit; if a test needs fuller nested inheritance,
-/// revisit here.
 /// What a nested location takes from its parent where it sets nothing
 /// itself (#106), as nginx's `merge_loc_conf` of each module: a list
 /// directive (`add_header`, `error_page`, `proxy_set_header`, …) comes as a
@@ -349,8 +338,150 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     child.limit_req = std::mem::take(&mut child.limit_req).inherit(&parent.limit_req);
     child.limit_conn = std::mem::take(&mut child.limit_conn).inherit(&parent.limit_conn);
     child.client_timeouts = child.client_timeouts.inherit(parent.client_timeouts);
+    // Its `if` blocks' anonymous locations, merged with it before it had
+    // the parent's settings, get them too (an unset field takes them).
+    if has_if_locations(&child.rewrite_ops) {
+        let snapshot = child.clone();
+        merge_if_locations(&mut child.rewrite_ops, &snapshot);
+    }
 }
 
+/// Whether `ops` has an `if` block with an anonymous location (#137), at
+/// the top: nested ones are inside one that has.
+fn has_if_locations(ops: &[RewriteOp]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            RewriteOp::If {
+                location: Some(_),
+                ..
+            }
+        )
+    })
+}
+
+/// What `parse_location_block` found in an `if` block's body.
+#[derive(Default)]
+pub(crate) struct IfBody {
+    /// Something besides rewrite directives: the block is an anonymous
+    /// location (#137).
+    settings: bool,
+    /// `proxy_pass` of its own.
+    own_handler: bool,
+    /// `root` of its own.
+    own_root: bool,
+}
+
+/// A location-level `if (…) { … }` (#137): its rewrite directives, and,
+/// when the block sets anything else, the anonymous location the request
+/// switches to when the condition holds, as nginx's `ngx_http_rewrite_if`
+/// parses the block with location context.
+fn parse_location_if(args: &[String], lx: &mut Lexer) -> Result<RewriteOp, Error> {
+    let guard = parse_if_guard(args)?;
+    let mut sink = Vec::with_capacity(1);
+    let mut info = IfBody::default();
+    let spec = LocationSpec {
+        mode: MatchMode::Prefix,
+        pattern: String::new(),
+        noregex: false,
+    };
+    parse_location_block(
+        spec,
+        lx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &AccessConf::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &mut sink,
+        Some(&mut info),
+    )?;
+    let mut location = sink.pop().expect("an if block makes one location");
+    let body = std::mem::take(&mut location.rewrite_ops);
+    let location = info.settings.then(|| IfLocation::Parsed {
+        location: Box::new(location),
+        own_handler: info.own_handler,
+        own_root: info.own_root,
+    });
+    Ok(RewriteOp::If {
+        guard,
+        body,
+        location,
+    })
+}
+
+/// Give the anonymous locations of `ops`' `if` blocks what they inherit
+/// from `parent` (nested ones from their enclosing block): everything
+/// `inherit_from_parent` passes on, the parent's root unless the block
+/// sets `root`, and the parent's content handler unless the block has a
+/// `proxy_pass`, or a `root` for what would be a static handler: nginx
+/// keeps the location's handler when the `if` configuration sets none
+/// (`ngx_http_update_location_config`). The parent's own `return` runs
+/// after the `if` in the same code array, so it is the handler whatever
+/// the block sets. With a `proxy_pass` of its own, the pattern starts with
+/// `@`: like a named location, there is no location prefix for a
+/// `proxy_pass` URI to replace (nginx: "cannot have URI part … inside
+/// "if" statement").
+fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
+    for op in ops {
+        let RewriteOp::If { body, location, .. } = op else {
+            continue;
+        };
+        match location {
+            Some(IfLocation::Parsed {
+                location,
+                own_handler,
+                own_root,
+            }) => {
+                inherit_from_parent(location, parent);
+                location.mode = parent.mode;
+                if !*own_root {
+                    location.document_root = parent.document_root.clone();
+                    location.alias_prefix_override = parent.alias_prefix_override.clone();
+                    location.inherits_root = parent.inherits_root;
+                }
+                let static_parent =
+                    !matches!(parent.handler, Handler::Proxy(_) | Handler::StubStatus);
+                let keeps_own =
+                    !parent.explicit_return && (*own_handler || (*own_root && static_parent));
+                if keeps_own && *own_handler {
+                    location.pattern = format!("@if:{}", parent.pattern);
+                } else {
+                    location.pattern = parent.pattern.clone();
+                }
+                if !keeps_own {
+                    location.handler = parent.handler.clone();
+                    location.explicit_return = parent.explicit_return;
+                }
+                let snapshot = (**location).clone();
+                merge_if_locations(body, &snapshot);
+            }
+            _ => merge_if_locations(body, parent),
+        }
+    }
+}
+
+/// Parse one `location {}` block and push the resulting `Location` into
+/// `sink`. Nested `location` blocks inside this one get flattened into the
+/// same sink — nginx's own matcher (`ngx_http_core_find_static_location`)
+/// descends into children only after the parent prefix matches, but since
+/// all sibling/child patterns live in the same absolute URI space, a
+/// flattened peer list + longest-prefix win produces the same routing
+/// decision for the cases our tests exercise. The parent's settings reach
+/// them through `inherit_from_parent` when the parent's block ends (#106).
 pub(crate) fn parse_location_block(
     spec: LocationSpec,
     lx: &mut Lexer,
@@ -373,6 +504,7 @@ pub(crate) fn parse_location_block(
     inherited_client_body_temp_path: Option<TempPath>,
     inherited_disable_symlinks: Option<DisableSymlinks>,
     sink: &mut Vec<Location>,
+    mut if_body: Option<&mut IfBody>,
 ) -> Result<(), Error> {
     let mut ret: Option<(u16, Vec<ValuePart>)> = None;
     let mut rewrite_ops: Vec<RewriteOp> = Vec::new();
@@ -437,9 +569,34 @@ pub(crate) fn parse_location_block(
 
     loop {
         let (args, term) = lx.read_directive()?;
+        if let (Some(info), Some(name)) = (if_body.as_deref_mut(), args.first()) {
+            match name.as_str() {
+                "set" | "rewrite" | "break" | "return" | "if" => {}
+                // What nginx allows in an `if` in a location
+                // (`NGX_HTTP_LIF_CONF`) and ruxen implements.
+                "proxy_pass" | "root" | "add_header" | "add_trailer" | "error_page"
+                | "access_log" | "expires" | "gzip" | "limit_rate" | "limit_rate_after"
+                | "post_action" | "sendfile" => info.settings = true,
+                // Accepted and ignored anywhere, as they were in `if`.
+                n if term == Terminator::Semi && is_ignored_stmt(n) => {
+                    check_ignored_args(lx, &args)?;
+                    continue;
+                }
+                // nginx: "… directive is not allowed here". While
+                // collecting, `unknown` skips a block itself.
+                _ => {
+                    compat::unknown(lx, &args, &term, "if")?;
+                    continue;
+                }
+            }
+        }
         if args.is_empty() {
             return match term {
                 Terminator::BlockClose => {
+                    if let Some(info) = if_body.as_deref_mut() {
+                        info.own_handler = proxy_pass.is_some();
+                        info.own_root = local_path_mapping.is_some();
+                    }
                     // `return` short-circuits the rewrite phase in nginx, so
                     // it wins over `root` / `alias` / `proxy_pass` if both
                     // are set. `proxy_pass` wins over `root`/`alias`
@@ -449,6 +606,7 @@ pub(crate) fn parse_location_block(
                     let document_root = root
                         .clone()
                         .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
+                    let explicit_return = ret.is_some();
                     let handler = if let Some((status, body)) = ret {
                         Handler::Return { status, body }
                     } else if stub_status {
@@ -553,7 +711,14 @@ pub(crate) fn parse_location_block(
                         client_timeouts,
                         alias_prefix_override,
                         inherits_root,
+                        explicit_return,
                     };
+                    // The anonymous locations of its `if` blocks (#137).
+                    let mut location = location;
+                    if if_body.is_none() && has_if_locations(&location.rewrite_ops) {
+                        let snapshot = location.clone();
+                        merge_if_locations(&mut location.rewrite_ops, &snapshot);
+                    }
                     // nginx merges each nested location with its parent's
                     // final configuration (ngx_http_merge_locations), so a
                     // directive after the nested block counts too. The
@@ -586,7 +751,12 @@ pub(crate) fn parse_location_block(
                 rewrite_ops.push(RewriteOp::Break);
             }
             ("if", Terminator::BlockOpen) => {
-                rewrite_ops.push(parse_if_op(&args[1..], lx)?);
+                rewrite_ops.push(parse_location_if(&args[1..], lx)?);
+            }
+            // In an `if` block, `return` is one of its rewrite directives.
+            ("return", Terminator::Semi) if if_body.is_some() => {
+                let (status, body) = parse_return_args(&args[1..])?;
+                rewrite_ops.push(RewriteOp::Return { status, body });
             }
             ("return", Terminator::Semi) => {
                 if ret.is_some() {
@@ -943,6 +1113,7 @@ pub(crate) fn parse_location_block(
                     pass_client_body_temp_path,
                     pass_disable_symlinks,
                     &mut children,
+                    None,
                 )?;
             }
             (

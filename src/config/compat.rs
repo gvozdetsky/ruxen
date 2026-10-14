@@ -407,6 +407,18 @@ mod tests {
     }
 
     #[test]
+    fn a_block_not_allowed_in_if_is_skipped_once() {
+        // The `return` after the skipped block stays in the `if` (#137).
+        let (found, res) = findings(
+            "http { server { location / { if ($arg_a) { location /x { } return 403; } \
+             proxy_pass http://127.0.0.1:1; } } }",
+        );
+        let names: Vec<&str> = found.iter().map(|f| f.directive.as_str()).collect();
+        assert_eq!(names, ["location /x"]);
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
     fn ignored_directives_differ_unless_set_to_the_default() {
         let (found, _) = findings(
             "http { ssi on; etag on; tcp_nopush on; types { text/html html; } server { } }",

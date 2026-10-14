@@ -896,3 +896,35 @@ http {{
     assert_eq!((first.len(), second.len()), (1, 1));
     assert_ne!(first, second);
 }
+
+/// `$document_root` / `$request_filename` in a proxied response's
+/// `add_header`: the location's root, as for any other response (#363).
+#[test]
+fn m40_proxy_add_header_document_root() {
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location /p {{
+            root /srv/www;
+            proxy_pass http://127.0.0.1:{p};
+            add_header X-Root $document_root;
+            add_header X-File $request_filename;
+            add_header X-Uri $uri;
+        }}
+    }}
+}}
+"#,
+        p = backend.addr.port()
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let resp = String::from_utf8_lossy(&http_get_close(port, "/p/a")).into_owned();
+    assert!(resp.contains("\r\nX-Root: /srv/www\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-File: /srv/www/p/a\r\n"), "{resp}");
+    // The current URI, normalized, not the request's raw path (#373).
+    let resp = String::from_utf8_lossy(&http_get_close(port, "/p/%61//b?x=1")).into_owned();
+    assert!(resp.contains("\r\nX-Uri: /p/a/b\r\n"), "{resp}");
+    assert!(resp.contains("\r\nX-File: /srv/www/p/a/b\r\n"), "{resp}");
+}
