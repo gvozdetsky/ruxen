@@ -520,6 +520,7 @@ impl ProxyPlan {
 /// the request's context; on the happy path nothing is pushed and the
 /// caller's empty `Vec` never allocates.
 pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Response {
+    report.passes_date = plan.response.passes_date;
     if let Some(cache) = plan.cache.as_deref_mut() {
         if cache.wait_until.is_some() {
             Box::pin(wait_for_lock(cache)).await;
@@ -1222,6 +1223,9 @@ pub struct ProxyReport {
     pub states: Vec<UpstreamState>,
     /// `$upstream_cache_status`, when the location has a `proxy_cache`.
     pub cache_status: Option<crate::proxy_cache::CacheStatus>,
+    /// `proxy_pass_header Date`: the response's `Date` is the upstream's,
+    /// or there is none, and the worker doesn't stamp one (#360).
+    pub passes_date: bool,
 }
 
 /// The answer's upstream request is over (its header filtered, or the

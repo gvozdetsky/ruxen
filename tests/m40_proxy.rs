@@ -845,6 +845,58 @@ http {{
     assert!(h.contains("\r\nX-Hide: secret"), "{h}");
 }
 
+/// proxy_pass_header Date: the upstream's Date goes out as it is, and
+/// none at all when the upstream sent none (#360), as in nginx, where an
+/// empty passed Date keeps the header filter from writing its own.
+#[test]
+fn m40_proxy_pass_header_date() {
+    let dated = Backend::spawn(
+        b"HTTP/1.0 200 OK\r\nDate: Mon, 01 Jan 2001 00:00:00 GMT\r\nContent-Length: 2\r\n\r\nok"
+            .to_vec(),
+    );
+    let undated = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location /dated/ {{ proxy_pass http://127.0.0.1:{d}; proxy_pass_header Date; }}
+        location /undated/ {{ proxy_pass http://127.0.0.1:{u}; proxy_pass_header Date; }}
+        location /hidden/ {{ proxy_pass http://127.0.0.1:{d}; }}
+        location /down/ {{
+            proxy_pass http://127.0.0.1:1;
+            proxy_pass_header Date;
+            add_header X-A a;
+        }}
+    }}
+}}
+"#,
+        d = dated.addr.port(),
+        u = undated.addr.port()
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let dates = |path: &str| {
+        let resp = String::from_utf8_lossy(&http_get_close(port, path)).into_owned();
+        let head = resp.split("\r\n\r\n").next().unwrap().to_string();
+        head.lines()
+            .filter(|l| l.starts_with("Date:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(dates("/dated/"), ["Date: Mon, 01 Jan 2001 00:00:00 GMT"]);
+    assert!(dates("/undated/").is_empty());
+    let own = dates("/hidden/");
+    assert_eq!(own.len(), 1);
+    assert_ne!(own[0], "Date: Mon, 01 Jan 2001 00:00:00 GMT");
+    // The proxy's own 502 is not the upstream's: it gets a current Date,
+    // not the one from when its page was built at startup.
+    let first = dates("/down/");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = dates("/down/");
+    assert_eq!((first.len(), second.len()), (1, 1));
+    assert_ne!(first, second);
+}
+
 /// `$document_root` / `$request_filename` in a proxied response's
 /// `add_header`: the location's root, as for any other response (#363).
 #[test]
