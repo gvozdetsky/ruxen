@@ -143,11 +143,25 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for Poll
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.poll_write_vectored(cx, &[io::IoSlice::new(data)])
+    }
+
+    /// `h2` sends a DATA payload over 256 bytes as its own slice after the
+    /// frame head. Taking all slices at once makes that one socket write
+    /// instead of one per slice, each waiting for the last (#348).
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         ready!(this.poll_written(cx))?;
         let mut buf = std::mem::take(&mut this.wbuf);
         buf.clear();
-        buf.extend_from_slice(data);
+        for slice in data {
+            buf.extend_from_slice(slice);
+        }
+        let len = buf.len();
         // SAFETY: see `stream`.
         let stream = unsafe { this.stream() };
         this.writing = Some(Box::pin(async move { stream.write_all(buf).await }));
@@ -157,7 +171,11 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for Poll
             // Taken already: reported as this write's error.
             return Poll::Ready(Err(e));
         }
-        Poll::Ready(Ok(data.len()))
+        Poll::Ready(Ok(len))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
