@@ -7,13 +7,13 @@ Last run: 2026-10-14 against `nginx-tests` 0b70854 (2026-09-30).
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 123
+- **Passing in ruxen:** 125
 - **Intentionally skipped (`-V` banner excludes the module):** 315
-- **Failing — work in progress:** 67
+- **Failing — work in progress:** 65
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (123)
+## Passing in ruxen (125)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -93,6 +93,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_cache_variables.t`
 - `proxy_chunked_extra.t`
 - `proxy_duplicate_headers.t`
+- `proxy_force_ranges.t`
 - `proxy_implicit.t`
 - `proxy_intercept_errors.t`
 - `proxy_limit_rate.t`
@@ -110,6 +111,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_variables.t`
 - `proxy_websocket.t`
 - `proxy_xar.t`
+- `range_clearing.t`
 - `range_if_range.t`
 - `realip_hostname.t`
 - `realip_remote_addr.t`
@@ -141,7 +143,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (67)
+## Failing — actively being worked on (65)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -156,7 +158,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `h2_proxy_request_buffering_ssl.t` — 40/42
 - `h2_proxy_ssl.t` — 1/3
 - `h2_request_body.t` — 8/51
-- `h2_request_body_extra.t` — 4/52
+- `h2_request_body_extra.t` — 1/52
 - `h2_request_body_preread.t` — 1/11
 - `h2_ssl_verify_client.t` — 0/0
 - `h2_variables.t` — 2/8
@@ -171,12 +173,11 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_cache.t` — 0/0
 - `proxy_cache_convert_head.t` — 2/10
 - `proxy_cache_max_range_offset.t` — 0/0
-- `proxy_cache_range.t` — 6/9
+- `proxy_cache_range.t` — 1/9
 - `proxy_cache_vary.t` — 0/0
 - `proxy_connection_headers.t` — 2/7
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 0/0
-- `proxy_force_ranges.t` — 7/9
 - `proxy_if.t` — 15/17
 - `proxy_next_upstream_tries.t` — 1/10
 - `proxy_protocol.t` — 24/26
@@ -194,7 +195,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_ssl_keepalive.t` — 3/5
 - `proxy_ssl_verify.t` — 6/8
 - `proxy_ssl_verify_ip.t` — 8/10
-- `range_clearing.t` — 3/5
 - `realip.t` — 0/0
 - `ssl.t` — 3/23
 - `ssl_cache.t` — 4/6

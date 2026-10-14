@@ -53,6 +53,16 @@ pub(crate) fn passes(gz: &PreparedGzip, upstream_head: &[u8]) -> bool {
     !candidate(gz, &head)
 }
 
+/// gzip compresses this in-memory response (`filter` would): the range
+/// filter, which nginx runs after gzip, then leaves it alone (#370).
+pub(crate) fn compresses(gz: &PreparedGzip, req: &GzipRequest<'_>, response: &[u8]) -> bool {
+    let Some(head_end) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    parse_head(&response[..head_end + 4])
+        .is_some_and(|head| matches!(decide(gz, req, &head), Decision::Compress))
+}
+
 /// `ngx_http_gzip_header_filter`'s checks on the response alone.
 fn candidate(gz: &PreparedGzip, head: &Head<'_>) -> bool {
     matches!(head.status, 200 | 403 | 404)

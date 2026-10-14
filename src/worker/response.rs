@@ -1217,10 +1217,15 @@ pub(crate) fn inject_add_trailers(
     // so subsequent `$sent_trailer_*` lookups can see prior entries. Skip
     // entries with empty rendered values (matches `add_header`).
     let mut trailer_block: Vec<u8> = Vec::with_capacity(trailers.len() * 64);
+    // nginx's `r->expect_trailers`: a trailer the status allows makes the
+    // response chunked, even when its value renders empty and it isn't
+    // sent (ngx_http_headers_filter).
+    let mut expect_trailers = false;
     for t in trailers {
         if !t.always && !add_header_status_eligible(ctx.status) {
             continue;
         }
+        expect_trailers = true;
         let mut rendered = Vec::with_capacity(64);
         {
             let mut local_ctx = *ctx;
@@ -1236,7 +1241,7 @@ pub(crate) fn inject_add_trailers(
         trailer_block.extend_from_slice(&rendered);
         trailer_block.extend_from_slice(b"\r\n");
     }
-    if trailer_block.is_empty() {
+    if !expect_trailers {
         return response;
     }
 

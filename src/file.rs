@@ -54,6 +54,11 @@ pub struct Conditionals<'a> {
     /// "Last-Modified suppressed", and non-empty values are parsed as
     /// HTTP-date for conditional comparisons.
     pub last_modified_override: Option<&'a [u8]>,
+    /// nginx's range filter runs: a `Range` is honoured and a 200 says
+    /// `Accept-Ranges: bytes`. False for `max_ranges 0` (#370), where the
+    /// filter declines (ngx_http_range_header_filter): `range` and
+    /// `if_range` count for nothing and there is no `Accept-Ranges`.
+    pub accept_ranges: bool,
 }
 
 struct FileMeta {
@@ -139,11 +144,12 @@ pub fn serve_path(
 
     let meta = meta_from_opened(&opened);
 
+    let accept_ranges = cond.accept_ranges;
     match decide(&meta, cond) {
         Decision::NotModified => Response::Owned(build_not_modified_response(&meta, server)),
         Decision::Full => {
             let body_len = meta.size;
-            let mut headers = build_content_headers(&meta, 200, None, server);
+            let mut headers = build_content_headers(&meta, 200, None, accept_ranges, server);
             if matches!(method, Method::Head) || body_len == 0 {
                 Response::Owned(headers)
             } else if body_len <= inline_limit {
@@ -165,7 +171,7 @@ pub fn serve_path(
         }
         Decision::Range { start, end } => {
             let body_len = end - start + 1;
-            let mut headers = build_content_headers(&meta, 206, Some((start, end)), server);
+            let mut headers = build_content_headers(&meta, 206, Some((start, end)), true, server);
             if matches!(method, Method::Head) || body_len == 0 {
                 Response::Owned(headers)
             } else if body_len <= inline_limit {
@@ -259,7 +265,7 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
         }
     }
 
-    let mut range = cond.range;
+    let mut range = cond.range.filter(|_| cond.accept_ranges);
     if let (Some(_), Some(if_range)) = (range, cond.if_range) {
         if !if_range_matches(if_range, meta, conditional_last_modified) {
             range = None;
@@ -349,6 +355,7 @@ fn build_content_headers(
     meta: &FileMeta,
     status: u16,
     range: Option<(u64, u64)>,
+    accept_ranges: bool,
     server: &[u8],
 ) -> Vec<u8> {
     let body_len = range
@@ -357,7 +364,9 @@ fn build_content_headers(
     let mut out = Vec::with_capacity(256);
     write_status_line(&mut out, status);
     crate::http::write_server_and_date(&mut out, server);
-    out.extend_from_slice(b"\r\nAccept-Ranges: bytes");
+    if accept_ranges {
+        out.extend_from_slice(b"\r\nAccept-Ranges: bytes");
+    }
     out.extend_from_slice(b"\r\nContent-Type: ");
     out.extend_from_slice(meta.mime);
     out.extend_from_slice(b"\r\nContent-Length: ");
@@ -1052,6 +1061,7 @@ mod tests {
             range: None,
             if_range: None,
             last_modified_override: None,
+            accept_ranges: true,
         }
     }
 
@@ -1382,6 +1392,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1400,6 +1411,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1423,6 +1435,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1443,6 +1456,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1461,6 +1475,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b""),
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1479,6 +1494,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::PreconditionFailed);
@@ -1497,6 +1513,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1517,6 +1534,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1535,6 +1553,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1553,6 +1572,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b""),
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1571,6 +1591,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(b"W/\"other\""),
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1591,9 +1612,43 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(meta.etag.as_slice()),
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
+    }
+
+    #[test]
+    fn ranges_off_serves_the_whole_file_without_accept_ranges() {
+        // `max_ranges 0` (#370): nginx's range filter declines, so a Range
+        // (even an unsatisfiable one) gets the whole file, and the 200 has
+        // no Accept-Ranges.
+        let dir = unique_dir();
+        let file_path = dir.join("whole.txt");
+        std::fs::write(&file_path, b"abcdef").unwrap();
+        for range in [&b"bytes=0-1"[..], b"bytes=100-"] {
+            let r = serve_path(
+                open_for_test(&file_path),
+                Method::Get,
+                Conditionals {
+                    range: Some(range),
+                    accept_ranges: false,
+                    ..no_cond()
+                },
+                b"nginx/1.29.2",
+                false,
+            );
+            let Response::Owned(bytes) = r else {
+                panic!("expected an inline response");
+            };
+            let s = std::str::from_utf8(&bytes).unwrap();
+            assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "{s}");
+            assert!(s.contains("Content-Length: 6\r\n"), "{s}");
+            assert!(!s.contains("Accept-Ranges"), "{s}");
+            assert!(!s.contains("Content-Range"), "{s}");
+            assert!(s.ends_with("\r\n\r\nabcdef"), "{s}");
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1611,6 +1666,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1633,6 +1689,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(&weak),
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1651,6 +1708,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(&meta.last_modified),
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1669,6 +1727,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
+                accept_ranges: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1715,6 +1774,7 @@ mod tests {
                     range: None,
                     if_range: None,
                     last_modified_override: None,
+                    accept_ranges: true,
                 },
             );
             assert_eq!(decision, Decision::NotModified, "INM={:?}", inm);
@@ -1773,7 +1833,7 @@ mod tests {
     #[test]
     fn content_headers_head_shape_has_no_body_bytes() {
         let meta = meta(5, 100);
-        let out = build_content_headers(&meta, 200, None, b"nginx/1.29.2");
+        let out = build_content_headers(&meta, 200, None, true, b"nginx/1.29.2");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 5\r\n"));
@@ -1787,7 +1847,7 @@ mod tests {
     #[test]
     fn content_headers_206_include_content_range_without_body() {
         let meta = meta(100, 100);
-        let out = build_content_headers(&meta, 206, Some((5, 14)), b"nginx/1.29.2");
+        let out = build_content_headers(&meta, 206, Some((5, 14)), true, b"nginx/1.29.2");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(s.contains("Content-Length: 10\r\n"));

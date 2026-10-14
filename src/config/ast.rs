@@ -77,6 +77,8 @@ pub struct ProxyConf {
     /// `proxy_next_upstream_timeout`; `0` means no cap.
     pub next_upstream_timeout_ms: Option<u64>,
     pub intercept_errors: Option<bool>,
+    /// `proxy_force_ranges on|off` (#370); unset means off.
+    pub force_ranges: Option<bool>,
     /// `proxy_redirect`; unset means nginx's implicit `default`.
     pub redirect: Option<ProxyRedirect>,
     /// `proxy_hide_header` / `proxy_pass_header` names.
@@ -229,6 +231,7 @@ impl ProxyConf {
                 .next_upstream_timeout_ms
                 .or(parent.next_upstream_timeout_ms),
             intercept_errors: self.intercept_errors.or(parent.intercept_errors),
+            force_ranges: self.force_ranges.or(parent.force_ranges),
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
@@ -326,6 +329,8 @@ pub struct HttpConfig {
     pub access: AccessConf,
     /// http-scope `client_max_body_size` in bytes. `None` means "not set".
     pub client_max_body_size: Option<u64>,
+    /// http-scope `max_ranges` (#370). `None` means "not set" (no limit).
+    pub max_ranges: Option<u32>,
     /// http-scope `client_body_buffer_size`: request bodies up to this
     /// size stay in memory. `None` means "not set" (nginx: 16k).
     pub client_body_buffer_size: Option<u64>,
@@ -800,6 +805,8 @@ pub struct Server {
     pub access: AccessConf,
     /// Server-scope `client_max_body_size` in bytes. `None` inherits from http.
     pub client_max_body_size: Option<u64>,
+    /// Server-scope `max_ranges` (#370). `None` inherits from http.
+    pub max_ranges: Option<u32>,
     /// Server-scope `client_body_buffer_size`. `None` inherits from http.
     pub client_body_buffer_size: Option<u64>,
     /// Server-scope `client_body_temp_path`. `None` inherits from http.
@@ -938,6 +945,9 @@ pub struct Location {
     /// Location-scope `client_max_body_size` in bytes. `None` inherits from
     /// server.
     pub client_max_body_size: Option<u64>,
+    /// Location-scope `max_ranges` (#370), inherited through nested
+    /// locations and `if` blocks. `None` inherits from server.
+    pub max_ranges: Option<u32>,
     /// Location-scope `client_body_buffer_size`, inherited through nested
     /// locations. `None` inherits from server.
     pub client_body_buffer_size: Option<u64>,

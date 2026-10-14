@@ -57,6 +57,7 @@ pub(crate) fn parse_server_block(
     let mut auth_delay_ms: Option<u64> = None;
     let mut access = AccessConf::default();
     let mut client_max_body_size: Option<u64> = None;
+    let mut max_ranges: Option<u32> = None;
     let mut client_body_buffer_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
     let mut http2: Option<bool> = None;
@@ -145,6 +146,7 @@ pub(crate) fn parse_server_block(
                         auth_delay_ms,
                         access,
                         client_max_body_size,
+                        max_ranges,
                         client_body_buffer_size,
                         client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
@@ -508,6 +510,12 @@ pub(crate) fn parse_server_block(
                 }
                 client_max_body_size = Some(parse_client_max_body_size_args(&args[1..])?);
             }
+            ("max_ranges", Terminator::Semi) => {
+                if max_ranges.is_some() {
+                    return Err(Error::Duplicate("max_ranges"));
+                }
+                max_ranges = Some(parse_max_ranges_args(&args[1..])?);
+            }
             ("limit_rate", Terminator::Semi) => {
                 if limit_rate.is_some() {
                     return Err(Error::Duplicate("limit_rate"));
@@ -656,6 +664,7 @@ pub(crate) fn parse_server_block(
                 | "auth_request"
                 | "auth_request_set"
                 | "client_max_body_size"
+                | "max_ranges"
                 | "client_body_temp_path"
                 | "disable_symlinks"
                 | "post_action"
@@ -674,6 +683,7 @@ pub(crate) fn parse_server_block(
                 | "proxy_next_upstream_tries"
                 | "proxy_next_upstream_timeout"
                 | "proxy_intercept_errors"
+                | "proxy_force_ranges"
                 | "proxy_redirect"
                 | "proxy_hide_header"
                 | "proxy_pass_header"

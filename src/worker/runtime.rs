@@ -648,6 +648,7 @@ fn finish_proxy_response(
 ) -> (Response, phase::ProcessMeta) {
     process_meta.upstream_states = std::mem::take(&mut report.states);
     process_meta.upstream_cache_status = report.cache_status;
+    process_meta.range_allow = report.range_allow;
     // Not for the proxy's own 502/504 (prebuilt at startup, so its `Date`
     // is old): nginx writes its own `Date` there.
     process_meta.keep_upstream_date =
@@ -680,6 +681,16 @@ fn finish_proxy_response(
     } else {
         upstream_resp
     };
+    // The range filter (#370). nginx runs it after gzip, which then
+    // leaves the response alone, and before the chunked filter writes
+    // the trailers: here before `add_trailer`, on what gzip won't compress.
+    let upstream_resp = if process_meta.range_allow != super::range::RangeAllow::No
+        && may_cut_ranges(&process_meta, ctx.http_11, ctx.headers_raw, &upstream_resp)
+    {
+        range_filter(upstream_resp, relayed.is_some(), &process_meta, ctx)
+    } else {
+        upstream_resp
+    };
     let response = apply_proxy_add_headers(
         upstream_resp,
         http,
@@ -703,6 +714,79 @@ fn finish_proxy_response(
     }
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
+}
+
+/// The range filter may see `response` (#370): gzip won't compress it.
+#[cold]
+#[inline(never)]
+fn may_cut_ranges(
+    meta: &phase::ProcessMeta,
+    http_11: bool,
+    headers_raw: &[u8],
+    response: &Response,
+) -> bool {
+    let Some(gz) = meta.gzip else {
+        return true;
+    };
+    let bytes: &[u8] = match response {
+        Response::Owned(b) => b,
+        Response::ProxyStream(s) => &s.head,
+        _ => return false,
+    };
+    !super::gzip::compresses(
+        gz,
+        &super::gzip::GzipRequest::from_headers(http_11, headers_raw),
+        bytes,
+    )
+}
+
+/// nginx's range filter over a proxied or cached response (#370): an
+/// in-memory one is cut, a relayed one only says it could be.
+#[cold]
+#[inline(never)]
+fn range_filter(
+    response: Response,
+    relayed: bool,
+    meta: &phase::ProcessMeta,
+    ctx: &phase::RequestCtx<'_>,
+) -> Response {
+    let req = super::range::RangeRequest {
+        range: ctx.range,
+        if_range: ctx.if_range,
+        head_only: matches!(ctx.method, Method::Head),
+    };
+    match response {
+        Response::Owned(head) if relayed => {
+            Response::Owned(super::range::relayed_head(head, meta.max_ranges))
+        }
+        Response::Owned(bytes) => Response::Owned(super::range::filter(
+            bytes,
+            meta.range_allow,
+            meta.max_ranges,
+            req,
+            |len, server| range_not_satisfiable(len, req.head_only, server),
+        )),
+        other => other,
+    }
+}
+
+/// The 416 the range filter finalizes the request with: nginx's page
+/// for it, with `Content-Range: bytes */<length>`.
+fn range_not_satisfiable(len: u64, head_only: bool, server: &[u8]) -> Vec<u8> {
+    let page = crate::http::default_error_page_body_for(416, server).unwrap_or_default();
+    let method = if head_only { Method::Head } else { Method::Get };
+    let mut out = crate::http::build_response_bytes_with_content_type(
+        416,
+        &page,
+        b"text/html",
+        method,
+        server,
+    );
+    if let Some(end) = out.windows(4).position(|w| w == b"\r\n\r\n") {
+        let line = format!("\r\nContent-Range: bytes */{len}");
+        out.splice(end..end, line.into_bytes());
+    }
+    out
 }
 
 enum PassOutcome {

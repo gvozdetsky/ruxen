@@ -262,11 +262,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         "proxied responses are not stored",
     ),
     (
-        "proxy_force_ranges",
-        Some("off"),
-        "byte ranges are not applied to proxied responses",
-    ),
-    (
         "resolver",
         None,
         "upstream names are resolved once at startup, not at run time (#133)",
