@@ -20,12 +20,11 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | configurations | first error in ruxen | examples |
 |---:|---|---|
 | 14 | open() "…" failed (No such file or directory (os error N)) in <sandbox>…:N | h5bp:nginx.conf, gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:ocftw/OpenGovReport14-16/nginx.config, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt … |
+| 7 | unknown directive `http2` | mastodon, vaultwarden#1, vaultwarden#2, vaultwarden#3 … |
 | 5 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf, gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf … |
 | 4 | bad value for ssl_protocols (insecure version rejected): TLSvN in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:EstudioNexos/flautodiscover/fla_nginx.conf, gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf |
-| 4 | unknown directive `http2` | mastodon, gh:refluxdb/influxdb3-community/iox-nginx.conf, gh:qida/gohp/jsonx/nginx.conf.txt, gh:exp0logy/familycal/frontend/nginx.conf |
 | 4 | unknown directive `proxy_pass` | puma#1, gh:limingxinleo/phalcon/swoole.nginx.conf, gh:limingxinleo/basic-phalcon/swoole.nginx.conf, gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
-| 3 | unknown directive `zone` | vaultwarden#1, vaultwarden#2, vaultwarden#3 |
 | 2 | bad value for ssl_protocols (insecure version rejected): TLSvN.N in <sandbox>…:N | gh:decred/dcrstakepool/sample-nginx.conf, gh:TetAlius/GoSyncMyCalendars/.nginx.conf |
 | 2 | unknown directive `auth_request` | gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in, gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf |
 | 2 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir |
@@ -56,9 +55,9 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | synapse#5 | proxy | — | — | (nginx: [emerg] unexpected "}" in <sandbox>/conf/nginx.conf:24) |
 | synapse#6 | proxy | — | — | (nginx: [emerg] unknown directive "table" in <sandbox>/conf/nginx.conf:3) |
 | synapse#7 | proxy | — | — | (nginx: [emerg] unexpected "," in <sandbox>/conf/nginx.conf:7) |
-| vaultwarden#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in a upstream block in <sandbox>/conf/nginx.conf:12 |
-| vaultwarden#2 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in a upstream block in <sandbox>/conf/nginx.conf:12 |
-| vaultwarden#3 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `zone` in a upstream block in <sandbox>/conf/nginx.conf:19 |
+| vaultwarden#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `http2` in a server block in <sandbox>/conf/nginx.conf:39 |
+| vaultwarden#2 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `http2` in a server block in <sandbox>/conf/nginx.conf:46 |
+| vaultwarden#3 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `http2` in a server block in <sandbox>/conf/nginx.conf:45 |
 | laravel#1 | php | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_pass` in a location block in <sandbox>/conf/nginx.conf:27 |
 | puma#1 | proxy | ok | FAIL | ruxen: [emerg] unknown directive `proxy_pass` in a if block in <sandbox>/conf/nginx.conf:60 |
 | immich#1 | proxy | ok | ok |  |

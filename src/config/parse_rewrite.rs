@@ -96,7 +96,11 @@ pub(crate) fn split_replacement_at_question(
 pub(crate) fn parse_if_op(args: &[String], lx: &mut Lexer) -> Result<RewriteOp, Error> {
     let guard = parse_if_guard(args)?;
     let body = parse_rewrite_block(lx)?;
-    Ok(RewriteOp::If { guard, body })
+    Ok(RewriteOp::If {
+        guard,
+        body,
+        location: None,
+    })
 }
 
 pub(crate) fn parse_rewrite_block(lx: &mut Lexer) -> Result<Vec<RewriteOp>, Error> {
