@@ -726,11 +726,15 @@ pub(crate) fn run_location_handler(
         } else {
             None
         };
+
+        let upstream_head: bool = forward_method.eq_ignore_ascii_case(b"HEAD");
+
         return Response::Proxy(crate::proxy::ProxyPlan {
             upstream: proxy.upstream,
             initial_peer,
             request: bytes::Bytes::from(request),
             method: req.method,
+            upstream_head,
             server_bytes,
             connect_timeout: std::time::Duration::from_millis(proxy.connect_timeout_ms),
             read_timeout: std::time::Duration::from_millis(proxy.read_timeout_ms),

@@ -92,6 +92,8 @@ pub struct ProxyPlan {
     /// HEAD responses on the way back when the upstream sends one
     /// anyway.
     pub method: Method,
+    /// Stores whether proxy_method is HEAD so it we know not to expect a response from the upstream
+    pub upstream_head: bool,
     /// `Server:` header bytes for synthesized 502/504 errors.
     #[allow(dead_code)]
     pub server_bytes: &'static [u8],
@@ -1239,6 +1241,7 @@ async fn attempt(
     // the header.
     let skip_body = accel.as_ref().is_some_and(|a| a.redirect.is_some());
     let bodiless = matches!(plan.method, Method::Head)
+        || plan.upstream_head
         || status_code == 204
         || status_code == 304
         || (!chunked && content_length == Some(0));
@@ -1247,6 +1250,7 @@ async fn attempt(
     }
     let body_has_content = !skip_body
         && !matches!(plan.method, Method::Head)
+        && !plan.upstream_head
         && status_code != 204
         && status_code != 304
         && !(status_code >= 100 && status_code < 200);

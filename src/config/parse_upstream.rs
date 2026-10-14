@@ -600,7 +600,7 @@ impl ProxyConf {
                         got: args[1..].join(" "),
                     });
                 }
-                self.proxy_method = Some(parse_value_with_vars(&method)?);
+                self.proxy_method = Some(parse_value_with_vars(method)?);
             }
             other => unreachable!("not a ProxyConf directive: {other}"),
         }
