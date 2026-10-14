@@ -1,8 +1,8 @@
 # Contributing to ruxen
 
-Thanks for looking. ruxen is early: small, well-scoped contributions are the
-most useful kind, and an issue that pins down one nginx/ruxen difference is
-as valuable as a patch.
+Thanks for looking. Small, well-scoped contributions are the most useful
+kind, and an issue that pins down one nginx/ruxen difference is as valuable
+as a patch.
 
 Issues labelled [`good first issue`](https://github.com/gvozdetsky/ruxen/labels/good%20first%20issue)
 and [`help wanted`](https://github.com/gvozdetsky/ruxen/labels/help%20wanted) are
@@ -26,8 +26,10 @@ sentence a PR description can contain.
 
 ## Setup
 
-You need Linux with `io_uring` (any recent kernel), a stable Rust toolchain,
-and `curl`. Docker's default seccomp profile blocks `io_uring`; from the
+You need Linux with `io_uring` (any recent kernel), Rust 1.88 or newer, `cmake`
+and a C compiler (for rustls's `aws-lc-rs` backend), and `curl`. Without
+`io_uring` ruxen runs on epoll, but the benchmarks and most development use
+`io_uring`. Docker's default seccomp profile blocks `io_uring`; from the
 repository root, pass
 `--security-opt seccomp=contrib/docker/seccomp-io_uring.json` to `docker run`
 to use the bundled profile, which allows the required `io_uring` syscalls

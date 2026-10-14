@@ -1,8 +1,8 @@
 # Security policy
 
-ruxen is an experimental prototype and is not meant for production yet (see the
-README). Security reports are still very welcome: a bug that would matter in
-nginx most likely matters here too, and finding it early is the point.
+ruxen sits at the edge and parses untrusted input from clients and upstreams,
+so security reports are very welcome: a bug that would matter in nginx most
+likely matters here too.
 
 ## Reporting a vulnerability
 
@@ -27,7 +27,8 @@ Anything a client, an upstream server or a configuration can use to make ruxen
 do something it shouldn't, for example:
 
 - request smuggling, response splitting, header injection;
-- reading files outside `root` / `alias`, or bypassing `auth_basic`;
+- reading files outside `root` / `alias`, or bypassing `auth_basic`,
+  `auth_request`, `allow` / `deny` or `limit_except`;
 - a crash, hang or unbounded memory/CPU use triggered by a request or by an
   upstream response;
 - a directive that ruxen accepts but silently doesn't enforce, when it restricts

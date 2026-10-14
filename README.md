@@ -1,19 +1,16 @@
 # ruxen
 
-**An experimental nginx-compatible HTTP server and reverse proxy written from scratch in Rust.**
+**An nginx-compatible HTTP server and reverse proxy written from scratch in Rust.**
 
-ruxen explores how nginx's architecture and configuration semantics can be reimplemented in idiomatic Rust — without translating the C code line by line.
+ruxen takes an nginx configuration and serves it the way nginx would: TLS termination, reverse proxying with caching, and static files, over HTTP/1.1 and HTTP/2. It reimplements nginx's architecture and configuration semantics in idiomatic Rust instead of translating the C code line by line.
 
-It is Linux-only, built around a thread-per-core model using [monoio](https://github.com/bytedance/monoio) and `io_uring`, and currently targets HTTP/1.1.
+It is Linux-only and thread-per-core, on [monoio](https://github.com/bytedance/monoio) with `io_uring`, and on epoll where `io_uring` is unavailable.
 
-> [!WARNING]
-> **ruxen is an active prototype. It is not production-ready yet.**
+ruxen covers a subset of nginx, not all of it (see [What works](#what-works) and [Limitations](#limitations)); `ruxen --compat` tells you whether your configuration is in that subset. It is pre-1.0, so the supported surface still grows from release to release.
 
 ## Why ruxen?
 
-nginx has decades of engineering behind its event loop, HTTP state machine, configuration system, request routing, and upstream handling.
-
-The goal of ruxen is to study those ideas and reproduce their behaviour using Rust's ownership model and type system rather than copying nginx's C implementation.
+nginx serves a large share of the web, and edge servers parse untrusted input all day, which is where memory-safety bugs matter most. Rust servers exist, but they ask you to rewrite your configuration or are libraries for building your own proxy. ruxen keeps the nginx configuration and reproduces nginx's behaviour with Rust's ownership model and type system rather than its C implementation.
 
 Three things guide the project:
 
@@ -25,21 +22,19 @@ See [`DESIGN.md`](DESIGN.md) for the architecture notes and the reasoning behind
 
 ## Current status
 
-The v0.1 scope is deliberately limited:
+Version 0.1.3. In short:
 
-- Linux only
+- Linux only, x86_64 and aarch64
 - HTTP/1.1, and HTTP/2 for clients (`http2 on`; over TLS through ALPN, and cleartext with prior knowledge)
-- hand-written HTTP parser
-- thread-per-core workers
-- `io_uring` via monoio (epoll where `io_uring` is unavailable)
-- nginx-style configuration
-- static file serving
-- reverse proxying and upstreams
+- thread-per-core workers on `io_uring` via monoio, epoll where `io_uring` is unavailable
+- a hand-written HTTP/1.1 parser
+- nginx-style configuration, checked against your own with `--compat`
+- static files, reverse proxying with upstreams, WebSocket tunnels and a proxy cache
 - TLS 1.2/1.3 termination via rustls
-- no module system
-- a proxy cache (`proxy_cache`)
+- configuration reload without dropping connections (`SIGHUP`, `-s reload`)
+- no dynamic modules
 
-The upstream `nginx-tests` suite is used as a compatibility test. **122 of the 190 test files that ruxen currently opts into pass end-to-end** (main; v0.1.3: 105 of 159).
+The upstream `nginx-tests` suite is used as a compatibility test. **124 of the 190 test files that ruxen currently opts into pass end-to-end** (main; v0.1.3: 105 of 159).
 
 See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, and [`ROADMAP.md`](ROADMAP.md) for where ruxen is going: first a memory-safe edge server (TLS termination, reverse proxy, static files) that takes your nginx configuration.
 
@@ -171,7 +166,7 @@ With nothing unsupported, the configuration is then loaded the way `-t` does it 
 
 ### Run as a service
 
-ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it gracefully, `SIGTERM` at once, `SIGUSR1` reopens the log files; it can't re-read its configuration yet, so restart it to apply a change.
+ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it gracefully, `SIGTERM` at once, `SIGUSR1` reopens the log files, and `SIGHUP` (or `ruxen -s reload`) reloads the configuration: new workers start with it on the same listening sockets, and the old ones finish their requests. A configuration that fails to load leaves the running one in place.
 
 **systemd:** [`contrib/systemd/ruxen.service`](contrib/systemd/ruxen.service) runs `/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf` as a dynamic unprivileged user that may bind ports below 1024, checks the configuration first, stops it with `SIGQUIT`, and maps `systemctl reload` to a configuration reload. [`contrib/logrotate/ruxen`](contrib/logrotate/ruxen) rotates `/var/log/ruxen/*.log` and has ruxen reopen them with `SIGUSR1`.
 
@@ -193,6 +188,7 @@ docker run --rm -p 8080:8080 \
 ### HTTP and routing
 
 - hand-written HTTP/1.1 parser
+- HTTP/2 for clients: `http2 on`, `listen … http2`, ALPN `h2`, cleartext HTTP/2 with prior knowledge, `http2_max_concurrent_streams`, `http2_body_preread_size`, `http2_chunk_size`
 - persistent connections and nginx-style keep-alive behaviour
 - virtual hosts on multiple `listen` addresses
 - `server_name` exact, wildcard and regex matching
@@ -203,10 +199,12 @@ docker run --rm -p 8080:8080 \
   - regex (`~`, `~*`)
   - named locations
 - `internal` locations
-- `listen` port ranges and `listen … proxy_protocol` (PROXY protocol v1 and v2, `$proxy_protocol_*`)
+- `listen` port ranges, `listen unix:` and `listen … proxy_protocol` (PROXY protocol v1 and v2, `$proxy_protocol_*`)
 - `worker_connections`, `client_header_timeout`, `client_body_timeout`, `send_timeout`
 - request bodies of any `client_max_body_size`, spilled to private temp files (`client_body_temp_path`), with an early 413
 - `limit_rate`, `limit_rate_after` and `$limit_rate`
+- `limit_req` and `limit_conn` on zones shared by the workers and kept across a reload
+- `stub_status` and the `$connections_*` variables
 - gzip compression (`gzip`, `gzip_types`, `gzip_min_length`, `gzip_comp_level`, `gzip_vary`, `gzip_http_version`, `gzip_proxied`, `gzip_disable`) of static files, `return`, error pages and proxied responses, as nginx decides it: the same statuses, types, `Accept-Encoding` q-values, weak `ETag`, no `Accept-Ranges`. A file gzip compresses is sent whole even for a `Range` request, as from nginx. Not yet: `gzip_static`, `gunzip`, `$gzip_ratio`, and gzip under `limit_rate` (such a response goes out unpaced).
 
 ### Static files
@@ -230,14 +228,16 @@ Supported functionality includes:
 
 ruxen supports a growing subset of nginx's proxy functionality, including:
 
-- `proxy_pass`
+- `proxy_pass`, with variables (literal addresses, `upstream` names and `unix:` paths; no `resolver` yet), to TCP and `unix:` upstreams
 - named `upstream` blocks
 - path rewriting
-- weighted round-robin
-- `least_conn`
+- weighted round-robin, `least_conn`, `hash` (including `consistent`) and `ip_hash`
 - backup and down peers
-- `max_fails` / `fail_timeout`
+- `max_fails` / `fail_timeout`, `max_conns`, and `zone` for peer state shared by the workers
 - per-worker upstream keep-alive pools
+- `proxy_bind` (including `transparent`)
+- WebSocket and other `Upgrade` connections, tunnelled after the upstream's 101
+- responses relayed as they arrive when nothing needs them whole (no cache, gzip compression or `add_trailer`); otherwise buffered
 - `proxy_http_version`
 - `proxy_set_header`
 - request-body forwarding and `proxy_set_body`
@@ -261,8 +261,8 @@ Currently supported:
 - `ssl_certificate_key`
 - RSA and ECDSA certificates
 - multiple certificates per server
-- SNI
-- `ssl_session_cache` (in memory, shared by the workers), `ssl_session_tickets`, `ssl_session_timeout`
+- SNI, and `ssl_reject_handshake`
+- `ssl_session_cache` (in memory, shared by the workers, kept across a reload), `ssl_session_tickets`, `ssl_session_ticket_key` in nginx's ticket layout, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 
 ALPN offers `h2` where the server has `http2 on` (or `listen … http2`), else HTTP/1.1.
@@ -285,6 +285,9 @@ A growing nginx-compatible configuration surface is implemented, including:
 - `auth_basic`
 - `auth_basic_user_file`
 - `auth_request`, `auth_request_set` (authentication by a subrequest, e.g. to oauth2-proxy or Authelia)
+- `allow` / `deny`, `satisfy` and `limit_except`
+- realip: `set_real_ip_from`, `real_ip_header` (including `proxy_protocol`), `real_ip_recursive`
+- `user`: started as root, ruxen switches to it after binding (see [Install](#install))
 - `log_format`
 - `access_log` and `error_log`, including `syslog:` targets
 
@@ -303,7 +306,7 @@ The currently implemented nginx-style command-line surface includes:
 -T
 -q
 -V
--s stop | quit | reopen
+-s stop | quit | reopen | reload
 ```
 
 and one option nginx doesn't have: `--compat`, the configuration check described in [Check your nginx configuration](#check-your-nginx-configuration).
@@ -344,9 +347,11 @@ The HTTPS integration tests use the system `curl` binary and generate temporary 
 
 `fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the parsers that read untrusted bytes:
 - `request`: the HTTP request parser, which must also give the same answer when its input arrives in two pieces;
+- `chunked`: the chunked request-body decoder;
 - `host`: `Host` validation;
 - `uri`: path normalization;
 - `proxy_protocol`: PROXY protocol v1/v2;
+- `upstream_head` and `upstream_chunked`: an upstream's response head and a relayed chunked body, as a broken or hostile upstream would send them;
 - `config`: the configuration parser.
 
 They need a nightly toolchain:
@@ -396,32 +401,31 @@ The benchmark suite runs equivalent scenarios against nginx and ruxen and stores
 
 See [`bench/README.md`](bench/README.md) for the benchmark methodology and individual scenarios.
 
-The current v0.1 performance contract for the minimal serving path is to reach at least **95% of nginx's throughput on the same hardware**, while keeping p99 latency within the project's target and producing zero errors.
+The performance contract is at least **95% of nginx 1.24.0's throughput on the same hardware** on every bench scenario, with zero errors. Changes to the hot path are measured as ABBA pairs against the previous build before they merge.
 
-See [`DESIGN.md`](DESIGN.md) for the current baseline and performance notes.
+See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design decisions.
 
-## v0.1 limitations
+## Limitations
 
-The following are intentionally outside the current v0.1 scope:
+Not implemented yet (`--compat` names the ones a configuration uses):
 
-- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
-- nginx's module ecosystem
+- HTTPS upstreams (`proxy_pass https://`, `proxy_ssl_*`), HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
+- FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, charset conversion, and third-party modules
+- the `resolver` (a `proxy_pass` with variables reaches literal addresses and `upstream` names only)
+- streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
 - a proxy cache file per `Vary` variant (another variant replaces the stored one)
-- TLS to upstream servers (`proxy_ssl_*`)
-- OCSP stapling
-- client certificate authentication
-- 0-RTT / TLS early data
-- persistent TLS session caches (the cache lives in memory and is lost on restart)
-- password-protected private keys
-- full nginx process supervision and binary upgrade behaviour
+- client certificate authentication, OCSP stapling, 0-RTT / TLS early data, password-protected private keys
+- persistent TLS session caches (sessions survive a reload, not a restart)
+- nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
+- variables in `root` and `alias`
 
-Access restrictions that ruxen can't enforce yet — `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders it per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
 
-Missing functionality is expected at this stage. ruxen should not yet be treated as a drop-in production replacement for nginx.
+Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently. Anything else that behaves unlike nginx is a bug; please report it.
 
 ## Contributing
 
-ruxen is still early enough that small experiments and compatibility reports can be genuinely useful.
+Compatibility reports are the most useful contribution: every configuration that ruxen refuses or serves differently from nginx says what to build next.
 
 Good ways to contribute include:
 
