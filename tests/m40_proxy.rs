@@ -338,9 +338,8 @@ http {{
 
 #[test]
 fn m40_strips_hop_by_hop_headers_from_upstream() {
-    // Upstream returns Connection, Keep-Alive, Transfer-Encoding (illegal
-    // here since there's no chunked body, but we just want to assert it
-    // gets stripped). Plus a regular header that should pass through.
+    // Upstream returns Connection and Keep-Alive, which are stripped, and
+    // Upgrade and a regular header, which pass through as with nginx.
     let backend = Backend::spawn(
         b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nUpgrade: x\r\nX-App: yes\r\n\r\nok"
             .to_vec(),
@@ -385,9 +384,11 @@ http {{
         !has_header(&resp, "Keep-Alive"),
         "Keep-Alive must be stripped; full head:\n{head_str}"
     );
+    // nginx passes the upstream's Upgrade on to an HTTP/1 client
+    // (proxy_connection_headers.t, "upgrade in 200").
     assert!(
-        !has_header(&resp, "Upgrade"),
-        "Upgrade must be stripped; full head:\n{head_str}"
+        has_header(&resp, "Upgrade"),
+        "Upgrade passes as with nginx; full head:\n{head_str}"
     );
 }
 
@@ -545,6 +546,28 @@ fn m40_invalid_upstream_framing_is_502() {
         );
         assert_eq!(status_code(&http_get_close(port, "/alive")), 200);
     }
+}
+
+/// An HTTP/1.1 response with neither a length nor chunked, and no
+/// `Connection: close`, ends with the connection, as nginx reads it
+/// (ngx_http_proxy_input_filter_init: length -1, no keep-alive); it used
+/// to be a 502.
+#[test]
+fn m40_unframed_http11_body_ends_with_the_connection() {
+    let backend = Backend::spawn(
+        b"HTTP/1.1 200 OK\r\nConnection: Upgrade\r\nX-App: yes\r\n\r\nhello".to_vec(),
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&proxy_conf(backend.addr.port()));
+    let resp = http_get_close(port, "/up/");
+    assert_eq!(
+        status_code(&resp),
+        200,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    let raw = body(&resp);
+    let text = String::from_utf8_lossy(raw);
+    assert!(text.contains("hello"), "{text}");
 }
 
 /// nginx keeps the first of a repeated single-valued header (Expires,
