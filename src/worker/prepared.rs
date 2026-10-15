@@ -1780,8 +1780,8 @@ impl PreparedHttp {
 #[derive(Default)]
 pub struct RuntimeState {
     shutting_down: AtomicBool,
-    /// `worker_shutdown_timeout` passed after a reload: the workers end
-    /// their connections (`listeners::shut_down_sockets`).
+    /// `worker_shutdown_timeout` passed after a reload or SIGQUIT: the
+    /// workers end their connections (`listeners::shut_down_sockets`).
     forced: AtomicBool,
     connection_ids: AtomicU64,
     /// Bumped when a reload retires these workers, along with the

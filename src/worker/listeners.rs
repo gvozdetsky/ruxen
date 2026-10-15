@@ -293,12 +293,12 @@ fn open_fds() -> Vec<RawFd> {
         .collect()
 }
 
-/// `worker_shutdown_timeout` passed after a reload: shut down every
-/// connected socket this worker opened (clients and upstreams), as nginx's
-/// ngx_shutdown_timer_handler closes an old worker's connections. Each
-/// connection then ends as on a closed peer: its reads see EOF, its writes
-/// fail, and its future finishes and frees what it holds. Listening sockets
-/// and descriptors in `inherited` are left alone.
+/// `worker_shutdown_timeout` passed after a reload or SIGQUIT: shut down
+/// every connected socket this worker opened (clients and upstreams), as
+/// nginx's ngx_shutdown_timer_handler closes a stopping worker's
+/// connections. Each connection then ends as on a closed peer: its reads
+/// see EOF, its writes fail, and its future finishes and frees what it
+/// holds. Listening sockets and descriptors in `inherited` are left alone.
 pub(crate) fn shut_down_sockets(inherited: &[RawFd]) {
     for fd in open_fds() {
         if inherited.binary_search(&fd).is_ok() || !is_connection(fd) {

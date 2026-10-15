@@ -51,6 +51,11 @@ static SIGTERM_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGHUP_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGUSR1_SEEN: AtomicBool = AtomicBool::new(false);
 
+/// How long the workers get to end their requests once
+/// `worker_shutdown_timeout` closed their connections, before the process
+/// leaves without them.
+const FORCED_EXIT_AFTER: Duration = Duration::from_secs(1);
+
 #[cfg(unix)]
 const SIGHUP: i32 = 1;
 #[cfg(unix)]
@@ -543,6 +548,8 @@ impl Master {
         reopen_stderr: Option<PathBuf>,
     ) -> Result<(), Failure> {
         let mut quit_at = None;
+        // When `worker_shutdown_timeout` ended a graceful shutdown.
+        let mut forced_at: Option<Instant> = None;
         let mut worker_panicked = false;
         loop {
             // Workers say when they are gone, in any order. One that
@@ -574,17 +581,29 @@ impl Master {
             if self.current.alive == 0 && self.retiring.is_empty() {
                 break;
             }
-            // SIGTERM / SIGINT: nginx's fast shutdown. Its workers exit
-            // without waiting for their requests, and the master deletes
-            // the pid file and exits 0. Leaving the process does both.
-            // `worker_shutdown_timeout` ends a graceful shutdown the same
-            // way: nginx closes the connections still open when it fires
-            // (ngx_shutdown_timer_handler), and its workers then exit.
+            // `worker_shutdown_timeout` ends a graceful shutdown: nginx
+            // closes the connections still open when it fires
+            // (ngx_shutdown_timer_handler), their requests end as on a
+            // closed peer and are logged, and the workers then exit. The
+            // workers here shut their sockets down the same way (`drain`).
             let timed_out = matches!(
                 (quit_at, self.settings.shutdown_timeout),
                 (Some(at), Some(limit)) if Instant::now().duration_since(at) >= limit
             );
-            if SIGTERM_SEEN.load(Ordering::SeqCst) || timed_out {
+            if timed_out && forced_at.is_none() {
+                for generation in self.retiring.iter().chain([&self.current]) {
+                    generation.state.force_close();
+                }
+                forced_at = Some(Instant::now());
+            }
+            // A backstop for workers that can't tell their connections
+            // apart (no private fd table) or don't finish: leave as on
+            // SIGTERM.
+            let stuck = forced_at.is_some_and(|at| at.elapsed() >= FORCED_EXIT_AFTER);
+            // SIGTERM / SIGINT: nginx's fast shutdown. Its workers exit
+            // without waiting for their requests, and the master deletes
+            // the pid file and exits 0. Leaving the process does both.
+            if SIGTERM_SEEN.load(Ordering::SeqCst) || stuck {
                 self.begin_shutdown();
                 if let Some(path) = &self.settings.pid {
                     privileges::remove_pid_file_on_exit(path);
