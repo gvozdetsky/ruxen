@@ -54,6 +54,9 @@ pub(crate) struct StreamIo {
     counters: (std::time::Instant, u64),
     /// `http2_chunk_size`: the largest DATA frame sent.
     chunk: usize,
+    /// The request's header block as sent (`compat::HeaderBlocks`), for
+    /// `$request_length` (#409).
+    header_block: u64,
 }
 
 enum Out {
@@ -89,6 +92,7 @@ impl StreamIo {
         respond: SendResponse<Bytes>,
         counters: (std::time::Instant, u64),
         chunk: usize,
+        header_block: u64,
     ) -> Self {
         let has_body = !body.is_end_stream();
         let length = parts.headers.contains_key(http::header::CONTENT_LENGTH);
@@ -108,6 +112,7 @@ impl StreamIo {
             head: Vec::new(),
             counters,
             chunk: chunk.max(1),
+            header_block,
         }
     }
 
@@ -666,6 +671,10 @@ impl super::super::ConnIo for StreamIo {
         unsafe { buf.set_len(len) };
         self.out = Out::Done;
         Some(self.send_data_owned(buf.freeze()).await.is_ok())
+    }
+
+    fn h2_header_block(&self) -> Option<u64> {
+        Some(self.header_block)
     }
 
     fn conn_counters(&self) -> Option<(std::time::Instant, u64)> {

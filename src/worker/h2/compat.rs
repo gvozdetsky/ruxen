@@ -29,6 +29,103 @@ const PENDING_MAX: usize = 256 * 1024;
 
 type Op<T> = Pin<Box<dyn Future<Output = T>>>;
 
+/// The size of each request's header block as the client sent it: the
+/// HEADERS payload without padding and priority, plus its CONTINUATIONs.
+/// nginx's `$request_length` on HTTP/2 starts from it
+/// (ngx_http_v2_state_headers, ngx_http_v2_handle_continuation); the `h2`
+/// crate decodes the block without saying how long it was (#409), so
+/// `PollIo` reads the frame heads as the bytes go by.
+#[derive(Default)]
+pub(crate) struct HeaderBlocks {
+    /// Per stream id, until its stream takes it.
+    sizes: std::cell::RefCell<Vec<(u32, u64)>>,
+}
+
+impl HeaderBlocks {
+    /// Streams the crate refused or reset never take theirs: keep the
+    /// latest few.
+    const KEEP: usize = 256;
+
+    fn add(&self, sid: u32, n: u64) {
+        let mut sizes = self.sizes.borrow_mut();
+        if let Some(entry) = sizes.iter_mut().rev().find(|(id, _)| *id == sid) {
+            entry.1 += n;
+            return;
+        }
+        if sizes.len() == Self::KEEP {
+            sizes.remove(0);
+        }
+        sizes.push((sid, n));
+    }
+
+    /// Stream `sid`'s header block size, once.
+    pub(crate) fn take(&self, sid: u32) -> u64 {
+        let mut sizes = self.sizes.borrow_mut();
+        match sizes.iter().position(|(id, _)| *id == sid) {
+            Some(i) => sizes.remove(i).1,
+            None => 0,
+        }
+    }
+}
+
+/// Walks the client's frames as they are read, from frame head to frame
+/// head, for `HeaderBlocks`.
+struct FrameScan {
+    /// Bytes of the preface, then of the current frame's payload, still to
+    /// pass over.
+    skip: usize,
+    /// A frame head split across reads.
+    head: [u8; 9],
+    head_len: usize,
+    /// A padded HEADERS frame waiting for its first payload byte, the pad
+    /// length: its stream, and the payload length less the priority.
+    padded: Option<(u32, u64)>,
+    blocks: Rc<HeaderBlocks>,
+}
+
+impl FrameScan {
+    fn scan(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self.skip > 0 {
+                if let Some((sid, len)) = self.padded.take() {
+                    let pad = u64::from(data[0]) + 1;
+                    self.blocks.add(sid, len.saturating_sub(pad));
+                }
+                let n = self.skip.min(data.len());
+                self.skip -= n;
+                data = &data[n..];
+                continue;
+            }
+            let n = (9 - self.head_len).min(data.len());
+            self.head[self.head_len..self.head_len + n].copy_from_slice(&data[..n]);
+            self.head_len += n;
+            data = &data[n..];
+            if self.head_len < 9 {
+                break;
+            }
+            self.head_len = 0;
+            let h = &self.head;
+            let len = u32::from_be_bytes([0, h[0], h[1], h[2]]) as usize;
+            let sid = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff;
+            self.skip = len;
+            match h[3] {
+                // HEADERS: less the priority fields and the padding.
+                0x1 => {
+                    let rest = (len as u64).saturating_sub(if h[4] & 0x20 != 0 { 5 } else { 0 });
+                    if h[4] & 0x8 != 0 && len > 0 {
+                        self.padded = Some((sid, rest));
+                    } else {
+                        self.blocks.add(sid, rest);
+                    }
+                }
+                // CONTINUATION.
+                0x9 => self.blocks.add(sid, len as u64),
+                _ => {}
+            }
+        }
+    }
+}
+
 pub(crate) struct PollIo<S: 'static> {
     // The operations borrow `*stream`; declared first, so they are dropped
     // before it.
@@ -37,6 +134,7 @@ pub(crate) struct PollIo<S: 'static> {
     shutting_down: Option<Op<io::Result<()>>>,
     /// Bytes read and not yet handed out: `rbuf[rpos..]`.
     rbuf: Vec<u8>,
+    scan: FrameScan,
     rpos: usize,
     /// The write buffer between writes.
     wbuf: Vec<u8>,
@@ -59,6 +157,14 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
             shutting_down: None,
             rbuf: Vec::new(),
             rpos: 0,
+            scan: FrameScan {
+                // The client preface comes first (RFC 9113, 3.4).
+                skip: super::PREFACE.len(),
+                head: [0; 9],
+                head_len: 0,
+                padded: None,
+                blocks: Rc::default(),
+            },
             wbuf: Vec::new(),
             pending: Vec::new(),
             write_error: None,
@@ -71,6 +177,11 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
     /// any more then.
     pub(crate) fn stream_handle(&self) -> Rc<UnsafeCell<S>> {
         self.stream.clone()
+    }
+
+    /// The header block sizes the frames read so far gave.
+    pub(crate) fn header_blocks(&self) -> Rc<HeaderBlocks> {
+        self.scan.blocks.clone()
     }
 
     /// When the write in flight started, kept up to date for whoever
@@ -164,6 +275,7 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncRead for PollI
                 this.rbuf.clear();
                 return Poll::Ready(Err(e));
             }
+            this.scan.scan(&this.rbuf);
             // `Ok(0)`, EOF: nothing is filled in.
         }
         let n = (this.rbuf.len() - this.rpos).min(out.remaining());
@@ -240,5 +352,52 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for Poll
                 .poll(cx)
         );
         Poll::Ready(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(kind: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u32;
+        let mut f = len.to_be_bytes()[1..].to_vec();
+        f.extend_from_slice(&[kind, flags]);
+        f.extend_from_slice(&sid.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Header block sizes as nginx counts them (#409), whatever the reads'
+    /// boundaries: HEADERS less padding and priority, plus CONTINUATIONs.
+    #[test]
+    fn header_blocks_follow_the_frames() {
+        let mut wire = super::super::PREFACE.to_vec();
+        wire.extend(frame(0x4, 0, 0, &[0; 6])); // SETTINGS
+        wire.extend(frame(0x1, 0x4, 1, &[0; 18])); // HEADERS, END_HEADERS
+        // Padded (pad length 3) and with priority: 1 + 5 + 10 + 3.
+        let mut padded = vec![3];
+        padded.extend_from_slice(&[0; 5 + 10 + 3]);
+        wire.extend(frame(0x1, 0x8 | 0x20 | 0x4, 3, &padded));
+        wire.extend(frame(0x1, 0, 5, &[0; 7])); // HEADERS without END_HEADERS
+        wire.extend(frame(0x0, 0x1, 1, &[0; 40])); // DATA: not counted
+        wire.extend(frame(0x9, 0x4, 5, &[0; 4])); // CONTINUATION
+        for step in [1, 2, 7, 9, 10, wire.len()] {
+            let blocks = Rc::new(HeaderBlocks::default());
+            let mut scan = FrameScan {
+                skip: super::super::PREFACE.len(),
+                head: [0; 9],
+                head_len: 0,
+                padded: None,
+                blocks: blocks.clone(),
+            };
+            for piece in wire.chunks(step) {
+                scan.scan(piece);
+            }
+            assert_eq!(blocks.take(1), 18, "step {step}");
+            assert_eq!(blocks.take(3), 10, "step {step}");
+            assert_eq!(blocks.take(5), 11, "step {step}");
+            assert_eq!(blocks.take(5), 0, "taken once");
+        }
     }
 }
