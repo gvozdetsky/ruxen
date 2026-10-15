@@ -2396,14 +2396,16 @@ pub(crate) async fn wait_readable_or_shutdown(
 /// the read in flight. The read is cancelled only when the connection is
 /// to close. A read that completes while being cancelled still hands its
 /// bytes back, and a timeout that loses that race serves the request.
-pub(crate) async fn read_first_or_shutdown(
+/// `buf`: the request buffer's `[..len]` for plain TCP, or a TLS
+/// stream's ciphertext buffer (#145).
+pub(crate) async fn read_first_or_shutdown<T: monoio::buf::IoBufMut>(
     stream: &mut TcpStream,
-    buf: Vec<u8>,
+    buf: T,
     state: &RuntimeState,
     idle_timeout: Option<Duration>,
     fresh: bool,
     timers: &mut ConnTimers<'_>,
-) -> (IdleRead, Vec<u8>) {
+) -> (IdleRead, T) {
     use monoio::io::CancelableAsyncReadRent;
     use std::task::Poll;
 
@@ -2413,9 +2415,7 @@ pub(crate) async fn read_first_or_shutdown(
     }
     let idle = IdleMark::new();
     let canceller = monoio::io::Canceller::new();
-    let len = buf.len();
-    let mut read =
-        std::pin::pin!(stream.cancelable_read(buf.slice_mut(0..len), canceller.handle()));
+    let mut read = std::pin::pin!(stream.cancelable_read(buf, canceller.handle()));
     let outcome = |res: std::io::Result<usize>| match res {
         Ok(n) if n > 0 => IdleRead::Read(n),
         _ => IdleRead::Close,
@@ -2444,16 +2444,16 @@ pub(crate) async fn read_first_or_shutdown(
     })
     .await;
     match woke {
-        Woke::Read((res, returned)) => (outcome(res), returned.into_inner()),
+        Woke::Read((res, returned)) => (outcome(res), returned),
         Woke::Close => {
             canceller.cancel();
             let (_, returned) = read.as_mut().await;
-            (IdleRead::Close, returned.into_inner())
+            (IdleRead::Close, returned)
         }
         Woke::Timeout => {
             canceller.cancel();
             let (res, returned) = read.as_mut().await;
-            (outcome(res), returned.into_inner())
+            (outcome(res), returned)
         }
     }
 }

@@ -298,6 +298,29 @@ impl<IO> TlsStream<IO> {
         &self.io
     }
 
+    /// The transport, for a read of ciphertext into `take_read_buf`'s
+    /// buffer (the keep-alive wait, #145).
+    pub(crate) fn io_mut(&mut self) -> &mut IO {
+        &mut self.io
+    }
+
+    /// The ciphertext buffer, empty and with room for a record, when
+    /// everything read so far went to rustls (`!has_buffered_input`).
+    pub(crate) fn take_read_buf(&mut self) -> Vec<u8> {
+        let mut buf = mem::take(&mut self.rbuf);
+        self.rpos = 0;
+        buf.clear();
+        buf.reserve(READ_BUF_SIZE);
+        buf
+    }
+
+    /// Back from `take_read_buf` with what the socket gave: the next
+    /// `read` hands it to rustls before it reads the socket again.
+    pub(crate) fn put_read_buf(&mut self, buf: Vec<u8>) {
+        self.rbuf = buf;
+        self.rpos = 0;
+    }
+
     /// Whether the next `read` can make progress without new bytes from
     /// the socket: ciphertext already read but not yet handed to rustls, or
     /// plaintext (or a close_notify) rustls hasn't returned yet. TLS 1.3
