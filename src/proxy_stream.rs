@@ -1,11 +1,12 @@
 //! A proxied response whose body is relayed to the client as it arrives
 //! (#88), instead of being read whole first. `proxy::attempt` hands one
 //! over when the body didn't come in with the header and nothing needs it
-//! whole (no cache store, no gzip, no `add_trailer`, no failover or
-//! interception on the status); the worker writes the head and calls
-//! [`relay`]. As in nginx (`ngx_http_upstream_process_non_buffered_*`),
-//! once the head is out an upstream error can't become a 502 or a retry:
-//! the client connection is closed.
+//! whole (no cache store, no `add_trailer`, no failover or interception on
+//! the status); the worker writes the head and calls [`relay`]. gzip
+//! compresses it on the way (`ProxyStream::gzip`). As in nginx
+//! (`ngx_http_upstream_process_non_buffered_*`), once the head is out an
+//! upstream error can't become a 502 or a retry: the client connection is
+//! closed.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -45,6 +46,9 @@ pub struct ProxyStream {
     /// it, as nginx frees the peer when the request ends. Only held.
     #[allow(dead_code)]
     pub lease: Option<LeasedPeer>,
+    /// gzip compresses the body on its way (`gzip::filter`): the client
+    /// gets no length.
+    pub(crate) gzip: Option<crate::worker::gzip::GzipStream>,
 }
 
 pub(crate) enum StreamFraming {
@@ -67,7 +71,7 @@ impl ProxyStream {
     /// The client learns the length from the head (`Content-Length`);
     /// otherwise the worker chunks the body (HTTP/1.1) or closes after it.
     pub fn length_known(&self) -> bool {
-        matches!(self.framing, StreamFraming::Length(_))
+        matches!(self.framing, StreamFraming::Length(_)) && self.gzip.is_none()
     }
 }
 
@@ -121,15 +125,20 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
     // decoded body of a chunked upstream.
     let mut framed = Vec::new();
     let mut decoded = Vec::new();
+    // gzip: the body as it decodes, and what the compressor makes of it.
+    let mut deflater = s.gzip.map(crate::worker::gzip::Deflater::new);
+    let mut plain = Vec::new();
+    let mut compressed = Vec::new();
 
     // The head goes out with whatever body came with it.
     let head_len = head.len();
     let pending = std::mem::take(&mut s.pending);
-    let done = match consume(
+    let done = match consume_out(
         &mut s.framing,
         &pending,
         chunked_out,
         &mut decoded,
+        deflater.as_mut().map(|d| (d, &mut plain, &mut compressed)),
         &mut head,
     ) {
         Ok((done, _, more)) => {
@@ -183,16 +192,31 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
                     // The upstream closed: the body is complete, and
                     // nothing goes back to the pool.
                     s.pool = None;
+                    framed.clear();
+                    // The rest of the compressed body.
+                    if let Some(d) = deflater.as_mut() {
+                        compressed.clear();
+                        d.push(&[], &mut compressed, true);
+                        push_body(&mut framed, &compressed, chunked_out);
+                    }
                     if chunked_out {
-                        framed.clear();
                         framed.extend_from_slice(b"0\r\n\r\n");
-                        let (ok, _) =
-                            write_out(client, framed, 5, &mut pacer, timer.as_mut(), send_timeout)
-                                .await;
+                    }
+                    if !framed.is_empty() {
+                        let len = framed.len();
+                        let (ok, _) = write_out(
+                            client,
+                            framed,
+                            len,
+                            &mut pacer,
+                            timer.as_mut(),
+                            send_timeout,
+                        )
+                        .await;
                         if !ok {
                             break;
                         }
-                        end.body_sent += 5;
+                        end.body_sent += len as u64;
                     }
                     end.complete = true;
                 } else {
@@ -216,7 +240,10 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         s.paced += n as u64;
         // A length-framed body to a client that takes it as it is goes
         // out of the read buffer itself.
-        if !chunked_out && let StreamFraming::Length(left) = &mut s.framing {
+        if !chunked_out
+            && deflater.is_none()
+            && let StreamFraming::Length(left) = &mut s.framing
+        {
             let take = n.min(*left as usize);
             extra |= n > take;
             *left -= take as u64;
@@ -238,11 +265,12 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         }
         framed.clear();
         let input = &s.read_buf[..n];
-        let done = match consume(
+        let done = match consume_out(
             &mut s.framing,
             input,
             chunked_out,
             &mut decoded,
+            deflater.as_mut().map(|d| (d, &mut plain, &mut compressed)),
             &mut framed,
         ) {
             Ok((done, used, more)) => {
@@ -311,6 +339,35 @@ fn consume(
             Ok((false, input.len(), false))
         }
     }
+}
+
+/// `consume`, through the compressor when gzip is on: the body's bytes
+/// are decoded into `plain`, compressed into `compressed`, and those go
+/// out (chunked when `chunked_out`), the end of the member with the last.
+fn consume_out(
+    framing: &mut StreamFraming,
+    input: &[u8],
+    chunked_out: bool,
+    decoded: &mut Vec<u8>,
+    gzip: Option<(
+        &mut crate::worker::gzip::Deflater,
+        &mut Vec<u8>,
+        &mut Vec<u8>,
+    )>,
+    out: &mut Vec<u8>,
+) -> Result<(bool, usize, bool), ()> {
+    let Some((deflater, plain, compressed)) = gzip else {
+        return consume(framing, input, chunked_out, decoded, out);
+    };
+    plain.clear();
+    let (done, used, more) = consume(framing, input, false, decoded, plain)?;
+    compressed.clear();
+    deflater.push(plain, compressed, done);
+    push_body(out, compressed, chunked_out);
+    if done && chunked_out {
+        out.extend_from_slice(b"0\r\n\r\n");
+    }
+    Ok((done, used, more))
 }
 
 /// The relay is over: time it, and pool the connection if the body was

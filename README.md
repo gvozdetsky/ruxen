@@ -237,7 +237,7 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - per-worker upstream keep-alive pools
 - `proxy_bind` (including `transparent`)
 - WebSocket and other `Upgrade` connections, tunnelled after the upstream's 101
-- responses relayed as they arrive when nothing needs them whole (no cache, gzip compression or `add_trailer`); otherwise buffered
+- responses relayed as they arrive when nothing needs them whole (no cache or `add_trailer`), gzip-compressed on the way when gzip is on; otherwise buffered
 - `proxy_http_version`, `proxy_method`
 - `proxy_set_header`
 - request-body forwarding and `proxy_set_body`

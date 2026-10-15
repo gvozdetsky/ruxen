@@ -1067,7 +1067,6 @@ pub(crate) fn run_location_handler(
             stream: cache.is_none()
                 && loc.add_trailers.is_empty()
                 && !(force_ranges && req.range.is_some()),
-            gzip: loc.gzip,
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
             cache,

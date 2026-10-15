@@ -39,20 +39,6 @@ impl<'a> GzipRequest<'a> {
     }
 }
 
-/// Whether gzip leaves a proxied response with this head (the upstream's)
-/// as it is, whoever asks: not a status, type or encoding it compresses,
-/// or shorter than `gzip_min_length`. Then its body may be relayed as it
-/// comes (#88). The upstream's own framing doesn't count: the buffered
-/// path re-frames the body before the filter sees it, so an unknown
-/// length (chunked) leaves the response a candidate.
-pub(crate) fn passes(gz: &PreparedGzip, upstream_head: &[u8]) -> bool {
-    let Some(mut head) = parse_head(upstream_head) else {
-        return false;
-    };
-    head.transfer_encoding = false;
-    !candidate(gz, &head)
-}
-
 /// gzip compresses this in-memory response (`filter` would): the range
 /// filter, which nginx runs after gzip, then leaves it alone (#370).
 pub(crate) fn compresses(gz: &PreparedGzip, req: &GzipRequest<'_>, response: &[u8]) -> bool {
@@ -386,6 +372,33 @@ pub(crate) fn filter(
                     (Response::File { headers: out, body }, Some(stream))
                 }
             }
+        }
+        // A proxied body relayed as it arrives (#88): compressed on the
+        // way, as nginx's gzip filter does over the upstream's buffers.
+        Response::ProxyStream(mut s) => {
+            let decision = parse_head(&s.head).map(|head| {
+                let compress = match decide(gz, req, &head) {
+                    Decision::Pass => None,
+                    Decision::Vary => Some(false),
+                    Decision::Compress => Some(true),
+                };
+                (compress, window_bits(head.content_length))
+            });
+            match decision {
+                Some((Some(true), window_bits)) => {
+                    // No length; the worker frames the body (chunked, or
+                    // the close for HTTP/1.0).
+                    s.head = rewrite_head(&s.head, gz.vary, Some(b""));
+                    s.gzip = Some(GzipStream {
+                        level: gz.comp_level,
+                        window_bits,
+                        chunked: req.http_11,
+                    });
+                }
+                Some((Some(false), _)) => s.head = rewrite_head(&s.head, gz.vary, None),
+                _ => {}
+            }
+            (Response::ProxyStream(s), None)
         }
         other => (other, None),
     }

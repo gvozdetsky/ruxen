@@ -52,6 +52,7 @@ fn start() -> (Server, u16) {
              location /ret {{ gzip on; default_type text/plain; gzip_types text/plain; \
              return 200 \"{body}\"; }}\n \
              location /proxy/ {{ gzip on; proxy_pass http://127.0.0.1:{port}/local/; }}\n \
+             location /relay/ {{ gzip on; proxy_pass http://127.0.0.1:{port}/local/; }}\n \
              location /local/ {{ alias {www}/; }}\n }}\n}}\n",
             www = dir.join("www").display(),
             body = "one ".repeat(30),
@@ -179,6 +180,21 @@ fn m97_gzip_like_nginx() {
     let (head, body) = get(port, "/proxy/index.html", GZ, "1.1");
     assert!(head.contains("Content-Encoding: gzip"), "{head}");
     assert_eq!(gunzip(&body), b"X".repeat(64));
+    // A proxied body too big to come with the head is relayed as it
+    // arrives, and compressed on the way (#88): chunked, no length.
+    let (head, body) = get(port, "/relay/big.css", GZ, "1.1");
+    assert!(head.contains("Content-Encoding: gzip"), "{head}");
+    assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+    assert!(!head.contains("Content-Length"), "{head}");
+    assert_eq!(gunzip(&dechunk(&body)), expected);
+    // Not to a client that doesn't ask for it.
+    let (head, body) = get(port, "/relay/big.css", "", "1.1");
+    assert!(!head.contains("Content-Encoding"), "{head}");
+    assert!(
+        head.contains(&format!("Content-Length: {}", expected.len())),
+        "{head}"
+    );
+    assert_eq!(body, expected);
 
     // q=0 refuses gzip.
     let (head, _) = get(port, "/", "Accept-Encoding: gzip;q=0\r\n", "1.1");
