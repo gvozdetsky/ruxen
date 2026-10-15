@@ -1042,7 +1042,6 @@ pub enum UpstreamError {
     TooBigHeader,
     InvalidStatusLine,
     Status444,
-    NoBodyFraming,
     InvalidChunked,
     TooBigBody,
     NoLiveUpstreams,
@@ -1166,12 +1165,6 @@ impl std::fmt::Display for UpstreamError {
             Status444 => write!(
                 f,
                 "upstream sent status 444 while {}",
-                Stage::ReadingHeader.as_str()
-            ),
-            NoBodyFraming => write!(
-                f,
-                "upstream sent neither Content-Length nor chunked encoding with HTTP/1.1 \
-                 keep-alive while {}",
                 Stage::ReadingHeader.as_str()
             ),
             InvalidChunked => write!(
@@ -1848,6 +1841,13 @@ async fn attempt(
         && status_code != 204
         && status_code != 304
         && !(status_code >= 100 && status_code < 200);
+    // Neither a length nor chunked: the body ends with the connection,
+    // whatever `Connection` says, and the connection isn't reused. nginx
+    // takes such a body as of unknown length too (length -1 in
+    // ngx_http_proxy_input_filter_init, `u->keepalive` left off).
+    if !chunked && content_length.is_none() && body_has_content {
+        upstream_close = true;
+    }
     let mut body_len_in_accum: usize = accum.len() - body_start;
     let mut decoded_chunked_body: Option<Vec<u8>> = None;
     // proxy_limit_rate pacer state — anchors at the moment body collection
@@ -2013,7 +2013,7 @@ async fn attempt(
                 }
             }
         }
-    } else if upstream_close {
+    } else {
         // No length, no chunked, "close" semantics — read until EOF
         // straight into `accum`.
         loop {
@@ -2053,14 +2053,6 @@ async fn attempt(
                 );
             }
         }
-    } else {
-        // HTTP/1.1 with no Content-Length, no chunked, no Connection:
-        // close — protocol error. Treat as bad gateway.
-        return AttemptOutcome::Failed(
-            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-            FailKind::InvalidHeader,
-            Box::new(UpstreamError::NoBodyFraming),
-        );
     }
 
     // 7. Stitch the rewritten response: status line forced to HTTP/1.1,
@@ -3037,7 +3029,11 @@ const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 /// How the response stitch treats one upstream header.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamHeader {
-    /// Hop-by-hop: never forwarded.
+    /// `Connection`, `Keep-Alive`, `Transfer-Encoding`: never forwarded,
+    /// the ones nginx's `ngx_http_upstream_headers_in` doesn't copy. The
+    /// rest of RFC 9110's hop-by-hop set (`Upgrade`, `TE`, `Trailers`,
+    /// `Proxy-Authenticate`) reaches an HTTP/1 client as with nginx;
+    /// HTTP/2 drops the connection-specific ones (`h2::stream`).
     HopByHop,
     /// Hidden by default like nginx's `ngx_http_proxy_hide_headers` (Date,
     /// Server, X-Pad, X-Accel-*): it writes its own Date and Server, and
@@ -3068,15 +3064,12 @@ pub(crate) fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
     use UpstreamHeader::*;
     let is = |h: &[u8]| name.eq_ignore_ascii_case(h);
     match name.len() {
-        2 if is(b"te") => HopByHop,
         4 if is(b"date") => Hidden(HIDDEN_DATE),
         4 if is(b"etag") => Single(1 << 0),
         5 if is(b"x-pad") => Hidden(1 << 2),
         6 if is(b"server") => Hidden(HIDDEN_SERVER),
-        7 if is(b"upgrade") => HopByHop,
         7 if is(b"expires") => Single(1 << 1),
         7 if is(b"refresh") => Redirect(1 << 2),
-        8 if is(b"trailers") => HopByHop,
         8 if is(b"location") => Redirect(1 << 3),
         10 if is(b"connection") || is(b"keep-alive") => HopByHop,
         12 if is(b"content-type") => Single(1 << 4),
@@ -3089,8 +3082,6 @@ pub(crate) fn classify_upstream_header(name: &[u8]) -> UpstreamHeader {
         17 if is(b"transfer-encoding") => HopByHop,
         17 if is(b"x-accel-buffering") => Hidden(1 << 6),
         18 if is(b"x-accel-limit-rate") => Hidden(HIDDEN_X_ACCEL_LIMIT_RATE),
-        18 if is(b"proxy-authenticate") => HopByHop,
-        19 if is(b"proxy-authorization") => HopByHop,
         _ => Other,
     }
 }
@@ -3403,17 +3394,19 @@ mod tests {
                 name
             );
         }
+        for name in [&b"Connection"[..], b"Keep-Alive", b"Transfer-Encoding"] {
+            assert_eq!(classify_upstream_header(name), HopByHop, "{:?}", name);
+        }
+        // nginx copies the rest of the RFC's hop-by-hop set to the client
+        // (ngx_http_upstream_headers_in ignores only the three above).
         for name in [
-            &b"Connection"[..],
-            b"Keep-Alive",
-            b"Transfer-Encoding",
-            b"TE",
+            &b"TE"[..],
             b"Trailers",
             b"Upgrade",
             b"Proxy-Authenticate",
             b"Proxy-Authorization",
         ] {
-            assert_eq!(classify_upstream_header(name), HopByHop, "{:?}", name);
+            assert_eq!(classify_upstream_header(name), Other, "{:?}", name);
         }
         for name in [&b"Expires"[..], b"content-type", b"ETag", b"Last-Modified"] {
             assert!(
