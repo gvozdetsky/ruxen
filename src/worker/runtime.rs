@@ -832,29 +832,10 @@ fn range_filter(
             meta.range_allow,
             meta.max_ranges,
             req,
-            |len, server| range_not_satisfiable(len, req.head_only, server),
+            |len, server| super::range::not_satisfiable(len, req.head_only, server),
         )),
         other => other,
     }
-}
-
-/// The 416 the range filter finalizes the request with: nginx's page
-/// for it, with `Content-Range: bytes */<length>`.
-fn range_not_satisfiable(len: u64, head_only: bool, server: &[u8]) -> Vec<u8> {
-    let page = crate::http::default_error_page_body_for(416, server).unwrap_or_default();
-    let method = if head_only { Method::Head } else { Method::Get };
-    let mut out = crate::http::build_response_bytes_with_content_type(
-        416,
-        &page,
-        b"text/html",
-        method,
-        server,
-    );
-    if let Some(end) = out.windows(4).position(|w| w == b"\r\n\r\n") {
-        let line = format!("\r\nContent-Range: bytes */{len}");
-        out.splice(end..end, line.into_bytes());
-    }
-    out
 }
 
 enum PassOutcome {

@@ -1,6 +1,7 @@
 //! nginx's range filter (`ngx_http_range_filter_module`) over a response
 //! held whole in memory: a proxied response (#370) or a cached one. Static
-//! files take their single range in `file.rs`.
+//! files (`file.rs`) use its parse, multipart layout and 416 page, with the
+//! parts read from the file (#401).
 //!
 //! The filter runs after gzip and add_header, on a 200 of known length,
 //! when the response allows ranges (`RangeAllow`, nginx's
@@ -34,12 +35,41 @@ pub(crate) struct RangeRequest<'a> {
 
 /// nginx's `ngx_http_range_parse` outcome.
 #[derive(Debug, PartialEq, Eq)]
-enum Parsed {
-    /// `[start, end)` pairs.
-    Ranges(Vec<(u64, u64)>),
+pub(crate) enum Parsed {
+    Ranges(Ranges),
     NotSatisfiable,
     /// The whole response, as if there were no `Range`.
     Declined,
+}
+
+/// `[start, end)` pairs, at least one. The first is held inline, so a
+/// single range (the common case) allocates nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Ranges {
+    pub first: (u64, u64),
+    pub rest: Vec<(u64, u64)>,
+}
+
+impl Ranges {
+    pub(crate) fn len(&self) -> usize {
+        1 + self.rest.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+
+    /// The bytes the ranges take in total.
+    pub(crate) fn size(&self) -> u64 {
+        self.iter().map(|(start, end)| end - start).sum()
+    }
+}
+
+/// A `Range` header's ranges for a body of `len` bytes: `None` when the
+/// filter passes it by (no `bytes=` unit), as nginx's header filter does.
+pub(crate) fn parse_header(value: &[u8], len: u64, limit: u64) -> Option<Parsed> {
+    (value.len() >= 7 && value[..6].eq_ignore_ascii_case(b"bytes="))
+        .then(|| parse(&value[6..], len, limit))
 }
 
 /// `value` after `bytes=`, against a body of `len` bytes, at most `limit`
@@ -47,7 +77,12 @@ enum Parsed {
 fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
     let mut p = 0;
     let at = |i: usize| value.get(i).copied().unwrap_or(0);
-    let mut ranges = Vec::new();
+    let mut first: Option<(u64, u64)> = None;
+    let mut rest = Vec::new();
+    let mut push = |range: (u64, u64)| match first {
+        None => first = Some(range),
+        Some(_) => rest.push(range),
+    };
     let mut size: u64 = 0;
     let mut left = limit;
     let digits = |p: &mut usize| -> Option<u64> {
@@ -86,7 +121,7 @@ fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
             if at(p) == b',' || at(p) == 0 {
                 end = len;
                 if start < end {
-                    ranges.push((start, end));
+                    push((start, end));
                     size += end - start;
                     if left == 0 {
                         return Parsed::Declined;
@@ -130,7 +165,7 @@ fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
             end += 1;
         }
         if start < end {
-            ranges.push((start, end));
+            push((start, end));
             size += end - start;
             if left == 0 {
                 return Parsed::Declined;
@@ -144,13 +179,13 @@ fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
         }
         p += 1;
     }
-    if ranges.is_empty() {
+    let Some(first) = first else {
         return Parsed::NotSatisfiable;
-    }
+    };
     if size > len {
         return Parsed::Declined;
     }
-    Parsed::Ranges(ranges)
+    Parsed::Ranges(Ranges { first, rest })
 }
 
 /// The value of header `name` in `head` (without the status line), trimmed.
@@ -267,6 +302,8 @@ pub(crate) fn filter(
     else {
         return accept_ranges(response);
     };
+    // Checked above.
+    let range = &range[6..];
     if let Some(if_range) = req.if_range {
         let matches = if if_range.len() >= 2 && if_range.ends_with(b"\"") {
             header(head, b"etag") == Some(if_range)
@@ -288,11 +325,11 @@ pub(crate) fn filter(
         RangeAllow::Single => 1,
         _ => max_ranges.map_or(u64::MAX, u64::from),
     };
-    match parse(&range[6..], len, limit) {
+    match parse(range, len, limit) {
         Parsed::Declined => accept_ranges(response),
         Parsed::NotSatisfiable => not_satisfiable(len, header(head, b"server").unwrap_or_default()),
         Parsed::Ranges(ranges) if ranges.len() == 1 => {
-            let (start, end) = ranges[0];
+            let (start, end) = ranges.first;
             let add = format!(
                 "\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{len}",
                 end - start,
@@ -311,50 +348,92 @@ pub(crate) fn filter(
             out
         }
         Parsed::Ranges(ranges) => {
-            let boundary = format!("{:020}", next_boundary());
-            let part_type = header(head, b"content-type")
-                .map(|t| format!("\r\nContent-Type: {}", String::from_utf8_lossy(t)))
-                .unwrap_or_default();
-            let mut parts = Vec::with_capacity(body.len() + ranges.len() * 96);
-            // A HEAD response counts the parts' bodies without them.
-            let mut skipped = 0;
-            for &(start, end) in &ranges {
-                parts.extend_from_slice(
-                    format!(
-                        "\r\n--{boundary}{part_type}\r\nContent-Range: bytes {}-{}/{len}\r\n\r\n",
-                        start,
-                        end - 1
-                    )
-                    .as_bytes(),
-                );
-                if req.head_only {
-                    skipped += end - start;
-                } else {
-                    parts.extend_from_slice(&body[start as usize..end as usize]);
-                }
-            }
-            parts.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-            let add = format!(
-                "\r\nContent-Type: multipart/byteranges; boundary={boundary}\r\nContent-Length: {}",
-                parts.len() as u64 + skipped
-            );
-            let mut out = rebuild(
-                b"HTTP/1.1 206 Partial Content",
-                head,
-                &[
-                    b"content-length",
-                    b"content-range",
-                    b"accept-ranges",
-                    b"content-type",
-                ],
-                add.as_bytes(),
-            );
-            if !req.head_only {
-                out.extend_from_slice(&parts);
-            }
-            out
+            let read = |start: u64, end: u64, out: &mut Vec<u8>| {
+                out.extend_from_slice(&body[start as usize..end as usize]);
+                Ok(())
+            };
+            multipart(head, len, &ranges, req.head_only, read).unwrap_or_default()
         }
     }
+}
+
+/// nginx's multipart/byteranges 206 (ngx_http_range_multipart_header,
+/// ngx_http_range_multipart_body) for a 200 whose head is `head` (status
+/// line included, final CRLF not) and whose body is `len` bytes: the
+/// parts' headers, with `read(start, end, out)` appending each part's
+/// bytes. `head_only`: the length only, no body.
+pub(crate) fn multipart(
+    head: &[u8],
+    len: u64,
+    ranges: &Ranges,
+    head_only: bool,
+    mut read: impl FnMut(u64, u64, &mut Vec<u8>) -> std::io::Result<()>,
+) -> std::io::Result<Vec<u8>> {
+    let boundary = format!("{:020}", next_boundary());
+    let part_type = header(head, b"content-type")
+        .map(|t| format!("\r\nContent-Type: {}", String::from_utf8_lossy(t)))
+        .unwrap_or_default();
+    let mut parts =
+        Vec::with_capacity(if head_only { 0 } else { ranges.size() as usize } + ranges.len() * 96);
+    // A HEAD response counts the parts' bodies without them.
+    let mut skipped = 0;
+    for (start, end) in ranges.iter() {
+        parts.extend_from_slice(
+            format!(
+                "\r\n--{boundary}{part_type}\r\nContent-Range: bytes {}-{}/{len}\r\n\r\n",
+                start,
+                end - 1
+            )
+            .as_bytes(),
+        );
+        if head_only {
+            skipped += end - start;
+        } else {
+            read(start, end, &mut parts)?;
+        }
+    }
+    parts.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let add = format!(
+        "\r\nContent-Type: multipart/byteranges; boundary={boundary}\r\nContent-Length: {}",
+        parts.len() as u64 + skipped
+    );
+    let status_line = b"HTTP/1.1 206 Partial Content";
+    let mut out = rebuild(
+        status_line,
+        head,
+        &[
+            b"content-length",
+            b"content-range",
+            b"accept-ranges",
+            b"content-type",
+        ],
+        add.as_bytes(),
+    );
+    if !head_only {
+        out.extend_from_slice(&parts);
+    }
+    Ok(out)
+}
+
+/// The 416 the range filter finalizes the request with: nginx's page
+/// for it (ngx_http_range_not_satisfiable, then the special response),
+/// with `Content-Range: bytes */<length>`.
+pub(crate) fn not_satisfiable(len: u64, head_only: bool, server: &[u8]) -> Vec<u8> {
+    use crate::http::Method;
+    let page = crate::http::default_error_page_body_for(416, server).unwrap_or_default();
+    let method = if head_only { Method::Head } else { Method::Get };
+    let mut out = crate::http::build_response_bytes_with_content_type(
+        416,
+        &page,
+        b"text/html",
+        method,
+        server,
+    );
+    if let Some(end) = out.windows(4).position(|w| w == b"\r\n\r\n") {
+        let line = format!("\r\nContent-Range: bytes */{len}");
+        out.splice(end..end, line.into_bytes());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -385,15 +464,22 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn ranges(first: (u64, u64), rest: &[(u64, u64)]) -> Parsed {
+        Parsed::Ranges(Ranges {
+            first,
+            rest: rest.to_vec(),
+        })
+    }
+
     #[test]
     fn parses_as_nginx() {
-        assert_eq!(parse(b"0-4", 8, 9), Parsed::Ranges(vec![(0, 5)]));
-        assert_eq!(parse(b"4-", 8, 9), Parsed::Ranges(vec![(4, 8)]));
-        assert_eq!(parse(b"-2", 8, 9), Parsed::Ranges(vec![(6, 8)]));
-        assert_eq!(parse(b"0-2,4-", 8, 9), Parsed::Ranges(vec![(0, 3), (4, 8)]));
+        assert_eq!(parse(b"0-4", 8, 9), ranges((0, 5), &[]));
+        assert_eq!(parse(b"4-", 8, 9), ranges((4, 8), &[]));
+        assert_eq!(parse(b"-2", 8, 9), ranges((6, 8), &[]));
+        assert_eq!(parse(b"0-2,4-", 8, 9), ranges((0, 3), &[(4, 8)]));
         assert_eq!(parse(b"0-2, 4-", 8, 1), Parsed::Declined);
         assert_eq!(parse(b"1000-", 8, 9), Parsed::NotSatisfiable);
-        assert_eq!(parse(b"0-100", 8, 9), Parsed::Ranges(vec![(0, 8)]));
+        assert_eq!(parse(b"0-100", 8, 9), ranges((0, 8), &[]));
         assert_eq!(parse(b"x", 8, 9), Parsed::NotSatisfiable);
         // More than the whole body in total: the whole body instead.
         assert_eq!(parse(b"0-7,0-7", 8, 9), Parsed::Declined);
