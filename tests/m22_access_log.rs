@@ -354,3 +354,69 @@ http {
     let log = std::fs::read_to_string(dir.join("t.log")).unwrap();
     assert_eq!(log, "/srv/a /srv/a/a/a\n/srv/b /srv/b/b/x\n");
 }
+
+/// Waits for `n` lines in `dir/access.log`.
+fn access_lines(dir: &std::path::Path, n: usize, wait: Duration) -> Vec<String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let text = std::fs::read_to_string(dir.join("access.log")).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        if lines.len() >= n || Instant::now() > deadline {
+            return lines;
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+/// A request whose response the client doesn't take is logged all the
+/// same, as nginx logs it after a failed send (#410): a client that closes
+/// in the middle of a download (with and without sendfile), and one that
+/// stops reading until send_timeout.
+#[test]
+fn requests_cut_short_by_the_client_are_logged() {
+    let conf = r#"
+events {}
+http {
+  log_format st '$request $status';
+  access_log %%DIR%%/access.log st;
+  send_timeout 1s;
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    root %%DIR%%;
+    location /sf/ { alias %%DIR%%/; sendfile on; }
+  }
+}
+"#;
+    let (_guard, port, dir) = spawn_server(conf);
+    // Sparse: far more than the socket buffers hold.
+    std::fs::File::create(dir.join("big.bin"))
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+
+    let request = |path: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut head = [0; 64];
+        s.read_exact(&mut head).unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 200"));
+        s
+    };
+    // Closed with unread data: the kernel resets the connection.
+    drop(request("/big.bin"));
+    drop(request("/sf/big.bin"));
+    let stalled = request("/big.bin?stalled");
+
+    let lines = access_lines(&dir, 3, Duration::from_secs(5));
+    drop(stalled);
+    let mut lines = lines;
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            "GET /big.bin HTTP/1.1 200",
+            "GET /big.bin?stalled HTTP/1.1 200",
+            "GET /sf/big.bin HTTP/1.1 200",
+        ],
+    );
+}
