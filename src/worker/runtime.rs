@@ -1580,10 +1580,10 @@ pub fn driver() -> Driver {
 }
 
 /// Wait for this worker's connections to finish once shutdown began. When
-/// `main` forces the end (`worker_shutdown_timeout` after a reload), shut
-/// their sockets down, again every second for connections opened since
-/// (an upstream retry); `inherited` is `None` without a private fd table,
-/// where that can't be told apart.
+/// `main` forces the end (`worker_shutdown_timeout` after a reload or
+/// SIGQUIT), shut their sockets down, again every second for connections
+/// opened since (an upstream retry); `inherited` is `None` without a
+/// private fd table, where that can't be told apart.
 async fn drain(state: &RuntimeState, inherited: Option<&[std::os::fd::RawFd]>) {
     let mut swept: Option<Instant> = None;
     while worker_clients() != 0 {

@@ -19,6 +19,11 @@ unsafe extern "C" {
 const SIGQUIT: i32 = 3;
 
 fn start(dir: &Path, directive: &str) -> (common::KillOnDrop, u16) {
+    let location = format!("root {};", dir.display());
+    start_with(dir, directive, &location)
+}
+
+fn start_with(dir: &Path, directive: &str, location: &str) -> (common::KillOnDrop, u16) {
     let setup = common::ports::setup_lock();
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -28,8 +33,9 @@ fn start(dir: &Path, directive: &str) -> (common::KillOnDrop, u16) {
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
-            "pid {d}/ruxen.pid;\n{directive}\nevents {{}}\nhttp {{\n\
-             server {{ listen 127.0.0.1:{port}; location / {{ root {d}; }} }}\n\
+            "pid {d}/ruxen.pid;\nerror_log {d}/error.log;\n{directive}\nevents {{}}\n\
+             http {{\n\
+             server {{ listen 127.0.0.1:{port}; location / {{ {location} }} }}\n\
              }}\n",
             d = dir.display()
         ),
@@ -123,5 +129,50 @@ fn the_timeout_closes_in_flight_connections() {
         read.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
             || rest.len() < 256 << 20,
         "the whole body arrived"
+    );
+}
+
+/// The timeout closes the connections and lets their requests end, as
+/// nginx's ngx_shutdown_timer_handler does: a request waiting for a silent
+/// upstream sees it close, and that is logged before the process exits.
+#[test]
+fn the_timeout_ends_requests_in_progress() {
+    let dir = std::env::temp_dir().join(format!("ruxen-m79-proxy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Takes the request and never answers.
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let silent = std::thread::spawn(move || {
+        let (mut s, _) = upstream.accept().unwrap();
+        let mut buf = [0; 1024];
+        let _ = s.read(&mut buf);
+        sleep(Duration::from_secs(3));
+    });
+
+    let (mut child, port) = start_with(
+        &dir,
+        "worker_shutdown_timeout 100ms;",
+        &format!("proxy_pass http://127.0.0.1:{upstream_port}; proxy_read_timeout 10s;"),
+    );
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    sleep(Duration::from_millis(200));
+    let exited = quit(&mut child, Duration::from_secs(3));
+    if exited.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let error_log = std::fs::read_to_string(dir.join("error.log")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(client);
+    silent.join().unwrap();
+
+    exited.expect("still running 3 s after SIGQUIT");
+    assert!(
+        error_log.contains("upstream prematurely closed connection"),
+        "{error_log}"
     );
 }
