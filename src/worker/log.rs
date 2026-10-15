@@ -70,9 +70,10 @@ pub(crate) struct ErrorLogRequest<'a> {
     pub connection_id: u64,
     pub client: &'a [u8],
     pub server: &'a [u8],
-    pub method: &'a [u8],
-    pub uri: &'a [u8],
-    pub http_11: bool,
+    /// The client's request line, as nginx's r->request_line: an HTTP/2
+    /// request's says `HTTP/2.0`, and an internal redirect doesn't change
+    /// it.
+    pub request_line: &'a [u8],
     pub host: Option<&'a [u8]>,
 }
 
@@ -82,9 +83,7 @@ impl<'a> ErrorLogRequest<'a> {
             connection_id: ctx.connection_id,
             client: ctx.remote_addr,
             server,
-            method: ctx.method_bytes,
-            uri: ctx.path,
-            http_11: ctx.http_11,
+            request_line: ctx.request_line,
             // The Host header line (nginx's r->headers_in.host->value),
             // port included, not the host used for routing. Its letters
             // are already lowercased: the parser folds them in place.
@@ -107,14 +106,8 @@ impl<'a> ErrorLogRequest<'a> {
         out.extend_from_slice(b", server: ");
         out.extend_from_slice(self.server);
         out.extend_from_slice(b", request: \"");
-        out.extend_from_slice(self.method);
-        out.push(b' ');
-        out.extend_from_slice(self.uri);
-        out.extend_from_slice(if self.http_11 {
-            b" HTTP/1.1\""
-        } else {
-            b" HTTP/1.0\""
-        });
+        out.extend_from_slice(self.request_line);
+        out.push(b'"');
         if let Some(upstream) = upstream.filter(|u| !u.is_empty()) {
             out.extend_from_slice(b", upstream: \"");
             out.extend_from_slice(upstream.as_bytes());

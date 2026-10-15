@@ -138,6 +138,13 @@ fn cleartext_http2_with_prior_knowledge() {
 
     let log = std::fs::read_to_string(s.dir.join("access.log")).unwrap();
     assert!(log.contains("\"GET /r HTTP/2.0\" 200"), "{log}");
+    // The error log quotes the request line as the client sent it, as
+    // nginx's r->request_line.
+    let errors = std::fs::read_to_string(s.dir.join("error.log")).unwrap();
+    assert!(
+        errors.contains("request: \"GET /missing HTTP/2.0\""),
+        "{errors}"
+    );
 }
 
 #[test]
