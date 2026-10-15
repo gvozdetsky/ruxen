@@ -481,21 +481,23 @@ async fn write_response_paced<S: ConnIo>(
     request_start: Instant,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
-) -> bool {
+) -> Result<(), u64> {
     let Some(mut pacer) = Pacer::new(rate, after, request_start) else {
-        return false;
+        return Err(0);
     };
     let taken = std::mem::take(scratch);
     let len = taken.len();
     let (res, returned) =
         write_all_paced(stream, taken, len, &mut pacer, timer.as_mut(), send_timeout).await;
     *scratch = returned;
-    if res.is_err() {
-        return false;
+    if let Err(n) = res {
+        return Err(n as u64);
     }
     match file_body {
-        Some(body) => stream_file(stream, body, timer, send_timeout, Some(&mut pacer)).await,
-        None => true,
+        Some(body) => stream_file(stream, body, timer, send_timeout, Some(&mut pacer))
+            .await
+            .map_err(|n| len as u64 + n),
+        None => Ok(()),
     }
 }
 
@@ -3818,6 +3820,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             // A head that didn't go out: no tunnel, but the
                             // request is logged all the same (#410).
                             let head_sent = res.is_ok();
+                            let head_cut_at = res.err().unwrap_or(0) as u64;
                             let head = if head.is_empty() {
                                 lost_head(101)
                             } else {
@@ -3887,7 +3890,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let bytes_sent = if head_sent {
                                     head_len as u64 + tunnelled.to_client
                                 } else {
-                                    0
+                                    head_cut_at
                                 };
                                 write_access_logs(
                                     process_meta.access_logs,
@@ -4093,10 +4096,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // logged with what is known to have gone out, then
                         // the connection closes, as nginx's
                         // ngx_http_terminate_request after a failed send
-                        // (#410). `head_unsent`: not even the head is known
+                        // (#410). `cut_sent`: the bytes that went out then
+                        // (nginx's c->sent), when the write here failed.
                         // to have gone out.
                         let mut cut_short = false;
-                        let mut head_unsent = false;
+                        let mut cut_sent: Option<u64> = None;
                         // Only scan the raw headers for User-Agent when a
                         // policy could actually trigger. disable_safari fires
                         // on any method; disable_msie6 only on POST. Skipping
@@ -4146,13 +4150,13 @@ pub(crate) async fn handle<S: ConnIo>(
                             )
                             .await;
                             *scratch = returned;
-                            if res.is_err() {
+                            if let Err(n) = res {
                                 // A timed-out write took the buffer with it.
                                 if scratch.is_empty() {
                                     scratch.extend_from_slice(variant.bytes);
                                 }
                                 cut_short = true;
-                                head_unsent = true;
+                                cut_sent = Some(n as u64);
                             }
                             response_for_logs = &*scratch;
                         } else {
@@ -4217,7 +4221,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // Cold: `limit_rate`. Boxed so the pacer
                                 // doesn't grow every connection's future.
                                 let body = file_body.take();
-                                if !Box::pin(write_response_paced(
+                                if let Err(n) = Box::pin(write_response_paced(
                                     stream,
                                     &mut *scratch,
                                     body,
@@ -4230,7 +4234,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 .await
                                 {
                                     cut_short = true;
-                                    head_unsent = true;
+                                    cut_sent = Some(n);
                                 }
                             } else if process_meta.sendfile
                                 && file_body.is_some()
@@ -4238,7 +4242,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 && stream.sendfile_fd().is_some()
                             {
                                 let body = file_body.take().expect("checked is_some");
-                                if !send_head_and_file(
+                                if let Err(n) = send_head_and_file(
                                     &*stream,
                                     &mut sock_nonblocking,
                                     scratch,
@@ -4249,7 +4253,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 .await
                                 {
                                     cut_short = true;
-                                    head_unsent = true;
+                                    cut_sent = Some(n);
                                 }
                             } else {
                                 // Hand scratch to monoio for the io_uring
@@ -4267,9 +4271,9 @@ pub(crate) async fn handle<S: ConnIo>(
                                 )
                                 .await;
                                 *scratch = returned;
-                                if res.is_err() {
+                                if let Err(n) = res {
                                     cut_short = true;
-                                    head_unsent = true;
+                                    cut_sent = Some(n as u64);
                                 }
                             }
                             if cut_short && scratch.is_empty() {
@@ -4293,7 +4297,9 @@ pub(crate) async fn handle<S: ConnIo>(
                                     } else {
                                         None
                                     } {
-                                        Some(sent) => sent.then_some(streamed_body_len),
+                                        // HTTP/2 doesn't say how much of
+                                        // its DATA went out: none, then.
+                                        Some(sent) => sent.then_some(streamed_body_len).ok_or(0),
                                         None => stream_file(
                                             stream,
                                             body,
@@ -4302,15 +4308,15 @@ pub(crate) async fn handle<S: ConnIo>(
                                             None,
                                         )
                                         .await
-                                        .then_some(streamed_body_len),
+                                        .map(|()| streamed_body_len),
                                     },
                                 };
+                                // The head went out whole: the body counts
+                                // as far as it got.
                                 match sent {
-                                    Some(n) => streamed_body_len = n,
-                                    // How much of the body went out
-                                    // isn't counted yet: none of it.
-                                    None => {
-                                        streamed_body_len = 0;
+                                    Ok(n) => streamed_body_len = n,
+                                    Err(n) => {
+                                        streamed_body_len = n;
                                         cut_short = true;
                                     }
                                 }
@@ -4327,11 +4333,8 @@ pub(crate) async fn handle<S: ConnIo>(
                             // above, so we don't need a second `windows(4)`
                             // scan here.
                             let header_size = scan.head_end + 4;
-                            let bytes_sent = if head_unsent {
-                                0
-                            } else {
-                                response_for_logs.len() as u64 + streamed_body_len
-                            };
+                            let bytes_sent = cut_sent
+                                .unwrap_or(response_for_logs.len() as u64 + streamed_body_len);
                             let body_bytes_sent = bytes_sent.saturating_sub(header_size as u64);
                             write_access_logs(
                                 process_meta.access_logs,

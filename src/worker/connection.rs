@@ -427,8 +427,9 @@ const SENDFILE_MAX_CHUNK: usize = 2 * 1024 * 1024;
 /// only the direct `send` / `sendfile` calls here see the flag, and they
 /// wait for writability instead of blocking the worker.
 ///
-/// Returns `false` on any write error or if the file is shorter than the
-/// `Content-Length` already promised; the caller drops the connection.
+/// Fails on any write error or if the file is shorter than the
+/// `Content-Length` already promised, with the bytes that went out (head
+/// and file); the caller logs the request and drops the connection.
 pub(crate) async fn send_head_and_file<S: ConnIo>(
     stream: &S,
     nonblocking: &mut bool,
@@ -436,16 +437,16 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
     body: phase::FileBody,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
-) -> bool {
+) -> Result<(), u64> {
     use std::os::unix::io::AsRawFd;
     let Some(sock) = stream.sendfile_fd() else {
-        return false;
+        return Err(0);
     };
     if !*nonblocking {
         // SAFETY: fcntl on an fd we own for the connection's lifetime.
         let flags = unsafe { libc::fcntl(sock, libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(sock, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return false;
+            return Err(0);
         }
         *nonblocking = true;
     }
@@ -474,11 +475,11 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
                 // like nginx's timer between two successive sends.
                 let ready = with_timeout(timer.as_mut(), send_timeout, stream.wait_writable());
                 if !matches!(ready.await, Some(Ok(_))) {
-                    return false;
+                    return Err(sent as u64);
                 }
             }
             std::io::ErrorKind::Interrupted => {}
-            _ => return false,
+            _ => return Err(sent as u64),
         }
     }
 
@@ -494,7 +495,7 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
         }
         if n == 0 {
             // File shrank below the Content-Length we already sent.
-            return false;
+            return Err(sent as u64 + (offset as u64 - body.offset));
         }
         match std::io::Error::last_os_error().kind() {
             std::io::ErrorKind::WouldBlock => {
@@ -502,14 +503,14 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
                 // like nginx's timer between two successive sends.
                 let ready = with_timeout(timer.as_mut(), send_timeout, stream.wait_writable());
                 if !matches!(ready.await, Some(Ok(_))) {
-                    return false;
+                    return Err(sent as u64 + (offset as u64 - body.offset));
                 }
             }
             std::io::ErrorKind::Interrupted => {}
-            _ => return false,
+            _ => return Err(sent as u64 + (offset as u64 - body.offset)),
         }
     }
-    true
+    Ok(())
 }
 
 /// A connection's long-lived timers. monoio extends a registered timer
@@ -623,26 +624,26 @@ where
 /// when one write makes no progress for `timeout`. nginx re-arms the timer
 /// after every partial send, so a slow but steady client may take longer
 /// than `timeout` in total. Writes `buf[..len]`; on a timeout the buffer
-/// is dropped with the write and an empty one comes back.
+/// is dropped with the write and an empty one comes back. A write that
+/// fails says how many bytes went out (nginx's `c->sent`, for the log).
 pub(crate) async fn write_all_timed<S: monoio::io::AsyncWriteRent>(
     stream: &mut S,
     mut buf: Vec<u8>,
     len: usize,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     timeout: Duration,
-) -> (std::io::Result<()>, Vec<u8>) {
+) -> (Result<(), usize>, Vec<u8>) {
     let mut written = 0;
     while written < len {
         let slice = buf.slice(written..len);
         let Some((res, slice)) = with_timeout(timer.as_mut(), timeout, stream.write(slice)).await
         else {
-            return (Err(std::io::ErrorKind::TimedOut.into()), Vec::new());
+            return (Err(written), Vec::new());
         };
         buf = slice.into_inner();
         match res {
-            Ok(0) => return (Err(std::io::ErrorKind::WriteZero.into()), buf),
-            Ok(n) => written += n,
-            Err(e) => return (Err(e), buf),
+            Ok(n) if n > 0 => written += n,
+            _ => return (Err(written), buf),
         }
     }
     (Ok(()), buf)
@@ -735,7 +736,7 @@ pub(crate) async fn write_all_paced<S: ConnIo>(
     pacer: &mut Pacer,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     timeout: Duration,
-) -> (std::io::Result<()>, Vec<u8>) {
+) -> (Result<(), usize>, Vec<u8>) {
     let mut written = 0;
     while written < len {
         let n = match pacer.next(len - written) {
@@ -746,7 +747,7 @@ pub(crate) async fn write_all_paced<S: ConnIo>(
                     _ = stream.peer_closed() => true,
                 };
                 if closed {
-                    return (Err(std::io::ErrorKind::ConnectionAborted.into()), buf);
+                    return (Err(written), buf);
                 }
                 continue;
             }
@@ -754,28 +755,28 @@ pub(crate) async fn write_all_paced<S: ConnIo>(
         let slice = buf.slice(written..written + n);
         let Some((res, slice)) = with_timeout(timer.as_mut(), timeout, stream.write(slice)).await
         else {
-            return (Err(std::io::ErrorKind::TimedOut.into()), Vec::new());
+            return (Err(written), Vec::new());
         };
         buf = slice.into_inner();
         match res {
-            Ok(0) => return (Err(std::io::ErrorKind::WriteZero.into()), buf),
-            Ok(n) => {
+            Ok(n) if n > 0 => {
                 written += n;
                 pacer.sent += n as u64;
             }
-            Err(e) => return (Err(e), buf),
+            _ => return (Err(written), buf),
         }
     }
     (Ok(()), buf)
 }
 
+/// Fails with the body bytes that went out.
 pub(crate) async fn stream_file<S: ConnIo>(
     stream: &mut S,
     body: phase::FileBody,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
     mut pacer: Option<&mut Pacer>,
-) -> bool {
+) -> Result<(), u64> {
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
     // duplicating the fd. Dropping `file` at the end closes the fd.
@@ -790,9 +791,8 @@ pub(crate) async fn stream_file<S: ConnIo>(
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
         let n = match file.read_at(&mut buf[..want], offset) {
-            Ok(0) => return false,
+            Ok(0) | Err(_) => return Err(body.len - remaining),
             Ok(n) => n,
-            Err(_) => return false,
         };
         offset += n as u64;
         let (res, returned) = match pacer.as_deref_mut() {
@@ -819,25 +819,26 @@ pub(crate) async fn stream_file<S: ConnIo>(
             }
         };
         buf = returned;
-        if res.is_err() {
-            return false;
+        if let Err(n) = res {
+            return Err(body.len - remaining + n as u64);
         }
         remaining -= n as u64;
     }
-    true
+    Ok(())
 }
 
 /// `stream_file` through the gzip filter: the file is read in 64 KiB
 /// blocks, compressed, and sent as HTTP/1.1 chunks (or raw for HTTP/1.0,
 /// where the connection closes after). Returns the bytes written, or
-/// `None` on an error or a file shorter than its stat said.
+/// those that went out before an error or a file shorter than its stat
+/// said.
 pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
     stream: &mut S,
     body: phase::FileBody,
     gzip: super::gzip::GzipStream,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
-) -> Option<u64> {
+) -> Result<u64, u64> {
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::from(body.fd);
     let mut deflater = super::gzip::Deflater::new(gzip);
@@ -860,7 +861,7 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
         } else {
             let want = remaining.min(block as u64) as usize;
             match file.read_at(&mut input[..want], offset) {
-                Ok(0) | Err(_) => break None,
+                Ok(0) | Err(_) => break Err(sent),
                 Ok(n) => n,
             }
         };
@@ -900,13 +901,13 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
             )
             .await;
             out = returned;
-            if res.is_err() {
-                break None;
+            if let Err(n) = res {
+                break Err(sent + n as u64);
             }
             sent += len as u64;
         }
         if remaining == 0 {
-            break Some(sent);
+            break Ok(sent);
         }
     };
     deflater.input = input;

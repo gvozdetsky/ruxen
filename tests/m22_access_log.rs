@@ -377,7 +377,7 @@ fn requests_cut_short_by_the_client_are_logged() {
     let conf = r#"
 events {}
 http {
-  log_format st '$request $status';
+  log_format st '$request $status $body_bytes_sent';
   access_log %%DIR%%/access.log st;
   send_timeout 1s;
   server {
@@ -409,14 +409,27 @@ http {
 
     let lines = access_lines(&dir, 3, Duration::from_secs(5));
     drop(stalled);
-    let mut lines = lines;
-    lines.sort();
+    // The body counts as far as it got (nginx's c->sent, #411): not all
+    // of it, and for the stalled client what filled the socket buffers.
+    let mut logged: Vec<(String, u64)> = lines
+        .iter()
+        .map(|l| {
+            let (line, sent) = l.rsplit_once(' ').unwrap();
+            (line.to_owned(), sent.parse().unwrap())
+        })
+        .collect();
+    logged.sort();
+    let requests: Vec<&str> = logged.iter().map(|(l, _)| l.as_str()).collect();
     assert_eq!(
-        lines,
+        requests,
         [
             "GET /big.bin HTTP/1.1 200",
             "GET /big.bin?stalled HTTP/1.1 200",
             "GET /sf/big.bin HTTP/1.1 200",
         ],
     );
+    for (line, sent) in &logged {
+        assert!(*sent < 64 << 20, "{line}: {sent}");
+    }
+    assert!(logged[1].1 > 0, "{logged:?}");
 }
