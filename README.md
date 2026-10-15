@@ -238,11 +238,12 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - `proxy_bind` (including `transparent`)
 - WebSocket and other `Upgrade` connections, tunnelled after the upstream's 101
 - responses relayed as they arrive when nothing needs them whole (no cache, gzip compression or `add_trailer`); otherwise buffered
-- `proxy_http_version`
+- `proxy_http_version`, `proxy_method`
 - `proxy_set_header`
 - request-body forwarding and `proxy_set_body`
 - `proxy_next_upstream` (including `_tries` / `_timeout`)
 - `proxy_intercept_errors`
+- client aborts: a client that closes while the upstream is awaited ends the exchange (499 in the access log), unless `proxy_ignore_client_abort on`
 - byte ranges on proxied responses as nginx allows them: `proxy_force_ranges`, cacheable and cached responses (multipart from the cache), `max_ranges`
 - `proxy_redirect`, including the implicit default
 - `proxy_hide_header` / `proxy_pass_header`
