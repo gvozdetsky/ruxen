@@ -94,6 +94,7 @@ where
     let timeouts = listen.servers[listen.default_server].timeouts;
     let io = compat::PollIo::new(stream);
     let writing_since = io.writing_since();
+    let header_blocks = io.header_blocks();
     let stream = io.stream_handle();
     // What nginx announces (ngx_http_v2_send_settings), from the default
     // server's settings: http2_max_concurrent_streams (128), a stream
@@ -118,7 +119,7 @@ where
         Ok(Ok(conn)) => conn,
         _ => return,
     };
-    drive(conn, &ctx, timeouts, writing_since).await;
+    drive(conn, &ctx, timeouts, writing_since, header_blocks).await;
     // The `h2` connection, and with it every operation on the stream, is
     // gone. Close as nginx does (ngx_http_v2_finalize_connection →
     // lingering close): what the client still sends (a WINDOW_UPDATE, a
@@ -136,6 +137,7 @@ async fn drive<IO>(
     ctx: &Rc<ConnCtx>,
     timeouts: super::PreparedClientTimeouts,
     writing_since: Rc<Cell<Option<std::time::Instant>>>,
+    header_blocks: Rc<compat::HeaderBlocks>,
 ) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -207,13 +209,14 @@ async fn drive<IO>(
             Some(Some(Ok((request, respond)))) => {
                 streams.active.set(streams.active.get() + 1);
                 let counters = (started, requests);
+                let header_block = header_blocks.take(u32::from(respond.stream_id()));
                 requests += 1;
                 let (http, connection_id, peer_addr) = (ctx.http, ctx.connection_id, ctx.peer_addr);
                 let ctx = ctx.clone();
                 let streams = streams.clone();
                 monoio::spawn(Contained::new(
                     async move {
-                        serve_stream(request, respond, &ctx, counters).await;
+                        serve_stream(request, respond, &ctx, counters, header_block).await;
                         streams.end();
                     },
                     http,
@@ -336,6 +339,7 @@ async fn serve_stream(
     respond: h2::server::SendResponse<Bytes>,
     ctx: &ConnCtx,
     counters: (std::time::Instant, u64),
+    header_block: u64,
 ) {
     let (parts, body) = request.into_parts();
     let listen = &ctx.http.listens[ctx.listen_index];
@@ -348,7 +352,7 @@ async fn serve_stream(
         .h2
         .chunk_size
         .unwrap_or(8 * 1024) as usize;
-    let mut io = stream::StreamIo::new(&parts, body, respond, counters, chunk);
+    let mut io = stream::StreamIo::new(&parts, body, respond, counters, chunk, header_block);
     super::handle(
         &mut io,
         ctx.peer_addr,

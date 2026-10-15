@@ -145,6 +145,13 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         false
     }
 
+    /// For an HTTP/2 stream, the size of its header block as the client
+    /// sent it, where nginx's `$request_length` starts there instead of
+    /// the HTTP/1.1 head `handle` reads (#409).
+    fn h2_header_block(&self) -> Option<u64> {
+        None
+    }
+
     /// For an HTTP/2 stream, its connection's start and the requests it
     /// carried before this one (`$connection_time`, `$connection_requests`).
     fn conn_counters(&self) -> Option<(Instant, u64)> {

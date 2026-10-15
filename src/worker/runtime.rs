@@ -3713,7 +3713,14 @@ pub(crate) async fn handle<S: ConnIo>(
                         };
                         let body_file = request_body_file.as_ref();
                         let request_total_consumed = req.consumed + body_in_buf;
-                        let request_length = req.consumed as u64 + request_body_len as u64;
+                        // HTTP/2: the header block, and the body as it was
+                        // read (DATA bytes), not when it was discarded:
+                        // nginx counts it in ngx_http_v2_process_request_body.
+                        let request_length = match stream.h2_header_block() {
+                            Some(block) if discard_body || body_too_large => block,
+                            Some(block) => block + body_len as u64,
+                            None => req.consumed as u64 + request_body_len as u64,
+                        };
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default();
