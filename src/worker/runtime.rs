@@ -177,8 +177,15 @@ pub(crate) async fn write_access_logs(
         // A path with variables: render, open, write, close (#303).
         if let Some(path) = log.path_vars {
             let error_logs = meta.map_or(&[][..], |m| m.log.error_logs);
-            write_access_line_by_path(path, meta.and_then(|m| m.doc_root), error_logs, &ctx, line)
-                .await;
+            write_access_line_by_path(
+                path,
+                log.open_cache,
+                meta.and_then(|m| m.doc_root),
+                error_logs,
+                &ctx,
+                line,
+            )
+            .await;
             continue;
         }
         // `buffer=`: into this worker's buffer for the file (#151).
@@ -216,6 +223,7 @@ pub(crate) async fn write_access_logs(
 #[inline(never)]
 async fn write_access_line_by_path(
     path: &'static [PreparedValuePart],
+    cache: Option<&'static crate::config::OpenLogFileCache>,
     doc_root: Option<&'static DocRoot>,
     error_logs: &'static [PreparedErrorLog],
     ctx: &RenderCtx<'_>,
@@ -239,6 +247,21 @@ async fn write_access_line_by_path(
     render_parts(path, ctx, &mut rendered);
     use std::os::unix::ffi::OsStrExt;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&rendered));
+    // open_log_file_cache (#371): through this worker's cache.
+    if let Some(cache) = cache {
+        if let Err(e) = super::open_log_cache::write(cache, path, &line) {
+            write_worker_log(
+                error_logs,
+                ErrorLogLevel::Error,
+                &format!(
+                    "open() \"{}\" failed ({}) while logging request",
+                    path.display(),
+                    errno_text(&e)
+                ),
+            );
+        }
+        return;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

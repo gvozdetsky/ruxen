@@ -300,6 +300,8 @@ pub struct HttpConfig {
     pub log_formats: Vec<LogFormatDef>,
     /// `access_log` directives declared at http scope.
     pub access_logs: Vec<AccessLog>,
+    /// http-scope `open_log_file_cache`; `None` for none or `off`.
+    pub open_log_file_cache: Option<OpenLogFileCache>,
     /// http-scope `server_tokens`. `None` means "not set" — server/location
     /// blocks then default to `On`. Setting it here changes the inherited
     /// baseline for all child scopes.
@@ -799,6 +801,9 @@ pub struct Server {
     /// list. `Some(empty)` means `access_log off;` was used to disable
     /// logging at this scope (parser collapses `off` to an empty vec).
     pub access_logs: Option<Vec<AccessLog>>,
+    /// Server-scope `open_log_file_cache`: `None` inherits, `Some(None)`
+    /// is `off`.
+    pub open_log_file_cache: Option<Option<OpenLogFileCache>>,
     /// Server-scope `auth_basic` realm or explicit `off`.
     pub auth_basic: Option<AuthBasic>,
     /// Server-scope `auth_basic_user_file`. `None` inherits from http scope.
@@ -937,6 +942,9 @@ pub struct Location {
     /// Location-scope `access_log` directives. `None` inherits from server.
     /// `Some(empty)` is `access_log off;` — explicit suppression.
     pub access_logs: Option<Vec<AccessLog>>,
+    /// Location-scope `open_log_file_cache`: `None` inherits, `Some(None)`
+    /// is `off`.
+    pub open_log_file_cache: Option<Option<OpenLogFileCache>>,
     /// Location-scope `auth_basic` realm or explicit `off`.
     pub auth_basic: Option<AuthBasic>,
     /// Location-scope `auth_basic_user_file`. `None` inherits from server.
@@ -1224,6 +1232,20 @@ pub enum LogEscape {
     Json,
     /// Bytes as they are; a value that isn't set is empty.
     None,
+}
+
+/// `open_log_file_cache max=N [inactive=time] [min_uses=N] [valid=time]`
+/// (#371): access_log files whose path has variables stay open between
+/// lines (ngx_http_log_open_file_cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenLogFileCache {
+    /// Which directive this is: locations that inherit it share its cache,
+    /// as nginx's share the one `ngx_open_file_cache_t`.
+    pub id: u32,
+    pub max: u32,
+    pub inactive_ms: u64,
+    pub min_uses: u32,
+    pub valid_ms: u64,
 }
 
 /// One `access_log path [format] [if=expr];` sink.

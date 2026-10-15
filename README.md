@@ -290,7 +290,7 @@ A growing nginx-compatible configuration surface is implemented, including:
 - realip: `set_real_ip_from`, `real_ip_header` (including `proxy_protocol`), `real_ip_recursive`
 - `user`: started as root, ruxen switches to it after binding (see [Install](#install))
 - `log_format`
-- `access_log` and `error_log`, including `syslog:` targets
+- `access_log` and `error_log`, including `syslog:` targets; `open_log_file_cache` for access_log paths with variables
 
 Many common nginx variables are also available, including request, response, upstream, TLS, cookie, header and rewrite variables.
 
