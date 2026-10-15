@@ -54,12 +54,15 @@ pub struct Conditionals<'a> {
     /// "Last-Modified suppressed", and non-empty values are parsed as
     /// HTTP-date for conditional comparisons.
     pub last_modified_override: Option<&'a [u8]>,
-    /// nginx's range filter runs: a `Range` is honoured and a 200 says
-    /// `Accept-Ranges: bytes`. False for `max_ranges 0` (#370), where the
-    /// filter declines (ngx_http_range_header_filter): `range` and
-    /// `if_range` count for nothing and there is no `Accept-Ranges`.
-    pub accept_ranges: bool,
+    /// The location's `max_ranges` (`None`: no limit). With 0, nginx's
+    /// range filter declines (ngx_http_range_header_filter, #370): `range`
+    /// and `if_range` count for nothing and a 200 has no `Accept-Ranges`.
+    pub max_ranges: Option<u32>,
 }
+
+/// Several ranges are read into memory for their multipart response up to
+/// this many bytes in total; beyond it the file goes whole, a 200 (#401).
+const MULTIPART_MAX: u64 = 1 << 20;
 
 struct FileMeta {
     size: u64,
@@ -98,18 +101,13 @@ enum Decision {
         start: u64,
         end: u64,
     },
+    /// Several ranges: a multipart/byteranges 206.
+    Ranges(crate::worker::range::Ranges),
     UnsatisfiableRange,
     /// `If-Match` failed against a resource that *does* exist — RFC 9110
     /// §13.1.1 says 412. We return this from `decide` and let the content
     /// builder emit the bare 412 with no body.
     PreconditionFailed,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum RangeParse {
-    Ignore,
-    Slice { start: u64, end: u64 },
-    Unsatisfiable,
 }
 
 /// Serve an already-opened, root-contained file. The resolver has done
@@ -144,8 +142,13 @@ pub fn serve_path(
 
     let meta = meta_from_opened(&opened);
 
-    let accept_ranges = cond.accept_ranges;
-    match decide(&meta, cond) {
+    let accept_ranges = cond.max_ranges != Some(0);
+    let head_only = matches!(method, Method::Head);
+    let decision = match decide(&meta, cond) {
+        Decision::Ranges(ranges) if ranges.size() > MULTIPART_MAX => Decision::Full,
+        decision => decision,
+    };
+    match decision {
         Decision::NotModified => Response::Owned(build_not_modified_response(&meta, server)),
         Decision::Full => {
             let body_len = meta.size;
@@ -171,7 +174,9 @@ pub fn serve_path(
         }
         Decision::Range { start, end } => {
             let body_len = end - start + 1;
-            let mut headers = build_content_headers(&meta, 206, Some((start, end)), true, server);
+            // nginx's 206 has no `Accept-Ranges`: the range filter's
+            // header filter adds it only to a response it doesn't cut.
+            let mut headers = build_content_headers(&meta, 206, Some((start, end)), false, server);
             if matches!(method, Method::Head) || body_len == 0 {
                 Response::Owned(headers)
             } else if body_len <= inline_limit {
@@ -191,9 +196,20 @@ pub fn serve_path(
                 }
             }
         }
-        Decision::UnsatisfiableRange => {
-            Response::Owned(build_range_not_satisfiable_response(&meta, server))
+        Decision::Ranges(ranges) => {
+            let mut head = build_content_headers(&meta, 200, None, false, server);
+            head.truncate(head.len() - 4);
+            let fd = opened.fd.as_raw_fd();
+            let read =
+                |start: u64, end: u64, out: &mut Vec<u8>| read_at_into(fd, start, end - start, out);
+            match crate::worker::range::multipart(&head, meta.size, &ranges, head_only, read) {
+                Ok(out) => Response::Owned(out),
+                Err(e) => Response::Owned(io_error_response(e, method, server)),
+            }
         }
+        Decision::UnsatisfiableRange => Response::Owned(crate::worker::range::not_satisfiable(
+            meta.size, head_only, server,
+        )),
         Decision::PreconditionFailed => {
             Response::Owned(error_response(412, "Precondition Failed\n", method, server))
         }
@@ -265,20 +281,24 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
         }
     }
 
-    let mut range = cond.range.filter(|_| cond.accept_ranges);
+    let mut range = cond.range.filter(|_| cond.max_ranges != Some(0));
     if let (Some(_), Some(if_range)) = (range, cond.if_range) {
         if !if_range_matches(if_range, meta, conditional_last_modified) {
             range = None;
         }
     }
 
-    match range {
-        Some(value) => match parse_range(value, meta.size) {
-            RangeParse::Ignore => Decision::Full,
-            RangeParse::Slice { start, end } => Decision::Range { start, end },
-            RangeParse::Unsatisfiable => Decision::UnsatisfiableRange,
+    // nginx's range filter: its parse, up to max_ranges ranges.
+    use crate::worker::range::{Parsed, parse_header};
+    let limit = cond.max_ranges.map_or(u64::MAX, u64::from);
+    match range.and_then(|value| parse_header(value, meta.size, limit)) {
+        None | Some(Parsed::Declined) => Decision::Full,
+        Some(Parsed::NotSatisfiable) => Decision::UnsatisfiableRange,
+        Some(Parsed::Ranges(ranges)) if ranges.len() == 1 => Decision::Range {
+            start: ranges.first.0,
+            end: ranges.first.1 - 1,
         },
-        None => Decision::Full,
+        Some(Parsed::Ranges(ranges)) => Decision::Ranges(ranges),
     }
 }
 
@@ -399,22 +419,6 @@ fn build_not_modified_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
     out
 }
 
-fn build_range_not_satisfiable_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
-    write_status_line(&mut out, 416);
-    crate::http::write_server_and_date(&mut out, server);
-    out.extend_from_slice(b"\r\nAccept-Ranges: bytes");
-    out.extend_from_slice(b"\r\nContent-Range: bytes */");
-    write_u64(&mut out, meta.size);
-    out.extend_from_slice(b"\r\nContent-Length: 0");
-    out.extend_from_slice(b"\r\nLast-Modified: ");
-    out.extend_from_slice(&meta.last_modified);
-    out.extend_from_slice(b"\r\nETag: ");
-    out.extend_from_slice(meta.etag.as_slice());
-    out.extend_from_slice(b"\r\n\r\n");
-    out
-}
-
 fn if_range_matches(value: &[u8], meta: &FileMeta, conditional_last_modified: Option<u64>) -> bool {
     // If-Range with an entity-tag uses strong comparison.
     if let Some(first) = value.first() {
@@ -522,73 +526,6 @@ fn etag_weak_equal(a: &[u8], b: &[u8]) -> bool {
     let a = a.strip_prefix(b"W/").unwrap_or(a);
     let b = b.strip_prefix(b"W/").unwrap_or(b);
     a == b
-}
-
-fn parse_range(value: &[u8], size: u64) -> RangeParse {
-    if !value.starts_with(b"bytes=") {
-        return RangeParse::Ignore;
-    }
-    let spec = &value[6..];
-    if spec.is_empty() || spec.contains(&b',') {
-        return RangeParse::Ignore;
-    }
-    let Some(dash) = spec.iter().position(|&b| b == b'-') else {
-        return RangeParse::Ignore;
-    };
-    let start = trim_ows(&spec[..dash]);
-    let end = trim_ows(&spec[dash + 1..]);
-
-    if start.is_empty() {
-        let Some(suffix_len) = parse_u64_ascii(end) else {
-            return RangeParse::Ignore;
-        };
-        if suffix_len == 0 || size == 0 {
-            return RangeParse::Unsatisfiable;
-        }
-        let body_len = suffix_len.min(size);
-        return RangeParse::Slice {
-            start: size - body_len,
-            end: size - 1,
-        };
-    }
-
-    let Some(start) = parse_u64_ascii(start) else {
-        return RangeParse::Ignore;
-    };
-    if start >= size {
-        return RangeParse::Unsatisfiable;
-    }
-    if end.is_empty() {
-        return RangeParse::Slice {
-            start,
-            end: size - 1,
-        };
-    }
-    let Some(end) = parse_u64_ascii(end) else {
-        return RangeParse::Ignore;
-    };
-    if end < start {
-        return RangeParse::Ignore;
-    }
-    RangeParse::Slice {
-        start,
-        end: end.min(size - 1),
-    }
-}
-
-fn parse_u64_ascii(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() {
-        return None;
-    }
-
-    let mut out = 0u64;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        out = out.checked_mul(10)?.checked_add((b - b'0') as u64)?;
-    }
-    Some(out)
 }
 
 fn trim_ows(mut bytes: &[u8]) -> &[u8] {
@@ -1061,7 +998,7 @@ mod tests {
             range: None,
             if_range: None,
             last_modified_override: None,
-            accept_ranges: true,
+            max_ranges: None,
         }
     }
 
@@ -1354,29 +1291,57 @@ mod tests {
         assert_eq!(days_in_month(2100, 2), 28);
     }
 
+    fn range_decision(range: &str, size: u64, max_ranges: Option<u32>) -> Decision {
+        decide(
+            &meta(size, 100),
+            Conditionals {
+                if_modified_since: None,
+                if_unmodified_since: None,
+                if_none_match: None,
+                if_match: None,
+                range: Some(range.as_bytes()),
+                if_range: None,
+                last_modified_override: None,
+                max_ranges,
+            },
+        )
+    }
+
+    /// nginx's range parse (#401): several ranges, a reversed one is not
+    /// satisfiable, more than max_ranges or another unit is the whole file.
     #[test]
-    fn range_parser_table() {
+    fn ranges_are_decided_as_nginx() {
+        use crate::worker::range::Ranges;
+        let range = |start, end| Decision::Range { start, end };
+        assert_eq!(range_decision("bytes=0-9", 100, None), range(0, 9));
+        assert_eq!(range_decision("bytes=0-", 100, None), range(0, 99));
+        assert_eq!(range_decision("bytes=-9", 100, None), range(91, 99));
+        assert_eq!(range_decision("BYTES=0-9", 100, None), range(0, 9));
         assert_eq!(
-            parse_range(b"bytes=0-9", 100),
-            RangeParse::Slice { start: 0, end: 9 }
+            range_decision("bytes=0-9,20-29", 100, None),
+            Decision::Ranges(Ranges {
+                first: (0, 10),
+                rest: vec![(20, 30)]
+            })
         );
         assert_eq!(
-            parse_range(b"bytes=0-", 100),
-            RangeParse::Slice { start: 0, end: 99 }
+            range_decision("bytes=0-9,20-29", 100, Some(1)),
+            Decision::Full
         );
         assert_eq!(
-            parse_range(b"bytes=-9", 100),
-            RangeParse::Slice { start: 91, end: 99 }
+            range_decision("bytes=9-0", 100, None),
+            Decision::UnsatisfiableRange
         );
-        assert_eq!(parse_range(b"bytes=9-0", 100), RangeParse::Ignore);
         assert_eq!(
-            parse_range(b"bytes=1000-2000", 100),
-            RangeParse::Unsatisfiable
+            range_decision("bytes=1000-2000", 100, None),
+            Decision::UnsatisfiableRange
         );
-        assert_eq!(parse_range(b"items=0-9", 100), RangeParse::Ignore);
-        assert_eq!(parse_range(b"bytes=0-9,20-29", 100), RangeParse::Ignore);
-        assert_eq!(parse_range(b"bytes=wat", 100), RangeParse::Ignore);
-        assert_eq!(parse_range(b"bytes=-1", 0), RangeParse::Unsatisfiable);
+        assert_eq!(range_decision("items=0-9", 100, None), Decision::Full);
+        assert_eq!(
+            range_decision("bytes=wat", 100, None),
+            Decision::UnsatisfiableRange
+        );
+        assert_eq!(range_decision("bytes=0-9", 100, Some(0)), Decision::Full);
     }
 
     #[test]
@@ -1392,7 +1357,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1411,7 +1376,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1435,7 +1400,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1456,7 +1421,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1475,7 +1440,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b""),
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1494,7 +1459,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::PreconditionFailed);
@@ -1513,7 +1478,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1534,7 +1499,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1553,7 +1518,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1572,7 +1537,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: Some(b""),
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1591,7 +1556,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(b"W/\"other\""),
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1612,7 +1577,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(meta.etag.as_slice()),
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1632,7 +1597,7 @@ mod tests {
                 Method::Get,
                 Conditionals {
                     range: Some(range),
-                    accept_ranges: false,
+                    max_ranges: Some(0),
                     ..no_cond()
                 },
                 b"nginx/1.29.2",
@@ -1666,7 +1631,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1689,7 +1654,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(&weak),
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1708,7 +1673,7 @@ mod tests {
                 range: Some(b"bytes=0-9"),
                 if_range: Some(&meta.last_modified),
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1727,7 +1692,7 @@ mod tests {
                 range: None,
                 if_range: None,
                 last_modified_override: None,
-                accept_ranges: true,
+                max_ranges: None,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1774,7 +1739,7 @@ mod tests {
                     range: None,
                     if_range: None,
                     last_modified_override: None,
-                    accept_ranges: true,
+                    max_ranges: None,
                 },
             );
             assert_eq!(decision, Decision::NotModified, "INM={:?}", inm);
@@ -1855,14 +1820,64 @@ mod tests {
         assert!(s.ends_with("\r\n\r\n"));
     }
 
+    /// Several ranges are a multipart/byteranges 206 read from the file;
+    /// none satisfiable is nginx's 416 page, with `Content-Range` and none
+    /// of the file's validators (#401).
     #[test]
-    fn range_not_satisfiable_includes_content_range() {
-        let meta = meta(10, 100);
-        let out = build_range_not_satisfiable_response(&meta, b"nginx/1.29.2");
-        let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.starts_with("HTTP/1.1 416 Requested Range Not Satisfiable\r\n"));
-        assert!(s.contains("Content-Range: bytes */10\r\n"));
-        assert!(s.contains("Content-Length: 0\r\n"));
+    fn multipart_and_not_satisfiable_responses() {
+        let dir = unique_dir();
+        let path = dir.join("t.txt");
+        std::fs::write(&path, b"SEE-THIS").unwrap();
+        let serve = |range: &'static [u8], method| {
+            let r = serve_path(
+                open_for_test(&path),
+                method,
+                Conditionals {
+                    range: Some(range),
+                    ..no_cond()
+                },
+                b"nginx/1.29.2",
+                false,
+            );
+            let Response::Owned(bytes) = r else {
+                panic!("expected an inline response");
+            };
+            String::from_utf8(bytes).unwrap()
+        };
+        let s = serve(b"bytes=0-2,4-", Method::Get);
+        assert!(s.starts_with("HTTP/1.1 206 Partial Content\r\n"), "{s}");
+        let boundary = s
+            .split("boundary=")
+            .nth(1)
+            .and_then(|b| b.split("\r\n").next())
+            .unwrap();
+        let body = format!(
+            "\r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 0-2/8\r\n\r\nSEE\
+             \r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 4-7/8\r\n\r\nTHIS\
+             \r\n--{boundary}--\r\n"
+        );
+        assert!(s.ends_with(&format!("\r\n\r\n{body}")), "{s}");
+        assert!(
+            s.contains(&format!("\r\nContent-Length: {}\r\n", body.len())),
+            "{s}"
+        );
+        assert!(!s.contains("Accept-Ranges"), "{s}");
+        // HEAD: the same length, no body.
+        let head = serve(b"bytes=0-2,4-", Method::Head);
+        assert!(head.contains(&format!("\r\nContent-Length: {}\r\n", body.len())));
+        assert!(head.ends_with("\r\n\r\n"), "{head}");
+
+        for range in [&b"bytes=4-2"[..], b"bytes=1000-"] {
+            let s = serve(range, Method::Get);
+            assert!(
+                s.starts_with("HTTP/1.1 416 Requested Range Not Satisfiable\r\n"),
+                "{s}"
+            );
+            assert!(s.contains("\r\nContent-Type: text/html\r\n"), "{s}");
+            assert!(s.contains("\r\nContent-Range: bytes */8\r\n"), "{s}");
+            assert!(s.contains("<title>416 Requested Range Not Satisfiable</title>"));
+            assert!(!s.contains("ETag") && !s.contains("Accept-Ranges"), "{s}");
+        }
     }
 
     #[test]
