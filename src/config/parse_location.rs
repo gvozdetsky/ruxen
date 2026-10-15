@@ -287,6 +287,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     or(&mut child.keepalive_disable, &parent.keepalive_disable);
     or(&mut child.error_logs, &parent.error_logs);
     or(&mut child.log_not_found, &parent.log_not_found);
+    or(&mut child.open_log_file_cache, &parent.open_log_file_cache);
     or(
         &mut child.recursive_error_pages,
         &parent.recursive_error_pages,
@@ -541,6 +542,7 @@ pub(crate) fn parse_location_block(
     let mut autoindex_localtime: Option<bool> = None;
     let mut autoindex_format: Option<AutoindexFormat> = None;
     let mut access_logs: Option<Vec<AccessLog>> = None;
+    let mut open_log_file_cache: Option<Option<OpenLogFileCache>> = None;
     let mut auth_basic: Option<AuthBasic> = None;
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
@@ -676,6 +678,7 @@ pub(crate) fn parse_location_block(
                         keepalive_disable,
                         error_logs,
                         log_not_found,
+                        open_log_file_cache,
                         recursive_error_pages,
                         internal,
                         server_tokens: effective_server_tokens,
@@ -861,6 +864,12 @@ pub(crate) fn parse_location_block(
                     ParsedAccessLog::Off => list.clear(),
                     ParsedAccessLog::Entry(log) => list.push(log),
                 }
+            }
+            ("open_log_file_cache", Terminator::Semi) => {
+                if open_log_file_cache.is_some() {
+                    return Err(Error::Duplicate("open_log_file_cache"));
+                }
+                open_log_file_cache = Some(parse_open_log_file_cache_args(&args[1..])?);
             }
             ("auth_basic", Terminator::Semi) => {
                 if auth_basic.is_some() {

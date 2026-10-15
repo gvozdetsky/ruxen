@@ -4,6 +4,72 @@
 use super::*;
 use std::net::SocketAddr;
 
+/// `open_log_file_cache max=N [inactive=time] [min_uses=N] [valid=time] |
+/// off` (`ngx_http_log_open_file_cache`): `None` for `off`. Defaults as
+/// nginx's: inactive 10s, min_uses 1, valid 60s.
+pub(crate) fn parse_open_log_file_cache_args(
+    args: &[String],
+) -> Result<Option<OpenLogFileCache>, Error> {
+    const WHAT: &str = "open_log_file_cache";
+    static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    if args.is_empty() {
+        return Err(Error::MissingArg(WHAT));
+    }
+    if args.len() > 4 {
+        return Err(Error::BadValue {
+            what: WHAT,
+            got: args.join(" "),
+        });
+    }
+    let count = |v: &str| {
+        v.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| v.parse::<u32>().ok())
+            .flatten()
+    };
+    let mut cache = OpenLogFileCache {
+        id: 0,
+        max: 0,
+        inactive_ms: 10_000,
+        min_uses: 1,
+        valid_ms: 60_000,
+    };
+    let mut off = false;
+    for a in args {
+        let ok = if let Some(v) = a.strip_prefix("max=") {
+            count(v).map(|n| cache.max = n)
+        } else if let Some(v) = a.strip_prefix("min_uses=") {
+            count(v).map(|n| cache.min_uses = n)
+        } else if let Some(v) = a.strip_prefix("inactive=") {
+            parse_time(v, true).map(|s| cache.inactive_ms = s as u64 * 1000)
+        } else if let Some(v) = a.strip_prefix("valid=") {
+            parse_time(v, true).map(|s| cache.valid_ms = s as u64 * 1000)
+        } else if a == "off" {
+            off = true;
+            Some(())
+        } else {
+            None
+        };
+        if ok.is_none() {
+            return Err(Error::BadValue {
+                what: WHAT,
+                got: a.clone(),
+            });
+        }
+    }
+    if cache.max == 0 {
+        if off {
+            return Ok(None);
+        }
+        return Err(Error::BadValue {
+            what: "open_log_file_cache (must have \"max\" parameter)",
+            got: args.join(" "),
+        });
+    }
+    cache.id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some(cache))
+}
+
 pub(crate) enum ParsedAccessLog {
     Off,
     Entry(AccessLog),

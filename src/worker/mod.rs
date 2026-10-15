@@ -58,6 +58,7 @@ pub(crate) mod limit_req;
 pub(crate) mod listeners;
 mod log;
 pub(crate) mod logbuf;
+pub(crate) mod open_log_cache;
 mod panics;
 mod prepare;
 mod prepared;

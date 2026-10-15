@@ -419,6 +419,9 @@ pub struct PreparedAccessLog {
     pub buffer: Option<&'static PreparedLogBuffer>,
     /// The path has variables: rendered, opened and closed per line (#303).
     pub path_vars: Option<&'static [PreparedValuePart]>,
+    /// For a path with variables, the `open_log_file_cache` of the scope
+    /// whose list this is (#371): the files stay open between lines.
+    pub open_cache: Option<&'static crate::config::OpenLogFileCache>,
 }
 
 /// A buffered access_log file, shared by every `access_log` with buffer

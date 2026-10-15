@@ -276,6 +276,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut root: Option<PathBuf> = None;
     let mut log_formats: Vec<LogFormatDef> = Vec::new();
     let mut access_logs: Vec<AccessLog> = Vec::new();
+    let mut open_log_file_cache: Option<Option<OpenLogFileCache>> = None;
     let mut server_tokens: Option<ServerTokens> = None;
     let mut autoindex: Option<bool> = None;
     let mut autoindex_exact_size: Option<bool> = None;
@@ -386,6 +387,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         error_logs,
                         log_formats,
                         access_logs,
+                        open_log_file_cache: open_log_file_cache.flatten(),
                         server_tokens,
                         autoindex,
                         autoindex_exact_size,
@@ -489,6 +491,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 ParsedAccessLog::Off => access_logs.clear(),
                 ParsedAccessLog::Entry(log) => access_logs.push(log),
             },
+            ("open_log_file_cache", Terminator::Semi) => {
+                if open_log_file_cache.is_some() {
+                    return Err(Error::Duplicate("open_log_file_cache"));
+                }
+                open_log_file_cache = Some(parse_open_log_file_cache_args(&args[1..])?);
+            }
             ("server_tokens", Terminator::Semi) => {
                 if server_tokens.is_some() {
                     return Err(Error::Duplicate("server_tokens"));
@@ -1018,9 +1026,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "fastcgi_temp_path",
     "uwsgi_temp_path",
     "scgi_temp_path",
-    // Caches the descriptors of access logs whose path has variables; ruxen
-    // opens access logs once per worker anyway. Arguments are checked.
-    "open_log_file_cache",
     "proxy_cookie_domain",
     "proxy_cookie_path",
     "proxy_cookie_flags",
@@ -1187,58 +1192,9 @@ pub(crate) fn check_ignored_args(lx: &Lexer, args: &[String]) -> Result<(), Erro
         "fastcgi_temp_path" => "fastcgi_temp_path",
         "uwsgi_temp_path" => "uwsgi_temp_path",
         "scgi_temp_path" => "scgi_temp_path",
-        "open_log_file_cache" => return check_open_log_file_cache_args(&args[1..]),
         _ => return Ok(()),
     };
     parse_temp_path_args(&args[1..], what).map(drop)
-}
-
-/// `open_log_file_cache max=N [inactive=time] [min_uses=N] [valid=time] | off`
-/// (`ngx_http_log_open_file_cache`).
-fn check_open_log_file_cache_args(args: &[String]) -> Result<(), Error> {
-    const WHAT: &str = "open_log_file_cache";
-    if args.is_empty() {
-        return Err(Error::MissingArg(WHAT));
-    }
-    if args.len() > 4 {
-        return Err(Error::BadValue {
-            what: WHAT,
-            got: args.join(" "),
-        });
-    }
-    let count = |v: &str| v.parse::<u64>().is_ok() && v.bytes().all(|b| b.is_ascii_digit());
-    let (mut max, mut off) = (0_u64, false);
-    for a in args {
-        let ok = if let Some(v) = a.strip_prefix("max=") {
-            max = v.parse().unwrap_or(0);
-            count(v)
-        } else if let Some(v) = a.strip_prefix("min_uses=") {
-            count(v)
-        } else if let Some(v) = a
-            .strip_prefix("inactive=")
-            .or_else(|| a.strip_prefix("valid="))
-        {
-            parse_time(v, true).is_some()
-        } else if a == "off" {
-            off = true;
-            true
-        } else {
-            false
-        };
-        if !ok {
-            return Err(Error::BadValue {
-                what: WHAT,
-                got: a.clone(),
-            });
-        }
-    }
-    if !off && max == 0 {
-        return Err(Error::BadValue {
-            what: "open_log_file_cache (must have \"max\" parameter)",
-            got: args.join(" "),
-        });
-    }
-    Ok(())
 }
 
 #[inline]
@@ -3846,8 +3802,57 @@ mod tests {
         assert!(matches!(tf.fallback, TryFilesFallback::UriTemplate(_)));
     }
 
+    /// `open_log_file_cache` per scope (#371): `off` at a server, a
+    /// nested location takes its parent's, defaults as nginx's.
     #[test]
-    fn module_temp_paths_and_open_log_file_cache_are_checked_no_ops() {
+    fn open_log_file_cache_is_parsed_per_scope() {
+        let cfg = parse(
+            r#"
+            http {
+                open_log_file_cache max=3 min_uses=2;
+                server { listen 80; open_log_file_cache off;
+                    location /a { open_log_file_cache max=5 inactive=1m valid=10s;
+                        location /a/b { }
+                    }
+                    location /c { }
+                }
+            }
+        "#,
+        )
+        .unwrap();
+        let http = cfg;
+        let top = http.open_log_file_cache.unwrap();
+        assert_eq!(
+            (top.max, top.min_uses, top.inactive_ms, top.valid_ms),
+            (3, 2, 10_000, 60_000)
+        );
+        let server = &http.servers[0];
+        assert_eq!(server.open_log_file_cache, Some(None));
+        let a = server.locations.iter().find(|l| l.pattern == "/a").unwrap();
+        let own = a.open_log_file_cache.unwrap().unwrap();
+        assert_eq!(
+            (own.max, own.inactive_ms, own.valid_ms),
+            (5, 60_000, 10_000)
+        );
+        let nested = server
+            .locations
+            .iter()
+            .find(|l| l.pattern == "/a/b")
+            .unwrap();
+        assert_eq!(nested.open_log_file_cache, Some(Some(own)));
+        let c = server.locations.iter().find(|l| l.pattern == "/c").unwrap();
+        assert_eq!(c.open_log_file_cache, None);
+        for bad in [
+            "open_log_file_cache max=1; open_log_file_cache max=2;",
+            "location / { if ($a) { open_log_file_cache max=1; } }",
+        ] {
+            let src = format!("http {{ server {{ listen 80; {bad} }} }}");
+            assert!(parse(&src).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn module_temp_paths_are_checked_no_ops_and_open_log_file_cache_is_checked() {
         let src = r#"
             http {
                 fastcgi_temp_path /var/cache/nginx/fastcgi_temp 1 2;

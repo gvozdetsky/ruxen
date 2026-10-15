@@ -52,6 +52,7 @@ pub(crate) fn parse_server_block(
     let mut autoindex_localtime: Option<bool> = None;
     let mut autoindex_format: Option<AutoindexFormat> = None;
     let mut access_logs: Option<Vec<AccessLog>> = None;
+    let mut open_log_file_cache: Option<Option<OpenLogFileCache>> = None;
     let mut auth_basic: Option<AuthBasic> = None;
     let mut auth_basic_user_file: Option<PathBuf> = None;
     let mut auth_delay_ms: Option<u64> = None;
@@ -134,6 +135,7 @@ pub(crate) fn parse_server_block(
                         underscores_in_headers,
                         error_logs,
                         log_not_found,
+                        open_log_file_cache,
                         recursive_error_pages,
                         server_tokens,
                         autoindex,
@@ -468,6 +470,12 @@ pub(crate) fn parse_server_block(
                     ParsedAccessLog::Off => list.clear(),
                     ParsedAccessLog::Entry(log) => list.push(log),
                 }
+            }
+            ("open_log_file_cache", Terminator::Semi) => {
+                if open_log_file_cache.is_some() {
+                    return Err(Error::Duplicate("open_log_file_cache"));
+                }
+                open_log_file_cache = Some(parse_open_log_file_cache_args(&args[1..])?);
             }
             ("auth_basic", Terminator::Semi) => {
                 if auth_basic.is_some() {

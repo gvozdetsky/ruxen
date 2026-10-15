@@ -27,7 +27,7 @@ use crate::config::{
     ErrorLogSyslogServer, ErrorLogTarget, ErrorPage, ErrorPageAction, ExpiresDirective,
     FileTestKind, Handler, HttpConfig, IfGuard, IndexEntry, KeepaliveDisable, KeepaliveTimeout,
     LimitExcept, Location, LogFormatDef, MapBlock, MapExactEntry, MapRegexEntry, MatchMode,
-    PathMapping, ProxyConf, ProxyPass, ProxySetHeader, RealIpHeader,
+    OpenLogFileCache, PathMapping, ProxyConf, ProxyPass, ProxySetHeader, RealIpHeader,
     RewriteFlag as ConfigRewriteFlag, RewriteOp, RewriteRule, Server, SplitClients, TryFiles,
     TryFilesFallback, TryFilesProbe, ValuePart, Variable,
 };
@@ -70,6 +70,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         error_logs: http_error_logs,
         log_formats,
         access_logs,
+        open_log_file_cache,
         server_tokens,
         autoindex,
         autoindex_exact_size,
@@ -165,7 +166,9 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         None => main_error_logs,
     };
     let mut alp = AccessLogPrep::new(&log_formats);
+    alp.http_cache = open_log_file_cache;
     let http_access_logs: &'static [PreparedAccessLog] = alp.prepare_list(&access_logs)?;
+    let http_access_logs = alp.with_cache(http_access_logs, open_log_file_cache);
     let prepared_split_clients = prepare_split_clients(split_clients);
     let prepared_maps = prepare_maps(maps);
     prepare_cache_zones(proxy_cache_paths)?;
@@ -1617,6 +1620,10 @@ pub(crate) fn prepare_server(
         Some(ref list) => alp.prepare_list(list)?,
         None => http_access_logs,
     };
+    // The cache of the scope a line is written in (#371); the locations
+    // fall back to this one.
+    alp.server_cache = server.open_log_file_cache.unwrap_or(alp.http_cache);
+    let server_access_logs = alp.with_cache(server_access_logs, alp.server_cache);
     // Done last because Server can't be partially moved further down.
 
     let mut exact: Vec<PreparedLocation> = Vec::new();
@@ -2334,6 +2341,12 @@ fn prepare_syslog_peer(
 pub(crate) struct AccessLogPrep<'a> {
     format_map: std::collections::HashMap<&'a str, &'a LogFormatDef>,
     canonical: Vec<PreparedAccessLog>,
+    /// `open_log_file_cache` at http scope, and for the server being
+    /// prepared (#371).
+    pub(crate) http_cache: Option<OpenLogFileCache>,
+    pub(crate) server_cache: Option<OpenLogFileCache>,
+    /// One `&'static` per directive (`OpenLogFileCache::id`).
+    caches: std::collections::HashMap<u32, &'static OpenLogFileCache>,
     /// Buffered files by path.
     buffers: std::collections::HashMap<std::path::PathBuf, &'static PreparedLogBuffer>,
 }
@@ -2348,6 +2361,9 @@ impl<'a> AccessLogPrep<'a> {
         Self {
             format_map,
             canonical: Vec::new(),
+            http_cache: None,
+            server_cache: None,
+            caches: std::collections::HashMap::new(),
             buffers: std::collections::HashMap::new(),
         }
     }
@@ -2427,6 +2443,7 @@ impl<'a> AccessLogPrep<'a> {
             });
         let prepared = PreparedAccessLog {
             buffer,
+            open_cache: None,
             path_vars,
             path: crate::arena::leak(log.path.clone().into_boxed_path()),
             format,
@@ -2458,6 +2475,41 @@ impl<'a> AccessLogPrep<'a> {
             .map(|l| self.prepare_one(l))
             .collect::<Result<_, _>>()?;
         Ok(crate::arena::leak(prepared.into_boxed_slice()))
+    }
+
+    /// `list` as written from a scope with `cache` as its
+    /// `open_log_file_cache`: the entries with variables in the path take
+    /// it, as nginx takes the cache of the location the line is written
+    /// in. The same list when nothing changes.
+    pub(crate) fn with_cache(
+        &mut self,
+        list: &'static [PreparedAccessLog],
+        cache: Option<OpenLogFileCache>,
+    ) -> &'static [PreparedAccessLog] {
+        let cache = cache.map(|c| {
+            *self
+                .caches
+                .entry(c.id)
+                .or_insert_with(|| crate::arena::leak(Box::new(c)))
+        });
+        let same = |log: &PreparedAccessLog| {
+            log.path_vars.is_none() || log.open_cache.map(|c| c.id) == cache.map(|c| c.id)
+        };
+        if list.iter().all(same) {
+            return list;
+        }
+        let copied: Vec<PreparedAccessLog> = list
+            .iter()
+            .map(|log| PreparedAccessLog {
+                open_cache: if log.path_vars.is_some() {
+                    cache
+                } else {
+                    log.open_cache
+                },
+                ..*log
+            })
+            .collect();
+        crate::arena::leak(copied.into_boxed_slice())
     }
 
     pub(crate) fn finish(self) -> &'static [PreparedAccessLog] {
@@ -2974,6 +3026,7 @@ pub(crate) fn build_prefix_or_exact(
         autoindex_localtime: location_autoindex_localtime,
         autoindex_format: location_autoindex_format,
         access_logs: location_access_logs,
+        open_log_file_cache: location_open_log_file_cache,
         auth_basic: location_auth_basic,
         auth_basic_user_file: location_auth_basic_user_file,
         auth_delay_ms: location_auth_delay_ms,
@@ -3094,6 +3147,10 @@ pub(crate) fn build_prefix_or_exact(
         Some(ref list) => alp.prepare_list(list)?,
         None => server_access_logs,
     };
+    let access_logs = alp.with_cache(
+        access_logs,
+        location_open_log_file_cache.unwrap_or(alp.server_cache),
+    );
     let access = resolve_access(
         location_access,
         location_auth_basic,
@@ -3223,6 +3280,7 @@ pub(crate) fn build_regex_location(
         autoindex_localtime: location_autoindex_localtime,
         autoindex_format: location_autoindex_format,
         access_logs: location_access_logs,
+        open_log_file_cache: location_open_log_file_cache,
         auth_basic: location_auth_basic,
         auth_basic_user_file: location_auth_basic_user_file,
         auth_delay_ms: location_auth_delay_ms,
@@ -3351,6 +3409,10 @@ pub(crate) fn build_regex_location(
         Some(ref list) => alp.prepare_list(list)?,
         None => server_access_logs,
     };
+    let access_logs = alp.with_cache(
+        access_logs,
+        location_open_log_file_cache.unwrap_or(alp.server_cache),
+    );
     let access = resolve_access(
         location_access,
         location_auth_basic,
