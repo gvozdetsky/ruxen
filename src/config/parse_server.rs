@@ -220,28 +220,7 @@ pub(crate) fn parse_server_block(
                 if args.len() < 2 {
                     return Err(Error::MissingArg("ssl_protocols"));
                 }
-                let mut set = TlsVersionSet {
-                    tlsv1_2: false,
-                    tlsv1_3: false,
-                };
-                for v in &args[1..] {
-                    match v.as_str() {
-                        "TLSv1.2" => set.tlsv1_2 = true,
-                        "TLSv1.3" => set.tlsv1_3 = true,
-                        "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols (insecure version rejected)",
-                                got: v.clone(),
-                            });
-                        }
-                        _ => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols",
-                                got: v.clone(),
-                            });
-                        }
-                    }
-                }
+                let set = parse_tls_protocols(&args[1..], "ssl_protocols")?;
                 ssl_protocols = Some(set);
             }
             ("ssl_ciphers", Terminator::Semi) => {
@@ -1328,4 +1307,42 @@ pub(crate) fn parse_keepalive_disable_args(args: &[String]) -> Result<KeepaliveD
         }
     }
     Ok(out)
+}
+
+/// `ssl_protocols` / `proxy_ssl_protocols` values: TLS 1.2 and 1.3, which
+/// rustls speaks; the older names are refused as insecure.
+pub(crate) fn parse_tls_protocols(
+    args: &[String],
+    what: &'static str,
+) -> Result<TlsVersionSet, Error> {
+    if args.is_empty() {
+        return Err(Error::MissingArg(what));
+    }
+    let mut set = TlsVersionSet {
+        tlsv1_2: false,
+        tlsv1_3: false,
+    };
+    for v in args {
+        match v.as_str() {
+            "TLSv1.2" => set.tlsv1_2 = true,
+            "TLSv1.3" => set.tlsv1_3 = true,
+            "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {
+                return Err(Error::BadValue {
+                    what: if what == "ssl_protocols" {
+                        "ssl_protocols (insecure version rejected)"
+                    } else {
+                        "proxy_ssl_protocols (insecure version rejected)"
+                    },
+                    got: v.clone(),
+                });
+            }
+            _ => {
+                return Err(Error::BadValue {
+                    what,
+                    got: v.clone(),
+                });
+            }
+        }
+    }
+    Ok(set)
 }

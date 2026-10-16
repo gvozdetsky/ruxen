@@ -144,6 +144,7 @@ pub(crate) async fn write_access_logs(
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: meta.map_or(&[][..], |m| m.proxy_host),
+        proxy_tls: meta.is_some_and(|m| m.proxy_tls),
         upstream_headers: meta.map_or(&[][..], |m| &m.upstream_headers),
         upstream_states: meta.map_or(&[][..], |m| &m.upstream_states),
         upstream_cache_status: meta

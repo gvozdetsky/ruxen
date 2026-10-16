@@ -400,10 +400,17 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
             url: parse_value_with_vars(raw)?,
         });
     }
-    let after_scheme = raw.strip_prefix("http://").ok_or_else(|| Error::BadValue {
-        what: "proxy_pass scheme (only http:// supported in v0.1)",
-        got: raw.clone(),
-    })?;
+    // `https://`: TLS to the upstream (#116), port 443 by default.
+    let (after_scheme, tls) = match (raw.strip_prefix("http://"), raw.strip_prefix("https://")) {
+        (Some(rest), _) => (rest, false),
+        (None, Some(rest)) => (rest, true),
+        (None, None) => {
+            return Err(Error::BadValue {
+                what: "proxy_pass scheme (http:// or https://)",
+                got: raw.clone(),
+            });
+        }
+    };
     if after_scheme.is_empty() {
         return Err(Error::MissingArg("proxy_pass authority"));
     }
@@ -423,6 +430,7 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
             addrs: vec![addr],
             host_header: "localhost".to_string(),
             request_path: (!uri.is_empty()).then(|| uri.to_string()),
+            tls,
         });
     }
     let (authority, request_path) = match after_scheme.find('/') {
@@ -454,10 +462,13 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
             name: authority.to_string(),
             host_header: authority.to_string(),
             request_path,
+            tls,
         });
     }
     let host_port = if authority.contains(':') {
         authority.to_string()
+    } else if tls {
+        format!("{authority}:443")
     } else {
         format!("{authority}:80")
     };
@@ -469,6 +480,7 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
         addrs: addrs.into_iter().map(UpstreamAddr::Inet).collect(),
         host_header: authority.to_string(),
         request_path,
+        tls,
     })
 }
 
@@ -667,6 +679,11 @@ impl ProxyConf {
         "proxy_cache_lock",
         "proxy_cache_lock_timeout",
         "proxy_cache_lock_age",
+        "proxy_ssl_server_name",
+        "proxy_ssl_name",
+        "proxy_ssl_session_reuse",
+        "proxy_ssl_protocols",
+        "proxy_ssl_verify",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -743,6 +760,46 @@ impl ProxyConf {
                     what: "proxy_limit_rate",
                     got: v.clone(),
                 })?);
+            }
+            "proxy_ssl_server_name" => {
+                if self.ssl_server_name.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_server_name"));
+                }
+                self.ssl_server_name =
+                    Some(parse_on_off_args(&args[1..], "proxy_ssl_server_name")?);
+            }
+            "proxy_ssl_session_reuse" => {
+                if self.ssl_session_reuse.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_session_reuse"));
+                }
+                self.ssl_session_reuse =
+                    Some(parse_on_off_args(&args[1..], "proxy_ssl_session_reuse")?);
+            }
+            "proxy_ssl_name" => {
+                if self.ssl_name.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_name"));
+                }
+                if args.len() != 2 {
+                    return Err(Error::BadValue {
+                        what: "proxy_ssl_name",
+                        got: args[1..].join(" "),
+                    });
+                }
+                self.ssl_name = Some(parse_value_with_vars(&args[1])?);
+            }
+            "proxy_ssl_protocols" => {
+                if self.ssl_protocols.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_protocols"));
+                }
+                self.ssl_protocols = Some(super::parse_server::parse_tls_protocols(
+                    &args[1..],
+                    "proxy_ssl_protocols",
+                )?);
+            }
+            // Only `off`, nginx's default: `on` is refused before this
+            // (`reject_unenforced`) until #117 verifies certificates.
+            "proxy_ssl_verify" => {
+                parse_on_off_args(&args[1..], "proxy_ssl_verify")?;
             }
             "proxy_http_version" => {
                 if self.http_version.is_some() {
@@ -1210,6 +1267,7 @@ mod tests {
                 addrs: vec![UpstreamAddr::Unix("/run/app.sock".into())],
                 host_header: "localhost".into(),
                 request_path: Some("/api/".into()),
+                tls: false,
             }
         );
         assert_eq!(
@@ -1218,9 +1276,33 @@ mod tests {
                 addrs: vec![UpstreamAddr::Unix("/run/app.sock".into())],
                 host_header: "localhost".into(),
                 request_path: None,
+                tls: false,
             }
         );
         assert!(proxy_pass("http://unix::/x").is_err());
+    }
+
+    /// `https://` (#116): TLS, and port 443 when none is given.
+    #[test]
+    fn proxy_pass_https() {
+        assert_eq!(
+            proxy_pass("https://127.0.0.1/x").unwrap(),
+            ProxyPass::Direct {
+                addrs: vec![UpstreamAddr::Inet("127.0.0.1:443".parse().unwrap())],
+                host_header: "127.0.0.1".into(),
+                request_path: Some("/x".into()),
+                tls: true,
+            }
+        );
+        assert!(matches!(
+            proxy_pass("https://backend").unwrap(),
+            ProxyPass::UpstreamRef { tls: true, .. }
+        ));
+        assert!(matches!(
+            proxy_pass("http://backend").unwrap(),
+            ProxyPass::UpstreamRef { tls: false, .. }
+        ));
+        assert!(proxy_pass("ftp://127.0.0.1").is_err());
     }
 
     #[test]

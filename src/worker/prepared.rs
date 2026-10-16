@@ -712,6 +712,9 @@ pub struct PreparedProxy {
     pub url: Option<&'static [PreparedValuePart]>,
     /// Inheritance-resolved `proxy_bind`; `None` when unset or `off`.
     pub bind: Option<&'static PreparedBind>,
+    /// `proxy_pass https://` (#116); for a URL with variables, always
+    /// set, and used when the rendered URL says `https://`.
+    pub tls: Option<&'static crate::upstream_tls::PreparedUpstreamTls>,
 }
 
 /// A location's resolved `proxy_cache*` directives (#233).
@@ -824,6 +827,45 @@ pub(crate) struct ProxyEffective {
     /// of `proxy_ignore_headers`.
     pub cache: &'static crate::config::ProxyCacheConf,
     pub cache_ignore: crate::proxy_cache::Ignore,
+    /// `proxy_ssl_*` (#116).
+    pub tls: UpstreamTlsSettings,
+}
+
+/// The `proxy_ssl_*` settings of a scope, resolved (#116).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamTlsSettings {
+    pub server_name: bool,
+    pub session_reuse: bool,
+    pub protocols: crate::config::TlsVersionSet,
+    pub name: Option<&'static [PreparedValuePart]>,
+}
+
+impl UpstreamTlsSettings {
+    /// nginx's: no SNI, session reuse on; TLS 1.2 and 1.3 (rustls speaks
+    /// no older one).
+    pub const DEFAULT: Self = Self {
+        server_name: false,
+        session_reuse: true,
+        protocols: crate::config::TlsVersionSet {
+            tlsv1_2: true,
+            tlsv1_3: true,
+        },
+        name: None,
+    };
+
+    /// `conf`'s values over `self`.
+    pub(crate) fn over(self, conf: &crate::config::ProxyConf) -> Self {
+        Self {
+            server_name: conf.ssl_server_name.unwrap_or(self.server_name),
+            session_reuse: conf.ssl_session_reuse.unwrap_or(self.session_reuse),
+            protocols: conf.ssl_protocols.unwrap_or(self.protocols),
+            name: conf
+                .ssl_name
+                .clone()
+                .map(super::prepare::prepare_value_parts)
+                .or(self.name),
+        }
+    }
 }
 
 /// No `proxy_cache*` directive anywhere.
@@ -875,6 +917,7 @@ impl ProxyEffective {
             error_pages: &[],
             recursive_error_pages: false,
             proxy_method: None,
+            tls: UpstreamTlsSettings::DEFAULT,
             cache: &NO_CACHE_CONF,
             cache_ignore: crate::proxy_cache::Ignore {
                 x_accel_expires: false,

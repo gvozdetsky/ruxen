@@ -223,7 +223,7 @@ fn der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
 /// without `CryptoProvider::install_default()` having been called; the
 /// default-provider path keeps them green without leaking provider choice
 /// into the public API.
-fn active_provider() -> Arc<CryptoProvider> {
+pub(crate) fn active_provider() -> Arc<CryptoProvider> {
     if let Some(p) = CryptoProvider::get_default() {
         return p.clone();
     }

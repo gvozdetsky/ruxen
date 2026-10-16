@@ -877,14 +877,21 @@ pub struct PooledConn {
 }
 
 thread_local! {
-    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize), VecDeque<PooledConn>, FxBuild>> =
+    /// Keyed by upstream, peer and whether the connection is TLS: a
+    /// location proxying over `https://` never gets a plain connection to
+    /// the same peer, nor the other way round (#116).
+    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize, bool), VecDeque<PooledConn>, FxBuild>> =
         RefCell::new(HashMap::default());
 }
 
 /// Take an idle connection from the pool. Drops entries that are past
 /// idle timeout; keepalive-time is enforced on release so over-age conns
 /// may be reused once and then retired (nginx behavior).
-pub fn pool_take(upstream: &'static PreparedUpstream, peer_idx: usize) -> Option<PooledConn> {
+pub fn pool_take(
+    upstream: &'static PreparedUpstream,
+    peer_idx: usize,
+    tls: bool,
+) -> Option<PooledConn> {
     if upstream.keepalive_max_idle.is_none() {
         return None;
     }
@@ -892,7 +899,7 @@ pub fn pool_take(upstream: &'static PreparedUpstream, peer_idx: usize) -> Option
     let now = Instant::now();
     POOL.with(|p| {
         let mut map = p.borrow_mut();
-        let key = (upstream as *const PreparedUpstream, peer_idx);
+        let key = (upstream as *const PreparedUpstream, peer_idx, tls);
         let q = map.get_mut(&key)?;
         // Pop from the front; LIFO since we push at the front. Drop any
         // entries that have aged out before returning the first live one.
@@ -939,9 +946,10 @@ pub fn pool_release(upstream: &'static PreparedUpstream, peer_idx: usize, mut co
         return;
     }
     conn.last_used = now;
+    let tls = matches!(conn.stream, crate::upstream_io::UpstreamIo::Tls(_));
     POOL.with(|p| {
         let mut map = p.borrow_mut();
-        let key = (upstream as *const PreparedUpstream, peer_idx);
+        let key = (upstream as *const PreparedUpstream, peer_idx, tls);
         let q = map.entry(key).or_default();
         if q.len() as u32 >= max_idle {
             // Pool full — evict the oldest (back of the deque) to make

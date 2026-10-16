@@ -1012,6 +1012,9 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // upstream nginx-tests configs (which inject these via TEST_GLOBALS_HTTP)
     // load.
     "proxy_temp_path",
+    // rustls offers only strong suites, so ignoring the upstream cipher
+    // list can't enable a weak one, as with ssl_ciphers (#116).
+    "proxy_ssl_ciphers",
     "proxy_temp_file_write_size",
     "proxy_max_temp_file_size",
     "proxy_buffering",
@@ -1078,6 +1081,10 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let consequence = match args.first().map(String::as_str) {
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
+        }
+        // Certificates of HTTPS upstreams aren't verified yet (#117).
+        Some("proxy_ssl_verify") if value != Some("off") => {
+            "upstream certificates would be accepted without verification"
         }
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
         // dropping them weakens what the config protects. Only `off` loads.

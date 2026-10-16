@@ -913,7 +913,10 @@ pub(crate) fn build_proxy(
     );
     Ok(match pp {
         ProxyPass::Direct {
-            addrs, host_header, ..
+            addrs,
+            host_header,
+            tls,
+            ..
         } => {
             let inet = matches!(addrs.first(), Some(crate::config::UpstreamAddr::Inet(_)));
             let display: &'static [u8] =
@@ -953,7 +956,7 @@ pub(crate) fn build_proxy(
             }
             PreparedProxy {
                 upstream,
-                host_header: without_default_port(host_header_static),
+                host_header: without_default_port(host_header_static, tls),
                 set_headers: eff.set_headers,
                 pass_request_headers: eff.pass_request_headers,
                 pass_request_body: eff.pass_request_body,
@@ -978,10 +981,16 @@ pub(crate) fn build_proxy(
                 cache,
                 url: None,
                 bind: eff.bind,
+                tls: tls
+                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .transpose()?,
             }
         }
         ProxyPass::UpstreamRef {
-            name, host_header, ..
+            name,
+            host_header,
+            tls,
+            ..
         } => {
             let upstream = *upstreams.get(name.as_str()).unwrap_or_else(|| {
                 panic!("ruxen: proxy_pass http://{name} references undeclared upstream block")
@@ -1018,6 +1027,9 @@ pub(crate) fn build_proxy(
                 cache,
                 url: None,
                 bind: eff.bind,
+                tls: tls
+                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .transpose()?,
             }
         }
         ProxyPass::Variable { url } => {
@@ -1072,6 +1084,7 @@ pub(crate) fn build_proxy(
                 cache,
                 url: Some(prepare_value_parts(url)),
                 bind: eff.bind,
+                tls: Some(prepare_upstream_tls(eff.tls, b"")?),
                 proxy_method: eff.proxy_method,
             }
         }
@@ -1082,7 +1095,46 @@ pub(crate) fn build_proxy(
 /// port equal to the scheme's default (80; only `http://` is proxied) is
 /// dropped, as ngx_http_proxy_set_vars does. The URL as written still
 /// names the peer and feeds `proxy_redirect default`.
-fn without_default_port(authority: &'static [u8]) -> &'static [u8] {
+/// `proxy_ssl_*` for a location that proxies over TLS: the shared client
+/// config, and the name (`proxy_ssl_name`, else `host`, the host of
+/// `proxy_pass`; empty for a URL with variables, whose host is rendered).
+fn prepare_upstream_tls(
+    settings: super::prepared::UpstreamTlsSettings,
+    host: &[u8],
+) -> Result<&'static crate::upstream_tls::PreparedUpstreamTls, String> {
+    let config = crate::upstream_tls::client_config(
+        settings.protocols,
+        settings.server_name,
+        settings.session_reuse,
+    )?;
+    let literal = |parts: &[PreparedValuePart]| -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        for p in parts {
+            match p {
+                PreparedValuePart::Literal(b) => out.extend_from_slice(b),
+                PreparedValuePart::Var(_) => return None,
+            }
+        }
+        Some(out)
+    };
+    let (name_vars, name) = match settings.name {
+        Some(parts) => match literal(parts) {
+            Some(text) => (None, crate::upstream_tls::server_name(&text)),
+            None => (Some(parts), crate::upstream_tls::server_name(host)),
+        },
+        None => (None, crate::upstream_tls::server_name(host)),
+    };
+    Ok(crate::arena::leak(Box::new(
+        crate::upstream_tls::PreparedUpstreamTls {
+            config,
+            name_vars,
+            name,
+            default_name: settings.name.is_none(),
+        },
+    )))
+}
+
+fn without_default_port(authority: &'static [u8], tls: bool) -> &'static [u8] {
     let host_end = authority
         .iter()
         .rposition(|&b| b == b']')
@@ -1093,7 +1145,7 @@ fn without_default_port(authority: &'static [u8]) -> &'static [u8] {
             let port = std::str::from_utf8(&authority[colon + 1..])
                 .ok()
                 .and_then(|p| p.parse::<u16>().ok());
-            if port == Some(80) {
+            if port == Some(if tls { 443 } else { 80 }) {
                 &authority[..colon]
             } else {
                 authority
@@ -1227,6 +1279,7 @@ pub(crate) struct ServerProxyDefaults {
     pub cache: &'static crate::config::ProxyCacheConf,
     pub cache_ignore: crate::proxy_cache::Ignore,
     pub bind: Option<&'static PreparedBind>,
+    pub tls: super::prepared::UpstreamTlsSettings,
 }
 
 /// The cache fields of `proxy_ignore_headers` at one scope, the unset ones
@@ -1266,6 +1319,7 @@ impl ServerProxyDefaults {
         underscores_in_headers: bool,
     ) -> Self {
         let defaults = ProxyEffective::defaults();
+        let tls = super::prepared::UpstreamTlsSettings::DEFAULT.over(&conf);
         let set_headers: &'static [PreparedProxySetHeader] = match conf.set_headers {
             Some(list) => prepare_proxy_set_headers(list),
             None => &[],
@@ -1307,6 +1361,7 @@ impl ServerProxyDefaults {
             pass_headers: leak_list(conf.pass_headers),
             proxy_method: conf.proxy_method.map(prepare_value_parts),
             cache_ignore: cache_ignore(conf.ignore_headers.as_deref(), defaults.cache_ignore),
+            tls,
             cache: crate::arena::leak(Box::new(conf.cache)),
             bind: conf.bind.and_then(prepare_bind),
         }
@@ -1346,6 +1401,7 @@ pub(crate) fn resolve_proxy_effective(
     location: ProxyConf,
     server_defaults: ServerProxyDefaults,
 ) -> ProxyEffective {
+    let tls = server_defaults.tls.over(&location);
     let set_headers: &'static [PreparedProxySetHeader] = match location.set_headers {
         Some(list) => prepare_proxy_set_headers(list),
         None => server_defaults.set_headers,
@@ -1410,6 +1466,7 @@ pub(crate) fn resolve_proxy_effective(
         cache: crate::arena::leak(Box::new(location.cache.inherit(server_defaults.cache))),
         hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
+        tls,
         bind: match location.bind {
             Some(bind) => prepare_bind(bind),
             None => server_defaults.bind,
@@ -3528,7 +3585,7 @@ mod tests {
             ("[::1]", "[::1]"),
             ("u", "u"),
         ] {
-            let got = without_default_port(crate::arena::leak(authority.as_bytes().into()));
+            let got = without_default_port(crate::arena::leak(authority.as_bytes().into()), false);
             assert_eq!(got, want.as_bytes(), "{authority}");
         }
     }
