@@ -155,25 +155,41 @@ impl Lexer {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(path)
         };
-        let bytes = std::fs::read(&resolved).map_err(|e| Error::IncludeOpen {
-            path: resolved.display().to_string(),
-            reason: format!("{e}"),
-        })?;
-        let name = Some(std::rc::Rc::from(resolved.display().to_string()));
-        let canonical = resolved.canonicalize().unwrap_or(resolved);
-        let contents = String::from_utf8_lossy(&bytes).into_owned();
-        if self.dump_seen.insert(canonical.clone()) {
-            self.dump_files.push(DumpFile {
-                path: canonical,
-                contents,
+        // A pattern (`*?[`, as ngx_conf_include tests it) includes every
+        // file it matches, sorted, and none is fine (#35).
+        let files = if resolved.to_string_lossy().contains(['*', '?', '[']) {
+            glob(&resolved).map_err(|e| Error::IncludeOpen {
+                path: resolved.display().to_string(),
+                reason: format!("glob() failed: {e}"),
+            })?
+        } else {
+            vec![resolved]
+        };
+        // Read them all first: the dump lists them in order, and the frames
+        // go on the stack last first, so the first is read first.
+        let mut frames = Vec::with_capacity(files.len());
+        for resolved in files {
+            let bytes = std::fs::read(&resolved).map_err(|e| Error::IncludeOpen {
+                path: resolved.display().to_string(),
+                reason: format!("{e}"),
+            })?;
+            let name = Some(std::rc::Rc::from(resolved.display().to_string()));
+            let canonical = resolved.canonicalize().unwrap_or(resolved);
+            let contents = String::from_utf8_lossy(&bytes).into_owned();
+            if self.dump_seen.insert(canonical.clone()) {
+                self.dump_files.push(DumpFile {
+                    path: canonical,
+                    contents,
+                });
+            }
+            frames.push(LexerFrame {
+                bytes,
+                pos: 0,
+                name,
+                last_end: 0,
             });
         }
-        self.frames.push(LexerFrame {
-            bytes,
-            pos: 0,
-            name,
-            last_end: 0,
-        });
+        self.frames.extend(frames.into_iter().rev());
         Ok(())
     }
 
@@ -361,4 +377,30 @@ mod tests {
         // other unlisted pair, the backslash itself stays.
         assert_eq!(args(r"set $a a\;b\ c;"), vec!["set", "$a", r"a\;b\ c"]);
     }
+}
+
+/// The paths `pattern` matches, as glob(3) with nginx's flags (none:
+/// sorted, `*` doesn't match a leading dot) returns them; no match is an
+/// empty list (ngx_open_glob with `test`).
+fn glob(pattern: &Path) -> std::io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let c_pattern = std::ffi::CString::new(pattern.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut found: libc::glob_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::glob(c_pattern.as_ptr(), 0, None, &mut found) };
+    let paths = match rc {
+        0 => (0..found.gl_pathc)
+            .map(|i| unsafe {
+                let p = std::ffi::CStr::from_ptr(*found.gl_pathv.add(i));
+                PathBuf::from(std::ffi::OsString::from_vec(p.to_bytes().to_vec()))
+            })
+            .collect(),
+        libc::GLOB_NOMATCH => Vec::new(),
+        _ => {
+            unsafe { libc::globfree(&mut found) };
+            return Err(std::io::Error::last_os_error());
+        }
+    };
+    unsafe { libc::globfree(&mut found) };
+    Ok(paths)
 }
