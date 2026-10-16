@@ -185,10 +185,6 @@ pub(crate) fn ignored_block(lx: &Lexer, args: &[String]) {
         // Read by nginx only to size its connection table; ruxen takes
         // `worker_connections` from it.
         "events" => return,
-        "types" => (
-            Severity::Differs,
-            "MIME types come from ruxen's built-in table, not from this block (#38)".to_string(),
-        ),
         _ => (
             Severity::Ignored,
             "accepted, no effect in ruxen".to_string(),
@@ -221,11 +217,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
     ),
     ("override_charset", Some("off"), "nothing is converted"),
     ("source_charset", None, "nothing is converted"),
-    (
-        "default_type",
-        Some("text/plain"),
-        "files of unknown types get ruxen's built-in default (#38)",
-    ),
     ("etag", Some("on"), "static responses still carry an ETag"),
     (
         "if_modified_since",
@@ -490,7 +481,6 @@ mod tests {
                 (Severity::Differs, "ssi on"),
                 (Severity::Ignored, "etag on"),
                 (Severity::Ignored, "tcp_nopush on"),
-                (Severity::Differs, "types"),
             ]
         );
     }

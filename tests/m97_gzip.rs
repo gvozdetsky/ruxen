@@ -46,7 +46,7 @@ fn start() -> (Server, u16) {
     std::fs::write(
         &conf,
         format!(
-            "events {{}}\nhttp {{\n access_log off;\n sendfile on;\n gzip_types text/css;\n \
+            "events {{}}\nhttp {{\n access_log off;\n sendfile on;\n gzip_types text/css;\n types {{ text/css css; text/html html; }}\n \
              server {{\n listen 127.0.0.1:{port};\n \
              location / {{ gzip on; gzip_vary on; root {www}; }}\n \
              location /ret {{ gzip on; default_type text/plain; gzip_types text/plain; \

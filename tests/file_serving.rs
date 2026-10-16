@@ -68,7 +68,8 @@ fn setup_server() -> (ServerGuard, u16) {
     std::fs::write(
         &conf,
         format!(
-            "http {{ server {{ listen {port}; location / {{ root {}; }} }} }}\n",
+            "http {{ types {{ text/html html; application/json json; }}\n\
+             server {{ listen {port}; location / {{ root {}; }} }} }}\n",
             dir.display()
         ),
     )
@@ -247,10 +248,8 @@ fn m3_end_to_end() {
         b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
-    assert_eq!(
-        header(&r, "Content-Type").as_deref(),
-        Some("text/html; charset=utf-8")
-    );
+    // From `types {}`, without a charset (#38).
+    assert_eq!(header(&r, "Content-Type").as_deref(), Some("text/html"));
     assert_eq!(header(&r, "Content-Length").as_deref(), Some("11"));
     assert!(header(&r, "Last-Modified").is_some());
     assert_eq!(body(&r), b"<h1>ok</h1>");

@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 150 implemented, 37 accepted with a difference, 72 accepted with no effect, 1 refused, 290 unknown.
+Of 550 directives: 151 implemented, 36 accepted with a difference, 72 accepted with no effect, 1 refused, 290 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -111,7 +111,7 @@ Not supported: `ssl_engine`.
 | `types_hash_max_size` | accepted, no effect | any |  |
 | `types_hash_bucket_size` | accepted, no effect | any |  |
 | `types` | no |  |  |
-| `default_type` | accepted, differs | any | files of unknown types get ruxen's built-in default (#38) |
+| `default_type` | yes | http, server, location |  |
 | `root` | yes | http, server, location |  |
 | `alias` | yes | location |  |
 | `limit_except` | yes | location |  |
