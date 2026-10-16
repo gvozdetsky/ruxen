@@ -20,10 +20,10 @@ use std::cell::RefCell;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::worker::lazy_timeout as timeout;
 use monoio::io::AsyncReadRent;
 use monoio::io::AsyncWriteRentExt;
 use monoio::net::TcpStream;
-use monoio::time::timeout;
 
 use crate::config::ProxyNextUpstream;
 use crate::http::Method;
