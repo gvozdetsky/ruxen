@@ -12,6 +12,18 @@ use std::path::PathBuf;
 /// behaves identically.
 pub(crate) fn parse_return_args(args: &[String]) -> Result<(u16, Vec<ValuePart>), Error> {
     let status_s = args.first().ok_or(Error::MissingArg("return status"))?;
+    // `return URL;`: a lone argument that starts as a URL is a 302 to it
+    // (ngx_http_rewrite_return, #16).
+    if args.len() == 1
+        && status_s.parse::<u16>().is_err()
+        && ["http://", "https://", "$scheme"]
+            .iter()
+            .any(|p| status_s.starts_with(p))
+    {
+        let parts = parse_value_with_vars(status_s)?;
+        reject_sent_http_parts(&parts, "return body ($sent_http_* unavailable)")?;
+        return Ok((302, parts));
+    }
     let status = status_s.parse::<u16>().map_err(|_| Error::BadValue {
         what: "return status",
         got: status_s.clone(),
