@@ -891,7 +891,88 @@ pub struct Server {
     /// were declared; the parser validates the listen-flag/cert pairing and
     /// surfaces mismatches as either errors or warnings.
     pub ssl: ServerSsl,
+    /// `absolute_redirect`, `server_name_in_redirect`, `port_in_redirect`
+    /// (#15), http's merged in.
+    pub redirect: RedirectConf,
     pub locations: Vec<Location>,
+}
+
+/// `absolute_redirect`, `server_name_in_redirect` and `port_in_redirect`
+/// of one level (#15), each `None` until set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedirectConf {
+    pub absolute: Option<bool>,
+    pub server_name: Option<bool>,
+    pub port: Option<bool>,
+}
+
+/// How a `Location` that starts with `/` goes out (ngx_http_header_filter):
+/// made absolute, with the server's name or the request's host, and the
+/// port unless it is the scheme's.
+/// One byte (absolute, server name, port: bits 0–2), so the per-request
+/// `MatchedLocation` copy stays the size it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedirectPolicy(u8);
+
+impl RedirectPolicy {
+    pub fn new(absolute: bool, server_name: bool, port: bool) -> Self {
+        Self(u8::from(absolute) | (u8::from(server_name) << 1) | (u8::from(port) << 2))
+    }
+    pub fn absolute(self) -> bool {
+        self.0 & 1 != 0
+    }
+    pub fn server_name(self) -> bool {
+        self.0 & 2 != 0
+    }
+    pub fn port(self) -> bool {
+        self.0 & 4 != 0
+    }
+}
+
+impl Default for RedirectPolicy {
+    fn default() -> Self {
+        RedirectConf::default().policy()
+    }
+}
+
+impl RedirectConf {
+    pub(crate) fn takes(name: &str) -> bool {
+        matches!(
+            name,
+            "absolute_redirect" | "server_name_in_redirect" | "port_in_redirect"
+        )
+    }
+
+    /// One of `takes`'s directives into `self`.
+    pub(crate) fn parse(&mut self, args: &[String]) -> Result<(), super::error::Error> {
+        let (name, slot): (&'static str, &mut Option<bool>) = match args[0].as_str() {
+            "absolute_redirect" => ("absolute_redirect", &mut self.absolute),
+            "server_name_in_redirect" => ("server_name_in_redirect", &mut self.server_name),
+            _ => ("port_in_redirect", &mut self.port),
+        };
+        if slot.is_some() {
+            return Err(super::error::Error::Duplicate(name));
+        }
+        *slot = Some(super::parse_on_off_args(&args[1..], name)?);
+        Ok(())
+    }
+
+    pub(crate) fn inherit(self, parent: &RedirectConf) -> RedirectConf {
+        RedirectConf {
+            absolute: self.absolute.or(parent.absolute),
+            server_name: self.server_name.or(parent.server_name),
+            port: self.port.or(parent.port),
+        }
+    }
+
+    /// With nginx's defaults: on, off, on.
+    pub fn policy(self) -> RedirectPolicy {
+        RedirectPolicy::new(
+            self.absolute.unwrap_or(true),
+            self.server_name.unwrap_or(false),
+            self.port.unwrap_or(true),
+        )
+    }
 }
 
 /// How a `location` pattern matches the request URI. M9 added regex (`~`,
@@ -1040,6 +1121,9 @@ pub struct Location {
     /// `false`, the response body uses `Content-Length` framing and any
     /// `add_trailer` directives in scope are silently dropped.
     pub chunked_transfer_encoding: Option<bool>,
+    /// `absolute_redirect` and friends (#15), the server's merged in when
+    /// the http block closes.
+    pub redirect: RedirectConf,
     /// The location's own `client_body_timeout` / `send_timeout` (#147);
     /// `client_header_timeout` stays a server setting.
     pub client_timeouts: ClientTimeouts,
@@ -1075,6 +1159,27 @@ impl Location {
             *path = root.to_path_buf();
         }
         inherit_root_in_ifs(&mut self.rewrite_ops, root);
+    }
+}
+
+impl Location {
+    /// `redirect`'s unset values from `parent`, here and in the location's
+    /// `if` blocks (#15).
+    pub(crate) fn inherit_redirect(&mut self, parent: &RedirectConf) {
+        self.redirect = self.redirect.inherit(parent);
+        let own = self.redirect;
+        inherit_redirect_in_ifs(&mut self.rewrite_ops, &own);
+    }
+}
+
+fn inherit_redirect_in_ifs(ops: &mut [RewriteOp], parent: &RedirectConf) {
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            if let Some(IfLocation::Parsed { location, .. }) = location {
+                location.inherit_redirect(parent);
+            }
+            inherit_redirect_in_ifs(body, parent);
+        }
     }
 }
 
@@ -1447,6 +1552,9 @@ pub struct LimitExcept {
     /// inherits the location's.
     pub auth_basic: Option<AuthBasic>,
     pub auth_basic_user_file: Option<PathBuf>,
+    /// `proxy_pass` of the block: the other methods go to it (its own
+    /// content handler in nginx); `None` keeps the location's handler.
+    pub proxy_pass: Option<ProxyPass>,
 }
 
 /// The methods `limit_except` takes, in `ngx_methods_names` order.
