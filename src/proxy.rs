@@ -212,7 +212,11 @@ pub struct CachePlan {
     pub conf: &'static crate::worker::PreparedProxyCache,
     pub zone: &'static crate::proxy_cache::CacheZone,
     pub key: Vec<u8>,
+    /// The key's hash (nginx's `c->main`), and the one looked up: the
+    /// same, or with `secondary` the request's variant's (`c->key`).
+    pub main: crate::proxy_cache::CacheHash,
     pub hash: crate::proxy_cache::CacheHash,
+    pub secondary: bool,
     pub status: crate::proxy_cache::CacheStatus,
     /// The response may be stored (`proxy_cache_min_uses` reached, no
     /// `proxy_no_cache` condition holds).
@@ -2463,7 +2467,15 @@ fn store_response(
     let variant = if storable.vary.is_empty() {
         [0; 16]
     } else {
-        crate::proxy_cache::vary_digest(&storable.vary, &cache.request_headers)
+        crate::proxy_cache::vary_digest(&cache.main, &storable.vary, &cache.request_headers)
+    };
+    // ngx_http_file_cache_update_variant: looked up at a variant's key, the
+    // response stays there only if it is that variant; else (another
+    // `Vary`, or none) it replaces the main key's.
+    let at = if cache.secondary && (storable.vary.is_empty() || variant != cache.hash) {
+        &cache.main
+    } else {
+        &cache.hash
     };
     let entry = crate::proxy_cache::EntryParts {
         valid_sec: storable.valid_sec,
@@ -2477,7 +2489,7 @@ fn store_response(
     };
     // A file that can't be written leaves the entry uncached; the
     // response itself still goes out.
-    let _ = cache.zone.store(&cache.hash, &entry);
+    let _ = cache.zone.store(at, &entry);
 }
 
 /// The upstream said 304 to a revalidation (ngx_http_upstream_test_next):
@@ -2566,7 +2578,9 @@ async fn wait_for_lock(cache: &mut CachePlan) {
         monoio::time::sleep(pause).await;
         if cache.zone.is_fresh(&cache.hash, now_secs())
             && let Some(entry) = Entry::read(&cache.zone.file_path(&cache.hash), &cache.key)
-            && entry.matches_variant(&cache.request_headers)
+            && entry
+                .other_variant(&cache.main, &cache.request_headers)
+                .is_none()
         {
             cache.status = CacheStatus::Hit;
             cache.hit = Some(CacheHit::Entry(entry));
