@@ -696,7 +696,6 @@ fn openat2_with(dirfd: RawFd, rel: &[u8], flags: i32, extra: u64) -> std::io::Re
 /// cares about. The CString conversion catches interior NULs as EINVAL
 /// rather than panicking.
 fn openat2_beneath(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd> {
-    let c_rel = CString::new(rel).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     // `libc::open_how` is `#[non_exhaustive]`, so zero it and fill by
     // field write. That also future-proofs us against new trailing fields
     // — a zero value preserves default kernel behavior.
@@ -704,15 +703,15 @@ fn openat2_beneath(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd> {
     how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
     how.mode = 0;
     how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
-    let ret = unsafe {
+    let ret = with_c_path(rel, |c_rel| unsafe {
         libc::syscall(
             libc::SYS_openat2,
             dirfd,
-            c_rel.as_ptr(),
+            c_rel,
             &how as *const libc::open_how,
             core::mem::size_of::<libc::open_how>(),
         )
-    };
+    })?;
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -745,6 +744,30 @@ fn open_following_symlinks(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd>
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
+}
+
+/// Call `f` with `rel` as a NUL-terminated C string: copied onto the
+/// stack when short (no allocation per request), a `CString` otherwise. An
+/// interior NUL is EINVAL, as `CString::new` makes it.
+#[inline]
+fn with_c_path<R>(rel: &[u8], f: impl FnOnce(*const libc::c_char) -> R) -> std::io::Result<R> {
+    const STACK: usize = 256;
+    if rel.contains(&0) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    if rel.len() < STACK {
+        let mut buf = std::mem::MaybeUninit::<[u8; STACK]>::uninit();
+        let p = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: `rel.len() < STACK`: the copy and the NUL fit, and the
+        // syscall reads up to the NUL only.
+        unsafe {
+            std::ptr::copy_nonoverlapping(rel.as_ptr(), p, rel.len());
+            p.add(rel.len()).write(0);
+        }
+        return Ok(f(p.cast()));
+    }
+    let c = CString::new(rel).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    Ok(f(c.as_ptr()))
 }
 
 /// Whether a relative path has a `..` component.
@@ -915,6 +938,21 @@ fn io_to_outcome(e: std::io::Error) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    /// The C path for openat2: on the stack when short, a CString when
+    /// long, EINVAL for an interior NUL either way.
+    #[test]
+    fn c_paths_are_nul_terminated_whatever_their_length() {
+        let len = |p: *const libc::c_char| unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().len();
+        assert_eq!(with_c_path(b"a/b.txt", len).unwrap(), 7);
+        let long = vec![b'x'; 300];
+        assert_eq!(with_c_path(&long, len).unwrap(), 300);
+        assert_eq!(with_c_path(&[b'x'; 255], len).unwrap(), 255);
+        for bad in [&b"a\0b"[..], &[b'x', 0].repeat(200)] {
+            let err = with_c_path(bad, len).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        }
+    }
+
     use super::*;
 
     fn fake_root(mapping: PreparedPathMapping) -> PreparedRoot {
