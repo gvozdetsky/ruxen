@@ -544,6 +544,56 @@ pub(crate) fn with_deadline<F: std::future::Future>(
     }
 }
 
+/// `monoio::time::timeout` for an upstream operation, that reads the clock
+/// and touches the timer wheel only once `fut` has to wait: a write that
+/// the socket takes at once (the request to an upstream, most of the
+/// time) costs neither. The timeout runs from that first wait, as nginx
+/// arms its timer when a send or read would block.
+pub(crate) fn lazy_timeout<F: std::future::Future>(dur: Duration, fut: F) -> LazyTimeout<F> {
+    LazyTimeout {
+        fut,
+        dur,
+        sleep: None,
+    }
+}
+
+/// The future of `lazy_timeout`.
+pub(crate) struct LazyTimeout<F> {
+    fut: F,
+    dur: Duration,
+    /// Armed on the first `Pending`.
+    sleep: Option<monoio::time::Sleep>,
+}
+
+/// `lazy_timeout`'s operation took longer than its duration.
+#[derive(Debug)]
+pub(crate) struct Elapsed;
+
+impl<F: std::future::Future> std::future::Future for LazyTimeout<F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        // SAFETY: neither field is moved out of the pinned struct; `sleep`
+        // is only ever set once, in place.
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { std::pin::Pin::new_unchecked(&mut this.fut) };
+        if let Poll::Ready(out) = fut.poll(cx) {
+            return Poll::Ready(Ok(out));
+        }
+        let dur = this.dur;
+        let sleep = this.sleep.get_or_insert_with(|| monoio::time::sleep(dur));
+        // SAFETY: as above.
+        match unsafe { std::pin::Pin::new_unchecked(sleep) }.poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(Elapsed)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// `with_deadline` for a timeout that starts when the operation first
 /// waits, as nginx arms its timer when a read or send would block.
 pub(crate) fn with_timeout<F: std::future::Future>(
