@@ -3278,10 +3278,14 @@ pub(crate) async fn handle<S: ConnIo>(
                         // `error_page` applies (`phase::process`). The body
                         // is not read and the connection closes.
                         let mut refuse: Option<u16> = None;
-                        if let Some(te) = lookup_request_header(
-                            &buf[base + req.headers_start..base + req.headers_end],
-                            b"transfer-encoding",
-                        ) {
+                        // The parser noted whether there is one: no scan of
+                        // the header block for a request without it.
+                        if parse_state.has_transfer_encoding
+                            && let Some(te) = lookup_request_header(
+                                &buf[base + req.headers_start..base + req.headers_end],
+                                b"transfer-encoding",
+                            )
+                        {
                             // nginx request-body gate:
                             // - Transfer-Encoding is HTTP/1.1-only.
                             // - Transfer-Encoding + Content-Length is rejected.
@@ -3518,7 +3522,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // Content-Length below: nginx sets expect_tested
                         // before discarding it, so no 100 goes out.
                         let refused_unread = req.content_length.is_some_and(|cl| cl > max_body);
-                        if req.http_11 && refuse.is_none() && !refused_unread {
+                        if req.http_11
+                            && refuse.is_none()
+                            && !refused_unread
+                            && parse_state.has_expect
+                        {
                             if let Some(expect) = lookup_request_header(
                                 &buf[base + req.headers_start..base + req.headers_end],
                                 b"expect",
