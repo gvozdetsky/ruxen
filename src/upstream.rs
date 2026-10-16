@@ -49,8 +49,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
-use monoio::net::TcpStream;
-
 use crate::config::LbAlgorithm;
 use crate::worker::PreparedPeer;
 use crate::worker::PreparedUpstream;
@@ -870,7 +868,7 @@ impl Drop for LeasedPeer {
 /// One pooled upstream connection awaiting reuse. The stream is the raw
 /// monoio handle; the metadata fields drive eviction at take-time.
 pub struct PooledConn {
-    pub stream: TcpStream,
+    pub stream: crate::upstream_io::UpstreamIo,
     pub last_used: Instant,
     pub opened_at: Instant,
     pub requests_served: u32,

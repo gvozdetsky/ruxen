@@ -28,6 +28,7 @@ mod tls_session;
 mod tls_stream;
 mod tls_ticket;
 mod upstream;
+mod upstream_io;
 mod uri;
 mod worker;
 

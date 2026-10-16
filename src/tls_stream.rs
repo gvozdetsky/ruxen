@@ -16,7 +16,9 @@
 //   rustls's outgoing queue) → `write_tls` drains the whole queue into
 //   `wbuf` → one `write_all` to the socket.
 //
-// Server side only: ruxen talks plain HTTP to upstreams.
+// The same stream carries an upstream connection (`proxy_pass https://`,
+// #116): `TlsStream<IO, ClientConnection>`, made by `connect`. What is
+// server-only (the session id, `connection()`) is on `TlsStream<IO>`.
 
 use std::io::{self, BufRead, IoSlice, Write};
 use std::mem;
@@ -25,7 +27,9 @@ use std::sync::Arc;
 use monoio::BufResult;
 use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut, RawBuf};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
-use rustls::{ServerConfig, ServerConnection};
+use rustls::{
+    ClientConfig, ClientConnection, ConnectionCommon, ServerConfig, ServerConnection, SideData,
+};
 
 /// Socket read size: one maximum-size TLS record (16 KiB of plaintext plus
 /// record overhead) fits in a single read.
@@ -248,9 +252,9 @@ impl TlsAcceptor {
 }
 
 #[derive(Debug)]
-pub struct TlsStream<IO> {
+pub struct TlsStream<IO, C = ServerConnection> {
     io: IO,
-    conn: ServerConnection,
+    conn: C,
     /// Ciphertext read from `io`; `rbuf[rpos..]` hasn't been handed to
     /// rustls yet. Allocated on the first read.
     rbuf: Vec<u8>,
@@ -282,7 +286,43 @@ impl<IO> TlsStream<IO> {
         }
         self.session_id.as_ref()
     }
+}
 
+/// A TLS client connection to `name` over `io`, handshaken: an HTTPS
+/// upstream (#116). `name` is what the certificate is checked against
+/// and, with SNI on in `config`, what the ClientHello names.
+pub async fn connect<IO: AsyncReadRent + AsyncWriteRent>(
+    config: Arc<ClientConfig>,
+    name: rustls::pki_types::ServerName<'static>,
+    io: IO,
+) -> io::Result<TlsStream<IO, ClientConnection>> {
+    let conn = ClientConnection::new(config, name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut stream = TlsStream {
+        io,
+        conn,
+        rbuf: Vec::new(),
+        rpos: 0,
+        wbuf: Vec::new(),
+        session_id: None,
+        tunnel: false,
+    };
+    loop {
+        stream.write_tls().await?;
+        if !stream.conn.is_handshaking() {
+            return Ok(stream);
+        }
+        if stream.read_tls().await? == 0 {
+            return Err(handshake_eof());
+        }
+    }
+}
+
+impl<IO, C, D> TlsStream<IO, C>
+where
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     /// From now on a read may run while a write is in flight (the tunnel
     /// after a proxied 101). Both touch the session only between awaits;
     /// the socket write is the one thing that can't happen twice at once.
@@ -359,7 +399,14 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
             }
         }
     }
+}
 
+impl<IO, C, D> TlsStream<IO, C>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     /// Hand rustls the next chunk of ciphertext, reading from the socket
     /// first when nothing is buffered, and process it. Returns 0 at EOF:
     /// TCP FIN, or a close_notify already received.
@@ -457,7 +504,12 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
     }
 }
 
-impl<IO: AsyncReadRent + AsyncWriteRent> AsyncReadRent for TlsStream<IO> {
+impl<IO, C, D> AsyncReadRent for TlsStream<IO, C>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
         let (dst, cap) = (buf.write_ptr(), buf.bytes_total());
         loop {
@@ -491,7 +543,12 @@ impl<IO: AsyncReadRent + AsyncWriteRent> AsyncReadRent for TlsStream<IO> {
     }
 }
 
-impl<IO: AsyncReadRent + AsyncWriteRent> AsyncWriteRent for TlsStream<IO> {
+impl<IO, C, D> AsyncWriteRent for TlsStream<IO, C>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         // SAFETY: `IoBuf` guarantees `bytes_init` initialized bytes at
         // `read_ptr`, and `buf` is owned here until we return it.

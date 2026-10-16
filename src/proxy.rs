@@ -25,6 +25,8 @@ use monoio::io::AsyncReadRent;
 use monoio::io::AsyncWriteRentExt;
 use monoio::net::TcpStream;
 
+use crate::upstream_io::UpstreamIo;
+
 use crate::config::ProxyNextUpstream;
 use crate::http::Method;
 use crate::phase::Response;
@@ -187,7 +189,7 @@ pub struct ProxyPlan {
 /// response head for the client and the connection to tunnel to.
 pub struct Upgraded {
     pub head: Vec<u8>,
-    pub upstream: TcpStream,
+    pub upstream: UpstreamIo,
     /// Bytes the upstream sent past its head, already read.
     pub leftover: Vec<u8>,
     /// The worker_connections slot the upstream connection holds.
@@ -333,7 +335,7 @@ unsafe impl monoio::buf::IoVecBuf for RequestParts {
 
 /// Write the header block and the body with writev until both are sent.
 async fn write_request_parts(
-    stream: &mut TcpStream,
+    stream: &mut UpstreamIo,
     head: bytes::Bytes,
     body: bytes::Bytes,
 ) -> std::io::Result<()> {
@@ -1534,7 +1536,7 @@ async fn attempt(
             }
         };
         let _ = stream.set_nodelay(true);
-        (stream, Instant::now(), 0, slot)
+        (UpstreamIo::Plain(stream), Instant::now(), 0, slot)
     };
     state.connect_ms = Some(elapsed_ms(started));
 
@@ -2758,7 +2760,7 @@ fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
 fn upgraded(
     plan: &ProxyPlan,
     peer_idx: usize,
-    stream: TcpStream,
+    stream: UpstreamIo,
     accum: Vec<u8>,
     first_line_end: usize,
     head_end: usize,
@@ -2819,7 +2821,7 @@ fn upgraded(
 /// temp file. Opened per attempt, so a retry on the next peer re-sends it
 /// from the start; `proxy_send_timeout` bounds each write.
 async fn send_body_file(
-    stream: &mut TcpStream,
+    stream: &mut UpstreamIo,
     file: &RequestBodyFile,
     send_timeout: Duration,
 ) -> Result<(), UpstreamError> {
@@ -2881,7 +2883,7 @@ pub(crate) async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: I
 /// On failure returns the reason, paired with `true` if no bytes were read
 /// at all (a stale pooled connection) and `false` otherwise.
 async fn read_chunked_body_with_buf(
-    stream: &mut TcpStream,
+    stream: &mut UpstreamIo,
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
