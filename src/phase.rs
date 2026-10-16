@@ -702,6 +702,24 @@ fn process_with_meta_inner(
                 Some(status),
             );
         }
+        // `ssl_verify_client` (#113): a Host naming another server than
+        // the SNI name, when that server checks certificates, is 421
+        // (ngx_http_set_virtual_server); a certificate the server refuses
+        // is 495, a missing one 496, both sent as 400 unless `error_page`
+        // takes them (ngx_http_process_request).
+        if listen.client_verify
+            && let Some(tls) = req.tls
+            && let Some((status, close)) = client_certificate_refusal(listen, server, req, tls)
+        {
+            let canned = match status {
+                421 => &http.misdirected,
+                495 => &http.cert_error,
+                _ => &http.no_cert,
+            };
+            let response = Response::Prebuilt(canned.pick(req.method));
+            let code = (status != 421).then_some(status);
+            return refuse(http, req, url_scratch, server, response, close, false, code);
+        }
         if matches!(req.method, Method::Trace | Method::Connect) {
             if req.method == Method::Trace
                 && crate::worker::test_panic() == crate::worker::TestPanic::Trace
@@ -2057,22 +2075,76 @@ pub(crate) fn rejects_handshake(listen: &PreparedListen, sni: Option<&str>) -> b
 /// server the name selects (else the TLS default server) has HTTP/2 on,
 /// as ngx_http_ssl_alpn_select asks the server the servername callback
 /// chose (#144).
+/// Why `ssl_verify_client` refuses this request, if it does: the status
+/// (421, 495 or 496) and whether the connection closes after it, as nginx
+/// closes it after 495 and 496.
+#[cold]
+#[inline(never)]
+fn client_certificate_refusal(
+    listen: &PreparedListen,
+    server: &'static PreparedServer,
+    req: &RequestCtx<'_>,
+    tls: &crate::tls::HandshakeInfo,
+) -> Option<(u16, bool)> {
+    use crate::client_verify::ClientVerify;
+    use crate::config::{ErrorLogLevel, VerifyClient};
+    let log = |message: &[u8]| {
+        crate::worker::write_error_log(
+            server.error_logs,
+            ErrorLogLevel::Info,
+            &crate::worker::ErrorLogRequest::new(req, server.primary_server_name),
+            message,
+            None,
+        )
+    };
+    // The server the Host names, else the default one, as nginx looks it
+    // up when the Host isn't the SNI name.
+    if let (Some(sni), Some(host)) = (req.sni, req.host)
+        && !host.eq_ignore_ascii_case(sni)
+    {
+        let named = match_server_name(listen, host)
+            .map(|(s, _)| s)
+            .unwrap_or(&listen.servers[listen.default_server]);
+        if named.client_verify != VerifyClient::Off {
+            log(b"client attempted to request the server name different from the one that was negotiated");
+            return Some((421, false));
+        }
+    }
+    match (server.client_verify, &tls.client_verify) {
+        (VerifyClient::Off, _) => None,
+        (mode, ClientVerify::Failed(code, text))
+            if mode != VerifyClient::OptionalNoCa
+                || !crate::x509_verify::error_is_optional(*code as std::ffi::c_long) =>
+        {
+            log(format!("client SSL certificate verify error: ({code}:{text})").as_bytes());
+            Some((495, true))
+        }
+        (VerifyClient::On, ClientVerify::None) => {
+            log(b"client sent no required SSL certificate");
+            Some((496, true))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn tls_choice(listen: &PreparedListen, sni: Option<&str>) -> crate::tls_stream::Choice {
     use crate::tls_stream::Choice;
     if rejects_handshake(listen, sni) {
         return Choice::Reject;
     }
-    if !listen.h2_by_sni {
-        return Choice::Accept;
+    if !listen.h2_by_sni && !listen.tls_contexts_by_sni {
+        return Choice::Accept {
+            h2: true,
+            context: None,
+        };
     }
     let server = sni
         .and_then(|name| match_server_name(listen, name.as_bytes()))
         .map(|(server, _)| server)
         .unwrap_or(&listen.servers[listen.tls_default_server]);
-    if server.http2 {
-        Choice::Accept
-    } else {
-        Choice::AcceptWithoutH2
+    Choice::Accept {
+        h2: !listen.h2_by_sni || server.http2,
+        context: server.tls_context,
     }
 }
 

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme};
 
@@ -339,16 +339,6 @@ pub fn verify_failure(e: &std::io::Error) -> Option<&crate::x509_verify::Failure
     }
 }
 
-impl Verification {
-    fn spki(cert: &CertificateDer<'_>) -> Result<SubjectPublicKeyInfoDer<'static>, rustls::Error> {
-        crate::x509_verify::spki(cert)
-            .map(SubjectPublicKeyInfoDer::from)
-            .ok_or(rustls::Error::InvalidCertificate(
-                CertificateError::BadEncoding,
-            ))
-    }
-}
-
 impl ServerCertVerifier for Verification {
     fn verify_server_cert(
         &self,
@@ -379,27 +369,12 @@ impl ServerCertVerifier for Verification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        // As rustls's verify_tls12_signature, from the key alone: TLS 1.2
-        // names a scheme several algorithms may stand for.
-        let spki = Self::spki(cert)?;
-        let key = webpki::RawPublicKeyEntity::try_from(&spki)
-            .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
-        let algs = &self.provider.signature_verification_algorithms;
-        let candidates = algs
-            .mapping
-            .iter()
-            .filter(|(scheme, _)| *scheme == dss.scheme)
-            .flat_map(|(_, algs)| algs.iter());
-        for alg in candidates {
-            match key.verify_signature(*alg, message, dss.signature()) {
-                Ok(()) => return Ok(HandshakeSignatureValid::assertion()),
-                Err(webpki::Error::UnsupportedSignatureAlgorithmForPublicKeyContext(_)) => continue,
-                Err(_) => break,
-            }
-        }
-        Err(rustls::Error::InvalidCertificate(
-            CertificateError::BadSignature,
-        ))
+        crate::x509_verify::verify_tls12_signature(
+            &self.provider.signature_verification_algorithms,
+            message,
+            cert,
+            dss,
+        )
     }
 
     fn verify_tls13_signature(
@@ -408,11 +383,11 @@ impl ServerCertVerifier for Verification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature_with_raw_key(
-            message,
-            &Self::spki(cert)?,
-            dss,
+        crate::x509_verify::verify_tls13_signature(
             &self.provider.signature_verification_algorithms,
+            message,
+            cert,
+            dss,
         )
     }
 

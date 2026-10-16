@@ -54,7 +54,7 @@ The scenarios are in `bench/scenarios/manifest.tsv`, with nginx's frozen baselin
 - **`worker_connections` per worker, with idle reuse.** `events { worker_connections N; }` (default 512) caps each worker's connections at N minus the listening sockets, as listeners use slots in nginx. Upstream connections count too, in the pool as well (`UpstreamSlot`), since nginx takes them from the same table; there is no master channel, so a worker has one slot more than nginx's. A new upstream connection without a slot first closes an idle keep-alive one, else the request gets a 500 with the `[alert]` below (ngx_http_upstream_connect); a new client closes an idle keep-alive upstream connection before it is refused. Accounting is thread-local (`WorkerConns`: active / idle / drain) because a worker owns its connections. Like `ngx_drain_connections`, when free slots drop to a sixteenth, up to 32 (an eighth) of the connections waiting for a request are asked to close; they are woken to do so (see "Idle keep-alive connections are woken" above). With no slot left, the new connection is closed and `[alert] N worker_connections are not enough` is logged, at most once a second (the reuse case logs `[warn] …, reusing connections`). Without the reuse, idle sockets could hold every slot until their timeouts.
 - **Error-log lines use nginx's layout and context.** `2026/10/02 14:00:00 [error] <pid>#<tid>: *<connection> <message>, client: …, server: …, request: "…", upstream: "…", host: "…"` (`worker::write_error_log`; times in UTC like `$time_local`). Failed upstream attempts are logged with nginx's wording (`connect() failed (111: Connection refused) while connecting to upstream`, `upstream timed out … while reading response header from upstream`, `no live upstreams …`): `proxy::run_proxy` appends them as `AttemptFailure`s to a `Vec` the worker passes in, and the worker adds the request context. The happy path allocates and formats nothing; the reason is boxed inside `AttemptOutcome::Failed` because growing that enum (every attempt returns one) cost ~1.5% on `proxy_hello` in ABBA pairs, and so did wrapping the result in a second async layer. `error_log` is inherited like nginx's (location ← server ← http ← top level). With none in scope, lines go to stderr at level `error` (nginx's default is its compiled-in `logs/error.log`; ruxen runs in the foreground and `-e` redirects stderr). `syslog:` targets send nginx's RFC 3164 datagrams (`src/syslog.rs`), for `access_log` too.
 - **Responses say ruxen; the test harness gets nginx.** `Server` and the built-in error pages' footer carry `ruxen/<version>` (`http::identity`). nginx-tests asserts `nginx/<version>` (`server_tokens.t`, error-page bodies), so `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, read once at config preparation, never on the request path. `-V` keeps its nginx line in both modes: Test::Nginx parses it to decide which tests apply.
-- **Unknown-directive policy** is an explicit allowlist, not "accept everything". An unknown directive in a test config almost always means the test exercises a feature we don't implement; silently accepting would produce a wrong-looking pass instead of a clear "not yet" failure. The allowlist is for tuning knobs only: a directive that restricts access and isn't implemented yet (`ssl_verify_client on`, `proxy_cookie_flags`, `root` / `alias` with variables) fails closed with an `[emerg]`, because ignoring it would serve what the config says to protect (`config::reject_unenforced`, checked by the lexer for every directive). Warnings only: `ssl_ciphers` / `ssl_ecdh_curve` (rustls has no weak suites or groups to fall back to), and `ssl_verify_client optional|optional_no_ca` — nginx admits certless clients there too and leaves the decision to `$ssl_client_verify`, which ruxen always renders `NONE`, so a `= SUCCESS` check denies.
+- **Unknown-directive policy** is an explicit allowlist, not "accept everything". An unknown directive in a test config almost always means the test exercises a feature we don't implement; silently accepting would produce a wrong-looking pass instead of a clear "not yet" failure. The allowlist is for tuning knobs only: a directive that restricts access and isn't implemented yet (`proxy_cookie_flags`, `root` / `alias` with variables; `ssl_verify_client on` was one until #113) fails closed with an `[emerg]`, because ignoring it would serve what the config says to protect (`config::reject_unenforced`, checked by the lexer for every directive). Warnings only: `ssl_ciphers` / `ssl_ecdh_curve` (rustls has no weak suites or groups to fall back to).
 - **Out of scope for nginx-tests interop:** any `.t` that uses `Test::Nginx::Stream`, `Test::Nginx::IMAP`, `Test::Nginx::SMTP`, `Test::Nginx::POP3`; any test whose conf references directives outside the allowlist; any test requiring dynamic-module loading. The full per-file pass/fail/skip taxonomy lives in [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md); regenerate it via `scripts/run_nginx_tests.sh --update-progress`.
 
 ### Why the nginx-tests track matters
@@ -442,6 +442,30 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   direct `ServerConnection` path. A rejecting default server needs no
   certificate; the other servers then need one or reject too
   (ngx_http_ssl_init).
+- **Client certificates, `ssl_verify_client` (#113).** As in nginx the
+  handshake never fails over the certificate (its verify callback always
+  returns 1): `client_verify::RequestCertificate` asks for one with the
+  subjects of `ssl_client_certificate` as the CA list, takes any chain,
+  and checks only the handshake signature, the client's proof that it has
+  the key. The chain is checked once after the handshake, resumed ones
+  included, against the server's store (`x509_verify`, OpenSSL's rules:
+  `ssl_client_certificate` + `ssl_trusted_certificate`, `ssl_verify_depth`,
+  `ssl_crl`), and the result rides in `HandshakeInfo`. Requests are refused
+  where nginx refuses them (ngx_http_process_request): 495 for a
+  certificate the server rejects (`optional_no_ca` lets through the errors
+  of ngx_ssl_verify_error_optional), 496 for none with `on`, both sent as
+  400 and closing the connection unless `error_page` takes them; and 421
+  when the Host isn't the SNI name and names a verifying server
+  (ngx_http_set_virtual_server). The context is per server: rustls keeps a
+  verifier per `ServerConfig`, so a server with its own context gets a
+  config built from the address's (`tls_certs::with_client_verifier`, the
+  same resolver, session cache and ticket keys), picked by the SNI name in
+  the ClientHello-first accept; a server without certificates of its own
+  takes the default server's, as its name keeps the default's SSL_CTX in
+  nginx. Sessions can't carry a verification across contexts: resumption
+  needs the same SNI name, and the chain is checked again on every
+  handshake. Not done: nginx removes the session of a refused handshake
+  from its cache; here a resumed one is refused the same way again.
 - **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
   rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
   When the variable is used and the listen resumes sessions, a full

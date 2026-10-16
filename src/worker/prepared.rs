@@ -1594,6 +1594,11 @@ pub struct PreparedServer {
     /// HTTP/2 for this server: `http2 on` (server, else http) or
     /// `listen … http2` (#144).
     pub http2: bool,
+    /// The client-certificate context a ClientHello naming this server
+    /// gets (`TlsAcceptor::with_contexts`); `None` for the address's own.
+    pub tls_context: Option<u16>,
+    /// `ssl_verify_client`, checked per request (#113).
+    pub client_verify: crate::config::VerifyClient,
     /// Its `http2_*` settings, http's inherited (#346).
     pub h2: crate::config::Http2Conf,
     /// The server-level keep-alive settings, which an HTTP/2 connection
@@ -1715,6 +1720,12 @@ pub struct PreparedListen {
     /// The servers differ in `http2`: the SNI name decides whether ALPN
     /// offers `h2` (`phase::tls_choice`).
     pub h2_by_sni: bool,
+    /// The servers differ in client-certificate context: the SNI name
+    /// picks the config (`phase::tls_choice`, #113).
+    pub tls_contexts_by_sni: bool,
+    /// Some server of the address has `ssl_verify_client` on: requests are
+    /// checked (`phase::client_certificate_refusal`).
+    pub client_verify: bool,
     /// The TLS default server (`default_server`, else the first), for a
     /// ClientHello without a name that selects one.
     pub tls_default_server: usize,
@@ -1858,6 +1869,10 @@ pub struct PreparedHttp {
     pub bad_request: Prebuilt,
     /// nginx's 497 page: plain HTTP on an `ssl` port, sent as 400 (#384).
     pub plain_http: Prebuilt,
+    /// nginx's 495 and 496 pages, sent as 400, and its 421 (#113).
+    pub cert_error: Prebuilt,
+    pub no_cert: Prebuilt,
+    pub misdirected: Prebuilt,
     pub not_implemented: Prebuilt,
     pub forbidden: Prebuilt,
     pub bad_gateway: Prebuilt,

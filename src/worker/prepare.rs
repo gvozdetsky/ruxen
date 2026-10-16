@@ -253,7 +253,25 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             server.h2 = *h2;
         }
         let h2_by_sni = server_http2.iter().any(|&on| on != http2);
-        let tls = build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)?;
+        let tls = match build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)? {
+            Some((acceptor, contexts)) => {
+                for ((server, context), input) in servers.iter_mut().zip(contexts).zip(&tls_inputs)
+                {
+                    server.tls_context = context;
+                    server.client_verify = input
+                        .ssl
+                        .client_verify
+                        .mode
+                        .unwrap_or(crate::config::VerifyClient::Off);
+                }
+                Some(acceptor)
+            }
+            None => None,
+        };
+        let tls_contexts_by_sni = servers.iter().any(|s| s.tls_context.is_some());
+        let client_verify = servers
+            .iter()
+            .any(|s| s.client_verify != crate::config::VerifyClient::Off);
         let h2_by_sni = h2_by_sni && tls.is_some();
         let reject_handshake = (tls.is_some()
             && tls_inputs
@@ -313,6 +331,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             // The default server is the first (`default_server: 0`).
             h2_plain: server_http2.first().copied().unwrap_or(false),
             h2_by_sni,
+            tls_contexts_by_sni,
+            client_verify,
             tls_default_server,
             socket,
         });
@@ -341,6 +361,13 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             "The plain HTTP request was sent to HTTPS port\n",
             http_server_bytes,
         ),
+        cert_error: Prebuilt::leak(400, "The SSL certificate error\n", http_server_bytes),
+        no_cert: Prebuilt::leak(
+            400,
+            "No required SSL certificate was sent\n",
+            http_server_bytes,
+        ),
+        misdirected: Prebuilt::leak(421, "Misdirected Request\n", http_server_bytes),
         not_implemented: Prebuilt::leak(501, "Not Implemented\n", http_server_bytes),
         forbidden: Prebuilt::leak(403, "Forbidden\n", http_server_bytes),
         bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),
@@ -401,12 +428,13 @@ pub(crate) struct TlsServerInput {
 /// ssl listens carry `ssl_certificate`/`ssl_certificate_key` pairs, so a
 /// load failure here is an unreadable file, a malformed PEM or a key that
 /// doesn't match its certificate — a startup error, as in nginx.
+/// With it, each server's client-certificate context (`tls_context`).
 pub(crate) fn build_listen_tls(
     addr: SocketAddr,
     inputs: &[TlsServerInput],
     http2: bool,
     h2_by_sni: bool,
-) -> Result<Option<Arc<crate::tls::TlsAcceptor>>, String> {
+) -> Result<Option<(Arc<crate::tls::TlsAcceptor>, Vec<Option<u16>>)>, String> {
     use crate::config::ServerNameSpec;
 
     // As in nginx, `ssl` belongs to the listening socket: one `listen …
@@ -525,12 +553,141 @@ pub(crate) fn build_listen_tls(
     if http2 && let Some(cfg) = Arc::get_mut(&mut cfg) {
         cfg.alpn_protocols.insert(0, b"h2".to_vec());
     }
-    let acceptor = crate::tls::acceptor_from_config(cfg);
-    Ok(Some(Arc::new(if h2_by_sni {
-        acceptor.with_choice_of_h2()
-    } else {
-        acceptor
-    })))
+    // Client certificates (#113): each server with certificates of its own
+    // has its context; one without takes the default server's, whose
+    // SSL_CTX its SNI name keeps in nginx. Equal contexts are one.
+    let mut auths: Vec<(ClientAuthKey, Arc<crate::client_verify::ClientAuth>)> = Vec::new();
+    let mut auth_of = |input: &TlsServerInput| -> Result<Option<usize>, String> {
+        let Some(key) = client_auth_key(input)? else {
+            return Ok(None);
+        };
+        if let Some(i) = auths.iter().position(|(k, _)| *k == key) {
+            return Ok(Some(i));
+        }
+        let auth = client_auth(&key)?;
+        auths.push((key, Arc::new(auth)));
+        Ok(Some(auths.len() - 1))
+    };
+    let default_auth = auth_of(default)?;
+    let mut server_auth: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        server_auth.push(if input.ssl.certs.is_empty() {
+            default_auth
+        } else {
+            auth_of(input)?
+        });
+    }
+    // The address's config is the default server's context; the others
+    // are configs of their own, indexed in `contexts`.
+    let with_auth = |auth: Option<usize>| -> Arc<rustls::ServerConfig> {
+        match auth {
+            Some(i) => crate::tls_certs::with_client_verifier(
+                &cfg,
+                protocols,
+                auths[i].1.verifier(crate::tls_certs::active_provider()),
+            ),
+            None => cfg.clone(),
+        }
+    };
+    let mut others: Vec<Option<usize>> = Vec::new();
+    let contexts: Vec<Option<u16>> = server_auth
+        .iter()
+        .map(|&auth| {
+            (auth != default_auth).then(|| {
+                let i = others.iter().position(|&o| o == auth).unwrap_or_else(|| {
+                    others.push(auth);
+                    others.len() - 1
+                });
+                i as u16
+            })
+        })
+        .collect();
+    let main = with_auth(default_auth);
+    let other_configs = others
+        .iter()
+        .map(|&auth| (with_auth(auth), auth.map(|i| auths[i].1.clone())))
+        .collect();
+    let acceptor = crate::tls::acceptor_from_config(main)
+        .with_contexts(default_auth.map(|i| auths[i].1.clone()), other_configs);
+    Ok(Some((
+        Arc::new(if h2_by_sni {
+            acceptor.with_choice_of_h2()
+        } else {
+            acceptor
+        }),
+        contexts,
+    )))
+}
+
+/// What a client-certificate context is made of: the files' contents and
+/// the depth. `ssl_client_certificate`'s subjects are also the CA list.
+#[derive(PartialEq, Eq)]
+struct ClientAuthKey {
+    client_certificate: Option<Vec<u8>>,
+    trusted_certificate: Option<Vec<u8>>,
+    crl: Option<Vec<u8>>,
+    depth: u32,
+}
+
+/// A server's `ssl_verify_client` settings, read: `None` with it off.
+/// The files load as nginx loads them (ngx_http_ssl_merge_srv_conf), and
+/// fail as it fails: `on` / `optional` need `ssl_client_certificate`.
+fn client_auth_key(input: &TlsServerInput) -> Result<Option<ClientAuthKey>, String> {
+    use crate::config::VerifyClient;
+    let conf = &input.ssl.client_verify;
+    let mode = conf.mode.unwrap_or(VerifyClient::Off);
+    let read = |path: &Option<std::path::PathBuf>, call: &str| {
+        path.as_ref()
+            .map(|p| {
+                std::fs::read(p)
+                    .map_err(|e| format!("{call}(\"{}\") failed ({})", p.display(), errno_text(&e)))
+            })
+            .transpose()
+    };
+    let trusted_certificate = read(&conf.trusted_certificate, "SSL_CTX_load_verify_locations")?;
+    let crl = read(&conf.crl, "X509_LOOKUP_load_file")?;
+    if mode == VerifyClient::Off {
+        return Ok(None);
+    }
+    if conf.client_certificate.is_none() && mode != VerifyClient::OptionalNoCa {
+        return Err("no ssl_client_certificate for ssl_verify_client".to_string());
+    }
+    Ok(Some(ClientAuthKey {
+        client_certificate: read(&conf.client_certificate, "SSL_CTX_load_verify_locations")?,
+        trusted_certificate,
+        crl,
+        depth: conf.depth.unwrap_or(1),
+    }))
+}
+
+fn client_auth(key: &ClientAuthKey) -> Result<crate::client_verify::ClientAuth, String> {
+    let fail = |what: &str, e: String| format!("{what} failed (SSL: {e})");
+    let mut store =
+        crate::x509_verify::Store::empty(key.depth).map_err(|e| fail("X509_STORE_new()", e))?;
+    let mut hints = Vec::new();
+    if let Some(pem) = &key.client_certificate {
+        store
+            .add_trusted(pem)
+            .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_client_certificate)", e))?;
+        hints = crate::x509_verify::subjects(pem)
+            .into_iter()
+            .map(rustls::DistinguishedName::from)
+            .collect();
+    }
+    if let Some(pem) = &key.trusted_certificate {
+        store
+            .add_trusted(pem)
+            .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_trusted_certificate)", e))?;
+    }
+    if let Some(pem) = &key.crl {
+        store
+            .add_crl(pem)
+            .map_err(|e| fail("X509_LOOKUP_load_file(ssl_crl)", e))?;
+    }
+    Ok(crate::client_verify::ClientAuth {
+        store: Arc::new(store),
+        hints,
+    })
 }
 
 pub(crate) fn prepare_upstreams(
@@ -2014,6 +2171,8 @@ pub(crate) fn prepare_server(
         doc_root: server_doc_root,
         // Set by the caller, which knows the http scope.
         http2: false,
+        tls_context: None,
+        client_verify: crate::config::VerifyClient::Off,
         h2: Default::default(),
         keepalive: server_keepalive,
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),

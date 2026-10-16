@@ -2941,14 +2941,15 @@ pub(crate) async fn handle_tls(
         plain_http: false,
     };
     let budget = budget.saturating_sub(accepted_at.elapsed());
-    let accepted = if listen.reject_handshake.is_some() || listen.h2_by_sni {
-        crate::tls::accept_choosing_with_timeout(&acceptor, stream, budget, |sni| {
-            phase::tls_choice(listen, sni)
-        })
-        .await
-    } else {
-        crate::tls::accept_with_timeout(&acceptor, stream, budget).await
-    };
+    let accepted =
+        if listen.reject_handshake.is_some() || listen.h2_by_sni || listen.tls_contexts_by_sni {
+            crate::tls::accept_choosing_with_timeout(&acceptor, stream, budget, |sni| {
+                phase::tls_choice(listen, sni)
+            })
+            .await
+        } else {
+            crate::tls::accept_with_timeout(&acceptor, stream, budget).await
+        };
     let (mut tls_stream, info) = match accepted {
         Ok(crate::tls::Handshake::Tls(stream, info)) => (stream, info),
         Ok(crate::tls::Handshake::Plain(stream, read)) => {
