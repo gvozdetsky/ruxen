@@ -38,6 +38,10 @@ const READ_BUF_SIZE: usize = 17 * 1024;
 /// `wbuf` keeps its allocation between writes only up to this size, so a
 /// connection that once streamed a large body doesn't pin ~64 KiB (rustls's
 /// outgoing limit) for the rest of its keepalive life.
+/// A write of at least this much ciphertext is tried on the socket at once
+/// (`write_tls`); smaller ones, most responses, stay batched in io_uring.
+const DIRECT_SEND_MIN: usize = 16 * 1024;
+
 const WRITE_BUF_KEEP: usize = 32 * 1024;
 
 /// What a client opened on a TLS port with.
@@ -171,7 +175,7 @@ impl TlsAcceptor {
     /// A first byte that can't start TLS gives `Accepted::Plain`.
     pub async fn accept<IO>(&self, mut io: IO) -> io::Result<Accepted<IO>>
     where
-        IO: AsyncReadRent + AsyncWriteRent,
+        IO: AsyncReadRent + AsyncWriteRent + 'static,
     {
         let Some(first) = first_read(&mut io).await? else {
             return Err(handshake_eof());
@@ -198,7 +202,7 @@ impl TlsAcceptor {
         choose: impl FnOnce(Option<&str>) -> Choice,
     ) -> io::Result<Accepted<IO>>
     where
-        IO: AsyncReadRent + AsyncWriteRent,
+        IO: AsyncReadRent + AsyncWriteRent + 'static,
     {
         let mut acceptor = rustls::server::Acceptor::default();
         let Some(mut buf) = first_read(&mut io).await? else {
@@ -280,7 +284,7 @@ impl TlsAcceptor {
         rbuf: Vec<u8>,
     ) -> io::Result<TlsStream<IO>>
     where
-        IO: AsyncReadRent + AsyncWriteRent,
+        IO: AsyncReadRent + AsyncWriteRent + 'static,
     {
         let session_id = if self.session_ids {
             let mut id = [0; 32];
@@ -348,7 +352,7 @@ impl<IO> TlsStream<IO> {
 /// A TLS client connection to `name` over `io`, handshaken: an HTTPS
 /// upstream (#116). `name` is what the certificate is checked against
 /// and, with SNI on in `config`, what the ClientHello names.
-pub async fn connect<IO: AsyncReadRent + AsyncWriteRent>(
+pub async fn connect<IO: AsyncReadRent + AsyncWriteRent + 'static>(
     config: Arc<ClientConfig>,
     name: rustls::pki_types::ServerName<'static>,
     io: IO,
@@ -430,7 +434,7 @@ where
     }
 }
 
-impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
+impl<IO: AsyncReadRent + AsyncWriteRent + 'static> TlsStream<IO> {
     async fn handshake(&mut self) -> io::Result<()> {
         loop {
             // The final pass also flushes what rustls queues right after the
@@ -460,7 +464,7 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
 
 impl<IO, C, D> TlsStream<IO, C>
 where
-    IO: AsyncReadRent + AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + 'static,
     C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
     D: SideData,
 {
@@ -512,7 +516,45 @@ where
             while self.conn.wants_write() {
                 self.conn.write_tls(&mut buf)?;
             }
-            let (res, buf) = self.io.write_all(buf).await;
+            // A large run of records over plain TCP goes out at once, while
+            // it is still in the cache from being encrypted (#247); what
+            // the socket doesn't take goes through io_uring.
+            let mut buf = buf;
+            if buf.len() >= DIRECT_SEND_MIN
+                && let Some(tcp) =
+                    (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = tcp.as_raw_fd();
+                let mut sent = 0usize;
+                while sent < buf.len() {
+                    // SAFETY: the pointer/len pair stays within `buf`.
+                    let r = unsafe {
+                        libc::send(
+                            fd,
+                            buf[sent..].as_ptr().cast(),
+                            buf.len() - sent,
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    if r > 0 {
+                        sent += r as usize;
+                        continue;
+                    }
+                    if r < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                buf.drain(..sent);
+            }
+            let (res, buf) = if buf.is_empty() {
+                (Ok(()), buf)
+            } else {
+                let (res, buf) = self.io.write_all(buf).await;
+                (res.map(|_| ()), buf)
+            };
             if buf.capacity() <= WRITE_BUF_KEEP {
                 self.wbuf = buf;
             }
@@ -563,7 +605,7 @@ where
 
 impl<IO, C, D> AsyncReadRent for TlsStream<IO, C>
 where
-    IO: AsyncReadRent + AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + 'static,
     C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
     D: SideData,
 {
@@ -602,7 +644,7 @@ where
 
 impl<IO, C, D> AsyncWriteRent for TlsStream<IO, C>
 where
-    IO: AsyncReadRent + AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + 'static,
     C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
     D: SideData,
 {

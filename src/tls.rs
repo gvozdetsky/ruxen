@@ -69,7 +69,7 @@ pub async fn accept_with_timeout<IO>(
     timeout: Duration,
 ) -> Result<Handshake<IO>, AcceptError>
 where
-    IO: AsyncReadRent + AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + 'static,
 {
     match monoio::time::timeout(timeout, acceptor.accept(stream)).await {
         Ok(Ok(accepted)) => Ok(accepted.into()),
@@ -88,7 +88,7 @@ pub async fn accept_choosing_with_timeout<IO>(
     choose: impl FnOnce(Option<&str>) -> crate::tls_stream::Choice,
 ) -> Result<Handshake<IO>, AcceptError>
 where
-    IO: AsyncReadRent + AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + 'static,
 {
     match monoio::time::timeout(timeout, acceptor.accept_choosing(stream, choose)).await {
         Ok(Ok(accepted)) => Ok(accepted.into()),

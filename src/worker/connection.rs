@@ -716,6 +716,54 @@ where
     }
 }
 
+/// `write_all_timed`, but on plain TCP the bytes go out at once with
+/// `send(MSG_DONTWAIT)`, while they are still in the cache from being
+/// read; it waits for writability only when the socket is full (#247).
+/// An io_uring write would run at the next submit, after other
+/// connections' reads have pushed them out. TLS and HTTP/2 use the
+/// io_uring write.
+pub(crate) async fn write_all_now<S: ConnIo>(
+    stream: &mut S,
+    buf: Vec<u8>,
+    len: usize,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    timeout: Duration,
+) -> (Result<(), usize>, Vec<u8>) {
+    let Some(sock) = stream.sendfile_fd() else {
+        return write_all_timed(stream, buf, len, timer, timeout).await;
+    };
+    let mut sent = 0usize;
+    while sent < len {
+        // SAFETY: the pointer/len pair stays within `buf[..len]`.
+        let r = unsafe {
+            libc::send(
+                sock,
+                buf[sent..len].as_ptr().cast(),
+                len - sent,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if r > 0 {
+            sent += r as usize;
+            continue;
+        }
+        if r == 0 {
+            return (Err(sent), buf);
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock => {
+                let ready = with_timeout(timer.as_mut(), timeout, stream.wait_writable());
+                if !matches!(ready.await, Some(Ok(_))) {
+                    return (Err(sent), buf);
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return (Err(sent), buf),
+        }
+    }
+    (Ok(()), buf)
+}
+
 /// `write_all` with nginx's `send_timeout`: the connection is given up
 /// when one write makes no progress for `timeout`. nginx re-arms the timer
 /// after every partial send, so a slow but steady client may take longer
