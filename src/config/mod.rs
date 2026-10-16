@@ -1137,11 +1137,24 @@ pub(crate) fn parse_mime(
     mime: &mut MimeConf,
 ) -> Result<bool, Error> {
     match (args[0].as_str(), term) {
+        // A second `types {}` at the same level adds to the first, a
+        // repeated extension taking the later type: ngx_http_core_types
+        // keeps one array per level (`include mime.types;` and then a few
+        // more types is common).
         ("types", Terminator::BlockOpen) if args.len() == 1 => {
-            if mime.types.is_some() {
-                return Err(Error::Duplicate("types"));
+            let more = parse_types_block(lx)?;
+            match &mut mime.types {
+                None => mime.types = Some(std::sync::Arc::new(more)),
+                Some(types) => {
+                    let types = std::sync::Arc::make_mut(types);
+                    for (ext, ty) in more {
+                        match types.iter_mut().find(|(e, _)| *e == ext) {
+                            Some(slot) => slot.1 = ty,
+                            None => types.push((ext, ty)),
+                        }
+                    }
+                }
             }
-            mime.types = Some(std::sync::Arc::new(parse_types_block(lx)?));
             Ok(true)
         }
         ("default_type", Terminator::Semi) => {
