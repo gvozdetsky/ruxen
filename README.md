@@ -229,7 +229,7 @@ Supported functionality includes:
 ruxen supports a growing subset of nginx's proxy functionality, including:
 
 - `proxy_pass`, with variables (literal addresses, `upstream` names and `unix:` paths; no `resolver` yet), to TCP and `unix:` upstreams
-- HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); certificate verification with `proxy_ssl_verify`, `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth` and `proxy_ssl_crl`, by OpenSSL's rules (AWS-LC's X.509 code: commonName fallback, depth, CRLs) and nginx's error-log lines; client certificates to upstreams with `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (`""` cancels an inherited one; paths with variables and encrypted keys aren't supported yet and are refused)
+- HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); certificate verification with `proxy_ssl_verify`, `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth` and `proxy_ssl_crl`, by OpenSSL's rules (AWS-LC's X.509 code: commonName fallback, depth, CRLs) and nginx's error-log lines; client certificates to upstreams with `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (`""` cancels an inherited one, `proxy_ssl_password_file` for an encrypted key; paths with variables aren't supported yet and are refused)
 - named `upstream` blocks
 - path rewriting
 - weighted round-robin, `least_conn`, `hash` (including `consistent`) and `ip_hash`
@@ -260,7 +260,7 @@ Currently supported:
 
 - TLS 1.2 and TLS 1.3
 - `ssl_certificate`
-- `ssl_certificate_key`
+- `ssl_certificate_key`, encrypted ones with `ssl_password_file` (each line tried in order, as nginx does)
 - RSA and ECDSA certificates
 - multiple certificates per server
 - SNI, and `ssl_reject_handshake`
@@ -412,7 +412,7 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
-- client certificates to upstreams with variables in the path, and encrypted keys (`proxy_ssl_password_file`); HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
+- client certificates to upstreams with variables in the path (#434); HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, charset conversion, and third-party modules
 - the `resolver` (a `proxy_pass` with variables reaches literal addresses and `upstream` names only)
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file

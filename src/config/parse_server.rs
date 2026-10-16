@@ -28,6 +28,7 @@ pub(crate) fn parse_server_block(
     let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut client_verify = ClientVerifyConf::default();
+    let mut ssl_password_file: Option<PathBuf> = None;
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -111,6 +112,7 @@ pub(crate) fn parse_server_block(
                         reject_handshake: ssl_reject_handshake,
                         resumption,
                         client_verify,
+                        password_file: ssl_password_file,
                     };
                     let mut listens_iter = listens.into_iter();
                     let first_listen = listens_iter
@@ -276,6 +278,16 @@ pub(crate) fn parse_server_block(
                 };
                 resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
+            ("ssl_password_file", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                if ssl_password_file.is_some() {
+                    return Err(Error::Duplicate("ssl_password_file"));
+                }
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_password_file"));
+                };
+                ssl_password_file = Some(resolve_conf_path(lx.conf_prefix(), PathBuf::from(path)));
+            }
             (name, Terminator::Semi) if ClientVerifyConf::takes(name) => {
                 saw_any_ssl_directive = true;
                 client_verify.parse(&args, lx.conf_prefix())?;
@@ -288,7 +300,6 @@ pub(crate) fn parse_server_block(
                 | "ssl_stapling_file"
                 | "ssl_stapling_responder"
                 | "ssl_stapling_verify"
-                | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_conf_command",
                 Terminator::Semi,

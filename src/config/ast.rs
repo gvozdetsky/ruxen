@@ -114,6 +114,8 @@ pub struct ProxyConf {
     /// inherited one.
     pub ssl_certificate: Option<Option<std::path::PathBuf>>,
     pub ssl_certificate_key: Option<Option<std::path::PathBuf>>,
+    /// `proxy_ssl_password_file` (#139).
+    pub ssl_password_file: Option<std::path::PathBuf>,
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -280,6 +282,9 @@ impl ProxyConf {
             ssl_certificate_key: self
                 .ssl_certificate_key
                 .or_else(|| parent.ssl_certificate_key.clone()),
+            ssl_password_file: self
+                .ssl_password_file
+                .or_else(|| parent.ssl_password_file.clone()),
         }
     }
 }
@@ -664,6 +669,8 @@ pub struct ServerSsl {
     /// `ssl_verify_client` and what it checks with (#113), merged with
     /// http scope.
     pub client_verify: ClientVerifyConf,
+    /// `ssl_password_file` (#139), merged with http scope.
+    pub password_file: Option<PathBuf>,
 }
 
 /// `ssl_verify_client`'s modes (ngx_http_ssl_verify).

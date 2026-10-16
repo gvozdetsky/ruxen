@@ -326,6 +326,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut client_verify = ClientVerifyConf::default();
+    let mut ssl_password_file: Option<PathBuf> = None;
     let mut warnings: Vec<String> = Vec::new();
     loop {
         let (args, term) = lx.read_directive()?;
@@ -384,6 +385,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ssl.reject_handshake = ssl.reject_handshake.or(ssl_reject_handshake);
                         ssl.client_verify =
                             std::mem::take(&mut ssl.client_verify).inherit(&client_verify);
+                        if ssl.password_file.is_none() {
+                            ssl.password_file.clone_from(&ssl_password_file);
+                        }
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -645,6 +649,15 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 };
                 resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
+            ("ssl_password_file", Terminator::Semi) => {
+                if ssl_password_file.is_some() {
+                    return Err(Error::Duplicate("ssl_password_file"));
+                }
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_password_file"));
+                };
+                ssl_password_file = Some(resolve_conf_path(lx.conf_prefix(), PathBuf::from(path)));
+            }
             (name, Terminator::Semi) if ClientVerifyConf::takes(name) => {
                 client_verify.parse(&args, lx.conf_prefix())?
             }
@@ -656,7 +669,6 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_stapling_file"
                 | "ssl_stapling_responder"
                 | "ssl_stapling_verify"
-                | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_conf_command",
                 Terminator::Semi,
