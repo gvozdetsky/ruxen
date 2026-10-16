@@ -3450,6 +3450,7 @@ pub(crate) fn build_prefix_or_exact(
             location_disable_symlinks
                 .clone()
                 .or_else(|| server_disable_symlinks.clone()),
+            &mime,
             tokens,
             upstreams,
             proxy_effective,
@@ -3743,6 +3744,7 @@ pub(crate) fn build_regex_location(
             location_disable_symlinks
                 .clone()
                 .or_else(|| server_disable_symlinks.clone()),
+            &mime,
             tokens,
             upstreams,
             proxy_effective,
