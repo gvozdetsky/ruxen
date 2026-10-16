@@ -141,7 +141,12 @@ pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::S
 
 /// `proxy_ssl_certificate` and its key (#138), loaded once per content of
 /// the files, as the trust stores are. `Err` is the `[emerg]` text.
-pub fn client_certificate(cert: &Path, key: &Path) -> Result<Arc<CertifiedKey>, String> {
+/// An encrypted key opens with `passwords` (`proxy_ssl_password_file`).
+pub fn client_certificate(
+    cert: &Path,
+    key: &Path,
+    passwords: &[Vec<u8>],
+) -> Result<Arc<CertifiedKey>, String> {
     type Key = (Vec<u8>, Vec<u8>);
     static KEYS: Mutex<Vec<(Key, Arc<CertifiedKey>)>> = Mutex::new(Vec::new());
     let fail = |e: &dyn std::fmt::Display| {
@@ -165,8 +170,8 @@ pub fn client_certificate(cert: &Path, key: &Path) -> Result<Arc<CertifiedKey>, 
     if let Some((_, certified)) = keys.iter().find(|(known, _)| *known == k) {
         return Ok(certified.clone());
     }
-    let certified =
-        crate::tls_certs::parse_certified_key(&k.0, &k.1, cert, key).map_err(|e| fail(&e))?;
+    let certified = crate::tls_certs::parse_certified_key(&k.0, &k.1, cert, key, passwords)
+        .map_err(|e| fail(&e))?;
     let certified = Arc::new(certified);
     keys.push((k, certified.clone()));
     Ok(certified)

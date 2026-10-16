@@ -534,6 +534,61 @@ fn escape_uri_component(input: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// An encrypted PEM private key (PKCS#8 `ENCRYPTED PRIVATE KEY`, or
+/// OpenSSL's legacy `Proc-Type: 4,ENCRYPTED`) decrypted with the first of
+/// `passwords` that opens it, as nginx tries `ssl_password_file`'s lines
+/// with PEM_read_bio_PrivateKey (ngx_ssl_load_certificate_key). The key
+/// comes back as unencrypted PKCS#8 DER. `Err` is OpenSSL's reason.
+pub fn decrypt_private_key(pem: &[u8], passwords: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    let mut reason = String::from("no password to decrypt it with (ssl_password_file)");
+    for password in passwords {
+        let mut c_password: Vec<u8> = password.iter().copied().filter(|&b| b != 0).collect();
+        c_password.push(0);
+        let key = unsafe {
+            let bio = ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _);
+            let key = ffi::PEM_read_bio_PrivateKey(
+                bio,
+                ptr::null_mut(),
+                None,
+                c_password.as_mut_ptr() as *mut c_void,
+            );
+            ffi::BIO_free(bio);
+            ffi::OPENSSL_cleanse(c_password.as_mut_ptr() as *mut c_void, c_password.len());
+            key
+        };
+        if key.is_null() {
+            reason = ssl_error();
+            continue;
+        }
+        let der = unsafe {
+            let mut cbb: ffi::CBB = std::mem::zeroed();
+            let mut out: *mut u8 = ptr::null_mut();
+            let mut len: usize = 0;
+            let ok = ffi::CBB_init(&mut cbb, 0) == 1
+                && ffi::EVP_marshal_private_key(&mut cbb, key) == 1
+                && ffi::CBB_finish(&mut cbb, &mut out, &mut len) == 1;
+            ffi::EVP_PKEY_free(key);
+            if !ok {
+                ffi::CBB_cleanup(&mut cbb);
+                return Err(ssl_error());
+            }
+            let der = std::slice::from_raw_parts(out, len).to_vec();
+            ffi::OPENSSL_cleanse(out as *mut c_void, len);
+            ffi::OPENSSL_free(out as *mut c_void);
+            der
+        };
+        unsafe { ffi::ERR_clear_error() };
+        return Ok(der);
+    }
+    Err(reason)
+}
+
+/// The key PEM is encrypted: PKCS#8 or OpenSSL's legacy form.
+pub fn is_encrypted_key(pem: &[u8]) -> bool {
+    let has = |needle: &[u8]| pem.windows(needle.len()).any(|w| w == needle);
+    has(b"-----BEGIN ENCRYPTED PRIVATE KEY-----") || has(b"Proc-Type: 4,ENCRYPTED")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

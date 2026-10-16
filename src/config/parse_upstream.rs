@@ -689,6 +689,7 @@ impl ProxyConf {
         "proxy_ssl_crl",
         "proxy_ssl_certificate",
         "proxy_ssl_certificate_key",
+        "proxy_ssl_password_file",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -874,6 +875,18 @@ impl ProxyConf {
                 *slot = Some((!args[1].is_empty()).then(|| {
                     super::resolve_conf_path(conf_prefix, std::path::PathBuf::from(&args[1]))
                 }));
+            }
+            "proxy_ssl_password_file" => {
+                if self.ssl_password_file.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_password_file"));
+                }
+                let [_, path] = args else {
+                    return Err(Error::MissingArg("proxy_ssl_password_file"));
+                };
+                self.ssl_password_file = Some(super::resolve_conf_path(
+                    conf_prefix,
+                    std::path::PathBuf::from(path),
+                ));
             }
             "proxy_ssl_verify_depth" => {
                 if self.ssl_verify_depth.is_some() {

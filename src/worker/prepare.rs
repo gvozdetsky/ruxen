@@ -59,6 +59,7 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// `-t` runs it too, like `nginx -t` runs module init. The error is the
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
+    crate::tls_certs::forget_password_files();
     let HttpConfig {
         limit_req_zones,
         limit_conn_zones,
@@ -441,6 +442,24 @@ pub(crate) fn build_listen_tls(
     // ssl` makes every server on the address TLS (ngx_http.c:
     // `ssl = lsopt->ssl || addr[i].opt.ssl`).
     if !inputs.iter().any(|i| i.ssl_listen) {
+        // nginx still loads the certificates of every server that has
+        // them (ngx_http_ssl_merge_srv_conf), so a bad key or password is
+        // an [emerg] here too (#139).
+        for input in inputs {
+            let passwords = match &input.ssl.password_file {
+                Some(path) if !input.ssl.certs.is_empty() => crate::tls_certs::password_file(path)?,
+                _ => Arc::from(Vec::new()),
+            };
+            for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
+                crate::tls_certs::load_certified_key(cert, key, &passwords).map_err(|e| {
+                    format!(
+                        "cannot load certificate \"{}\" with key \"{}\": {e}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?;
+            }
+        }
         return Ok(None);
     }
     // The address's default server — `default_server`, else the first —
@@ -476,8 +495,12 @@ pub(crate) fn build_listen_tls(
         }
         let mut keys: Vec<Arc<rustls::sign::CertifiedKey>> =
             Vec::with_capacity(input.ssl.certs.len());
+        let passwords = match &input.ssl.password_file {
+            Some(path) => crate::tls_certs::password_file(path)?,
+            None => Arc::from(Vec::new()),
+        };
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
-            let ck = crate::tls_certs::load_certified_key(cert, key).map_err(|e| {
+            let ck = crate::tls_certs::load_certified_key(cert, key, &passwords).map_err(|e| {
                 format!(
                     "cannot load certificate \"{}\" with key \"{}\": {e}",
                     cert.display(),
@@ -1284,7 +1307,15 @@ fn prepare_upstream_tls(
                 cert.display()
             ));
         }
-        (Some(cert), Some(key)) => Some(crate::upstream_tls::client_certificate(cert, key)?),
+        (Some(cert), Some(key)) => {
+            let passwords = match settings.password_file {
+                Some(path) => crate::tls_certs::password_file(path)?,
+                None => Arc::from(Vec::new()),
+            };
+            Some(crate::upstream_tls::client_certificate(
+                cert, key, &passwords,
+            )?)
+        }
     };
     let config = crate::upstream_tls::client_config(
         settings.protocols,
