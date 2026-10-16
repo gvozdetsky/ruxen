@@ -209,7 +209,11 @@ impl ConnIo for TcpStream {
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
-        read_first_or_shutdown(self, buf, state, idle, fresh, timers).await
+        use monoio::buf::IoBufMut;
+        let len = buf.len();
+        let (next, buf) =
+            read_first_or_shutdown(self, buf.slice_mut(0..len), state, idle, fresh, timers).await;
+        (next, buf.map_or_else(Vec::new, |b| b.into_inner()))
     }
 
     async fn idle_wait(
@@ -261,6 +265,37 @@ impl ConnIo for TcpStream {
 }
 
 impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
+    /// The socket read itself, of ciphertext into the stream's own buffer,
+    /// instead of a readiness poll and then the read (#145), as plain TCP
+    /// does; `Ready` then, and the request read decrypts what came.
+    async fn idle_read(
+        &mut self,
+        buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: Option<Duration>,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        if self.has_buffered_input() {
+            let next = if fresh || !state.is_shutting_down() {
+                IdleRead::Ready
+            } else {
+                IdleRead::Close
+            };
+            return (next, buf);
+        }
+        let ciphertext = self.take_read_buf();
+        let (next, ciphertext) =
+            read_first_or_shutdown(self.io_mut(), ciphertext, state, idle, fresh, timers).await;
+        // A dropped read took the buffer: the next read allocates one.
+        self.put_read_buf(ciphertext.unwrap_or_default());
+        let next = match next {
+            IdleRead::Read(_) => IdleRead::Ready,
+            other => other,
+        };
+        (next, buf)
+    }
+
     async fn idle_wait(
         &self,
         state: &RuntimeState,
@@ -382,7 +417,18 @@ impl ConnIo for Preread {
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
         if !self.has_pending() {
-            return read_first_or_shutdown(&mut self.io, buf, state, idle, fresh, timers).await;
+            use monoio::buf::IoBufMut;
+            let len = buf.len();
+            let (next, buf) = read_first_or_shutdown(
+                &mut self.io,
+                buf.slice_mut(0..len),
+                state,
+                idle,
+                fresh,
+                timers,
+            )
+            .await;
+            return (next, buf.map_or_else(Vec::new, |b| b.into_inner()));
         }
         // As `read_first_or_shutdown`: into `buf[..buf.len()]`.
         // SAFETY: `buf` holds `len` initialized bytes to overwrite.

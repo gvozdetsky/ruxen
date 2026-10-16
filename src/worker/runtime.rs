@@ -2400,14 +2400,16 @@ pub(crate) async fn wait_readable_or_shutdown(
 /// connection closes, as nginx's keep-alive timer closes it. A monoio
 /// `Canceller` would keep the buffer, but cost a `HashSet` insert and
 /// remove (SipHash) per request, about 8% of `m1_hello`'s instructions.
-pub(crate) async fn read_first_or_shutdown(
+/// `buf`: the request buffer's `[..len]` for plain TCP, or a TLS stream's
+/// ciphertext buffer (#145); `None` back when the read was dropped.
+pub(crate) async fn read_first_or_shutdown<T: monoio::buf::IoBufMut>(
     stream: &mut TcpStream,
-    buf: Vec<u8>,
+    buf: T,
     state: &RuntimeState,
     idle_timeout: Option<Duration>,
     fresh: bool,
     timers: &mut ConnTimers<'_>,
-) -> (IdleRead, Vec<u8>) {
+) -> (IdleRead, Option<T>) {
     use std::task::Poll;
 
     let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
@@ -2415,8 +2417,7 @@ pub(crate) async fn read_first_or_shutdown(
         arm_idle(timers.idle.as_mut(), due);
     }
     let idle = IdleMark::new();
-    let len = buf.len();
-    let mut read = std::pin::pin!(stream.read(buf.slice_mut(0..len)));
+    let mut read = std::pin::pin!(stream.read(buf));
     // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
     // no per-connection tick.
     let done = std::future::poll_fn(|cx| {
@@ -2436,10 +2437,10 @@ pub(crate) async fn read_first_or_shutdown(
     })
     .await;
     match done {
-        Some((Ok(n), returned)) if n > 0 => (IdleRead::Read(n), returned.into_inner()),
-        Some((_, returned)) => (IdleRead::Close, returned.into_inner()),
+        Some((Ok(n), returned)) if n > 0 => (IdleRead::Read(n), Some(returned)),
+        Some((_, returned)) => (IdleRead::Close, Some(returned)),
         // The read is dropped with this frame, and cancelled with it.
-        None => (IdleRead::Close, Vec::new()),
+        None => (IdleRead::Close, None),
     }
 }
 
