@@ -6,11 +6,11 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 206 of 238 configurations nginx accepts (87%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 213 of 238 configurations nginx accepts (89%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 186 | 87% |
+| github | 214 | 193 | 90% |
 | php | 3 | 0 | 0% |
 | proxy | 17 | 17 | 100% |
 | static | 4 | 3 | 75% |
@@ -20,14 +20,13 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | configurations | first error in ruxen | examples |
 |---:|---|---|
 | 6 | unknown directive `stream` | gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt, gh:Azigaming404/cyber/nginx.conf.txt, gh:essoojay/Autoscript-by-azi/nginx.conf.txt … |
-| 5 | bad value for ssl_protocols (insecure version rejected): TLSvN in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:EstudioNexos/flautodiscover/fla_nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf … |
-| 4 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf, gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
-| 2 | bad value for ssl_protocols (insecure version rejected): TLSvN.N in <sandbox>…:N | gh:decred/dcrstakepool/sample-nginx.conf, gh:TetAlius/GoSyncMyCalendars/.nginx.conf |
-| 2 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir |
+| 3 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir, gh:EstudioNexos/flautodiscover/fla_nginx.conf |
+| 2 | bad value for upstream server host:port: N.N.N.N: invalid socket address in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf |
 | 1 | "…" is not supported yet, and ignoring it is unsafe: variables in the path aren't expanded yet (#N), | gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf |
 | 1 | bad value for proxy_pass scheme (only http:… supported in vN.N): https:… in <sandbox>…:N | gh:MRLokop/shiki-proxy/nginx.conf |
 | 1 | bad value for upstream server param: resolve in <sandbox>…:N | gh:rajim59/SwarmFort/infra/docker/nginx.conf |
+| 1 | invalid location regex `^${SEEK_SUB_URI}(…: regex parse error: | gh:nfdi4health/ldh-deployment/nginx.conf.https |
 | 1 | unknown "…" variable in <sandbox>…:N | gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf |
 | 1 | unknown directive `charset_types` | h5bp:nginx.conf |
 | 1 | unknown directive `fastcgi_pass` | laravel#1 |
@@ -87,13 +86,13 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:yunzhu-li/blupig-gomoku/docker-nginx.conf | github | ok | ok |  |
 | gh:healthlocker/healthlocker/nginx.config | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:35) |
 | gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in a location block in <sandbox>/conf/nginx.conf:39 |
-| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1.1 in <sandbox>/conf/nginx.conf:60 |
+| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | ok |  |
 | gh:ericbarch/socket-tunnel/nginx.conf.sample | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:17) |
 | gh:runzhliu/welink/dev-nginx.conf | github | ok | ok |  |
 | gh:TaitoUnited/full-stack-template/docker-nginx.conf | github | ok | ok |  |
 | gh:dataculturegroup/DataBasic/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:refluxdb/influxdb3-community/iox-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `grpc_pass` in a if block in <sandbox>/conf/nginx.conf:17 |
-| gh:luckylykkk/nnscholar-search/cloud-nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:22 |
+| gh:luckylykkk/nnscholar-search/cloud-nginx.conf | github | ok | ok |  |
 | gh:jataware/beaker-notebook/docs/nginx.conf.txt | github | ok | ok |  |
 | gh:wednesday-solutions/react-template/app/.nginx.conf | github | ok | ok |  |
 | gh:react-boilerplate/site/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
@@ -145,7 +144,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:vazw/siamstr/nginx.config | github | ok | ok |  |
 | gh:awfeequdng/rust-admin/nginx.conf.default | github | ok | ok |  |
 | gh:mazz/kifu/nginx.conf.sample | github | ok | ok |  |
-| gh:eubr-bigsea/citrus/custom_nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 in <sandbox>/conf/nginx.conf:21 |
+| gh:eubr-bigsea/citrus/custom_nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server host:port: 127.0.0.1: invalid socket address in <sandbox>/conf/nginx.conf:36 |
 | gh:brick-family/brick/nginx.config | github | ok | ok |  |
 | gh:bakery/openmic/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:O-C-R/intotheokavango/nginx.conf.smp | github | ok | ok |  |
@@ -160,15 +159,15 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:sk123/theyownwhat/nginx.conf_dev | github | ok | ok |  |
 | gh:sul-cidr/mime/nginx.config | github | ok | ok |  |
 | gh:llong2195/nest-fastify/nginx.conf.d | github | ok | ok |  |
-| gh:TetAlius/GoSyncMyCalendars/.nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1.1 in <sandbox>/conf/nginx.conf:25 |
+| gh:TetAlius/GoSyncMyCalendars/.nginx.conf | github | ok | ok |  |
 | gh:opensessions/opensessions/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
 | gh:liberalman/nginx-consul-template/nginx.conf.ctmpl | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:6) |
 | gh:alecgorge/iguana/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:liujitao/tvbox/suntv_nginx.conf | github | — | — | (nginx: [emerg] unknown log format "main" in <sandbox>/conf/nginx.conf:8) |
 | gh:gierens/yubipi/yubipi-nginx.conf | github | ok | ok |  |
-| gh:nfdi4health/ldh-deployment/nginx.conf.https | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 in <sandbox>/conf/nginx.conf:42 |
+| gh:nfdi4health/ldh-deployment/nginx.conf.https | github | ok | FAIL | ruxen: [emerg] invalid location regex `^${SEEK_SUB_URI}(/.*\|$)`: regex parse error: |
 | gh:Wubbadub/ClubHub/nginx.config | github | ok | ok |  |
-| gh:EstudioNexos/flautodiscover/fla_nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 in <sandbox>/conf/nginx.conf:13 |
+| gh:EstudioNexos/flautodiscover/fla_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `fastcgi_buffers` in a server block in <sandbox>/conf/nginx.conf:15 |
 | gh:aws-solutions-library-samples/guidance-for-training-an-aws-deepracer-model-using-amazon-sagemaker/dpr401/src/lib/nginx.conf | github | ok | ok |  |
 | gh:yegor256/jare/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:yegor256/0pdd/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
@@ -190,7 +189,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf | github | ok | ok |  |
 | gh:TautvydasDerzinskas/Thingport/frontend/nginx.conf | github | ok | ok |  |
 | gh:nicholas-b-carter/progressive-react/app/.nginx.conf | github | — | — | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
-| gh:yashab-cyber/metasploit-ai/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:49 |
+| gh:yashab-cyber/metasploit-ai/docker/nginx.conf | github | ok | ok |  |
 | gh:Ngugi1/wallacepos/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:bleemeo/squirreldb/examples/squirreldb_ha/nginx.conf | github | ok | ok |  |
 | gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
@@ -230,8 +229,8 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:hatanaca/quick-filler-test/nginx.conf | github | ok | ok |  |
 | gh:Ecalose/ocr/nginx.conf | github | ok | ok |  |
 | gh:chelebyy/link-manager/frontend/nginx.conf | github | ok | ok |  |
-| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 in <sandbox>/conf/nginx.conf:24 |
-| gh:Ingvord/animated-garbanzo/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:33 |
+| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server host:port: 127.0.0.1: invalid socket address in <sandbox>/conf/nginx.conf:36 |
+| gh:Ingvord/animated-garbanzo/nginx/nginx.conf | github | ok | ok |  |
 | gh:cfrank/nextjs-common-host-redirect-issue/nginx/nginx.conf | github | ok | ok |  |
 | gh:flajoke/s21-Simple-Docker/src/06/nginx.conf | github | ok | ok |  |
 | gh:JonUkmata/ReviewAnalyzer/nginx/nginx.conf.backup.20260104-194315 | github | — | — | (nginx: [emerg] host not found in upstream "user-service:80" in <sandbox>/conf/ng) |
@@ -256,7 +255,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:zumassh/foodgram-st/infra/nginx.conf | github | ok | ok |  |
 | gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | ok |  |
 | gh:Kwon9302/LetsGoToWork/nginx/nginx.conf | github | ok | ok |  |
-| gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:37 |
+| gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf | github | ok | ok |  |
 | gh:c2-07/postOffice/nginx/nginx.conf | github | ok | ok |  |
 | gh:MikhailGubin/knowledge_plus/nginx/nginx.conf | github | — | — | (nginx: [emerg] invalid parameter "8000" in <sandbox>/conf/nginx.conf:11) |
 | gh:samuelarogbonlo/p2p-webserver-deployment/config/nginx.conf | github | ok | ok |  |
@@ -322,7 +321,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:mesanyaa/finance_manager/client/nginx.conf | github | ok | ok |  |
 | gh:ABCall-Project/abcall-payment-api/docker/nginx.conf | github | ok | ok |  |
 | gh:rahualrai/howard-safe/nginx.conf | github | ok | ok |  |
-| gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 in <sandbox>/conf/nginx.conf:35 |
+| gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf | github | ok | ok |  |
 | gh:franjavi-upct-es/SafeStream-AI/services/dashboard/nginx.conf | github | ok | ok |  |
 | gh:Lucasgarciamdz/reminders_app/frontend/nginx.conf | github | ok | ok |  |
 | gh:tesfandiari1/LLM-txt/frontend/nginx.conf | github | ok | ok |  |

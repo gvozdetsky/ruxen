@@ -217,31 +217,8 @@ pub(crate) fn parse_server_block(
                 if ssl_protocols.is_some() {
                     return Err(Error::Duplicate("ssl_protocols"));
                 }
-                if args.len() < 2 {
-                    return Err(Error::MissingArg("ssl_protocols"));
-                }
-                let mut set = TlsVersionSet {
-                    tlsv1_2: false,
-                    tlsv1_3: false,
-                };
-                for v in &args[1..] {
-                    match v.as_str() {
-                        "TLSv1.2" => set.tlsv1_2 = true,
-                        "TLSv1.3" => set.tlsv1_3 = true,
-                        "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols (insecure version rejected)",
-                                got: v.clone(),
-                            });
-                        }
-                        _ => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols",
-                                got: v.clone(),
-                            });
-                        }
-                    }
-                }
+                let set = parse_tls_protocols(&args[1..], "ssl_protocols")?;
+                warn_old_tls_protocols(&args, warnings);
                 ssl_protocols = Some(set);
             }
             ("ssl_ciphers", Terminator::Semi) => {
@@ -878,6 +855,68 @@ pub(crate) fn resolve_ssl_file_arg(conf_prefix: Option<&Path>, raw: &str) -> Pat
         return path;
     }
     resolve_conf_path(conf_prefix, path)
+}
+
+/// `ssl_protocols` values: TLS 1.2 and 1.3, which rustls speaks. The old
+/// names (`SSLv2` … `TLSv1.1`), on every distribution's default line
+/// `ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;`, are skipped
+/// (`warn_old_tls_protocols` says so); a list of only those is refused,
+/// since nothing would be left to speak (#36).
+pub(crate) fn parse_tls_protocols(
+    args: &[String],
+    what: &'static str,
+) -> Result<TlsVersionSet, Error> {
+    if args.is_empty() {
+        return Err(Error::MissingArg(what));
+    }
+    let mut set = TlsVersionSet {
+        tlsv1_2: false,
+        tlsv1_3: false,
+    };
+    for v in args {
+        match v.as_str() {
+            "TLSv1.2" => set.tlsv1_2 = true,
+            "TLSv1.3" => set.tlsv1_3 = true,
+            "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {}
+            _ => {
+                return Err(Error::BadValue {
+                    what,
+                    got: v.clone(),
+                });
+            }
+        }
+    }
+    if !set.tlsv1_2 && !set.tlsv1_3 {
+        return Err(Error::BadValue {
+            what: if what == "ssl_protocols" {
+                "ssl_protocols (only versions rustls doesn't speak; TLSv1.2 or TLSv1.3 is needed)"
+            } else {
+                "proxy_ssl_protocols (only versions rustls doesn't speak; TLSv1.2 or TLSv1.3 is needed)"
+            },
+            got: args.join(" "),
+        });
+    }
+    Ok(set)
+}
+
+/// The `[warn]` for the old names a `ssl_protocols` line skips (#36).
+pub(crate) fn warn_old_tls_protocols(args: &[String], warnings: &mut Vec<String>) {
+    let old: Vec<&str> = args[1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|v| matches!(*v, "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1"))
+        .collect();
+    if old.is_empty() {
+        return;
+    }
+    let w = format!(
+        "\"{}\": {} not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only",
+        args[0],
+        old.join(", ")
+    );
+    if !warnings.contains(&w) {
+        warnings.push(w);
+    }
 }
 
 pub(crate) fn parse_server_tokens_args(args: &[String]) -> Result<ServerTokens, Error> {
