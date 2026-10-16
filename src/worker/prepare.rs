@@ -282,7 +282,7 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 .flat_map(|s| s.regex_names.iter().map(|n| n.set_pattern.as_str())),
         )
         .map(|set| (set, name_index));
-        let mut exact_names = std::collections::HashMap::new();
+        let mut exact_names = super::prepared::NameMap::default();
         for (si, server) in servers.iter().enumerate() {
             for &name in &server.exact_names {
                 // The first server with a name keeps it (nginx warns about
