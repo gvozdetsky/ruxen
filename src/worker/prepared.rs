@@ -1649,8 +1649,52 @@ pub struct PreparedListen {
     /// Every exact `server_name` of `servers` (lowercased) to the first
     /// server that declares it, as nginx's server-name hash: one lookup
     /// instead of comparing against every name of every server.
-    pub exact_names: std::collections::HashMap<&'static [u8], u32>,
+    pub exact_names: NameMap,
     pub regex_name_set: Option<(regex::bytes::RegexSet, Vec<(u32, u32)>)>,
+}
+
+/// `PreparedListen::exact_names`: hashed with `NameHasher`.
+pub type NameMap =
+    std::collections::HashMap<&'static [u8], u32, std::hash::BuildHasherDefault<NameHasher>>;
+
+/// rustc's FxHash, for the server-name map. Its keys come from the
+/// configuration, so a lookup with any `Host` can't degrade the table,
+/// which is what SipHash guards against; SipHash cost 2.8% of
+/// `m1_hello`'s instructions (callgrind).
+#[derive(Default, Clone, Copy)]
+pub struct NameHasher(u64);
+
+const NAME_HASH_K: u64 = 0xf135_7aea_2e62_a9c5;
+
+impl std::hash::Hasher for NameHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let word = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+            h = (h.rotate_left(5) ^ word).wrapping_mul(NAME_HASH_K);
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(last)).wrapping_mul(NAME_HASH_K);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(NAME_HASH_K);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        // The multiply leaves the low bits weakest; hashbrown takes the
+        // bucket from them.
+        self.0.rotate_left(26)
+    }
 }
 
 /// A listening socket's `listen` options (`backlog=`, `rcvbuf=`, …), from
