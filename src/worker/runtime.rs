@@ -3945,7 +3945,13 @@ pub(crate) async fn handle<S: ConnIo>(
                         let (response, gzip_stream) = match process_meta.gzip {
                             Some(gz) => super::gzip::filter(
                                 gz,
-                                &super::gzip::GzipRequest::from_headers(req.http_11, headers_raw),
+                                &super::gzip::GzipRequest {
+                                    head_only: method_bytes == b"HEAD",
+                                    ..super::gzip::GzipRequest::from_headers(
+                                        req.http_11,
+                                        headers_raw,
+                                    )
+                                },
                                 response,
                             ),
                             None => (response, None),
