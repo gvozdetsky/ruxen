@@ -40,6 +40,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+
+/// The per-worker maps here are keyed by configuration addresses, not by
+/// anything a client sends: FxHash (`NameHasher`) instead of SipHash, which
+/// cost about 1% of `proxy_hello`'s instructions (callgrind).
+type FxBuild = std::hash::BuildHasherDefault<crate::worker::NameHasher>;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
@@ -457,8 +462,8 @@ struct UpstreamRt {
 }
 
 thread_local! {
-    static LB_STATE: RefCell<HashMap<*const PreparedUpstream, UpstreamRt>> =
-        RefCell::new(HashMap::new());
+    static LB_STATE: RefCell<HashMap<*const PreparedUpstream, UpstreamRt, FxBuild>> =
+        RefCell::new(HashMap::default());
 }
 
 /// Peers already tried on this request, nginx's `rrp->tried`: one word
@@ -874,8 +879,8 @@ pub struct PooledConn {
 }
 
 thread_local! {
-    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize), VecDeque<PooledConn>>> =
-        RefCell::new(HashMap::new());
+    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize), VecDeque<PooledConn>, FxBuild>> =
+        RefCell::new(HashMap::default());
 }
 
 /// Take an idle connection from the pool. Drops entries that are past

@@ -1657,10 +1657,10 @@ pub struct PreparedListen {
 pub type NameMap =
     std::collections::HashMap<&'static [u8], u32, std::hash::BuildHasherDefault<NameHasher>>;
 
-/// rustc's FxHash, for the server-name map. Its keys come from the
-/// configuration, so a lookup with any `Host` can't degrade the table,
-/// which is what SipHash guards against; SipHash cost 2.8% of
-/// `m1_hello`'s instructions (callgrind).
+/// rustc's FxHash, for maps keyed by what the configuration made: server
+/// names here, upstream addresses in `upstream.rs`. A lookup with any
+/// `Host` can't degrade such a table, which is what SipHash guards
+/// against; SipHash cost 2.8% of `m1_hello`'s instructions (callgrind).
 #[derive(Default, Clone, Copy)]
 pub struct NameHasher(u64);
 
