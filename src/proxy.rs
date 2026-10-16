@@ -464,8 +464,8 @@ pub fn build_request_bytes(method_bytes: &[u8], uri: &[u8], host_header: &[u8]) 
     )
 }
 
-/// True when the named header is hop-by-hop and must be stripped both
-/// from forwarded request headers and upstream response headers.
+/// True when the named request header isn't forwarded upstream as the
+/// client sent it (`is_hop_by_hop`).
 pub fn is_hop_by_hop_name(name: &[u8]) -> bool {
     is_hop_by_hop(name)
 }
@@ -3189,19 +3189,19 @@ fn first_line_terminator_len(buf: &[u8], line_end: usize) -> usize {
     }
 }
 
-/// RFC 7230 §6.1 hop-by-hop header set, plus `Proxy-Authenticate` /
-/// `Proxy-Authorization`. Compared case-insensitively against the header
-/// name (everything before the `:`). nginx blanks these in both directions
-/// (`ngx_http_proxy_module.c::ngx_http_proxy_create_request` for request,
-/// `ngx_http_upstream.c` upstream-header handlers for response).
+/// The client's request headers that don't go upstream: nginx's proxy
+/// module sets these itself or sends them empty (`ngx_http_proxy_headers`,
+/// ngx_http_proxy_module.c:820: `Connection: close` or the configured
+/// value, `Transfer-Encoding` of its own framing, and `TE`, `Keep-Alive`,
+/// `Expect`, `Upgrade` empty). Everything else, `Proxy-Authorization`
+/// included, is forwarded as nginx does. Compared case-insensitively
+/// against the header name (everything before the `:`).
 fn is_hop_by_hop(name: &[u8]) -> bool {
     const HOP_BY_HOP: &[&[u8]] = &[
         b"connection",
+        b"expect",
         b"keep-alive",
-        b"proxy-authenticate",
-        b"proxy-authorization",
         b"te",
-        b"trailers",
         b"transfer-encoding",
         b"upgrade",
     ];
@@ -3344,6 +3344,10 @@ mod tests {
         assert!(is_hop_by_hop(b"  Transfer-Encoding "));
         assert!(is_hop_by_hop(b"Keep-Alive"));
         assert!(is_hop_by_hop(b"TE"));
+        assert!(is_hop_by_hop(b"Expect"));
+        // nginx forwards these.
+        assert!(!is_hop_by_hop(b"Proxy-Authorization"));
+        assert!(!is_hop_by_hop(b"Trailers"));
         assert!(!is_hop_by_hop(b"Content-Length"));
         assert!(!is_hop_by_hop(b"Server"));
         assert!(!is_hop_by_hop(b"Date"));
