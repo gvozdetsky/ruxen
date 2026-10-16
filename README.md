@@ -270,7 +270,7 @@ ALPN offers `h2` where the server has `http2 on` (or `listen … http2`), else H
 
 ### Configuration and request processing
 
-A growing nginx-compatible configuration surface is implemented, including:
+A growing nginx-compatible configuration surface is implemented. [`docs/directives.md`](docs/directives.md) lists every directive of nginx's core, events and http modules and what ruxen does with it; the main ones:
 
 - `include`, with patterns (`include conf.d/*.conf;`: the matches sorted, none is fine, as nginx's glob)
 - `return`, including `return URL;` (a 302)
