@@ -913,6 +913,9 @@ pub(crate) async fn stream_file<S: ConnIo>(
                     sent += r as usize;
                     continue;
                 }
+                if r == 0 {
+                    return Err(body.len - remaining + sent as u64);
+                }
                 match std::io::Error::last_os_error().kind() {
                     std::io::ErrorKind::WouldBlock => {
                         let ready =
