@@ -21,7 +21,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::worker::lazy_timeout as timeout;
-use monoio::io::AsyncReadRent;
 use monoio::io::AsyncWriteRentExt;
 use monoio::net::TcpStream;
 
@@ -336,8 +335,8 @@ unsafe impl monoio::buf::IoVecBuf for RequestParts {
 }
 
 /// Write the header block and the body with writev until both are sent.
-async fn write_request_parts(
-    stream: &mut UpstreamIo,
+async fn write_request_parts<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
     head: bytes::Bytes,
     body: bytes::Bytes,
 ) -> std::io::Result<()> {
@@ -1507,7 +1506,7 @@ async fn attempt(
     *accel = None;
     *storable = None;
     let peer_addr = plan.peer_addr(peer_idx);
-    let (mut stream, opened_at, requests_served, slot) = if let Some(c) = pooled {
+    let (stream, opened_at, requests_served, slot) = if let Some(c) = pooled {
         (c.stream, c.opened_at, c.requests_served, c.slot)
     } else {
         let Some(slot) = crate::worker::take_upstream_slot() else {
@@ -1593,6 +1592,82 @@ async fn attempt(
         (stream, Instant::now(), 0, slot)
     };
     state.connect_ms = Some(elapsed_ms(started));
+    // The rest of the exchange is generic over the connection: a plain
+    // upstream runs it on the `TcpStream` itself, as before #116, since
+    // going through `UpstreamIo` on every read and write cost ~1.2% on
+    // proxy_hello (laptop ABBA). TLS takes the boxed path.
+    let conn = ExchangeConn {
+        from_pool,
+        opened_at,
+        requests_served,
+        slot,
+    };
+    match stream {
+        UpstreamIo::Plain(s) => {
+            exchange(
+                s,
+                conn,
+                plan,
+                peer_idx,
+                upstream_headers,
+                redirect_header,
+                range_allow,
+                accel,
+                state,
+                started,
+                storable,
+            )
+            .await
+        }
+        UpstreamIo::Tls(s) => {
+            Box::pin(exchange(
+                crate::upstream_io::TlsConn(s),
+                conn,
+                plan,
+                peer_idx,
+                upstream_headers,
+                redirect_header,
+                range_allow,
+                accel,
+                state,
+                started,
+                storable,
+            ))
+            .await
+        }
+    }
+}
+
+/// What `exchange` keeps of how the connection was got.
+struct ExchangeConn {
+    from_pool: bool,
+    opened_at: Instant,
+    requests_served: u32,
+    slot: crate::worker::UpstreamSlot,
+}
+
+/// One attempt after the connection: send the request, read the response
+/// head, then relay, buffer or pool (see `attempt`).
+#[allow(clippy::too_many_arguments)]
+async fn exchange<S: crate::upstream_io::UpstreamConn>(
+    mut stream: S,
+    conn: ExchangeConn,
+    plan: &ProxyPlan,
+    peer_idx: usize,
+    upstream_headers: &mut Vec<u8>,
+    redirect_header: &mut bool,
+    range_allow: &mut RangeAllow,
+    accel: &mut Option<Box<AccelHeaders>>,
+    state: &mut UpstreamState,
+    started: Instant,
+    storable: &mut Option<Storable>,
+) -> AttemptOutcome {
+    let ExchangeConn {
+        from_pool,
+        opened_at,
+        requests_served,
+        slot,
+    } = conn;
 
     // 2. Send the request. Cloning here keeps the original bytes available
     // for `proxy_next_upstream` retries when this attempt fails — monoio's
@@ -1767,7 +1842,7 @@ async fn attempt(
         return upgraded(
             plan,
             peer_idx,
-            stream,
+            stream.into(),
             accum,
             first_line_end,
             head_end,
@@ -1955,7 +2030,7 @@ async fn attempt(
                 head,
                 framing,
                 pending,
-                upstream: stream,
+                upstream: stream.into(),
                 read_buf,
                 read_timeout: plan.read_timeout,
                 limit_rate: plan.limit_rate,
@@ -2174,7 +2249,7 @@ async fn attempt(
             plan.upstream,
             peer_idx,
             upstream::PooledConn {
-                stream,
+                stream: stream.into(),
                 last_used: Instant::now(),
                 opened_at,
                 requests_served: requests_served + 1,
@@ -2876,8 +2951,8 @@ fn upgraded(
 /// Stream a request body that was too large to keep in memory from its
 /// temp file. Opened per attempt, so a retry on the next peer re-sends it
 /// from the start; `proxy_send_timeout` bounds each write.
-async fn send_body_file(
-    stream: &mut UpstreamIo,
+async fn send_body_file<S: monoio::io::AsyncWriteRent>(
+    stream: &mut S,
     file: &RequestBodyFile,
     send_timeout: Duration,
 ) -> Result<(), UpstreamError> {
@@ -2938,8 +3013,8 @@ pub(crate) async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: I
 ///
 /// On failure returns the reason, paired with `true` if no bytes were read
 /// at all (a stale pooled connection) and `false` otherwise.
-async fn read_chunked_body_with_buf(
-    stream: &mut UpstreamIo,
+async fn read_chunked_body_with_buf<S: monoio::io::AsyncReadRent>(
+    stream: &mut S,
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,

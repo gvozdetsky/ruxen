@@ -18,6 +18,55 @@ use crate::tls_stream::TlsStream;
 /// A TLS connection to an upstream.
 pub type UpstreamTls = TlsStream<TcpStream, ClientConnection>;
 
+/// What `proxy::exchange` runs on: a plain `TcpStream`, or `TlsConn`; it
+/// turns back into an `UpstreamIo` for the pool or a relayed body.
+pub trait UpstreamConn: AsyncReadRent + AsyncWriteRent + Into<UpstreamIo> {}
+
+impl<T: AsyncReadRent + AsyncWriteRent + Into<UpstreamIo>> UpstreamConn for T {}
+
+impl From<TcpStream> for UpstreamIo {
+    fn from(s: TcpStream) -> Self {
+        UpstreamIo::Plain(s)
+    }
+}
+
+/// A TLS connection as `proxy::exchange` takes it.
+pub struct TlsConn(pub Box<UpstreamTls>);
+
+impl From<TlsConn> for UpstreamIo {
+    fn from(c: TlsConn) -> Self {
+        UpstreamIo::Tls(c.0)
+    }
+}
+
+impl AsyncReadRent for TlsConn {
+    async fn read<T: IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
+        self.0.read(buf).await
+    }
+
+    async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
+        self.0.readv(buf).await
+    }
+}
+
+impl AsyncWriteRent for TlsConn {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+        self.0.write(buf).await
+    }
+
+    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+        self.0.writev(buf).await
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().await
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.0.shutdown().await
+    }
+}
+
 pub enum UpstreamIo {
     Plain(TcpStream),
     Tls(Box<UpstreamTls>),

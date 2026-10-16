@@ -913,13 +913,27 @@ pub fn pool_take(
         // From the front; LIFO since we push at the front. Drop any
         // entries that have aged out on the way to the first live one
         // opened for this name.
-        let mut i = 0;
+        let fits = |c: &PooledConn| {
+            tls.is_none_or(|t| c.tls.as_ref().is_some_and(|(_, name)| *name == t.name))
+        };
+        // The usual case, the freshest one fits, is a pop_front.
+        while let Some(c) = q.front() {
+            if now.saturating_duration_since(c.last_used) >= idle_max {
+                q.pop_front();
+                continue;
+            }
+            if fits(c) {
+                return q.pop_front();
+            }
+            break;
+        }
+        let mut i = 1;
         while i < q.len() {
             if now.saturating_duration_since(q[i].last_used) >= idle_max {
                 q.remove(i);
                 continue;
             }
-            if tls.is_none_or(|t| q[i].tls.as_ref().is_some_and(|(_, name)| *name == t.name)) {
+            if fits(&q[i]) {
                 return q.remove(i);
             }
             i += 1;
