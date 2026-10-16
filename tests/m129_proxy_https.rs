@@ -282,6 +282,50 @@ fn proxy_ssl_verify_like_nginx() {
     );
 }
 
+/// A kept-alive connection is only reused as it was opened (#117): not by a
+/// location that verifies when it was opened without verification, nor
+/// for a name it wasn't verified against. nginx's keepalive cache would
+/// hand either over, being keyed by the peer alone.
+#[test]
+fn pooled_connections_keep_their_verification() {
+    let chain = common::tls::make_ca_and_leaf("backend.test");
+    let other = common::tls::make_ca_and_leaf("backend.test");
+    let (front, backend) = (free_port(), free_port());
+    let s = start("pool-verify", |_| {
+        format!(
+            "upstream b {{ server 127.0.0.1:{backend}; keepalive 4; }}\n\
+             server {{ listen 127.0.0.1:{backend} ssl;\n\
+               ssl_certificate {cert}; ssl_certificate_key {key};\n\
+               location / {{ return 200 $connection_requests; }} }}\n\
+             server {{ listen 127.0.0.1:{front};\n\
+               proxy_http_version 1.1; proxy_set_header Connection \"\";\n\
+               location /off/ {{ proxy_pass https://b/; proxy_ssl_name backend.test; }}\n\
+               location /wrong-ca/ {{ proxy_pass https://b/; proxy_ssl_name backend.test;\n\
+                 proxy_ssl_verify on; proxy_ssl_trusted_certificate {other_ca}; }}\n\
+               location /right/ {{ proxy_pass https://b/; proxy_ssl_name backend.test;\n\
+                 proxy_ssl_verify on; proxy_ssl_trusted_certificate {ca}; }}\n\
+               location /wrong-name/ {{ proxy_pass https://b/; proxy_ssl_name other.test;\n\
+                 proxy_ssl_verify on; proxy_ssl_trusted_certificate {ca}; }} }}",
+            cert = chain.cert_path().display(),
+            key = chain.key_path().display(),
+            ca = chain.ca_path().unwrap().display(),
+            other_ca = other.ca_path().unwrap().display(),
+        )
+    });
+    // An unverified connection goes to the pool; verification refuses
+    // the certificate on a new one.
+    assert_eq!(get(front, "/off/"), (200, "1".to_string()));
+    assert_eq!(get(front, "/wrong-ca/").0, 502);
+    // The pooled unverified one still serves its own location.
+    assert_eq!(get(front, "/off/"), (200, "2".to_string()));
+    // Verified for backend.test, pooled, reused for backend.test only.
+    assert_eq!(get(front, "/right/"), (200, "1".to_string()));
+    assert_eq!(get(front, "/right/"), (200, "2".to_string()));
+    assert_eq!(get(front, "/wrong-name/").0, 502);
+    let log = std::fs::read_to_string(s.dir.join("error.log")).unwrap_or_default();
+    assert!(log.contains("does not match \"other.test\""), "{log}");
+}
+
 /// nginx refuses `proxy_ssl_verify on` without trusted certificates, and
 /// trusted certificates it can't load.
 #[test]

@@ -34,6 +34,36 @@ pub struct TlsPlan {
     pub name: ServerName<'static>,
 }
 
+/// Who a pooled TLS connection was opened as: its client config (one per
+/// combination of `proxy_ssl_*` settings) and the name it sent and was
+/// verified against.
+pub type TlsIdentity = (usize, ServerName<'static>);
+
+impl TlsPlan {
+    pub fn config_id(&self) -> usize {
+        Arc::as_ptr(&self.config) as usize
+    }
+
+    /// A clone of a prepared name borrows (`leak_name`), so this costs no
+    /// allocation unless the name was rendered for the request.
+    pub fn identity(&self) -> TlsIdentity {
+        (self.config_id(), self.name.clone())
+    }
+}
+
+/// `name` borrowing a leaked copy of itself, so that clones of a name
+/// prepared once (one per pooled connection) don't allocate.
+pub fn leak_name(name: ServerName<'static>) -> ServerName<'static> {
+    match name {
+        ServerName::DnsName(dns) => {
+            let text: &'static str = crate::arena::leak(dns.as_ref().to_string().into_boxed_str());
+            rustls::pki_types::DnsName::try_from(text)
+                .map_or(ServerName::DnsName(dns), ServerName::DnsName)
+        }
+        other => other,
+    }
+}
+
 /// The name for the ClientHello and the session cache: `host` without a
 /// port or IPv6 brackets. A host rustls can't take as a DNS name (an
 /// upstream group named `my_backend`, say) becomes an unspecified address:

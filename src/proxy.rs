@@ -619,7 +619,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
         //    stale-retry counts as part of the same `attempt` budget.
-        let pooled = upstream::pool_take(upstream, current.peer_idx, plan.tls.is_some());
+        let pooled = upstream::pool_take(upstream, current.peer_idx, plan.tls.as_deref());
         let outcome = if let Some(c) = pooled {
             match attempt(
                 &plan,
@@ -1946,6 +1946,7 @@ async fn attempt(
                     peer_idx,
                     opened_at,
                     requests_served,
+                    tls: plan.tls.as_ref().map(|t| t.identity()),
                 });
         let pending = accum[body_start..].to_vec();
         return_proxy_buf(accum);
@@ -2178,6 +2179,7 @@ async fn attempt(
                 opened_at,
                 requests_served: requests_served + 1,
                 slot,
+                tls: plan.tls.as_ref().map(|t| t.identity()),
             },
         );
     }

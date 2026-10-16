@@ -1135,10 +1135,19 @@ fn prepare_upstream_tls(
     };
     let (name_vars, name) = match settings.name {
         Some(parts) => match literal(parts) {
-            Some(text) => (None, crate::upstream_tls::server_name(&text)),
-            None => (Some(parts), crate::upstream_tls::server_name(host)),
+            Some(text) => (
+                None,
+                crate::upstream_tls::leak_name(crate::upstream_tls::server_name(&text)),
+            ),
+            None => (
+                Some(parts),
+                crate::upstream_tls::leak_name(crate::upstream_tls::server_name(host)),
+            ),
         },
-        None => (None, crate::upstream_tls::server_name(host)),
+        None => (
+            None,
+            crate::upstream_tls::leak_name(crate::upstream_tls::server_name(host)),
+        ),
     };
     Ok(crate::arena::leak(Box::new(
         crate::upstream_tls::PreparedUpstreamTls {

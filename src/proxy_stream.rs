@@ -64,6 +64,7 @@ pub(crate) struct StreamPool {
     pub peer_idx: usize,
     pub opened_at: Instant,
     pub requests_served: u32,
+    pub tls: Option<crate::upstream_tls::TlsIdentity>,
 }
 
 impl ProxyStream {
@@ -393,6 +394,7 @@ fn finish(
                 opened_at: pool.opened_at,
                 requests_served: pool.requests_served + 1,
                 slot: s.slot,
+                tls: pool.tls,
             },
         );
     }
