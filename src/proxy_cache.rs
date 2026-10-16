@@ -922,12 +922,59 @@ impl Entry {
             .unwrap_or(0)
     }
 
-    /// The request is the variant the response was stored for: its
-    /// headers named by the stored `Vary` have the same values.
-    pub fn matches_variant(&self, request_headers: &[u8]) -> bool {
-        let vary = &self.bytes[self.vary.0..self.vary.1];
-        vary.is_empty() || vary_digest(vary, request_headers) == self.variant
+    /// ngx_http_file_cache_read's vary check: `None` when the request is
+    /// the variant the response was stored for (or it has no `Vary`), else
+    /// the request's own variant, the key to look again at.
+    pub fn other_variant(&self, main: &CacheHash, request_headers: &[u8]) -> Option<CacheHash> {
+        other_variant(
+            &self.bytes[self.vary.0..self.vary.1],
+            &self.variant,
+            main,
+            request_headers,
+        )
     }
+}
+
+fn other_variant(
+    vary: &[u8],
+    variant: &CacheHash,
+    main: &CacheHash,
+    request_headers: &[u8],
+) -> Option<CacheHash> {
+    if vary.is_empty() {
+        return None;
+    }
+    let own = vary_digest(main, vary, request_headers);
+    (own != *variant).then_some(own)
+}
+
+/// `Entry::other_variant` from the file's header alone, for a lookup that
+/// doesn't read the response.
+pub fn stored_other_variant(
+    path: &Path,
+    key: &[u8],
+    main: &CacheHash,
+    request_headers: &[u8],
+) -> Option<CacheHash> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut fixed = [0u8; FIXED + 16];
+    file.read_exact(&mut fixed).ok()?;
+    if &fixed[..4] != MAGIC {
+        return None;
+    }
+    let u32_at = |at: usize| u32::from_le_bytes(fixed[at..at + 4].try_into().unwrap()) as usize;
+    let (key_len, vary_len) = (u32_at(28), u32_at(32));
+    if vary_len == 0 || key_len != key.len() || vary_len > 4096 {
+        return None;
+    }
+    let mut rest = vec![0u8; key_len + vary_len];
+    file.read_exact(&mut rest).ok()?;
+    if &rest[..key_len] != key {
+        return None;
+    }
+    let variant: CacheHash = fixed[FIXED..].try_into().unwrap();
+    other_variant(&rest[key_len..], &variant, main, request_headers)
 }
 
 /// A header block's `(name, value)` lines, after its status line.
@@ -939,20 +986,26 @@ pub fn header_lines(head: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
     })
 }
 
-/// ngx_http_file_cache_vary: a digest over the request's values of the
-/// headers a `Vary` value names, in its order. `request_headers` is the
-/// raw request header block.
-pub fn vary_digest(vary: &[u8], request_headers: &[u8]) -> CacheHash {
+/// ngx_http_file_cache_vary: the variant's key, a digest over the main
+/// key's and the request's values of the headers a `Vary` value names, in
+/// its order. `request_headers` is the raw request header block.
+pub fn vary_digest(main: &CacheHash, vary: &[u8], request_headers: &[u8]) -> CacheHash {
     let mut input = Vec::with_capacity(64);
-    for name in vary.split(|&b| b == b',') {
-        let name = name.trim_ascii();
-        if name.is_empty() {
-            continue;
-        }
+    input.extend_from_slice(main);
+    for name in list_items(vary) {
         for b in name {
             input.push(b.to_ascii_lowercase());
         }
         input.push(b':');
+        // ngx_http_file_cache_vary_header: the values of every header of
+        // that name, joined with ","; for these three, each list item.
+        let normalize = [
+            &b"accept-charset"[..],
+            b"accept-encoding",
+            b"accept-language",
+        ]
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n));
         let mut first = true;
         for line in request_headers.split(|&b| b == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -962,15 +1015,30 @@ pub fn vary_digest(vary: &[u8], request_headers: &[u8]) -> CacheHash {
             if !line[..colon].trim_ascii().eq_ignore_ascii_case(name) {
                 continue;
             }
-            if !first {
-                input.push(b',');
+            let value = line[colon + 1..].trim_ascii();
+            let mut push = |item: &[u8]| {
+                if !first {
+                    input.push(b',');
+                }
+                first = false;
+                input.extend_from_slice(item);
+            };
+            if normalize {
+                list_items(value).for_each(push);
+            } else {
+                push(value);
             }
-            first = false;
-            input.extend_from_slice(line[colon + 1..].trim_ascii());
         }
         input.extend_from_slice(b"\r\n");
     }
     hash_key(&input)
+}
+
+/// A header list's items: between spaces and commas.
+fn list_items(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+    value
+        .split(|&b| b == b' ' || b == b',')
+        .filter(|item| !item.is_empty())
 }
 
 /// The cache fields of `proxy_ignore_headers`.
@@ -991,7 +1059,7 @@ pub struct Freshness<'a> {
     /// `stale-while-revalidate` / `stale-if-error`.
     pub updating_sec: i64,
     pub error_sec: i64,
-    pub vary: &'a [u8],
+    pub vary: std::borrow::Cow<'a, [u8]>,
 }
 
 /// What the upstream's response header says about caching it (`None`: it
@@ -1030,7 +1098,7 @@ struct HeaderRead<'a> {
     no_cache: bool,
     expired: bool,
     cacheable: bool,
-    vary: &'a [u8],
+    vary: std::borrow::Cow<'a, [u8]>,
 }
 
 fn read_headers<'a>(
@@ -1045,7 +1113,7 @@ fn read_headers<'a>(
     let mut cacheable = true;
     let mut accel_seen = false;
     let mut expires_seen = false;
-    let mut vary: &[u8] = b"";
+    let mut vary = std::borrow::Cow::Borrowed(&b""[..]);
     for (name, value) in header_lines {
         if name.eq_ignore_ascii_case(b"set-cookie") {
             if !ignore.set_cookie {
@@ -1103,11 +1171,22 @@ fn read_headers<'a>(
             if ignore.vary {
                 continue;
             }
-            // NGX_HTTP_CACHE_VARY_LEN
-            if value.len() > 128 || value == b"*" {
+            if value == b"*" {
                 cacheable = false;
             }
-            vary = value;
+            // ngx_http_upstream_process_vary: several headers are one
+            // list (ticket #1423).
+            if vary.is_empty() {
+                vary = std::borrow::Cow::Borrowed(value);
+            } else {
+                let joined = vary.to_mut();
+                joined.extend_from_slice(b", ");
+                joined.extend_from_slice(value);
+            }
+            // NGX_HTTP_CACHE_VARY_LEN
+            if vary.len() > 128 {
+                cacheable = false;
+            }
         }
     }
     HeaderRead {
@@ -1482,15 +1561,63 @@ mod tests {
 
     #[test]
     fn variants_compare_the_named_request_headers() {
+        let main = hash_key(b"/");
         let gz = b"Host: x\r\nAccept-Encoding: gzip\r\n";
         let plain = b"Host: x\r\n";
         assert_ne!(
-            vary_digest(b"Accept-Encoding", gz),
-            vary_digest(b"Accept-Encoding", plain)
+            vary_digest(&main, b"Accept-Encoding", gz),
+            vary_digest(&main, b"Accept-Encoding", plain)
+        );
+        assert_ne!(
+            vary_digest(&main, b"Accept-Encoding", gz),
+            vary_digest(&hash_key(b"/other"), b"Accept-Encoding", gz)
         );
         assert_eq!(
-            vary_digest(b"accept-encoding", gz),
-            vary_digest(b"Accept-Encoding", b"accept-encoding:  gzip\r\n")
+            vary_digest(&main, b",, accept-encoding , ,", gz),
+            vary_digest(&main, b"Accept-Encoding", b"accept-encoding:  gzip\r\n")
         );
+        // Accept-Encoding's list items, whatever the spaces and empty items.
+        let ae = |v: &str| format!("Accept-Encoding: {v}\r\n").into_bytes();
+        let d = |v: &str| vary_digest(&main, b"Accept-Encoding", &ae(v));
+        assert_eq!(d("foo, bar"), d("foo,bar"));
+        assert_eq!(d("foo, bar"), d("foo,,  ,bar , "));
+        assert_ne!(d("foo, bar"), d("foobar"));
+        assert_ne!(d("foo, bar"), d("bar, foo"));
+        // Other headers compare as they are; several of a name are one.
+        let x = |h: &[u8]| vary_digest(&main, b"X", h);
+        assert_ne!(x(b"X: a, b\r\n"), x(b"X: a,b\r\n"));
+        assert_eq!(x(b"X: a\r\nX: b\r\n"), x(b"X: a,b\r\n"));
+    }
+
+    #[test]
+    fn several_vary_headers_are_one_list() {
+        let lines: [(&[u8], &[u8]); 2] = [(b"Vary", b"Accept-Encoding"), (b"Vary", b"Foo")];
+        let f = freshness(lines.into_iter(), Ignore::default(), NOW).unwrap();
+        assert_eq!(&*f.vary, b"Accept-Encoding, Foo");
+        let long = [b'a'; 100];
+        let lines: [(&[u8], &[u8]); 2] = [(b"Vary", &long), (b"Vary", &long)];
+        assert!(freshness(lines.into_iter(), Ignore::default(), NOW).is_none());
+    }
+
+    #[test]
+    fn the_header_alone_tells_the_variant() {
+        let dir = std::env::temp_dir().join(format!("ruxen-vary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let z = zone(&dir, 1 << 20, None);
+        let main = hash_key(b"k");
+        let gz = b"Accept-Encoding: gzip\r\n";
+        let mut entry = parts(b"k", b"body");
+        entry.vary = b"Accept-Encoding";
+        entry.variant = vary_digest(&main, b"Accept-Encoding", gz);
+        z.store(&main, &entry).unwrap();
+        let path = z.file_path(&main);
+        assert_eq!(stored_other_variant(&path, b"k", &main, gz), None);
+        let own = vary_digest(&main, b"Accept-Encoding", b"");
+        assert_eq!(stored_other_variant(&path, b"k", &main, b""), Some(own));
+        let read = Entry::read(&path, b"k").unwrap();
+        assert_eq!(read.other_variant(&main, gz), None);
+        assert_eq!(read.other_variant(&main, b""), Some(own));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
