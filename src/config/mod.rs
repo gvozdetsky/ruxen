@@ -313,6 +313,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     // inherit them once the block is closed (see `BlockClose`).
     let mut index: Option<Vec<IndexEntry>> = None;
     let mut error_pages: Option<Vec<ErrorPage>> = None;
+    let mut add_headers: Option<Vec<AddHeader>> = None;
+    let mut add_trailers: Option<Vec<AddHeader>> = None;
     let mut recursive_error_pages: Option<bool> = None;
     let mut merge_slashes: Option<bool> = None;
     // http-scope SSL defaults inherited by `server {}` blocks unless
@@ -347,6 +349,15 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         // list (ngx_http_core_merge_loc_conf).
                         if server.error_pages.is_none() {
                             server.error_pages.clone_from(&error_pages);
+                        }
+                        // add_header / add_trailer likewise
+                        // (ngx_http_headers_merge_conf, #17); a location
+                        // without its own takes the server's.
+                        if server.add_headers.is_none() {
+                            server.add_headers.clone_from(&add_headers);
+                        }
+                        if server.add_trailers.is_none() {
+                            server.add_trailers.clone_from(&add_trailers);
                         }
                         server.recursive_error_pages =
                             server.recursive_error_pages.or(recursive_error_pages);
@@ -476,6 +487,14 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             ("error_page", Terminator::Semi) => {
                 let entries = parse_error_page_args(&args[1..])?;
                 error_pages.get_or_insert_with(Vec::new).extend(entries);
+            }
+            ("add_header", Terminator::Semi) => {
+                let entry = parse_add_header_args(&args[1..])?;
+                add_headers.get_or_insert_with(Vec::new).push(entry);
+            }
+            ("add_trailer", Terminator::Semi) => {
+                let entry = parse_add_header_args(&args[1..])?;
+                add_trailers.get_or_insert_with(Vec::new).push(entry);
             }
             ("recursive_error_pages", Terminator::Semi) => {
                 if recursive_error_pages.is_some() {

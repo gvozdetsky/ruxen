@@ -273,8 +273,7 @@ ALPN offers `h2` where the server has `http2 on` (or `listen … http2`), else H
 A growing nginx-compatible configuration surface is implemented, including:
 
 - `return`
-- `add_header`
-- `add_trailer`
+- `add_header` and `add_trailer`, at http, server and location level
 - `expires`
 - `error_page` and `recursive_error_pages`
 - `post_action`
