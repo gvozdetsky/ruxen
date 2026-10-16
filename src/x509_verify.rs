@@ -135,12 +135,14 @@ impl Store {
     fn load(&self, pem: &[u8]) -> Result<(), String> {
         let mut found = 0;
         // PEM_read_bio_* skip the blocks of other types, so one pass per
-        // type finds them all.
+        // type finds them all. The _AUX reader takes OpenSSL's `TRUSTED
+        // CERTIFICATE` form too (`openssl x509 -trustout`), as
+        // X509_load_cert_crl_file does (ssl_certificate_aux.t).
         let bio = || unsafe { ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _) };
         unsafe {
             let b = bio();
             loop {
-                let x = ffi::PEM_read_bio_X509(b, ptr::null_mut(), None, ptr::null_mut());
+                let x = ffi::PEM_read_bio_X509_AUX(b, ptr::null_mut(), None, ptr::null_mut());
                 if x.is_null() {
                     break;
                 }
@@ -273,7 +275,7 @@ pub fn subjects(pem: &[u8]) -> Vec<Vec<u8>> {
     unsafe {
         let b = ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _);
         loop {
-            let x = ffi::PEM_read_bio_X509(b, ptr::null_mut(), None, ptr::null_mut());
+            let x = ffi::PEM_read_bio_X509_AUX(b, ptr::null_mut(), None, ptr::null_mut());
             if x.is_null() {
                 break;
             }
