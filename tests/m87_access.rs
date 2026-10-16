@@ -206,9 +206,10 @@ fn bad_access_directives_fail_to_load() {
             "location / { limit_except GET FETCH { deny all; } }",
             "bad value for limit_except method: FETCH",
         ),
+        // proxy_pass is taken there now (m135), without a URI part.
         (
-            "location / { limit_except GET { proxy_pass http://127.0.0.1:1; } }",
-            "unknown directive `proxy_pass` in a limit_except block",
+            "location / { limit_except GET { proxy_pass http://127.0.0.1:1/x; } }",
+            "no URI part inside \"limit_except\" block",
         ),
         (
             "location / { limit_except GET { deny all; } limit_except POST { deny all; } }",
