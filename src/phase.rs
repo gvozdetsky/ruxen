@@ -326,6 +326,8 @@ pub struct ProcessMeta {
     pub server_name: &'static [u8],
     /// `$proxy_host` value (upstream URL authority) for the proxy plan.
     pub proxy_host: &'static [u8],
+    /// `proxy_pass https://` (#116): `$proxy_port` defaults to 443.
+    pub proxy_tls: bool,
     /// Pre-write delay in milliseconds, applied by the worker via
     /// `monoio::time::sleep` before sending the response. Set by the
     /// access-control phase to defer 401 replies (`auth_delay`) without
@@ -403,6 +405,7 @@ impl Default for ProcessMeta {
             redirect: crate::config::RedirectPolicy::default(),
             server_name: &[],
             proxy_host: &[],
+            proxy_tls: false,
             response_delay_ms: 0,
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
@@ -1150,6 +1153,7 @@ fn process_with_meta_inner(
             && let crate::worker::PreparedHandler::Proxy(proxy) = loc.handler
         {
             meta.proxy_host = proxy.host_header;
+            meta.proxy_tls = proxy.tls.is_some() && proxy.url.is_none();
         }
         let response = match denied {
             None => run_location_handler(

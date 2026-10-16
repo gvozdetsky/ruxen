@@ -92,6 +92,14 @@ pub struct ProxyConf {
     pub cache: ProxyCacheConf,
     /// `proxy_bind` (#135); `Some(ProxyBind::Off)` turns an inherited one off.
     pub bind: Option<ProxyBind>,
+    /// `proxy_ssl_server_name` (#116); unset means off, as nginx: no SNI.
+    pub ssl_server_name: Option<bool>,
+    /// `proxy_ssl_name`; unset means the host of `proxy_pass`.
+    pub ssl_name: Option<Vec<ValuePart>>,
+    /// `proxy_ssl_session_reuse`; unset means on.
+    pub ssl_session_reuse: Option<bool>,
+    /// `proxy_ssl_protocols`; unset means TLS 1.2 and 1.3.
+    pub ssl_protocols: Option<TlsVersionSet>,
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -242,6 +250,10 @@ impl ProxyConf {
             proxy_method: self.proxy_method.or_else(|| parent.proxy_method.clone()),
             cache: self.cache.inherit(&parent.cache),
             bind: self.bind.or_else(|| parent.bind.clone()),
+            ssl_server_name: self.ssl_server_name.or(parent.ssl_server_name),
+            ssl_name: self.ssl_name.or_else(|| parent.ssl_name.clone()),
+            ssl_session_reuse: self.ssl_session_reuse.or(parent.ssl_session_reuse),
+            ssl_protocols: self.ssl_protocols.or(parent.ssl_protocols),
         }
     }
 }
@@ -2332,12 +2344,16 @@ pub enum ProxyPass {
         name: String,
         host_header: String,
         request_path: Option<String>,
+        /// `https://` (#116).
+        tls: bool,
     },
     Direct {
         /// Every address the host resolves to (one for a `unix:` path).
         addrs: Vec<UpstreamAddr>,
         host_header: String,
         request_path: Option<String>,
+        /// `https://` (#116).
+        tls: bool,
     },
     /// A URL with variables, evaluated per request (#100).
     Variable { url: Vec<ValuePart> },

@@ -297,6 +297,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: &[],
+        proxy_tls: false,
         upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
         upstream_states: req.upstream.map_or(&[], |u| &u.states),
         upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),

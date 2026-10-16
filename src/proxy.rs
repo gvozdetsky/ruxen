@@ -25,6 +25,8 @@ use monoio::io::AsyncReadRent;
 use monoio::io::AsyncWriteRentExt;
 use monoio::net::TcpStream;
 
+use crate::upstream_io::UpstreamIo;
+
 use crate::config::ProxyNextUpstream;
 use crate::http::Method;
 use crate::phase::Response;
@@ -84,6 +86,8 @@ pub struct ProxyPlan {
     /// Boxed: only a `proxy_pass` with variables has one, and the plan
     /// moves with every proxied response.
     pub adhoc_peer: Option<Box<PeerAddr>>,
+    /// `proxy_pass https://` (#116): TLS over the connection to the peer.
+    pub tls: Option<Box<crate::upstream_tls::TlsPlan>>,
     /// First peer to try, leased at plan-build time. Subsequent
     /// `proxy_next_upstream` retries lease their own peers inside
     /// `run_proxy`. Wrapped in `Option` so the run loop can `.take()`
@@ -187,7 +191,7 @@ pub struct ProxyPlan {
 /// response head for the client and the connection to tunnel to.
 pub struct Upgraded {
     pub head: Vec<u8>,
-    pub upstream: TcpStream,
+    pub upstream: UpstreamIo,
     /// Bytes the upstream sent past its head, already read.
     pub leftover: Vec<u8>,
     /// The worker_connections slot the upstream connection holds.
@@ -333,7 +337,7 @@ unsafe impl monoio::buf::IoVecBuf for RequestParts {
 
 /// Write the header block and the body with writev until both are sent.
 async fn write_request_parts(
-    stream: &mut TcpStream,
+    stream: &mut UpstreamIo,
     head: bytes::Bytes,
     body: bytes::Bytes,
 ) -> std::io::Result<()> {
@@ -512,7 +516,11 @@ fn upstream_url(plan: &ProxyPlan, peer_idx: usize) -> String {
         PeerAddr::Unix(_) => ":",
         PeerAddr::Inet(_) => "",
     };
-    format!("http://{addr}{separator}{}", String::from_utf8_lossy(uri))
+    let scheme = if plan.tls.is_some() { "https" } else { "http" };
+    format!(
+        "{scheme}://{addr}{separator}{}",
+        String::from_utf8_lossy(uri)
+    )
 }
 
 fn upstream_uri(plan: &ProxyPlan) -> &[u8] {
@@ -611,7 +619,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
         //    stale-retry counts as part of the same `attempt` budget.
-        let pooled = upstream::pool_take(upstream, current.peer_idx);
+        let pooled = upstream::pool_take(upstream, current.peer_idx, plan.tls.is_some());
         let outcome = if let Some(c) = pooled {
             match attempt(
                 &plan,
@@ -862,7 +870,8 @@ fn no_live_upstreams(
     failures.push(AttemptFailure {
         error: UpstreamError::NoLiveUpstreams,
         upstream: format!(
-            "http://{}{}",
+            "{}://{}{}",
+            if plan.tls.is_some() { "https" } else { "http" },
             String::from_utf8_lossy(plan.upstream.name),
             String::from_utf8_lossy(upstream_uri(plan))
         ),
@@ -1005,6 +1014,8 @@ pub enum Stage {
     ReadingHeader,
     ReadingBody,
     Upgraded,
+    /// The TLS handshake with an HTTPS upstream (#116).
+    SslHandshaking,
 }
 
 impl Stage {
@@ -1015,6 +1026,7 @@ impl Stage {
             Stage::ReadingHeader => "reading response header from upstream",
             Stage::ReadingBody => "reading upstream",
             Stage::Upgraded => "proxying upgraded connection",
+            Stage::SslHandshaking => "SSL handshaking to upstream",
         }
     }
 }
@@ -1025,6 +1037,9 @@ impl Stage {
 #[derive(Debug)]
 pub enum UpstreamError {
     ConnectFailed(std::io::Error),
+    /// The TLS handshake with an HTTPS upstream failed (#116): nginx's
+    /// `SSL_do_handshake() failed`.
+    SslHandshakeFailed(std::io::Error),
     /// A UNIX-domain socket refuses at once, so nginx reports it from
     /// connect() itself, with the path (ngx_event_connect_peer).
     UnixConnectFailed(std::io::Error, &'static std::path::Path),
@@ -1089,6 +1104,11 @@ impl std::fmt::Display for UpstreamError {
                 "connect() failed ({}) while {}",
                 errno_text(e),
                 Stage::Connecting.as_str()
+            ),
+            SslHandshakeFailed(e) => write!(
+                f,
+                "SSL_do_handshake() failed ({e}) while {}",
+                Stage::SslHandshaking.as_str()
             ),
             UnixConnectFailed(e, path) => write!(
                 f,
@@ -1534,6 +1554,34 @@ async fn attempt(
             }
         };
         let _ = stream.set_nodelay(true);
+        let stream = match plan.tls.as_deref() {
+            None => UpstreamIo::Plain(stream),
+            // proxy_pass https:// (#116): the handshake under its own
+            // proxy_connect_timeout, as nginx arms it again for the SSL
+            // handshake (ngx_http_upstream_ssl_init_connection). Boxed:
+            // only TLS upstreams need its state in the attempt.
+            Some(tls) => {
+                let handshake =
+                    crate::tls_stream::connect(tls.config.clone(), tls.name.clone(), stream);
+                match timeout(plan.connect_timeout, Box::pin(handshake)).await {
+                    Ok(Ok(tls)) => UpstreamIo::Tls(Box::new(tls)),
+                    Ok(Err(e)) => {
+                        return AttemptOutcome::Failed(
+                            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                            FailKind::Error,
+                            Box::new(UpstreamError::SslHandshakeFailed(e)),
+                        );
+                    }
+                    Err(_) => {
+                        return AttemptOutcome::Failed(
+                            Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+                            FailKind::Timeout,
+                            Box::new(UpstreamError::TimedOut(Stage::SslHandshaking)),
+                        );
+                    }
+                }
+            }
+        };
         (stream, Instant::now(), 0, slot)
     };
     state.connect_ms = Some(elapsed_ms(started));
@@ -2758,7 +2806,7 @@ fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
 fn upgraded(
     plan: &ProxyPlan,
     peer_idx: usize,
-    stream: TcpStream,
+    stream: UpstreamIo,
     accum: Vec<u8>,
     first_line_end: usize,
     head_end: usize,
@@ -2819,7 +2867,7 @@ fn upgraded(
 /// temp file. Opened per attempt, so a retry on the next peer re-sends it
 /// from the start; `proxy_send_timeout` bounds each write.
 async fn send_body_file(
-    stream: &mut TcpStream,
+    stream: &mut UpstreamIo,
     file: &RequestBodyFile,
     send_timeout: Duration,
 ) -> Result<(), UpstreamError> {
@@ -2881,7 +2929,7 @@ pub(crate) async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: I
 /// On failure returns the reason, paired with `true` if no bytes were read
 /// at all (a stale pooled connection) and `false` otherwise.
 async fn read_chunked_body_with_buf(
-    stream: &mut TcpStream,
+    stream: &mut UpstreamIo,
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,

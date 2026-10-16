@@ -114,6 +114,8 @@ pub(crate) struct RenderCtx<'a> {
     /// proxy context (the location handler doesn't dispatch through
     /// `proxy_pass`).
     pub proxy_host: &'a [u8],
+    /// `proxy_pass https://` (#116), for `$proxy_port`'s default.
+    pub proxy_tls: bool,
     /// Raw upstream response header block (everything between the status
     /// line CRLF and the empty CRLF that ends the header section, the
     /// trailing CRLF of the last header included). Empty outside a proxy
@@ -483,7 +485,9 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::ProxyHost => out.extend_from_slice(self.proxy_host),
-            Variable::ProxyPort => out.extend_from_slice(proxy_port(self.proxy_host)),
+            Variable::ProxyPort => {
+                out.extend_from_slice(proxy_port(self.proxy_host, self.proxy_tls))
+            }
             Variable::ProxyAddXForwardedFor => {
                 let existing =
                     lookup_request_header(self.headers_raw, b"x-forwarded-for").unwrap_or(b"");
@@ -1353,9 +1357,9 @@ pub(crate) fn write_time_local(out: &mut Vec<u8>, secs: u64) {
 
 /// `$proxy_port`: the port written in `$proxy_host` (`host:port`,
 /// `[v6]:port`), else the scheme's default, as nginx's
-/// ngx_http_proxy_set_vars. Only `http://` is proxied today, so that's 80.
-/// Empty outside a proxy context, like `$proxy_host`.
-fn proxy_port(proxy_host: &[u8]) -> &[u8] {
+/// ngx_http_proxy_set_vars: 443 for `https://`, 80 otherwise. Empty outside
+/// a proxy context, like `$proxy_host`.
+fn proxy_port(proxy_host: &[u8], tls: bool) -> &[u8] {
     if proxy_host.is_empty() {
         return b"";
     }
@@ -1365,6 +1369,7 @@ fn proxy_port(proxy_host: &[u8]) -> &[u8] {
     };
     match after_host.iter().rposition(|&b| b == b':') {
         Some(i) => &after_host[i + 1..],
+        None if tls => b"443",
         None => b"80",
     }
 }
