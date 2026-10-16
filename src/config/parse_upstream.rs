@@ -684,6 +684,9 @@ impl ProxyConf {
         "proxy_ssl_session_reuse",
         "proxy_ssl_protocols",
         "proxy_ssl_verify",
+        "proxy_ssl_trusted_certificate",
+        "proxy_ssl_verify_depth",
+        "proxy_ssl_crl",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -691,7 +694,13 @@ impl ProxyConf {
     }
 
     /// Parse one of `DIRECTIVES` (`args[0]`) into `self`, at any level.
-    pub(crate) fn parse(&mut self, args: &[String]) -> Result<(), Error> {
+    /// File names are resolved against `conf_prefix`, as nginx's
+    /// ngx_conf_full_name with the config prefix.
+    pub(crate) fn parse(
+        &mut self,
+        args: &[String],
+        conf_prefix: Option<&std::path::Path>,
+    ) -> Result<(), Error> {
         match args[0].as_str() {
             "proxy_set_header" => {
                 let entry = parse_proxy_set_header_args(&args[1..])?;
@@ -796,10 +805,49 @@ impl ProxyConf {
                     "proxy_ssl_protocols",
                 )?);
             }
-            // Only `off`, nginx's default: `on` is refused before this
-            // (`reject_unenforced`) until #117 verifies certificates.
             "proxy_ssl_verify" => {
-                parse_on_off_args(&args[1..], "proxy_ssl_verify")?;
+                if self.ssl_verify.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_verify"));
+                }
+                self.ssl_verify = Some(parse_on_off_args(&args[1..], "proxy_ssl_verify")?);
+            }
+            "proxy_ssl_trusted_certificate" | "proxy_ssl_crl" => {
+                let name: &'static str = if args[0] == "proxy_ssl_crl" {
+                    "proxy_ssl_crl"
+                } else {
+                    "proxy_ssl_trusted_certificate"
+                };
+                let slot = if name == "proxy_ssl_crl" {
+                    &mut self.ssl_crl
+                } else {
+                    &mut self.ssl_trusted_certificate
+                };
+                if slot.is_some() {
+                    return Err(Error::Duplicate(name));
+                }
+                if args.len() != 2 {
+                    return Err(Error::BadValue {
+                        what: name,
+                        got: args[1..].join(" "),
+                    });
+                }
+                *slot = Some(super::resolve_conf_path(
+                    conf_prefix,
+                    std::path::PathBuf::from(&args[1]),
+                ));
+            }
+            "proxy_ssl_verify_depth" => {
+                if self.ssl_verify_depth.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_verify_depth"));
+                }
+                let v = args
+                    .get(1)
+                    .filter(|_| args.len() == 2)
+                    .ok_or(Error::MissingArg("proxy_ssl_verify_depth"))?;
+                self.ssl_verify_depth = Some(v.parse::<u32>().map_err(|_| Error::BadValue {
+                    what: "proxy_ssl_verify_depth",
+                    got: v.clone(),
+                })?);
             }
             "proxy_http_version" => {
                 if self.http_version.is_some() {
@@ -1396,7 +1444,7 @@ mod tests {
         let parse = |args: &[&str]| {
             let mut conf = ProxyConf::default();
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            conf.parse(&args).map(|()| conf.bind.unwrap())
+            conf.parse(&args, None).map(|()| conf.bind.unwrap())
         };
         assert_eq!(parse(&["proxy_bind", "off"]).unwrap(), ProxyBind::Off);
         assert!(matches!(

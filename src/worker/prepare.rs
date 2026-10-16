@@ -1102,10 +1102,26 @@ fn prepare_upstream_tls(
     settings: super::prepared::UpstreamTlsSettings,
     host: &[u8],
 ) -> Result<&'static crate::upstream_tls::PreparedUpstreamTls, String> {
+    // `proxy_ssl_verify on` needs the certificates to trust, as nginx's
+    // ngx_http_proxy_set_ssl refuses it without them.
+    let store = match (settings.verify, settings.trusted) {
+        (false, _) => None,
+        (true, None) => {
+            return Err("no proxy_ssl_trusted_certificate for proxy_ssl_verify".to_string());
+        }
+        (true, Some(trusted)) => Some(crate::upstream_tls::trust_store(
+            crate::upstream_tls::VerifySettings {
+                trusted,
+                depth: settings.verify_depth,
+                crl: settings.crl,
+            },
+        )?),
+    };
     let config = crate::upstream_tls::client_config(
         settings.protocols,
         settings.server_name,
         settings.session_reuse,
+        store,
     )?;
     let literal = |parts: &[PreparedValuePart]| -> Option<Vec<u8>> {
         let mut out = Vec::new();

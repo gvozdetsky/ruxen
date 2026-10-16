@@ -1014,7 +1014,9 @@ pub(crate) fn parse_location_block(
                 }
                 proxy_pass = Some(parse_proxy_pass_arg(&args[1..])?);
             }
-            (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
+            (name, Terminator::Semi) if ProxyConf::takes(name) => {
+                proxy.parse(&args, lx.conf_prefix())?
+            }
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
             (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,

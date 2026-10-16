@@ -1,7 +1,8 @@
 //! M129 — `proxy_pass https://` (#116): TLS to upstreams with nginx's
 //! defaults (no SNI unless `proxy_ssl_server_name on`, session reuse on,
-//! the certificate not verified), the keep-alive pool, and the failures.
-//! The upstream is a TLS server block of the same ruxen.
+//! the certificate not verified), the keep-alive pool, and the failures;
+//! `proxy_ssl_verify on` (#117). The upstream is a TLS server block of the
+//! same ruxen.
 
 mod common;
 
@@ -152,43 +153,188 @@ fn https_upstreams_like_nginx() {
     );
 }
 
-/// `proxy_ssl_verify on` can't be honoured until certificates are
-/// verified (#117): the configuration is refused, not served unverified.
+/// root CA → intermediate CA → leaf for `name`, in `dir`: the leaf's
+/// chain file (leaf, then the intermediate), its key, and the root.
+fn chain_with_intermediate(dir: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    let ca = |cn: &str| {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+    };
+    let root_key = KeyPair::generate().unwrap();
+    let root_params = ca("ruxen-test-root");
+    let root = root_params.self_signed(&root_key).unwrap();
+    let root_issuer = Issuer::new(root_params, root_key);
+    let int_key = KeyPair::generate().unwrap();
+    let int_params = ca("ruxen-test-intermediate");
+    let int = int_params.signed_by(&int_key, &root_issuer).unwrap();
+    let int_issuer = Issuer::new(int_params, int_key);
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec![name.to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, &int_issuer)
+        .unwrap();
+    let paths = (
+        dir.join("deep.crt"),
+        dir.join("deep.key"),
+        dir.join("root.crt"),
+    );
+    std::fs::write(&paths.0, leaf.pem() + &int.pem()).unwrap();
+    std::fs::write(&paths.1, leaf_key.serialize_pem()).unwrap();
+    std::fs::write(&paths.2, root.pem()).unwrap();
+    paths
+}
+
+/// `proxy_ssl_verify on` (#117): the chain, the depth and the name checked
+/// as nginx's OpenSSL checks them, including certificates webpki refuses
+/// (a self-signed CA:TRUE leaf named by its commonName only, X.509 v1),
+/// and nginx's error-log lines for a refusal.
 #[test]
-fn proxy_ssl_verify_on_is_refused() {
-    let dir = std::env::temp_dir().join(format!("ruxen-m129-verify-{}", std::process::id()));
+fn proxy_ssl_verify_like_nginx() {
+    let chain = common::tls::make_ca_and_leaf("backend.test");
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/tls");
+    let ca_leaf = data.join("rsa.crt");
+    let v1 = data.join("v1_ec.crt");
+    let (front, signed, ca_true, old) = (free_port(), free_port(), free_port(), free_port());
+    let deep = free_port();
+    let s = start("verify", |dir| {
+        let (deep_crt, deep_key, root) = chain_with_intermediate(dir, "deep.test");
+        format!(
+            "server {{ listen 127.0.0.1:{signed} ssl;\n\
+               ssl_certificate {cert}; ssl_certificate_key {key};\n\
+               location / {{ return 200 signed; }} }}\n\
+             server {{ listen 127.0.0.1:{ca_true} ssl;\n\
+               ssl_certificate {ca_leaf}; ssl_certificate_key {ca_leaf_key};\n\
+               location / {{ return 200 ca-leaf; }} }}\n\
+             server {{ listen 127.0.0.1:{old} ssl;\n\
+               ssl_certificate {v1}; ssl_certificate_key {v1_key};\n\
+               location / {{ return 200 v1; }} }}\n\
+             server {{ listen 127.0.0.1:{deep} ssl;\n\
+               ssl_certificate {deep_crt}; ssl_certificate_key {deep_key};\n\
+               location / {{ return 200 deep; }} }}\n\
+             server {{ listen 127.0.0.1:{front};\n\
+               proxy_ssl_verify on; proxy_ssl_trusted_certificate {ca};\n\
+               proxy_ssl_session_reuse off;\n\
+               location /ok/ {{ proxy_pass https://127.0.0.1:{signed}/;\n\
+                 proxy_ssl_name backend.test; }}\n\
+               location /depth0/ {{ proxy_pass https://127.0.0.1:{signed}/;\n\
+                 proxy_ssl_name backend.test; proxy_ssl_verify_depth 0; }}\n\
+               location /deep/ {{ proxy_pass https://127.0.0.1:{deep}/;\n\
+                 proxy_ssl_name deep.test; proxy_ssl_trusted_certificate {root}; }}\n\
+               location /deep0/ {{ proxy_pass https://127.0.0.1:{deep}/;\n\
+                 proxy_ssl_name deep.test; proxy_ssl_trusted_certificate {root};\n\
+                 proxy_ssl_verify_depth 0; }}\n\
+               location /name/ {{ proxy_pass https://127.0.0.1:{signed}/;\n\
+                 proxy_ssl_name other.test; }}\n\
+               location /untrusted/ {{ proxy_pass https://127.0.0.1:{signed}/;\n\
+                 proxy_ssl_name backend.test; proxy_ssl_trusted_certificate {v1}; }}\n\
+               location /off/ {{ proxy_pass https://127.0.0.1:{signed}/;\n\
+                 proxy_ssl_verify off; }}\n\
+               location /ca-leaf/ {{ proxy_pass https://127.0.0.1:{ca_true}/;\n\
+                 proxy_ssl_name test.ruxen.local; proxy_ssl_trusted_certificate {ca_leaf}; }}\n\
+               location /v1/ {{ proxy_pass https://127.0.0.1:{old}/;\n\
+                 proxy_ssl_name v1-ec; proxy_ssl_trusted_certificate {v1}; }}\n\
+               location /v1-tls12/ {{ proxy_pass https://127.0.0.1:{old}/;\n\
+                 proxy_ssl_name v1-ec; proxy_ssl_trusted_certificate {v1};\n\
+                 proxy_ssl_protocols TLSv1.2; }} }}",
+            cert = chain.cert_path().display(),
+            key = chain.key_path().display(),
+            ca = chain.ca_path().unwrap().display(),
+            ca_leaf = ca_leaf.display(),
+            ca_leaf_key = data.join("rsa.key").display(),
+            v1 = v1.display(),
+            v1_key = data.join("v1_ec.key").display(),
+            deep_crt = deep_crt.display(),
+            deep_key = deep_key.display(),
+            root = root.display(),
+        )
+    });
+
+    // The depth is OpenSSL's: intermediates below the trusted one, so 0
+    // takes a leaf the trusted CA signed, and the default 1 one more CA.
+    for (path, want) in [
+        ("/ok/", "signed"),
+        ("/depth0/", "signed"),
+        ("/deep/", "deep"),
+        ("/off/", "signed"),
+        ("/ca-leaf/", "ca-leaf"),
+        ("/v1/", "v1"),
+        ("/v1-tls12/", "v1"),
+    ] {
+        assert_eq!(get(front, path), (200, want.to_string()), "{path}");
+    }
+    for path in ["/deep0/", "/name/", "/untrusted/"] {
+        assert_eq!(get(front, path).0, 502, "{path}");
+    }
+    let log = std::fs::read_to_string(s.dir.join("error.log")).unwrap_or_default();
+    assert!(
+        log.contains(
+            "upstream SSL certificate does not match \"other.test\" while SSL handshaking to upstream"
+        ),
+        "{log}"
+    );
+    assert!(
+        log.contains("upstream SSL certificate verify error: (")
+            && log.contains("while SSL handshaking to upstream"),
+        "{log}"
+    );
+}
+
+/// nginx refuses `proxy_ssl_verify on` without trusted certificates, and
+/// trusted certificates it can't load.
+#[test]
+fn proxy_ssl_verify_needs_trusted_certificates() {
+    let dir = std::env::temp_dir().join(format!("ruxen-m129-check-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let check = |verify: &str| {
+    std::fs::write(dir.join("empty.pem"), "").unwrap();
+    let check = |directives: &str| {
         std::fs::write(
             dir.join("nginx.conf"),
             format!(
                 "events {{}}\nhttp {{ server {{ listen 127.0.0.1:1;\n\
-                 location / {{ proxy_pass https://127.0.0.1:2; proxy_ssl_verify {verify}; }} }} }}\n"
+                 location / {{ proxy_pass https://127.0.0.1:2; {directives} }} }} }}\n"
             ),
         )
         .unwrap();
-        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ruxen"))
             .arg("-t")
             .arg("-c")
             .arg(dir.join("nginx.conf"))
             .output()
-            .unwrap()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
-    let on = check("on");
-    let off = check("off");
+    let none = check("proxy_ssl_verify on;");
+    let missing = check("proxy_ssl_verify on; proxy_ssl_trusted_certificate missing.pem;");
+    let empty = check("proxy_ssl_verify on; proxy_ssl_trusted_certificate empty.pem;");
+    let off = check("proxy_ssl_verify off; proxy_ssl_trusted_certificate missing.pem;");
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(!on.status.success());
     assert!(
-        String::from_utf8_lossy(&on.stderr).contains("proxy_ssl_verify"),
+        !none.0
+            && none
+                .1
+                .contains("no proxy_ssl_trusted_certificate for proxy_ssl_verify"),
         "{}",
-        String::from_utf8_lossy(&on.stderr)
+        none.1
     );
     assert!(
-        off.status.success(),
+        !missing.0 && missing.1.contains("SSL_CTX_load_verify_locations(\""),
         "{}",
-        String::from_utf8_lossy(&off.stderr)
+        missing.1
     );
+    assert!(
+        !empty.0 && empty.1.contains("SSL_CTX_load_verify_locations(\""),
+        "{}",
+        empty.1
+    );
+    // As nginx: with verification off, the file isn't loaded.
+    assert!(off.0, "{}", off.1);
 }
 
 /// A 101 over TLS (#87 with #116): the tunnel shares the TLS connection

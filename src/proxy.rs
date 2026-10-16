@@ -1040,6 +1040,9 @@ pub enum UpstreamError {
     /// The TLS handshake with an HTTPS upstream failed (#116): nginx's
     /// `SSL_do_handshake() failed`.
     SslHandshakeFailed(std::io::Error),
+    /// `proxy_ssl_verify on` refused the certificate (#117): nginx's
+    /// `upstream SSL certificate verify error: (..)` or `does not match`.
+    SslVerifyFailed(String),
     /// A UNIX-domain socket refuses at once, so nginx reports it from
     /// connect() itself, with the path (ngx_event_connect_peer).
     UnixConnectFailed(std::io::Error, &'static std::path::Path),
@@ -1110,6 +1113,7 @@ impl std::fmt::Display for UpstreamError {
                 "SSL_do_handshake() failed ({e}) while {}",
                 Stage::SslHandshaking.as_str()
             ),
+            SslVerifyFailed(why) => write!(f, "{why} while {}", Stage::SslHandshaking.as_str()),
             UnixConnectFailed(e, path) => write!(
                 f,
                 "connect() to unix:{} failed ({}) while {}",
@@ -1566,10 +1570,14 @@ async fn attempt(
                 match timeout(plan.connect_timeout, Box::pin(handshake)).await {
                     Ok(Ok(tls)) => UpstreamIo::Tls(Box::new(tls)),
                     Ok(Err(e)) => {
+                        let error = match crate::upstream_tls::verify_failure(&e) {
+                            Some(why) => UpstreamError::SslVerifyFailed(why.to_string()),
+                            None => UpstreamError::SslHandshakeFailed(e),
+                        };
                         return AttemptOutcome::Failed(
                             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                             FailKind::Error,
-                            Box::new(UpstreamError::SslHandshakeFailed(e)),
+                            Box::new(error),
                         );
                     }
                     Err(_) => {

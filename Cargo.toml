@@ -42,6 +42,12 @@ rustls = "0.23"
 # (#233); already in the tree through
 # rustls, with the features rustls turns on.
 aws-lc-rs = { version = "1.16", default-features = false }
+# proxy_ssl_verify (#117): OpenSSL's X.509 verification from the AWS-LC
+# under aws-lc-rs, and webpki's signature check from a bare key; both
+# already in the tree through rustls. `all-bindings` only picks the
+# pregenerated bindings with the X509 API (the C library is the same).
+aws-lc-sys = { version = "0.40", default-features = false, features = ["all-bindings"] }
+rustls-webpki = { version = "0.103", default-features = false }
 rustls-pemfile = "2"
 h2 = "0.4"
 http = "1"
