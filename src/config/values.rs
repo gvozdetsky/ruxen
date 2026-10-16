@@ -233,7 +233,7 @@ pub(crate) fn note_defined_variables(args: &[String]) {
     VARIABLES.with(|v| {
         let mut v = v.borrow_mut();
         if let Some(name) = target.and_then(|t| t.strip_prefix('$')) {
-            v.defined.insert(name.to_string());
+            v.defined.insert(name.to_ascii_lowercase());
         }
         for arg in args {
             for (open, close) in [("(?<", '>'), ("(?P<", '>'), ("(?'", '\'')] {
@@ -241,7 +241,7 @@ pub(crate) fn note_defined_variables(args: &[String]) {
                 while let Some(i) = rest.find(open) {
                     rest = &rest[i + open.len()..];
                     if let Some(end) = rest.find(close) {
-                        v.defined.insert(rest[..end].to_string());
+                        v.defined.insert(rest[..end].to_ascii_lowercase());
                     }
                 }
             }
@@ -369,7 +369,10 @@ fn classify_proxy_protocol_tlv(name: &[u8]) -> ProxyProtocolTlv {
 pub static SSL_SESSION_ID_USED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Variable names are case-insensitive, as nginx lowercases each one it
+/// defines or looks up (ngx_http_add_variable, _get_variable_index).
 pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
+    let name = &name.to_ascii_lowercase()[..];
     Ok(match name {
         // nginx's `$document_uri` is `$uri` under another name.
         b"uri" | b"document_uri" => Variable::Uri,

@@ -64,7 +64,7 @@ pub(crate) fn parse_access_directive(
                 });
             };
             conf.auth_request_set.push((
-                name.to_string(),
+                name.to_ascii_lowercase(),
                 super::values::parse_value_with_vars(value)?,
             ));
         }

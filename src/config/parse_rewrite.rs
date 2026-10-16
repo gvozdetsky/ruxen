@@ -382,7 +382,8 @@ pub(crate) fn parse_rewrite_variable_name(raw: &str, what: &'static str) -> Resu
             got: raw.to_string(),
         });
     }
-    Ok(name.to_string())
+    // Case-insensitive, as every variable name (`classify_variable`).
+    Ok(name.to_ascii_lowercase())
 }
 
 #[cfg(test)]
