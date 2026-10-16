@@ -520,7 +520,13 @@ fn head_worker_404_has_no_body() {
         b"HEAD /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(status_line(&r), "HTTP/1.1 404 Not Found");
-    assert_eq!(header(&r, "Content-Length").as_deref(), Some("10"));
+    // nginx's HTML page (#34): its length, no body.
+    assert_eq!(header(&r, "Content-Type").as_deref(), Some("text/html"));
+    assert!(
+        header(&r, "Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n > 100)
+    );
     assert_eq!(body(&r), b"");
 }
 
@@ -533,7 +539,13 @@ fn head_worker_403_has_no_body() {
         b"HEAD /../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden");
-    assert_eq!(header(&r, "Content-Length").as_deref(), Some("10"));
+    // nginx's HTML page (#34): its length, no body.
+    assert_eq!(header(&r, "Content-Type").as_deref(), Some("text/html"));
+    assert!(
+        header(&r, "Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n > 100)
+    );
     assert_eq!(body(&r), b"");
 }
 
@@ -546,7 +558,13 @@ fn head_bad_request_has_no_body_when_request_line_parsed() {
         b"HEAD /index.html HTTP/1.1\r\nBroken-Header\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request");
-    assert_eq!(header(&r, "Content-Length").as_deref(), Some("12"));
+    // nginx's HTML page (#34): its length, no body.
+    assert_eq!(header(&r, "Content-Type").as_deref(), Some("text/html"));
+    assert!(
+        header(&r, "Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n > 100)
+    );
     assert_eq!(body(&r), b"");
 }
 

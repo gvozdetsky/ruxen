@@ -334,18 +334,18 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         access_logs: canonical_access_logs,
         split_clients: prepared_split_clients,
         maps: prepared_maps,
-        not_found: Prebuilt::leak(404, "Not Found\n", http_server_bytes),
-        bad_request: Prebuilt::leak(400, "Bad Request\n", http_server_bytes),
-        plain_http: Prebuilt::leak(
-            400,
+        not_found: Prebuilt::leak_error(404, "Not Found\n", http_server_bytes),
+        bad_request: Prebuilt::leak_error(400, "Bad Request\n", http_server_bytes),
+        plain_http: Prebuilt::leak_error(
+            497,
             "The plain HTTP request was sent to HTTPS port\n",
             http_server_bytes,
         ),
-        not_implemented: Prebuilt::leak(501, "Not Implemented\n", http_server_bytes),
-        forbidden: Prebuilt::leak(403, "Forbidden\n", http_server_bytes),
-        bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),
-        gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
-        internal_error: Prebuilt::leak(500, "Internal Server Error\n", http_server_bytes),
+        not_implemented: Prebuilt::leak_error(501, "Not Implemented\n", http_server_bytes),
+        forbidden: Prebuilt::leak_error(403, "Forbidden\n", http_server_bytes),
+        bad_gateway: Prebuilt::leak_error(502, "Bad Gateway\n", http_server_bytes),
+        gateway_timeout: Prebuilt::leak_error(504, "Gateway Timeout\n", http_server_bytes),
+        internal_error: Prebuilt::leak_error(500, "Internal Server Error\n", http_server_bytes),
         upstreams: prepared_upstreams,
         cache_zones: CACHE_ZONES
             .with(|z| &*crate::arena::leak(z.borrow().clone().into_boxed_slice())),
@@ -2638,9 +2638,12 @@ pub(crate) fn prepare_return(
             // nginx error page (4xx/5xx), substitute it — including the
             // `<center>nginx/X.Y.Z</center>` signature that respects
             // `server_tokens`.
-            match http::default_error_page_body(status, tokens) {
-                Some(default_body) => Prebuilt::leak_bytes(status, &default_body, server_bytes),
-                None => Prebuilt::leak(status, &concatenated, server_bytes),
+            // 494–497 keep their code for `error_page` to find, which the
+            // page, sent as 400, wouldn't (http_error_page.t "redirect 497").
+            if (494..=497).contains(&status) {
+                Prebuilt::leak(status, &concatenated, server_bytes)
+            } else {
+                Prebuilt::leak_error(status, &concatenated, server_bytes)
             }
         } else {
             Prebuilt::leak(status, &concatenated, server_bytes)
@@ -3500,9 +3503,11 @@ pub(crate) fn prepare_try_files(
         .collect();
     let server_bytes = http::server_header_value(tokens);
     let fallback = match tf.fallback {
-        TryFilesFallback::Status(code) => {
-            PreparedFallback::Status(Prebuilt::leak(code, fallback_body(code), server_bytes))
-        }
+        TryFilesFallback::Status(code) => PreparedFallback::Status(Prebuilt::leak_error(
+            code,
+            fallback_body(code),
+            server_bytes,
+        )),
         TryFilesFallback::Uri(u) => PreparedFallback::Uri(leak_bytes(u.as_bytes())),
         TryFilesFallback::UriTemplate(parts) => {
             PreparedFallback::UriTemplate(prepare_value_parts(parts))

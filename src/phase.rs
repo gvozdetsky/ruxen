@@ -645,7 +645,7 @@ fn process_with_meta_inner(
     let Some(listen) = select_listen(http, req.listen_index) else {
         let server_bytes = default_server_header(http);
         return (
-            Response::Owned(crate::http::build_response_for_method(
+            Response::Owned(crate::http::error_response_for_method(
                 500,
                 "Internal Server Error\n",
                 req.method,
@@ -832,7 +832,7 @@ fn process_with_meta_inner(
                 Some(loc) => loc,
                 None => {
                     return (
-                        Response::Owned(crate::http::build_response_for_method(
+                        Response::Owned(crate::http::error_response_for_method(
                             500,
                             "Internal Server Error\n",
                             req.method,
@@ -1239,7 +1239,7 @@ fn process_with_meta_inner(
     }
     // Budget exhausted: nginx returns 500; we match.
     (
-        Response::Owned(crate::http::build_response_for_method(
+        Response::Owned(crate::http::error_response_for_method(
             500,
             "Internal Server Error\n",
             req.method,
@@ -1690,7 +1690,7 @@ fn run_auth_basic(
     };
     let auth_delay_ms = access.auth_delay_ms;
     let internal_error = || AccessControl::Deny {
-        response: Response::Owned(crate::http::build_response_for_method(
+        response: Response::Owned(crate::http::error_response_for_method(
             500,
             "Internal Server Error\n",
             req.method,

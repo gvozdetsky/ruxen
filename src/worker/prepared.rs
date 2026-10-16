@@ -56,11 +56,17 @@ impl Prebuilt {
         )
     }
 
-    pub(crate) fn leak_bytes(status: u16, body: &[u8], server: &[u8]) -> Self {
-        Self::from_built(
-            http::build_response_bytes(status, body, server),
-            http::build_head_response(status, body.len(), server),
-        )
+    /// nginx's page for an error status it answers itself, as `text/html`
+    /// (`http::build_error_response`); a plain `fallback` for a status
+    /// without one.
+    pub(crate) fn leak_error(status: u16, fallback: &str, server: &[u8]) -> Self {
+        match (
+            http::build_error_response(status, Method::Get, server),
+            http::build_error_response(status, Method::Head, server),
+        ) {
+            (Some(full), Some(head)) => Self::from_built(full, head),
+            _ => Self::leak(status, fallback, server),
+        }
     }
 
     pub(crate) fn leak_redirect(status: u16, location: &[u8], server: &[u8]) -> Self {

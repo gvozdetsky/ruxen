@@ -1224,7 +1224,7 @@ pub(crate) fn run_location_handler(
                                     dir_path.display(),
                                     String::from_utf8_lossy(&uri)
                                 );
-                                Response::Owned(http::build_response_for_method(
+                                Response::Owned(http::error_response_for_method(
                                     500,
                                     "Internal Server Error\n",
                                     req.method,
@@ -1247,7 +1247,7 @@ pub(crate) fn run_location_handler(
                                 dir_path.display(),
                                 String::from_utf8_lossy(&uri)
                             );
-                            Response::Owned(http::build_response_for_method(
+                            Response::Owned(http::error_response_for_method(
                                 500,
                                 "Internal Server Error\n",
                                 req.method,
@@ -1272,7 +1272,7 @@ pub(crate) fn run_location_handler(
                                     dir_path.display(),
                                     String::from_utf8_lossy(&uri)
                                 );
-                                Response::Owned(http::build_response_for_method(
+                                Response::Owned(http::error_response_for_method(
                                     500,
                                     "Internal Server Error\n",
                                     req.method,
@@ -1303,7 +1303,7 @@ pub(crate) fn run_location_handler(
                                     dir_path.display(),
                                     String::from_utf8_lossy(&uri)
                                 );
-                                Response::Owned(http::build_response_for_method(
+                                Response::Owned(http::error_response_for_method(
                                     500,
                                     "Internal Server Error\n",
                                     req.method,
@@ -1314,7 +1314,7 @@ pub(crate) fn run_location_handler(
                     }
                 },
                 fs_resolve::Outcome::InternalServerError => {
-                    Response::Owned(http::build_response_for_method(
+                    Response::Owned(http::error_response_for_method(
                         500,
                         "Internal Server Error\n",
                         req.method,
@@ -1365,12 +1365,12 @@ fn entity_too_large(
     in_error_page: bool,
     preserved_www_authenticate: &[Vec<u8>],
 ) -> Response {
-    let body = "413 Request Entity Too Large\n";
-    let response = if matches!(req.method, Method::Head) {
-        http::build_head_response(413, body.len(), loc.server_header)
-    } else {
-        http::build_response(413, body, loc.server_header)
-    };
+    let response = http::error_response_for_method(
+        413,
+        "Request Entity Too Large\n",
+        req.method,
+        loc.server_header,
+    );
     let intercepted = maybe_intercept_error_page(
         Response::Owned(response),
         loc.error_pages,
