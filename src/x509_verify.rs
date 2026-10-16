@@ -407,3 +407,206 @@ fn spki_der(
         .map(rustls::pki_types::SubjectPublicKeyInfoDer::from)
         .ok_or_else(bad_encoding)
 }
+
+/// One `$ssl_client_*` field of a certificate, as nginx's ngx_ssl_get_*
+/// prints it with OpenSSL (#114). Nothing for a certificate that doesn't
+/// parse.
+pub fn print_field(der: &[u8], field: crate::config::SslClientField, out: &mut Vec<u8>) {
+    use crate::config::SslClientField as F;
+    let Some(cert) = Cert::from_der(der) else {
+        return;
+    };
+    let x = cert.0;
+    unsafe {
+        match field {
+            F::RawCert => print_to(out, |b| ffi::PEM_write_bio_X509(b, x)),
+            // ngx_ssl_get_certificate: the PEM without its last newline,
+            // a TAB after each other one.
+            F::Cert => {
+                let mut pem = Vec::new();
+                print_to(&mut pem, |b| ffi::PEM_write_bio_X509(b, x));
+                pem.pop();
+                for &byte in &pem {
+                    out.push(byte);
+                    if byte == b'\n' {
+                        out.push(b'\t');
+                    }
+                }
+            }
+            F::EscapedCert => {
+                let mut pem = Vec::new();
+                print_to(&mut pem, |b| ffi::PEM_write_bio_X509(b, x));
+                escape_uri_component(&pem, out);
+            }
+            F::SDn | F::IDn => {
+                let name = if field == F::SDn {
+                    ffi::X509_get_subject_name(x)
+                } else {
+                    ffi::X509_get_issuer_name(x)
+                };
+                print_to(out, |b| {
+                    ffi::X509_NAME_print_ex(b, name, 0, ffi::XN_FLAG_RFC2253 as _)
+                });
+            }
+            F::SDnLegacy | F::IDnLegacy => {
+                let name = if field == F::SDnLegacy {
+                    ffi::X509_get_subject_name(x)
+                } else {
+                    ffi::X509_get_issuer_name(x)
+                };
+                let text = ffi::X509_NAME_oneline(name, ptr::null_mut(), 0);
+                if !text.is_null() {
+                    out.extend_from_slice(CStr::from_ptr(text).to_bytes());
+                    ffi::OPENSSL_free(text as *mut c_void);
+                }
+            }
+            F::Serial => print_to(out, |b| {
+                ffi::i2a_ASN1_INTEGER(b, ffi::X509_get_serialNumber(x))
+            }),
+            F::Fingerprint => {
+                let mut digest = [0u8; 64];
+                let mut len: std::ffi::c_uint = 0;
+                if ffi::X509_digest(x, ffi::EVP_sha1(), digest.as_mut_ptr(), &mut len) == 1 {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    for b in &digest[..len as usize] {
+                        out.push(HEX[(b >> 4) as usize]);
+                        out.push(HEX[(b & 0xf) as usize]);
+                    }
+                }
+            }
+            F::VStart => print_to(out, |b| {
+                ffi::ASN1_TIME_print(b, ffi::X509_get0_notBefore(x))
+            }),
+            F::VEnd => print_to(out, |b| ffi::ASN1_TIME_print(b, ffi::X509_get0_notAfter(x))),
+            // ngx_ssl_get_client_v_remain: whole days, 0 under one day.
+            F::VRemain => {
+                let mut end: i64 = 0;
+                if ffi::ASN1_TIME_to_posix(ffi::X509_get0_notAfter(x), &mut end) == 1 {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let days = if end < now + 86400 {
+                        0
+                    } else {
+                        (end - now) / 86400
+                    };
+                    out.extend_from_slice(days.to_string().as_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// What `print` writes into a memory BIO, appended to `out`.
+unsafe fn print_to(out: &mut Vec<u8>, print: impl FnOnce(*mut ffi::BIO) -> c_int) {
+    unsafe {
+        let bio = ffi::BIO_new(ffi::BIO_s_mem());
+        if bio.is_null() {
+            return;
+        }
+        if print(bio) > 0 {
+            let mut data: *const u8 = ptr::null();
+            let mut len: usize = 0;
+            if ffi::BIO_mem_contents(bio, &mut data, &mut len) == 1 && !data.is_null() {
+                out.extend_from_slice(std::slice::from_raw_parts(data, len));
+            }
+        }
+        ffi::BIO_free(bio);
+        ffi::ERR_clear_error();
+    }
+}
+
+/// nginx's ngx_escape_uri with NGX_ESCAPE_URI_COMPONENT.
+fn escape_uri_component(input: &[u8], out: &mut Vec<u8>) {
+    const ESCAPE: [u32; 8] = [
+        0xffffffff, 0xfc009fff, 0x78000001, 0xb8000001, 0xffffffff, 0xffffffff, 0xffffffff,
+        0xffffffff,
+    ];
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in input {
+        if ESCAPE[(b >> 5) as usize] & (1 << (b & 0x1f)) != 0 {
+            out.push(b'%');
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0xf) as usize]);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SslClientField as F;
+
+    fn der(pem: &[u8]) -> Vec<u8> {
+        rustls_pemfile::certs(&mut &pem[..])
+            .next()
+            .unwrap()
+            .unwrap()
+            .to_vec()
+    }
+
+    fn field(der: &[u8], f: F) -> String {
+        let mut out = Vec::new();
+        print_field(der, f, &mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The values `openssl x509 -noout -subject -nameopt RFC2253 -serial
+    /// -fingerprint -sha1 -startdate -enddate` prints for the file.
+    #[test]
+    fn fields_print_as_openssl_prints_them() {
+        let pem = include_bytes!("testdata/tls/ec.crt");
+        let d = der(pem);
+        assert_eq!(field(&d, F::SDn), "CN=test.ruxen.local");
+        assert_eq!(field(&d, F::IDnLegacy), "/CN=test.ruxen.local");
+        assert_eq!(
+            field(&d, F::Serial),
+            "0130DB20D13F4A1CA436D5DB9BB517E9BBAACD84"
+        );
+        assert_eq!(
+            field(&d, F::Fingerprint),
+            "2b6995dd5d71a32053872757b729d6876f4eb9e4"
+        );
+        assert_eq!(field(&d, F::VStart), "Apr 28 15:17:31 2026 GMT");
+        assert_eq!(field(&d, F::VEnd), "Apr  4 15:17:31 2126 GMT");
+        let days: i64 = field(&d, F::VRemain).parse().unwrap();
+        assert!((36_000..36_600).contains(&days), "{days}");
+        // The PEM as PEM_write_bio_X509 writes it, and nginx's two forms.
+        let raw = field(&d, F::RawCert);
+        assert!(raw.starts_with("-----BEGIN CERTIFICATE-----\n") && raw.ends_with("-----\n"));
+        assert_eq!(der(raw.as_bytes()), d);
+        let tabbed = field(&d, F::Cert);
+        assert_eq!(tabbed, raw.trim_end_matches('\n').replace('\n', "\n\t"));
+        let escaped = field(&d, F::EscapedCert);
+        assert!(
+            escaped.starts_with("-----BEGIN%20CERTIFICATE-----%0A"),
+            "{escaped}"
+        );
+        assert!(!escaped.contains('\n') && !escaped.contains('+') && !escaped.contains('/'));
+    }
+
+    /// RFC 2253: the RDNs last first, `,` escaped; the legacy form in
+    /// order with `/`.
+    #[test]
+    fn names_with_several_attributes() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CountryName, "NL");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "Acme, Inc.");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "client");
+        let cert = params.self_signed(&key).unwrap();
+        let d = cert.der().to_vec();
+        assert_eq!(field(&d, F::SDn), "CN=client,O=Acme\\, Inc.,C=NL");
+        assert_eq!(field(&d, F::SDnLegacy), "/C=NL/O=Acme, Inc./CN=client");
+        assert_eq!(field(b"not a certificate", F::SDn), "");
+    }
+}

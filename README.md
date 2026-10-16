@@ -264,7 +264,7 @@ Currently supported:
 - RSA and ECDSA certificates
 - multiple certificates per server
 - SNI, and `ssl_reject_handshake`
-- client certificates: `ssl_verify_client on|optional|optional_no_ca`, `ssl_client_certificate`, `ssl_trusted_certificate`, `ssl_verify_depth`, `ssl_crl`, per server, checked by OpenSSL's rules (AWS-LC's X.509 code); refused requests get nginx's 400 pages (495 / 496, which `error_page` can take) and a Host naming another verifying server 421; `$ssl_client_verify`
+- client certificates: `ssl_verify_client on|optional|optional_no_ca`, `ssl_client_certificate`, `ssl_trusted_certificate`, `ssl_verify_depth`, `ssl_crl`, per server, checked by OpenSSL's rules (AWS-LC's X.509 code); refused requests get nginx's 400 pages (495 / 496, which `error_page` can take) and a Host naming another verifying server 421; `$ssl_client_verify` and the certificate's fields (`$ssl_client_cert`, `_raw_cert`, `_escaped_cert`, `_s_dn`, `_i_dn` and their `_legacy` forms, `_serial`, `_fingerprint`, `_v_start`, `_v_end`, `_v_remain`), printed as OpenSSL prints them
 - `ssl_session_cache` (in memory, shared by the workers, kept across a reload), `ssl_session_tickets`, `ssl_session_ticket_key` in nginx's ticket layout, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 

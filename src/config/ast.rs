@@ -1946,6 +1946,33 @@ pub enum ConnectionsGauge {
     Waiting,
 }
 
+/// What `$ssl_client_*` shows of the client's certificate (#114), as
+/// nginx's ngx_ssl_get_* functions print it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslClientField {
+    /// `$ssl_client_cert`: the PEM with a TAB after each inner newline.
+    Cert,
+    /// `$ssl_client_raw_cert`: the PEM.
+    RawCert,
+    /// `$ssl_client_escaped_cert`: the PEM, URI-escaped.
+    EscapedCert,
+    /// Subject and issuer DN, RFC 2253 (`CN=subject`) and legacy
+    /// (`/CN=subject`).
+    SDn,
+    SDnLegacy,
+    IDn,
+    IDnLegacy,
+    /// Serial number, uppercase hex.
+    Serial,
+    /// SHA-1 of the DER, lowercase hex.
+    Fingerprint,
+    /// notBefore / notAfter as ASN1_TIME_print writes them.
+    VStart,
+    VEnd,
+    /// Whole days until notAfter.
+    VRemain,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Variable {
     /// Normalized request URI (no query string).
@@ -1991,20 +2018,8 @@ pub enum Variable {
     SslSessionId,
     /// Client cert verification result (`NONE`, `SUCCESS`, `FAILED:...`).
     SslClientVerify,
-    /// Issuer DN in RFC2253-style form (`CN=issuer`).
-    SslClientIDn,
-    /// Issuer DN in legacy slash form (`/CN=issuer`).
-    SslClientIDnLegacy,
-    /// Subject DN in RFC2253-style form (`CN=subject`).
-    SslClientSDn,
-    /// Subject DN in legacy slash form (`/CN=subject`).
-    SslClientSDnLegacy,
-    /// Client cert notBefore timestamp.
-    SslClientVStart,
-    /// Client cert notAfter timestamp.
-    SslClientVEnd,
-    /// Whole days until client cert expiry.
-    SslClientVRemain,
+    /// The client certificate's `$ssl_client_*` fields (#114).
+    SslClient(SslClientField),
     /// Request body buffered by the parser.
     RequestBody,
     /// `$limit_req_status` (#94).

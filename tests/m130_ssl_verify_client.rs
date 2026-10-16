@@ -236,6 +236,9 @@ fn ssl_verify_client_like_nginx() {
                location / {{ return 200 \"$ssl_client_verify\"; }} }}\n\
              server {{ {tls} server_name off;\n\
                location / {{ return 200 \"$ssl_client_verify\"; }} }}\n\
+             server {{ {tls} server_name vars;\n\
+               ssl_verify_client optional; ssl_client_certificate {ca};\n\
+               location / {{ return 200 \"$ssl_client_s_dn|$ssl_client_i_dn_legacy|$ssl_client_v_remain\"; }} }}\n\
              server {{ {tls} server_name page;\n\
                ssl_verify_client on; ssl_client_certificate {ca};\n\
                error_page 495 496 /denied;\n\
@@ -276,6 +279,18 @@ fn ssl_verify_client_like_nginx() {
         body.starts_with("FAILED:") && body.contains("self"),
         "{body}"
     );
+
+    // The certificate's fields (#114); empty without one.
+    let (status, body) = one(port, "vars", good);
+    assert_eq!(status, 200);
+    let fields: Vec<&str> = body.split('|').collect();
+    assert_eq!(
+        fields[..2],
+        ["CN=client.test", "/CN=ruxen-test-ca-ca"],
+        "{body}"
+    );
+    assert!(fields[2].parse::<u32>().is_ok_and(|d| d > 0), "{body}");
+    assert_eq!(one(port, "vars", None), (200, "||".into()));
 
     // Off: no certificate is asked for.
     assert_eq!(one(port, "off", good), (200, "NONE".into()));
