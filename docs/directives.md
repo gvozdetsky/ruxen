@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 147 implemented, 40 accepted with a difference, 72 accepted with no effect, 1 refused, 290 unknown.
+Of 550 directives: 150 implemented, 37 accepted with a difference, 72 accepted with no effect, 1 refused, 290 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -147,9 +147,9 @@ Not supported: `ssl_engine`.
 | `lingering_time` | accepted, no effect | any |  |
 | `lingering_timeout` | accepted, no effect | any |  |
 | `reset_timedout_connection` | accepted, no effect | any |  |
-| `absolute_redirect` | accepted, differs | any | redirects ruxen makes are absolute URLs |
-| `server_name_in_redirect` | accepted, differs | any | redirects use the request's Host, not the server_name |
-| `port_in_redirect` | accepted, differs | any | redirects keep the port |
+| `absolute_redirect` | yes | http, server, location |  |
+| `server_name_in_redirect` | yes | http, server, location |  |
+| `port_in_redirect` | yes | http, server, location |  |
 | `msie_padding` | accepted, no effect | any |  |
 | `msie_refresh` | accepted, no effect | any |  |
 | `log_not_found` | accepted, no effect | any |  |

@@ -292,3 +292,52 @@ http {
     );
     assert_eq!(body(&http_get(port, "/if")), b"stay");
 }
+
+/// `absolute_redirect`, `server_name_in_redirect`, `port_in_redirect`
+/// (#15): a Location that starts with `/` is made absolute as nginx's
+/// header filter makes it, whoever set it (`return`, `rewrite`, the
+/// directory redirect), with the Host, else the local address, and the
+/// port unless it is off; `absolute_redirect off` leaves it a path.
+#[test]
+fn redirects_follow_absolute_redirect() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    server_name named.example;
+    root %%DIR%%;
+    location /ret { return 301 /target; }
+    location /rw { rewrite ^ /rewritten redirect; }
+    location /name { server_name_in_redirect on; return 302 /n; }
+    location /noport { port_in_redirect off; return 302 /p; }
+    location /off { absolute_redirect off; return 302 /rel; }
+  }
+}
+"#;
+    let (s, port) = spawn_server(conf);
+    std::fs::create_dir_all(s.tempdir.join("a dir")).unwrap();
+    let loc = |path: &str| {
+        let r = http_get(port, path);
+        header_value(&r, "Location").map(str::to_string)
+    };
+    assert_eq!(
+        loc("/ret").as_deref(),
+        Some(format!("http://localhost:{port}/target").as_str())
+    );
+    assert_eq!(
+        loc("/rw").as_deref(),
+        Some(format!("http://localhost:{port}/rewritten").as_str())
+    );
+    assert_eq!(
+        loc("/name").as_deref(),
+        Some(format!("http://named.example:{port}/n").as_str())
+    );
+    assert_eq!(loc("/noport").as_deref(), Some("http://localhost/p"));
+    assert_eq!(loc("/off").as_deref(), Some("/rel"));
+    // The directory redirect escapes the URI and keeps the arguments.
+    assert_eq!(
+        loc("/a%20dir?x=1").as_deref(),
+        Some(format!("http://localhost:{port}/a%20dir/?x=1").as_str())
+    );
+}

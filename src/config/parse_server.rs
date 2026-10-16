@@ -74,6 +74,7 @@ pub(crate) fn parse_server_block(
     let mut limit_req = LimitReqConf::default();
     let mut limit_conn = LimitConnConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
+    let mut redirect = RedirectConf::default();
 
     loop {
         let (args, term) = lx.read_directive()?;
@@ -164,6 +165,7 @@ pub(crate) fn parse_server_block(
                         limit_req: limit_req.clone(),
                         limit_conn: limit_conn.clone(),
                         chunked_transfer_encoding,
+                        redirect,
                         ssl,
                         locations,
                     });
@@ -606,6 +608,7 @@ pub(crate) fn parse_server_block(
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
             (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,
+            (name, Terminator::Semi) if RedirectConf::takes(name) => redirect.parse(&args)?,
             ("chunked_transfer_encoding", Terminator::Semi) => {
                 if chunked_transfer_encoding.is_some() {
                     return Err(Error::Duplicate("chunked_transfer_encoding"));

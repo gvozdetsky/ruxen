@@ -226,17 +226,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         Some("text/plain"),
         "files of unknown types get ruxen's built-in default (#38)",
     ),
-    (
-        "absolute_redirect",
-        Some("on"),
-        "redirects ruxen makes are absolute URLs",
-    ),
-    (
-        "server_name_in_redirect",
-        Some("off"),
-        "redirects use the request's Host, not the server_name",
-    ),
-    ("port_in_redirect", Some("on"), "redirects keep the port"),
     ("etag", Some("on"), "static responses still carry an ETag"),
     (
         "if_modified_since",

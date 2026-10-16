@@ -1078,9 +1078,16 @@ pub(crate) fn run_location_handler(
         PreparedHandler::Return(PreparedReturn::Static(response), _) => {
             Response::Prebuilt(response.pick(req.method))
         }
-        PreparedHandler::Return(PreparedReturn::Template { status, parts }, _) => Response::Owned(
-            build_templated_return(*status, parts, &render_ctx_base, req.method, server_bytes),
-        ),
+        PreparedHandler::Return(PreparedReturn::Template { status, parts }, _) => {
+            Response::Owned(build_templated_return(
+                *status,
+                parts,
+                &render_ctx_base,
+                req.method,
+                server_bytes,
+                phase::RedirectCtx::new(loc.redirect, req, server),
+            ))
+        }
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
         // ngx_http_stub_status_handler: GET and HEAD only, text/plain.
         PreparedHandler::StubStatus => match req.method {
@@ -1152,12 +1159,14 @@ pub(crate) fn run_location_handler(
                     )
                 }
                 fs_resolve::Outcome::Redirect(location) => {
-                    let abs = build_absolute_redirect_location(
-                        &location,
-                        req.host.unwrap_or(server.primary_server_name),
-                        server.listen_port,
-                        req.tls.is_some(),
-                    );
+                    // ngx_http_static_handler: the URI escaped
+                    // (NGX_ESCAPE_URI), its arguments kept (#15).
+                    let mut location = phase::escape_redirect_uri(&location);
+                    if !render_ctx_base.args.is_empty() {
+                        location.push(b'?');
+                        location.extend_from_slice(render_ctx_base.args);
+                    }
+                    let abs = phase::RedirectCtx::new(loc.redirect, req, server).apply(&location);
                     Response::Owned(http::build_redirect_response(
                         301,
                         &abs,
