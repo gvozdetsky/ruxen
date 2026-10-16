@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -52,34 +52,27 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("server did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-}
-
 fn spawn_ruxen(conf_body: &str) -> (ServerGuard, u16) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
     let conf_path = dir.join("ruxen.conf");
     std::fs::write(&conf_path, conf_body.replace("%%PORT%%", &port.to_string())).unwrap();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+    let pid_file = dir.join("ruxen.pid");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .env("RUXEN_WORKERS", "1") // single worker → deterministic LB state
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
 
-    wait_for_listen(port);
+    // The pid file, not "the port accepts": a connection from a parallel
+    // test can hold the picked port as its source port for a moment, and
+    // ruxen's bind retries ride that out (common::ports).
+    common::ports::wait_for_pid_file(&mut child, &pid_file, Duration::from_secs(5));
     (
         ServerGuard {
             child,
