@@ -1810,7 +1810,7 @@ pub(crate) fn prepare_server(
                 let capture_names: Vec<&'static str> = regex
                     .capture_names()
                     .flatten()
-                    .map(|n| &*crate::arena::leak(n.to_string().into_boxed_str()))
+                    .map(|n| &*crate::arena::leak(n.to_ascii_lowercase().into_boxed_str()))
                     .collect();
                 regex_names.push(PreparedRegexName {
                     regex,

@@ -1846,7 +1846,8 @@ fn request_arg_value<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
             Some(eq) => (&pair[..eq], &pair[eq + 1..]),
             None => (pair, &[][..]),
         };
-        if key == name {
+        // ngx_http_arg: the name matches whatever its case.
+        if key.eq_ignore_ascii_case(name) {
             return Some(value);
         }
     }
