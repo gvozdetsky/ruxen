@@ -257,6 +257,36 @@ pub(crate) fn classify_header_name_policy(
     }
 }
 
+/// `proxy_ssl_certificate` with variables (#434): the pair rendered for
+/// this request, and its client config; `None` without a certificate.
+/// `Err`: it doesn't load, and the error log says why.
+#[cold]
+fn dynamic_client_config(
+    d: &crate::upstream_tls::DynamicCert,
+    ctx: &RenderCtx<'_>,
+) -> Result<Option<std::sync::Arc<rustls::ClientConfig>>, ()> {
+    use crate::worker::PreparedCertPath;
+    let render = |path: &PreparedCertPath| match path {
+        PreparedCertPath::File(path) => {
+            use std::os::unix::ffi::OsStrExt;
+            path.as_os_str().as_bytes().to_vec()
+        }
+        PreparedCertPath::Vars { parts, .. } => {
+            let mut out = Vec::new();
+            render_parts(parts, ctx, &mut out);
+            out
+        }
+    };
+    let cert = render(&d.cert);
+    let key = if cert.is_empty() {
+        Vec::new()
+    } else {
+        render(&d.key)
+    };
+    d.config(&cert, &key)
+        .map_err(|e| crate::fs_resolve::note_failed_lookup(e, false))
+}
+
 /// `proxy_cache` for one request (#233, ngx_http_upstream_cache): the
 /// zone, the key, and what the cache holds for it. `None` when the method
 /// isn't cached or `proxy_cache $var` renders empty or `off`; `Err` (a
@@ -1122,10 +1152,12 @@ pub(crate) fn run_location_handler(
             .bind
             .and_then(|bind| resolve_bind(bind, &proxy_render_ctx));
         // TLS to the upstream (#116): a URL with variables says per request.
-        let tls = proxy
+        let tls = match proxy
             .tls
             .filter(|_| variable.as_ref().is_none_or(|v| v.tls))
-            .map(|t| {
+        {
+            None => None,
+            Some(t) => {
                 let name = match (t.name_vars, variable.as_ref()) {
                     (Some(parts), _) => {
                         let mut rendered = Vec::with_capacity(32);
@@ -1137,11 +1169,17 @@ pub(crate) fn run_location_handler(
                     }
                     (None, _) => t.name.clone(),
                 };
-                Box::new(crate::upstream_tls::TlsPlan {
-                    config: t.config.clone(),
-                    name,
-                })
-            });
+                let config = match &t.dynamic_cert {
+                    None => t.config.clone(),
+                    Some(d) => match dynamic_client_config(d, &proxy_render_ctx) {
+                        Ok(Some(config)) => config,
+                        Ok(None) => t.config.clone(),
+                        Err(()) => return crate::worker::internal_error_response(req.method),
+                    },
+                };
+                Some(Box::new(crate::upstream_tls::TlsPlan { config, name }))
+            }
+        };
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             tls,

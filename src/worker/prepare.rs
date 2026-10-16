@@ -1306,23 +1306,35 @@ fn prepare_upstream_tls(
         )?),
     };
     // A certificate needs its key (ngx_http_proxy_set_ssl); a key alone
-    // is unused.
+    // is unused. With variables in either, the pair loads per request.
+    use super::prepared::PreparedCertPath;
+    let passwords = || match settings.password_file {
+        Some(path) => crate::tls_certs::password_file(path),
+        None => Ok(Arc::from(Vec::new())),
+    };
+    let mut dynamic_cert = None;
     let client_cert = match (settings.certificate, settings.certificate_key) {
         (None, _) => None,
         (Some(cert), None) => {
             return Err(format!(
                 "no \"proxy_ssl_certificate_key\" is defined for certificate \"{}\"",
-                cert.display()
+                cert.text()
             ));
         }
+        (Some(PreparedCertPath::File(cert)), Some(PreparedCertPath::File(key))) => Some(
+            crate::upstream_tls::client_certificate(cert, key, &passwords()?)?,
+        ),
         (Some(cert), Some(key)) => {
-            let passwords = match settings.password_file {
-                Some(path) => crate::tls_certs::password_file(path)?,
-                None => Arc::from(Vec::new()),
-            };
-            Some(crate::upstream_tls::client_certificate(
-                cert, key, &passwords,
-            )?)
+            dynamic_cert = Some(crate::upstream_tls::DynamicCert::new(
+                cert,
+                key,
+                passwords()?,
+                settings.protocols,
+                settings.server_name,
+                settings.session_reuse,
+                store.clone(),
+            ));
+            None
         }
     };
     let config = crate::upstream_tls::client_config(
@@ -1364,6 +1376,7 @@ fn prepare_upstream_tls(
             name_vars,
             name,
             default_name: settings.name.is_none(),
+            dynamic_cert,
         },
     )))
 }
