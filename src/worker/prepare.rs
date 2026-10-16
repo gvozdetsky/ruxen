@@ -59,7 +59,13 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// `-t` runs it too, like `nginx -t` runs module init. The error is the
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
-    crate::tls_certs::forget_password_files();
+    crate::tls_certs::forget_files();
+    let prepared = prepare_http(cfg);
+    crate::tls_certs::forget_files();
+    prepared
+}
+
+fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         limit_req_zones,
         limit_conn_zones,
@@ -662,7 +668,8 @@ fn client_auth_key(input: &TlsServerInput) -> Result<Option<ClientAuthKey>, Stri
     let read = |path: &Option<std::path::PathBuf>, call: &str| {
         path.as_ref()
             .map(|p| {
-                std::fs::read(p)
+                crate::tls_certs::pem_file(p)
+                    .map(|b| b.to_vec())
                     .map_err(|e| format!("{call}(\"{}\") failed ({})", p.display(), errno_text(&e)))
             })
             .transpose()
@@ -853,6 +860,7 @@ fn prepare_proxy_cache(
         lock_timeout_ms: conf.lock_timeout_ms.unwrap_or(5000),
         lock_age_ms: conf.lock_age_ms.unwrap_or(5000),
         ignore,
+        max_range_offset: conf.max_range_offset,
     }))))
 }
 

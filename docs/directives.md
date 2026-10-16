@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 152 implemented, 36 accepted with a difference, 73 accepted with no effect, 1 refused, 288 unknown.
+Of 550 directives: 170 implemented, 30 accepted with a difference, 74 accepted with no effect, 1 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -441,7 +441,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_no_cache` | yes | http, server, location |  |
 | `proxy_cache_valid` | yes | http, server, location |  |
 | `proxy_cache_min_uses` | yes | http, server, location |  |
-| `proxy_cache_max_range_offset` | no |  |  |
+| `proxy_cache_max_range_offset` | yes | http, server, location |  |
 | `proxy_cache_use_stale` | yes | http, server, location |  |
 | `proxy_cache_methods` | yes | http, server, location |  |
 | `proxy_cache_lock` | yes | http, server, location |  |
@@ -460,18 +460,18 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_hide_header` | yes | http, server, location |  |
 | `proxy_ignore_headers` | yes | http, server, location |  |
 | `proxy_http_version` | yes | http, server, location |  |
-| `proxy_ssl_session_reuse` | no |  |  |
-| `proxy_ssl_protocols` | no |  |  |
-| `proxy_ssl_ciphers` | no |  |  |
-| `proxy_ssl_name` | no |  |  |
-| `proxy_ssl_server_name` | no |  |  |
-| `proxy_ssl_verify` | no |  |  |
-| `proxy_ssl_verify_depth` | no |  |  |
-| `proxy_ssl_trusted_certificate` | no |  |  |
-| `proxy_ssl_crl` | no |  |  |
-| `proxy_ssl_certificate` | no |  |  |
-| `proxy_ssl_certificate_key` | no |  |  |
-| `proxy_ssl_password_file` | no |  |  |
+| `proxy_ssl_session_reuse` | yes | http, server, location |  |
+| `proxy_ssl_protocols` | yes | http, server, location |  |
+| `proxy_ssl_ciphers` | accepted, no effect | any |  |
+| `proxy_ssl_name` | yes | http, server, location |  |
+| `proxy_ssl_server_name` | yes | http, server, location |  |
+| `proxy_ssl_verify` | yes | http, server, location |  |
+| `proxy_ssl_verify_depth` | yes | http, server, location |  |
+| `proxy_ssl_trusted_certificate` | yes | http, server, location |  |
+| `proxy_ssl_crl` | yes | http, server, location |  |
+| `proxy_ssl_certificate` | yes | http, server, location |  |
+| `proxy_ssl_certificate_key` | yes | http, server, location |  |
+| `proxy_ssl_password_file` | yes | http, server, location |  |
 | `proxy_ssl_conf_command` | no |  |  |
 
 ## http_random_index
@@ -584,22 +584,22 @@ Not supported: `slice`.
 | `ssl` | no |  |  |
 | `ssl_certificate` | yes | http, server |  |
 | `ssl_certificate_key` | yes | http, server |  |
-| `ssl_password_file` | accepted, differs | http, server | encrypted private keys can't be loaded yet (#139) |
+| `ssl_password_file` | yes | http, server |  |
 | `ssl_dhparam` | accepted, no effect | http, server |  |
 | `ssl_ecdh_curve` | accepted, differs | http, server | "ssl_ecdh_curve" is not supported yet and is ignored: rustls's default key exchange groups are used |
 | `ssl_protocols` | yes | http, server |  |
 | `ssl_ciphers` | accepted, differs | http, server | "ssl_ciphers" is not supported yet and is ignored: rustls's default cipher suites are used |
 | `ssl_buffer_size` | accepted, no effect | http, server |  |
-| `ssl_verify_client` | accepted, differs | http, server | client certificates are not requested yet (#113) |
-| `ssl_verify_depth` | accepted, differs | http, server | client certificates are not requested yet (#113) |
-| `ssl_client_certificate` | accepted, differs | http, server | client certificates are not requested yet (#113) |
-| `ssl_trusted_certificate` | accepted, differs | http, server | client certificates are not requested yet (#113) |
+| `ssl_verify_client` | yes | http, server |  |
+| `ssl_verify_depth` | yes | http, server |  |
+| `ssl_client_certificate` | yes | http, server |  |
+| `ssl_trusted_certificate` | yes | http, server |  |
 | `ssl_prefer_server_ciphers` | yes | http, server |  |
 | `ssl_session_cache` | yes | http, server |  |
 | `ssl_session_tickets` | yes | http, server |  |
 | `ssl_session_ticket_key` | yes | http, server |  |
 | `ssl_session_timeout` | yes | http, server |  |
-| `ssl_crl` | accepted, differs | http, server | client certificates are not requested yet (#113) |
+| `ssl_crl` | yes | http, server |  |
 | `ssl_ocsp` | no |  |  |
 | `ssl_ocsp_responder` | no |  |  |
 | `ssl_ocsp_cache` | no |  |  |

@@ -102,13 +102,15 @@ pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::S
     type Key = (Vec<u8>, Option<Vec<u8>>, u32);
     static STORES: Mutex<Vec<(Key, Arc<crate::x509_verify::Store>)>> = Mutex::new(Vec::new());
     let read = |path: &Path, call: &str| {
-        std::fs::read(path).map_err(|e| {
-            format!(
-                "{call}(\"{}\") failed ({})",
-                path.display(),
-                crate::worker::errno_text(&e)
-            )
-        })
+        crate::tls_certs::pem_file(path)
+            .map(|b| b.to_vec())
+            .map_err(|e| {
+                format!(
+                    "{call}(\"{}\") failed ({})",
+                    path.display(),
+                    crate::worker::errno_text(&e)
+                )
+            })
     };
     let trusted = read(settings.trusted, "SSL_CTX_load_verify_locations")?;
     let crl = settings
@@ -157,13 +159,15 @@ pub fn client_certificate(
         )
     };
     let read = |path: &Path| {
-        std::fs::read(path).map_err(|e| {
-            fail(&format_args!(
-                "reading {}: {}",
-                path.display(),
-                crate::worker::errno_text(&e)
-            ))
-        })
+        crate::tls_certs::pem_file(path)
+            .map(|b| b.to_vec())
+            .map_err(|e| {
+                fail(&format_args!(
+                    "reading {}: {}",
+                    path.display(),
+                    crate::worker::errno_text(&e)
+                ))
+            })
     };
     let k = (read(cert)?, read(key)?);
     let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());

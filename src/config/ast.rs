@@ -138,6 +138,8 @@ pub struct ProxyCacheConf {
     pub lock: Option<bool>,
     pub lock_timeout_ms: Option<u64>,
     pub lock_age_ms: Option<u64>,
+    /// `proxy_cache_max_range_offset`; unset is no limit.
+    pub max_range_offset: Option<u64>,
 }
 
 /// `proxy_cache_use_stale`: when a stale cached response answers instead
@@ -191,6 +193,7 @@ impl ProxyCacheConf {
             lock: self.lock.or(parent.lock),
             lock_timeout_ms: self.lock_timeout_ms.or(parent.lock_timeout_ms),
             lock_age_ms: self.lock_age_ms.or(parent.lock_age_ms),
+            max_range_offset: self.max_range_offset.or(parent.max_range_offset),
         }
     }
 }
