@@ -257,7 +257,8 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
             what,
             got: host_port.clone(),
         })?],
-        None => resolve_host_port(host_port)
+        // ngx_http_upstream_server: the port defaults to 80.
+        None => resolve_host_port(&with_default_port(host_port, 80))
             .map_err(|msg| Error::BadValue {
                 what: "upstream server host:port",
                 got: format!("{host_port}: {msg}"),
@@ -351,6 +352,20 @@ fn unix_socket_path(path: &str) -> Result<UpstreamAddr, &'static str> {
 /// at parse time. nginx itself does this via `getaddrinfo` for non-resolver
 /// upstreams; we do the same. Picks the first resolved address — multi-A
 /// expansion is not supported in v0.1.
+/// `host[:port]` with `port` when it names none, as ngx_parse_inet_url's
+/// `default_port`; an IPv6 address is in brackets (`[::1]`, `[::1]:8080`).
+fn with_default_port(host_port: &str, port: u16) -> String {
+    let has_port = match host_port.strip_prefix('[') {
+        Some(rest) => rest.contains("]:"),
+        None => host_port.contains(':'),
+    };
+    if has_port {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:{port}")
+    }
+}
+
 pub(crate) fn resolve_host_port(s: &str) -> Result<Vec<SocketAddr>, String> {
     use std::net::ToSocketAddrs;
     // Every address, in getaddrinfo's order: each is a peer, as
@@ -465,13 +480,7 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
             tls,
         });
     }
-    let host_port = if authority.contains(':') {
-        authority.to_string()
-    } else if tls {
-        format!("{authority}:443")
-    } else {
-        format!("{authority}:80")
-    };
+    let host_port = with_default_port(authority, if tls { 443 } else { 80 });
     let addrs = resolve_host_port(&host_port).map_err(|msg| Error::BadValue {
         what: "proxy_pass host:port",
         got: format!("{raw}: {msg}"),
@@ -1454,6 +1463,30 @@ mod tests {
         match proxy_pass("http://localhost:8081/").unwrap() {
             ProxyPass::Direct { addrs, .. } => assert_eq!(addrs, want),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_port_defaults_to_80() {
+        let addr = |a: &str| UpstreamAddr::Inet(a.parse().unwrap());
+        let server = |arg: &str| {
+            parse_upstream_server_args(&[arg.into(), "max_fails=3".into()]).unwrap()[0]
+                .addr
+                .clone()
+        };
+        assert_eq!(server("127.0.0.1"), addr("127.0.0.1:80"));
+        assert_eq!(server("[::1]"), addr("[::1]:80"));
+        assert_eq!(server("[::1]:8080"), addr("[::1]:8080"));
+        for (url, want) in [
+            ("http://[::1]/", "[::1]:80"),
+            ("https://[::1]/", "[::1]:443"),
+            ("http://[::1]:81/", "[::1]:81"),
+            ("http://127.0.0.1/", "127.0.0.1:80"),
+        ] {
+            match proxy_pass(url).unwrap() {
+                ProxyPass::Direct { addrs, .. } => assert_eq!(addrs, [addr(want)], "{url}"),
+                other => panic!("{other:?}"),
+            }
         }
     }
 
