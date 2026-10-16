@@ -20,6 +20,9 @@ use super::PreparedGzip;
 /// The parts of the request the filter looks at.
 pub(crate) struct GzipRequest<'a> {
     pub http_11: bool,
+    /// A HEAD request: a body in memory is empty because nothing is sent,
+    /// not because the response has none.
+    pub head_only: bool,
     pub accept_encoding: Option<&'a [u8]>,
     pub user_agent: Option<&'a [u8]>,
     pub via: bool,
@@ -31,6 +34,7 @@ impl<'a> GzipRequest<'a> {
         use super::lookup_request_header as h;
         GzipRequest {
             http_11,
+            head_only: false,
             accept_encoding: h(headers_raw, b"accept-encoding"),
             user_agent: h(headers_raw, b"user-agent"),
             via: h(headers_raw, b"via").is_some(),
@@ -489,10 +493,11 @@ fn filter_bytes(gz: &PreparedGzip, req: &GzipRequest<'_>, bytes: &[u8]) -> Optio
             Some(out)
         }
         Decision::Compress => {
-            // A HEAD response (or any without a body here) gets the
-            // compressed response's header only, without a length, as
-            // nginx's (its header filter runs before the body is known).
-            if body.is_empty() {
+            // A HEAD response gets the compressed response's header only,
+            // without a length, as nginx's (its header filter runs before
+            // the body is known). An empty body of a GET is compressed, as
+            // nginx does (20 bytes of gzip, proxy_cache.t).
+            if body.is_empty() && req.head_only {
                 return Some(rewrite_head(headers, gz.vary, Some(b"")));
             }
             let compressed =
@@ -794,6 +799,7 @@ mod tests {
     fn req(ae: Option<&'static [u8]>) -> GzipRequest<'static> {
         GzipRequest {
             http_11: true,
+            head_only: false,
             accept_encoding: ae,
             user_agent: None,
             via: false,
