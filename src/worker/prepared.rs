@@ -718,6 +718,9 @@ pub struct PreparedProxy {
     pub url: Option<&'static [PreparedValuePart]>,
     /// Inheritance-resolved `proxy_bind`; `None` when unset or `off`.
     pub bind: Option<&'static PreparedBind>,
+    /// `proxy_pass https://` (#116); for a URL with variables, always
+    /// set, and used when the rendered URL says `https://`.
+    pub tls: Option<&'static crate::upstream_tls::PreparedUpstreamTls>,
 }
 
 /// A location's resolved `proxy_cache*` directives (#233).
@@ -830,6 +833,87 @@ pub(crate) struct ProxyEffective {
     /// of `proxy_ignore_headers`.
     pub cache: &'static crate::config::ProxyCacheConf,
     pub cache_ignore: crate::proxy_cache::Ignore,
+    /// `proxy_ssl_*` (#116).
+    pub tls: UpstreamTlsSettings,
+}
+
+fn leak_path(path: &std::path::Path) -> &'static std::path::Path {
+    crate::arena::leak(path.to_path_buf().into_boxed_path())
+}
+
+/// The `proxy_ssl_*` settings of a scope, resolved (#116).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamTlsSettings {
+    pub server_name: bool,
+    pub session_reuse: bool,
+    pub protocols: crate::config::TlsVersionSet,
+    pub name: Option<&'static [PreparedValuePart]>,
+    /// `proxy_ssl_verify` and what it checks against (#117).
+    pub verify: bool,
+    pub trusted: Option<&'static std::path::Path>,
+    pub verify_depth: u32,
+    pub crl: Option<&'static std::path::Path>,
+    /// `proxy_ssl_certificate` and its key (#138); `None` for `""`.
+    pub certificate: Option<&'static std::path::Path>,
+    pub certificate_key: Option<&'static std::path::Path>,
+    /// `proxy_ssl_password_file` (#139).
+    pub password_file: Option<&'static std::path::Path>,
+}
+
+impl UpstreamTlsSettings {
+    /// nginx's: no SNI, session reuse on; TLS 1.2 and 1.3 (rustls speaks
+    /// no older one).
+    pub const DEFAULT: Self = Self {
+        server_name: false,
+        session_reuse: true,
+        protocols: crate::config::TlsVersionSet {
+            tlsv1_2: true,
+            tlsv1_3: true,
+        },
+        name: None,
+        verify: false,
+        trusted: None,
+        verify_depth: 1,
+        crl: None,
+        certificate: None,
+        certificate_key: None,
+        password_file: None,
+    };
+
+    /// `conf`'s values over `self`.
+    pub(crate) fn over(self, conf: &crate::config::ProxyConf) -> Self {
+        Self {
+            server_name: conf.ssl_server_name.unwrap_or(self.server_name),
+            session_reuse: conf.ssl_session_reuse.unwrap_or(self.session_reuse),
+            protocols: conf.ssl_protocols.unwrap_or(self.protocols),
+            name: conf
+                .ssl_name
+                .clone()
+                .map(super::prepare::prepare_value_parts)
+                .or(self.name),
+            verify: conf.ssl_verify.unwrap_or(self.verify),
+            trusted: conf
+                .ssl_trusted_certificate
+                .as_deref()
+                .map(leak_path)
+                .or(self.trusted),
+            verify_depth: conf.ssl_verify_depth.unwrap_or(self.verify_depth),
+            crl: conf.ssl_crl.as_deref().map(leak_path).or(self.crl),
+            certificate: match &conf.ssl_certificate {
+                Some(path) => path.as_deref().map(leak_path),
+                None => self.certificate,
+            },
+            password_file: conf
+                .ssl_password_file
+                .as_deref()
+                .map(leak_path)
+                .or(self.password_file),
+            certificate_key: match &conf.ssl_certificate_key {
+                Some(path) => path.as_deref().map(leak_path),
+                None => self.certificate_key,
+            },
+        }
+    }
 }
 
 /// No `proxy_cache*` directive anywhere.
@@ -881,6 +965,7 @@ impl ProxyEffective {
             error_pages: &[],
             recursive_error_pages: false,
             proxy_method: None,
+            tls: UpstreamTlsSettings::DEFAULT,
             cache: &NO_CACHE_CONF,
             cache_ignore: crate::proxy_cache::Ignore {
                 x_accel_expires: false,
@@ -1569,6 +1654,11 @@ pub struct PreparedServer {
     /// HTTP/2 for this server: `http2 on` (server, else http) or
     /// `listen … http2` (#144).
     pub http2: bool,
+    /// The client-certificate context a ClientHello naming this server
+    /// gets (`TlsAcceptor::with_contexts`); `None` for the address's own.
+    pub tls_context: Option<u16>,
+    /// `ssl_verify_client`, checked per request (#113).
+    pub client_verify: crate::config::VerifyClient,
     /// Its `http2_*` settings, http's inherited (#346).
     pub h2: crate::config::Http2Conf,
     /// The server-level keep-alive settings, which an HTTP/2 connection
@@ -1693,6 +1783,12 @@ pub struct PreparedListen {
     /// The servers differ in `http2`: the SNI name decides whether ALPN
     /// offers `h2` (`phase::tls_choice`).
     pub h2_by_sni: bool,
+    /// The servers differ in client-certificate context: the SNI name
+    /// picks the config (`phase::tls_choice`, #113).
+    pub tls_contexts_by_sni: bool,
+    /// Some server of the address has `ssl_verify_client` on: requests are
+    /// checked (`phase::client_certificate_refusal`).
+    pub client_verify: bool,
     /// The TLS default server (`default_server`, else the first), for a
     /// ClientHello without a name that selects one.
     pub tls_default_server: usize,
@@ -1836,6 +1932,10 @@ pub struct PreparedHttp {
     pub bad_request: Prebuilt,
     /// nginx's 497 page: plain HTTP on an `ssl` port, sent as 400 (#384).
     pub plain_http: Prebuilt,
+    /// nginx's 495 and 496 pages, sent as 400, and its 421 (#113).
+    pub cert_error: Prebuilt,
+    pub no_cert: Prebuilt,
+    pub misdirected: Prebuilt,
     pub not_implemented: Prebuilt,
     pub forbidden: Prebuilt,
     pub bad_gateway: Prebuilt,

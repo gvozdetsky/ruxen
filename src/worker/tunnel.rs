@@ -6,7 +6,8 @@
 //!
 //! The two directions run at once, so a peer that writes without reading
 //! can't stall the other way. The upstream connection is split as monoio
-//! splits a `TcpStream`; the client connection is borrowed by both
+//! splits a `TcpStream`, or shared like the client's when it is TLS
+//! (`UpstreamIo::into_tunnel`); the client connection is borrowed by both
 //! directions, which `ConnIo::begin_tunnel` makes safe for TLS (see
 //! `TlsStream::begin_tunnel`).
 //!
@@ -21,8 +22,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::time::Duration;
 
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
-use monoio::net::TcpStream;
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::time::{Instant, timeout};
 
 use super::{ConnIo, EventWatch, PreparedHttp, RuntimeState};
@@ -64,13 +64,13 @@ pub(crate) struct TunnelConf<'a> {
 
 pub(crate) async fn run_tunnel<S: ConnIo>(
     client: &mut S,
-    upstream: TcpStream,
+    upstream: crate::upstream_io::UpstreamIo,
     client_early: &[u8],
     upstream_early: Vec<u8>,
     conf: TunnelConf<'_>,
 ) -> Tunnelled {
     client.begin_tunnel();
-    let (mut up_read, mut up_write) = upstream.into_split();
+    let (mut up_read, mut up_write) = upstream.into_tunnel();
     let client = UnsafeCell::from_mut(client);
     let activity = Cell::new(Instant::now());
     // Writes in progress. While one waits for its peer to read, nginx

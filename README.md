@@ -229,6 +229,7 @@ Supported functionality includes:
 ruxen supports a growing subset of nginx's proxy functionality, including:
 
 - `proxy_pass`, with variables (literal addresses, `upstream` names and `unix:` paths; no `resolver` yet), to TCP and `unix:` upstreams
+- HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); certificate verification with `proxy_ssl_verify`, `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth` and `proxy_ssl_crl`, by OpenSSL's rules (AWS-LC's X.509 code: commonName fallback, depth, CRLs) and nginx's error-log lines; client certificates to upstreams with `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (`""` cancels an inherited one, `proxy_ssl_password_file` for an encrypted key; paths with variables aren't supported yet and are refused)
 - named `upstream` blocks
 - path rewriting
 - weighted round-robin, `least_conn`, `hash` (including `consistent`) and `ip_hash`
@@ -259,10 +260,11 @@ Currently supported:
 
 - TLS 1.2 and TLS 1.3
 - `ssl_certificate`
-- `ssl_certificate_key`
+- `ssl_certificate_key`, encrypted ones with `ssl_password_file` (each line tried in order, as nginx does)
 - RSA and ECDSA certificates
 - multiple certificates per server
 - SNI, and `ssl_reject_handshake`
+- client certificates: `ssl_verify_client on|optional|optional_no_ca`, `ssl_client_certificate`, `ssl_trusted_certificate`, `ssl_verify_depth`, `ssl_crl`, per server, checked by OpenSSL's rules (AWS-LC's X.509 code); refused requests get nginx's 400 pages (495 / 496, which `error_page` can take) and a Host naming another verifying server 421; `$ssl_client_verify` and the certificate's fields (`$ssl_client_cert`, `_raw_cert`, `_escaped_cert`, `_s_dn`, `_i_dn` and their `_legacy` forms, `_serial`, `_fingerprint`, `_v_start`, `_v_end`, `_v_remain`), printed as OpenSSL prints them
 - `ssl_session_cache` (in memory, shared by the workers, kept across a reload), `ssl_session_tickets`, `ssl_session_ticket_key` in nginx's ticket layout, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 
@@ -411,7 +413,7 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
-- HTTPS upstreams (`proxy_pass https://`, `proxy_ssl_*`), HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
+- client certificates to upstreams with variables in the path (#434); HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, charset conversion, and third-party modules
 - the `resolver` (a `proxy_pass` with variables reaches literal addresses and `upstream` names only)
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
@@ -421,7 +423,7 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 - nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
 - variables in `root` and `alias`
 
-Access restrictions that ruxen can't enforce yet — `ssl_verify_client on`, `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used) and `ssl_verify_client optional|optional_no_ca` (no client certificate is requested, and `$ssl_client_verify` is always `NONE`).
+Access restrictions that ruxen can't enforce yet — `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used).
 
 Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently. Anything else that behaves unlike nginx is a bug; please report it.
 

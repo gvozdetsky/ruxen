@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 mod arena;
 mod auth;
 mod autoindex;
+mod client_verify;
 mod config;
 mod file;
 mod fs_resolve;
@@ -37,8 +38,11 @@ mod tls_session;
 mod tls_stream;
 mod tls_ticket;
 mod upstream;
+mod upstream_io;
+mod upstream_tls;
 mod uri;
 mod worker;
+mod x509_verify;
 
 /// musl's malloc costs the static build most of its proxy and TLS
 /// throughput (#199). glibc builds keep the system allocator.

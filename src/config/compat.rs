@@ -487,10 +487,10 @@ mod tests {
 
     #[test]
     fn unenforced_restrictions_are_unsupported() {
-        let (found, _) = findings("http { server { ssl_verify_client on; } }");
+        let (found, _) = findings("http { server { root /srv/$host; } }");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].severity, Severity::Unsupported);
-        assert_eq!(found[0].directive, "ssl_verify_client on");
+        assert_eq!(found[0].directive, "root /srv/$host");
     }
 
     #[test]

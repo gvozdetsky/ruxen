@@ -59,6 +59,7 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// `-t` runs it too, like `nginx -t` runs module init. The error is the
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
+    crate::tls_certs::forget_password_files();
     let HttpConfig {
         limit_req_zones,
         limit_conn_zones,
@@ -253,7 +254,25 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             server.h2 = *h2;
         }
         let h2_by_sni = server_http2.iter().any(|&on| on != http2);
-        let tls = build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)?;
+        let tls = match build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)? {
+            Some((acceptor, contexts)) => {
+                for ((server, context), input) in servers.iter_mut().zip(contexts).zip(&tls_inputs)
+                {
+                    server.tls_context = context;
+                    server.client_verify = input
+                        .ssl
+                        .client_verify
+                        .mode
+                        .unwrap_or(crate::config::VerifyClient::Off);
+                }
+                Some(acceptor)
+            }
+            None => None,
+        };
+        let tls_contexts_by_sni = servers.iter().any(|s| s.tls_context.is_some());
+        let client_verify = servers
+            .iter()
+            .any(|s| s.client_verify != crate::config::VerifyClient::Off);
         let h2_by_sni = h2_by_sni && tls.is_some();
         let reject_handshake = (tls.is_some()
             && tls_inputs
@@ -313,6 +332,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             // The default server is the first (`default_server: 0`).
             h2_plain: server_http2.first().copied().unwrap_or(false),
             h2_by_sni,
+            tls_contexts_by_sni,
+            client_verify,
             tls_default_server,
             socket,
         });
@@ -341,6 +362,13 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             "The plain HTTP request was sent to HTTPS port\n",
             http_server_bytes,
         ),
+        cert_error: Prebuilt::leak_error(495, "The SSL certificate error\n", http_server_bytes),
+        no_cert: Prebuilt::leak_error(
+            496,
+            "No required SSL certificate was sent\n",
+            http_server_bytes,
+        ),
+        misdirected: Prebuilt::leak_error(421, "Misdirected Request\n", http_server_bytes),
         not_implemented: Prebuilt::leak_error(501, "Not Implemented\n", http_server_bytes),
         forbidden: Prebuilt::leak_error(403, "Forbidden\n", http_server_bytes),
         bad_gateway: Prebuilt::leak_error(502, "Bad Gateway\n", http_server_bytes),
@@ -401,18 +429,37 @@ pub(crate) struct TlsServerInput {
 /// ssl listens carry `ssl_certificate`/`ssl_certificate_key` pairs, so a
 /// load failure here is an unreadable file, a malformed PEM or a key that
 /// doesn't match its certificate — a startup error, as in nginx.
+/// With it, each server's client-certificate context (`tls_context`).
 pub(crate) fn build_listen_tls(
     addr: SocketAddr,
     inputs: &[TlsServerInput],
     http2: bool,
     h2_by_sni: bool,
-) -> Result<Option<Arc<crate::tls::TlsAcceptor>>, String> {
+) -> Result<Option<(Arc<crate::tls::TlsAcceptor>, Vec<Option<u16>>)>, String> {
     use crate::config::ServerNameSpec;
 
     // As in nginx, `ssl` belongs to the listening socket: one `listen …
     // ssl` makes every server on the address TLS (ngx_http.c:
     // `ssl = lsopt->ssl || addr[i].opt.ssl`).
     if !inputs.iter().any(|i| i.ssl_listen) {
+        // nginx still loads the certificates of every server that has
+        // them (ngx_http_ssl_merge_srv_conf), so a bad key or password is
+        // an [emerg] here too (#139).
+        for input in inputs {
+            let passwords = match &input.ssl.password_file {
+                Some(path) if !input.ssl.certs.is_empty() => crate::tls_certs::password_file(path)?,
+                _ => Arc::from(Vec::new()),
+            };
+            for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
+                crate::tls_certs::load_certified_key(cert, key, &passwords).map_err(|e| {
+                    format!(
+                        "cannot load certificate \"{}\" with key \"{}\": {e}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?;
+            }
+        }
         return Ok(None);
     }
     // The address's default server — `default_server`, else the first —
@@ -448,8 +495,12 @@ pub(crate) fn build_listen_tls(
         }
         let mut keys: Vec<Arc<rustls::sign::CertifiedKey>> =
             Vec::with_capacity(input.ssl.certs.len());
+        let passwords = match &input.ssl.password_file {
+            Some(path) => crate::tls_certs::password_file(path)?,
+            None => Arc::from(Vec::new()),
+        };
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
-            let ck = crate::tls_certs::load_certified_key(cert, key).map_err(|e| {
+            let ck = crate::tls_certs::load_certified_key(cert, key, &passwords).map_err(|e| {
                 format!(
                     "cannot load certificate \"{}\" with key \"{}\": {e}",
                     cert.display(),
@@ -525,12 +576,141 @@ pub(crate) fn build_listen_tls(
     if http2 && let Some(cfg) = Arc::get_mut(&mut cfg) {
         cfg.alpn_protocols.insert(0, b"h2".to_vec());
     }
-    let acceptor = crate::tls::acceptor_from_config(cfg);
-    Ok(Some(Arc::new(if h2_by_sni {
-        acceptor.with_choice_of_h2()
-    } else {
-        acceptor
-    })))
+    // Client certificates (#113): each server with certificates of its own
+    // has its context; one without takes the default server's, whose
+    // SSL_CTX its SNI name keeps in nginx. Equal contexts are one.
+    let mut auths: Vec<(ClientAuthKey, Arc<crate::client_verify::ClientAuth>)> = Vec::new();
+    let mut auth_of = |input: &TlsServerInput| -> Result<Option<usize>, String> {
+        let Some(key) = client_auth_key(input)? else {
+            return Ok(None);
+        };
+        if let Some(i) = auths.iter().position(|(k, _)| *k == key) {
+            return Ok(Some(i));
+        }
+        let auth = client_auth(&key)?;
+        auths.push((key, Arc::new(auth)));
+        Ok(Some(auths.len() - 1))
+    };
+    let default_auth = auth_of(default)?;
+    let mut server_auth: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        server_auth.push(if input.ssl.certs.is_empty() {
+            default_auth
+        } else {
+            auth_of(input)?
+        });
+    }
+    // The address's config is the default server's context; the others
+    // are configs of their own, indexed in `contexts`.
+    let with_auth = |auth: Option<usize>| -> Arc<rustls::ServerConfig> {
+        match auth {
+            Some(i) => crate::tls_certs::with_client_verifier(
+                &cfg,
+                protocols,
+                auths[i].1.verifier(crate::tls_certs::active_provider()),
+            ),
+            None => cfg.clone(),
+        }
+    };
+    let mut others: Vec<Option<usize>> = Vec::new();
+    let contexts: Vec<Option<u16>> = server_auth
+        .iter()
+        .map(|&auth| {
+            (auth != default_auth).then(|| {
+                let i = others.iter().position(|&o| o == auth).unwrap_or_else(|| {
+                    others.push(auth);
+                    others.len() - 1
+                });
+                i as u16
+            })
+        })
+        .collect();
+    let main = with_auth(default_auth);
+    let other_configs = others
+        .iter()
+        .map(|&auth| (with_auth(auth), auth.map(|i| auths[i].1.clone())))
+        .collect();
+    let acceptor = crate::tls::acceptor_from_config(main)
+        .with_contexts(default_auth.map(|i| auths[i].1.clone()), other_configs);
+    Ok(Some((
+        Arc::new(if h2_by_sni {
+            acceptor.with_choice_of_h2()
+        } else {
+            acceptor
+        }),
+        contexts,
+    )))
+}
+
+/// What a client-certificate context is made of: the files' contents and
+/// the depth. `ssl_client_certificate`'s subjects are also the CA list.
+#[derive(PartialEq, Eq)]
+struct ClientAuthKey {
+    client_certificate: Option<Vec<u8>>,
+    trusted_certificate: Option<Vec<u8>>,
+    crl: Option<Vec<u8>>,
+    depth: u32,
+}
+
+/// A server's `ssl_verify_client` settings, read: `None` with it off.
+/// The files load as nginx loads them (ngx_http_ssl_merge_srv_conf), and
+/// fail as it fails: `on` / `optional` need `ssl_client_certificate`.
+fn client_auth_key(input: &TlsServerInput) -> Result<Option<ClientAuthKey>, String> {
+    use crate::config::VerifyClient;
+    let conf = &input.ssl.client_verify;
+    let mode = conf.mode.unwrap_or(VerifyClient::Off);
+    let read = |path: &Option<std::path::PathBuf>, call: &str| {
+        path.as_ref()
+            .map(|p| {
+                std::fs::read(p)
+                    .map_err(|e| format!("{call}(\"{}\") failed ({})", p.display(), errno_text(&e)))
+            })
+            .transpose()
+    };
+    let trusted_certificate = read(&conf.trusted_certificate, "SSL_CTX_load_verify_locations")?;
+    let crl = read(&conf.crl, "X509_LOOKUP_load_file")?;
+    if mode == VerifyClient::Off {
+        return Ok(None);
+    }
+    if conf.client_certificate.is_none() && mode != VerifyClient::OptionalNoCa {
+        return Err("no ssl_client_certificate for ssl_verify_client".to_string());
+    }
+    Ok(Some(ClientAuthKey {
+        client_certificate: read(&conf.client_certificate, "SSL_CTX_load_verify_locations")?,
+        trusted_certificate,
+        crl,
+        depth: conf.depth.unwrap_or(1),
+    }))
+}
+
+fn client_auth(key: &ClientAuthKey) -> Result<crate::client_verify::ClientAuth, String> {
+    let fail = |what: &str, e: String| format!("{what} failed (SSL: {e})");
+    let mut store =
+        crate::x509_verify::Store::empty(key.depth).map_err(|e| fail("X509_STORE_new()", e))?;
+    let mut hints = Vec::new();
+    if let Some(pem) = &key.client_certificate {
+        store
+            .add_trusted(pem)
+            .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_client_certificate)", e))?;
+        hints = crate::x509_verify::subjects(pem)
+            .into_iter()
+            .map(rustls::DistinguishedName::from)
+            .collect();
+    }
+    if let Some(pem) = &key.trusted_certificate {
+        store
+            .add_trusted(pem)
+            .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_trusted_certificate)", e))?;
+    }
+    if let Some(pem) = &key.crl {
+        store
+            .add_crl(pem)
+            .map_err(|e| fail("X509_LOOKUP_load_file(ssl_crl)", e))?;
+    }
+    Ok(crate::client_verify::ClientAuth {
+        store: Arc::new(store),
+        hints,
+    })
 }
 
 pub(crate) fn prepare_upstreams(
@@ -913,7 +1093,10 @@ pub(crate) fn build_proxy(
     );
     Ok(match pp {
         ProxyPass::Direct {
-            addrs, host_header, ..
+            addrs,
+            host_header,
+            tls,
+            ..
         } => {
             let inet = matches!(addrs.first(), Some(crate::config::UpstreamAddr::Inet(_)));
             let display: &'static [u8] =
@@ -953,7 +1136,7 @@ pub(crate) fn build_proxy(
             }
             PreparedProxy {
                 upstream,
-                host_header: without_default_port(host_header_static),
+                host_header: without_default_port(host_header_static, tls),
                 set_headers: eff.set_headers,
                 pass_request_headers: eff.pass_request_headers,
                 pass_request_body: eff.pass_request_body,
@@ -978,10 +1161,16 @@ pub(crate) fn build_proxy(
                 cache,
                 url: None,
                 bind: eff.bind,
+                tls: tls
+                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .transpose()?,
             }
         }
         ProxyPass::UpstreamRef {
-            name, host_header, ..
+            name,
+            host_header,
+            tls,
+            ..
         } => {
             let upstream = *upstreams.get(name.as_str()).unwrap_or_else(|| {
                 panic!("ruxen: proxy_pass http://{name} references undeclared upstream block")
@@ -1018,6 +1207,9 @@ pub(crate) fn build_proxy(
                 cache,
                 url: None,
                 bind: eff.bind,
+                tls: tls
+                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .transpose()?,
             }
         }
         ProxyPass::Variable { url } => {
@@ -1072,6 +1264,7 @@ pub(crate) fn build_proxy(
                 cache,
                 url: Some(prepare_value_parts(url)),
                 bind: eff.bind,
+                tls: Some(prepare_upstream_tls(eff.tls, b"")?),
                 proxy_method: eff.proxy_method,
             }
         }
@@ -1082,7 +1275,92 @@ pub(crate) fn build_proxy(
 /// port equal to the scheme's default (80; only `http://` is proxied) is
 /// dropped, as ngx_http_proxy_set_vars does. The URL as written still
 /// names the peer and feeds `proxy_redirect default`.
-fn without_default_port(authority: &'static [u8]) -> &'static [u8] {
+/// `proxy_ssl_*` for a location that proxies over TLS: the shared client
+/// config, and the name (`proxy_ssl_name`, else `host`, the host of
+/// `proxy_pass`; empty for a URL with variables, whose host is rendered).
+fn prepare_upstream_tls(
+    settings: super::prepared::UpstreamTlsSettings,
+    host: &[u8],
+) -> Result<&'static crate::upstream_tls::PreparedUpstreamTls, String> {
+    // `proxy_ssl_verify on` needs the certificates to trust, as nginx's
+    // ngx_http_proxy_set_ssl refuses it without them.
+    let store = match (settings.verify, settings.trusted) {
+        (false, _) => None,
+        (true, None) => {
+            return Err("no proxy_ssl_trusted_certificate for proxy_ssl_verify".to_string());
+        }
+        (true, Some(trusted)) => Some(crate::upstream_tls::trust_store(
+            crate::upstream_tls::VerifySettings {
+                trusted,
+                depth: settings.verify_depth,
+                crl: settings.crl,
+            },
+        )?),
+    };
+    // A certificate needs its key (ngx_http_proxy_set_ssl); a key alone
+    // is unused.
+    let client_cert = match (settings.certificate, settings.certificate_key) {
+        (None, _) => None,
+        (Some(cert), None) => {
+            return Err(format!(
+                "no \"proxy_ssl_certificate_key\" is defined for certificate \"{}\"",
+                cert.display()
+            ));
+        }
+        (Some(cert), Some(key)) => {
+            let passwords = match settings.password_file {
+                Some(path) => crate::tls_certs::password_file(path)?,
+                None => Arc::from(Vec::new()),
+            };
+            Some(crate::upstream_tls::client_certificate(
+                cert, key, &passwords,
+            )?)
+        }
+    };
+    let config = crate::upstream_tls::client_config(
+        settings.protocols,
+        settings.server_name,
+        settings.session_reuse,
+        store,
+        client_cert,
+    )?;
+    let literal = |parts: &[PreparedValuePart]| -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        for p in parts {
+            match p {
+                PreparedValuePart::Literal(b) => out.extend_from_slice(b),
+                PreparedValuePart::Var(_) => return None,
+            }
+        }
+        Some(out)
+    };
+    let (name_vars, name) = match settings.name {
+        Some(parts) => match literal(parts) {
+            Some(text) => (
+                None,
+                crate::upstream_tls::leak_name(crate::upstream_tls::server_name(&text)),
+            ),
+            None => (
+                Some(parts),
+                crate::upstream_tls::leak_name(crate::upstream_tls::server_name(host)),
+            ),
+        },
+        None => (
+            None,
+            crate::upstream_tls::leak_name(crate::upstream_tls::server_name(host)),
+        ),
+    };
+    Ok(crate::arena::leak(Box::new(
+        crate::upstream_tls::PreparedUpstreamTls {
+            config,
+            name_vars,
+            name,
+            default_name: settings.name.is_none(),
+        },
+    )))
+}
+
+fn without_default_port(authority: &'static [u8], tls: bool) -> &'static [u8] {
     let host_end = authority
         .iter()
         .rposition(|&b| b == b']')
@@ -1093,7 +1371,7 @@ fn without_default_port(authority: &'static [u8]) -> &'static [u8] {
             let port = std::str::from_utf8(&authority[colon + 1..])
                 .ok()
                 .and_then(|p| p.parse::<u16>().ok());
-            if port == Some(80) {
+            if port == Some(if tls { 443 } else { 80 }) {
                 &authority[..colon]
             } else {
                 authority
@@ -1227,6 +1505,7 @@ pub(crate) struct ServerProxyDefaults {
     pub cache: &'static crate::config::ProxyCacheConf,
     pub cache_ignore: crate::proxy_cache::Ignore,
     pub bind: Option<&'static PreparedBind>,
+    pub tls: super::prepared::UpstreamTlsSettings,
 }
 
 /// The cache fields of `proxy_ignore_headers` at one scope, the unset ones
@@ -1266,6 +1545,7 @@ impl ServerProxyDefaults {
         underscores_in_headers: bool,
     ) -> Self {
         let defaults = ProxyEffective::defaults();
+        let tls = super::prepared::UpstreamTlsSettings::DEFAULT.over(&conf);
         let set_headers: &'static [PreparedProxySetHeader] = match conf.set_headers {
             Some(list) => prepare_proxy_set_headers(list),
             None => &[],
@@ -1307,6 +1587,7 @@ impl ServerProxyDefaults {
             pass_headers: leak_list(conf.pass_headers),
             proxy_method: conf.proxy_method.map(prepare_value_parts),
             cache_ignore: cache_ignore(conf.ignore_headers.as_deref(), defaults.cache_ignore),
+            tls,
             cache: crate::arena::leak(Box::new(conf.cache)),
             bind: conf.bind.and_then(prepare_bind),
         }
@@ -1346,6 +1627,7 @@ pub(crate) fn resolve_proxy_effective(
     location: ProxyConf,
     server_defaults: ServerProxyDefaults,
 ) -> ProxyEffective {
+    let tls = server_defaults.tls.over(&location);
     let set_headers: &'static [PreparedProxySetHeader] = match location.set_headers {
         Some(list) => prepare_proxy_set_headers(list),
         None => server_defaults.set_headers,
@@ -1410,6 +1692,7 @@ pub(crate) fn resolve_proxy_effective(
         cache: crate::arena::leak(Box::new(location.cache.inherit(server_defaults.cache))),
         hide_headers: leak_list(location.hide_headers).or(server_defaults.hide_headers),
         pass_headers: leak_list(location.pass_headers).or(server_defaults.pass_headers),
+        tls,
         bind: match location.bind {
             Some(bind) => prepare_bind(bind),
             None => server_defaults.bind,
@@ -1922,6 +2205,8 @@ pub(crate) fn prepare_server(
         doc_root: server_doc_root,
         // Set by the caller, which knows the http scope.
         http2: false,
+        tls_context: None,
+        client_verify: crate::config::VerifyClient::Off,
         h2: Default::default(),
         keepalive: server_keepalive,
         timeouts: PreparedClientTimeouts::resolve(server.client_timeouts),
@@ -3144,6 +3429,31 @@ pub(crate) fn build_prefix_or_exact(
         ..proxy_effective
     };
     let limited_handler = match &limit_except {
+        // `proxy_pass` in the block: the other methods are proxied there,
+        // with the location's proxy_* settings (proxy_if.t).
+        Some(le) if le.proxy_pass.is_some() => Some(build_handler(
+            Handler::Proxy(le.proxy_pass.clone().expect("checked")),
+            pattern,
+            is_regex,
+            alias_prefix_override,
+            None,
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            proxy_effective,
+        )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),
@@ -3412,6 +3722,31 @@ pub(crate) fn build_regex_location(
         ..proxy_effective
     };
     let limited_handler = match &limit_except {
+        // `proxy_pass` in the block: the other methods are proxied there,
+        // with the location's proxy_* settings (proxy_if.t).
+        Some(le) if le.proxy_pass.is_some() => Some(build_handler(
+            Handler::Proxy(le.proxy_pass.clone().expect("checked")),
+            location_pattern,
+            true,
+            alias_prefix_override,
+            None,
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            proxy_effective,
+        )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),
@@ -3602,7 +3937,7 @@ mod tests {
             ("[::1]", "[::1]"),
             ("u", "u"),
         ] {
-            let got = without_default_port(crate::arena::leak(authority.as_bytes().into()));
+            let got = without_default_port(crate::arena::leak(authority.as_bytes().into()), false);
             assert_eq!(got, want.as_bytes(), "{authority}");
         }
     }

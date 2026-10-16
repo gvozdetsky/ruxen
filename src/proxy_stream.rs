@@ -12,7 +12,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use monoio::io::AsyncReadRent;
-use monoio::net::TcpStream;
 use monoio::time::timeout;
 
 use crate::proxy::{AttemptFailure, Stage, UpstreamError};
@@ -26,7 +25,7 @@ pub struct ProxyStream {
     pub(crate) framing: StreamFraming,
     /// Body bytes read together with the header (wire bytes for chunked).
     pub(crate) pending: Vec<u8>,
-    pub(crate) upstream: TcpStream,
+    pub(crate) upstream: crate::upstream_io::UpstreamIo,
     pub(crate) read_buf: Vec<u8>,
     pub(crate) read_timeout: Duration,
     /// `proxy_limit_rate`, from `pacer_start` with `paced` bytes counted.
@@ -65,6 +64,7 @@ pub(crate) struct StreamPool {
     pub peer_idx: usize,
     pub opened_at: Instant,
     pub requests_served: u32,
+    pub tls: Option<crate::upstream_tls::TlsIdentity>,
 }
 
 impl ProxyStream {
@@ -394,6 +394,7 @@ fn finish(
                 opened_at: pool.opened_at,
                 requests_served: pool.requests_served + 1,
                 slot: s.slot,
+                tls: pool.tls,
             },
         );
     }

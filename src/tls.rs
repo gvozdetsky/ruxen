@@ -49,8 +49,8 @@ pub enum Handshake<IO> {
 impl<IO> From<Accepted<IO>> for Handshake<IO> {
     fn from(accepted: Accepted<IO>) -> Self {
         match accepted {
-            Accepted::Tls(s) => {
-                let info = HandshakeInfo::from_stream(&s);
+            Accepted::Tls(s, verify) => {
+                let info = HandshakeInfo::from_stream(&s, verify.as_deref());
                 Handshake::Tls(s, info)
             }
             Accepted::Plain(io, read) => Handshake::Plain(io, read),
@@ -113,10 +113,18 @@ pub struct HandshakeInfo {
     pub session_reused: bool,
     /// `$ssl_session_id` bytes (`TlsStream::session_id`).
     pub session_id: Option<[u8; 32]>,
+    /// The client's certificate, checked once after the handshake against
+    /// the context it ran with (`ssl_verify_client`, #113).
+    pub client_verify: crate::client_verify::ClientVerify,
+    /// The DER of the client's certificate, for `$ssl_client_*` (#114).
+    pub client_cert: Option<Arc<[u8]>>,
 }
 
 impl HandshakeInfo {
-    fn from_stream<IO>(stream: &ServerTlsStream<IO>) -> Self {
+    fn from_stream<IO>(
+        stream: &ServerTlsStream<IO>,
+        verify: Option<&crate::client_verify::ClientAuth>,
+    ) -> Self {
         let conn = stream.connection();
         Self {
             alpn_protocol: conn.alpn_protocol().map(|s| s.to_vec()),
@@ -125,6 +133,13 @@ impl HandshakeInfo {
             negotiated_cipher_suite: conn.negotiated_cipher_suite(),
             session_reused: matches!(conn.handshake_kind(), Some(rustls::HandshakeKind::Resumed)),
             session_id: stream.session_id().copied(),
+            client_verify: verify
+                .map(|v| v.check(conn.peer_certificates()))
+                .unwrap_or_default(),
+            client_cert: conn
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .map(|leaf| Arc::from(leaf.as_ref())),
         }
     }
 }

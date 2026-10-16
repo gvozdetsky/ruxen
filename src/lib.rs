@@ -10,6 +10,7 @@
 mod arena;
 mod auth;
 mod autoindex;
+mod client_verify;
 mod config;
 mod file;
 mod fs_resolve;
@@ -28,8 +29,11 @@ mod tls_session;
 mod tls_stream;
 mod tls_ticket;
 mod upstream;
+mod upstream_io;
+mod upstream_tls;
 mod uri;
 mod worker;
+mod x509_verify;
 
 /// Entry points for the fuzz targets: thin wrappers over the parsers that
 /// see untrusted bytes.

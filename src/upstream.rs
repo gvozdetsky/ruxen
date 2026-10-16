@@ -49,8 +49,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
-use monoio::net::TcpStream;
-
 use crate::config::LbAlgorithm;
 use crate::worker::PreparedPeer;
 use crate::worker::PreparedUpstream;
@@ -870,23 +868,35 @@ impl Drop for LeasedPeer {
 /// One pooled upstream connection awaiting reuse. The stream is the raw
 /// monoio handle; the metadata fields drive eviction at take-time.
 pub struct PooledConn {
-    pub stream: TcpStream,
+    pub stream: crate::upstream_io::UpstreamIo,
     pub last_used: Instant,
     pub opened_at: Instant,
     pub requests_served: u32,
     /// Its `worker_connections` slot, freed with the socket.
     pub slot: crate::worker::UpstreamSlot,
+    /// For a TLS connection, who it was opened as (`TlsPlan::identity`).
+    pub tls: Option<crate::upstream_tls::TlsIdentity>,
 }
 
 thread_local! {
-    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize), VecDeque<PooledConn>, FxBuild>> =
+    /// Keyed by upstream, peer and, for TLS, the rustls config the
+    /// connection was opened with (0 for plain TCP): a location proxying
+    /// over `https://` never gets a plain connection to the same peer, nor
+    /// one opened with other `proxy_ssl_*` settings, such as without
+    /// verification (#116, #117). Within a queue a TLS connection is only
+    /// taken for the name it was opened for (`PooledConn::tls`).
+    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize, usize), VecDeque<PooledConn>, FxBuild>> =
         RefCell::new(HashMap::default());
 }
 
 /// Take an idle connection from the pool. Drops entries that are past
 /// idle timeout; keepalive-time is enforced on release so over-age conns
 /// may be reused once and then retired (nginx behavior).
-pub fn pool_take(upstream: &'static PreparedUpstream, peer_idx: usize) -> Option<PooledConn> {
+pub fn pool_take(
+    upstream: &'static PreparedUpstream,
+    peer_idx: usize,
+    tls: Option<&crate::upstream_tls::TlsPlan>,
+) -> Option<PooledConn> {
     if upstream.keepalive_max_idle.is_none() {
         return None;
     }
@@ -894,15 +904,25 @@ pub fn pool_take(upstream: &'static PreparedUpstream, peer_idx: usize) -> Option
     let now = Instant::now();
     POOL.with(|p| {
         let mut map = p.borrow_mut();
-        let key = (upstream as *const PreparedUpstream, peer_idx);
+        let key = (
+            upstream as *const PreparedUpstream,
+            peer_idx,
+            tls.map_or(0, |t| t.config_id()),
+        );
         let q = map.get_mut(&key)?;
-        // Pop from the front; LIFO since we push at the front. Drop any
-        // entries that have aged out before returning the first live one.
-        while let Some(c) = q.pop_front() {
-            if now.saturating_duration_since(c.last_used) >= idle_max {
+        // From the front; LIFO since we push at the front. Drop any
+        // entries that have aged out on the way to the first live one
+        // opened for this name.
+        let mut i = 0;
+        while i < q.len() {
+            if now.saturating_duration_since(q[i].last_used) >= idle_max {
+                q.remove(i);
                 continue;
             }
-            return Some(c);
+            if tls.is_none_or(|t| q[i].tls.as_ref().is_some_and(|(_, name)| *name == t.name)) {
+                return q.remove(i);
+            }
+            i += 1;
         }
         None
     })
@@ -941,9 +961,10 @@ pub fn pool_release(upstream: &'static PreparedUpstream, peer_idx: usize, mut co
         return;
     }
     conn.last_used = now;
+    let tls = conn.tls.as_ref().map_or(0, |(config, _)| *config);
     POOL.with(|p| {
         let mut map = p.borrow_mut();
-        let key = (upstream as *const PreparedUpstream, peer_idx);
+        let key = (upstream as *const PreparedUpstream, peer_idx, tls);
         let q = map.entry(key).or_default();
         if q.len() as u32 >= max_idle {
             // Pool full — evict the oldest (back of the deque) to make

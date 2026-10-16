@@ -16,7 +16,9 @@
 //   rustls's outgoing queue) → `write_tls` drains the whole queue into
 //   `wbuf` → one `write_all` to the socket.
 //
-// Server side only: ruxen talks plain HTTP to upstreams.
+// The same stream carries an upstream connection (`proxy_pass https://`,
+// #116): `TlsStream<IO, ClientConnection>`, made by `connect`. What is
+// server-only (the session id, `connection()`) is on `TlsStream<IO>`.
 
 use std::io::{self, BufRead, IoSlice, Write};
 use std::mem;
@@ -25,7 +27,9 @@ use std::sync::Arc;
 use monoio::BufResult;
 use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut, RawBuf};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
-use rustls::{ServerConfig, ServerConnection};
+use rustls::{
+    ClientConfig, ClientConnection, ConnectionCommon, ServerConfig, ServerConnection, SideData,
+};
 
 /// Socket read size: one maximum-size TLS record (16 KiB of plaintext plus
 /// record overhead) fits in a single read.
@@ -38,8 +42,9 @@ const WRITE_BUF_KEEP: usize = 32 * 1024;
 
 /// What a client opened on a TLS port with.
 pub enum Accepted<IO> {
-    /// A completed handshake.
-    Tls(TlsStream<IO>),
+    /// A completed handshake, and the client-certificate context of the
+    /// config it ran with (`ssl_verify_client`, #113).
+    Tls(TlsStream<IO>, Option<Arc<crate::client_verify::ClientAuth>>),
     /// The first bytes aren't a TLS record: plain HTTP sent to an `ssl`
     /// port (#384). The transport comes back with the bytes already read,
     /// for the caller to answer as nginx does (`NGX_HTTP_TO_HTTPS`).
@@ -72,6 +77,19 @@ pub struct TlsAcceptor {
     /// have HTTP/2 off when others have it on (#144).
     without_h2: Option<Arc<ServerConfig>>,
     session_ids: bool,
+    /// The client-certificate context of `config` (#113).
+    verify: Option<Arc<crate::client_verify::ClientAuth>>,
+    /// The other servers' contexts, for `Choice::Accept { context: Some(i) }`.
+    contexts: Vec<Context>,
+}
+
+/// A server's own client-certificate context (#113): `config` with its
+/// verifier, the rest as the address's.
+#[derive(Clone)]
+struct Context {
+    config: Arc<ServerConfig>,
+    without_h2: Option<Arc<ServerConfig>>,
+    verify: Option<Arc<crate::client_verify::ClientAuth>>,
 }
 
 /// What `accept_choosing` does after the ClientHello.
@@ -79,9 +97,10 @@ pub struct TlsAcceptor {
 pub enum Choice {
     /// `ssl_reject_handshake`: an `unrecognized_name` alert.
     Reject,
-    Accept,
-    /// Accept, without offering HTTP/2 through ALPN.
-    AcceptWithoutH2,
+    /// Accept, offering HTTP/2 through ALPN if `h2`, with the config of
+    /// client-certificate context `context` (`with_contexts`), else the
+    /// address's.
+    Accept { h2: bool, context: Option<u16> },
 }
 
 impl From<Arc<ServerConfig>> for TlsAcceptor {
@@ -90,6 +109,8 @@ impl From<Arc<ServerConfig>> for TlsAcceptor {
             config,
             without_h2: None,
             session_ids: false,
+            verify: None,
+            contexts: Vec::new(),
         }
     }
 }
@@ -103,9 +124,39 @@ impl TlsAcceptor {
     /// Keep `config` without `h2` in its ALPN list too, for
     /// `Choice::AcceptWithoutH2`.
     pub fn with_choice_of_h2(mut self) -> Self {
-        let mut config = (*self.config).clone();
-        config.alpn_protocols.retain(|p| p != b"h2");
-        self.without_h2 = Some(Arc::new(config));
+        let without = |config: &Arc<ServerConfig>| {
+            let mut config = (**config).clone();
+            config.alpn_protocols.retain(|p| p != b"h2");
+            Some(Arc::new(config))
+        };
+        self.without_h2 = without(&self.config);
+        for c in &mut self.contexts {
+            c.without_h2 = without(&c.config);
+        }
+        self
+    }
+
+    /// Client-certificate contexts (#113): `verify` is the one of the
+    /// address's config, `contexts` the configs of servers with another
+    /// (each built from the address's, with its own verifier), chosen by
+    /// index in `Choice::Accept`. Before `with_choice_of_h2`.
+    pub fn with_contexts(
+        mut self,
+        verify: Option<Arc<crate::client_verify::ClientAuth>>,
+        contexts: Vec<(
+            Arc<ServerConfig>,
+            Option<Arc<crate::client_verify::ClientAuth>>,
+        )>,
+    ) -> Self {
+        self.verify = verify;
+        self.contexts = contexts
+            .into_iter()
+            .map(|(config, verify)| Context {
+                config,
+                without_h2: None,
+                verify,
+            })
+            .collect();
         self
     }
 
@@ -131,7 +182,7 @@ impl TlsAcceptor {
         let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
         self.handshake_with(io, conn, first)
             .await
-            .map(Accepted::Tls)
+            .map(|s| Accepted::Tls(s, self.verify.clone()))
     }
 
     /// `accept`, but the ClientHello is read first and `choose` sees its
@@ -193,10 +244,20 @@ impl TlsAcceptor {
                 "handshake rejected (ssl_reject_handshake)",
             ));
         }
-        let config = match (choice, &self.without_h2) {
-            (Choice::AcceptWithoutH2, Some(config)) => config.clone(),
-            _ => self.config.clone(),
+        let (h2, context) = match choice {
+            Choice::Accept { h2, context } => (h2, context),
+            Choice::Reject => (true, None),
         };
+        let (config, without_h2, verify) = match context.and_then(|i| self.contexts.get(i as usize))
+        {
+            Some(c) => (&c.config, &c.without_h2, &c.verify),
+            None => (&self.config, &self.without_h2, &self.verify),
+        };
+        let config = match (h2, without_h2) {
+            (false, Some(config)) => config.clone(),
+            _ => config.clone(),
+        };
+        let verify = verify.clone();
         let conn = match accepted.into_connection(config) {
             Ok(conn) => conn,
             Err((e, mut alert)) => {
@@ -208,7 +269,7 @@ impl TlsAcceptor {
         };
         self.handshake_with(io, conn, Vec::new())
             .await
-            .map(Accepted::Tls)
+            .map(|s| Accepted::Tls(s, verify))
     }
 
     /// The handshake, with `rbuf` holding ciphertext already read.
@@ -248,9 +309,9 @@ impl TlsAcceptor {
 }
 
 #[derive(Debug)]
-pub struct TlsStream<IO> {
+pub struct TlsStream<IO, C = ServerConnection> {
     io: IO,
-    conn: ServerConnection,
+    conn: C,
     /// Ciphertext read from `io`; `rbuf[rpos..]` hasn't been handed to
     /// rustls yet. Allocated on the first read.
     rbuf: Vec<u8>,
@@ -282,7 +343,43 @@ impl<IO> TlsStream<IO> {
         }
         self.session_id.as_ref()
     }
+}
 
+/// A TLS client connection to `name` over `io`, handshaken: an HTTPS
+/// upstream (#116). `name` is what the certificate is checked against
+/// and, with SNI on in `config`, what the ClientHello names.
+pub async fn connect<IO: AsyncReadRent + AsyncWriteRent>(
+    config: Arc<ClientConfig>,
+    name: rustls::pki_types::ServerName<'static>,
+    io: IO,
+) -> io::Result<TlsStream<IO, ClientConnection>> {
+    let conn = ClientConnection::new(config, name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut stream = TlsStream {
+        io,
+        conn,
+        rbuf: Vec::new(),
+        rpos: 0,
+        wbuf: Vec::new(),
+        session_id: None,
+        tunnel: false,
+    };
+    loop {
+        stream.write_tls().await?;
+        if !stream.conn.is_handshaking() {
+            return Ok(stream);
+        }
+        if stream.read_tls().await? == 0 {
+            return Err(handshake_eof());
+        }
+    }
+}
+
+impl<IO, C, D> TlsStream<IO, C>
+where
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     /// From now on a read may run while a write is in flight (the tunnel
     /// after a proxied 101). Both touch the session only between awaits;
     /// the socket write is the one thing that can't happen twice at once.
@@ -359,7 +456,14 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
             }
         }
     }
+}
 
+impl<IO, C, D> TlsStream<IO, C>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     /// Hand rustls the next chunk of ciphertext, reading from the socket
     /// first when nothing is buffered, and process it. Returns 0 at EOF:
     /// TCP FIN, or a close_notify already received.
@@ -457,7 +561,12 @@ impl<IO: AsyncReadRent + AsyncWriteRent> TlsStream<IO> {
     }
 }
 
-impl<IO: AsyncReadRent + AsyncWriteRent> AsyncReadRent for TlsStream<IO> {
+impl<IO, C, D> AsyncReadRent for TlsStream<IO, C>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
         let (dst, cap) = (buf.write_ptr(), buf.bytes_total());
         loop {
@@ -491,7 +600,12 @@ impl<IO: AsyncReadRent + AsyncWriteRent> AsyncReadRent for TlsStream<IO> {
     }
 }
 
-impl<IO: AsyncReadRent + AsyncWriteRent> AsyncWriteRent for TlsStream<IO> {
+impl<IO, C, D> AsyncWriteRent for TlsStream<IO, C>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         // SAFETY: `IoBuf` guarantees `bytes_init` initialized bytes at
         // `read_ptr`, and `buf` is owned here until we return it.
@@ -586,7 +700,7 @@ mod tests {
 
     fn tls<IO>(accepted: Accepted<IO>) -> TlsStream<IO> {
         match accepted {
-            Accepted::Tls(s) => s,
+            Accepted::Tls(s, _) => s,
             Accepted::Plain(..) => panic!("plain bytes on the TLS port"),
         }
     }

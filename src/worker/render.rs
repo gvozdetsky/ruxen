@@ -114,6 +114,8 @@ pub(crate) struct RenderCtx<'a> {
     /// proxy context (the location handler doesn't dispatch through
     /// `proxy_pass`).
     pub proxy_host: &'a [u8],
+    /// `proxy_pass https://` (#116), for `$proxy_port`'s default.
+    pub proxy_tls: bool,
     /// Raw upstream response header block (everything between the status
     /// line CRLF and the empty CRLF that ends the header section, the
     /// trailing CRLF of the last header included). Empty outside a proxy
@@ -328,27 +330,25 @@ impl RenderCtx<'_> {
                     }
                 }
             }
+            // ngx_ssl_get_client_verify: empty outside TLS (#113).
             Variable::SslClientVerify => {
-                // ruxen does not request client certificates. nginx renders
-                // "NONE" inside TLS when no cert was supplied, empty
-                // otherwise. Once `ssl_verify_client` lands the rustls
-                // peer-cert state will distinguish SUCCESS / FAILED.
-                if self.tls.is_some() {
-                    out.extend_from_slice(b"NONE");
+                use crate::client_verify::ClientVerify;
+                match self.tls.map(|info| &info.client_verify) {
+                    None => {}
+                    Some(ClientVerify::None) => out.extend_from_slice(b"NONE"),
+                    Some(ClientVerify::Success) => out.extend_from_slice(b"SUCCESS"),
+                    Some(ClientVerify::Failed(_, text)) => {
+                        out.extend_from_slice(b"FAILED:");
+                        out.extend_from_slice(text.as_bytes());
+                    }
                 }
             }
-            // Client-cert DNs and validity range are intentionally empty
-            // until `ssl_verify_client` is implemented and we can decode
-            // the peer certificate via rustls/x509-parser. Returning
-            // hard-coded placeholder strings would let nginx-tests pass
-            // for the wrong reason.
-            Variable::SslClientIDn => {}
-            Variable::SslClientIDnLegacy => {}
-            Variable::SslClientSDn => {}
-            Variable::SslClientSDnLegacy => {}
-            Variable::SslClientVStart => {}
-            Variable::SslClientVEnd => {}
-            Variable::SslClientVRemain => {}
+            // The client certificate, printed as nginx prints it (#114).
+            Variable::SslClient(field) => {
+                if let Some(der) = self.tls.and_then(|info| info.client_cert.as_deref()) {
+                    crate::x509_verify::print_field(der, *field, out);
+                }
+            }
             Variable::Hostname => out.extend_from_slice(self.hostname),
             Variable::LimitConnStatus => {
                 if let Some(state) = self.rewrite_state {
@@ -483,7 +483,9 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::ProxyHost => out.extend_from_slice(self.proxy_host),
-            Variable::ProxyPort => out.extend_from_slice(proxy_port(self.proxy_host)),
+            Variable::ProxyPort => {
+                out.extend_from_slice(proxy_port(self.proxy_host, self.proxy_tls))
+            }
             Variable::ProxyAddXForwardedFor => {
                 let existing =
                     lookup_request_header(self.headers_raw, b"x-forwarded-for").unwrap_or(b"");
@@ -1048,13 +1050,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::SslServerName
             | Variable::SslSessionId
             | Variable::SslClientVerify
-            | Variable::SslClientIDn
-            | Variable::SslClientIDnLegacy
-            | Variable::SslClientSDn
-            | Variable::SslClientSDnLegacy
-            | Variable::SslClientVStart
-            | Variable::SslClientVEnd
-            | Variable::SslClientVRemain
+            | Variable::SslClient(_)
             | Variable::ProxyProtocolAddr
             | Variable::ProxyProtocolPort
             | Variable::ProxyProtocolServerAddr
@@ -1353,9 +1349,9 @@ pub(crate) fn write_time_local(out: &mut Vec<u8>, secs: u64) {
 
 /// `$proxy_port`: the port written in `$proxy_host` (`host:port`,
 /// `[v6]:port`), else the scheme's default, as nginx's
-/// ngx_http_proxy_set_vars. Only `http://` is proxied today, so that's 80.
-/// Empty outside a proxy context, like `$proxy_host`.
-fn proxy_port(proxy_host: &[u8]) -> &[u8] {
+/// ngx_http_proxy_set_vars: 443 for `https://`, 80 otherwise. Empty outside
+/// a proxy context, like `$proxy_host`.
+fn proxy_port(proxy_host: &[u8], tls: bool) -> &[u8] {
     if proxy_host.is_empty() {
         return b"";
     }
@@ -1365,6 +1361,7 @@ fn proxy_port(proxy_host: &[u8]) -> &[u8] {
     };
     match after_host.iter().rposition(|&b| b == b':') {
         Some(i) => &after_host[i + 1..],
+        None if tls => b"443",
         None => b"80",
     }
 }

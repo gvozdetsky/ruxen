@@ -27,6 +27,8 @@ pub(crate) fn parse_server_block(
     let mut ssl_session_timeout_ms: Option<u64> = None;
     let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
+    let mut client_verify = ClientVerifyConf::default();
+    let mut ssl_password_file: Option<PathBuf> = None;
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -111,6 +113,8 @@ pub(crate) fn parse_server_block(
                         session_timeout_ms: ssl_session_timeout_ms,
                         reject_handshake: ssl_reject_handshake,
                         resumption,
+                        client_verify,
+                        password_file: ssl_password_file,
                     };
                     let mut listens_iter = listens.into_iter();
                     let first_listen = listens_iter
@@ -279,6 +283,20 @@ pub(crate) fn parse_server_block(
                 };
                 resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
+            ("ssl_password_file", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                if ssl_password_file.is_some() {
+                    return Err(Error::Duplicate("ssl_password_file"));
+                }
+                let [_, path] = args.as_slice() else {
+                    return Err(Error::MissingArg("ssl_password_file"));
+                };
+                ssl_password_file = Some(resolve_conf_path(lx.conf_prefix(), PathBuf::from(path)));
+            }
+            (name, Terminator::Semi) if ClientVerifyConf::takes(name) => {
+                saw_any_ssl_directive = true;
+                client_verify.parse(&args, lx.conf_prefix())?;
+            }
             (
                 "ssl_buffer_size"
                 | "ssl_dhparam"
@@ -287,12 +305,6 @@ pub(crate) fn parse_server_block(
                 | "ssl_stapling_file"
                 | "ssl_stapling_responder"
                 | "ssl_stapling_verify"
-                | "ssl_verify_client"
-                | "ssl_verify_depth"
-                | "ssl_client_certificate"
-                | "ssl_trusted_certificate"
-                | "ssl_crl"
-                | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_conf_command",
                 Terminator::Semi,
@@ -609,7 +621,9 @@ pub(crate) fn parse_server_block(
                 let entries = parse_error_page_args(&args[1..])?;
                 error_pages.get_or_insert_with(Vec::new).extend(entries);
             }
-            (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
+            (name, Terminator::Semi) if ProxyConf::takes(name) => {
+                proxy.parse(&args, lx.conf_prefix())?
+            }
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
             (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,

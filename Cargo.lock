@@ -680,6 +680,7 @@ name = "ruxen"
 version = "0.1.3"
 dependencies = [
  "aws-lc-rs",
+ "aws-lc-sys",
  "bytes",
  "flate2",
  "h2",
@@ -691,6 +692,7 @@ dependencies = [
  "regex",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "socket2",
  "tokio",
  "zlib-rs",

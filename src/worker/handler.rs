@@ -302,7 +302,11 @@ fn cache_plan(
     match conf.key {
         Some(parts) => render_parts(parts, ctx, &mut key),
         None => {
-            key.extend_from_slice(b"http://");
+            key.extend_from_slice(if ctx.proxy_tls {
+                b"https://"
+            } else {
+                b"http://"
+            });
             key.extend_from_slice(host_header);
             key.extend_from_slice(request_uri);
         }
@@ -578,6 +582,7 @@ fn location_render_ctx<'a>(
         split_clients: Some(&http.split_clients),
         maps: Some(&http.maps),
         proxy_host: &[],
+        proxy_tls: false,
         upstream_headers: req.upstream.map_or(&[], |u| &u.headers),
         upstream_states: req.upstream.map_or(&[], |u| &u.states),
         upstream_cache_status: req.upstream.map_or(&[], |u| u.cache_status_bytes()),
@@ -797,6 +802,7 @@ pub(crate) fn run_location_handler(
         // fields are inherited from the base built above.
         let mut proxy_render_ctx = render_ctx_base;
         proxy_render_ctx.proxy_host = host_header;
+        proxy_render_ctx.proxy_tls = variable.as_ref().map_or(proxy.tls.is_some(), |v| v.tls);
         // `proxy_cache` (#233): what the cache has for this request.
         let cache = match proxy.cache {
             Some(conf) => {
@@ -1035,8 +1041,30 @@ pub(crate) fn run_location_handler(
         let bind = proxy
             .bind
             .and_then(|bind| resolve_bind(bind, &proxy_render_ctx));
+        // TLS to the upstream (#116): a URL with variables says per request.
+        let tls = proxy
+            .tls
+            .filter(|_| variable.as_ref().is_none_or(|v| v.tls))
+            .map(|t| {
+                let name = match (t.name_vars, variable.as_ref()) {
+                    (Some(parts), _) => {
+                        let mut rendered = Vec::with_capacity(32);
+                        render_parts(parts, &proxy_render_ctx, &mut rendered);
+                        crate::upstream_tls::server_name(&rendered)
+                    }
+                    (None, Some(v)) if t.default_name => {
+                        crate::upstream_tls::server_name(&v.host_header)
+                    }
+                    (None, _) => t.name.clone(),
+                };
+                Box::new(crate::upstream_tls::TlsPlan {
+                    config: t.config.clone(),
+                    name,
+                })
+            });
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
+            tls,
             adhoc_peer: variable.as_ref().and_then(|v| v.adhoc_peer).map(Box::new),
             initial_peer,
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
@@ -1465,6 +1493,8 @@ struct VariableTarget {
     /// The URL's URI part, sent as the whole request URI; `None`: the
     /// request's own.
     uri: Option<Vec<u8>>,
+    /// `https://` (#116).
+    tls: bool,
 }
 
 /// Render and parse a `proxy_pass` URL with variables, as nginx's
@@ -1490,9 +1520,13 @@ fn resolve_variable_url(
         crate::fs_resolve::note_failed_lookup_at(message, false, ErrorLogLevel::Error);
         Err(status)
     };
-    let rest = match rendered.get(..7) {
-        Some(scheme) if scheme.eq_ignore_ascii_case(b"http://") && rendered.len() > 7 => {
-            &rendered[7..]
+    // `https://`: TLS to the upstream (#116), port 443 by default.
+    let (rest, tls) = match (rendered.get(..7), rendered.get(..8)) {
+        (Some(scheme), _) if scheme.eq_ignore_ascii_case(b"http://") && rendered.len() > 7 => {
+            (&rendered[7..], false)
+        }
+        (_, Some(scheme)) if scheme.eq_ignore_ascii_case(b"https://") && rendered.len() > 8 => {
+            (&rendered[8..], true)
         }
         _ => {
             return fail(
@@ -1527,6 +1561,7 @@ fn resolve_variable_url(
             adhoc_peer: Some(PeerAddr::Unix(path)),
             host_header: b"localhost".to_vec(),
             uri: (!uri.is_empty()).then(|| uri.to_vec()),
+            tls,
         });
     }
     // host[:port] up to the URI, which starts at `/` or `?`.
@@ -1564,8 +1599,10 @@ fn resolve_variable_url(
         },
     };
     // ngx_http_proxy_set_vars: the scheme's port isn't repeated.
+    let default_port = if tls { 443 } else { 80 };
     let host_header = match port {
-        None | Some(80) => host.to_vec(),
+        None => host.to_vec(),
+        Some(p) if p == default_port => host.to_vec(),
         Some(_) => authority.to_vec(),
     };
     let uri = match uri {
@@ -1585,10 +1622,11 @@ fn resolve_variable_url(
             upstream: placeholder,
             adhoc_peer: Some(PeerAddr::Inet(std::net::SocketAddr::new(
                 ip,
-                port.unwrap_or(80),
+                port.unwrap_or(default_port),
             ))),
             host_header,
             uri,
+            tls,
         });
     }
     // An `upstream` block matches only a URL without a port, as its
@@ -1604,7 +1642,9 @@ fn resolve_variable_url(
     let implicit = || {
         http.implicit_upstreams
             .iter()
-            .find(|(name, p, _)| *p == port.unwrap_or(80) && name.eq_ignore_ascii_case(host))
+            .find(|(name, p, _)| {
+                *p == port.unwrap_or(default_port) && name.eq_ignore_ascii_case(host)
+            })
             .map(|(_, _, upstream)| *upstream)
     };
     if let Some(upstream) = port.is_none().then(block).flatten().or_else(implicit) {
@@ -1613,6 +1653,7 @@ fn resolve_variable_url(
             adhoc_peer: None,
             host_header,
             uri,
+            tls,
         });
     }
     fail(

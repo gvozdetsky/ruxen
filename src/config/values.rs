@@ -402,13 +402,18 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
             Variable::SslSessionId
         }
         b"ssl_client_verify" => Variable::SslClientVerify,
-        b"ssl_client_i_dn" => Variable::SslClientIDn,
-        b"ssl_client_i_dn_legacy" => Variable::SslClientIDnLegacy,
-        b"ssl_client_s_dn" => Variable::SslClientSDn,
-        b"ssl_client_s_dn_legacy" => Variable::SslClientSDnLegacy,
-        b"ssl_client_v_start" => Variable::SslClientVStart,
-        b"ssl_client_v_end" => Variable::SslClientVEnd,
-        b"ssl_client_v_remain" => Variable::SslClientVRemain,
+        b"ssl_client_cert" => Variable::SslClient(SslClientField::Cert),
+        b"ssl_client_raw_cert" => Variable::SslClient(SslClientField::RawCert),
+        b"ssl_client_escaped_cert" => Variable::SslClient(SslClientField::EscapedCert),
+        b"ssl_client_s_dn" => Variable::SslClient(SslClientField::SDn),
+        b"ssl_client_s_dn_legacy" => Variable::SslClient(SslClientField::SDnLegacy),
+        b"ssl_client_i_dn" => Variable::SslClient(SslClientField::IDn),
+        b"ssl_client_i_dn_legacy" => Variable::SslClient(SslClientField::IDnLegacy),
+        b"ssl_client_serial" => Variable::SslClient(SslClientField::Serial),
+        b"ssl_client_fingerprint" => Variable::SslClient(SslClientField::Fingerprint),
+        b"ssl_client_v_start" => Variable::SslClient(SslClientField::VStart),
+        b"ssl_client_v_end" => Variable::SslClient(SslClientField::VEnd),
+        b"ssl_client_v_remain" => Variable::SslClient(SslClientField::VRemain),
         b"request_body" => {
             VARIABLES.with(|v| v.borrow_mut().request_body = true);
             Variable::RequestBody

@@ -38,10 +38,21 @@ use crate::config::TlsVersionSet;
 
 #[derive(Debug)]
 pub enum LoadCertError {
-    Io { path: PathBuf, err: std::io::Error },
-    Pem { path: PathBuf, err: std::io::Error },
+    Io {
+        path: PathBuf,
+        err: std::io::Error,
+    },
+    Pem {
+        path: PathBuf,
+        err: std::io::Error,
+    },
     NoCerts(PathBuf),
     NoKey(PathBuf),
+    /// An encrypted key no password opened (#139).
+    Encrypted {
+        path: PathBuf,
+        reason: String,
+    },
     Rustls(rustls::Error),
 }
 
@@ -52,6 +63,11 @@ impl std::fmt::Display for LoadCertError {
             Self::Pem { path, err } => write!(f, "parsing PEM {}: {err}", path.display()),
             Self::NoCerts(p) => write!(f, "no certificates in {}", p.display()),
             Self::NoKey(p) => write!(f, "no private key in {}", p.display()),
+            Self::Encrypted { path, reason } => write!(
+                f,
+                "PEM_read_bio_PrivateKey(\"{}\") failed (SSL: {reason})",
+                path.display()
+            ),
             Self::Rustls(e) => write!(f, "{e}"),
         }
     }
@@ -63,7 +79,13 @@ impl std::error::Error for LoadCertError {}
 /// `CertifiedKey` whose private key was loaded by the active rustls
 /// `CryptoProvider`. A key that doesn't match the leaf certificate is
 /// rejected (`InconsistentKeys::KeyMismatch`).
-pub fn load_certified_key(cert_pem: &Path, key_pem: &Path) -> Result<CertifiedKey, LoadCertError> {
+/// An encrypted key is decrypted with `passwords` (`ssl_password_file`,
+/// #139).
+pub fn load_certified_key(
+    cert_pem: &Path,
+    key_pem: &Path,
+    passwords: &[Vec<u8>],
+) -> Result<CertifiedKey, LoadCertError> {
     let cert_bytes = std::fs::read(cert_pem).map_err(|err| LoadCertError::Io {
         path: cert_pem.to_path_buf(),
         err,
@@ -72,14 +94,15 @@ pub fn load_certified_key(cert_pem: &Path, key_pem: &Path) -> Result<CertifiedKe
         path: key_pem.to_path_buf(),
         err,
     })?;
-    parse_certified_key(&cert_bytes, &key_bytes, cert_pem, key_pem)
+    parse_certified_key(&cert_bytes, &key_bytes, cert_pem, key_pem, passwords)
 }
 
-fn parse_certified_key(
+pub(crate) fn parse_certified_key(
     cert_pem: &[u8],
     key_pem: &[u8],
     cert_path: &Path,
     key_path: &Path,
+    passwords: &[Vec<u8>],
 ) -> Result<CertifiedKey, LoadCertError> {
     let cert_pem = with_trusted_certificates_relabeled(cert_pem);
     let mut cert_reader = std::io::BufReader::new(&cert_pem[..]);
@@ -94,6 +117,25 @@ fn parse_certified_key(
         return Err(LoadCertError::NoCerts(cert_path.to_path_buf()));
     }
 
+    // rustls-pemfile skips encrypted blocks: those go through OpenSSL's
+    // PEM_read_bio_PrivateKey with each password in turn, as nginx reads
+    // them (ngx_ssl_load_certificate_key).
+    if crate::x509_verify::is_encrypted_key(key_pem) {
+        let der = crate::x509_verify::decrypt_private_key(key_pem, passwords).map_err(|e| {
+            LoadCertError::Encrypted {
+                path: key_path.to_path_buf(),
+                reason: e,
+            }
+        })?;
+        let key = PrivateKeyDer::Pkcs8(der.into());
+        let signing_key = active_provider()
+            .key_provider
+            .load_private_key(key)
+            .map_err(LoadCertError::Rustls)?;
+        let certified = CertifiedKey::new(certs, signing_key);
+        keys_match(&certified).map_err(LoadCertError::Rustls)?;
+        return Ok(certified);
+    }
     let mut key_reader = std::io::BufReader::new(key_pem);
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|err| LoadCertError::Pem {
@@ -223,7 +265,7 @@ fn der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
 /// without `CryptoProvider::install_default()` having been called; the
 /// default-provider path keeps them green without leaking provider choice
 /// into the public API.
-fn active_provider() -> Arc<CryptoProvider> {
+pub(crate) fn active_provider() -> Arc<CryptoProvider> {
     if let Some(p) = CryptoProvider::get_default() {
         return p.clone();
     }
@@ -520,6 +562,85 @@ pub fn build_server_config(
     Ok(Arc::new(cfg))
 }
 
+/// The passwords of an `ssl_password_file` / `proxy_ssl_password_file`
+/// (#139): one per non-empty line, CR LF or LF stripped
+/// (ngx_ssl_read_password_file). Read once per configuration load, even
+/// when many servers inherit the file, since it may be a FIFO;
+/// `forget_password_files` starts a load.
+pub fn password_file(path: &Path) -> Result<Arc<[Vec<u8>]>, String> {
+    let mut files = PASSWORD_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, passwords)) = files.iter().find(|(p, _)| p == path) {
+        return Ok(passwords.clone());
+    }
+    let text = std::fs::read(path).map_err(|e| {
+        format!(
+            "open() \"{}\" failed ({})",
+            path.display(),
+            crate::worker::errno_text(&e)
+        )
+    })?;
+    let passwords: Arc<[Vec<u8>]> = text
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    files.push((path.to_path_buf(), passwords.clone()));
+    Ok(passwords)
+}
+
+static PASSWORD_FILES: std::sync::Mutex<Vec<(PathBuf, Arc<[Vec<u8>]>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A configuration load starts: password files are read again.
+pub fn forget_password_files() {
+    PASSWORD_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// `base` with a client-certificate verifier (#113): a config of its own,
+/// since rustls keeps the verifier private, with everything else `base`'s,
+/// its session cache and ticket keys included. A session can't cross
+/// contexts anyway: resumption needs the same SNI name, which picks the
+/// context, and the certificate is checked again after every handshake.
+pub fn with_client_verifier(
+    base: &ServerConfig,
+    protocols: TlsVersionSet,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Arc<ServerConfig> {
+    let versions: Vec<&'static SupportedProtocolVersion> = [
+        (protocols.tlsv1_3, &rustls::version::TLS13),
+        (protocols.tlsv1_2, &rustls::version::TLS12),
+    ]
+    .into_iter()
+    .filter_map(|(on, v)| on.then_some(v))
+    .collect();
+    let mut cfg = ServerConfig::builder_with_provider(base.crypto_provider().clone())
+        .with_protocol_versions(&versions)
+        .expect("the base config's versions")
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(base.cert_resolver.clone());
+    // Every public field, as rustls 0.23 has them.
+    cfg.ignore_client_order = base.ignore_client_order;
+    cfg.max_fragment_size = base.max_fragment_size;
+    cfg.session_storage = base.session_storage.clone();
+    cfg.ticketer = base.ticketer.clone();
+    cfg.alpn_protocols = base.alpn_protocols.clone();
+    cfg.key_log = base.key_log.clone();
+    cfg.enable_secret_extraction = base.enable_secret_extraction;
+    cfg.max_early_data_size = base.max_early_data_size;
+    cfg.send_half_rtt_data = base.send_half_rtt_data;
+    cfg.send_tls13_tickets = base.send_tls13_tickets;
+    cfg.require_ems = base.require_ems;
+    cfg.time_provider = base.time_provider.clone();
+    cfg.cert_compressors = base.cert_compressors.clone();
+    cfg.cert_compression_cache = base.cert_compression_cache.clone();
+    cfg.cert_decompressors = base.cert_decompressors.clone();
+    Arc::new(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +661,7 @@ mod tests {
     const V1_EC_KEY: &[u8] = include_bytes!("testdata/tls/v1_ec.key");
 
     fn load(cert: &[u8], key: &[u8]) -> Result<CertifiedKey, LoadCertError> {
-        parse_certified_key(cert, key, Path::new("cert"), Path::new("key"))
+        parse_certified_key(cert, key, Path::new("cert"), Path::new("key"), &[])
     }
 
     fn ck(cert: &[u8], key: &[u8]) -> Arc<CertifiedKey> {

@@ -92,6 +92,30 @@ pub struct ProxyConf {
     pub cache: ProxyCacheConf,
     /// `proxy_bind` (#135); `Some(ProxyBind::Off)` turns an inherited one off.
     pub bind: Option<ProxyBind>,
+    /// `proxy_ssl_server_name` (#116); unset means off, as nginx: no SNI.
+    pub ssl_server_name: Option<bool>,
+    /// `proxy_ssl_name`; unset means the host of `proxy_pass`.
+    pub ssl_name: Option<Vec<ValuePart>>,
+    /// `proxy_ssl_session_reuse`; unset means on.
+    pub ssl_session_reuse: Option<bool>,
+    /// `proxy_ssl_protocols`; unset means TLS 1.2 and 1.3.
+    pub ssl_protocols: Option<TlsVersionSet>,
+    /// `proxy_ssl_verify` (#117); unset means off.
+    pub ssl_verify: Option<bool>,
+    /// `proxy_ssl_trusted_certificate`, resolved against the config
+    /// directory; required with `proxy_ssl_verify on`.
+    pub ssl_trusted_certificate: Option<std::path::PathBuf>,
+    /// `proxy_ssl_verify_depth`; unset means 1.
+    pub ssl_verify_depth: Option<u32>,
+    /// `proxy_ssl_crl`, resolved as the trusted certificates are.
+    pub ssl_crl: Option<std::path::PathBuf>,
+    /// `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (#138),
+    /// resolved; `Some(None)` is `""`, no certificate, which cancels an
+    /// inherited one.
+    pub ssl_certificate: Option<Option<std::path::PathBuf>>,
+    pub ssl_certificate_key: Option<Option<std::path::PathBuf>>,
+    /// `proxy_ssl_password_file` (#139).
+    pub ssl_password_file: Option<std::path::PathBuf>,
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -242,6 +266,25 @@ impl ProxyConf {
             proxy_method: self.proxy_method.or_else(|| parent.proxy_method.clone()),
             cache: self.cache.inherit(&parent.cache),
             bind: self.bind.or_else(|| parent.bind.clone()),
+            ssl_server_name: self.ssl_server_name.or(parent.ssl_server_name),
+            ssl_name: self.ssl_name.or_else(|| parent.ssl_name.clone()),
+            ssl_session_reuse: self.ssl_session_reuse.or(parent.ssl_session_reuse),
+            ssl_protocols: self.ssl_protocols.or(parent.ssl_protocols),
+            ssl_verify: self.ssl_verify.or(parent.ssl_verify),
+            ssl_trusted_certificate: self
+                .ssl_trusted_certificate
+                .or_else(|| parent.ssl_trusted_certificate.clone()),
+            ssl_verify_depth: self.ssl_verify_depth.or(parent.ssl_verify_depth),
+            ssl_crl: self.ssl_crl.or_else(|| parent.ssl_crl.clone()),
+            ssl_certificate: self
+                .ssl_certificate
+                .or_else(|| parent.ssl_certificate.clone()),
+            ssl_certificate_key: self
+                .ssl_certificate_key
+                .or_else(|| parent.ssl_certificate_key.clone()),
+            ssl_password_file: self
+                .ssl_password_file
+                .or_else(|| parent.ssl_password_file.clone()),
         }
     }
 }
@@ -623,6 +666,117 @@ pub struct ServerSsl {
     pub resumption: SessionResumption,
     /// `ssl_reject_handshake on|off` (#112), merged with http scope.
     pub reject_handshake: Option<bool>,
+    /// `ssl_verify_client` and what it checks with (#113), merged with
+    /// http scope.
+    pub client_verify: ClientVerifyConf,
+    /// `ssl_password_file` (#139), merged with http scope.
+    pub password_file: Option<PathBuf>,
+}
+
+/// `ssl_verify_client`'s modes (ngx_http_ssl_verify).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyClient {
+    Off,
+    On,
+    Optional,
+    /// A certificate is asked for, and one nobody vouches for still passes
+    /// (ngx_ssl_verify_error_optional).
+    OptionalNoCa,
+}
+
+/// `ssl_verify_client`, `ssl_client_certificate`, `ssl_trusted_certificate`,
+/// `ssl_verify_depth` and `ssl_crl` of one level (#113); paths resolved
+/// against the config directory. `None` until set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientVerifyConf {
+    pub mode: Option<VerifyClient>,
+    pub client_certificate: Option<PathBuf>,
+    pub trusted_certificate: Option<PathBuf>,
+    pub depth: Option<u32>,
+    pub crl: Option<PathBuf>,
+}
+
+impl ClientVerifyConf {
+    pub(crate) fn takes(name: &str) -> bool {
+        matches!(
+            name,
+            "ssl_verify_client"
+                | "ssl_client_certificate"
+                | "ssl_trusted_certificate"
+                | "ssl_verify_depth"
+                | "ssl_crl"
+        )
+    }
+
+    /// One of `takes`'s directives into `self`.
+    pub(crate) fn parse(
+        &mut self,
+        args: &[String],
+        conf_prefix: Option<&std::path::Path>,
+    ) -> Result<(), super::error::Error> {
+        use super::error::Error;
+        let name: &'static str = match args[0].as_str() {
+            "ssl_verify_client" => "ssl_verify_client",
+            "ssl_client_certificate" => "ssl_client_certificate",
+            "ssl_trusted_certificate" => "ssl_trusted_certificate",
+            "ssl_verify_depth" => "ssl_verify_depth",
+            _ => "ssl_crl",
+        };
+        let [_, value] = args else {
+            return Err(Error::BadValue {
+                what: name,
+                got: args[1..].join(" "),
+            });
+        };
+        let path = || super::resolve_conf_path(conf_prefix, PathBuf::from(value));
+        let duplicate = match name {
+            "ssl_verify_client" => {
+                let mode = match value.as_str() {
+                    "off" => VerifyClient::Off,
+                    "on" => VerifyClient::On,
+                    "optional" => VerifyClient::Optional,
+                    "optional_no_ca" => VerifyClient::OptionalNoCa,
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: name,
+                            got: value.clone(),
+                        });
+                    }
+                };
+                self.mode.replace(mode).is_some()
+            }
+            "ssl_client_certificate" => self.client_certificate.replace(path()).is_some(),
+            "ssl_trusted_certificate" => self.trusted_certificate.replace(path()).is_some(),
+            "ssl_verify_depth" => {
+                let depth = value.parse::<u32>().map_err(|_| Error::BadValue {
+                    what: name,
+                    got: value.clone(),
+                })?;
+                self.depth.replace(depth).is_some()
+            }
+            _ => self.crl.replace(path()).is_some(),
+        };
+        if duplicate {
+            return Err(Error::Duplicate(name));
+        }
+        Ok(())
+    }
+
+    /// Unset values come from `parent`, each on its own (nginx merges them
+    /// one by one).
+    pub(crate) fn inherit(self, parent: &ClientVerifyConf) -> ClientVerifyConf {
+        ClientVerifyConf {
+            mode: self.mode.or(parent.mode),
+            client_certificate: self
+                .client_certificate
+                .or_else(|| parent.client_certificate.clone()),
+            trusted_certificate: self
+                .trusted_certificate
+                .or_else(|| parent.trusted_certificate.clone()),
+            depth: self.depth.or(parent.depth),
+            crl: self.crl.or_else(|| parent.crl.clone()),
+        }
+    }
 }
 
 /// How TLS sessions can be resumed. `None` fields take nginx's defaults:
@@ -1540,6 +1694,9 @@ pub struct LimitExcept {
     /// inherits the location's.
     pub auth_basic: Option<AuthBasic>,
     pub auth_basic_user_file: Option<PathBuf>,
+    /// `proxy_pass` of the block: the other methods go to it (its own
+    /// content handler in nginx); `None` keeps the location's handler.
+    pub proxy_pass: Option<ProxyPass>,
 }
 
 /// The methods `limit_except` takes, in `ngx_methods_names` order.
@@ -1930,6 +2087,33 @@ pub enum ConnectionsGauge {
     Waiting,
 }
 
+/// What `$ssl_client_*` shows of the client's certificate (#114), as
+/// nginx's ngx_ssl_get_* functions print it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslClientField {
+    /// `$ssl_client_cert`: the PEM with a TAB after each inner newline.
+    Cert,
+    /// `$ssl_client_raw_cert`: the PEM.
+    RawCert,
+    /// `$ssl_client_escaped_cert`: the PEM, URI-escaped.
+    EscapedCert,
+    /// Subject and issuer DN, RFC 2253 (`CN=subject`) and legacy
+    /// (`/CN=subject`).
+    SDn,
+    SDnLegacy,
+    IDn,
+    IDnLegacy,
+    /// Serial number, uppercase hex.
+    Serial,
+    /// SHA-1 of the DER, lowercase hex.
+    Fingerprint,
+    /// notBefore / notAfter as ASN1_TIME_print writes them.
+    VStart,
+    VEnd,
+    /// Whole days until notAfter.
+    VRemain,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Variable {
     /// Normalized request URI (no query string).
@@ -1975,20 +2159,8 @@ pub enum Variable {
     SslSessionId,
     /// Client cert verification result (`NONE`, `SUCCESS`, `FAILED:...`).
     SslClientVerify,
-    /// Issuer DN in RFC2253-style form (`CN=issuer`).
-    SslClientIDn,
-    /// Issuer DN in legacy slash form (`/CN=issuer`).
-    SslClientIDnLegacy,
-    /// Subject DN in RFC2253-style form (`CN=subject`).
-    SslClientSDn,
-    /// Subject DN in legacy slash form (`/CN=subject`).
-    SslClientSDnLegacy,
-    /// Client cert notBefore timestamp.
-    SslClientVStart,
-    /// Client cert notAfter timestamp.
-    SslClientVEnd,
-    /// Whole days until client cert expiry.
-    SslClientVRemain,
+    /// The client certificate's `$ssl_client_*` fields (#114).
+    SslClient(SslClientField),
     /// Request body buffered by the parser.
     RequestBody,
     /// `$limit_req_status` (#94).
@@ -2355,12 +2527,16 @@ pub enum ProxyPass {
         name: String,
         host_header: String,
         request_path: Option<String>,
+        /// `https://` (#116).
+        tls: bool,
     },
     Direct {
         /// Every address the host resolves to (one for a `unix:` path).
         addrs: Vec<UpstreamAddr>,
         host_header: String,
         request_path: Option<String>,
+        /// `https://` (#116).
+        tls: bool,
     },
     /// A URL with variables, evaluated per request (#100).
     Variable { url: Vec<ValuePart> },
