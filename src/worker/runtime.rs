@@ -3801,16 +3801,24 @@ pub(crate) async fn handle<S: ConnIo>(
                             .await;
                         }
 
-                        let (response, settled_meta) = settle_proxy_response(
-                            http,
-                            &ctx,
-                            &mut *url_scratch,
-                            response,
-                            process_meta,
-                            Some(&*stream as &dyn super::client_watch::WatchClient),
-                        )
-                        .await;
-                        process_meta = settled_meta;
+                        // Only a proxied response has anything to settle;
+                        // the call would move `process_meta` (~1 KB) in
+                        // and out for nothing.
+                        let response = if matches!(response, Response::Proxy(_)) {
+                            let (response, settled_meta) = settle_proxy_response(
+                                http,
+                                &ctx,
+                                &mut *url_scratch,
+                                response,
+                                process_meta,
+                                Some(&*stream as &dyn super::client_watch::WatchClient),
+                            )
+                            .await;
+                            process_meta = settled_meta;
+                            response
+                        } else {
+                            response
+                        };
                         // The location's send_timeout for this response (#147);
                         // the next request's header waits use the default
                         // server's values again, as in nginx.
