@@ -195,13 +195,15 @@ pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::S
     type Key = (Vec<u8>, Option<Vec<u8>>, u32);
     static STORES: Mutex<Vec<(Key, Arc<crate::x509_verify::Store>)>> = Mutex::new(Vec::new());
     let read = |path: &Path, call: &str| {
-        std::fs::read(path).map_err(|e| {
-            format!(
-                "{call}(\"{}\") failed ({})",
-                path.display(),
-                crate::worker::errno_text(&e)
-            )
-        })
+        crate::tls_certs::pem_file(path)
+            .map(|b| b.to_vec())
+            .map_err(|e| {
+                format!(
+                    "{call}(\"{}\") failed ({})",
+                    path.display(),
+                    crate::worker::errno_text(&e)
+                )
+            })
     };
     let trusted = read(settings.trusted, "SSL_CTX_load_verify_locations")?;
     let crl = settings
@@ -234,13 +236,17 @@ pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::S
 
 /// `proxy_ssl_certificate` and its key (#138), loaded once per content of
 /// the files, as the trust stores are. `Err` is the `[emerg]` text.
+/// At load: the files are read once per load (`pem_file`); a request's
+/// pair (`DynamicCert`) reads them itself.
 /// An encrypted key opens with `passwords` (`proxy_ssl_password_file`).
 pub fn client_certificate(
     cert: &Path,
     key: &Path,
     passwords: &[Vec<u8>],
 ) -> Result<Arc<CertifiedKey>, String> {
-    certificate_pair(cert, key, passwords, |path| std::fs::read(path))
+    certificate_pair(cert, key, passwords, |path| {
+        crate::tls_certs::pem_file(path).map(|b| b.to_vec())
+    })
 }
 
 fn certificate_pair(

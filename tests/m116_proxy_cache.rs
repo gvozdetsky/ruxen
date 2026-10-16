@@ -225,6 +225,11 @@ fn m116_expiry_vary_and_restart() {
     assert_eq!(status_of(&r), "HIT", "{r}");
     let r = get(s.port, "/vary/v.txt");
     assert_eq!(status_of(&r), "MISS", "{r}");
+    // Each variant is kept (the second at its own key): both are hits.
+    let r = get(s.port, "/vary/v.txt");
+    assert_eq!(status_of(&r), "HIT", "{r}");
+    let r = request(s.port, gz);
+    assert_eq!(status_of(&r), "HIT", "{r}");
 
     // After a restart the files are found again.
     std::fs::write(html.join("keep.txt"), "KEPT").unwrap();
