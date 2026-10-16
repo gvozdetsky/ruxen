@@ -595,31 +595,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 if ssl_protocols.is_some() {
                     return Err(Error::Duplicate("ssl_protocols"));
                 }
-                if args.len() < 2 {
-                    return Err(Error::MissingArg("ssl_protocols"));
-                }
-                let mut set = TlsVersionSet {
-                    tlsv1_2: false,
-                    tlsv1_3: false,
-                };
-                for v in &args[1..] {
-                    match v.as_str() {
-                        "TLSv1.2" => set.tlsv1_2 = true,
-                        "TLSv1.3" => set.tlsv1_3 = true,
-                        "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols (insecure version rejected)",
-                                got: v.clone(),
-                            });
-                        }
-                        _ => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols",
-                                got: v.clone(),
-                            });
-                        }
-                    }
-                }
+                let set = parse_tls_protocols(&args[1..], "ssl_protocols")?;
+                warn_old_tls_protocols(&args, &mut warnings);
                 ssl_protocols = Some(set);
             }
             ("ssl_ciphers", Terminator::Semi) => {
@@ -2002,6 +1979,23 @@ mod tests {
             })
         );
 
+        // #36: the old names are skipped with a warning; only old ones is
+        // still an error.
+        let mixed = src.replace("TLSv1.2 TLSv1.3", "TLSv1 TLSv1.1 TLSv1.2 TLSv1.3");
+        let cfg = parse(&mixed).unwrap();
+        assert_eq!(
+            cfg.servers[0].ssl.protocols,
+            Some(TlsVersionSet {
+                tlsv1_2: true,
+                tlsv1_3: true
+            })
+        );
+        assert_eq!(
+            cfg.warnings,
+            [
+                "\"ssl_protocols\": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only"
+            ]
+        );
         for bad in ["SSLv2", "SSLv3", "TLSv1", "TLSv1.1"] {
             let src = format!(
                 r#"http {{

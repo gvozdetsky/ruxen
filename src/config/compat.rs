@@ -134,13 +134,17 @@ pub(crate) fn precheck(lx: &Lexer, args: &mut Vec<String>) {
     if old.is_empty() {
         return;
     }
+    // With TLSv1.2 or TLSv1.3 left, the line loads and its `[warn]` says
+    // the old names are ignored (#36).
+    if old.len() + 1 < args.len() {
+        return;
+    }
     record(
         lx,
         Severity::Unsupported,
         args,
         format!(
-            "{} rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old \
-             names with a warning)",
+            "{} rejected: ruxen speaks TLSv1.2 and TLSv1.3 only, and nothing else is listed",
             old.join(", ")
         ),
     );

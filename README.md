@@ -151,11 +151,11 @@ ruxen --compat -c /etc/nginx/nginx.conf
 
 ```text
 ruxen 0.1.3: checking /etc/nginx/nginx.conf
-/etc/nginx/nginx.conf:33: unsupported: ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3 — TLSv1, TLSv1.1 rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old names with a warning)
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
 /etc/nginx/nginx.conf:27: differs: default_type application/octet-stream — files of unknown types get ruxen's built-in default (#38)
+-: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
-ruxen does not start with this configuration: 2 unsupported, 1 behaving differently
+ruxen does not start with this configuration: 1 unsupported, 2 behaving differently
 ```
 
 - **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
