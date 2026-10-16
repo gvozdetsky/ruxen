@@ -2412,7 +2412,11 @@ pub(crate) async fn read_first_or_shutdown(
         arm_idle(timers.idle.as_mut(), due);
     }
     let idle = IdleMark::new();
-    let canceller = monoio::io::Canceller::new();
+    // From this worker's pool: a new one costs two allocations (its `Rc`
+    // and the first insert into its set) and two frees per request.
+    let canceller = CANCELLERS
+        .with(|c| c.borrow_mut().pop())
+        .unwrap_or_default();
     let len = buf.len();
     let mut read =
         std::pin::pin!(stream.cancelable_read(buf.slice_mut(0..len), canceller.handle()));
@@ -2444,7 +2448,16 @@ pub(crate) async fn read_first_or_shutdown(
     })
     .await;
     match woke {
-        Woke::Read((res, returned)) => (outcome(res), returned.into_inner()),
+        Woke::Read((res, returned)) => {
+            // Done with it: the op left its set when the read completed.
+            CANCELLERS.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.len() < CANCELLERS_KEPT {
+                    c.push(canceller);
+                }
+            });
+            (outcome(res), returned.into_inner())
+        }
         Woke::Close => {
             canceller.cancel();
             let (_, returned) = read.as_mut().await;
@@ -2457,6 +2470,15 @@ pub(crate) async fn read_first_or_shutdown(
         }
     }
 }
+
+thread_local! {
+    /// `read_first_or_shutdown`'s cancellers, reused: one per keep-alive
+    /// read otherwise.
+    static CANCELLERS: RefCell<Vec<monoio::io::Canceller>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Cancellers kept per worker.
+const CANCELLERS_KEPT: usize = 64;
 
 /// A connection's read buffer and scratch buffers (see `handle`).
 struct ConnBufs {
@@ -4013,19 +4035,30 @@ pub(crate) async fn handle<S: ConnIo>(
                                 prebuilt_base = Some(bytes);
                                 None
                             }
+                            // The buffer not kept goes back to the worker's
+                            // pool, for the next response head built
+                            // (`response::take_buf`).
                             Response::Owned(bytes) => {
                                 if bytes.capacity() > scratch.capacity() {
-                                    *scratch = bytes;
+                                    super::response::give_buf(std::mem::replace(
+                                        &mut *scratch,
+                                        bytes,
+                                    ));
                                 } else {
                                     scratch.extend_from_slice(&bytes);
+                                    super::response::give_buf(bytes);
                                 }
                                 None
                             }
                             Response::File { headers, body } => {
                                 if headers.capacity() > scratch.capacity() {
-                                    *scratch = headers;
+                                    super::response::give_buf(std::mem::replace(
+                                        &mut *scratch,
+                                        headers,
+                                    ));
                                 } else {
                                     scratch.extend_from_slice(&headers);
+                                    super::response::give_buf(headers);
                                 }
                                 Some(body)
                             }

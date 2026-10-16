@@ -381,7 +381,7 @@ fn build_content_headers(
     let body_len = range
         .map(|(start, end)| end - start + 1)
         .unwrap_or(meta.size);
-    let mut out = Vec::with_capacity(256);
+    let mut out = crate::worker::take_response_buf(256);
     write_status_line(&mut out, status);
     crate::http::write_server_and_date(&mut out, server);
     if accept_ranges {
@@ -408,7 +408,7 @@ fn build_content_headers(
 }
 
 fn build_not_modified_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
+    let mut out = crate::worker::take_response_buf(128);
     write_status_line(&mut out, 304);
     crate::http::write_server_and_date(&mut out, server);
     out.extend_from_slice(b"\r\nLast-Modified: ");

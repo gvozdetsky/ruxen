@@ -65,6 +65,7 @@ mod prepared;
 pub(crate) mod range;
 mod render;
 mod response;
+pub(crate) use response::take_buf as take_response_buf;
 mod rewrite;
 mod runtime;
 pub(crate) mod stats;

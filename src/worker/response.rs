@@ -1791,3 +1791,42 @@ pub(crate) fn write_u64_decimal_into(out: &mut [u8], mut n: u64) -> usize {
     out[..len].copy_from_slice(&tmp[k..]);
     len
 }
+
+thread_local! {
+    /// Response-head buffers for reuse: the handler that builds a head
+    /// takes one (`take_buf`), and the worker gives back whichever of that
+    /// buffer and its scratch it doesn't keep (`give_buf`). A static file
+    /// or a 304 then costs no allocation.
+    static BUFS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Buffers kept per worker, and the largest kept.
+const BUFS_KEPT: usize = 16;
+const BUF_KEPT_MAX: usize = 16 * 1024;
+
+/// An empty buffer with room for `cap` bytes: a pooled one if there is.
+#[inline]
+pub(crate) fn take_buf(cap: usize) -> Vec<u8> {
+    match BUFS.with(|b| b.borrow_mut().pop()) {
+        Some(mut buf) => {
+            buf.reserve(cap);
+            buf
+        }
+        None => Vec::with_capacity(cap),
+    }
+}
+
+/// Back to the pool, unless it is full or the buffer is too big to keep.
+#[inline]
+pub(crate) fn give_buf(mut buf: Vec<u8>) {
+    if buf.capacity() == 0 || buf.capacity() > BUF_KEPT_MAX {
+        return;
+    }
+    buf.clear();
+    BUFS.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.len() < BUFS_KEPT {
+            b.push(buf);
+        }
+    });
+}
