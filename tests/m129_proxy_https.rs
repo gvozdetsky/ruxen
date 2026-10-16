@@ -469,3 +469,148 @@ fn upgrade_through_an_https_upstream() {
     drop(c);
     echo.join().unwrap();
 }
+
+/// `proxy_ssl_certificate` (#138): the certificate goes to an upstream that
+/// asks for one; `""` cancels an inherited one. The upstream is a rustls
+/// server that answers with what it got.
+#[test]
+fn client_certificates_to_upstreams() {
+    use std::sync::Arc;
+    let client = common::tls::make_ca_and_leaf("client.test");
+    let ca_pem = std::fs::read(client.ca_path().unwrap()).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut &ca_pem[..]) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .allow_unauthenticated()
+    .build()
+    .unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    ck.cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
+                ),
+            )
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend = listener.local_addr().unwrap().port();
+    let requests = 2;
+    let upstream = std::thread::spawn(move || {
+        for _ in 0..requests {
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if tls.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let got = if tls.conn.peer_certificates().is_some() {
+                "cert"
+            } else {
+                "none"
+            };
+            let _ = write!(
+                tls,
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{got}"
+            );
+            let _ = tls.flush();
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        }
+    });
+    let front = free_port();
+    let _s = start("client-cert", |_| {
+        format!(
+            "server {{ listen 127.0.0.1:{front};\n\
+               proxy_ssl_certificate {cert}; proxy_ssl_certificate_key {key};\n\
+               location /with/ {{ proxy_pass https://127.0.0.1:{backend}/; }}\n\
+               location /cancel/ {{ proxy_pass https://127.0.0.1:{backend}/;\n\
+                 proxy_ssl_certificate \"\"; }} }}",
+            cert = client.cert_path().display(),
+            key = client.key_path().display(),
+        )
+    });
+    assert_eq!(get(front, "/with/"), (200, "cert".to_string()));
+    assert_eq!(get(front, "/cancel/"), (200, "none".to_string()));
+    upstream.join().unwrap();
+}
+
+/// nginx's checks of `proxy_ssl_certificate` at load: a certificate needs
+/// its key. Variables aren't supported yet, so they are refused rather
+/// than served without a certificate.
+#[test]
+fn proxy_ssl_certificate_needs_its_key() {
+    let client = common::tls::make_self_signed("client.test");
+    let dir = std::env::temp_dir().join(format!("ruxen-m129-cc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let check = |directives: &str| {
+        std::fs::write(
+            dir.join("nginx.conf"),
+            format!(
+                "events {{}}\nhttp {{ server {{ listen 127.0.0.1:1;\n\
+                 location / {{ proxy_pass https://127.0.0.1:2; {directives} }} }} }}\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-t")
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let cert = client.cert_path().display().to_string();
+    let key = client.key_path().display().to_string();
+    let no_key = check(&format!("proxy_ssl_certificate {cert};"));
+    let both = check(&format!(
+        "proxy_ssl_certificate {cert}; proxy_ssl_certificate_key {key};"
+    ));
+    let wrong_key = check(&format!(
+        "proxy_ssl_certificate {cert}; proxy_ssl_certificate_key {cert};"
+    ));
+    let vars = check("proxy_ssl_certificate $arg_c; proxy_ssl_certificate_key $arg_c;");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !no_key.0
+            && no_key
+                .1
+                .contains("no \"proxy_ssl_certificate_key\" is defined"),
+        "{}",
+        no_key.1
+    );
+    assert!(both.0, "{}", both.1);
+    assert!(
+        !wrong_key.0 && wrong_key.1.contains("cannot load certificate"),
+        "{}",
+        wrong_key.1
+    );
+    assert!(
+        !vars.0 && vars.1.contains("proxy_ssl_certificate"),
+        "{}",
+        vars.1
+    );
+}

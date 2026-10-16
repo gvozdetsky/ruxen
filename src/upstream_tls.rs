@@ -10,6 +10,7 @@ use std::path::Path;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
+use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 use crate::config::TlsVersionSet;
@@ -138,14 +139,50 @@ pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::S
     Ok(store)
 }
 
+/// `proxy_ssl_certificate` and its key (#138), loaded once per content of
+/// the files, as the trust stores are. `Err` is the `[emerg]` text.
+pub fn client_certificate(cert: &Path, key: &Path) -> Result<Arc<CertifiedKey>, String> {
+    type Key = (Vec<u8>, Vec<u8>);
+    static KEYS: Mutex<Vec<(Key, Arc<CertifiedKey>)>> = Mutex::new(Vec::new());
+    let fail = |e: &dyn std::fmt::Display| {
+        format!(
+            "cannot load certificate \"{}\" with key \"{}\": {e}",
+            cert.display(),
+            key.display()
+        )
+    };
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|e| {
+            fail(&format_args!(
+                "reading {}: {}",
+                path.display(),
+                crate::worker::errno_text(&e)
+            ))
+        })
+    };
+    let k = (read(cert)?, read(key)?);
+    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, certified)) = keys.iter().find(|(known, _)| *known == k) {
+        return Ok(certified.clone());
+    }
+    let certified =
+        crate::tls_certs::parse_certified_key(&k.0, &k.1, cert, key).map_err(|e| fail(&e))?;
+    let certified = Arc::new(certified);
+    keys.push((k, certified.clone()));
+    Ok(certified)
+}
+
 /// The client config for this combination of settings, shared by every
 /// location that has it, so they share the session cache too. `verify` is
-/// the trust store of `proxy_ssl_verify on`.
+/// the trust store of `proxy_ssl_verify on`, `client_cert` the
+/// certificate of `proxy_ssl_certificate`: a session or a pooled
+/// connection (keyed by this config) never crosses either.
 pub fn client_config(
     protocols: TlsVersionSet,
     sni: bool,
     reuse: bool,
     verify: Option<Arc<crate::x509_verify::Store>>,
+    client_cert: Option<Arc<CertifiedKey>>,
 ) -> Result<Arc<ClientConfig>, String> {
     type Key = (
         bool,
@@ -153,16 +190,26 @@ pub fn client_config(
         bool,
         bool,
         Option<Arc<crate::x509_verify::Store>>,
+        Option<Arc<CertifiedKey>>,
     );
     static CONFIGS: Mutex<Vec<(Key, Arc<ClientConfig>)>> = Mutex::new(Vec::new());
-    let key = (protocols.tlsv1_2, protocols.tlsv1_3, sni, reuse, verify);
+    let key = (
+        protocols.tlsv1_2,
+        protocols.tlsv1_3,
+        sni,
+        reuse,
+        verify,
+        client_cert,
+    );
+    fn same_arc<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
     let same = |a: &Key, b: &Key| {
-        (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3)
-            && match (&a.4, &b.4) {
-                (None, None) => true,
-                (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-                _ => false,
-            }
+        (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3) && same_arc(&a.4, &b.4) && same_arc(&a.5, &b.5)
     };
     let mut configs = CONFIGS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, config)) = configs.iter().find(|(k, _)| same(k, &key)) {
@@ -183,12 +230,19 @@ pub fn client_config(
         }),
         None => Arc::new(NoVerification(provider.clone())),
     };
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&versions)
         .map_err(|e| format!("proxy_ssl_protocols: {e}"))?
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier);
+    // Sent when the server asks for one (a CertificateRequest), as OpenSSL
+    // sends it.
+    let mut config = match &key.5 {
+        Some(certified) => {
+            builder.with_client_cert_resolver(Arc::new(ClientCert(certified.clone())))
+        }
+        None => builder.with_no_client_auth(),
+    };
     config.enable_sni = sni;
     if !reuse {
         config.resumption = rustls::client::Resumption::disabled();
@@ -196,6 +250,24 @@ pub fn client_config(
     let config = Arc::new(config);
     configs.push((key, config.clone()));
     Ok(config)
+}
+
+/// `proxy_ssl_certificate`: the one certificate, whatever the server asks.
+#[derive(Debug)]
+struct ClientCert(Arc<CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for ClientCert {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
 }
 
 /// `proxy_ssl_verify off`: any certificate is taken, as nginx takes it,

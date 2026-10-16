@@ -75,7 +75,7 @@ pub fn load_certified_key(cert_pem: &Path, key_pem: &Path) -> Result<CertifiedKe
     parse_certified_key(&cert_bytes, &key_bytes, cert_pem, key_pem)
 }
 
-fn parse_certified_key(
+pub(crate) fn parse_certified_key(
     cert_pem: &[u8],
     key_pem: &[u8],
     cert_path: &Path,
