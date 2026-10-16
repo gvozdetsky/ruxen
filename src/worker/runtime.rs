@@ -2392,10 +2392,14 @@ pub(crate) async fn wait_readable_or_shutdown(
 
 /// `wait_readable_or_shutdown` with the request read in place of the
 /// readiness poll: the read is submitted once and raced against the idle
-/// deadline and the 50 ms tick. A tick that finds nothing to do leaves
-/// the read in flight. The read is cancelled only when the connection is
-/// to close. A read that completes while being cancelled still hands its
-/// bytes back, and a timeout that loses that race serves the request.
+/// deadline, shutdown, a reload and a drain. When the connection is to
+/// close, the read is dropped, which cancels it (monoio's `async-cancel`
+/// submits IORING_OP_ASYNC_CANCEL and keeps the buffer until the kernel is
+/// done with it); the buffer goes with it, and an empty one comes back.
+/// A request arriving just as the timeout fires isn't served then: the
+/// connection closes, as nginx's keep-alive timer closes it. A monoio
+/// `Canceller` would keep the buffer, but cost a `HashSet` insert and
+/// remove (SipHash) per request, about 8% of `m1_hello`'s instructions.
 pub(crate) async fn read_first_or_shutdown(
     stream: &mut TcpStream,
     buf: Vec<u8>,
@@ -2404,7 +2408,6 @@ pub(crate) async fn read_first_or_shutdown(
     fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> (IdleRead, Vec<u8>) {
-    use monoio::io::CancelableAsyncReadRent;
     use std::task::Poll;
 
     let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
@@ -2412,73 +2415,33 @@ pub(crate) async fn read_first_or_shutdown(
         arm_idle(timers.idle.as_mut(), due);
     }
     let idle = IdleMark::new();
-    // From this worker's pool: a new one costs two allocations (its `Rc`
-    // and the first insert into its set) and two frees per request.
-    let canceller = CANCELLERS
-        .with(|c| c.borrow_mut().pop())
-        .unwrap_or_default();
     let len = buf.len();
-    let mut read =
-        std::pin::pin!(stream.cancelable_read(buf.slice_mut(0..len), canceller.handle()));
-    let outcome = |res: std::io::Result<usize>| match res {
-        Ok(n) if n > 0 => IdleRead::Read(n),
-        _ => IdleRead::Close,
-    };
-    enum Woke<T> {
-        Read(T),
-        Close,
-        Timeout,
-    }
+    let mut read = std::pin::pin!(stream.read(buf.slice_mut(0..len)));
     // Shutdown, a reload and a drain wake the wait (`IdleMark::register`):
     // no per-connection tick.
-    let woke = std::future::poll_fn(|cx| {
+    let done = std::future::poll_fn(|cx| {
         if (!fresh && state.is_shutting_down()) || idle.asked_to_close() {
-            return Poll::Ready(Woke::Close);
+            return Poll::Ready(None);
         }
         if let Poll::Ready(done) = read.as_mut().poll(cx) {
-            return Poll::Ready(Woke::Read(done));
+            return Poll::Ready(Some(done));
         }
         if let Some(due) = due
             && idle_expired(timers.idle.as_mut(), due, cx)
         {
-            return Poll::Ready(Woke::Timeout);
+            return Poll::Ready(None);
         }
         idle.register(cx.waker());
         Poll::Pending
     })
     .await;
-    match woke {
-        Woke::Read((res, returned)) => {
-            // Done with it: the op left its set when the read completed.
-            CANCELLERS.with(|c| {
-                let mut c = c.borrow_mut();
-                if c.len() < CANCELLERS_KEPT {
-                    c.push(canceller);
-                }
-            });
-            (outcome(res), returned.into_inner())
-        }
-        Woke::Close => {
-            canceller.cancel();
-            let (_, returned) = read.as_mut().await;
-            (IdleRead::Close, returned.into_inner())
-        }
-        Woke::Timeout => {
-            canceller.cancel();
-            let (res, returned) = read.as_mut().await;
-            (outcome(res), returned.into_inner())
-        }
+    match done {
+        Some((Ok(n), returned)) if n > 0 => (IdleRead::Read(n), returned.into_inner()),
+        Some((_, returned)) => (IdleRead::Close, returned.into_inner()),
+        // The read is dropped with this frame, and cancelled with it.
+        None => (IdleRead::Close, Vec::new()),
     }
 }
-
-thread_local! {
-    /// `read_first_or_shutdown`'s cancellers, reused: one per keep-alive
-    /// read otherwise.
-    static CANCELLERS: RefCell<Vec<monoio::io::Canceller>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Cancellers kept per worker.
-const CANCELLERS_KEPT: usize = 64;
 
 /// A connection's read buffer and scratch buffers (see `handle`).
 struct ConnBufs {
