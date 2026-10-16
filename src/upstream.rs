@@ -874,8 +874,6 @@ pub struct PooledConn {
     pub requests_served: u32,
     /// Its `worker_connections` slot, freed with the socket.
     pub slot: crate::worker::UpstreamSlot,
-    /// For a TLS connection, who it was opened as (`TlsPlan::identity`).
-    pub tls: Option<crate::upstream_tls::TlsIdentity>,
 }
 
 thread_local! {
@@ -919,7 +917,11 @@ pub fn pool_take(
                 q.remove(i);
                 continue;
             }
-            if tls.is_none_or(|t| q[i].tls.as_ref().is_some_and(|(_, name)| *name == t.name)) {
+            if tls.is_none_or(|t| {
+                q[i].stream
+                    .tls_identity()
+                    .is_some_and(|(_, name)| *name == t.name)
+            }) {
                 return q.remove(i);
             }
             i += 1;
@@ -961,7 +963,7 @@ pub fn pool_release(upstream: &'static PreparedUpstream, peer_idx: usize, mut co
         return;
     }
     conn.last_used = now;
-    let tls = conn.tls.as_ref().map_or(0, |(config, _)| *config);
+    let tls = conn.stream.tls_identity().map_or(0, |(config, _)| *config);
     POOL.with(|p| {
         let mut map = p.borrow_mut();
         let key = (upstream as *const PreparedUpstream, peer_idx, tls);
