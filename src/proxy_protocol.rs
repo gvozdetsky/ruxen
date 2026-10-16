@@ -165,9 +165,13 @@ fn parse_v2(buf: &[u8]) -> Parsed {
                 tlvs: body[36..].into(),
             }
         }
-        // AF_UNSPEC / AF_UNIX: no usable addresses, as nginx.
-        0 | 3 => unknown,
-        _ => return Parsed::Invalid("broken header"),
+        // An address block too short for its family is broken (nginx
+        // returns NULL).
+        1 | 2 => return Parsed::Invalid("broken header"),
+        // AF_UNSPEC, AF_UNIX and any family nginx doesn't know: no usable
+        // addresses, and the connection goes on (the `default` of
+        // ngx_proxy_protocol_v2_read).
+        _ => unknown,
     };
     Parsed::Header(header, len)
 }
@@ -411,6 +415,25 @@ mod tests {
         let mut bad = V2_SIGNATURE.to_vec();
         bad.extend_from_slice(&[0x31, 0x11, 0, 0]);
         assert!(matches!(parse(&bad), Parsed::Invalid(_)));
+        // A family nginx doesn't know (proxy_protocol2.t "unknown 2"): no
+        // addresses, and the connection goes on.
+        let mut unknown = V2_SIGNATURE.to_vec();
+        unknown.extend_from_slice(&[0x21, 0x41, 0, 4, 1, 2, 3, 4]);
+        assert!(matches!(
+            parse(&unknown),
+            Parsed::Header(
+                ProxyHeader {
+                    source: None,
+                    destination: None,
+                    ..
+                },
+                20
+            )
+        ));
+        // AF_INET with too short an address block is still broken.
+        let mut short = V2_SIGNATURE.to_vec();
+        short.extend_from_slice(&[0x21, 0x11, 0, 4, 1, 2, 3, 4]);
+        assert!(matches!(parse(&short), Parsed::Invalid(_)));
     }
 
     fn tlv(ty: u8, value: &[u8]) -> Vec<u8> {

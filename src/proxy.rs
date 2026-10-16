@@ -2604,7 +2604,7 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         // error_page answers it.
         CacheHit::Error(status) => {
             let body = format!("{}\n", crate::http::reason_phrase(status));
-            let resp = Response::Owned(crate::http::build_response_for_method(
+            let resp = Response::Owned(crate::http::error_response_for_method(
                 status,
                 &body,
                 plan.method,
@@ -2641,7 +2641,7 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         // (ngx_http_filter_finalize_request), with the server's own head.
         if answer == 412 {
             let body = format!("{}\n", crate::http::reason_phrase(412));
-            return Response::Owned(crate::http::build_response_for_method(
+            return Response::Owned(crate::http::error_response_for_method(
                 412,
                 &body,
                 plan.method,
@@ -2759,7 +2759,7 @@ fn conditional_fresh(plan: &ProxyPlan, cache: &CachePlan, resp: &mut Response) {
         Some(412) => {
             let body = format!("{}\n", crate::http::reason_phrase(412));
             *out =
-                crate::http::build_response_for_method(412, &body, plan.method, plan.server_bytes);
+                crate::http::error_response_for_method(412, &body, plan.method, plan.server_bytes);
         }
         Some(status) => *out = conditional_head(&out[..end], status),
         None => {}

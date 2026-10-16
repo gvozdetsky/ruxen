@@ -309,7 +309,7 @@ pub(crate) fn run(
     }
     if verdict.reject {
         let body = format!("{}\n", crate::http::reason_phrase(lc.status));
-        let response = crate::phase::Response::Owned(crate::http::build_response_for_method(
+        let response = crate::phase::Response::Owned(crate::http::error_response_for_method(
             lc.status,
             &body,
             req.method,

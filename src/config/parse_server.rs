@@ -74,6 +74,7 @@ pub(crate) fn parse_server_block(
     let mut limit_req = LimitReqConf::default();
     let mut limit_conn = LimitConnConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
+    let mut redirect = RedirectConf::default();
 
     loop {
         let (args, term) = lx.read_directive()?;
@@ -164,6 +165,7 @@ pub(crate) fn parse_server_block(
                         limit_req: limit_req.clone(),
                         limit_conn: limit_conn.clone(),
                         chunked_transfer_encoding,
+                        redirect,
                         ssl,
                         locations,
                     });
@@ -217,10 +219,8 @@ pub(crate) fn parse_server_block(
                 if ssl_protocols.is_some() {
                     return Err(Error::Duplicate("ssl_protocols"));
                 }
-                if args.len() < 2 {
-                    return Err(Error::MissingArg("ssl_protocols"));
-                }
                 let set = parse_tls_protocols(&args[1..], "ssl_protocols")?;
+                warn_old_tls_protocols(&args, warnings);
                 ssl_protocols = Some(set);
             }
             ("ssl_ciphers", Terminator::Semi) => {
@@ -294,6 +294,10 @@ pub(crate) fn parse_server_block(
             ) => {
                 saw_any_ssl_directive = true;
                 warn_ignored_tls_policy(&args, warnings);
+                // ssl_ecdh_curve says so in its warning already.
+                if args[0] != "ssl_ecdh_curve" {
+                    compat::ignored(lx, &args);
+                }
             }
             ("server_name", Terminator::Semi) => {
                 if args.len() < 2 {
@@ -604,6 +608,7 @@ pub(crate) fn parse_server_block(
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             (name, Terminator::Semi) if LimitReqConf::takes(name) => limit_req.parse(&args)?,
             (name, Terminator::Semi) if LimitConnConf::takes(name) => limit_conn.parse(&args)?,
+            (name, Terminator::Semi) if RedirectConf::takes(name) => redirect.parse(&args)?,
             ("chunked_transfer_encoding", Terminator::Semi) => {
                 if chunked_transfer_encoding.is_some() {
                     return Err(Error::Duplicate("chunked_transfer_encoding"));
@@ -857,6 +862,68 @@ pub(crate) fn resolve_ssl_file_arg(conf_prefix: Option<&Path>, raw: &str) -> Pat
         return path;
     }
     resolve_conf_path(conf_prefix, path)
+}
+
+/// `ssl_protocols` values: TLS 1.2 and 1.3, which rustls speaks. The old
+/// names (`SSLv2` … `TLSv1.1`), on every distribution's default line
+/// `ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;`, are skipped
+/// (`warn_old_tls_protocols` says so); a list of only those is refused,
+/// since nothing would be left to speak (#36).
+pub(crate) fn parse_tls_protocols(
+    args: &[String],
+    what: &'static str,
+) -> Result<TlsVersionSet, Error> {
+    if args.is_empty() {
+        return Err(Error::MissingArg(what));
+    }
+    let mut set = TlsVersionSet {
+        tlsv1_2: false,
+        tlsv1_3: false,
+    };
+    for v in args {
+        match v.as_str() {
+            "TLSv1.2" => set.tlsv1_2 = true,
+            "TLSv1.3" => set.tlsv1_3 = true,
+            "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {}
+            _ => {
+                return Err(Error::BadValue {
+                    what,
+                    got: v.clone(),
+                });
+            }
+        }
+    }
+    if !set.tlsv1_2 && !set.tlsv1_3 {
+        return Err(Error::BadValue {
+            what: if what == "ssl_protocols" {
+                "ssl_protocols (only versions rustls doesn't speak; TLSv1.2 or TLSv1.3 is needed)"
+            } else {
+                "proxy_ssl_protocols (only versions rustls doesn't speak; TLSv1.2 or TLSv1.3 is needed)"
+            },
+            got: args.join(" "),
+        });
+    }
+    Ok(set)
+}
+
+/// The `[warn]` for the old names a `ssl_protocols` line skips (#36).
+pub(crate) fn warn_old_tls_protocols(args: &[String], warnings: &mut Vec<String>) {
+    let old: Vec<&str> = args[1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|v| matches!(*v, "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1"))
+        .collect();
+    if old.is_empty() {
+        return;
+    }
+    let w = format!(
+        "\"{}\": {} not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only",
+        args[0],
+        old.join(", ")
+    );
+    if !warnings.contains(&w) {
+        warnings.push(w);
+    }
 }
 
 pub(crate) fn parse_server_tokens_args(args: &[String]) -> Result<ServerTokens, Error> {
@@ -1307,42 +1374,4 @@ pub(crate) fn parse_keepalive_disable_args(args: &[String]) -> Result<KeepaliveD
         }
     }
     Ok(out)
-}
-
-/// `ssl_protocols` / `proxy_ssl_protocols` values: TLS 1.2 and 1.3, which
-/// rustls speaks; the older names are refused as insecure.
-pub(crate) fn parse_tls_protocols(
-    args: &[String],
-    what: &'static str,
-) -> Result<TlsVersionSet, Error> {
-    if args.is_empty() {
-        return Err(Error::MissingArg(what));
-    }
-    let mut set = TlsVersionSet {
-        tlsv1_2: false,
-        tlsv1_3: false,
-    };
-    for v in args {
-        match v.as_str() {
-            "TLSv1.2" => set.tlsv1_2 = true,
-            "TLSv1.3" => set.tlsv1_3 = true,
-            "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {
-                return Err(Error::BadValue {
-                    what: if what == "ssl_protocols" {
-                        "ssl_protocols (insecure version rejected)"
-                    } else {
-                        "proxy_ssl_protocols (insecure version rejected)"
-                    },
-                    got: v.clone(),
-                });
-            }
-            _ => {
-                return Err(Error::BadValue {
-                    what,
-                    got: v.clone(),
-                });
-            }
-        }
-    }
-    Ok(set)
 }

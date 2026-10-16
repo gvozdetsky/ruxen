@@ -122,7 +122,7 @@ fn parse_htpasswd(raw: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 pub fn build_unauthorized_response(method: http::Method, server: &[u8], realm: &[u8]) -> Vec<u8> {
-    let mut response = http::build_response_for_method(401, "Unauthorized\n", method, server);
+    let mut response = http::error_response_for_method(401, "Unauthorized\n", method, server);
     let mut header = Vec::with_capacity(realm.len() + 48);
     header.extend_from_slice(b"\r\nWWW-Authenticate: Basic realm=\"");
     append_escaped_realm(&mut header, realm);
@@ -140,7 +140,7 @@ pub fn build_unauthorized_with(
     server: &[u8],
     www_authenticate: &[Vec<u8>],
 ) -> Vec<u8> {
-    let mut response = http::build_response_for_method(401, "Unauthorized\n", method, server);
+    let mut response = http::error_response_for_method(401, "Unauthorized\n", method, server);
     let mut headers = Vec::new();
     for value in www_authenticate {
         headers.extend_from_slice(b"\r\nWWW-Authenticate: ");
