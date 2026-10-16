@@ -853,6 +853,9 @@ pub(crate) struct UpstreamTlsSettings {
     pub trusted: Option<&'static std::path::Path>,
     pub verify_depth: u32,
     pub crl: Option<&'static std::path::Path>,
+    /// `proxy_ssl_certificate` and its key (#138); `None` for `""`.
+    pub certificate: Option<&'static std::path::Path>,
+    pub certificate_key: Option<&'static std::path::Path>,
 }
 
 impl UpstreamTlsSettings {
@@ -870,6 +873,8 @@ impl UpstreamTlsSettings {
         trusted: None,
         verify_depth: 1,
         crl: None,
+        certificate: None,
+        certificate_key: None,
     };
 
     /// `conf`'s values over `self`.
@@ -891,6 +896,14 @@ impl UpstreamTlsSettings {
                 .or(self.trusted),
             verify_depth: conf.ssl_verify_depth.unwrap_or(self.verify_depth),
             crl: conf.ssl_crl.as_deref().map(leak_path).or(self.crl),
+            certificate: match &conf.ssl_certificate {
+                Some(path) => path.as_deref().map(leak_path),
+                None => self.certificate,
+            },
+            certificate_key: match &conf.ssl_certificate_key {
+                Some(path) => path.as_deref().map(leak_path),
+                None => self.certificate_key,
+            },
         }
     }
 }

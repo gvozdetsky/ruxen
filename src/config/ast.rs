@@ -109,6 +109,11 @@ pub struct ProxyConf {
     pub ssl_verify_depth: Option<u32>,
     /// `proxy_ssl_crl`, resolved as the trusted certificates are.
     pub ssl_crl: Option<std::path::PathBuf>,
+    /// `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (#138),
+    /// resolved; `Some(None)` is `""`, no certificate, which cancels an
+    /// inherited one.
+    pub ssl_certificate: Option<Option<std::path::PathBuf>>,
+    pub ssl_certificate_key: Option<Option<std::path::PathBuf>>,
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -269,6 +274,12 @@ impl ProxyConf {
                 .or_else(|| parent.ssl_trusted_certificate.clone()),
             ssl_verify_depth: self.ssl_verify_depth.or(parent.ssl_verify_depth),
             ssl_crl: self.ssl_crl.or_else(|| parent.ssl_crl.clone()),
+            ssl_certificate: self
+                .ssl_certificate
+                .or_else(|| parent.ssl_certificate.clone()),
+            ssl_certificate_key: self
+                .ssl_certificate_key
+                .or_else(|| parent.ssl_certificate_key.clone()),
         }
     }
 }

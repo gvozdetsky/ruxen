@@ -1117,11 +1117,24 @@ fn prepare_upstream_tls(
             },
         )?),
     };
+    // A certificate needs its key (ngx_http_proxy_set_ssl); a key alone
+    // is unused.
+    let client_cert = match (settings.certificate, settings.certificate_key) {
+        (None, _) => None,
+        (Some(cert), None) => {
+            return Err(format!(
+                "no \"proxy_ssl_certificate_key\" is defined for certificate \"{}\"",
+                cert.display()
+            ));
+        }
+        (Some(cert), Some(key)) => Some(crate::upstream_tls::client_certificate(cert, key)?),
+    };
     let config = crate::upstream_tls::client_config(
         settings.protocols,
         settings.server_name,
         settings.session_reuse,
         store,
+        client_cert,
     )?;
     let literal = |parts: &[PreparedValuePart]| -> Option<Vec<u8>> {
         let mut out = Vec::new();

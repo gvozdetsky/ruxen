@@ -687,6 +687,8 @@ impl ProxyConf {
         "proxy_ssl_trusted_certificate",
         "proxy_ssl_verify_depth",
         "proxy_ssl_crl",
+        "proxy_ssl_certificate",
+        "proxy_ssl_certificate_key",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -835,6 +837,43 @@ impl ProxyConf {
                     conf_prefix,
                     std::path::PathBuf::from(&args[1]),
                 ));
+            }
+            // Variables, which nginx renders per connection, aren't
+            // supported: such a configuration is refused, not served
+            // without the certificate.
+            "proxy_ssl_certificate" | "proxy_ssl_certificate_key" => {
+                let name: &'static str = if args[0] == "proxy_ssl_certificate" {
+                    "proxy_ssl_certificate"
+                } else {
+                    "proxy_ssl_certificate_key"
+                };
+                let slot = if name == "proxy_ssl_certificate" {
+                    &mut self.ssl_certificate
+                } else {
+                    &mut self.ssl_certificate_key
+                };
+                if slot.is_some() {
+                    return Err(Error::Duplicate(name));
+                }
+                if args.len() != 2 {
+                    return Err(Error::BadValue {
+                        what: name,
+                        got: args[1..].join(" "),
+                    });
+                }
+                if args[1].contains('$') || args[1].starts_with("data:") {
+                    return Err(Error::BadValue {
+                        what: if name == "proxy_ssl_certificate" {
+                            "proxy_ssl_certificate (variables and data: aren't supported yet)"
+                        } else {
+                            "proxy_ssl_certificate_key (variables and data: aren't supported yet)"
+                        },
+                        got: args[1].clone(),
+                    });
+                }
+                *slot = Some((!args[1].is_empty()).then(|| {
+                    super::resolve_conf_path(conf_prefix, std::path::PathBuf::from(&args[1]))
+                }));
             }
             "proxy_ssl_verify_depth" => {
                 if self.ssl_verify_depth.is_some() {
