@@ -6,11 +6,11 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 213 of 238 configurations nginx accepts (89%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 214 of 238 configurations nginx accepts (90%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 193 | 90% |
+| github | 214 | 194 | 91% |
 | php | 3 | 0 | 0% |
 | proxy | 17 | 17 | 100% |
 | static | 4 | 3 | 75% |
@@ -24,14 +24,13 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | 3 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir, gh:EstudioNexos/flautodiscover/fla_nginx.conf |
 | 2 | bad value for upstream server host:port: N.N.N.N: invalid socket address in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf |
 | 1 | "…" is not supported yet, and ignoring it is unsafe: variables in the path aren't expanded yet (#N), | gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf |
-| 1 | bad value for proxy_pass scheme (only http:… supported in vN.N): https:… in <sandbox>…:N | gh:MRLokop/shiki-proxy/nginx.conf |
 | 1 | bad value for upstream server param: resolve in <sandbox>…:N | gh:rajim59/SwarmFort/infra/docker/nginx.conf |
 | 1 | invalid location regex `^${SEEK_SUB_URI}(…: regex parse error: | gh:nfdi4health/ldh-deployment/nginx.conf.https |
 | 1 | unknown "…" variable in <sandbox>…:N | gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf |
 | 1 | unknown directive `charset_types` | h5bp:nginx.conf |
 | 1 | unknown directive `fastcgi_pass` | laravel#1 |
 | 1 | unknown directive `grpc_pass` | gh:refluxdb/influxdb3-community/iox-nginx.conf |
-| 1 | unknown directive `proxy_ssl_server_name` | gh:devstroop/penpot/docker/devenv/files/nginx.conf |
+| 1 | unknown directive `sub_filter_types` | gh:MRLokop/shiki-proxy/nginx.conf |
 | 1 | unknown directive `uwsgi_pass_request_headers` | gh:lijiejie/eyes.sh/dnslog_nginx.conf |
 
 ## Every case
@@ -280,7 +279,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:azzaraq-creator/admix/deploy/nginx.conf.template | github | ok | ok |  |
 | gh:panyam/onehub/configs/nginx.conf | github | ok | ok |  |
 | gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf | github | ok | ok |  |
-| gh:MRLokop/shiki-proxy/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass scheme (only http:// supported in v0.1): https://135.181.210.175 in <sandbox>/conf/nginx.conf:12 |
+| gh:MRLokop/shiki-proxy/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `sub_filter_types` in a location block in <sandbox>/conf/nginx.conf:112 |
 | gh:codeDogMcGee/Django-RestApi-Appointments/nginx/nginx.conf | github | ok | ok |  |
 | gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf | github | ok | ok |  |
 | gh:Kwizera250232/Teacher-s-App-frontent/student-nginx.conf | github | ok | ok |  |
@@ -337,7 +336,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:fatmagulfidan/DEP-LB1/frontend/nginx.conf | github | ok | ok |  |
 | gh:thodotpro/PonchoProphet/frontend/nginx.conf | github | ok | ok |  |
 | gh:vthot4/poc_nifi/examples/Ejemplo_2/nginx-conf/nginx.conf | github | ok | ok |  |
-| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_ssl_server_name` in a location block in <sandbox>/conf/nginx.conf:93 |
+| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | ok |  |
 | gh:kc611/microservices-app/m-frontend/nginx.conf | github | ok | ok |  |
 | gh:noam-r/produckt/frontend/nginx.conf | github | ok | ok |  |
 | gh:pranali04/SampleTradingApp/api_gateway/nginx.conf | github | ok | ok |  |
