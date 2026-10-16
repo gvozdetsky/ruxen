@@ -389,19 +389,22 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
 - **`Conn<S>` generic for the request loop.** `pub trait ConnIo:
   AsyncReadRent + AsyncWriteRent` carries what differs per transport
   (`idle_wait`, `sendfile_fd`, `begin_tunnel`, `sends_file_bodies`, …). The handler `fn handle<S: ConnIo>(…)` is
-  monomorphized for `TcpStream`, `ServerTlsStream<TcpStream>` and an HTTP/2 stream (`StreamIo`). Plain
-  TCP polls the kernel socket for readability without allocating a
-  buffer (mirrors nginx's `wait_request_handler`). TLS does the same
-  poll, with the keepalive deadline, unless the stream already holds
-  input the socket won't signal again: ciphertext read but not yet
-  handed to rustls, or plaintext rustls hasn't returned
-  (`TlsStream::has_buffered_input`; TLS 1.3 clients send the first
-  request in the same flight as Finished). Then it goes straight to the
-  read. Until 2026-10 TLS skipped the poll entirely and never enforced
-  the idle timeout. The poll costs `tls_hello` about 2–4% (ABBA vs the
-  no-poll build): a keep-alive request now takes a readiness wait plus
-  a read instead of one read, as plain TCP already does. A single read
-  raced against the deadline would avoid that for both.
+  monomorphized for `TcpStream`, `ServerTlsStream<TcpStream>` and an HTTP/2 stream (`StreamIo`).
+  Between keep-alive requests both plain TCP and TLS submit the read
+  itself, raced against the keep-alive deadline, shutdown, a reload and
+  a drain (`ConnIo::idle_read`, `read_first_or_shutdown`): one io_uring
+  operation per request instead of a readiness poll and then the read
+  (#145). TLS reads ciphertext into its stream's own buffer, and the
+  request read hands it to rustls without going back to the socket;
+  input the stream already holds (left from the handshake, as TLS 1.3
+  clients send the first request with Finished, or from a previous
+  read: `TlsStream::has_buffered_input`) is used at once. When the
+  connection is to close, the read is dropped, which cancels it
+  (monoio's `async-cancel`; #426 replaced a `Canceller`, whose `HashSet`
+  cost about 8% of `m1_hello`'s instructions). The direct read was worth
+  1–2.5% on the TLS scenarios on the bench laptop (#430); the readiness
+  poll it replaced had come in when TLS started enforcing the idle
+  timeout.
 - **The handshake runs under `client_header_timeout`.** As in nginx
   1.24, which has no separate handshake timeout: the default server's
   `client_header_timeout` (60 s unless set) is armed at accept, and a
