@@ -4184,6 +4184,41 @@ mod tests {
     }
 
     #[test]
+    fn return_url_alone_is_a_302() {
+        // #16, ngx_http_rewrite_return: one argument that starts as a URL.
+        for (arg, parts) in [
+            ("http://example.com/", 1),
+            ("https://example.com$uri", 2),
+            ("$scheme://$host$uri", 4),
+        ] {
+            let src = format!("http {{ server {{ listen 80; location / {{ return {arg}; }} }} }}");
+            let cfg = parse(&src).unwrap();
+            match &cfg.servers[0].locations[0].handler {
+                Handler::Return { status, body } => {
+                    assert_eq!(*status, 302, "{arg}");
+                    assert_eq!(body.len(), parts, "{arg}: {body:?}");
+                }
+                other => panic!("{arg}: {other:?}"),
+            }
+        }
+        // Anything else that isn't a number is still an invalid code, and
+        // a URL needs to stand alone.
+        for bad in ["return foo;", "return /local;", "return http://a b;"] {
+            let src = format!("http {{ server {{ listen 80; location / {{ {bad} }} }} }}");
+            assert!(
+                matches!(
+                    parse(&src),
+                    Err(Error::BadValue {
+                        what: "return status",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn return_body_rejects_sent_http_variable() {
         let src = r#"
             http { server { listen 80; location / {

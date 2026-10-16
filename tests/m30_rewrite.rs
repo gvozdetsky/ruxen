@@ -252,3 +252,43 @@ http {
     assert_eq!(status_line(&text), "HTTP/1.1 403 Forbidden");
     assert_eq!(body(&text), b"text");
 }
+
+/// `return URL;` (#16): a 302 to the URL, variables rendered, in a server,
+/// a location and an `if`.
+#[test]
+fn return_url_alone_redirects_with_302() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location /lit { return http://example.com/new; }
+    location /var { return https://example.com$uri?a=$arg_a; }
+    location /if {
+      if ($arg_go) { return $scheme://other.example$uri; }
+      return 200 stay;
+    }
+  }
+}
+"#;
+    let (_s, port) = spawn_server(conf);
+    let r = http_get(port, "/lit");
+    assert!(
+        status_line(&r).contains("302"),
+        "{}",
+        String::from_utf8_lossy(&r)
+    );
+    assert_eq!(header_value(&r, "Location"), Some("http://example.com/new"));
+    let r = http_get(port, "/var?a=1");
+    assert!(status_line(&r).contains("302"));
+    assert_eq!(
+        header_value(&r, "Location"),
+        Some("https://example.com/var?a=1")
+    );
+    let r = http_get(port, "/if?go=1");
+    assert_eq!(
+        header_value(&r, "Location"),
+        Some("http://other.example/if")
+    );
+    assert_eq!(body(&http_get(port, "/if")), b"stay");
+}
