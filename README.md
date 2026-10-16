@@ -34,7 +34,7 @@ Version 0.1.3. In short:
 - configuration reload without dropping connections (`SIGHUP`, `-s reload`)
 - no dynamic modules
 
-The upstream `nginx-tests` suite is used as a compatibility test. **132 of the 190 test files that ruxen currently opts into pass end-to-end** (main; v0.1.3: 105 of 159).
+The upstream `nginx-tests` suite is used as a compatibility test. **160 of the 191 test files that ruxen currently opts into pass end-to-end** (main; v0.1.3: 105 of 159).
 
 See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, and [`ROADMAP.md`](ROADMAP.md) for where ruxen is going: first a memory-safe edge server (TLS termination, reverse proxy, static files) that takes your nginx configuration.
 
