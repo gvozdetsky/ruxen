@@ -433,7 +433,7 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
         fd,
         size: stat.st_size as u64,
         mtime,
-        mime: mime_for_url(url_path),
+        mime: root.types.for_url(url_path),
     })
 }
 
@@ -795,30 +795,6 @@ fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
     }
 }
 
-/// MIME lookup from the URL-path extension. Mirrors the table in
-/// `file.rs::mime_for`, but byte-driven and no `Path` allocation.
-fn mime_for_url(url_path: &[u8]) -> &'static [u8] {
-    let slash = url_path
-        .iter()
-        .rposition(|&b| b == b'/')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let filename = &url_path[slash..];
-    let dot = match filename.iter().rposition(|&b| b == b'.') {
-        Some(d) if d + 1 < filename.len() => d,
-        _ => return crate::file::DEFAULT_MIME,
-    };
-    let ext_raw = &filename[dot + 1..];
-    let mut lower = [0u8; 16];
-    if ext_raw.len() > lower.len() {
-        return crate::file::DEFAULT_MIME;
-    }
-    for (i, &b) in ext_raw.iter().enumerate() {
-        lower[i] = b.to_ascii_lowercase();
-    }
-    crate::file::mime_for(&lower[..ext_raw.len()])
-}
-
 fn render_index(entry: &PreparedIndexEntry, render_ctx: &RenderCtx<'_>) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     render_parts(entry.parts, render_ctx, &mut out);
@@ -958,6 +934,10 @@ mod tests {
     fn fake_root(mapping: PreparedPathMapping) -> PreparedRoot {
         PreparedRoot {
             root: Path::new("/srv"),
+            types: crate::arena::leak(Box::new(crate::worker::PreparedTypes {
+                map: Default::default(),
+                default: b"text/plain",
+            })),
             // `AT_FDCWD` is fine for tests that only exercise the path
             // utilities below — none of them hit `openat2`.
             root_fd: libc::AT_FDCWD,

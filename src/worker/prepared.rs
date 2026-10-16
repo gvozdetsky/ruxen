@@ -1085,8 +1085,46 @@ impl PreparedLimitRate {
     }
 }
 
+/// A location's `types {}` and `default_type` (#38): the content type of a
+/// file by the extension of its URI, as ngx_http_set_content_type finds it.
+pub struct PreparedTypes {
+    pub map: std::collections::HashMap<
+        Box<[u8]>,
+        &'static [u8],
+        std::hash::BuildHasherDefault<super::NameHasher>,
+    >,
+    pub default: &'static [u8],
+}
+
+impl PreparedTypes {
+    /// The type for `url_path`'s extension (after the last `.` of the last
+    /// segment), case-insensitively; `default_type` without one or without
+    /// a match.
+    #[inline]
+    pub fn for_url(&self, url_path: &[u8]) -> &'static [u8] {
+        let name = match url_path.iter().rposition(|&b| b == b'/') {
+            Some(i) => &url_path[i + 1..],
+            None => url_path,
+        };
+        let ext = match name.iter().rposition(|&b| b == b'.') {
+            Some(d) if d + 1 < name.len() => &name[d + 1..],
+            _ => return self.default,
+        };
+        if !ext.iter().any(u8::is_ascii_uppercase) {
+            return self.map.get(ext).copied().unwrap_or(self.default);
+        }
+        let lower = ext.to_ascii_lowercase();
+        self.map
+            .get(lower.as_slice())
+            .copied()
+            .unwrap_or(self.default)
+    }
+}
+
 pub struct PreparedRoot {
     pub root: &'static Path,
+    /// `types {}` / `default_type` (#38).
+    pub types: &'static PreparedTypes,
     /// Open dirfd for the canonicalized root, or -1 if it didn't exist at
     /// startup (read it through `fd()`). Used as the `dirfd` argument of
     /// `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` so the kernel

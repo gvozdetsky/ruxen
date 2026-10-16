@@ -45,8 +45,9 @@ def nginx_directives(src):
     return out
 
 
-def conf(ctx, directive):
-    d = f"{directive} x;"
+def conf(ctx, directive, block=False):
+    # A block directive (`types`, `limit_except`, …) is probed as one too.
+    d = f"{directive} {{ }}" if block else f"{directive} x;"
     return {
         "main": f"{d}\nevents {{}}\nhttp {{}}\n",
         "http": f"events {{}}\nhttp {{ {d} }}\n",
@@ -69,14 +70,18 @@ def run(binary, path, flag):
 def probe(binary, name, work):
     path = os.path.join(work, "nginx.conf")
     known = []
+    block = False
     for ctx in CONTEXTS:
-        open(path, "w").write(conf(ctx, name))
-        if "unknown directive" not in run(binary, path, "-t"):
-            known.append(ctx)
+        for b in (False, True):
+            open(path, "w").write(conf(ctx, name, b))
+            if "unknown directive" not in run(binary, path, "-t"):
+                known.append(ctx)
+                block = block or b
+                break
     if not known:
         return known, None, ""
     ctx = next((c for c in ["http", "server", "location", "upstream"] if c in known), known[0])
-    open(path, "w").write(conf(ctx, name))
+    open(path, "w").write(conf(ctx, name, block))
     for line in run(binary, path, "--compat").splitlines():
         m = re.match(r"^(?:\S+: )?(unsupported|differs|ignored): (.*)$", line)
         if not m:

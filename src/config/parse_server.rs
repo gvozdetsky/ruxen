@@ -77,6 +77,7 @@ pub(crate) fn parse_server_block(
     let mut limit_conn = LimitConnConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut redirect = RedirectConf::default();
+    let mut mime = MimeConf::default();
 
     loop {
         let (args, term) = lx.read_directive()?;
@@ -170,6 +171,7 @@ pub(crate) fn parse_server_block(
                         limit_conn: limit_conn.clone(),
                         chunked_transfer_encoding,
                         redirect,
+                        mime,
                         ssl,
                         locations,
                     });
@@ -193,6 +195,9 @@ pub(crate) fn parse_server_block(
             };
         }
         match (args[0].as_str(), &term) {
+            ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
+                parse_mime(lx, &args, &term, &mut mime)?;
+            }
             ("listen", Terminator::Semi) => {
                 listens.extend(parse_listen_range_args(&args[1..])?);
             }

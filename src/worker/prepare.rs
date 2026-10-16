@@ -2163,6 +2163,7 @@ pub(crate) fn prepare_server(
             server_autoindex_localtime,
             server_autoindex_format,
             server_disable_symlinks.clone(),
+            &server.mime,
             server_tokens_value,
             upstreams,
             ProxyEffective::defaults(),
@@ -3109,6 +3110,55 @@ fn build_limit_except(
     }))
 }
 
+/// The lookup for `types {}` / `default_type` (#38), built once per table
+/// and default for every location that has them. Without `types` at any
+/// level, nginx's built-in three (ngx_http_core_default_types); without
+/// `default_type`, `text/plain`.
+fn prepare_types(mime: &crate::config::MimeConf) -> &'static PreparedTypes {
+    type Key = (Option<*const Vec<(String, String)>>, Option<String>);
+    thread_local! {
+        static BUILT: std::cell::RefCell<Vec<(Key, &'static PreparedTypes)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key: Key = (
+        mime.types.as_ref().map(std::sync::Arc::as_ptr),
+        mime.default_type.clone(),
+    );
+    if let Some(t) = BUILT.with(|b| b.borrow().iter().find(|(k, _)| *k == key).map(|(_, t)| *t)) {
+        return t;
+    }
+    const DEFAULT_TYPES: &[(&str, &str)] = &[
+        ("html", "text/html"),
+        ("gif", "image/gif"),
+        ("jpg", "image/jpeg"),
+    ];
+    let mut map = std::collections::HashMap::default();
+    let pairs: Vec<(String, String)> = match &mime.types {
+        Some(t) => t.as_ref().clone(),
+        None => DEFAULT_TYPES
+            .iter()
+            .map(|(e, m)| (e.to_string(), m.to_string()))
+            .collect(),
+    };
+    for (ext, ty) in pairs {
+        map.insert(
+            ext.into_bytes().into_boxed_slice(),
+            leak_bytes(ty.as_bytes()),
+        );
+    }
+    let types: &'static PreparedTypes = crate::arena::leak(Box::new(PreparedTypes {
+        map,
+        default: leak_bytes(
+            mime.default_type
+                .as_deref()
+                .unwrap_or("text/plain")
+                .as_bytes(),
+        ),
+    }));
+    BUILT.with(|b| b.borrow_mut().push((key, types)));
+    types
+}
+
 pub(crate) fn build_handler(
     handler: Handler,
     location_pattern: &'static [u8],
@@ -3126,6 +3176,7 @@ pub(crate) fn build_handler(
     server_autoindex_localtime: bool,
     server_autoindex_format: AutoindexFormat,
     disable_symlinks: Option<crate::config::DisableSymlinks>,
+    mime: &crate::config::MimeConf,
     tokens: crate::config::ServerTokens,
     upstreams: &UpstreamMap,
     proxy_effective: ProxyEffective,
@@ -3183,6 +3234,7 @@ pub(crate) fn build_handler(
 
             PreparedHandler::Root(PreparedRoot {
                 root,
+                types: prepare_types(mime),
                 root_fd,
                 symlinks: PreparedSymlinks::new(disable_symlinks),
                 path_mapping,
@@ -3305,6 +3357,7 @@ pub(crate) fn build_prefix_or_exact(
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedLocation, String> {
     let Location {
+        mime,
         mode,
         pattern,
         noregex,
@@ -3405,6 +3458,7 @@ pub(crate) fn build_prefix_or_exact(
             location_disable_symlinks
                 .clone()
                 .or_else(|| server_disable_symlinks.clone()),
+            &mime,
             tokens,
             upstreams,
             proxy_effective,
@@ -3431,6 +3485,7 @@ pub(crate) fn build_prefix_or_exact(
             location_disable_symlinks
                 .clone()
                 .or_else(|| server_disable_symlinks.clone()),
+            &mime,
             tokens,
             upstreams,
             ProxyEffective::defaults(),
@@ -3463,6 +3518,7 @@ pub(crate) fn build_prefix_or_exact(
         server_autoindex_localtime,
         server_autoindex_format,
         location_disable_symlinks.or(server_disable_symlinks),
+        &mime,
         tokens,
         upstreams,
         proxy_effective,
@@ -3586,6 +3642,7 @@ pub(crate) fn build_regex_location(
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedRegexLocation, String> {
     let Location {
+        mime,
         mode: _,
         pattern,
         noregex: _,
@@ -3695,6 +3752,7 @@ pub(crate) fn build_regex_location(
             location_disable_symlinks
                 .clone()
                 .or_else(|| server_disable_symlinks.clone()),
+            &mime,
             tokens,
             upstreams,
             proxy_effective,
@@ -3721,6 +3779,7 @@ pub(crate) fn build_regex_location(
             location_disable_symlinks
                 .clone()
                 .or_else(|| server_disable_symlinks.clone()),
+            &mime,
             tokens,
             upstreams,
             ProxyEffective::defaults(),
@@ -3753,6 +3812,7 @@ pub(crate) fn build_regex_location(
         server_autoindex_localtime,
         server_autoindex_format,
         location_disable_symlinks.or(server_disable_symlinks),
+        &mime,
         tokens,
         upstreams,
         proxy_effective,

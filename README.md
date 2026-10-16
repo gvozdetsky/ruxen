@@ -152,7 +152,7 @@ ruxen --compat -c /etc/nginx/nginx.conf
 ```text
 ruxen 0.1.3: checking /etc/nginx/nginx.conf
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
-/etc/nginx/nginx.conf:27: differs: default_type application/octet-stream — files of unknown types get ruxen's built-in default (#38)
+/etc/nginx/nginx.conf:41: differs: ssl_stapling on — OCSP responses are not stapled (#141)
 -: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
 ruxen does not start with this configuration: 1 unsupported, 2 behaving differently
@@ -277,6 +277,7 @@ A growing nginx-compatible configuration surface is implemented. [`docs/directiv
 - `include`, with patterns (`include conf.d/*.conf;`: the matches sorted, none is fine, as nginx's glob)
 - `return`, including `return URL;` (a 302)
 - `add_header` and `add_trailer`, at http, server and location level
+- `types {}` (`include mime.types`) and `default_type`, as nginx sets Content-Type: no charset is added, and without `types` only .html, .gif and .jpg have a type
 - `expires`
 - `error_page` and `recursive_error_pages`
 - `post_action`

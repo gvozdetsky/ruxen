@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 168 implemented, 31 accepted with a difference, 73 accepted with no effect, 1 refused, 277 unknown.
+Of 550 directives: 170 implemented, 30 accepted with a difference, 74 accepted with no effect, 1 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -110,8 +110,8 @@ Not supported: `ssl_engine`.
 | `server_name` | yes | server |  |
 | `types_hash_max_size` | accepted, no effect | any |  |
 | `types_hash_bucket_size` | accepted, no effect | any |  |
-| `types` | no |  |  |
-| `default_type` | accepted, differs | any | files of unknown types get ruxen's built-in default (#38) |
+| `types` | yes | http, server, location |  |
+| `default_type` | yes | http, server, location |  |
 | `root` | yes | http, server, location |  |
 | `alias` | yes | location |  |
 | `limit_except` | yes | location |  |
@@ -227,7 +227,7 @@ Not supported: `modern_browser`, `ancient_browser`, `modern_browser_value`, `anc
 | `source_charset` | accepted, differs | any | nothing is converted |
 | `override_charset` | accepted, differs | any | nothing is converted |
 | `charset_types` | no |  |  |
-| `charset_map` | no |  |  |
+| `charset_map` | accepted, no effect | any |  |
 
 ## http_dav
 

@@ -315,6 +315,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut error_pages: Option<Vec<ErrorPage>> = None;
     let mut add_headers: Option<Vec<AddHeader>> = None;
     let mut redirect = RedirectConf::default();
+    let mut mime = MimeConf::default();
     let mut add_trailers: Option<Vec<AddHeader>> = None;
     let mut recursive_error_pages: Option<bool> = None;
     let mut merge_slashes: Option<bool> = None;
@@ -367,8 +368,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         // `if` blocks.
                         server.redirect = server.redirect.inherit(&redirect);
                         let server_redirect = server.redirect;
+                        // types {} / default_type (#38) the same way.
+                        server.mime.inherit(&mime);
+                        let server_mime = server.mime.clone();
                         for loc in &mut server.locations {
                             loc.inherit_redirect(&server_redirect);
+                            loc.mime.inherit(&server_mime);
                         }
                         server.recursive_error_pages =
                             server.recursive_error_pages.or(recursive_error_pages);
@@ -460,6 +465,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             };
         }
         match (args[0].as_str(), &term) {
+            ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
+                parse_mime(lx, &args, &term, &mut mime)?;
+            }
             ("server", Terminator::BlockOpen) => {
                 servers.extend(parse_server_block(lx, &mut warnings)?)
             }
@@ -1009,7 +1017,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "lingering_timeout",
     "lingering_time",
     // Response-surface tuning
-    "default_type",
     "chunked_transfer_encoding",
     "output_buffers",
     "postpone_output",
@@ -1089,7 +1096,70 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
 ];
 
 /// Block directives whose body we swallow wholesale (no inner parsing).
-pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "types", "charset_map"];
+pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "charset_map"];
+
+/// The body of `types { TYPE EXT…; … }` (#38): extensions lowercased, a
+/// repeated one taking the later type, as ngx_http_core_type does (it
+/// warns too).
+pub(crate) fn parse_types_block(lx: &mut Lexer) -> Result<Vec<(String, String)>, Error> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    loop {
+        let (args, term) = lx.read_directive()?;
+        if args.is_empty() {
+            match term {
+                Terminator::BlockClose => return Ok(out),
+                Terminator::Eof => return Err(Error::UnclosedBlock),
+                _ => return Err(Error::UnexpectedEof),
+            }
+        }
+        if !matches!(term, Terminator::Semi) || args.len() < 2 {
+            return Err(Error::BadValue {
+                what: "types",
+                got: args.join(" "),
+            });
+        }
+        for ext in &args[1..] {
+            let ext = ext.to_ascii_lowercase();
+            match out.iter_mut().find(|(e, _)| *e == ext) {
+                Some(slot) => slot.1.clone_from(&args[0]),
+                None => out.push((ext, args[0].clone())),
+            }
+        }
+    }
+}
+
+/// `types {` or `default_type …;` into `mime` (#38); `false` if `args`
+/// is neither.
+pub(crate) fn parse_mime(
+    lx: &mut Lexer,
+    args: &[String],
+    term: &Terminator,
+    mime: &mut MimeConf,
+) -> Result<bool, Error> {
+    match (args[0].as_str(), term) {
+        ("types", Terminator::BlockOpen) if args.len() == 1 => {
+            if mime.types.is_some() {
+                return Err(Error::Duplicate("types"));
+            }
+            mime.types = Some(std::sync::Arc::new(parse_types_block(lx)?));
+            Ok(true)
+        }
+        ("default_type", Terminator::Semi) => {
+            if mime.default_type.is_some() {
+                return Err(Error::Duplicate("default_type"));
+            }
+            let [_, value] = args else {
+                return Err(Error::BadValue {
+                    what: "default_type",
+                    got: args[1..].join(" "),
+                });
+            };
+            mime.default_type = Some(value.clone());
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
 
 /// Fail closed on directives that restrict access, when ruxen can't
 /// enforce them yet. The allowlist above is for tuning knobs; silently

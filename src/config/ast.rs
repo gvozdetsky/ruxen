@@ -1013,7 +1013,31 @@ pub struct Server {
     /// `absolute_redirect`, `server_name_in_redirect`, `port_in_redirect`
     /// (#15), http's merged in.
     pub redirect: RedirectConf,
+    /// `types {}` / `default_type` (#38), http's merged in.
+    pub mime: MimeConf,
     pub locations: Vec<Location>,
+}
+
+/// `types {}` and `default_type` of one level (#38), `None` until set.
+/// The table is shared (`Arc`) by the levels that inherit it, so prepare
+/// builds its lookup once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MimeConf {
+    /// Extension (lowercased) → content type, later lines winning, as
+    /// ngx_http_core_type keeps them.
+    pub types: Option<std::sync::Arc<Vec<(String, String)>>>,
+    pub default_type: Option<String>,
+}
+
+impl MimeConf {
+    pub(crate) fn inherit(&mut self, parent: &MimeConf) {
+        if self.types.is_none() {
+            self.types.clone_from(&parent.types);
+        }
+        if self.default_type.is_none() {
+            self.default_type.clone_from(&parent.default_type);
+        }
+    }
 }
 
 /// `absolute_redirect`, `server_name_in_redirect` and `port_in_redirect`
@@ -1243,6 +1267,8 @@ pub struct Location {
     /// `absolute_redirect` and friends (#15), the server's merged in when
     /// the http block closes.
     pub redirect: RedirectConf,
+    /// `types {}` / `default_type` (#38), likewise.
+    pub mime: MimeConf,
     /// The location's own `client_body_timeout` / `send_timeout` (#147);
     /// `client_header_timeout` stays a server setting.
     pub client_timeouts: ClientTimeouts,

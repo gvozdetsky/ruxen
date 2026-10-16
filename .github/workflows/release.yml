@@ -98,7 +98,7 @@ jobs:
           dist=${{ steps.version.outputs.dist }}
           mkdir -p "$dist/examples"
           cp target/${{ matrix.target }}/release/ruxen README.md LICENSE "$dist/"
-          cp examples/*.conf "$dist/examples/"
+          cp examples/*.conf examples/mime.types "$dist/examples/"
           tar czf "$dist.tar.gz" "$dist"
           # The same tarball under a version-less name, so
           # releases/latest/download/ruxen-<target>.tar.gz (the README's

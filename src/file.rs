@@ -11,30 +11,6 @@ use crate::fs_resolve::Opened;
 use crate::http::Method;
 use crate::phase::{FileBody, Response};
 
-/// Mini mime table, keyed on lowercased extension. Matches the handful of
-/// types nginx ships by default in `conf/mime.types` with the widest
-/// real-world coverage.
-const MIME_TYPES: &[(&[u8], &[u8])] = &[
-    (b"html", b"text/html; charset=utf-8"),
-    (b"htm", b"text/html; charset=utf-8"),
-    (b"css", b"text/css; charset=utf-8"),
-    (b"js", b"text/javascript; charset=utf-8"),
-    (b"mjs", b"text/javascript; charset=utf-8"),
-    (b"json", b"application/json"),
-    (b"txt", b"text/plain; charset=utf-8"),
-    (b"xml", b"application/xml"),
-    (b"png", b"image/png"),
-    (b"jpg", b"image/jpeg"),
-    (b"jpeg", b"image/jpeg"),
-    (b"gif", b"image/gif"),
-    (b"svg", b"image/svg+xml"),
-    (b"webp", b"image/webp"),
-    (b"ico", b"image/x-icon"),
-    (b"woff2", b"font/woff2"),
-    (b"pdf", b"application/pdf"),
-    (b"wasm", b"application/wasm"),
-];
-pub(crate) const DEFAULT_MIME: &[u8] = b"application/octet-stream";
 const INLINE_BODY_LIMIT: u64 = 8 * 1024;
 /// With `sendfile on`, bodies at least this large go out zero-copy. Below
 /// it, `pread` into the response buffer plus one io_uring write beats the
@@ -604,22 +580,6 @@ fn error_response(status: u16, body: &str, method: Method, server: &[u8]) -> Vec
     crate::http::error_response_for_method(status, body, method, server)
 }
 
-pub(crate) fn mime_for(ext: &[u8]) -> &'static [u8] {
-    // ext is raw bytes from the filesystem — compare case-insensitively on
-    // ASCII. This doesn't allocate; we match character-by-character.
-    for &(e, m) in MIME_TYPES {
-        if ext.len() == e.len()
-            && ext
-                .iter()
-                .zip(e.iter())
-                .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        {
-            return m;
-        }
-    }
-    DEFAULT_MIME
-}
-
 fn write_status_line(out: &mut Vec<u8>, status: u16) {
     out.extend_from_slice(b"HTTP/1.1 ");
     write_u16(out, status);
@@ -1150,13 +1110,24 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// `types {}` / `default_type` (#38): by the URI's extension, case
+    /// folded; the default without one.
     #[test]
-    fn mime_table_lookup() {
-        assert_eq!(mime_for(b"html"), b"text/html; charset=utf-8");
-        assert_eq!(mime_for(b"HTML"), b"text/html; charset=utf-8");
-        assert_eq!(mime_for(b"png"), b"image/png");
-        assert_eq!(mime_for(b"unknown"), DEFAULT_MIME);
-        assert_eq!(mime_for(b""), DEFAULT_MIME);
+    fn types_lookup() {
+        let mut map = std::collections::HashMap::default();
+        map.insert(b"html".to_vec().into_boxed_slice(), &b"text/html"[..]);
+        map.insert(b"png".to_vec().into_boxed_slice(), &b"image/png"[..]);
+        let types = crate::worker::PreparedTypes {
+            map,
+            default: b"text/plain",
+        };
+        assert_eq!(types.for_url(b"/a/index.html"), b"text/html");
+        assert_eq!(types.for_url(b"/a/INDEX.HTML"), b"text/html");
+        assert_eq!(types.for_url(b"/p.png"), b"image/png");
+        assert_eq!(types.for_url(b"/x.unknown"), b"text/plain");
+        assert_eq!(types.for_url(b"/noext"), b"text/plain");
+        assert_eq!(types.for_url(b"/dir.html/file"), b"text/plain");
+        assert_eq!(types.for_url(b"/trailing."), b"text/plain");
     }
 
     #[test]
