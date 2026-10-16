@@ -871,11 +871,24 @@ pub struct RedirectConf {
 /// How a `Location` that starts with `/` goes out (ngx_http_header_filter):
 /// made absolute, with the server's name or the request's host, and the
 /// port unless it is the scheme's.
+/// One byte (absolute, server name, port: bits 0–2), so the per-request
+/// `MatchedLocation` copy stays the size it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RedirectPolicy {
-    pub absolute: bool,
-    pub server_name: bool,
-    pub port: bool,
+pub struct RedirectPolicy(u8);
+
+impl RedirectPolicy {
+    pub fn new(absolute: bool, server_name: bool, port: bool) -> Self {
+        Self(u8::from(absolute) | (u8::from(server_name) << 1) | (u8::from(port) << 2))
+    }
+    pub fn absolute(self) -> bool {
+        self.0 & 1 != 0
+    }
+    pub fn server_name(self) -> bool {
+        self.0 & 2 != 0
+    }
+    pub fn port(self) -> bool {
+        self.0 & 4 != 0
+    }
 }
 
 impl Default for RedirectPolicy {
@@ -916,11 +929,11 @@ impl RedirectConf {
 
     /// With nginx's defaults: on, off, on.
     pub fn policy(self) -> RedirectPolicy {
-        RedirectPolicy {
-            absolute: self.absolute.unwrap_or(true),
-            server_name: self.server_name.unwrap_or(false),
-            port: self.port.unwrap_or(true),
-        }
+        RedirectPolicy::new(
+            self.absolute.unwrap_or(true),
+            self.server_name.unwrap_or(false),
+            self.port.unwrap_or(true),
+        )
     }
 }
 

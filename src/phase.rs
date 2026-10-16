@@ -2338,10 +2338,10 @@ impl<'a> RedirectCtx<'a> {
     }
 
     pub(crate) fn apply<'l>(&self, location: &'l [u8]) -> std::borrow::Cow<'l, [u8]> {
-        if !self.policy.absolute || location.first() != Some(&b'/') {
+        if !self.policy.absolute() || location.first() != Some(&b'/') {
             return std::borrow::Cow::Borrowed(location);
         }
-        let host = if self.policy.server_name {
+        let host = if self.policy.server_name() {
             self.server_name
         } else {
             match self.host {
@@ -2357,7 +2357,7 @@ impl<'a> RedirectCtx<'a> {
         let mut out = Vec::with_capacity(scheme.len() + host.len() + 6 + location.len());
         out.extend_from_slice(scheme);
         out.extend_from_slice(host);
-        if self.policy.port && self.port != default_port {
+        if self.policy.port() && self.port != default_port {
             out.push(b':');
             out.extend_from_slice(self.port.to_string().as_bytes());
         }
