@@ -18,12 +18,28 @@ use crate::tls_stream::TlsStream;
 /// A TLS connection to an upstream.
 pub type UpstreamTls = TlsStream<TcpStream, ClientConnection>;
 
+/// A TLS connection, with who it was opened as (`TlsPlan::identity`): the
+/// keep-alive pool reuses it only for that. Kept in the box rather than in
+/// `PooledConn`, so that a plain pooled connection stays small to move
+/// (#451).
+pub struct UpstreamTlsConn {
+    pub stream: UpstreamTls,
+    pub identity: crate::upstream_tls::TlsIdentity,
+}
+
 pub enum UpstreamIo {
     Plain(TcpStream),
-    Tls(Box<UpstreamTls>),
+    Tls(Box<UpstreamTlsConn>),
 }
 
 impl UpstreamIo {
+    pub fn tls_identity(&self) -> Option<&crate::upstream_tls::TlsIdentity> {
+        match self {
+            UpstreamIo::Plain(_) => None,
+            UpstreamIo::Tls(s) => Some(&s.identity),
+        }
+    }
+
     /// The two directions of a tunnel after a 101 (#87): TCP splits as
     /// monoio splits it; TLS is shared by both, which `begin_tunnel` makes
     /// safe (a read no longer writes to the socket).
@@ -33,9 +49,10 @@ impl UpstreamIo {
                 let (r, w) = s.into_split();
                 (UpstreamRead::Plain(r), UpstreamWrite::Plain(w))
             }
-            UpstreamIo::Tls(mut s) => {
+            UpstreamIo::Tls(s) => {
+                let mut s = s.stream;
                 s.begin_tunnel();
-                let shared = Rc::new(UnsafeCell::new(*s));
+                let shared = Rc::new(UnsafeCell::new(s));
                 (
                     UpstreamRead::Tls(shared.clone()),
                     UpstreamWrite::Tls(shared),
@@ -49,14 +66,14 @@ impl AsyncReadRent for UpstreamIo {
     async fn read<T: IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
         match self {
             UpstreamIo::Plain(s) => s.read(buf).await,
-            UpstreamIo::Tls(s) => s.read(buf).await,
+            UpstreamIo::Tls(s) => s.stream.read(buf).await,
         }
     }
 
     async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
         match self {
             UpstreamIo::Plain(s) => s.readv(buf).await,
-            UpstreamIo::Tls(s) => s.readv(buf).await,
+            UpstreamIo::Tls(s) => s.stream.readv(buf).await,
         }
     }
 }
@@ -65,28 +82,28 @@ impl AsyncWriteRent for UpstreamIo {
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         match self {
             UpstreamIo::Plain(s) => s.write(buf).await,
-            UpstreamIo::Tls(s) => s.write(buf).await,
+            UpstreamIo::Tls(s) => s.stream.write(buf).await,
         }
     }
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         match self {
             UpstreamIo::Plain(s) => s.writev(buf).await,
-            UpstreamIo::Tls(s) => s.writev(buf).await,
+            UpstreamIo::Tls(s) => s.stream.writev(buf).await,
         }
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
         match self {
             UpstreamIo::Plain(s) => s.flush().await,
-            UpstreamIo::Tls(s) => s.flush().await,
+            UpstreamIo::Tls(s) => s.stream.flush().await,
         }
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         match self {
             UpstreamIo::Plain(s) => s.shutdown().await,
-            UpstreamIo::Tls(s) => s.shutdown().await,
+            UpstreamIo::Tls(s) => s.stream.shutdown().await,
         }
     }
 }

@@ -1572,7 +1572,12 @@ async fn attempt(
                 let handshake =
                     crate::tls_stream::connect(tls.config.clone(), tls.name.clone(), stream);
                 match timeout(plan.connect_timeout, Box::pin(handshake)).await {
-                    Ok(Ok(tls)) => UpstreamIo::Tls(Box::new(tls)),
+                    Ok(Ok(stream)) => {
+                        UpstreamIo::Tls(Box::new(crate::upstream_io::UpstreamTlsConn {
+                            stream,
+                            identity: tls.identity(),
+                        }))
+                    }
                     Ok(Err(e)) => {
                         let error = match crate::upstream_tls::verify_failure(&e) {
                             Some(why) => UpstreamError::SslVerifyFailed(why.to_string()),
@@ -1808,9 +1813,11 @@ async fn attempt(
                 continue;
             };
             let name = trim_ascii(&line[..colon]);
-            let value = trim_ascii(&line[colon + 1..]);
-            let is_length = name.eq_ignore_ascii_case(b"content-length");
-            if is_length || name.eq_ignore_ascii_case(b"transfer-encoding") {
+            // The value is trimmed only for the names below.
+            let value = || trim_ascii(&line[colon + 1..]);
+            let is_length = name_is(name, b"content-length");
+            if is_length || name_is(name, b"transfer-encoding") {
+                let value = value();
                 let header_line = trim_ascii(line);
                 let invalid = if let Some((previous, previous_is_length)) = framing_line {
                     Some(if previous_is_length == is_length {
@@ -1848,8 +1855,9 @@ async fn attempt(
                 }
                 framing_line = Some((header_line, is_length));
             } else if name.len() >= 16 && name[..8].eq_ignore_ascii_case(b"x-accel-") {
-                note_accel_header(accel, plan.response, name, value);
-            } else if name.eq_ignore_ascii_case(b"connection") {
+                note_accel_header(accel, plan.response, name, value());
+            } else if name_is(name, b"connection") {
+                let value = value();
                 if value
                     .split(|&b| b == b',')
                     .any(|t| trim_ascii(t).eq_ignore_ascii_case(b"close"))
@@ -1950,7 +1958,6 @@ async fn attempt(
                     peer_idx,
                     opened_at,
                     requests_served,
-                    tls: plan.tls.as_ref().map(|t| t.identity()),
                 });
         let pending = accum[body_start..].to_vec();
         return_proxy_buf(accum);
@@ -2183,7 +2190,6 @@ async fn attempt(
                 opened_at,
                 requests_served: requests_served + 1,
                 slot,
-                tls: plan.tls.as_ref().map(|t| t.identity()),
             },
         );
     }
@@ -3286,6 +3292,15 @@ fn is_hop_by_hop(name: &[u8]) -> bool {
     false
 }
 
+/// `name` is `lower` (lowercase), whatever its case. The length goes
+/// first, inline: most header names differ in it, and the scan of an
+/// upstream head (`attempt`) then makes no call for them (#451).
+#[inline(always)]
+fn name_is(name: &[u8], lower: &[u8]) -> bool {
+    name.len() == lower.len() && name.eq_ignore_ascii_case(lower)
+}
+
+#[inline(always)]
 fn trim_ascii(s: &[u8]) -> &[u8] {
     let mut start = 0;
     let mut end = s.len();
