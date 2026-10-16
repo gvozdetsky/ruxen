@@ -252,13 +252,18 @@ fn ssl_verify_client_like_nginx() {
         requests(port, "on", "on", good, &["/", "/"]),
         [(200, "SUCCESS".into()), (200, "SUCCESS".into())]
     );
-    assert_eq!(
-        one(port, "on", None),
-        (400, "No required SSL certificate was sent\n".into())
+    // nginx's 496 and 495 pages, sent as 400.
+    let (status, body) = one(port, "on", None);
+    assert_eq!(status, 400);
+    assert!(
+        body.contains("<center>No required SSL certificate was sent</center>"),
+        "{body}"
     );
-    assert_eq!(
-        one(port, "on", bad),
-        (400, "The SSL certificate error\n".into())
+    let (status, body) = one(port, "on", bad);
+    assert_eq!(status, 400);
+    assert!(
+        body.contains("<center>The SSL certificate error</center>"),
+        "{body}"
     );
     // The connection closes after the refusal, as nginx closes it.
     assert_eq!(requests(port, "on", "on", None, &["/", "/"]).len(), 1);
@@ -286,9 +291,12 @@ fn ssl_verify_client_like_nginx() {
 
     // A Host naming a verifying server other than the SNI name: 421, and
     // the connection stays.
-    assert_eq!(
-        requests(port, "optional", "on", good, &["/"]),
-        [(421, "Misdirected Request\n".into())]
+    let misdirected = requests(port, "optional", "on", good, &["/"]);
+    assert_eq!(misdirected.len(), 1);
+    assert_eq!(misdirected[0].0, 421);
+    assert!(
+        misdirected[0].1.contains("421 Misdirected Request"),
+        "{misdirected:?}"
     );
     // Naming one that doesn't verify is fine.
     assert_eq!(

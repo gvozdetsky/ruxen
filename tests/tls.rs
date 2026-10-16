@@ -313,8 +313,10 @@ http {
     let resp = raw("GET /a?b=1 HTTP/1.0\r\n\r\n");
     assert!(resp.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{resp}");
     assert!(resp.contains("Connection: close\r\n"), "{resp}");
+    // nginx's page (#34).
     assert!(
-        resp.ends_with("\r\n\r\nThe plain HTTP request was sent to HTTPS port\n"),
+        resp.contains("<center>The plain HTTP request was sent to HTTPS port</center>")
+            && resp.contains("Content-Type: text/html\r\n"),
         "{resp}"
     );
 

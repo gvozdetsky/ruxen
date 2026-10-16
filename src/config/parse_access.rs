@@ -267,6 +267,7 @@ pub(crate) fn parse_limit_except_block(
     let mut access = AccessConf::default();
     let mut auth_basic = None;
     let mut auth_basic_user_file = None;
+    let mut proxy_pass = None;
     loop {
         let (args, term) = lx.read_directive()?;
         let Some(name) = args.first() else {
@@ -276,6 +277,7 @@ pub(crate) fn parse_limit_except_block(
                     rules: access.rules,
                     auth_basic,
                     auth_basic_user_file,
+                    proxy_pass,
                 }),
                 Terminator::Eof => Err(Error::UnclosedBlock),
                 _ => Err(Error::UnexpectedEof),
@@ -299,6 +301,23 @@ pub(crate) fn parse_limit_except_block(
                     &args[1..],
                     lx.conf_prefix(),
                 )?);
+            }
+            ("proxy_pass", Terminator::Semi) => {
+                if proxy_pass.is_some() {
+                    return Err(Error::Duplicate("proxy_pass"));
+                }
+                // ngx_http_proxy_pass: no URI part here, as in `if`.
+                if args.len() == 2
+                    && let Some(rest) = args[1].split_once("://").map(|(_, r)| r)
+                    && !args[1].contains('$')
+                    && rest.contains('/')
+                {
+                    return Err(Error::BadValue {
+                        what: "proxy_pass (no URI part inside \"limit_except\" block)",
+                        got: args[1].clone(),
+                    });
+                }
+                proxy_pass = Some(super::parse_upstream::parse_proxy_pass_arg(&args[1..])?);
             }
             ("allow" | "deny" | "auth_basic" | "auth_basic_user_file", _) => {
                 return Err(Error::WrongTerminator {

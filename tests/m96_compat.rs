@@ -33,7 +33,7 @@ fn m96_compat_lists_everything_with_positions() {
         &conf,
         format!(
             "events {{}}\nhttp {{\n    ssi on;\n    tcp_nopush on;\n    include {};\n    \
-             include {}/conf.d/*.conf;\n    server {{\n        listen 127.0.0.1:1;\n        \
+             include {}/missing.conf;\n    server {{\n        listen 127.0.0.1:1;\n        \
              secure_link $arg_s;\n    }}\n}}\n",
             d.join("site.conf").display(),
             d.display()
@@ -50,7 +50,8 @@ fn m96_compat_lists_everything_with_positions() {
             "{s}:3: unsupported: fastcgi_pass 127.0.0.1:9000 — unknown directive in a server block"
         ),
         format!(
-            "{c}:6: unsupported: include {}/conf.d/*.conf — wildcards in include",
+            "{c}:6: unsupported: include {}/missing.conf — open() \"{}/missing.conf\" failed",
+            d.display(),
             d.display()
         ),
         format!("{c}:9: unsupported: secure_link $arg_s — unknown directive in a server block"),

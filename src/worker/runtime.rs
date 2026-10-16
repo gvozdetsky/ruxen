@@ -1038,7 +1038,7 @@ async fn settle_redirected(
         }
     }
     // nginx: "rewrite or internal redirection cycle" → 500.
-    let response = Response::Owned(http::build_response_for_method(
+    let response = Response::Owned(http::error_response_for_method(
         500,
         "Internal Server Error\n",
         ctx.method,
@@ -2624,7 +2624,7 @@ pub(crate) fn internal_error_response(method: Method) -> Response {
     let http = WORKER_CONNS.with(|w| w.http.get());
     match http {
         Some(http) => Response::Prebuilt(http.internal_error.pick(method)),
-        None => Response::Owned(http::build_response_for_method(
+        None => Response::Owned(http::error_response_for_method(
             500,
             "Internal Server Error\n",
             method,

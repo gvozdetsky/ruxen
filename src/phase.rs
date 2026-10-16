@@ -318,6 +318,9 @@ pub struct ProcessMeta {
     /// trailer filter. False suppresses the trailer block (matching nginx's
     /// chunked filter, which skips chunked encoding entirely when off).
     pub proxy_chunked_transfer_encoding: bool,
+    /// The location's `absolute_redirect` and friends, for a `Location`
+    /// that `proxy_redirect` rewrote to a path (#15).
+    pub redirect: crate::config::RedirectPolicy,
     /// `$server_name` value for the matched server, for the post-await
     /// proxy add_header render and the `server: …` part of error-log lines.
     pub server_name: &'static [u8],
@@ -399,6 +402,7 @@ impl Default for ProcessMeta {
             proxy_add_headers: &[],
             proxy_add_trailers: &[],
             proxy_chunked_transfer_encoding: true,
+            redirect: crate::config::RedirectPolicy::default(),
             server_name: &[],
             proxy_host: &[],
             proxy_tls: false,
@@ -648,7 +652,7 @@ fn process_with_meta_inner(
     let Some(listen) = select_listen(http, req.listen_index) else {
         let server_bytes = default_server_header(http);
         return (
-            Response::Owned(crate::http::build_response_for_method(
+            Response::Owned(crate::http::error_response_for_method(
                 500,
                 "Internal Server Error\n",
                 req.method,
@@ -853,7 +857,7 @@ fn process_with_meta_inner(
                 Some(loc) => loc,
                 None => {
                     return (
-                        Response::Owned(crate::http::build_response_for_method(
+                        Response::Owned(crate::http::error_response_for_method(
                             500,
                             "Internal Server Error\n",
                             req.method,
@@ -963,7 +967,14 @@ fn process_with_meta_inner(
                 .as_deref()
                 .unwrap_or_else(|| request_args(req.path));
             return (
-                build_auto_redirect_response(server, loc.server_header, req, target, args),
+                build_auto_redirect_response(
+                    server,
+                    loc.server_header,
+                    loc.redirect,
+                    req,
+                    target,
+                    args,
+                ),
                 meta,
             );
         }
@@ -1242,6 +1253,7 @@ fn process_with_meta_inner(
                 meta.proxy_add_headers = loc_add_headers;
                 meta.proxy_add_trailers = loc_add_trailers;
                 meta.proxy_chunked_transfer_encoding = loc_chunked_te;
+                meta.redirect = loc.redirect;
                 meta.proxy_expires = loc_expires;
                 meta.underscores_in_headers = server.underscores_in_headers;
                 // The proxied response's add_header / proxy_redirect read
@@ -1261,7 +1273,7 @@ fn process_with_meta_inner(
     }
     // Budget exhausted: nginx returns 500; we match.
     (
-        Response::Owned(crate::http::build_response_for_method(
+        Response::Owned(crate::http::error_response_for_method(
             500,
             "Internal Server Error\n",
             req.method,
@@ -1712,7 +1724,7 @@ fn run_auth_basic(
     };
     let auth_delay_ms = access.auth_delay_ms;
     let internal_error = || AccessControl::Deny {
-        response: Response::Owned(crate::http::build_response_for_method(
+        response: Response::Owned(crate::http::error_response_for_method(
             500,
             "Internal Server Error\n",
             req.method,
@@ -2370,9 +2382,70 @@ pub(crate) fn match_location<'a>(
     best.map(MatchedLocation::from_prefix)
 }
 
+/// What a `Location` that starts with `/` becomes (#15), as nginx's header
+/// filter writes it: with `absolute_redirect` on, `scheme://host[:port]`
+/// before it. The host is the server's name with `server_name_in_redirect`,
+/// else the request's host, else the connection's local address; the port
+/// the listen's, unless `port_in_redirect` is off or it is the scheme's.
+#[derive(Clone, Copy)]
+pub(crate) struct RedirectCtx<'a> {
+    pub policy: crate::config::RedirectPolicy,
+    pub host: Option<&'a [u8]>,
+    pub server_name: &'a [u8],
+    pub port: u16,
+    pub tls: bool,
+    pub local_addr: &'a [u8],
+}
+
+impl<'a> RedirectCtx<'a> {
+    pub(crate) fn new(
+        policy: crate::config::RedirectPolicy,
+        req: &'a RequestCtx<'_>,
+        server: &'a PreparedServer,
+    ) -> Self {
+        Self {
+            policy,
+            host: req.host,
+            server_name: server.primary_server_name,
+            port: server.listen_port,
+            tls: req.tls.is_some(),
+            local_addr: &req.conn.server_addr,
+        }
+    }
+
+    pub(crate) fn apply<'l>(&self, location: &'l [u8]) -> std::borrow::Cow<'l, [u8]> {
+        if !self.policy.absolute() || location.first() != Some(&b'/') {
+            return std::borrow::Cow::Borrowed(location);
+        }
+        let host = if self.policy.server_name() {
+            self.server_name
+        } else {
+            match self.host {
+                Some(h) if !h.is_empty() => h,
+                _ => self.local_addr,
+            }
+        };
+        let (scheme, default_port): (&[u8], u16) = if self.tls {
+            (b"https://", 443)
+        } else {
+            (b"http://", 80)
+        };
+        let mut out = Vec::with_capacity(scheme.len() + host.len() + 6 + location.len());
+        out.extend_from_slice(scheme);
+        out.extend_from_slice(host);
+        if self.policy.port() && self.port != default_port {
+            out.push(b':');
+            out.extend_from_slice(self.port.to_string().as_bytes());
+        }
+        out.extend_from_slice(location);
+        std::borrow::Cow::Owned(out)
+    }
+}
+
 fn build_auto_redirect_response(
     server: &PreparedServer,
     server_header: &[u8],
+    redirect: crate::config::RedirectPolicy,
     req: &RequestCtx<'_>,
     target: &[u8],
     args: &[u8],
@@ -2384,12 +2457,9 @@ fn build_auto_redirect_response(
         path.push(b'?');
         path.extend_from_slice(args);
     }
-    let location = build_absolute_redirect_location(
-        &path,
-        req.host.unwrap_or(server.primary_server_name),
-        server.listen_port,
-        req.tls.is_some(),
-    );
+    let location = RedirectCtx::new(redirect, req, server)
+        .apply(&path)
+        .into_owned();
     Response::Owned(crate::http::build_redirect_response(
         301,
         &location,
@@ -2398,22 +2468,7 @@ fn build_auto_redirect_response(
     ))
 }
 
-fn build_absolute_redirect_location(path: &[u8], host: &[u8], port: u16, tls: bool) -> Vec<u8> {
-    let scheme: &[u8] = if tls { b"https" } else { b"http" };
-    let default_port = if tls { 443 } else { 80 };
-    let mut out = Vec::with_capacity(scheme.len() + 3 + host.len() + 6 + path.len());
-    out.extend_from_slice(scheme);
-    out.extend_from_slice(b"://");
-    out.extend_from_slice(host);
-    if port != default_port {
-        out.push(b':');
-        out.extend_from_slice(port.to_string().as_bytes());
-    }
-    out.extend_from_slice(path);
-    out
-}
-
-fn escape_redirect_uri(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn escape_redirect_uri(raw: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = Vec::with_capacity(raw.len());
     for &b in raw {
