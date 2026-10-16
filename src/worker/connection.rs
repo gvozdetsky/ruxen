@@ -891,6 +891,46 @@ pub(crate) async fn stream_file<S: ConnIo>(
             Ok(n) => n,
         };
         offset += n as u64;
+        // Plain TCP, not paced: send the chunk now, while it is still in
+        // the cache, as nginx writes what it just read (#247). An io_uring
+        // write would run at the next submit, after other connections'
+        // reads have pushed it out.
+        if pacer.is_none()
+            && let Some(sock) = stream.sendfile_fd()
+        {
+            let mut sent = 0usize;
+            while sent < n {
+                // SAFETY: the pointer/len pair stays within `buf[..n]`.
+                let r = unsafe {
+                    libc::send(
+                        sock,
+                        buf[sent..n].as_ptr().cast(),
+                        n - sent,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if r > 0 {
+                    sent += r as usize;
+                    continue;
+                }
+                if r == 0 {
+                    return Err(body.len - remaining + sent as u64);
+                }
+                match std::io::Error::last_os_error().kind() {
+                    std::io::ErrorKind::WouldBlock => {
+                        let ready =
+                            with_timeout(timer.as_mut(), send_timeout, stream.wait_writable());
+                        if !matches!(ready.await, Some(Ok(_))) {
+                            return Err(body.len - remaining + sent as u64);
+                        }
+                    }
+                    std::io::ErrorKind::Interrupted => {}
+                    _ => return Err(body.len - remaining + sent as u64),
+                }
+            }
+            remaining -= n as u64;
+            continue;
+        }
         let (res, returned) = match pacer.as_deref_mut() {
             Some(pacer) => {
                 write_all_paced(
