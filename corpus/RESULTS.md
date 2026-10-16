@@ -6,11 +6,11 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 201 of 238 configurations nginx accepts (84%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 206 of 238 configurations nginx accepts (87%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 181 | 85% |
+| github | 214 | 186 | 87% |
 | php | 3 | 0 | 0% |
 | proxy | 17 | 17 | 100% |
 | static | 4 | 3 | 75% |
@@ -19,18 +19,20 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
 | configurations | first error in ruxen | examples |
 |---:|---|---|
-| 14 | open() "…" failed (No such file or directory (os error N)) in <sandbox>…:N | h5bp:nginx.conf, gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:ocftw/OpenGovReport14-16/nginx.config, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt … |
-| 4 | bad value for ssl_protocols (insecure version rejected): TLSvN in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:EstudioNexos/flautodiscover/fla_nginx.conf, gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf |
+| 6 | unknown directive `stream` | gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt, gh:Azigaming404/cyber/nginx.conf.txt, gh:essoojay/Autoscript-by-azi/nginx.conf.txt … |
+| 5 | bad value for ssl_protocols (insecure version rejected): TLSvN in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https, gh:EstudioNexos/flautodiscover/fla_nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf … |
 | 4 | unknown directive `add_header` | gh:luckylykkk/nnscholar-search/cloud-nginx.conf, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:Ingvord/animated-garbanzo/nginx/nginx.conf, gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
 | 2 | bad value for ssl_protocols (insecure version rejected): TLSvN.N in <sandbox>…:N | gh:decred/dcrstakepool/sample-nginx.conf, gh:TetAlius/GoSyncMyCalendars/.nginx.conf |
 | 2 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir |
+| 1 | "…" is not supported yet, and ignoring it is unsafe: variables in the path aren't expanded yet (#N), | gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf |
 | 1 | bad value for proxy_pass scheme (only http:… supported in vN.N): https:… in <sandbox>…:N | gh:MRLokop/shiki-proxy/nginx.conf |
 | 1 | bad value for upstream server param: resolve in <sandbox>…:N | gh:rajim59/SwarmFort/infra/docker/nginx.conf |
 | 1 | unknown "…" variable in <sandbox>…:N | gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf |
+| 1 | unknown directive `charset_types` | h5bp:nginx.conf |
 | 1 | unknown directive `fastcgi_pass` | laravel#1 |
 | 1 | unknown directive `grpc_pass` | gh:refluxdb/influxdb3-community/iox-nginx.conf |
-| 1 | unknown directive `stream` | gh:alphadx/nginx-proxy-html-mysql/nginx.conf |
+| 1 | unknown directive `proxy_ssl_server_name` | gh:devstroop/penpot/docker/devenv/files/nginx.conf |
 | 1 | unknown directive `uwsgi_pass_request_headers` | gh:lijiejie/eyes.sh/dnslog_nginx.conf |
 
 ## Every case
@@ -64,7 +66,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | uptime-kuma#3 | proxy | ok | ok |  |
 | grafana#1 | proxy | ok | ok |  |
 | grafana#2 | proxy | ok | ok |  |
-| h5bp:nginx.conf | static | ok | FAIL | ruxen: [emerg] open() "<sandbox>/conf/custom.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:53 |
+| h5bp:nginx.conf | static | ok | FAIL | ruxen: [emerg] unknown directive `charset_types` in a http block in <sandbox>/conf/h5bp/media_types/character_encodings.conf:32 |
 | h5bp:conf.d/templates/example.com.conf | static | ok | ok |  |
 | h5bp:conf.d/templates/no-ssl.example.com.conf | static | ok | ok |  |
 | gh:Cloud-CV/Fabrik/ide_nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `uwsgi_pass` in a location block in <sandbox>/conf/nginx.conf:33 |
@@ -134,7 +136,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:Apress/adv-microservices/ch4-nginx.conf | github | ok | ok |  |
 | gh:gsw945/wechat-demo4dev/app-nginx.conf | github | ok | ok |  |
 | gh:backupify/yard-server/yard-nginx.conf | github | ok | ok |  |
-| gh:Agunxzzz/XrayCol/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:31 |
+| gh:Agunxzzz/XrayCol/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
 | gh:inab/openEBench-nuxt/nginx.conf.devci | github | ok | ok |  |
 | gh:allisterb/Alpheus/Examples/nginx.conf.1 | github | — | — | (nginx: [emerg] invalid event type "kqueue" in <sandbox>/conf/nginx.conf:15) |
 | gh:Ozrlz/odoo-nginx-reverse-proxy/odoo-nginx.conf | github | ok | ok |  |
@@ -147,7 +149,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:brick-family/brick/nginx.config | github | ok | ok |  |
 | gh:bakery/openmic/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:O-C-R/intotheokavango/nginx.conf.smp | github | ok | ok |  |
-| gh:ocftw/OpenGovReport14-16/nginx.config | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:28 |
+| gh:ocftw/OpenGovReport14-16/nginx.config | github | ok | ok |  |
 | gh:TortugaPower/bookplayer-api/nginx.config | github | ok | ok |  |
 | gh:amoeba/treestats.net/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf | github | ok | ok |  |
@@ -191,11 +193,11 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:yashab-cyber/metasploit-ai/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:49 |
 | gh:Ngugi1/wallacepos/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:bleemeo/squirreldb/examples/squirreldb_ha/nginx.conf | github | ok | ok |  |
-| gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:31 |
+| gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
 | gh:hjl369/proxy_conf/hub-nginx.conf | github | — | — | (nginx: [emerg] unknown directive "header_filter_by_lua_block" in <sandbox>/conf/) |
-| gh:Azigaming404/cyber/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:31 |
-| gh:essoojay/Autoscript-by-azi/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:31 |
-| gh:SatanTech/Autoscript-Premium/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:31 |
+| gh:Azigaming404/cyber/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
+| gh:essoojay/Autoscript-by-azi/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
+| gh:SatanTech/Autoscript-Premium/nginx.conf.txt | github | ok | FAIL | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
 | gh:Jengro777/fabu.love/fabu_nginx.conf | github | ok | ok |  |
 | gh:UKingGit/aifabu/fabu_nginx.conf | github | ok | ok |  |
 | gh:zzxtbl/fabu.love-ok/fabu_nginx.conf | github | ok | ok |  |
@@ -221,14 +223,14 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:apurv-wednesday/react-template/app/.nginx.conf | github | ok | ok |  |
 | gh:notTanveer/sp-cli/dev/nginx.conf.in | github | — | — | (nginx: [emerg] directive "root" is not terminated by ";" in <sandbox>/conf/nginx) |
 | gh:josuemontano/minio-dokku/nginx.conf.sigil | github | — | — | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
-| gh:guilhermewebdev/stock/server/proxy/prod/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:34 |
+| gh:guilhermewebdev/stock/server/proxy/prod/nginx.conf | github | ok | ok |  |
 | gh:vkresch/pdftoxrechnung/nginx/nginx.conf | github | ok | ok |  |
 | gh:thuongtruong109/flashot/nginx.conf | github | ok | ok |  |
 | gh:betarixm/poka-roulette/nginx.conf | github | ok | ok |  |
 | gh:hatanaca/quick-filler-test/nginx.conf | github | ok | ok |  |
 | gh:Ecalose/ocr/nginx.conf | github | ok | ok |  |
 | gh:chelebyy/link-manager/frontend/nginx.conf | github | ok | ok |  |
-| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:4 |
+| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for ssl_protocols (insecure version rejected): TLSv1 in <sandbox>/conf/nginx.conf:24 |
 | gh:Ingvord/animated-garbanzo/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `add_header` in a http block in <sandbox>/conf/nginx.conf:33 |
 | gh:cfrank/nextjs-common-host-redirect-issue/nginx/nginx.conf | github | ok | ok |  |
 | gh:flajoke/s21-Simple-Docker/src/06/nginx.conf | github | ok | ok |  |
@@ -281,10 +283,10 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf | github | ok | ok |  |
 | gh:MRLokop/shiki-proxy/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for proxy_pass scheme (only http:// supported in v0.1): https://135.181.210.175 in <sandbox>/conf/nginx.conf:12 |
 | gh:codeDogMcGee/Django-RestApi-Appointments/nginx/nginx.conf | github | ok | ok |  |
-| gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/usr/share/nginx/modules/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:11 |
+| gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf | github | ok | ok |  |
 | gh:Kwizera250232/Teacher-s-App-frontent/student-nginx.conf | github | ok | ok |  |
 | gh:codest40/edgepaas-project/ansible/templates/nginx.conf.j2 | github | — | — | (nginx: [emerg] directive "server" is not terminated by ";" in <sandbox>/conf/ngi) |
-| gh:shulieTech/takin-docker/takin-nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/modules/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:7 |
+| gh:shulieTech/takin-docker/takin-nginx/nginx.conf | github | ok | ok |  |
 | gh:moniishhh/ansys-copilot/deploy/nginx.conf | github | ok | ok |  |
 | gh:mechmind-dwv/ftrt-cambrian-correlation/nginx.conf | github | — | — | (nginx: [emerg] invalid port in "${FRONTEND_PORT:-1111}" of the "listen" directiv) |
 | gh:Top-of-the-Top/profession-web-app/frontend/nginx.conf | github | ok | ok |  |
@@ -298,7 +300,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:exp0logy/familycal/frontend/nginx.conf | github | ok | ok |  |
 | gh:Thybaau/todolist-app/nginx.conf | github | ok | ok |  |
 | gh:milan-lf/quiz/nginx.conf | github | ok | ok |  |
-| gh:SangHyunGil/KonerFrontEnd/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/conf.d/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:49 |
+| gh:SangHyunGil/KonerFrontEnd/nginx.conf | github | ok | ok |  |
 | gh:vicaqu/gp1f5a14/nginx.conf | github | ok | ok |  |
 | gh:rizkikasim/HelloProject-Muhamad-Rizki-Kasim_1303220030/nginx.conf | github | ok | ok |  |
 | gh:kayab23/Base_Costos_PWA/nginx.conf | github | ok | ok |  |
@@ -336,7 +338,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:fatmagulfidan/DEP-LB1/frontend/nginx.conf | github | ok | ok |  |
 | gh:thodotpro/PonchoProphet/frontend/nginx.conf | github | ok | ok |  |
 | gh:vthot4/poc_nifi/examples/Ejemplo_2/nginx-conf/nginx.conf | github | ok | ok |  |
-| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:4 |
+| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown directive `proxy_ssl_server_name` in a location block in <sandbox>/conf/nginx.conf:93 |
 | gh:kc611/microservices-app/m-frontend/nginx.conf | github | ok | ok |  |
 | gh:noam-r/produckt/frontend/nginx.conf | github | ok | ok |  |
 | gh:pranali04/SampleTradingApp/api_gateway/nginx.conf | github | ok | ok |  |
@@ -361,7 +363,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:zwlcoding/yt-todo/frontend/nginx.conf | github | ok | ok |  |
 | gh:hypothetical-andrei/compnet-live-2026/s11/1_nginx-reverse-proxy/nginx.conf | github | ok | ok |  |
 | gh:Mozart409/nixos-fleet/hosts/containers/harbor/config/nginx.conf | github | ok | ok |  |
-| gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] open() "<sandbox>/fs/etc/nginx/modules-enabled/*.conf" failed (No such file or directory (os error 2)) in <sandbox>/conf/nginx.conf:4 |
+| gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf | github | ok | FAIL | ruxen: [emerg] "root /srv/p1-$domain" is not supported yet, and ignoring it is unsafe: variables in the path aren't expanded yet (#232), so other files would be served than nginx serves in <sandbox>/conf/nginx.conf:55 |
 | gh:GrabowMar/result_llm_analysis/generated/apps/openai_gpt-5.2-codex-20260114/app1/frontend/nginx.conf | github | ok | ok |  |
 | gh:duongnghia222/DATKLL_Object_Tracking_Robot/Ref/Object-Finding-Rover-master/raspberry_pi_packet_serial/nginx.conf | github | ok | ok |  |
 | gh:wildfly-security/wildfly-elytron/http/oidc/src/test/resources/org/wildfly/security/http/oidc/nginx.conf | github | — | — | (nginx: [emerg] unknown "client_port" variable) |
