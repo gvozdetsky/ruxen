@@ -1355,6 +1355,7 @@ pub fn write_server_and_date(out: &mut Vec<u8>, server: &[u8]) {
 /// nginx page (matches `ngx_http_error_pages` in
 /// `ngx_http_special_response.c`). The footer is the `Server` value, so
 /// it follows `server_tokens` and the identity (see `identity`).
+#[cfg(test)]
 pub fn default_error_page_body(status: u16, t: crate::config::ServerTokens) -> Option<Vec<u8>> {
     default_error_page_body_for(status, server_header_value(t))
 }
@@ -1410,6 +1411,56 @@ fn error_page_title(status: u16) -> Option<(&'static str, &'static str)> {
         _ => return None,
     };
     Some((s, s))
+}
+
+/// nginx's own response for an error status it answers itself
+/// (ngx_http_special_response_handler, #34): the page of
+/// `ngx_http_error_pages` as `text/html`. 494–497 go out as 400 with the
+/// reason on a line of its own. `None` for a status without a page. HEAD
+/// gets the head with the page's length.
+pub fn build_error_response(status: u16, method: Method, server: &[u8]) -> Option<Vec<u8>> {
+    let reason = match status {
+        494 => Some("Request Header Or Cookie Too Large"),
+        495 => Some("The SSL certificate error"),
+        496 => Some("No required SSL certificate was sent"),
+        497 => Some("The plain HTTP request was sent to HTTPS port"),
+        _ => None,
+    };
+    let (sent, body) = match reason {
+        Some(reason) => {
+            let mut body = Vec::with_capacity(160 + server.len());
+            body.extend_from_slice(b"<html>\r\n<head><title>400 ");
+            body.extend_from_slice(reason.as_bytes());
+            body.extend_from_slice(
+                b"</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<center>",
+            );
+            body.extend_from_slice(reason.as_bytes());
+            body.extend_from_slice(b"</center>\r\n<hr><center>");
+            body.extend_from_slice(server);
+            body.extend_from_slice(b"</center>\r\n</body>\r\n</html>\r\n");
+            (400, body)
+        }
+        None => (status, default_error_page_body_for(status, server)?),
+    };
+    Some(build_response_bytes_with_content_type(
+        sent,
+        &body,
+        b"text/html",
+        method,
+        server,
+    ))
+}
+
+/// An error response ruxen answers itself: nginx's page for the status
+/// (`build_error_response`), else `body` as plain text.
+pub fn error_response_for_method(
+    status: u16,
+    body: &str,
+    method: Method,
+    server: &[u8],
+) -> Vec<u8> {
+    build_error_response(status, method, server)
+        .unwrap_or_else(|| build_response_for_method(status, body, method, server))
 }
 
 pub fn build_response(status: u16, body: &str, server: &[u8]) -> Vec<u8> {
@@ -1714,6 +1765,34 @@ fn write_usize(out: &mut Vec<u8>, mut n: usize) {
 
 #[cfg(test)]
 mod tests {
+    /// nginx's special responses (#34): the page, `text/html`; 497 as 400
+    /// with its reason line; HEAD with the page's length.
+    #[test]
+    fn error_responses_are_nginx_pages() {
+        let r =
+            String::from_utf8(build_error_response(404, Method::Get, b"ruxen").unwrap()).unwrap();
+        assert!(r.starts_with("HTTP/1.1 404 Not Found\r\n"), "{r}");
+        assert!(r.contains("\r\nContent-Type: text/html\r\n"), "{r}");
+        assert!(r.ends_with(
+            "\r\n\r\n<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n\
+             <center><h1>404 Not Found</h1></center>\r\n<hr><center>ruxen</center>\r\n\
+             </body>\r\n</html>\r\n"
+        ));
+        let r =
+            String::from_utf8(build_error_response(497, Method::Get, b"ruxen").unwrap()).unwrap();
+        assert!(r.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{r}");
+        assert!(r.ends_with(
+            "<html>\r\n<head><title>400 The plain HTTP request was sent to HTTPS port</title></head>\r\n\
+             <body>\r\n<center><h1>400 Bad Request</h1></center>\r\n\
+             <center>The plain HTTP request was sent to HTTPS port</center>\r\n\
+             <hr><center>ruxen</center>\r\n</body>\r\n</html>\r\n"
+        ), "{r}");
+        let full = build_error_response(503, Method::Get, b"ruxen").unwrap();
+        let head = build_error_response(503, Method::Head, b"ruxen").unwrap();
+        assert!(full.starts_with(&head) && head.ends_with(b"\r\n\r\n"));
+        assert!(build_error_response(418, Method::Get, b"ruxen").is_none());
+    }
+
     use super::*;
 
     fn parse_fresh(buf: &[u8]) -> Parse {

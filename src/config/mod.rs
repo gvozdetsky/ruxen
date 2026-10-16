@@ -313,6 +313,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     // inherit them once the block is closed (see `BlockClose`).
     let mut index: Option<Vec<IndexEntry>> = None;
     let mut error_pages: Option<Vec<ErrorPage>> = None;
+    let mut add_headers: Option<Vec<AddHeader>> = None;
+    let mut redirect = RedirectConf::default();
+    let mut add_trailers: Option<Vec<AddHeader>> = None;
     let mut recursive_error_pages: Option<bool> = None;
     let mut merge_slashes: Option<bool> = None;
     // http-scope SSL defaults inherited by `server {}` blocks unless
@@ -349,6 +352,23 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         // list (ngx_http_core_merge_loc_conf).
                         if server.error_pages.is_none() {
                             server.error_pages.clone_from(&error_pages);
+                        }
+                        // add_header / add_trailer likewise
+                        // (ngx_http_headers_merge_conf, #17); a location
+                        // without its own takes the server's.
+                        if server.add_headers.is_none() {
+                            server.add_headers.clone_from(&add_headers);
+                        }
+                        if server.add_trailers.is_none() {
+                            server.add_trailers.clone_from(&add_trailers);
+                        }
+                        // absolute_redirect and friends (#15): http into the
+                        // server, the server into each location and its
+                        // `if` blocks.
+                        server.redirect = server.redirect.inherit(&redirect);
+                        let server_redirect = server.redirect;
+                        for loc in &mut server.locations {
+                            loc.inherit_redirect(&server_redirect);
                         }
                         server.recursive_error_pages =
                             server.recursive_error_pages.or(recursive_error_pages);
@@ -484,6 +504,15 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 let entries = parse_error_page_args(&args[1..])?;
                 error_pages.get_or_insert_with(Vec::new).extend(entries);
             }
+            ("add_header", Terminator::Semi) => {
+                let entry = parse_add_header_args(&args[1..])?;
+                add_headers.get_or_insert_with(Vec::new).push(entry);
+            }
+            (name, Terminator::Semi) if RedirectConf::takes(name) => redirect.parse(&args)?,
+            ("add_trailer", Terminator::Semi) => {
+                let entry = parse_add_header_args(&args[1..])?;
+                add_trailers.get_or_insert_with(Vec::new).push(entry);
+            }
             ("recursive_error_pages", Terminator::Semi) => {
                 if recursive_error_pages.is_some() {
                     return Err(Error::Duplicate("recursive_error_pages"));
@@ -583,31 +612,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 if ssl_protocols.is_some() {
                     return Err(Error::Duplicate("ssl_protocols"));
                 }
-                if args.len() < 2 {
-                    return Err(Error::MissingArg("ssl_protocols"));
-                }
-                let mut set = TlsVersionSet {
-                    tlsv1_2: false,
-                    tlsv1_3: false,
-                };
-                for v in &args[1..] {
-                    match v.as_str() {
-                        "TLSv1.2" => set.tlsv1_2 = true,
-                        "TLSv1.3" => set.tlsv1_3 = true,
-                        "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols (insecure version rejected)",
-                                got: v.clone(),
-                            });
-                        }
-                        _ => {
-                            return Err(Error::BadValue {
-                                what: "ssl_protocols",
-                                got: v.clone(),
-                            });
-                        }
-                    }
-                }
+                let set = parse_tls_protocols(&args[1..], "ssl_protocols")?;
+                warn_old_tls_protocols(&args, &mut warnings);
                 ssl_protocols = Some(set);
             }
             ("ssl_ciphers", Terminator::Semi) => {
@@ -672,7 +678,13 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_early_data"
                 | "ssl_conf_command",
                 Terminator::Semi,
-            ) => warn_ignored_tls_policy(&args, &mut warnings),
+            ) => {
+                warn_ignored_tls_policy(&args, &mut warnings);
+                // ssl_ecdh_curve says so in its warning already.
+                if args[0] != "ssl_ecdh_curve" {
+                    compat::ignored(lx, &args);
+                }
+            }
             (
                 "log_format"
                 | "access_log"
@@ -1001,9 +1013,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "chunked_transfer_encoding",
     "output_buffers",
     "postpone_output",
-    "server_name_in_redirect",
-    "port_in_redirect",
-    "absolute_redirect",
     "server_names_hash_bucket_size",
     "server_names_hash_max_size",
     "types_hash_bucket_size",
@@ -1989,6 +1998,23 @@ mod tests {
             })
         );
 
+        // #36: the old names are skipped with a warning; only old ones is
+        // still an error.
+        let mixed = src.replace("TLSv1.2 TLSv1.3", "TLSv1 TLSv1.1 TLSv1.2 TLSv1.3");
+        let cfg = parse(&mixed).unwrap();
+        assert_eq!(
+            cfg.servers[0].ssl.protocols,
+            Some(TlsVersionSet {
+                tlsv1_2: true,
+                tlsv1_3: true
+            })
+        );
+        assert_eq!(
+            cfg.warnings,
+            [
+                "\"ssl_protocols\": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only"
+            ]
+        );
         for bad in ["SSLv2", "SSLv3", "TLSv1", "TLSv1.1"] {
             let src = format!(
                 r#"http {{
@@ -4164,6 +4190,41 @@ mod tests {
                 assert!(body.is_empty());
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_url_alone_is_a_302() {
+        // #16, ngx_http_rewrite_return: one argument that starts as a URL.
+        for (arg, parts) in [
+            ("http://example.com/", 1),
+            ("https://example.com$uri", 2),
+            ("$scheme://$host$uri", 4),
+        ] {
+            let src = format!("http {{ server {{ listen 80; location / {{ return {arg}; }} }} }}");
+            let cfg = parse(&src).unwrap();
+            match &cfg.servers[0].locations[0].handler {
+                Handler::Return { status, body } => {
+                    assert_eq!(*status, 302, "{arg}");
+                    assert_eq!(body.len(), parts, "{arg}: {body:?}");
+                }
+                other => panic!("{arg}: {other:?}"),
+            }
+        }
+        // Anything else that isn't a number is still an invalid code, and
+        // a URL needs to stand alone.
+        for bad in ["return foo;", "return /local;", "return http://a b;"] {
+            let src = format!("http {{ server {{ listen 80; location / {{ {bad} }} }} }}");
+            assert!(
+                matches!(
+                    parse(&src),
+                    Err(Error::BadValue {
+                        what: "return status",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
         }
     }
 

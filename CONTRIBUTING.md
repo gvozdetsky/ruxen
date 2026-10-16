@@ -108,7 +108,9 @@ welcome — open an issue with the "Benchmark results" template.
 - **New directives:** unknown directives are rejected on purpose (an explicit
   allowlist, see `src/config/mod.rs`), and the `-V` banner only claims
   modules that are implemented. Widen either only together with the
-  implementation.
+  implementation, and rerun `scripts/directives.py` (it needs the `../nginx`
+  checkout and a release build) so [`docs/directives.md`](docs/directives.md)
+  says so.
 - Commit messages: what changed and *why*, with numbers when it's about
   performance. Look at `git log` for the house style.
 
