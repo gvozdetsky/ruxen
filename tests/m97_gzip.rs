@@ -124,17 +124,16 @@ const GZ: &str = "Accept-Encoding: gzip, deflate\r\n";
 fn m97_gzip_like_nginx() {
     let (_server, port) = start();
 
-    // A small static file: compressed whole, with its new length.
+    // A small static file: compressed whole, and sent without a length,
+    // as nginx's gzip filter drops it: chunked (proxy_cache.t).
     let (head, body) = get(port, "/", GZ, "1.1");
     assert!(head.contains("Content-Encoding: gzip"), "{head}");
     assert!(head.contains("Vary: Accept-Encoding"), "{head}");
     assert!(!head.contains("Accept-Ranges"), "{head}");
     assert!(head.contains("ETag: W/\""), "{head}");
-    assert!(
-        head.contains(&format!("Content-Length: {}", body.len())),
-        "{head}"
-    );
-    assert_eq!(gunzip(&body), b"X".repeat(64));
+    assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+    assert!(!head.contains("Content-Length"), "{head}");
+    assert_eq!(gunzip(&dechunk(&body)), b"X".repeat(64));
 
     // Without Accept-Encoding: as it was, plus Vary.
     let (head, body) = get(port, "/", "", "1.1");
@@ -176,10 +175,10 @@ fn m97_gzip_like_nginx() {
     // `return` and a proxied response.
     let (head, body) = get(port, "/ret", GZ, "1.1");
     assert!(head.contains("Content-Encoding: gzip"), "{head}");
-    assert_eq!(gunzip(&body), "one ".repeat(30).into_bytes());
+    assert_eq!(gunzip(&dechunk(&body)), "one ".repeat(30).into_bytes());
     let (head, body) = get(port, "/proxy/index.html", GZ, "1.1");
     assert!(head.contains("Content-Encoding: gzip"), "{head}");
-    assert_eq!(gunzip(&body), b"X".repeat(64));
+    assert_eq!(gunzip(&dechunk(&body)), b"X".repeat(64));
     // A proxied body too big to come with the head is relayed as it
     // arrives, and compressed on the way (#88): chunked, no length.
     let (head, body) = get(port, "/relay/big.css", GZ, "1.1");

@@ -351,7 +351,7 @@ pub(crate) fn filter(
                     (Response::File { headers: out, body }, None)
                 }
                 Decision::Compress if body.len <= WHOLE_FILE_MAX => {
-                    match compress_file(gz, &headers, body) {
+                    match compress_file(gz, req.http_11, &headers, body) {
                         Ok(out) => (Response::Owned(out), None),
                         // A read error: the plain path reports it.
                         Err(body) => (Response::File { headers, body }, None),
@@ -405,7 +405,7 @@ pub(crate) fn filter(
 }
 
 /// Files up to this size are read and compressed whole: the header and
-/// the body then go out in one write with a `Content-Length`, as other
+/// the body then go out in one write (`compressed_response`), as other
 /// bodies in memory do. Larger ones are streamed.
 const WHOLE_FILE_MAX: u64 = 64 * 1024;
 
@@ -413,6 +413,7 @@ const WHOLE_FILE_MAX: u64 = 64 * 1024;
 /// back when it can't be read whole.
 fn compress_file(
     gz: &PreparedGzip,
+    http_11: bool,
     headers: &[u8],
     body: crate::phase::FileBody,
 ) -> Result<Vec<u8>, crate::phase::FileBody> {
@@ -435,13 +436,7 @@ fn compress_file(
     }
     let result = if read == len {
         let compressed = compress_all(&input[..len], gz.comp_level, window_bits(Some(body.len)));
-        let mut length = Vec::with_capacity(40);
-        length.extend_from_slice(b"Content-Length: ");
-        length.extend_from_slice(compressed.len().to_string().as_bytes());
-        length.extend_from_slice(b"\r\n");
-        let mut out = rewrite_head(headers, gz.vary, Some(&length));
-        out.extend_from_slice(&compressed);
-        Ok(out)
+        Ok(compressed_response(headers, gz.vary, http_11, &compressed))
     } else {
         Err(crate::phase::FileBody {
             fd: file.into(),
@@ -502,15 +497,40 @@ fn filter_bytes(gz: &PreparedGzip, req: &GzipRequest<'_>, bytes: &[u8]) -> Optio
             }
             let compressed =
                 compress_all(body, gz.comp_level, window_bits(Some(body.len() as u64)));
-            let mut length = Vec::with_capacity(40);
-            length.extend_from_slice(b"Content-Length: ");
-            length.extend_from_slice(compressed.len().to_string().as_bytes());
-            length.extend_from_slice(b"\r\n");
-            let mut out = rewrite_head(headers, gz.vary, Some(&length));
-            out.extend_from_slice(&compressed);
-            Some(out)
+            Some(compressed_response(
+                headers,
+                gz.vary,
+                req.http_11,
+                &compressed,
+            ))
         }
     }
+}
+
+/// A response compressed whole, framed as nginx frames it: its gzip filter
+/// drops the length (ngx_http_clear_content_length), so HTTP/1.1 gets
+/// the body as one chunk (proxy_cache.t). HTTP/1.0 keeps a
+/// `Content-Length`, where nginx would end with the connection; it
+/// compresses for HTTP/1.0 only with `gzip_http_version 1.0`.
+fn compressed_response(headers: &[u8], vary: bool, http_11: bool, compressed: &[u8]) -> Vec<u8> {
+    let mut framing = Vec::with_capacity(40);
+    if http_11 {
+        framing.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    } else {
+        framing.extend_from_slice(b"Content-Length: ");
+        framing.extend_from_slice(compressed.len().to_string().as_bytes());
+        framing.extend_from_slice(b"\r\n");
+    }
+    let mut out = rewrite_head(headers, vary, Some(&framing));
+    out.reserve(compressed.len() + 16);
+    if http_11 {
+        out.extend_from_slice(format!("{:x}\r\n", compressed.len()).as_bytes());
+        out.extend_from_slice(compressed);
+        out.extend_from_slice(b"\r\n0\r\n\r\n");
+    } else {
+        out.extend_from_slice(compressed);
+    }
+    out
 }
 
 /// The header block with gzip's changes. `framing`: `None` keeps the
@@ -825,6 +845,33 @@ mod tests {
         assert!(head.contains("ETag: W/\"abc\""), "{head}");
         assert!(head.contains("Vary: Accept-Encoding"), "{head}");
         assert!(!head.contains("Accept-Ranges"), "{head}");
+        // nginx's framing: no length, the body as one chunk.
+        assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+        assert!(!head.contains("Content-Length"), "{head}");
+        let chunked = &bytes[end + 4..];
+        let crlf = chunked.windows(2).position(|w| w == b"\r\n").unwrap();
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&chunked[..crlf]).unwrap(), 16).unwrap();
+        let body = &chunked[crlf + 2..crlf + 2 + size];
+        assert_eq!(&chunked[crlf + 2 + size..], b"\r\n0\r\n\r\n");
+        assert_eq!(gunzip(body), vec![b'X'; 64]);
+
+        // HTTP/1.0 (`gzip_http_version 1.0`) keeps a length: it has no
+        // chunked framing.
+        let conf_10 = PreparedGzip {
+            http_10: true,
+            ..gz(&["text/html"])
+        };
+        let old = GzipRequest {
+            http_11: false,
+            ..req(Some(b"gzip"))
+        };
+        let (out, _) = filter(&conf_10, &old, Response::Prebuilt(RESP));
+        let Response::Owned(bytes) = out else {
+            panic!("not owned");
+        };
+        let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&bytes[..end]);
         let body = &bytes[end + 4..];
         assert!(
             head.contains(&format!("Content-Length: {}", body.len())),
