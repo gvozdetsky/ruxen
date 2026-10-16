@@ -152,31 +152,6 @@ pub(crate) fn rewrite_target_is_external(rendered: &[u8]) -> bool {
     rendered.starts_with(b"http://") || rendered.starts_with(b"https://")
 }
 
-/// Build an absolute `Location:` URL from a relative path. Mirrors nginx's
-/// `ngx_http_static_handler` directory-redirect behaviour with the default
-/// `absolute_redirect on`: scheme + Host header (or primary server_name as
-/// fallback) + listen port (omitted when it matches the scheme default) +
-/// the path. The path is expected to be already in URL form.
-pub(crate) fn build_absolute_redirect_location(
-    path: &[u8],
-    host: &[u8],
-    port: u16,
-    tls: bool,
-) -> Vec<u8> {
-    let scheme: &[u8] = if tls { b"https" } else { b"http" };
-    let default_port = if tls { 443 } else { 80 };
-    let mut out = Vec::with_capacity(scheme.len() + 3 + host.len() + 6 + path.len());
-    out.extend_from_slice(scheme);
-    out.extend_from_slice(b"://");
-    out.extend_from_slice(host);
-    if port != default_port {
-        out.push(b':');
-        out.extend_from_slice(port.to_string().as_bytes());
-    }
-    out.extend_from_slice(path);
-    out
-}
-
 /// `ngx_unescape_uri(…, NGX_UNESCAPE_REDIRECT)`, which a `rewrite …
 /// redirect` target goes through before the request's arguments are
 /// added: `%XX` turns into the byte when it is printable and above `%`,
@@ -339,6 +314,8 @@ pub(crate) fn execute_rewrite_ops(
     // `Server:` for a `return` response: the location's, or the server's
     // for the server-level program.
     server_header: &'static [u8],
+    // `absolute_redirect` and friends, likewise (#15).
+    redirect: crate::config::RedirectPolicy,
     req: &phase::RequestCtx<'_>,
     uri_path: &mut Vec<u8>,
     current_args: &mut Option<Vec<u8>>,
@@ -405,6 +382,7 @@ pub(crate) fn execute_rewrite_ops(
                         http,
                         server,
                         server_header,
+                        redirect,
                         req,
                         uri_path,
                         current_args,
@@ -476,6 +454,7 @@ pub(crate) fn execute_rewrite_ops(
                         rendered.extend_from_slice(args);
                     }
                     let location = escape_redirect_location(&rendered);
+                    let location = phase::RedirectCtx::new(redirect, req, server).apply(&location);
                     return RewriteControl::Respond(
                         Response::Owned(http::build_redirect_response(
                             status,
@@ -535,9 +514,16 @@ pub(crate) fn execute_rewrite_ops(
                     PreparedReturn::Static(prebuilt) => {
                         Response::Prebuilt(prebuilt.pick(req.method))
                     }
-                    PreparedReturn::Template { status, parts } => Response::Owned(
-                        build_templated_return(*status, parts, &ctx, req.method, server_header),
-                    ),
+                    PreparedReturn::Template { status, parts } => {
+                        Response::Owned(build_templated_return(
+                            *status,
+                            parts,
+                            &ctx,
+                            req.method,
+                            server_header,
+                            phase::RedirectCtx::new(redirect, req, server),
+                        ))
+                    }
                 };
                 return RewriteControl::Respond(response, *finalized);
             }
@@ -566,6 +552,7 @@ pub(crate) fn run_server_rewrite(
         http,
         server,
         server.server_header,
+        server.redirect,
         req,
         uri_path,
         current_args,
@@ -596,6 +583,7 @@ pub(crate) fn run_rewrite_program(
         http,
         server,
         loc.server_header,
+        loc.redirect,
         req,
         uri_path,
         current_args,

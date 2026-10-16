@@ -334,18 +334,18 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         access_logs: canonical_access_logs,
         split_clients: prepared_split_clients,
         maps: prepared_maps,
-        not_found: Prebuilt::leak(404, "Not Found\n", http_server_bytes),
-        bad_request: Prebuilt::leak(400, "Bad Request\n", http_server_bytes),
-        plain_http: Prebuilt::leak(
-            400,
+        not_found: Prebuilt::leak_error(404, "Not Found\n", http_server_bytes),
+        bad_request: Prebuilt::leak_error(400, "Bad Request\n", http_server_bytes),
+        plain_http: Prebuilt::leak_error(
+            497,
             "The plain HTTP request was sent to HTTPS port\n",
             http_server_bytes,
         ),
-        not_implemented: Prebuilt::leak(501, "Not Implemented\n", http_server_bytes),
-        forbidden: Prebuilt::leak(403, "Forbidden\n", http_server_bytes),
-        bad_gateway: Prebuilt::leak(502, "Bad Gateway\n", http_server_bytes),
-        gateway_timeout: Prebuilt::leak(504, "Gateway Timeout\n", http_server_bytes),
-        internal_error: Prebuilt::leak(500, "Internal Server Error\n", http_server_bytes),
+        not_implemented: Prebuilt::leak_error(501, "Not Implemented\n", http_server_bytes),
+        forbidden: Prebuilt::leak_error(403, "Forbidden\n", http_server_bytes),
+        bad_gateway: Prebuilt::leak_error(502, "Bad Gateway\n", http_server_bytes),
+        gateway_timeout: Prebuilt::leak_error(504, "Gateway Timeout\n", http_server_bytes),
+        internal_error: Prebuilt::leak_error(500, "Internal Server Error\n", http_server_bytes),
         upstreams: prepared_upstreams,
         cache_zones: CACHE_ZONES
             .with(|z| &*crate::arena::leak(z.borrow().clone().into_boxed_slice())),
@@ -1680,6 +1680,7 @@ pub(crate) fn prepare_server(
     // chunked_transfer_encoding has no http-scope inheritance pathway in
     // ruxen yet; default to nginx's `on` when unset at server scope.
     let server_chunked_transfer_encoding = server.chunked_transfer_encoding.unwrap_or(true);
+    let server_redirect = server.redirect.policy();
     let server_autoindex = server.autoindex.unwrap_or(http_autoindex);
     let server_autoindex_exact_size = server
         .autoindex_exact_size
@@ -1987,6 +1988,7 @@ pub(crate) fn prepare_server(
             post_action: server_post_action,
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
+            redirect: server.redirect.policy(),
             limit_req: prepare_limit_req(server.limit_req.clone())?,
             limit_conn: prepare_limit_conn(server.limit_conn.clone())?,
             timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
@@ -2010,6 +2012,7 @@ pub(crate) fn prepare_server(
         regex_names,
         matches_empty,
         primary_server_name,
+        redirect: server_redirect,
         listen_port,
         exact_locations: exact,
         prefix_locations: prefix,
@@ -2708,7 +2711,11 @@ pub(crate) fn prepare_return(
     tokens: crate::config::ServerTokens,
 ) -> PreparedReturn {
     let server_bytes = http::server_header_value(tokens);
-    if all_literal(&body) {
+    // A redirect to a path goes out as `absolute_redirect` makes it, with
+    // the request's host (#15): rendered per request.
+    let relative_redirect = is_redirect_status(status)
+        && matches!(body.first(), Some(ValuePart::Literal(s)) if s.starts_with('/'));
+    if all_literal(&body) && !relative_redirect {
         let concatenated = concat_literals(&body);
         // A redirect status is a redirect whatever its URL, an empty one
         // included: nginx's `ngx_http_send_response` sends an empty
@@ -2720,9 +2727,12 @@ pub(crate) fn prepare_return(
             // nginx error page (4xx/5xx), substitute it — including the
             // `<center>nginx/X.Y.Z</center>` signature that respects
             // `server_tokens`.
-            match http::default_error_page_body(status, tokens) {
-                Some(default_body) => Prebuilt::leak_bytes(status, &default_body, server_bytes),
-                None => Prebuilt::leak(status, &concatenated, server_bytes),
+            // 494–497 keep their code for `error_page` to find, which the
+            // page, sent as 400, wouldn't (http_error_page.t "redirect 497").
+            if (494..=497).contains(&status) {
+                Prebuilt::leak(status, &concatenated, server_bytes)
+            } else {
+                Prebuilt::leak_error(status, &concatenated, server_bytes)
             }
         } else {
             Prebuilt::leak(status, &concatenated, server_bytes)
@@ -3132,6 +3142,7 @@ pub(crate) fn build_prefix_or_exact(
         proxy: location_proxy,
         gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
+        redirect,
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
@@ -3162,6 +3173,31 @@ pub(crate) fn build_prefix_or_exact(
         ..proxy_effective
     };
     let limited_handler = match &limit_except {
+        // `proxy_pass` in the block: the other methods are proxied there,
+        // with the location's proxy_* settings (proxy_if.t).
+        Some(le) if le.proxy_pass.is_some() => Some(build_handler(
+            Handler::Proxy(le.proxy_pass.clone().expect("checked")),
+            pattern,
+            is_regex,
+            alias_prefix_override,
+            None,
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            proxy_effective,
+        )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),
@@ -3293,6 +3329,7 @@ pub(crate) fn build_prefix_or_exact(
         post_action,
         expires,
         chunked_transfer_encoding,
+        redirect: redirect.policy(),
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
         limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
         timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
@@ -3386,6 +3423,7 @@ pub(crate) fn build_regex_location(
         proxy: location_proxy,
         gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
+        redirect,
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
@@ -3425,6 +3463,31 @@ pub(crate) fn build_regex_location(
         ..proxy_effective
     };
     let limited_handler = match &limit_except {
+        // `proxy_pass` in the block: the other methods are proxied there,
+        // with the location's proxy_* settings (proxy_if.t).
+        Some(le) if le.proxy_pass.is_some() => Some(build_handler(
+            Handler::Proxy(le.proxy_pass.clone().expect("checked")),
+            location_pattern,
+            true,
+            alias_prefix_override,
+            None,
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            proxy_effective,
+        )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),
@@ -3554,6 +3617,7 @@ pub(crate) fn build_regex_location(
         post_action,
         expires,
         chunked_transfer_encoding,
+        redirect: redirect.policy(),
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
         limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
         timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
@@ -3582,9 +3646,11 @@ pub(crate) fn prepare_try_files(
         .collect();
     let server_bytes = http::server_header_value(tokens);
     let fallback = match tf.fallback {
-        TryFilesFallback::Status(code) => {
-            PreparedFallback::Status(Prebuilt::leak(code, fallback_body(code), server_bytes))
-        }
+        TryFilesFallback::Status(code) => PreparedFallback::Status(Prebuilt::leak_error(
+            code,
+            fallback_body(code),
+            server_bytes,
+        )),
         TryFilesFallback::Uri(u) => PreparedFallback::Uri(leak_bytes(u.as_bytes())),
         TryFilesFallback::UriTemplate(parts) => {
             PreparedFallback::UriTemplate(prepare_value_parts(parts))

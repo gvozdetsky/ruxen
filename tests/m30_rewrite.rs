@@ -252,3 +252,92 @@ http {
     assert_eq!(status_line(&text), "HTTP/1.1 403 Forbidden");
     assert_eq!(body(&text), b"text");
 }
+
+/// `return URL;` (#16): a 302 to the URL, variables rendered, in a server,
+/// a location and an `if`.
+#[test]
+fn return_url_alone_redirects_with_302() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location /lit { return http://example.com/new; }
+    location /var { return https://example.com$uri?a=$arg_a; }
+    location /if {
+      if ($arg_go) { return $scheme://other.example$uri; }
+      return 200 stay;
+    }
+  }
+}
+"#;
+    let (_s, port) = spawn_server(conf);
+    let r = http_get(port, "/lit");
+    assert!(
+        status_line(&r).contains("302"),
+        "{}",
+        String::from_utf8_lossy(&r)
+    );
+    assert_eq!(header_value(&r, "Location"), Some("http://example.com/new"));
+    let r = http_get(port, "/var?a=1");
+    assert!(status_line(&r).contains("302"));
+    assert_eq!(
+        header_value(&r, "Location"),
+        Some("https://example.com/var?a=1")
+    );
+    let r = http_get(port, "/if?go=1");
+    assert_eq!(
+        header_value(&r, "Location"),
+        Some("http://other.example/if")
+    );
+    assert_eq!(body(&http_get(port, "/if")), b"stay");
+}
+
+/// `absolute_redirect`, `server_name_in_redirect`, `port_in_redirect`
+/// (#15): a Location that starts with `/` is made absolute as nginx's
+/// header filter makes it, whoever set it (`return`, `rewrite`, the
+/// directory redirect), with the Host, else the local address, and the
+/// port unless it is off; `absolute_redirect off` leaves it a path.
+#[test]
+fn redirects_follow_absolute_redirect() {
+    let conf = r#"
+events {}
+http {
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    server_name named.example;
+    root %%DIR%%;
+    location /ret { return 301 /target; }
+    location /rw { rewrite ^ /rewritten redirect; }
+    location /name { server_name_in_redirect on; return 302 /n; }
+    location /noport { port_in_redirect off; return 302 /p; }
+    location /off { absolute_redirect off; return 302 /rel; }
+  }
+}
+"#;
+    let (s, port) = spawn_server(conf);
+    std::fs::create_dir_all(s.tempdir.join("a dir")).unwrap();
+    let loc = |path: &str| {
+        let r = http_get(port, path);
+        header_value(&r, "Location").map(str::to_string)
+    };
+    assert_eq!(
+        loc("/ret").as_deref(),
+        Some(format!("http://localhost:{port}/target").as_str())
+    );
+    assert_eq!(
+        loc("/rw").as_deref(),
+        Some(format!("http://localhost:{port}/rewritten").as_str())
+    );
+    assert_eq!(
+        loc("/name").as_deref(),
+        Some(format!("http://named.example:{port}/n").as_str())
+    );
+    assert_eq!(loc("/noport").as_deref(), Some("http://localhost/p"));
+    assert_eq!(loc("/off").as_deref(), Some("/rel"));
+    // The directory redirect escapes the URI and keeps the arguments.
+    assert_eq!(
+        loc("/a%20dir?x=1").as_deref(),
+        Some(format!("http://localhost:{port}/a%20dir/?x=1").as_str())
+    );
+}

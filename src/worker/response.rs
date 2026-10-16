@@ -43,11 +43,12 @@ pub(crate) fn build_templated_return(
     ctx: &RenderCtx<'_>,
     method: Method,
     server: &[u8],
+    redirect: crate::phase::RedirectCtx<'_>,
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(64);
     render_parts(parts, ctx, &mut body);
     if is_redirect_status(status) {
-        http::build_redirect_response(status, &body, method, server)
+        http::build_redirect_response(status, &redirect.apply(&body), method, server)
     } else if matches!(method, Method::Head) {
         http::build_head_response(status, body.len(), server)
     } else {
@@ -1106,12 +1107,15 @@ pub(crate) fn rewrite_proxy_redirects(
             };
             let mut new = apply_redirect_rules(rules, value, prefix, &render_ctx)?;
             if is_location && new.first() == Some(&b'/') {
-                new = build_absolute_redirect_location(
-                    &new,
-                    ctx.host.unwrap_or(meta.server_name),
-                    meta.server_port,
-                    ctx.tls.is_some(),
-                );
+                let redirect = crate::phase::RedirectCtx {
+                    policy: meta.redirect,
+                    host: ctx.host,
+                    server_name: meta.server_name,
+                    port: meta.server_port,
+                    tls: ctx.tls.is_some(),
+                    local_addr: &ctx.conn.server_addr,
+                };
+                new = redirect.apply(&new).into_owned();
             }
             let mut line_out = line[..colon + 1].to_vec();
             line_out.push(b' ');

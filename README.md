@@ -151,11 +151,11 @@ ruxen --compat -c /etc/nginx/nginx.conf
 
 ```text
 ruxen 0.1.3: checking /etc/nginx/nginx.conf
-/etc/nginx/nginx.conf:33: unsupported: ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3 — TLSv1, TLSv1.1 rejected: ruxen speaks TLSv1.2 and TLSv1.3 only (#36 would accept the old names with a warning)
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
 /etc/nginx/nginx.conf:27: differs: default_type application/octet-stream — files of unknown types get ruxen's built-in default (#38)
+-: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
-ruxen does not start with this configuration: 2 unsupported, 1 behaving differently
+ruxen does not start with this configuration: 1 unsupported, 2 behaving differently
 ```
 
 - **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
@@ -271,11 +271,11 @@ ALPN offers `h2` where the server has `http2 on` (or `listen … http2`), else H
 
 ### Configuration and request processing
 
-A growing nginx-compatible configuration surface is implemented, including:
+A growing nginx-compatible configuration surface is implemented. [`docs/directives.md`](docs/directives.md) lists every directive of nginx's core, events and http modules and what ruxen does with it; the main ones:
 
-- `return`
-- `add_header`
-- `add_trailer`
+- `include`, with patterns (`include conf.d/*.conf;`: the matches sorted, none is fine, as nginx's glob)
+- `return`, including `return URL;` (a 302)
+- `add_header` and `add_trailer`, at http, server and location level
 - `expires`
 - `error_page` and `recursive_error_pages`
 - `post_action`

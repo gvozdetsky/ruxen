@@ -218,8 +218,13 @@ fn m12_return_redirect_without_url_has_empty_location() {
     assert_eq!(status_line(&empty), "HTTP/1.1 302 Moved Temporarily");
     assert_eq!(header_value(&empty, "Location"), Some(""));
 
+    // A path is made absolute, as nginx's header filter does with
+    // `absolute_redirect on` (#15).
     let set = http_get(port, "/empty302?to=/x");
-    assert_eq!(header_value(&set, "Location"), Some("/x"));
+    assert_eq!(
+        header_value(&set, "Location"),
+        Some(format!("http://localhost:{port}/x").as_str())
+    );
 }
 
 #[test]

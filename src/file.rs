@@ -599,8 +599,9 @@ fn io_error_response(e: std::io::Error, method: Method, server: &[u8]) -> Vec<u8
     }
 }
 
+/// nginx's page for the status (#34), else `body` as plain text.
 fn error_response(status: u16, body: &str, method: Method, server: &[u8]) -> Vec<u8> {
-    crate::http::build_response_for_method(status, body, method, server)
+    crate::http::error_response_for_method(status, body, method, server)
 }
 
 pub(crate) fn mime_for(ext: &[u8]) -> &'static [u8] {
