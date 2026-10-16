@@ -3091,6 +3091,31 @@ pub(crate) fn build_prefix_or_exact(
         ..proxy_effective
     };
     let limited_handler = match &limit_except {
+        // `proxy_pass` in the block: the other methods are proxied there,
+        // with the location's proxy_* settings (proxy_if.t).
+        Some(le) if le.proxy_pass.is_some() => Some(build_handler(
+            Handler::Proxy(le.proxy_pass.clone().expect("checked")),
+            pattern,
+            is_regex,
+            alias_prefix_override,
+            None,
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            proxy_effective,
+        )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),
@@ -3356,6 +3381,31 @@ pub(crate) fn build_regex_location(
         ..proxy_effective
     };
     let limited_handler = match &limit_except {
+        // `proxy_pass` in the block: the other methods are proxied there,
+        // with the location's proxy_* settings (proxy_if.t).
+        Some(le) if le.proxy_pass.is_some() => Some(build_handler(
+            Handler::Proxy(le.proxy_pass.clone().expect("checked")),
+            location_pattern,
+            true,
+            alias_prefix_override,
+            None,
+            None,
+            server_index,
+            location_autoindex,
+            location_autoindex_exact_size,
+            location_autoindex_localtime,
+            location_autoindex_format,
+            server_autoindex,
+            server_autoindex_exact_size,
+            server_autoindex_localtime,
+            server_autoindex_format,
+            location_disable_symlinks
+                .clone()
+                .or_else(|| server_disable_symlinks.clone()),
+            tokens,
+            upstreams,
+            proxy_effective,
+        )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),

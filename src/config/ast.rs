@@ -1514,6 +1514,9 @@ pub struct LimitExcept {
     /// inherits the location's.
     pub auth_basic: Option<AuthBasic>,
     pub auth_basic_user_file: Option<PathBuf>,
+    /// `proxy_pass` of the block: the other methods go to it (its own
+    /// content handler in nginx); `None` keeps the location's handler.
+    pub proxy_pass: Option<ProxyPass>,
 }
 
 /// The methods `limit_except` takes, in `ngx_methods_names` order.
