@@ -314,6 +314,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut index: Option<Vec<IndexEntry>> = None;
     let mut error_pages: Option<Vec<ErrorPage>> = None;
     let mut add_headers: Option<Vec<AddHeader>> = None;
+    let mut redirect = RedirectConf::default();
     let mut add_trailers: Option<Vec<AddHeader>> = None;
     let mut recursive_error_pages: Option<bool> = None;
     let mut merge_slashes: Option<bool> = None;
@@ -358,6 +359,14 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         }
                         if server.add_trailers.is_none() {
                             server.add_trailers.clone_from(&add_trailers);
+                        }
+                        // absolute_redirect and friends (#15): http into the
+                        // server, the server into each location and its
+                        // `if` blocks.
+                        server.redirect = server.redirect.inherit(&redirect);
+                        let server_redirect = server.redirect;
+                        for loc in &mut server.locations {
+                            loc.inherit_redirect(&server_redirect);
                         }
                         server.recursive_error_pages =
                             server.recursive_error_pages.or(recursive_error_pages);
@@ -492,6 +501,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 let entry = parse_add_header_args(&args[1..])?;
                 add_headers.get_or_insert_with(Vec::new).push(entry);
             }
+            (name, Terminator::Semi) if RedirectConf::takes(name) => redirect.parse(&args)?,
             ("add_trailer", Terminator::Semi) => {
                 let entry = parse_add_header_args(&args[1..])?;
                 add_trailers.get_or_insert_with(Vec::new).push(entry);
@@ -988,9 +998,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "chunked_transfer_encoding",
     "output_buffers",
     "postpone_output",
-    "server_name_in_redirect",
-    "port_in_redirect",
-    "absolute_redirect",
     "server_names_hash_bucket_size",
     "server_names_hash_max_size",
     "types_hash_bucket_size",

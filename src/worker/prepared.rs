@@ -1266,6 +1266,8 @@ pub struct PreparedLocation {
     /// chunked is off there is no chunked frame to append trailers to,
     /// so they are silently dropped (matching nginx's chunked filter).
     pub chunked_transfer_encoding: bool,
+    /// `absolute_redirect` and friends, resolved (#15).
+    pub redirect: crate::config::RedirectPolicy,
     /// `limit_req` for requests routed here (#94); `None` without.
     pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
     /// `limit_conn` for requests routed here (#95); `None` without.
@@ -1316,6 +1318,8 @@ pub struct PreparedRegexLocation {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `absolute_redirect` and friends, resolved (#15).
+    pub redirect: crate::config::RedirectPolicy,
     /// `limit_req` for requests routed here (#94); `None` without.
     pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
     /// `limit_conn` for requests routed here (#95); `None` without.
@@ -1361,6 +1365,8 @@ pub struct MatchedLocation<'a> {
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
     pub chunked_transfer_encoding: bool,
+    /// `absolute_redirect` and friends, resolved (#15).
+    pub redirect: crate::config::RedirectPolicy,
     /// `limit_req` for requests routed here (#94); `None` without.
     pub limit_req: Option<&'static super::limit_req::PreparedLimitReq>,
     /// `limit_conn` for requests routed here (#95); `None` without.
@@ -1400,6 +1406,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            redirect: loc.redirect,
             limit_req: loc.limit_req,
             limit_conn: loc.limit_conn,
             timeouts: loc.timeouts,
@@ -1453,6 +1460,7 @@ impl<'a> MatchedLocation<'a> {
             post_action: loc.post_action,
             expires: loc.expires,
             chunked_transfer_encoding: loc.chunked_transfer_encoding,
+            redirect: loc.redirect,
             limit_req: loc.limit_req,
             limit_conn: loc.limit_conn,
             timeouts: loc.timeouts,
@@ -1549,6 +1557,9 @@ pub struct PreparedServer {
     /// by `$server_name`. For `~^...` it includes the `~` prefix; for
     /// `*.foo` it includes the `*`.
     pub primary_server_name: &'static [u8],
+    /// `absolute_redirect` and friends at server level (#15), for its own
+    /// rewrite program.
+    pub redirect: crate::config::RedirectPolicy,
     /// Listening port declared on this `server {}` block. Rendered by
     /// `$server_port`.
     pub listen_port: u16,

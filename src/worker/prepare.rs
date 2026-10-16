@@ -1598,6 +1598,7 @@ pub(crate) fn prepare_server(
     // chunked_transfer_encoding has no http-scope inheritance pathway in
     // ruxen yet; default to nginx's `on` when unset at server scope.
     let server_chunked_transfer_encoding = server.chunked_transfer_encoding.unwrap_or(true);
+    let server_redirect = server.redirect.policy();
     let server_autoindex = server.autoindex.unwrap_or(http_autoindex);
     let server_autoindex_exact_size = server
         .autoindex_exact_size
@@ -1905,6 +1906,7 @@ pub(crate) fn prepare_server(
             post_action: server_post_action,
             expires: server_expires,
             chunked_transfer_encoding: server_chunked_transfer_encoding,
+            redirect: server.redirect.policy(),
             limit_req: prepare_limit_req(server.limit_req.clone())?,
             limit_conn: prepare_limit_conn(server.limit_conn.clone())?,
             timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
@@ -1928,6 +1930,7 @@ pub(crate) fn prepare_server(
         regex_names,
         matches_empty,
         primary_server_name,
+        redirect: server_redirect,
         listen_port,
         exact_locations: exact,
         prefix_locations: prefix,
@@ -2626,7 +2629,11 @@ pub(crate) fn prepare_return(
     tokens: crate::config::ServerTokens,
 ) -> PreparedReturn {
     let server_bytes = http::server_header_value(tokens);
-    if all_literal(&body) {
+    // A redirect to a path goes out as `absolute_redirect` makes it, with
+    // the request's host (#15): rendered per request.
+    let relative_redirect = is_redirect_status(status)
+        && matches!(body.first(), Some(ValuePart::Literal(s)) if s.starts_with('/'));
+    if all_literal(&body) && !relative_redirect {
         let concatenated = concat_literals(&body);
         // A redirect status is a redirect whatever its URL, an empty one
         // included: nginx's `ngx_http_send_response` sends an empty
@@ -3053,6 +3060,7 @@ pub(crate) fn build_prefix_or_exact(
         proxy: location_proxy,
         gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
+        redirect,
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
@@ -3214,6 +3222,7 @@ pub(crate) fn build_prefix_or_exact(
         post_action,
         expires,
         chunked_transfer_encoding,
+        redirect: redirect.policy(),
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
         limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
         timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
@@ -3307,6 +3316,7 @@ pub(crate) fn build_regex_location(
         proxy: location_proxy,
         gzip: location_gzip,
         chunked_transfer_encoding: location_chunked_transfer_encoding,
+        redirect,
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
@@ -3475,6 +3485,7 @@ pub(crate) fn build_regex_location(
         post_action,
         expires,
         chunked_transfer_encoding,
+        redirect: redirect.policy(),
         limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
         limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
         timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(

@@ -290,6 +290,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
         }
     }
     or(&mut child.index, &parent.index);
+    child.redirect = child.redirect.inherit(&parent.redirect);
     or(&mut child.add_headers, &parent.add_headers);
     or(&mut child.add_trailers, &parent.add_trailers);
     or(&mut child.error_pages, &parent.error_pages);
@@ -573,6 +574,7 @@ pub(crate) fn parse_location_block(
     let mut limit_req = LimitReqConf::default();
     let mut limit_conn = LimitConnConf::default();
     let mut chunked_transfer_encoding: Option<bool> = None;
+    let mut redirect = RedirectConf::default();
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
@@ -721,6 +723,7 @@ pub(crate) fn parse_location_block(
                         limit_req,
                         limit_conn,
                         chunked_transfer_encoding,
+                        redirect,
                         client_timeouts,
                         alias_prefix_override,
                         inherits_root,
@@ -1061,6 +1064,7 @@ pub(crate) fn parse_location_block(
                 }
                 sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
             }
+            (name, Terminator::Semi) if RedirectConf::takes(name) => redirect.parse(&args)?,
             ("chunked_transfer_encoding", Terminator::Semi) => {
                 if chunked_transfer_encoding.is_some() {
                     return Err(Error::Duplicate("chunked_transfer_encoding"));
