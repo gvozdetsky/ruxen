@@ -420,6 +420,19 @@ fn cache_plan(
             }
         }
     }
+    // ngx_http_upstream_cache_check_range: a range from too far into the
+    // response isn't worth fetching it whole for the cache; it goes
+    // upstream as asked, and nothing is stored.
+    if hit.is_none()
+        && cacheable
+        && let Some(max) = conf.max_range_offset
+        && let Some(range) = req.range
+        && range_too_far(range, max)
+    {
+        cacheable = false;
+        store = false;
+        token = None;
+    }
     Ok(Some(Box::new(CachePlan {
         conf,
         zone,
@@ -665,6 +678,31 @@ pub(crate) fn finish_access_denial(
         preserved_www_authenticate,
         loc.expires,
     )
+}
+
+/// ngx_http_upstream_cache_check_range: `Range` starts at or past `max`
+/// (always, for `0`), or counts from the end.
+fn range_too_far(range: &[u8], max: u64) -> bool {
+    if max == 0 {
+        return true;
+    }
+    let Some(spec) = range
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case(b"bytes="))
+        .map(|_| &range[6..])
+        .filter(|_| range.len() >= 7)
+    else {
+        return false;
+    };
+    let spec = spec.trim_ascii_start();
+    if spec.first() == Some(&b'-') {
+        return true;
+    }
+    let digits = spec.iter().take_while(|b| b.is_ascii_digit()).count();
+    std::str::from_utf8(&spec[..digits])
+        .ok()
+        .and_then(|d| d.parse::<u64>().ok())
+        .is_some_and(|offset| offset >= max)
 }
 
 pub(crate) fn run_location_handler(
@@ -1769,4 +1807,23 @@ fn resolve_bind(
         addr,
         transparent: bind.transparent,
     })
+}
+
+#[cfg(test)]
+mod range_offset_tests {
+    use super::range_too_far;
+
+    /// ngx_http_upstream_cache_check_range's cases.
+    #[test]
+    fn ranges_past_the_offset() {
+        assert!(!range_too_far(b"bytes=1-", 2));
+        assert!(range_too_far(b"bytes=3-", 2));
+        assert!(range_too_far(b"bytes=2-5", 2));
+        assert!(range_too_far(b"bytes=-1", 2));
+        assert!(range_too_far(b"bytes= -1", 2));
+        assert!(!range_too_far(b"bytes=1-1,3-", 2));
+        assert!(range_too_far(b"bytes=0-0", 0));
+        assert!(!range_too_far(b"items=5-", 2));
+        assert!(!range_too_far(b"bytes=", 2));
+    }
 }

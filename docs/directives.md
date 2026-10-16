@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 167 implemented, 31 accepted with a difference, 73 accepted with no effect, 1 refused, 278 unknown.
+Of 550 directives: 168 implemented, 31 accepted with a difference, 73 accepted with no effect, 1 refused, 277 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -441,7 +441,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_no_cache` | yes | http, server, location |  |
 | `proxy_cache_valid` | yes | http, server, location |  |
 | `proxy_cache_min_uses` | yes | http, server, location |  |
-| `proxy_cache_max_range_offset` | no |  |  |
+| `proxy_cache_max_range_offset` | yes | http, server, location |  |
 | `proxy_cache_use_stale` | yes | http, server, location |  |
 | `proxy_cache_methods` | yes | http, server, location |  |
 | `proxy_cache_lock` | yes | http, server, location |  |

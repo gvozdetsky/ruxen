@@ -679,6 +679,7 @@ impl ProxyConf {
         "proxy_cache_lock",
         "proxy_cache_lock_timeout",
         "proxy_cache_lock_age",
+        "proxy_cache_max_range_offset",
         "proxy_ssl_server_name",
         "proxy_ssl_name",
         "proxy_ssl_session_reuse",
@@ -1121,6 +1122,20 @@ impl ProxyConf {
                     return Err(Error::Duplicate("proxy_cache_lock"));
                 }
                 self.cache.lock = Some(parse_on_off_args(&args[1..], "proxy_cache_lock")?);
+            }
+            "proxy_cache_max_range_offset" => {
+                if self.cache.max_range_offset.is_some() {
+                    return Err(Error::Duplicate("proxy_cache_max_range_offset"));
+                }
+                let [_, v] = args else {
+                    return Err(Error::MissingArg("proxy_cache_max_range_offset"));
+                };
+                self.cache.max_range_offset = Some(
+                    super::parse_server::parse_size_bytes(v).ok_or(Error::BadValue {
+                        what: "proxy_cache_max_range_offset",
+                        got: v.clone(),
+                    })?,
+                );
             }
             name @ ("proxy_cache_lock_timeout" | "proxy_cache_lock_age") => {
                 let (slot, what) = if name == "proxy_cache_lock_age" {
