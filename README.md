@@ -272,6 +272,7 @@ ALPN offers `h2` where the server has `http2 on` (or `listen … http2`), else H
 
 A growing nginx-compatible configuration surface is implemented, including:
 
+- `include`, with patterns (`include conf.d/*.conf;`: the matches sorted, none is fine, as nginx's glob)
 - `return`
 - `add_header`
 - `add_trailer`

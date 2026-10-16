@@ -113,12 +113,7 @@ pub(crate) fn include_failed(lx: &Lexer, args: &[String], err: Error) -> Result<
     if !collecting() {
         return Err(err);
     }
-    let note = if args[1].contains(['*', '?', '[']) {
-        "wildcards in include are not supported yet (#35); the files it names were not checked"
-            .to_string()
-    } else {
-        format!("{err}; the check goes on without it")
-    };
+    let note = format!("{err}; the check goes on without it");
     record(lx, Severity::Unsupported, args, note);
     Ok(())
 }
