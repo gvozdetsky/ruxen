@@ -466,6 +466,12 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   needs the same SNI name, and the chain is checked again on every
   handshake. Not done: nginx removes the session of a refused handshake
   from its cache; here a resumed one is refused the same way again.
+  The `$ssl_client_*` fields (#114) are printed from the leaf's DER, kept in
+  `HandshakeInfo`, by AWS-LC's own printers (`x509_verify::print_field`:
+  `PEM_write_bio_X509`, `X509_NAME_print_ex` with `XN_FLAG_RFC2253`,
+  `X509_NAME_oneline`, `i2a_ASN1_INTEGER`, `ASN1_TIME_print`), so the text is
+  OpenSSL's, escaping and attribute names included; the certificate is
+  parsed only when such a variable is rendered.
 - **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
   rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
   When the variable is used and the listen resumes sessions, a full

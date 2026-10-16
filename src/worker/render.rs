@@ -343,17 +343,12 @@ impl RenderCtx<'_> {
                     }
                 }
             }
-            // Client-cert DNs and validity range are intentionally empty
-            // until the peer certificate is decoded for them (#114). Returning
-            // hard-coded placeholder strings would let nginx-tests pass
-            // for the wrong reason.
-            Variable::SslClientIDn => {}
-            Variable::SslClientIDnLegacy => {}
-            Variable::SslClientSDn => {}
-            Variable::SslClientSDnLegacy => {}
-            Variable::SslClientVStart => {}
-            Variable::SslClientVEnd => {}
-            Variable::SslClientVRemain => {}
+            // The client certificate, printed as nginx prints it (#114).
+            Variable::SslClient(field) => {
+                if let Some(der) = self.tls.and_then(|info| info.client_cert.as_deref()) {
+                    crate::x509_verify::print_field(der, *field, out);
+                }
+            }
             Variable::Hostname => out.extend_from_slice(self.hostname),
             Variable::LimitConnStatus => {
                 if let Some(state) = self.rewrite_state {
@@ -1055,13 +1050,7 @@ fn unset_when_empty(v: &Variable) -> bool {
             | Variable::SslServerName
             | Variable::SslSessionId
             | Variable::SslClientVerify
-            | Variable::SslClientIDn
-            | Variable::SslClientIDnLegacy
-            | Variable::SslClientSDn
-            | Variable::SslClientSDnLegacy
-            | Variable::SslClientVStart
-            | Variable::SslClientVEnd
-            | Variable::SslClientVRemain
+            | Variable::SslClient(_)
             | Variable::ProxyProtocolAddr
             | Variable::ProxyProtocolPort
             | Variable::ProxyProtocolServerAddr

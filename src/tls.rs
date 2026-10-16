@@ -116,6 +116,8 @@ pub struct HandshakeInfo {
     /// The client's certificate, checked once after the handshake against
     /// the context it ran with (`ssl_verify_client`, #113).
     pub client_verify: crate::client_verify::ClientVerify,
+    /// The DER of the client's certificate, for `$ssl_client_*` (#114).
+    pub client_cert: Option<Arc<[u8]>>,
 }
 
 impl HandshakeInfo {
@@ -134,6 +136,10 @@ impl HandshakeInfo {
             client_verify: verify
                 .map(|v| v.check(conn.peer_certificates()))
                 .unwrap_or_default(),
+            client_cert: conn
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .map(|leaf| Arc::from(leaf.as_ref())),
         }
     }
 }
