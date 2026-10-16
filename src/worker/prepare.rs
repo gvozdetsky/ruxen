@@ -853,6 +853,7 @@ fn prepare_proxy_cache(
         lock_timeout_ms: conf.lock_timeout_ms.unwrap_or(5000),
         lock_age_ms: conf.lock_age_ms.unwrap_or(5000),
         ignore,
+        max_range_offset: conf.max_range_offset,
     }))))
 }
 

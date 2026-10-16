@@ -741,6 +741,8 @@ pub struct PreparedProxyCache {
     pub lock_timeout_ms: u64,
     pub lock_age_ms: u64,
     pub ignore: crate::proxy_cache::Ignore,
+    /// `proxy_cache_max_range_offset`; `None` is no limit.
+    pub max_range_offset: Option<u64>,
 }
 
 impl std::fmt::Debug for PreparedProxyCache {
@@ -932,6 +934,7 @@ pub(crate) static NO_CACHE_CONF: crate::config::ProxyCacheConf = crate::config::
     lock: None,
     lock_timeout_ms: None,
     lock_age_ms: None,
+    max_range_offset: None,
 };
 
 impl ProxyEffective {
