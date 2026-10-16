@@ -520,6 +520,47 @@ pub fn build_server_config(
     Ok(Arc::new(cfg))
 }
 
+/// `base` with a client-certificate verifier (#113): a config of its own,
+/// since rustls keeps the verifier private, with everything else `base`'s,
+/// its session cache and ticket keys included. A session can't cross
+/// contexts anyway: resumption needs the same SNI name, which picks the
+/// context, and the certificate is checked again after every handshake.
+pub fn with_client_verifier(
+    base: &ServerConfig,
+    protocols: TlsVersionSet,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Arc<ServerConfig> {
+    let versions: Vec<&'static SupportedProtocolVersion> = [
+        (protocols.tlsv1_3, &rustls::version::TLS13),
+        (protocols.tlsv1_2, &rustls::version::TLS12),
+    ]
+    .into_iter()
+    .filter_map(|(on, v)| on.then_some(v))
+    .collect();
+    let mut cfg = ServerConfig::builder_with_provider(base.crypto_provider().clone())
+        .with_protocol_versions(&versions)
+        .expect("the base config's versions")
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(base.cert_resolver.clone());
+    // Every public field, as rustls 0.23 has them.
+    cfg.ignore_client_order = base.ignore_client_order;
+    cfg.max_fragment_size = base.max_fragment_size;
+    cfg.session_storage = base.session_storage.clone();
+    cfg.ticketer = base.ticketer.clone();
+    cfg.alpn_protocols = base.alpn_protocols.clone();
+    cfg.key_log = base.key_log.clone();
+    cfg.enable_secret_extraction = base.enable_secret_extraction;
+    cfg.max_early_data_size = base.max_early_data_size;
+    cfg.send_half_rtt_data = base.send_half_rtt_data;
+    cfg.send_tls13_tickets = base.send_tls13_tickets;
+    cfg.require_ems = base.require_ems;
+    cfg.time_provider = base.time_provider.clone();
+    cfg.cert_compressors = base.cert_compressors.clone();
+    cfg.cert_compression_cache = base.cert_compression_cache.clone();
+    cfg.cert_decompressors = base.cert_decompressors.clone();
+    Arc::new(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

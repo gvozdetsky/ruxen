@@ -328,6 +328,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_session_timeout_ms: Option<u64> = None;
     let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
+    let mut client_verify = ClientVerifyConf::default();
     let mut warnings: Vec<String> = Vec::new();
     loop {
         let (args, term) = lx.read_directive()?;
@@ -401,6 +402,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
                         ssl.resumption = std::mem::take(&mut ssl.resumption).inherit(&resumption);
                         ssl.reject_handshake = ssl.reject_handshake.or(ssl_reject_handshake);
+                        ssl.client_verify =
+                            std::mem::take(&mut ssl.client_verify).inherit(&client_verify);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -648,6 +651,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 };
                 resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
+            (name, Terminator::Semi) if ClientVerifyConf::takes(name) => {
+                client_verify.parse(&args, lx.conf_prefix())?
+            }
             (
                 "ssl_buffer_size"
                 | "ssl_dhparam"
@@ -656,11 +662,6 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_stapling_file"
                 | "ssl_stapling_responder"
                 | "ssl_stapling_verify"
-                | "ssl_verify_client"
-                | "ssl_verify_depth"
-                | "ssl_client_certificate"
-                | "ssl_trusted_certificate"
-                | "ssl_crl"
                 | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_conf_command",
@@ -1081,18 +1082,10 @@ pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "types", "charset_map"];
 /// Fail closed on directives that restrict access, when ruxen can't
 /// enforce them yet. The allowlist above is for tuning knobs; silently
 /// dropping one of these would serve what the config says to protect.
-/// Forms nginx itself doesn't enforce still load: `ssl_verify_client off`,
-/// and `optional` / `optional_no_ca`, where nginx admits clients without a
-/// certificate and the config decides via `$ssl_client_verify` — which
-/// ruxen renders as `NONE`, so a `= SUCCESS` check denies (see
-/// `warn_ignored_tls_policy`).
 /// Called by the lexer for every directive, so no scope can miss it.
 pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
-        Some("ssl_verify_client") if value == Some("on") => {
-            "clients would be accepted without a certificate"
-        }
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
         // dropping them weakens what the config protects. Only `off` loads.
         Some("proxy_cookie_flags") if value != Some("off") || args.len() != 2 => {
@@ -1129,10 +1122,6 @@ pub(crate) fn warn_ignored_tls_policy(args: &[String], warnings: &mut Vec<String
         ("ssl_ecdh_curve", _) => format!(
             "\"{name}\" is not supported yet and is ignored: rustls's default key exchange groups \
              are used"
-        ),
-        ("ssl_verify_client", Some(mode @ ("optional" | "optional_no_ca"))) => format!(
-            "\"ssl_verify_client {mode}\" is not supported yet: client certificates are not \
-             requested, and $ssl_client_verify is always \"NONE\""
         ),
         _ => return,
     };
@@ -2096,7 +2085,12 @@ mod tests {
                  ssl_certificate_key k.pem; {directive} }} }}"
             )
         };
-        unenforced_err(&tls("ssl_verify_client on;"));
+        // ssl_verify_client is enforced now (client_verify, #113), with
+        // every level's settings.
+        let cfg = parse(&tls("ssl_verify_client on; ssl_verify_depth 2;")).unwrap();
+        let verify = &cfg.servers[0].ssl.client_verify;
+        assert_eq!(verify.mode, Some(VerifyClient::On));
+        assert_eq!(verify.depth, Some(2));
         // ssl_reject_handshake is enforced now (tls_stream::accept_or_reject).
         let cfg = parse(&tls("ssl_reject_handshake on;")).unwrap();
         assert_eq!(cfg.servers[0].ssl.reject_handshake, Some(true));
@@ -2134,19 +2128,11 @@ mod tests {
         ] {
             assert!(symlinks(value).is_err(), "{value}");
         }
-        // The forms nginx doesn't enforce either still load; `optional*`
-        // warns (nginx admits certless clients there too, and ruxen's
-        // `$ssl_client_verify` is always NONE, never SUCCESS).
-        parse(&tls("ssl_verify_client off;")).unwrap();
-        for mode in ["optional", "optional_no_ca"] {
+        for mode in ["off", "optional", "optional_no_ca"] {
             let cfg = parse(&tls(&format!("ssl_verify_client {mode};"))).unwrap();
-            let expected = format!("\"ssl_verify_client {mode}\" is not supported yet");
-            assert!(
-                cfg.warnings.iter().any(|w| w.starts_with(&expected)),
-                "{:?}",
-                cfg.warnings
-            );
+            assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
         }
+        assert!(parse(&tls("ssl_verify_client maybe;")).is_err());
         parse(&tls("ssl_reject_handshake off;")).unwrap();
         parse(&tls("ssl_client_certificate ca.pem;")).unwrap();
         // proxy_cookie_flags isn't implemented: refused at every level,

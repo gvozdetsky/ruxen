@@ -661,6 +661,115 @@ pub struct ServerSsl {
     pub resumption: SessionResumption,
     /// `ssl_reject_handshake on|off` (#112), merged with http scope.
     pub reject_handshake: Option<bool>,
+    /// `ssl_verify_client` and what it checks with (#113), merged with
+    /// http scope.
+    pub client_verify: ClientVerifyConf,
+}
+
+/// `ssl_verify_client`'s modes (ngx_http_ssl_verify).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyClient {
+    Off,
+    On,
+    Optional,
+    /// A certificate is asked for, and one nobody vouches for still passes
+    /// (ngx_ssl_verify_error_optional).
+    OptionalNoCa,
+}
+
+/// `ssl_verify_client`, `ssl_client_certificate`, `ssl_trusted_certificate`,
+/// `ssl_verify_depth` and `ssl_crl` of one level (#113); paths resolved
+/// against the config directory. `None` until set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientVerifyConf {
+    pub mode: Option<VerifyClient>,
+    pub client_certificate: Option<PathBuf>,
+    pub trusted_certificate: Option<PathBuf>,
+    pub depth: Option<u32>,
+    pub crl: Option<PathBuf>,
+}
+
+impl ClientVerifyConf {
+    pub(crate) fn takes(name: &str) -> bool {
+        matches!(
+            name,
+            "ssl_verify_client"
+                | "ssl_client_certificate"
+                | "ssl_trusted_certificate"
+                | "ssl_verify_depth"
+                | "ssl_crl"
+        )
+    }
+
+    /// One of `takes`'s directives into `self`.
+    pub(crate) fn parse(
+        &mut self,
+        args: &[String],
+        conf_prefix: Option<&std::path::Path>,
+    ) -> Result<(), super::error::Error> {
+        use super::error::Error;
+        let name: &'static str = match args[0].as_str() {
+            "ssl_verify_client" => "ssl_verify_client",
+            "ssl_client_certificate" => "ssl_client_certificate",
+            "ssl_trusted_certificate" => "ssl_trusted_certificate",
+            "ssl_verify_depth" => "ssl_verify_depth",
+            _ => "ssl_crl",
+        };
+        let [_, value] = args else {
+            return Err(Error::BadValue {
+                what: name,
+                got: args[1..].join(" "),
+            });
+        };
+        let path = || super::resolve_conf_path(conf_prefix, PathBuf::from(value));
+        let duplicate = match name {
+            "ssl_verify_client" => {
+                let mode = match value.as_str() {
+                    "off" => VerifyClient::Off,
+                    "on" => VerifyClient::On,
+                    "optional" => VerifyClient::Optional,
+                    "optional_no_ca" => VerifyClient::OptionalNoCa,
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: name,
+                            got: value.clone(),
+                        });
+                    }
+                };
+                self.mode.replace(mode).is_some()
+            }
+            "ssl_client_certificate" => self.client_certificate.replace(path()).is_some(),
+            "ssl_trusted_certificate" => self.trusted_certificate.replace(path()).is_some(),
+            "ssl_verify_depth" => {
+                let depth = value.parse::<u32>().map_err(|_| Error::BadValue {
+                    what: name,
+                    got: value.clone(),
+                })?;
+                self.depth.replace(depth).is_some()
+            }
+            _ => self.crl.replace(path()).is_some(),
+        };
+        if duplicate {
+            return Err(Error::Duplicate(name));
+        }
+        Ok(())
+    }
+
+    /// Unset values come from `parent`, each on its own (nginx merges them
+    /// one by one).
+    pub(crate) fn inherit(self, parent: &ClientVerifyConf) -> ClientVerifyConf {
+        ClientVerifyConf {
+            mode: self.mode.or(parent.mode),
+            client_certificate: self
+                .client_certificate
+                .or_else(|| parent.client_certificate.clone()),
+            trusted_certificate: self
+                .trusted_certificate
+                .or_else(|| parent.trusted_certificate.clone()),
+            depth: self.depth.or(parent.depth),
+            crl: self.crl.or_else(|| parent.crl.clone()),
+        }
+    }
 }
 
 /// How TLS sessions can be resumed. `None` fields take nginx's defaults:

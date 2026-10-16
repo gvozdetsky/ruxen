@@ -27,6 +27,7 @@ pub(crate) fn parse_server_block(
     let mut ssl_session_timeout_ms: Option<u64> = None;
     let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
+    let mut client_verify = ClientVerifyConf::default();
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -110,6 +111,7 @@ pub(crate) fn parse_server_block(
                         session_timeout_ms: ssl_session_timeout_ms,
                         reject_handshake: ssl_reject_handshake,
                         resumption,
+                        client_verify,
                     };
                     let mut listens_iter = listens.into_iter();
                     let first_listen = listens_iter
@@ -274,6 +276,10 @@ pub(crate) fn parse_server_block(
                 };
                 resumption.add_ticket_key(resolve_ssl_file_arg(lx.conf_prefix(), path));
             }
+            (name, Terminator::Semi) if ClientVerifyConf::takes(name) => {
+                saw_any_ssl_directive = true;
+                client_verify.parse(&args, lx.conf_prefix())?;
+            }
             (
                 "ssl_buffer_size"
                 | "ssl_dhparam"
@@ -282,11 +288,6 @@ pub(crate) fn parse_server_block(
                 | "ssl_stapling_file"
                 | "ssl_stapling_responder"
                 | "ssl_stapling_verify"
-                | "ssl_verify_client"
-                | "ssl_verify_depth"
-                | "ssl_client_certificate"
-                | "ssl_trusted_certificate"
-                | "ssl_crl"
                 | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_conf_command",

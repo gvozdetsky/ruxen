@@ -10,6 +10,7 @@
 mod arena;
 mod auth;
 mod autoindex;
+mod client_verify;
 mod config;
 mod file;
 mod fs_resolve;

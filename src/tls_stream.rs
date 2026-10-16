@@ -42,8 +42,9 @@ const WRITE_BUF_KEEP: usize = 32 * 1024;
 
 /// What a client opened on a TLS port with.
 pub enum Accepted<IO> {
-    /// A completed handshake.
-    Tls(TlsStream<IO>),
+    /// A completed handshake, and the client-certificate context of the
+    /// config it ran with (`ssl_verify_client`, #113).
+    Tls(TlsStream<IO>, Option<Arc<crate::client_verify::ClientAuth>>),
     /// The first bytes aren't a TLS record: plain HTTP sent to an `ssl`
     /// port (#384). The transport comes back with the bytes already read,
     /// for the caller to answer as nginx does (`NGX_HTTP_TO_HTTPS`).
@@ -76,6 +77,19 @@ pub struct TlsAcceptor {
     /// have HTTP/2 off when others have it on (#144).
     without_h2: Option<Arc<ServerConfig>>,
     session_ids: bool,
+    /// The client-certificate context of `config` (#113).
+    verify: Option<Arc<crate::client_verify::ClientAuth>>,
+    /// The other servers' contexts, for `Choice::Accept { context: Some(i) }`.
+    contexts: Vec<Context>,
+}
+
+/// A server's own client-certificate context (#113): `config` with its
+/// verifier, the rest as the address's.
+#[derive(Clone)]
+struct Context {
+    config: Arc<ServerConfig>,
+    without_h2: Option<Arc<ServerConfig>>,
+    verify: Option<Arc<crate::client_verify::ClientAuth>>,
 }
 
 /// What `accept_choosing` does after the ClientHello.
@@ -83,9 +97,10 @@ pub struct TlsAcceptor {
 pub enum Choice {
     /// `ssl_reject_handshake`: an `unrecognized_name` alert.
     Reject,
-    Accept,
-    /// Accept, without offering HTTP/2 through ALPN.
-    AcceptWithoutH2,
+    /// Accept, offering HTTP/2 through ALPN if `h2`, with the config of
+    /// client-certificate context `context` (`with_contexts`), else the
+    /// address's.
+    Accept { h2: bool, context: Option<u16> },
 }
 
 impl From<Arc<ServerConfig>> for TlsAcceptor {
@@ -94,6 +109,8 @@ impl From<Arc<ServerConfig>> for TlsAcceptor {
             config,
             without_h2: None,
             session_ids: false,
+            verify: None,
+            contexts: Vec::new(),
         }
     }
 }
@@ -107,9 +124,39 @@ impl TlsAcceptor {
     /// Keep `config` without `h2` in its ALPN list too, for
     /// `Choice::AcceptWithoutH2`.
     pub fn with_choice_of_h2(mut self) -> Self {
-        let mut config = (*self.config).clone();
-        config.alpn_protocols.retain(|p| p != b"h2");
-        self.without_h2 = Some(Arc::new(config));
+        let without = |config: &Arc<ServerConfig>| {
+            let mut config = (**config).clone();
+            config.alpn_protocols.retain(|p| p != b"h2");
+            Some(Arc::new(config))
+        };
+        self.without_h2 = without(&self.config);
+        for c in &mut self.contexts {
+            c.without_h2 = without(&c.config);
+        }
+        self
+    }
+
+    /// Client-certificate contexts (#113): `verify` is the one of the
+    /// address's config, `contexts` the configs of servers with another
+    /// (each built from the address's, with its own verifier), chosen by
+    /// index in `Choice::Accept`. Before `with_choice_of_h2`.
+    pub fn with_contexts(
+        mut self,
+        verify: Option<Arc<crate::client_verify::ClientAuth>>,
+        contexts: Vec<(
+            Arc<ServerConfig>,
+            Option<Arc<crate::client_verify::ClientAuth>>,
+        )>,
+    ) -> Self {
+        self.verify = verify;
+        self.contexts = contexts
+            .into_iter()
+            .map(|(config, verify)| Context {
+                config,
+                without_h2: None,
+                verify,
+            })
+            .collect();
         self
     }
 
@@ -135,7 +182,7 @@ impl TlsAcceptor {
         let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
         self.handshake_with(io, conn, first)
             .await
-            .map(Accepted::Tls)
+            .map(|s| Accepted::Tls(s, self.verify.clone()))
     }
 
     /// `accept`, but the ClientHello is read first and `choose` sees its
@@ -197,10 +244,20 @@ impl TlsAcceptor {
                 "handshake rejected (ssl_reject_handshake)",
             ));
         }
-        let config = match (choice, &self.without_h2) {
-            (Choice::AcceptWithoutH2, Some(config)) => config.clone(),
-            _ => self.config.clone(),
+        let (h2, context) = match choice {
+            Choice::Accept { h2, context } => (h2, context),
+            Choice::Reject => (true, None),
         };
+        let (config, without_h2, verify) = match context.and_then(|i| self.contexts.get(i as usize))
+        {
+            Some(c) => (&c.config, &c.without_h2, &c.verify),
+            None => (&self.config, &self.without_h2, &self.verify),
+        };
+        let config = match (h2, without_h2) {
+            (false, Some(config)) => config.clone(),
+            _ => config.clone(),
+        };
+        let verify = verify.clone();
         let conn = match accepted.into_connection(config) {
             Ok(conn) => conn,
             Err((e, mut alert)) => {
@@ -212,7 +269,7 @@ impl TlsAcceptor {
         };
         self.handshake_with(io, conn, Vec::new())
             .await
-            .map(Accepted::Tls)
+            .map(|s| Accepted::Tls(s, verify))
     }
 
     /// The handshake, with `rbuf` holding ciphertext already read.
@@ -643,7 +700,7 @@ mod tests {
 
     fn tls<IO>(accepted: Accepted<IO>) -> TlsStream<IO> {
         match accepted {
-            Accepted::Tls(s) => s,
+            Accepted::Tls(s, _) => s,
             Accepted::Plain(..) => panic!("plain bytes on the TLS port"),
         }
     }

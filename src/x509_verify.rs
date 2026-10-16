@@ -1,6 +1,6 @@
-//! Upstream certificate verification as nginx's OpenSSL does it
-//! (`proxy_ssl_verify`, #117), with the X.509 code of the AWS-LC that
-//! rustls already links: X509_verify_cert against the trusted
+//! Certificate verification as nginx's OpenSSL does it, for upstreams
+//! (`proxy_ssl_verify`, #117) and clients (`ssl_verify_client`, #113),
+//! with the X.509 code of the AWS-LC that rustls already links: X509_verify_cert against the trusted
 //! certificates, with nginx's verify depth and CRL flags, then
 //! X509_check_host (ngx_ssl_check_host). webpki can't stand in for it: it
 //! refuses certificates OpenSSL takes (a self-signed leaf marked CA:TRUE,
@@ -14,7 +14,8 @@ use std::ptr;
 use aws_lc_sys as ffi;
 
 /// A trust store: `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth`
-/// and `proxy_ssl_crl`, loaded once and shared by every worker.
+/// and `proxy_ssl_crl` (or the `ssl_*` ones of a server), loaded once and
+/// shared by every worker.
 #[derive(Debug)]
 pub struct Store(*mut ffi::X509_STORE);
 
@@ -94,14 +95,26 @@ impl Store {
     /// hold certificates and CRLs, and must hold one of them, as
     /// X509_load_cert_crl_file wants. `Err` is the reason, OpenSSL's text.
     pub fn new(trusted: &[u8], depth: u32) -> Result<Store, String> {
+        let mut store = Store::empty(depth)?;
+        store.add_trusted(trusted)?;
+        Ok(store)
+    }
+
+    /// A store that trusts nothing yet (`ssl_verify_client optional_no_ca`
+    /// without certificates).
+    pub fn empty(depth: u32) -> Result<Store, String> {
         let store = unsafe { ffi::X509_STORE_new() };
         if store.is_null() {
             return Err(ssl_error());
         }
-        let store = Store(store);
-        store.load(trusted)?;
-        unsafe { ffi::X509_STORE_set_depth(store.0, depth.min(c_int::MAX as u32) as c_int) };
-        Ok(store)
+        unsafe { ffi::X509_STORE_set_depth(store, depth.min(c_int::MAX as u32) as c_int) };
+        Ok(Store(store))
+    }
+
+    /// More trusted certificates (`ssl_client_certificate`, then
+    /// `ssl_trusted_certificate`).
+    pub fn add_trusted(&mut self, pem: &[u8]) -> Result<(), String> {
+        self.load(pem)
     }
 
     /// `proxy_ssl_crl`: the file loaded as the trusted one is, and every
@@ -174,6 +187,29 @@ impl Store {
         name: &NameToCheck<'_>,
     ) -> Result<(), Failure> {
         let leaf = Cert::from_der(leaf).ok_or(Failure::BadDer)?;
+        self.verify_chain(&leaf, intermediates, c"ssl_server")?;
+        if name.matches(&leaf) {
+            Ok(())
+        } else {
+            Err(Failure::Name(name.text.to_string()))
+        }
+    }
+
+    /// A client's certificate (`ssl_verify_client`): the chain it sent,
+    /// leaf first, verified for TLS client use, as OpenSSL verifies it in
+    /// the handshake (SSL_get_verify_result).
+    pub fn verify_client(&self, chain: &[&[u8]]) -> Result<(), Failure> {
+        let (leaf, intermediates) = chain.split_first().ok_or(Failure::BadDer)?;
+        let leaf = Cert::from_der(leaf).ok_or(Failure::BadDer)?;
+        self.verify_chain(&leaf, intermediates, c"ssl_client")
+    }
+
+    fn verify_chain(
+        &self,
+        leaf: &Cert,
+        intermediates: &[&[u8]],
+        purpose: &CStr,
+    ) -> Result<(), Failure> {
         let chain: Vec<Cert> = intermediates
             .iter()
             .map(|der| Cert::from_der(der).ok_or(Failure::BadDer))
@@ -193,12 +229,11 @@ impl Store {
             {
                 ffi::X509_V_ERR_UNSPECIFIED as c_long
             } else {
-                // As OpenSSL's ssl_verify_cert_chain for a client, with
-                // nginx's callback, which lets the chain be checked to
-                // the end (ngx_ssl_verify_callback; the verify mode is
-                // SSL_VERIFY_NONE): the result is the last error, as
-                // SSL_get_verify_result has it.
-                ffi::X509_STORE_CTX_set_default(ctx, c"ssl_server".as_ptr());
+                // As OpenSSL's ssl_verify_cert_chain, with nginx's
+                // callback, which lets the chain be checked to the end
+                // (ngx_ssl_verify_callback): the result is the last error,
+                // as SSL_get_verify_result has it.
+                ffi::X509_STORE_CTX_set_default(ctx, purpose.as_ptr());
                 ffi::X509_STORE_CTX_set_verify_cb(ctx, Some(keep_going));
                 ffi::X509_verify_cert(ctx);
                 ffi::X509_STORE_CTX_get_error(ctx) as c_long
@@ -212,12 +247,51 @@ impl Store {
             let text = unsafe { CStr::from_ptr(ffi::X509_verify_cert_error_string(code)) };
             return Err(Failure::Verify(code, text.to_string_lossy().into_owned()));
         }
-        if name.matches(&leaf) {
-            Ok(())
-        } else {
-            Err(Failure::Name(name.text.to_string()))
-        }
+        Ok(())
     }
+}
+
+/// nginx's ngx_ssl_verify_error_optional: the errors `ssl_verify_client
+/// optional_no_ca` lets through, those of a certificate nobody vouches for.
+pub fn error_is_optional(code: c_long) -> bool {
+    [
+        ffi::X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT,
+        ffi::X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN,
+        ffi::X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+        ffi::X509_V_ERR_CERT_UNTRUSTED,
+        ffi::X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE,
+    ]
+    .iter()
+    .any(|&c| c as c_long == code)
+}
+
+/// The DER subject names of the certificates in a PEM text, each once:
+/// the CA list a server sends with its CertificateRequest, as
+/// SSL_load_client_CA_file reads it from `ssl_client_certificate`.
+pub fn subjects(pem: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    unsafe {
+        let b = ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _);
+        loop {
+            let x = ffi::PEM_read_bio_X509(b, ptr::null_mut(), None, ptr::null_mut());
+            if x.is_null() {
+                break;
+            }
+            let name = ffi::X509_get_subject_name(x);
+            let len = ffi::i2d_X509_NAME(name, ptr::null_mut());
+            if len > 0 {
+                let mut der = vec![0u8; len as usize];
+                let mut p = der.as_mut_ptr();
+                if ffi::i2d_X509_NAME(name, &mut p) == len && !out.contains(&der) {
+                    out.push(der);
+                }
+            }
+            ffi::X509_free(x);
+        }
+        ffi::BIO_free(b);
+        ffi::ERR_clear_error();
+    }
+    out
 }
 
 unsafe extern "C" fn keep_going(_ok: c_int, _ctx: *mut ffi::X509_STORE_CTX) -> c_int {
@@ -281,4 +355,55 @@ pub fn spki(cert: &[u8]) -> Option<Vec<u8>> {
         }
         Some(out)
     }
+}
+
+/// A TLS 1.2 handshake signature checked with the key of `cert`, as
+/// rustls's verify_tls12_signature does but from the bare key: OpenSSL
+/// takes certificates webpki won't parse. TLS 1.2 names a scheme several
+/// algorithms may stand for.
+pub fn verify_tls12_signature(
+    algs: &rustls::crypto::WebPkiSupportedAlgorithms,
+    message: &[u8],
+    cert: &rustls::pki_types::CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    let spki = spki_der(cert)?;
+    let key = webpki::RawPublicKeyEntity::try_from(&spki).map_err(|_| bad_encoding())?;
+    let candidates = algs
+        .mapping
+        .iter()
+        .filter(|(scheme, _)| *scheme == dss.scheme)
+        .flat_map(|(_, algs)| algs.iter());
+    for alg in candidates {
+        match key.verify_signature(*alg, message, dss.signature()) {
+            Ok(()) => return Ok(rustls::client::danger::HandshakeSignatureValid::assertion()),
+            Err(webpki::Error::UnsupportedSignatureAlgorithmForPublicKeyContext(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    Err(rustls::Error::InvalidCertificate(
+        rustls::CertificateError::BadSignature,
+    ))
+}
+
+/// The TLS 1.3 handshake signature, likewise from the key of `cert`.
+pub fn verify_tls13_signature(
+    algs: &rustls::crypto::WebPkiSupportedAlgorithms,
+    message: &[u8],
+    cert: &rustls::pki_types::CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    rustls::crypto::verify_tls13_signature_with_raw_key(message, &spki_der(cert)?, dss, algs)
+}
+
+fn bad_encoding() -> rustls::Error {
+    rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+}
+
+fn spki_der(
+    cert: &rustls::pki_types::CertificateDer<'_>,
+) -> Result<rustls::pki_types::SubjectPublicKeyInfoDer<'static>, rustls::Error> {
+    spki(cert)
+        .map(rustls::pki_types::SubjectPublicKeyInfoDer::from)
+        .ok_or_else(bad_encoding)
 }

@@ -330,18 +330,21 @@ impl RenderCtx<'_> {
                     }
                 }
             }
+            // ngx_ssl_get_client_verify: empty outside TLS (#113).
             Variable::SslClientVerify => {
-                // ruxen does not request client certificates. nginx renders
-                // "NONE" inside TLS when no cert was supplied, empty
-                // otherwise. Once `ssl_verify_client` lands the rustls
-                // peer-cert state will distinguish SUCCESS / FAILED.
-                if self.tls.is_some() {
-                    out.extend_from_slice(b"NONE");
+                use crate::client_verify::ClientVerify;
+                match self.tls.map(|info| &info.client_verify) {
+                    None => {}
+                    Some(ClientVerify::None) => out.extend_from_slice(b"NONE"),
+                    Some(ClientVerify::Success) => out.extend_from_slice(b"SUCCESS"),
+                    Some(ClientVerify::Failed(_, text)) => {
+                        out.extend_from_slice(b"FAILED:");
+                        out.extend_from_slice(text.as_bytes());
+                    }
                 }
             }
             // Client-cert DNs and validity range are intentionally empty
-            // until `ssl_verify_client` is implemented and we can decode
-            // the peer certificate via rustls/x509-parser. Returning
+            // until the peer certificate is decoded for them (#114). Returning
             // hard-coded placeholder strings would let nginx-tests pass
             // for the wrong reason.
             Variable::SslClientIDn => {}
