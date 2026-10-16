@@ -443,7 +443,7 @@ async fn write_out<S: crate::worker::ConnIo>(
 ) -> (bool, Vec<u8>) {
     let (res, returned) = match pacer {
         Some(p) => crate::worker::write_all_paced(client, buf, len, p, timer, send_timeout).await,
-        None => crate::worker::write_all_timed(client, buf, len, timer, send_timeout).await,
+        None => crate::worker::write_all_now(client, buf, len, timer, send_timeout).await,
     };
     (res.is_ok(), returned)
 }
