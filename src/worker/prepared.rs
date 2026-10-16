@@ -837,6 +837,10 @@ pub(crate) struct ProxyEffective {
     pub tls: UpstreamTlsSettings,
 }
 
+fn leak_path(path: &std::path::Path) -> &'static std::path::Path {
+    crate::arena::leak(path.to_path_buf().into_boxed_path())
+}
+
 /// The `proxy_ssl_*` settings of a scope, resolved (#116).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamTlsSettings {
@@ -844,6 +848,11 @@ pub(crate) struct UpstreamTlsSettings {
     pub session_reuse: bool,
     pub protocols: crate::config::TlsVersionSet,
     pub name: Option<&'static [PreparedValuePart]>,
+    /// `proxy_ssl_verify` and what it checks against (#117).
+    pub verify: bool,
+    pub trusted: Option<&'static std::path::Path>,
+    pub verify_depth: u32,
+    pub crl: Option<&'static std::path::Path>,
 }
 
 impl UpstreamTlsSettings {
@@ -857,6 +866,10 @@ impl UpstreamTlsSettings {
             tlsv1_3: true,
         },
         name: None,
+        verify: false,
+        trusted: None,
+        verify_depth: 1,
+        crl: None,
     };
 
     /// `conf`'s values over `self`.
@@ -870,6 +883,14 @@ impl UpstreamTlsSettings {
                 .clone()
                 .map(super::prepare::prepare_value_parts)
                 .or(self.name),
+            verify: conf.ssl_verify.unwrap_or(self.verify),
+            trusted: conf
+                .ssl_trusted_certificate
+                .as_deref()
+                .map(leak_path)
+                .or(self.trusted),
+            verify_depth: conf.ssl_verify_depth.unwrap_or(self.verify_depth),
+            crl: conf.ssl_crl.as_deref().map(leak_path).or(self.crl),
         }
     }
 }

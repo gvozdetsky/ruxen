@@ -41,6 +41,7 @@ mod upstream_io;
 mod upstream_tls;
 mod uri;
 mod worker;
+mod x509_verify;
 
 /// musl's malloc costs the static build most of its proxy and TLS
 /// throughput (#199). glibc builds keep the system allocator.

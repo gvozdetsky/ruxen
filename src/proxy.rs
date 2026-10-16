@@ -619,7 +619,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
         //    stale-retry counts as part of the same `attempt` budget.
-        let pooled = upstream::pool_take(upstream, current.peer_idx, plan.tls.is_some());
+        let pooled = upstream::pool_take(upstream, current.peer_idx, plan.tls.as_deref());
         let outcome = if let Some(c) = pooled {
             match attempt(
                 &plan,
@@ -1040,6 +1040,9 @@ pub enum UpstreamError {
     /// The TLS handshake with an HTTPS upstream failed (#116): nginx's
     /// `SSL_do_handshake() failed`.
     SslHandshakeFailed(std::io::Error),
+    /// `proxy_ssl_verify on` refused the certificate (#117): nginx's
+    /// `upstream SSL certificate verify error: (..)` or `does not match`.
+    SslVerifyFailed(String),
     /// A UNIX-domain socket refuses at once, so nginx reports it from
     /// connect() itself, with the path (ngx_event_connect_peer).
     UnixConnectFailed(std::io::Error, &'static std::path::Path),
@@ -1110,6 +1113,7 @@ impl std::fmt::Display for UpstreamError {
                 "SSL_do_handshake() failed ({e}) while {}",
                 Stage::SslHandshaking.as_str()
             ),
+            SslVerifyFailed(why) => write!(f, "{why} while {}", Stage::SslHandshaking.as_str()),
             UnixConnectFailed(e, path) => write!(
                 f,
                 "connect() to unix:{} failed ({}) while {}",
@@ -1566,10 +1570,14 @@ async fn attempt(
                 match timeout(plan.connect_timeout, Box::pin(handshake)).await {
                     Ok(Ok(tls)) => UpstreamIo::Tls(Box::new(tls)),
                     Ok(Err(e)) => {
+                        let error = match crate::upstream_tls::verify_failure(&e) {
+                            Some(why) => UpstreamError::SslVerifyFailed(why.to_string()),
+                            None => UpstreamError::SslHandshakeFailed(e),
+                        };
                         return AttemptOutcome::Failed(
                             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                             FailKind::Error,
-                            Box::new(UpstreamError::SslHandshakeFailed(e)),
+                            Box::new(error),
                         );
                     }
                     Err(_) => {
@@ -1938,6 +1946,7 @@ async fn attempt(
                     peer_idx,
                     opened_at,
                     requests_served,
+                    tls: plan.tls.as_ref().map(|t| t.identity()),
                 });
         let pending = accum[body_start..].to_vec();
         return_proxy_buf(accum);
@@ -2170,6 +2179,7 @@ async fn attempt(
                 opened_at,
                 requests_served: requests_served + 1,
                 slot,
+                tls: plan.tls.as_ref().map(|t| t.identity()),
             },
         );
     }

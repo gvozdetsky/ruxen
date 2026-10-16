@@ -100,6 +100,15 @@ pub struct ProxyConf {
     pub ssl_session_reuse: Option<bool>,
     /// `proxy_ssl_protocols`; unset means TLS 1.2 and 1.3.
     pub ssl_protocols: Option<TlsVersionSet>,
+    /// `proxy_ssl_verify` (#117); unset means off.
+    pub ssl_verify: Option<bool>,
+    /// `proxy_ssl_trusted_certificate`, resolved against the config
+    /// directory; required with `proxy_ssl_verify on`.
+    pub ssl_trusted_certificate: Option<std::path::PathBuf>,
+    /// `proxy_ssl_verify_depth`; unset means 1.
+    pub ssl_verify_depth: Option<u32>,
+    /// `proxy_ssl_crl`, resolved as the trusted certificates are.
+    pub ssl_crl: Option<std::path::PathBuf>,
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -254,6 +263,12 @@ impl ProxyConf {
             ssl_name: self.ssl_name.or_else(|| parent.ssl_name.clone()),
             ssl_session_reuse: self.ssl_session_reuse.or(parent.ssl_session_reuse),
             ssl_protocols: self.ssl_protocols.or(parent.ssl_protocols),
+            ssl_verify: self.ssl_verify.or(parent.ssl_verify),
+            ssl_trusted_certificate: self
+                .ssl_trusted_certificate
+                .or_else(|| parent.ssl_trusted_certificate.clone()),
+            ssl_verify_depth: self.ssl_verify_depth.or(parent.ssl_verify_depth),
+            ssl_crl: self.ssl_crl.or_else(|| parent.ssl_crl.clone()),
         }
     }
 }

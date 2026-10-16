@@ -899,7 +899,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             ) => {
                 client_timeouts.parse(name, &args)?;
             }
-            (name, Terminator::Semi) if ProxyConf::takes(name) => proxy.parse(&args)?,
+            (name, Terminator::Semi) if ProxyConf::takes(name) => {
+                proxy.parse(&args, lx.conf_prefix())?
+            }
             (name, Terminator::Semi) if GzipConf::takes(name) => gzip.parse(&args)?,
             (name, Terminator::Semi) if Http2Conf::takes(name) => {
                 http2_conf.parse(&args, &mut warnings)?
@@ -1090,10 +1092,6 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
     let consequence = match args.first().map(String::as_str) {
         Some("ssl_verify_client") if value == Some("on") => {
             "clients would be accepted without a certificate"
-        }
-        // Certificates of HTTPS upstreams aren't verified yet (#117).
-        Some("proxy_ssl_verify") if value != Some("off") => {
-            "upstream certificates would be accepted without verification"
         }
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
         // dropping them weakens what the config protects. Only `off` loads.

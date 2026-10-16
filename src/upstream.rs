@@ -874,13 +874,18 @@ pub struct PooledConn {
     pub requests_served: u32,
     /// Its `worker_connections` slot, freed with the socket.
     pub slot: crate::worker::UpstreamSlot,
+    /// For a TLS connection, who it was opened as (`TlsPlan::identity`).
+    pub tls: Option<crate::upstream_tls::TlsIdentity>,
 }
 
 thread_local! {
-    /// Keyed by upstream, peer and whether the connection is TLS: a
-    /// location proxying over `https://` never gets a plain connection to
-    /// the same peer, nor the other way round (#116).
-    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize, bool), VecDeque<PooledConn>, FxBuild>> =
+    /// Keyed by upstream, peer and, for TLS, the rustls config the
+    /// connection was opened with (0 for plain TCP): a location proxying
+    /// over `https://` never gets a plain connection to the same peer, nor
+    /// one opened with other `proxy_ssl_*` settings, such as without
+    /// verification (#116, #117). Within a queue a TLS connection is only
+    /// taken for the name it was opened for (`PooledConn::tls`).
+    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize, usize), VecDeque<PooledConn>, FxBuild>> =
         RefCell::new(HashMap::default());
 }
 
@@ -890,7 +895,7 @@ thread_local! {
 pub fn pool_take(
     upstream: &'static PreparedUpstream,
     peer_idx: usize,
-    tls: bool,
+    tls: Option<&crate::upstream_tls::TlsPlan>,
 ) -> Option<PooledConn> {
     if upstream.keepalive_max_idle.is_none() {
         return None;
@@ -899,15 +904,25 @@ pub fn pool_take(
     let now = Instant::now();
     POOL.with(|p| {
         let mut map = p.borrow_mut();
-        let key = (upstream as *const PreparedUpstream, peer_idx, tls);
+        let key = (
+            upstream as *const PreparedUpstream,
+            peer_idx,
+            tls.map_or(0, |t| t.config_id()),
+        );
         let q = map.get_mut(&key)?;
-        // Pop from the front; LIFO since we push at the front. Drop any
-        // entries that have aged out before returning the first live one.
-        while let Some(c) = q.pop_front() {
-            if now.saturating_duration_since(c.last_used) >= idle_max {
+        // From the front; LIFO since we push at the front. Drop any
+        // entries that have aged out on the way to the first live one
+        // opened for this name.
+        let mut i = 0;
+        while i < q.len() {
+            if now.saturating_duration_since(q[i].last_used) >= idle_max {
+                q.remove(i);
                 continue;
             }
-            return Some(c);
+            if tls.is_none_or(|t| q[i].tls.as_ref().is_some_and(|(_, name)| *name == t.name)) {
+                return q.remove(i);
+            }
+            i += 1;
         }
         None
     })
@@ -946,7 +961,7 @@ pub fn pool_release(upstream: &'static PreparedUpstream, peer_idx: usize, mut co
         return;
     }
     conn.last_used = now;
-    let tls = matches!(conn.stream, crate::upstream_io::UpstreamIo::Tls(_));
+    let tls = conn.tls.as_ref().map_or(0, |(config, _)| *config);
     POOL.with(|p| {
         let mut map = p.borrow_mut();
         let key = (upstream as *const PreparedUpstream, peer_idx, tls);

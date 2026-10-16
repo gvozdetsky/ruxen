@@ -229,7 +229,7 @@ Supported functionality includes:
 ruxen supports a growing subset of nginx's proxy functionality, including:
 
 - `proxy_pass`, with variables (literal addresses, `upstream` names and `unix:` paths; no `resolver` yet), to TCP and `unix:` upstreams
-- HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); `proxy_ssl_verify on` and client certificates aren't supported yet and are refused
+- HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); certificate verification with `proxy_ssl_verify`, `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth` and `proxy_ssl_crl`, by OpenSSL's rules (AWS-LC's X.509 code: commonName fallback, depth, CRLs) and nginx's error-log lines; client certificates to upstreams aren't supported yet and are refused
 - named `upstream` blocks
 - path rewriting
 - weighted round-robin, `least_conn`, `hash` (including `consistent`) and `ip_hash`
@@ -411,7 +411,7 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
-- verifying upstream certificates (`proxy_ssl_verify on`, `proxy_ssl_trusted_certificate`) and client certificates to upstreams (`proxy_ssl_certificate`); HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
+- client certificates to upstreams (`proxy_ssl_certificate`); HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, charset conversion, and third-party modules
 - the `resolver` (a `proxy_pass` with variables reaches literal addresses and `upstream` names only)
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file

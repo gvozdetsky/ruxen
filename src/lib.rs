@@ -32,6 +32,7 @@ mod upstream_io;
 mod upstream_tls;
 mod uri;
 mod worker;
+mod x509_verify;
 
 /// Entry points for the fuzz targets: thin wrappers over the parsers that
 /// see untrusted bytes.
