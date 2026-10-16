@@ -86,11 +86,11 @@ pub fn load_certified_key(
     key_pem: &Path,
     passwords: &[Vec<u8>],
 ) -> Result<CertifiedKey, LoadCertError> {
-    let cert_bytes = std::fs::read(cert_pem).map_err(|err| LoadCertError::Io {
+    let cert_bytes = pem_file(cert_pem).map_err(|err| LoadCertError::Io {
         path: cert_pem.to_path_buf(),
         err,
     })?;
-    let key_bytes = std::fs::read(key_pem).map_err(|err| LoadCertError::Io {
+    let key_bytes = pem_file(key_pem).map_err(|err| LoadCertError::Io {
         path: key_pem.to_path_buf(),
         err,
     })?;
@@ -566,7 +566,7 @@ pub fn build_server_config(
 /// (#139): one per non-empty line, CR LF or LF stripped
 /// (ngx_ssl_read_password_file). Read once per configuration load, even
 /// when many servers inherit the file, since it may be a FIFO;
-/// `forget_password_files` starts a load.
+/// `forget_files` starts a load.
 pub fn password_file(path: &Path) -> Result<Arc<[Vec<u8>]>, String> {
     let mut files = PASSWORD_FILES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, passwords)) = files.iter().find(|(p, _)| p == path) {
@@ -592,8 +592,25 @@ pub fn password_file(path: &Path) -> Result<Arc<[Vec<u8>]>, String> {
 static PASSWORD_FILES: std::sync::Mutex<Vec<(PathBuf, Arc<[Vec<u8>]>)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// A configuration load starts: password files are read again.
-pub fn forget_password_files() {
+/// A certificate, key, CA or CRL file, read once per configuration load
+/// however many directives name it, as nginx's SSL object cache does
+/// (1.27.2+, ssl_cache.t): one may be a FIFO.
+pub fn pem_file(path: &Path) -> std::io::Result<Arc<[u8]>> {
+    let mut files = PEM_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, bytes)) = files.iter().find(|(p, _)| p == path) {
+        return Ok(bytes.clone());
+    }
+    let bytes: Arc<[u8]> = std::fs::read(path)?.into();
+    files.push((path.to_path_buf(), bytes.clone()));
+    Ok(bytes)
+}
+
+static PEM_FILES: std::sync::Mutex<Vec<(PathBuf, Arc<[u8]>)>> = std::sync::Mutex::new(Vec::new());
+
+/// A configuration load starts or ends: password and PEM files are read
+/// again by the next one, and what they held isn't kept.
+pub fn forget_files() {
+    PEM_FILES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     PASSWORD_FILES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
