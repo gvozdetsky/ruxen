@@ -32,7 +32,9 @@ fn content_types_like_nginx() {
     let dir = std::env::temp_dir().join(format!("ruxen-m134-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("www")).unwrap();
-    for f in ["a.html", "a.css", "a.FOO", "a.gif", "noext", "a.later"] {
+    for f in [
+        "a.html", "a.css", "a.FOO", "a.gif", "noext", "a.later", "a.two",
+    ] {
         std::fs::write(dir.join("www").join(f), "x").unwrap();
     }
     let port = TcpListener::bind("127.0.0.1:0")
@@ -46,6 +48,7 @@ fn content_types_like_nginx() {
         format!(
             "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{\naccess_log off;\n\
              types {{ text/html html; text/css css; text/x-foo foo; text/a later; text/b later; }}\n\
+             types {{ text/x-two two; text/c later; }}\n\
              default_type text/x-default;\n\
              server {{ listen 127.0.0.1:{port}; server_name http; root {www};\n\
                location /own/ {{ alias {www}/; types {{ image/x-own css; }} }}\n\
@@ -98,7 +101,10 @@ fn content_types_like_nginx() {
     assert_eq!(content_type(port, "http", "/a.html"), "text/html");
     assert_eq!(content_type(port, "http", "/a.css"), "text/css");
     assert_eq!(content_type(port, "http", "/a.FOO"), "text/x-foo");
-    assert_eq!(content_type(port, "http", "/a.later"), "text/b");
+    // A second `types {}` at the same level adds to the first; a repeated
+    // extension takes the later type.
+    assert_eq!(content_type(port, "http", "/a.later"), "text/c");
+    assert_eq!(content_type(port, "http", "/a.two"), "text/x-two");
     assert_eq!(content_type(port, "http", "/a.gif"), "text/x-default");
     assert_eq!(content_type(port, "http", "/noext"), "text/x-default");
     // A location's own types replace the inherited ones; its default_type
