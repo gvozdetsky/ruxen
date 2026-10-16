@@ -413,15 +413,15 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
-- client certificates to upstreams with variables in the path (#434); HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
-- FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, charset conversion, and third-party modules
+- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
+- FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
 - the `resolver` (a `proxy_pass` with variables reaches literal addresses and `upstream` names only)
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
-- a proxy cache file per `Vary` variant (another variant replaces the stored one)
-- client certificate authentication, OCSP stapling, 0-RTT / TLS early data, password-protected private keys
+- a proxied response is still read whole before it is sent in a few cases: a cache store, `add_trailer`, failover and interception (#463)
+- OCSP stapling and OCSP checks of client certificates (#141, #142), 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
 - nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
-- variables in `root` and `alias`
+- variables in `root` and `alias` (#232), `proxy_cookie_domain` / `_path` / `_flags` (#40)
 
 Access restrictions that ruxen can't enforce yet — `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used).
 
