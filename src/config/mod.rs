@@ -678,7 +678,13 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_early_data"
                 | "ssl_conf_command",
                 Terminator::Semi,
-            ) => warn_ignored_tls_policy(&args, &mut warnings),
+            ) => {
+                warn_ignored_tls_policy(&args, &mut warnings);
+                // ssl_ecdh_curve says so in its warning already.
+                if args[0] != "ssl_ecdh_curve" {
+                    compat::ignored(lx, &args);
+                }
+            }
             (
                 "log_format"
                 | "access_log"

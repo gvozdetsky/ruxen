@@ -155,6 +155,19 @@ pub(crate) fn ignored(lx: &Lexer, args: &[String]) {
     if !collecting() {
         return;
     }
+    // Already a finding here: refused as unenforced (`ssl_verify_client
+    // on`), which says more than "ignored".
+    let directive = args.join(" ");
+    let position = lx.position();
+    let seen = FINDINGS.with(|f| {
+        f.borrow().as_ref().is_some_and(|list| {
+            list.last()
+                .is_some_and(|last| last.position == position && last.directive == directive)
+        })
+    });
+    if seen {
+        return;
+    }
     let (severity, note) = classify(args);
     record(lx, severity, args, note);
 }
@@ -234,7 +247,7 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
     (
         "proxy_buffering",
         Some("on"),
-        "upstream responses are still buffered whole before they are sent (#88)",
+        "ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #88)",
     ),
     (
         "proxy_request_buffering",
@@ -260,6 +273,67 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         "resolver",
         None,
         "upstream names are resolved once at startup, not at run time (#133)",
+    ),
+    // The ssl_* lines the server parser takes and doesn't apply.
+    (
+        "ssl_stapling",
+        Some("off"),
+        "OCSP responses are not stapled (#141)",
+    ),
+    (
+        "ssl_stapling_file",
+        None,
+        "OCSP responses are not stapled (#141)",
+    ),
+    (
+        "ssl_stapling_responder",
+        None,
+        "OCSP responses are not stapled (#141)",
+    ),
+    (
+        "ssl_stapling_verify",
+        Some("off"),
+        "OCSP responses are not stapled (#141)",
+    ),
+    (
+        "ssl_early_data",
+        Some("off"),
+        "TLS 1.3 early data is not accepted",
+    ),
+    (
+        "ssl_conf_command",
+        None,
+        "OpenSSL commands are not applied: ruxen's TLS is rustls",
+    ),
+    (
+        "ssl_password_file",
+        None,
+        "encrypted private keys can't be loaded yet (#139)",
+    ),
+    (
+        "ssl_verify_client",
+        Some("off"),
+        "client certificates are not requested yet (#113)",
+    ),
+    (
+        "ssl_client_certificate",
+        None,
+        "client certificates are not requested yet (#113)",
+    ),
+    (
+        "ssl_trusted_certificate",
+        None,
+        "client certificates are not requested yet (#113)",
+    ),
+    (
+        "ssl_verify_depth",
+        None,
+        "client certificates are not requested yet (#113)",
+    ),
+    (
+        "ssl_crl",
+        None,
+        "client certificates are not requested yet (#113)",
     ),
 ];
 

@@ -315,6 +315,10 @@ pub(crate) fn parse_server_block(
             ) => {
                 saw_any_ssl_directive = true;
                 warn_ignored_tls_policy(&args, warnings);
+                // ssl_ecdh_curve says so in its warning already.
+                if args[0] != "ssl_ecdh_curve" {
+                    compat::ignored(lx, &args);
+                }
             }
             ("server_name", Terminator::Semi) => {
                 if args.len() < 2 {
