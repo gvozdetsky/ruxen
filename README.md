@@ -229,7 +229,7 @@ Supported functionality includes:
 ruxen supports a growing subset of nginx's proxy functionality, including:
 
 - `proxy_pass`, with variables (literal addresses, `upstream` names and `unix:` paths; no `resolver` yet), to TCP and `unix:` upstreams
-- HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); certificate verification with `proxy_ssl_verify`, `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth` and `proxy_ssl_crl`, by OpenSSL's rules (AWS-LC's X.509 code: commonName fallback, depth, CRLs) and nginx's error-log lines; client certificates to upstreams with `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (`""` cancels an inherited one, `proxy_ssl_password_file` for an encrypted key; paths with variables aren't supported yet and are refused)
+- HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); certificate verification with `proxy_ssl_verify`, `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth` and `proxy_ssl_crl`, by OpenSSL's rules (AWS-LC's X.509 code: commonName fallback, depth, CRLs) and nginx's error-log lines; client certificates to upstreams with `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (`""` cancels an inherited one, `proxy_ssl_password_file` for an encrypted key; paths with variables are rendered per request, and an empty certificate means none)
 - named `upstream` blocks
 - path rewriting
 - weighted round-robin, `least_conn`, `hash` (including `consistent`) and `ip_hash`

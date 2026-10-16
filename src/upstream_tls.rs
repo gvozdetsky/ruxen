@@ -26,6 +26,99 @@ pub struct PreparedUpstreamTls {
     pub name: ServerName<'static>,
     /// No `proxy_ssl_name`: for a URL with variables, the rendered host.
     pub default_name: bool,
+    /// `proxy_ssl_certificate` with variables: `config` has no
+    /// certificate, and this picks the request's.
+    pub dynamic_cert: Option<DynamicCert>,
+}
+
+/// `proxy_ssl_certificate` with variables (#434): the pair is rendered
+/// per request, as ngx_http_upstream_ssl_certificate does per connection,
+/// and the client config with it is kept, keyed by the rendered paths, so
+/// a pair's files are read and parsed on its first use only.
+#[derive(Debug)]
+pub struct DynamicCert {
+    pub(crate) cert: crate::worker::PreparedCertPath,
+    pub(crate) key: crate::worker::PreparedCertPath,
+    passwords: Arc<[Vec<u8>]>,
+    protocols: TlsVersionSet,
+    sni: bool,
+    reuse: bool,
+    verify: Option<Arc<crate::x509_verify::Store>>,
+    configs: Mutex<Vec<(Vec<u8>, Vec<u8>, Arc<ClientConfig>)>>,
+}
+
+/// Pairs kept per location; more distinct renderings start it over.
+const DYNAMIC_CONFIGS: usize = 64;
+
+impl DynamicCert {
+    pub(crate) fn new(
+        cert: crate::worker::PreparedCertPath,
+        key: crate::worker::PreparedCertPath,
+        passwords: Arc<[Vec<u8>]>,
+        protocols: TlsVersionSet,
+        sni: bool,
+        reuse: bool,
+        verify: Option<Arc<crate::x509_verify::Store>>,
+    ) -> Self {
+        Self {
+            cert,
+            key,
+            passwords,
+            protocols,
+            sni,
+            reuse,
+            verify,
+            configs: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The config for the rendered pair: `None` for an empty certificate
+    /// (the location's config, without one), else the pair's, loaded on
+    /// its first use; `Err` is the error log's line, and the request
+    /// fails with a 500, as nginx's does.
+    #[cold]
+    pub fn config(&self, cert: &[u8], key: &[u8]) -> Result<Option<Arc<ClientConfig>>, String> {
+        if cert.is_empty() {
+            return Ok(None);
+        }
+        let found = self
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(c, k, _)| c == cert && k == key)
+            .map(|(_, _, config)| config.clone());
+        if let Some(config) = found {
+            return Ok(Some(config));
+        }
+        let path = |rendered: &[u8], at: &crate::worker::PreparedCertPath| {
+            use std::os::unix::ffi::OsStrExt;
+            let path = Path::new(std::ffi::OsStr::from_bytes(rendered));
+            match at {
+                crate::worker::PreparedCertPath::Vars {
+                    prefix: Some(prefix),
+                    ..
+                } if path.is_relative() => prefix.join(path),
+                _ => path.to_path_buf(),
+            }
+        };
+        let (cert_path, key_path) = (path(cert, &self.cert), path(key, &self.key));
+        let certified =
+            certificate_pair(&cert_path, &key_path, &self.passwords, |p| std::fs::read(p))?;
+        let config = client_config(
+            self.protocols,
+            self.sni,
+            self.reuse,
+            self.verify.clone(),
+            Some(certified),
+        )?;
+        let mut configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
+        if configs.len() >= DYNAMIC_CONFIGS {
+            configs.clear();
+        }
+        configs.push((cert.to_vec(), key.to_vec(), config.clone()));
+        Ok(Some(config))
+    }
 }
 
 /// What one proxied request connects with.
@@ -147,6 +240,15 @@ pub fn client_certificate(
     key: &Path,
     passwords: &[Vec<u8>],
 ) -> Result<Arc<CertifiedKey>, String> {
+    certificate_pair(cert, key, passwords, |path| std::fs::read(path))
+}
+
+fn certificate_pair(
+    cert: &Path,
+    key: &Path,
+    passwords: &[Vec<u8>],
+    read_file: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<Arc<CertifiedKey>, String> {
     type Key = (Vec<u8>, Vec<u8>);
     static KEYS: Mutex<Vec<(Key, Arc<CertifiedKey>)>> = Mutex::new(Vec::new());
     let fail = |e: &dyn std::fmt::Display| {
@@ -157,7 +259,7 @@ pub fn client_certificate(
         )
     };
     let read = |path: &Path| {
-        std::fs::read(path).map_err(|e| {
+        read_file(path).map_err(|e| {
             fail(&format_args!(
                 "reading {}: {}",
                 path.display(),

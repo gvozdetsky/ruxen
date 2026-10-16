@@ -840,9 +840,8 @@ impl ProxyConf {
                     std::path::PathBuf::from(&args[1]),
                 ));
             }
-            // Variables, which nginx renders per connection, aren't
-            // supported: such a configuration is refused, not served
-            // without the certificate.
+            // With variables, rendered per request (#434). `data:` isn't
+            // supported: refused, not served without the certificate.
             "proxy_ssl_certificate" | "proxy_ssl_certificate_key" => {
                 let name: &'static str = if args[0] == "proxy_ssl_certificate" {
                     "proxy_ssl_certificate"
@@ -863,19 +862,30 @@ impl ProxyConf {
                         got: args[1..].join(" "),
                     });
                 }
-                if args[1].contains('$') || args[1].starts_with("data:") {
+                if args[1].starts_with("data:") {
                     return Err(Error::BadValue {
                         what: if name == "proxy_ssl_certificate" {
-                            "proxy_ssl_certificate (variables and data: aren't supported yet)"
+                            "proxy_ssl_certificate (data: isn't supported yet)"
                         } else {
-                            "proxy_ssl_certificate_key (variables and data: aren't supported yet)"
+                            "proxy_ssl_certificate_key (data: isn't supported yet)"
                         },
                         got: args[1].clone(),
                     });
                 }
-                *slot = Some((!args[1].is_empty()).then(|| {
-                    super::resolve_conf_path(conf_prefix, std::path::PathBuf::from(&args[1]))
-                }));
+                *slot = Some(if args[1].is_empty() {
+                    None
+                } else if args[1].contains('$') {
+                    Some(super::CertPath::Vars {
+                        raw: args[1].clone(),
+                        parts: parse_value_with_vars(&args[1])?,
+                        prefix: conf_prefix.map(<std::path::Path>::to_path_buf),
+                    })
+                } else {
+                    Some(super::CertPath::File(super::resolve_conf_path(
+                        conf_prefix,
+                        std::path::PathBuf::from(&args[1]),
+                    )))
+                });
             }
             "proxy_ssl_password_file" => {
                 if self.ssl_password_file.is_some() {

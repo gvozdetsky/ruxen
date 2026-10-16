@@ -843,6 +843,39 @@ fn leak_path(path: &std::path::Path) -> &'static std::path::Path {
     crate::arena::leak(path.to_path_buf().into_boxed_path())
 }
 
+/// `proxy_ssl_certificate` / `_key` (#138): a file, or a path with
+/// variables, rendered per request and resolved against `prefix` (#434).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PreparedCertPath {
+    File(&'static Path),
+    Vars {
+        raw: &'static str,
+        parts: &'static [PreparedValuePart],
+        prefix: Option<&'static Path>,
+    },
+}
+
+impl PreparedCertPath {
+    fn new(path: &crate::config::CertPath) -> Self {
+        match path {
+            crate::config::CertPath::File(path) => Self::File(leak_path(path)),
+            crate::config::CertPath::Vars { raw, parts, prefix } => Self::Vars {
+                raw: crate::arena::leak(raw.clone().into_boxed_str()),
+                parts: super::prepare::prepare_value_parts(parts.clone()),
+                prefix: prefix.as_deref().map(leak_path),
+            },
+        }
+    }
+
+    /// The directive's value, for messages.
+    pub fn text(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::File(path) => path.to_string_lossy(),
+            Self::Vars { raw, .. } => std::borrow::Cow::Borrowed(raw),
+        }
+    }
+}
+
 /// The `proxy_ssl_*` settings of a scope, resolved (#116).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamTlsSettings {
@@ -856,8 +889,8 @@ pub(crate) struct UpstreamTlsSettings {
     pub verify_depth: u32,
     pub crl: Option<&'static std::path::Path>,
     /// `proxy_ssl_certificate` and its key (#138); `None` for `""`.
-    pub certificate: Option<&'static std::path::Path>,
-    pub certificate_key: Option<&'static std::path::Path>,
+    pub certificate: Option<PreparedCertPath>,
+    pub certificate_key: Option<PreparedCertPath>,
     /// `proxy_ssl_password_file` (#139).
     pub password_file: Option<&'static std::path::Path>,
 }
@@ -902,7 +935,7 @@ impl UpstreamTlsSettings {
             verify_depth: conf.ssl_verify_depth.unwrap_or(self.verify_depth),
             crl: conf.ssl_crl.as_deref().map(leak_path).or(self.crl),
             certificate: match &conf.ssl_certificate {
-                Some(path) => path.as_deref().map(leak_path),
+                Some(path) => path.as_ref().map(PreparedCertPath::new),
                 None => self.certificate,
             },
             password_file: conf
@@ -911,7 +944,7 @@ impl UpstreamTlsSettings {
                 .map(leak_path)
                 .or(self.password_file),
             certificate_key: match &conf.ssl_certificate_key {
-                Some(path) => path.as_deref().map(leak_path),
+                Some(path) => path.as_ref().map(PreparedCertPath::new),
                 None => self.certificate_key,
             },
         }

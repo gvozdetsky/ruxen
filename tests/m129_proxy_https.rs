@@ -471,8 +471,10 @@ fn upgrade_through_an_https_upstream() {
 }
 
 /// `proxy_ssl_certificate` (#138): the certificate goes to an upstream that
-/// asks for one; `""` cancels an inherited one. The upstream is a rustls
-/// server that answers with what it got.
+/// asks for one; `""` cancels an inherited one. With variables (#434), the
+/// pair is the request's: none when it renders empty, a 500 when it
+/// doesn't load. The upstream is a rustls server that answers with what
+/// it got.
 #[test]
 fn client_certificates_to_upstreams() {
     use std::sync::Arc;
@@ -508,7 +510,7 @@ fn client_certificates_to_upstreams() {
     );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let backend = listener.local_addr().unwrap().port();
-    let requests = 2;
+    let requests = 5;
     let upstream = std::thread::spawn(move || {
         for _ in 0..requests {
             let (tcp, _) = listener.accept().unwrap();
@@ -544,19 +546,30 @@ fn client_certificates_to_upstreams() {
                proxy_ssl_certificate {cert}; proxy_ssl_certificate_key {key};\n\
                location /with/ {{ proxy_pass https://127.0.0.1:{backend}/; }}\n\
                location /cancel/ {{ proxy_pass https://127.0.0.1:{backend}/;\n\
-                 proxy_ssl_certificate \"\"; }} }}",
+                 proxy_ssl_certificate \"\"; }}\n\
+               location /vars/ {{ proxy_pass https://127.0.0.1:{backend}/;\n\
+                 proxy_ssl_certificate $arg_c; proxy_ssl_certificate_key $arg_k; }} }}",
             cert = client.cert_path().display(),
             key = client.key_path().display(),
         )
     });
     assert_eq!(get(front, "/with/"), (200, "cert".to_string()));
     assert_eq!(get(front, "/cancel/"), (200, "none".to_string()));
+    let vars = format!(
+        "/vars/?c={}&k={}",
+        client.cert_path().display(),
+        client.key_path().display()
+    );
+    assert_eq!(get(front, &vars), (200, "cert".to_string()));
+    assert_eq!(get(front, &vars), (200, "cert".to_string()));
+    assert_eq!(get(front, "/vars/"), (200, "none".to_string()));
+    assert_eq!(get(front, "/vars/?c=/nonexistent&k=/nonexistent").0, 500);
     upstream.join().unwrap();
 }
 
 /// nginx's checks of `proxy_ssl_certificate` at load: a certificate needs
-/// its key. Variables aren't supported yet, so they are refused rather
-/// than served without a certificate.
+/// its key. Variables load per request; `data:` isn't supported yet, so it
+/// is refused rather than served without a certificate.
 #[test]
 fn proxy_ssl_certificate_needs_its_key() {
     let client = common::tls::make_self_signed("client.test");
@@ -593,6 +606,8 @@ fn proxy_ssl_certificate_needs_its_key() {
         "proxy_ssl_certificate {cert}; proxy_ssl_certificate_key {cert};"
     ));
     let vars = check("proxy_ssl_certificate $arg_c; proxy_ssl_certificate_key $arg_c;");
+    let vars_no_key = check("proxy_ssl_certificate $arg_c;");
+    let data = check("proxy_ssl_certificate data:x; proxy_ssl_certificate_key data:x;");
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !no_key.0
@@ -608,9 +623,18 @@ fn proxy_ssl_certificate_needs_its_key() {
         "{}",
         wrong_key.1
     );
+    assert!(vars.0, "{}", vars.1);
     assert!(
-        !vars.0 && vars.1.contains("proxy_ssl_certificate"),
+        !vars_no_key.0
+            && vars_no_key
+                .1
+                .contains("no \"proxy_ssl_certificate_key\" is defined for certificate \"$arg_c\""),
         "{}",
-        vars.1
+        vars_no_key.1
+    );
+    assert!(
+        !data.0 && data.1.contains("data: isn't supported yet"),
+        "{}",
+        data.1
     );
 }

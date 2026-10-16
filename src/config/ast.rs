@@ -109,11 +109,11 @@ pub struct ProxyConf {
     pub ssl_verify_depth: Option<u32>,
     /// `proxy_ssl_crl`, resolved as the trusted certificates are.
     pub ssl_crl: Option<std::path::PathBuf>,
-    /// `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (#138),
-    /// resolved; `Some(None)` is `""`, no certificate, which cancels an
-    /// inherited one.
-    pub ssl_certificate: Option<Option<std::path::PathBuf>>,
-    pub ssl_certificate_key: Option<Option<std::path::PathBuf>>,
+    /// `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (#138);
+    /// `Some(None)` is `""`, no certificate, which cancels an inherited
+    /// one.
+    pub ssl_certificate: Option<Option<CertPath>>,
+    pub ssl_certificate_key: Option<Option<CertPath>>,
     /// `proxy_ssl_password_file` (#139).
     pub ssl_password_file: Option<std::path::PathBuf>,
 }
@@ -2021,6 +2021,19 @@ pub enum FileTestKind {
     Dir,
     Exists,
     Exec,
+}
+
+/// A `proxy_ssl_certificate` / `_key` value: a file, resolved against the
+/// config directory, or one with variables, rendered and resolved per
+/// request (#434).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertPath {
+    File(PathBuf),
+    Vars {
+        raw: String,
+        parts: Vec<ValuePart>,
+        prefix: Option<PathBuf>,
+    },
 }
 
 /// A value string as a sequence of literal chunks and `$variable` references.
