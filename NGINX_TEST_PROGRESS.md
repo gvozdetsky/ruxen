@@ -7,13 +7,13 @@ Last run: 2026-10-16 against `nginx-tests` 0b70854 (2026-09-30).
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 160
+- **Passing in ruxen:** 165
 - **Intentionally skipped (`-V` banner excludes the module):** 314
-- **Failing — work in progress:** 31
+- **Failing — work in progress:** 26
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (160)
+## Passing in ruxen (165)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -87,18 +87,21 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy.t`
 - `proxy_available.t`
 - `proxy_bind.t`
+- `proxy_cache.t`
 - `proxy_cache_bypass.t`
 - `proxy_cache_chunked.t`
 - `proxy_cache_control.t`
 - `proxy_cache_error.t`
 - `proxy_cache_lock.t`
 - `proxy_cache_lock_age.t`
+- `proxy_cache_max_range_offset.t`
 - `proxy_cache_min_free.t`
 - `proxy_cache_path.t`
 - `proxy_cache_range.t`
 - `proxy_cache_revalidate.t`
 - `proxy_cache_valid.t`
 - `proxy_cache_variables.t`
+- `proxy_cache_vary.t`
 - `proxy_chunked_extra.t`
 - `proxy_connection_headers.t`
 - `proxy_duplicate_headers.t`
@@ -122,6 +125,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_ssl.t`
 - `proxy_ssl_certificate.t`
 - `proxy_ssl_certificate_empty.t`
+- `proxy_ssl_certificate_vars.t`
 - `proxy_ssl_crl.t`
 - `proxy_ssl_keepalive.t`
 - `proxy_ssl_name.t`
@@ -144,6 +148,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `server_tokens.t`
 - `split_clients.t`
 - `ssl.t`
+- `ssl_cache.t`
 - `ssl_certificate_aux.t`
 - `ssl_certificate_chain.t`
 - `ssl_certificates.t`
@@ -178,7 +183,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout_h2.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (31)
+## Failing — actively being worked on (26)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -190,7 +195,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `h2_proxy_request_buffering.t` — 49/51
 - `h2_proxy_request_buffering_ssl.t` — 40/42
 - `h2_request_body.t` — 8/51
-- `h2_request_body_extra.t` — 1/52
+- `h2_request_body_extra.t` — 2/52
 - `h2_request_body_preread.t` — 1/11
 - `http_resolver.t` — 25/40
 - `http_resolver_aaaa.t` — 49/74
@@ -198,10 +203,7 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `http_resolver_cname.t` — 3/13
 - `http_resolver_ipv4.t` — 3/5
 - `limit_conn.t` — 1/10
-- `proxy_cache.t` — 0/0
 - `proxy_cache_convert_head.t` — 2/10
-- `proxy_cache_max_range_offset.t` — 0/0
-- `proxy_cache_vary.t` — 0/0
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 0/0
 - `proxy_if.t` — 1/17
@@ -209,8 +211,6 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_request_buffering.t` — 2/20
 - `proxy_request_buffering_chunked.t` — 3/24
 - `proxy_request_buffering_ssl.t` — 3/20
-- `proxy_ssl_certificate_vars.t` — 0/0
-- `ssl_cache.t` — 4/6
 - `ssl_ocsp.t` — 0/0
 - `ssl_stapling.t` — 5/12
 

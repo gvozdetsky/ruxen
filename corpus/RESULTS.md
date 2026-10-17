@@ -6,11 +6,11 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 214 of 238 configurations nginx accepts (90%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 217 of 238 configurations nginx accepts (91%).** 92 more cases were not valid for nginx either and don't count.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 194 | 91% |
+| github | 214 | 197 | 92% |
 | php | 3 | 0 | 0% |
 | proxy | 17 | 17 | 100% |
 | static | 4 | 3 | 75% |
@@ -22,11 +22,9 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | 6 | unknown directive `stream` | gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt, gh:Azigaming404/cyber/nginx.conf.txt, gh:essoojay/Autoscript-by-azi/nginx.conf.txt … |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
 | 3 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir, gh:EstudioNexos/flautodiscover/fla_nginx.conf |
-| 2 | bad value for upstream server host:port: N.N.N.N: invalid socket address in <sandbox>…:N | gh:eubr-bigsea/citrus/custom_nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf |
 | 1 | "…" is not supported yet, and ignoring it is unsafe: variables in the path aren't expanded yet (#N), | gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf |
 | 1 | bad value for upstream server param: resolve in <sandbox>…:N | gh:rajim59/SwarmFort/infra/docker/nginx.conf |
 | 1 | invalid location regex `^${SEEK_SUB_URI}(…: regex parse error: | gh:nfdi4health/ldh-deployment/nginx.conf.https |
-| 1 | unknown "…" variable in <sandbox>…:N | gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf |
 | 1 | unknown directive `charset_types` | h5bp:nginx.conf |
 | 1 | unknown directive `fastcgi_pass` | laravel#1 |
 | 1 | unknown directive `grpc_pass` | gh:refluxdb/influxdb3-community/iox-nginx.conf |
@@ -143,7 +141,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:vazw/siamstr/nginx.config | github | ok | ok |  |
 | gh:awfeequdng/rust-admin/nginx.conf.default | github | ok | ok |  |
 | gh:mazz/kifu/nginx.conf.sample | github | ok | ok |  |
-| gh:eubr-bigsea/citrus/custom_nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server host:port: 127.0.0.1: invalid socket address in <sandbox>/conf/nginx.conf:36 |
+| gh:eubr-bigsea/citrus/custom_nginx.conf | github | ok | ok |  |
 | gh:brick-family/brick/nginx.config | github | ok | ok |  |
 | gh:bakery/openmic/nginx.conf.sigil | github | — | — | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:O-C-R/intotheokavango/nginx.conf.smp | github | ok | ok |  |
@@ -228,7 +226,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:hatanaca/quick-filler-test/nginx.conf | github | ok | ok |  |
 | gh:Ecalose/ocr/nginx.conf | github | ok | ok |  |
 | gh:chelebyy/link-manager/frontend/nginx.conf | github | ok | ok |  |
-| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server host:port: 127.0.0.1: invalid socket address in <sandbox>/conf/nginx.conf:36 |
+| gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | ok |  |
 | gh:Ingvord/animated-garbanzo/nginx/nginx.conf | github | ok | ok |  |
 | gh:cfrank/nextjs-common-host-redirect-issue/nginx/nginx.conf | github | ok | ok |  |
 | gh:flajoke/s21-Simple-Docker/src/06/nginx.conf | github | ok | ok |  |
@@ -307,7 +305,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | gh:ksanyok/mailforge/docker/web/nginx.conf | github | ok | ok |  |
 | gh:Ikeu-1030/iRun/docker/nginx/nginx.conf | github | ok | ok |  |
 | gh:rajim59/SwarmFort/infra/docker/nginx.conf | github | ok | FAIL | ruxen: [emerg] bad value for upstream server param: resolve in <sandbox>/conf/nginx.conf:6 |
-| gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf | github | ok | FAIL | ruxen: [emerg] unknown "SSL_REDIRECT" variable in <sandbox>/conf/nginx.conf:260 |
+| gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf | github | ok | ok |  |
 | gh:izumiriyad/bsass-demov2/ops/nginx.conf | github | ok | ok |  |
 | gh:devfernandoa/HyController/panel/frontend/nginx.conf | github | ok | ok |  |
 | gh:mabels/mailu-arm/core/nginx/conf/nginx.conf | github | — | — | (nginx: [emerg] directive "resolver" is not terminated by ";" in <sandbox>/conf/n) |
