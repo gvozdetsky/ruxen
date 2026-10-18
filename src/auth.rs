@@ -415,15 +415,34 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     out
 }
 
+// crypt_r() with a buffer per thread, as nginx's ngx_libc_crypt with
+// NGX_HAVE_GNU_CRYPT_R: crypt() returns one static buffer, and a lock
+// around it would let only one worker hash at a time (#521).
+//
+// `struct crypt_data` is opaque here, so the buffer is sized for the
+// largest layout crypt_r may see: 131232 bytes in glibc's own libcrypt
+// (before 2.39), 32768 in libxcrypt, 260 in musl. u64 for the alignment
+// of glibc's `long` field. All three want it zeroed before first use and
+// let it be reused after.
 #[cfg(unix)]
-static CRYPT_LOCK: Mutex<()> = Mutex::new(());
+const CRYPT_DATA_WORDS: usize = 131232usize.div_ceil(8);
 
-// glibc has crypt() in libcrypt (libxcrypt); musl has it in libc itself,
+#[cfg(unix)]
+thread_local! {
+    static CRYPT_DATA: std::cell::RefCell<Box<[u64]>> =
+        std::cell::RefCell::new(vec![0u64; CRYPT_DATA_WORDS].into_boxed_slice());
+}
+
+// glibc has crypt_r() in libcrypt (libxcrypt); musl has it in libc itself,
 // and linking a glibc libcrypt.a into a static musl binary fails.
 #[cfg(unix)]
 #[cfg_attr(not(target_env = "musl"), link(name = "crypt"))]
 unsafe extern "C" {
-    fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
+    fn crypt_r(
+        key: *const libc::c_char,
+        salt: *const libc::c_char,
+        data: *mut libc::c_void,
+    ) -> *mut libc::c_char;
 }
 
 #[cfg(unix)]
@@ -437,13 +456,14 @@ fn verify_crypt(stored: &[u8], password: &[u8]) -> bool {
     let Ok(salt) = CString::new(stored) else {
         return false;
     };
-    let _guard = CRYPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let ptr = unsafe { crypt(key.as_ptr(), salt.as_ptr()) };
-    if ptr.is_null() {
-        return false;
-    }
-    let out = unsafe { CStr::from_ptr(ptr) }.to_bytes();
-    out == stored
+    CRYPT_DATA.with_borrow_mut(|data| {
+        let ptr = unsafe { crypt_r(key.as_ptr(), salt.as_ptr(), data.as_mut_ptr().cast()) };
+        if ptr.is_null() {
+            return false;
+        }
+        let out = unsafe { CStr::from_ptr(ptr) }.to_bytes();
+        out == stored
+    })
 }
 
 #[cfg(not(unix))]
@@ -544,5 +564,40 @@ mod tests {
             b"$apr1$salt$VEpBc9VHGUKwI9.yg13Iu0",
             b"nope"
         ));
+    }
+
+    // Without CRYPT_LOCK, threads hashing at once must not see each
+    // other's output (#521).
+    #[cfg(unix)]
+    #[test]
+    fn verify_crypt_concurrent_threads() {
+        const HASHES: [(&[u8], &[u8]); 8] = [
+            (b"$6$aa$TLd/SdOZKspSe2HFCYee6gxldyAskJzGLmwa0LZPgJ1ZdGRlhqzHUnqUpU93D13RYTty9F8QkCR2HJ0ITxpZY0", b"pw-aa"),
+            (b"$5$aa$oYTaHr3G4CF9tT3Tm2sbbrjG5ZVfXJEy0qxNYObcqk6", b"pw-aa"),
+            (b"$6$bb$JkdUslJY7rwxMzOCl02i0YsYLRz6ZMgPg/iugrG9DF7dpXYj1TKDSp9WSz/LBJbuNijWawXXPuYZCyKgpt4MQ.", b"pw-bb"),
+            (b"$5$bb$HjWZNtAkYBS1NZPluK6kLa30O.G1VBBWTy8dCzmTg34", b"pw-bb"),
+            (b"$6$cc$m8Dboc8FP3OKh19LA8srXNCy1mRwNbkGgyG42v63FiCtPrO2Pu.1eQWHWD6av9xIyYWvHGJxvXFth383EgdYZ1", b"pw-cc"),
+            (b"$5$cc$ThtmrLYUD3BkTYlGweOJgOujo2r1NbvoaWga1BjLlw7", b"pw-cc"),
+            (b"$6$dd$ttnvYfPvkplHNNHVSg6q.B.LPv.D7Vjh7K5U.hcE.d0V9FEc08r83xPysAJ38EOfyfU7Cmprp.CqRQAazY5fP.", b"pw-dd"),
+            (b"$5$dd$54/jofUh4P39bZLvG.Ryc0Fn2i78QDuVJ400nlFygTD", b"pw-dd"),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(HASHES.len()));
+        let threads: Vec<_> = HASHES
+            .iter()
+            .enumerate()
+            .map(|(i, &(stored, password))| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..50 {
+                        assert!(verify_stored_password(stored, password), "hash {i}");
+                        assert!(!verify_stored_password(stored, b"nope"), "hash {i}");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }
