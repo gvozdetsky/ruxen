@@ -98,16 +98,19 @@ where
     let stream = io.stream_handle();
     // What nginx announces (ngx_http_v2_send_settings), from the default
     // server's settings: http2_max_concurrent_streams (128), a stream
-    // window of http2_body_preread_size (64k), the largest frame size; then
-    // it opens
-    // the connection window to the maximum with a WINDOW_UPDATE
+    // window of http2_body_preread_size (64k); then it opens the
+    // connection window to the maximum with a WINDOW_UPDATE
     // (ngx_http_v2_init). Clients such as Test::Nginx wait for both.
+    // nginx also announces the largest frame size, 2^24-1, which it can
+    // afford: it parses frames as they arrive. The `h2` crate reads each
+    // frame whole first, so a client could make every connection hold a
+    // 16 MiB frame (#506). The default, 16384, is left: request bodies
+    // come in a 64k window anyway, and a head is held whole regardless.
     let h2conf = listen.servers[listen.default_server].h2;
     let max_streams = h2conf.max_concurrent_streams.unwrap_or(128);
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(max_streams)
         .initial_window_size(h2conf.body_preread_size.unwrap_or(64 * 1024))
-        .max_frame_size((1 << 24) - 1)
         .initial_connection_window_size((1 << 31) - 1)
         // The decoded request head is held whole before `handle` sees it:
         // bounded, as nginx's large_client_header_buffers bound a head
