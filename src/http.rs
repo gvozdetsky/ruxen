@@ -1306,27 +1306,30 @@ pub const RUXEN_IDENTITY: Identity = Identity {
     plain: b"ruxen",
 };
 
-/// What nginx-tests expects (`server_tokens.t`, error-page bodies): the
-/// nginx version `-V` reports.
+/// What nginx-tests expects (`server_tokens.t`, error-page bodies), and
+/// the `nginx version:` line of `-V` under the harness.
 pub const NGINX_IDENTITY: Identity = Identity {
     versioned: b"nginx/1.29.2",
     plain: b"nginx",
 };
 
-/// Set by `scripts/run_nginx_tests.sh` so responses name nginx, as the
-/// upstream tests assert. Everyone else gets ruxen's own name.
+/// Set by `scripts/run_nginx_tests.sh` so responses and `-V` name nginx,
+/// as the upstream tests assert. Everyone else gets ruxen's own name.
 pub const NGINX_IDENTITY_ENV: &str = "RUXEN_NGINX_IDENTITY";
 
-/// Read once; only config preparation calls this, never the request path.
+/// Read once; only `-V` and config preparation call this, never the
+/// request path.
+pub fn nginx_identity() -> bool {
+    static NGINX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NGINX.get_or_init(|| std::env::var_os(NGINX_IDENTITY_ENV).is_some_and(|v| v == "1"))
+}
+
 pub fn identity() -> &'static Identity {
-    static IDENTITY: std::sync::OnceLock<&'static Identity> = std::sync::OnceLock::new();
-    IDENTITY.get_or_init(|| {
-        if std::env::var_os(NGINX_IDENTITY_ENV).is_some_and(|v| v == "1") {
-            &NGINX_IDENTITY
-        } else {
-            &RUXEN_IDENTITY
-        }
-    })
+    if nginx_identity() {
+        &NGINX_IDENTITY
+    } else {
+        &RUXEN_IDENTITY
+    }
 }
 
 /// Resolve the `Server:` header value for a given `server_tokens` setting.
@@ -2298,7 +2301,7 @@ mod tests {
             format!("ruxen/{}", env!("CARGO_PKG_VERSION")).as_bytes()
         );
         assert_eq!(RUXEN_IDENTITY.plain, b"ruxen");
-        // Must match the `nginx version:` line of `-V`.
+        // Also the `nginx version:` line of `-V`.
         assert_eq!(NGINX_IDENTITY.versioned, b"nginx/1.29.2");
         assert_eq!(NGINX_IDENTITY.plain, b"nginx");
     }

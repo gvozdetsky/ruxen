@@ -315,9 +315,9 @@ The currently implemented nginx-style command-line surface includes:
 
 and one option nginx doesn't have: `--compat`, the configuration check described in [Check your nginx configuration](#check-your-nginx-configuration).
 
-`-V` starts with `nginx version: nginx/1.29.2`, followed by `ruxen version: ruxen/<version>`. The nginx line and the `configure arguments` list are what the nginx-tests harness reads to decide which tests apply, so they describe ruxen as an nginx build: the arguments list only the modules ruxen actually implements.
+`-V` starts with `ruxen version: ruxen/<version>`, followed by a `configure arguments` list in nginx's format that names only the modules ruxen actually implements: the nginx-tests harness reads it to decide which tests apply.
 
-Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.29.2` instead, because the upstream tests assert nginx's header.
+Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.29.2` instead, because the upstream tests assert nginx's header, and puts `nginx version: nginx/1.29.2` at the top of `-V`, which the harness needs too.
 
 ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) log reopening via `SIGUSR1`, and configuration reload via `SIGHUP`. `-s stop|quit|reopen|reload` send `SIGTERM`/`SIGQUIT`/`SIGUSR1`/`SIGHUP` to the PID in the config's `pid` file, as nginx does. A reload starts new workers with the new configuration (certificates included) on the same listening sockets, so connections aren't refused or reset in the handover, and the old workers finish their requests, within `worker_shutdown_timeout` if set; a configuration that fails to load is logged and the running one stays. After a switch to `user`, a reload reads the configuration as that user and can't bind new ports below 1024.
 

@@ -194,7 +194,7 @@ fn real_main() -> Result<(), Failure> {
     let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
 
     if cli.show_version {
-        print!("{}", version_output());
+        print!("{}", version_output(http::nginx_identity()));
         return Ok(());
     }
     let signal = match cli.signal.as_deref() {
@@ -961,41 +961,53 @@ fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
     Ok((abs, src))
 }
 
-fn version_output() -> &'static str {
-    concat!(
-        "nginx version: nginx/1.29.2\n",
-        "ruxen version: ruxen/",
-        env!("CARGO_PKG_VERSION"),
-        "\n",
-        "TLS SNI support enabled\n",
-        "configure arguments:",
-        " --with-http_ssl_module",
-        " --with-http_realip_module",
-        " --with-http_stub_status_module",
-        " --with-http_auth_request_module",
-        " --with-http_v2_module",
-        " --without-pcre",
-        " --without-http_charset_module",
-        " --without-http_ssi_module",
-        " --without-http_mirror_module",
-        " --without-http_userid_module",
-        " --without-http_geo_module",
-        " --without-http_referer_module",
-        " --without-http_fastcgi_module",
-        " --without-http_uwsgi_module",
-        " --without-http_scgi_module",
-        " --without-http_grpc_module",
-        " --without-http_memcached_module",
-        " --without-http_empty_gif_module",
-        " --without-http_browser_module",
-        " --without-http_upstream_random_module",
-        " --without-http_upstream_sticky_module",
-        " --without-mail_pop3_module",
-        " --without-mail_imap_module",
-        " --without-mail_smtp_module",
-        "\n",
-    )
+/// `-V`. The `nginx version:` line only under nginx-tests
+/// (RUXEN_NGINX_IDENTITY, as for `Server:`): Test::Nginx reads it to decide
+/// which tests apply, and outside the harness ruxen doesn't claim to be an
+/// nginx release. The `configure arguments` are the same in both modes.
+fn version_output(nginx_identity: bool) -> String {
+    let mut out = String::new();
+    if nginx_identity {
+        out.push_str("nginx version: ");
+        out.push_str(std::str::from_utf8(http::NGINX_IDENTITY.versioned).unwrap());
+        out.push('\n');
+    }
+    out.push_str(VERSION_BODY);
+    out
 }
+
+const VERSION_BODY: &str = concat!(
+    "ruxen version: ruxen/",
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "TLS SNI support enabled\n",
+    "configure arguments:",
+    " --with-http_ssl_module",
+    " --with-http_realip_module",
+    " --with-http_stub_status_module",
+    " --with-http_auth_request_module",
+    " --with-http_v2_module",
+    " --without-pcre",
+    " --without-http_charset_module",
+    " --without-http_ssi_module",
+    " --without-http_mirror_module",
+    " --without-http_userid_module",
+    " --without-http_geo_module",
+    " --without-http_referer_module",
+    " --without-http_fastcgi_module",
+    " --without-http_uwsgi_module",
+    " --without-http_scgi_module",
+    " --without-http_grpc_module",
+    " --without-http_memcached_module",
+    " --without-http_empty_gif_module",
+    " --without-http_browser_module",
+    " --without-http_upstream_random_module",
+    " --without-http_upstream_sticky_module",
+    " --without-mail_pop3_module",
+    " --without-mail_imap_module",
+    " --without-mail_smtp_module",
+    "\n",
+);
 
 /// nginx's ngx_event_module_init warning: more `worker_connections` than
 /// file descriptors (the `worker_rlimit_nofile` to be set, else the
@@ -1225,9 +1237,8 @@ mod tests {
     #[test]
     fn version_output_is_pinned() {
         assert_eq!(
-            version_output(),
+            version_output(false),
             concat!(
-                "nginx version: nginx/1.29.2\n",
                 "ruxen version: ruxen/",
                 env!("CARGO_PKG_VERSION"),
                 "\n",
@@ -1259,6 +1270,11 @@ mod tests {
                 " --without-mail_smtp_module",
                 "\n",
             )
+        );
+        // Test::Nginx matches `nginx version: nginx/<version>` at the top.
+        assert_eq!(
+            version_output(true),
+            format!("nginx version: nginx/1.29.2\n{}", version_output(false))
         );
     }
 
