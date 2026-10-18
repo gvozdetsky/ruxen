@@ -230,6 +230,22 @@ fn is_not_found(e: &std::io::Error) -> bool {
     )
 }
 
+/// `"<path>" is not a regular file`, at `crit` and whatever
+/// `log_not_found` says (ngx_http_static_module.c:208).
+#[cold]
+fn not_regular(root: &PreparedRoot, rel: &[u8]) {
+    let path = if rel.is_empty() {
+        root.root.to_path_buf()
+    } else {
+        join(root.root, rel)
+    };
+    note_failed_lookup_at(
+        format!("\"{}\" is not a regular file", path.display()),
+        false,
+        ErrorLogLevel::Crit,
+    );
+}
+
 /// `open() "<path>" failed (<errno>)`, nginx's static-module line.
 #[cold]
 fn open_failed(root: &PreparedRoot, rel: &[u8], e: std::io::Error) -> Outcome {
@@ -410,8 +426,8 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
     // walk), so seeing a dir here means the request was for a bare
     // directory path. Query preservation is deferred — the redirect
     // drops any `?query` from the original request, matching prior
-    // behavior. Any other non-regular file (socket, device, …) stays a
-    // 404.
+    // behavior. Any other non-regular file (FIFO, socket, device, …) is
+    // a 404, logged as by ngx_http_static_handler.
     let mode = stat.st_mode & libc::S_IFMT;
     if mode == libc::S_IFDIR {
         let mut loc = Vec::with_capacity(url_path.len() + 1);
@@ -420,6 +436,7 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
         return Outcome::Redirect(loc);
     }
     if mode != libc::S_IFREG {
+        not_regular(root, rel);
         return Outcome::NotFound;
     }
 
@@ -500,7 +517,7 @@ fn open_refusing_symlinks(
         return openat2_beneath(root_fd, rel);
     }
     let dirfd = anchor.as_ref().map_or(root_fd, |fd| fd.as_raw_fd());
-    openat2_no_symlinks(dirfd, rest, libc::O_RDONLY)
+    openat2_no_symlinks(dirfd, rest, READ_FLAGS)
 }
 
 /// `openat2(RESOLVE_NO_SYMLINKS)` with nginx's errors for a refused
@@ -690,7 +707,14 @@ fn openat2_with(dirfd: RawFd, rel: &[u8], flags: i32, extra: u64) -> std::io::Re
     Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
 }
 
-/// `openat2(dirfd, rel, { O_RDONLY | O_CLOEXEC, RESOLVE_BENEATH |
+/// How the request's file is opened. O_NONBLOCK, as nginx's
+/// ngx_open_and_stat_file: opening a FIFO for reading would otherwise wait
+/// for a writer, on the worker thread (#520). It changes nothing for a
+/// regular file, which is read with sendfile and pread; anything else is
+/// a 404 after fstat.
+const READ_FLAGS: i32 = libc::O_RDONLY | libc::O_NONBLOCK;
+
+/// `openat2(dirfd, rel, { READ_FLAGS | O_CLOEXEC, RESOLVE_BENEATH |
 /// RESOLVE_NO_MAGICLINKS })` wrapper. Returns the mapped `OwnedFd`, or an
 /// `io::Error` whose `kind()` already buckets the cases `io_to_outcome`
 /// cares about. The CString conversion catches interior NULs as EINVAL
@@ -700,7 +724,7 @@ fn openat2_beneath(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd> {
     // field write. That also future-proofs us against new trailing fields
     // — a zero value preserves default kernel behavior.
     let mut how: libc::open_how = unsafe { core::mem::zeroed() };
-    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    how.flags = (READ_FLAGS | libc::O_CLOEXEC) as u64;
     how.mode = 0;
     how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
     let ret = with_c_path(rel, |c_rel| unsafe {
@@ -729,7 +753,7 @@ fn openat2_beneath(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd> {
 fn open_following_symlinks(dirfd: RawFd, rel: &[u8]) -> std::io::Result<OwnedFd> {
     let c_rel = CString::new(rel).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     let mut how: libc::open_how = unsafe { core::mem::zeroed() };
-    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    how.flags = (READ_FLAGS | libc::O_CLOEXEC) as u64;
     how.resolve = libc::RESOLVE_NO_MAGICLINKS;
     let ret = unsafe {
         libc::syscall(
