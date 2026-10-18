@@ -449,8 +449,8 @@ async fn write_out<S: crate::worker::ConnIo>(
 }
 
 /// An incremental decoder of a chunked body (RFC 9112 7.1): chunk
-/// extensions and trailers are dropped, as `read_chunked_body_with_buf`
-/// does for buffered bodies.
+/// extensions and trailers are dropped. Buffered bodies go through it too
+/// (`read_chunked_body_with_buf`).
 #[derive(Default)]
 pub(crate) struct ChunkedDecoder {
     state: ChunkState,
