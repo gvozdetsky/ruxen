@@ -2202,7 +2202,8 @@ pub enum Variable {
     /// Username from successful HTTP Basic auth. Empty when no user was
     /// authenticated for the request.
     RemoteUser,
-    /// Machine hostname, captured once at startup (`gethostname`).
+    /// Machine hostname, lowercased, captured once at startup
+    /// (`gethostname`).
     Hostname,
     /// `$http_NAME` — request header lookup. Name is stored lowercased
     /// with underscores replaced by dashes so a linear scan of the raw
