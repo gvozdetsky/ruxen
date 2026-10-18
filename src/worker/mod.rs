@@ -222,25 +222,35 @@ pub(crate) fn flush_access_log_buffers() {
     });
 }
 
-/// Machine hostname, resolved once at startup for `$hostname` expansion.
-/// `OnceLock`-style simple cached value; if `gethostname` ever fails we
-/// fall back to an empty string rather than panicking the server boot.
-pub(crate) static HOSTNAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+/// Machine hostname for `$hostname` and syslog headers, nginx's
+/// `cycle->hostname`: set by `init_hostname` at startup.
+static HOSTNAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
+/// nginx's ngx_init_cycle: `gethostname()`, lowercased, and startup fails
+/// if the call does (`[emerg] gethostname() failed`). Unlike nginx, a
+/// reload keeps the name read at startup.
+pub(crate) fn init_hostname() -> Result<(), String> {
+    let name = gethostname()
+        .map_err(|e| format!("gethostname() failed ({})", errno_text(&e)))?
+        .to_ascii_lowercase();
+    let _ = HOSTNAME.set(name);
+    Ok(())
+}
+
+fn gethostname() -> std::io::Result<Vec<u8>> {
+    // Linux names are at most 64 bytes (HOST_NAME_MAX): any fits.
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for `buf.len()` bytes.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(buf[..len].to_vec())
+}
+
+/// Empty before `init_hostname`, which only unit tests see.
 pub(crate) fn hostname() -> &'static [u8] {
-    HOSTNAME
-        .get_or_init(|| {
-            // `uname -n` is enough — no crate dependency. Read `/etc/hostname`
-            // as a linux-friendly no-alloc-after-boot path; if that fails,
-            // fall back to `$HOSTNAME` env or empty.
-            if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
-                return s.trim().as_bytes().to_vec();
-            }
-            std::env::var_os("HOSTNAME")
-                .map(|s| s.to_string_lossy().into_owned().into_bytes())
-                .unwrap_or_default()
-        })
-        .as_slice()
+    HOSTNAME.get().map_or(&[], Vec::as_slice)
 }
 
 /// nginx's default `client_body_buffer_size` on 64-bit platforms (two

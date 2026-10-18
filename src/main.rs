@@ -230,6 +230,8 @@ fn real_main() -> Result<(), Failure> {
         return check_compat(main_path, file_src, globals_src);
     }
 
+    // Before the configuration, as in ngx_init_cycle.
+    worker::init_hostname().map_err(|e| report_emerg(&e, &cli, &main_path))?;
     let cfg = config::parse_with_main(main_path.clone(), file_src, globals_src)
         .map_err(|e| report_emerg(&e.to_string(), &cli, &main_path))?;
 
