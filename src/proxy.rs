@@ -2948,9 +2948,15 @@ pub(crate) async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: I
     }
 }
 
-/// Read a chunked transfer-encoding body, decoding it into `body`. Strips
-/// chunk-size and trailing CRLF lines so the resulting `body` is the
-/// dechunked payload only. Stops at the terminating zero-length chunk.
+/// Read a chunked transfer-encoding body, decoding it into `body`: it comes
+/// in holding the wire bytes that arrived with the header and leaves
+/// holding the dechunked payload. Stops at the terminating zero-length
+/// chunk.
+///
+/// The decoding is the streaming path's `ChunkedDecoder`, so a size or
+/// trailer line is bounded the same way there, and wire bytes are dropped
+/// as soon as they are decoded: only the payload counts against
+/// `MAX_BUFFERED_BODY`.
 ///
 /// `read_buf` is a caller-owned scratch passed through from `attempt`'s
 /// header-pull loop and reused for every read here too — `attempt` does
@@ -2964,131 +2970,61 @@ async fn read_chunked_body_with_buf(
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
 ) -> Result<u64, (bool, UpstreamError)> {
-    // Buffered reader over the stream — chunked decoding is line-oriented
-    // and we already may have leftover bytes from the header read in
-    // `body`. Returns the bytes read from the stream.
-    let mut buf = std::mem::take(body);
-    let leftover = buf.len();
-    let mut decoded: Vec<u8> = Vec::with_capacity(buf.len() + 4096);
-    let mut pos = 0usize;
-    let mut nothing_read = buf.is_empty();
-
-    loop {
-        // Find chunk-size line.
-        let line_end = loop {
-            if let Some(rel) = buf[pos..].iter().position(|&b| b == b'\n') {
-                break pos + rel;
-            }
-            // Need more bytes — borrow the shared read scratch.
-            let scratch = std::mem::take(read_buf);
-            let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
-                Ok(pair) => pair,
-                Err(_) => {
-                    *read_buf = vec![0u8; 4096];
-                    return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
-                }
-            };
-            *read_buf = returned;
-            match res {
-                Ok(0) => {
-                    return Err((
-                        nothing_read,
-                        UpstreamError::PrematurelyClosed(Stage::ReadingBody),
-                    ));
-                }
-                Ok(n) => {
-                    buf.extend_from_slice(&read_buf[..n]);
-                    nothing_read = false;
-                }
-                Err(e) => {
-                    return Err((
-                        nothing_read,
-                        UpstreamError::RecvFailed(e, Stage::ReadingBody),
-                    ));
-                }
+    let leftover = std::mem::take(body);
+    let mut nothing_read = leftover.is_empty();
+    let mut decoder = crate::proxy_stream::ChunkedDecoder::default();
+    let mut decoded: Vec<u8> = Vec::with_capacity(leftover.len() + 4096);
+    let mut done = decode_chunked(&mut decoder, &leftover, &mut decoded)?;
+    drop(leftover);
+    let mut received = 0u64;
+    while !done {
+        let scratch = std::mem::take(read_buf);
+        let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                *read_buf = vec![0u8; 4096];
+                return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
             }
         };
-        let line = trim_crlf(&buf[pos..line_end]);
-        // Chunk extension after `;` is allowed; ignore.
-        let size_part = match line.iter().position(|&b| b == b';') {
-            Some(i) => &line[..i],
-            None => line,
-        };
-        let size_str = match std::str::from_utf8(size_part) {
-            Ok(s) => s.trim(),
-            Err(_) => return Err((false, UpstreamError::InvalidChunked)),
-        };
-        let chunk_size = match u64::from_str_radix(size_str, 16) {
-            Ok(n) => n,
-            Err(_) => return Err((false, UpstreamError::InvalidChunked)),
-        };
-        pos = line_end + 1;
-        // Bound the size before any arithmetic on it: `FFFFFFFFFFFFFFFF`
-        // would overflow `chunk_size + 2` below and panic the worker.
-        if chunk_size > (MAX_BUFFERED_BODY - decoded.len()) as u64 {
-            return Err((false, UpstreamError::TooBigBody));
-        }
-        if chunk_size == 0 {
-            // Read the trailing CRLF (or any trailers, but we don't
-            // forward them — drain until the empty line).
-            loop {
-                let line_end = loop {
-                    if let Some(rel) = buf[pos..].iter().position(|&b| b == b'\n') {
-                        break pos + rel;
-                    }
-                    let scratch = std::mem::take(read_buf);
-                    let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
-                        Ok(pair) => pair,
-                        Err(_) => {
-                            *read_buf = vec![0u8; 4096];
-                            return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
-                        }
-                    };
-                    *read_buf = returned;
-                    match res {
-                        Ok(0) => {
-                            return Err((
-                                false,
-                                UpstreamError::PrematurelyClosed(Stage::ReadingBody),
-                            ));
-                        }
-                        Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                        Err(e) => {
-                            return Err((false, UpstreamError::RecvFailed(e, Stage::ReadingBody)));
-                        }
-                    }
-                };
-                let line = trim_crlf(&buf[pos..line_end]);
-                pos = line_end + 1;
-                if line.is_empty() {
-                    break;
-                }
-                // Trailer line — ignore.
+        *read_buf = returned;
+        match res {
+            Ok(0) => {
+                return Err((
+                    nothing_read,
+                    UpstreamError::PrematurelyClosed(Stage::ReadingBody),
+                ));
             }
-            *body = decoded;
-            return Ok((buf.len() - leftover) as u64);
-        }
-        // Pull `chunk_size` bytes plus trailing CRLF.
-        let need_total = chunk_size as usize + 2;
-        while buf.len() - pos < need_total {
-            let scratch = std::mem::take(read_buf);
-            let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
-                Ok(pair) => pair,
-                Err(_) => {
-                    *read_buf = vec![0u8; 4096];
-                    return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
-                }
-            };
-            *read_buf = returned;
-            match res {
-                Ok(0) => return Err((false, UpstreamError::PrematurelyClosed(Stage::ReadingBody))),
-                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                Err(e) => return Err((false, UpstreamError::RecvFailed(e, Stage::ReadingBody))),
+            Ok(n) => {
+                nothing_read = false;
+                received += n as u64;
+                done = decode_chunked(&mut decoder, &read_buf[..n], &mut decoded)?;
+            }
+            Err(e) => {
+                return Err((
+                    nothing_read,
+                    UpstreamError::RecvFailed(e, Stage::ReadingBody),
+                ));
             }
         }
-        decoded.extend_from_slice(&buf[pos..pos + chunk_size as usize]);
-        pos += chunk_size as usize + 2;
     }
+    *body = decoded;
+    Ok(received)
+}
+
+/// One step of `read_chunked_body_with_buf`: whether the body ended.
+/// Bytes past its end are dropped, as before.
+fn decode_chunked(
+    decoder: &mut crate::proxy_stream::ChunkedDecoder,
+    input: &[u8],
+    decoded: &mut Vec<u8>,
+) -> Result<bool, (bool, UpstreamError)> {
+    let (done, _) = decoder
+        .feed(input, decoded)
+        .map_err(|()| (false, UpstreamError::InvalidChunked))?;
+    if decoded.len() > MAX_BUFFERED_BODY {
+        return Err((false, UpstreamError::TooBigBody));
+    }
+    Ok(done)
 }
 
 /// Largest upstream body we buffer, however it is framed: past it the
@@ -3176,14 +3112,6 @@ pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
     value.iter().try_fold(0u64, |n, &d| {
         n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
     })
-}
-
-fn trim_crlf(s: &[u8]) -> &[u8] {
-    let mut end = s.len();
-    while end > 0 && (s[end - 1] == b'\n' || s[end - 1] == b'\r') {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 pub(crate) fn parse_status_code(status_line: &[u8]) -> u16 {

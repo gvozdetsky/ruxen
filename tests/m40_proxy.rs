@@ -548,6 +548,48 @@ fn m40_invalid_upstream_framing_is_502() {
     }
 }
 
+/// A chunk-size line that never ends is refused once it passes the line
+/// cap, also when the body is buffered (a status `proxy_next_upstream`
+/// may retry on): it used to be read into memory for as long as the
+/// upstream kept sending it.
+#[test]
+fn m40_endless_chunk_size_line_is_502() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf);
+        let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n");
+        let line = [b'1'; 16 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && s.write_all(&line).is_ok() {}
+    });
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location /up/ {{
+            proxy_pass http://127.0.0.1:{backend_port};
+            proxy_next_upstream http_404;
+        }}
+    }}
+}}
+"#
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let resp = http_get_close(port, "/up/");
+    assert_eq!(
+        status_code(&resp),
+        502,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+}
+
 /// An HTTP/1.1 response with neither a length nor chunked, and no
 /// `Connection: close`, ends with the connection, as nginx reads it
 /// (ngx_http_proxy_input_filter_init: length -1, no keep-alive); it used
