@@ -636,6 +636,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 &mut *state,
                 started,
                 &mut storable,
+                failures,
             )
             .await
             {
@@ -656,6 +657,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                             &mut *state,
                             started,
                             &mut storable,
+                            failures,
                         )
                         .await
                     } else {
@@ -680,6 +682,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 &mut *state,
                 started,
                 &mut storable,
+                failures,
             )
             .await
         };
@@ -1063,6 +1066,10 @@ pub enum UpstreamError {
     Status444,
     InvalidChunked,
     TooBigBody,
+    /// Bytes past `Content-Length` or past the final chunk: the response
+    /// is served, the connection not reused (a warning, not a failure).
+    ExtraAfterLength,
+    ExtraAfterFinalChunk,
     NoLiveUpstreams,
     DuplicateHeader {
         line: String,
@@ -1076,7 +1083,8 @@ pub enum UpstreamError {
 impl UpstreamError {
     /// The error-log level nginx uses: `crit` for a UNIX-domain connect()
     /// failing with anything but a refusal or a full backlog (a missing
-    /// socket file, say), `error` otherwise (ngx_event_connect_peer).
+    /// socket file, say), `error` otherwise (ngx_event_connect_peer);
+    /// `warn` for bytes past the body (ngx_http_proxy_copy_filter).
     pub fn log_level(&self) -> crate::config::ErrorLogLevel {
         use crate::config::ErrorLogLevel;
         match self {
@@ -1096,6 +1104,9 @@ impl UpstreamError {
                 ErrorLogLevel::Alert
             }
             UpstreamError::BindFailed(..) => ErrorLogLevel::Crit,
+            UpstreamError::ExtraAfterLength | UpstreamError::ExtraAfterFinalChunk => {
+                ErrorLogLevel::Warn
+            }
             _ => ErrorLogLevel::Error,
         }
     }
@@ -1202,6 +1213,16 @@ impl std::fmt::Display for UpstreamError {
                 "upstream response is too big to buffer while {}",
                 Stage::ReadingBody.as_str()
             ),
+            ExtraAfterLength => write!(
+                f,
+                "upstream sent more data than specified in \"Content-Length\" header while {}",
+                Stage::ReadingBody.as_str()
+            ),
+            ExtraAfterFinalChunk => write!(
+                f,
+                "upstream sent data after final chunk while {}",
+                Stage::ReadingBody.as_str()
+            ),
             NoLiveUpstreams => write!(f, "no live upstreams while {}", Stage::Connecting.as_str()),
             DuplicateHeader { line, previous } => write!(
                 f,
@@ -1249,8 +1270,9 @@ impl UpstreamTrail {
 /// What `run_proxy` reports besides the response.
 #[derive(Default)]
 pub struct ProxyReport {
-    /// Every failed attempt, for the error log (empty on the happy path,
-    /// so no allocation then).
+    /// Every failed attempt, and the warning of one that sent more than
+    /// its body, for the error log (empty on the happy path, so no
+    /// allocation then).
     pub failures: Vec<AttemptFailure>,
     /// The upstream's own header lines (each ending in CRLF), including
     /// the ones hidden from the client, for `$upstream_http_*`. Filled
@@ -1505,6 +1527,7 @@ async fn attempt(
     state: &mut UpstreamState,
     started: Instant,
     storable: &mut Option<Storable>,
+    failures: &mut Vec<AttemptFailure>,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     // Only the answering attempt's X-Accel headers count.
@@ -1915,6 +1938,10 @@ async fn attempt(
     }
     let mut body_len_in_accum: usize = accum.len() - body_start;
     let mut decoded_chunked_body: Option<Vec<u8>> = None;
+    // The upstream sent more than its framing: the response goes out, the
+    // connection is not reused (nginx clears u->keepalive), since what
+    // followed may still be in the socket for the next request.
+    let mut overrun: Option<UpstreamError> = None;
     // proxy_limit_rate pacer state — anchors at the moment body collection
     // begins. `paced_bytes` counts body bytes received from the upstream so
     // far; we sleep when bytes/elapsed would exceed `plan.limit_rate`. Bytes
@@ -1999,7 +2026,12 @@ async fn attempt(
         match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout)
             .await
         {
-            Ok(read) => state.bytes_received += read,
+            Ok((read, extra)) => {
+                state.bytes_received += read;
+                if extra {
+                    overrun = Some(UpstreamError::ExtraAfterFinalChunk);
+                }
+            }
             Err((stale, error)) => {
                 if stale && from_pool && body.is_empty() {
                     return AttemptOutcome::PooledStale;
@@ -2023,16 +2055,12 @@ async fn attempt(
             );
         }
         let cl_usize = cl as usize;
-        // We may have already read more than cl_usize bytes in the header
-        // pull (the upstream pipelined another response or sent stray
-        // bytes). Trim the over-read so we forward exactly cl_usize body
-        // bytes and don't pollute the keepalive socket — but only if the
-        // socket isn't going back to the pool. For simplicity we always
-        // trim; pool-release happens after this and the socket has no
-        // pending bytes to recover from in either case.
+        // More than cl_usize bytes in the header pull: only cl_usize go to
+        // the client, and the connection isn't pooled.
         if body_len_in_accum > cl_usize {
             accum.truncate(body_start + cl_usize);
             body_len_in_accum = cl_usize;
+            overrun = Some(UpstreamError::ExtraAfterLength);
         }
         // Reserve for what is likely to arrive, not for what the upstream
         // claims: a bogus `Content-Length: 1000000000000` must not abort
@@ -2062,6 +2090,9 @@ async fn attempt(
                     state.bytes_received += n as u64;
                     let need = cl_usize - body_len_in_accum;
                     let take = n.min(need);
+                    if n > take {
+                        overrun = Some(UpstreamError::ExtraAfterLength);
+                    }
                     accum.extend_from_slice(&read_buf[..take]);
                     body_len_in_accum += take;
                     paced_body_bytes += take as u64;
@@ -2174,8 +2205,14 @@ async fn attempt(
     //    - the upstream announced HTTP/1.1
     //    - we framed the body (chunked or content-length) so we know we
     //      consumed exactly the right number of bytes
+    //    - and the bytes read ended exactly there
     let response_framed = chunked || content_length.is_some() || !body_has_content;
-    if plan.keepalive_eligible
+    if let Some(error) = overrun {
+        failures.push(AttemptFailure {
+            error,
+            upstream: upstream_url(plan, peer_idx),
+        });
+    } else if plan.keepalive_eligible
         && status_code != 101
         && !upstream_close
         && upstream_is_11
@@ -2962,19 +2999,21 @@ pub(crate) async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: I
 /// header-pull loop and reused for every read here too — `attempt` does
 /// one allocation for it per request and threads it through both phases.
 ///
-/// On failure returns the reason, paired with `true` if no bytes were read
-/// at all (a stale pooled connection) and `false` otherwise.
+/// Returns the bytes read here and whether the last read went on past the
+/// final chunk. On failure returns the reason, paired with `true` if no
+/// bytes were read at all (a stale pooled connection) and `false`
+/// otherwise.
 async fn read_chunked_body_with_buf(
     stream: &mut UpstreamIo,
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
-) -> Result<u64, (bool, UpstreamError)> {
+) -> Result<(u64, bool), (bool, UpstreamError)> {
     let leftover = std::mem::take(body);
     let mut nothing_read = leftover.is_empty();
     let mut decoder = crate::proxy_stream::ChunkedDecoder::default();
     let mut decoded: Vec<u8> = Vec::with_capacity(leftover.len() + 4096);
-    let mut done = decode_chunked(&mut decoder, &leftover, &mut decoded)?;
+    let (mut done, mut extra) = decode_chunked(&mut decoder, &leftover, &mut decoded)?;
     drop(leftover);
     let mut received = 0u64;
     while !done {
@@ -2997,7 +3036,7 @@ async fn read_chunked_body_with_buf(
             Ok(n) => {
                 nothing_read = false;
                 received += n as u64;
-                done = decode_chunked(&mut decoder, &read_buf[..n], &mut decoded)?;
+                (done, extra) = decode_chunked(&mut decoder, &read_buf[..n], &mut decoded)?;
             }
             Err(e) => {
                 return Err((
@@ -3008,23 +3047,23 @@ async fn read_chunked_body_with_buf(
         }
     }
     *body = decoded;
-    Ok(received)
+    Ok((received, extra))
 }
 
-/// One step of `read_chunked_body_with_buf`: whether the body ended.
-/// Bytes past its end are dropped, as before.
+/// One step of `read_chunked_body_with_buf`: whether the body ended, and
+/// whether `input` went on past its end (those bytes are dropped).
 fn decode_chunked(
     decoder: &mut crate::proxy_stream::ChunkedDecoder,
     input: &[u8],
     decoded: &mut Vec<u8>,
-) -> Result<bool, (bool, UpstreamError)> {
-    let (done, _) = decoder
+) -> Result<(bool, bool), (bool, UpstreamError)> {
+    let (done, used) = decoder
         .feed(input, decoded)
         .map_err(|()| (false, UpstreamError::InvalidChunked))?;
     if decoded.len() > MAX_BUFFERED_BODY {
         return Err((false, UpstreamError::TooBigBody));
     }
-    Ok(done)
+    Ok((done, done && used < input.len()))
 }
 
 /// Largest upstream body we buffer, however it is framed: past it the

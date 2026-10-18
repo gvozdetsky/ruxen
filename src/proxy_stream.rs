@@ -85,7 +85,8 @@ pub struct RelayEnd {
     /// relay (for `$upstream_response_length`).
     pub upstream_body: u64,
     pub response_ms: u64,
-    /// The upstream failed before the body was complete.
+    /// The upstream failed before the body was complete, or sent more
+    /// than the body (a warning, the body complete).
     pub failure: Option<AttemptFailure>,
     /// The body reached the client whole.
     pub complete: bool,
@@ -378,6 +379,14 @@ fn finish(
     head: Vec<u8>,
 ) -> (RelayEnd, Vec<u8>) {
     end.response_ms = s.started.elapsed().as_millis() as u64;
+    // nginx warns, and doesn't keep the connection (#512).
+    if end.complete && extra && end.failure.is_none() {
+        let error = match s.framing {
+            StreamFraming::Chunked(_) => UpstreamError::ExtraAfterFinalChunk,
+            _ => UpstreamError::ExtraAfterLength,
+        };
+        end.failure = Some(failure(&s, error));
+    }
     let s = *s;
     crate::proxy::return_proxy_buf(s.read_buf);
     if end.complete
