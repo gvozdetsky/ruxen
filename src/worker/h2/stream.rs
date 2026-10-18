@@ -11,6 +11,7 @@
 //! becomes DATA frames, sent as the stream's flow-control window allows,
 //! as nginx's ngx_http_v2_send_chain does.
 
+use std::cell::RefCell;
 use std::future::poll_fn;
 use std::io;
 
@@ -45,8 +46,11 @@ pub(crate) struct StreamIo {
     started: bool,
     /// A HEAD request: the response has no body, whatever it says.
     head_request: bool,
-    respond: Option<SendResponse<Bytes>>,
-    send: Option<SendStream<Bytes>>,
+    /// In cells for `peer_closed`, which watches them for the client's
+    /// RST_STREAM through `&self`; everything else has `&mut self` and
+    /// goes through `get_mut`.
+    respond: RefCell<Option<SendResponse<Bytes>>>,
+    send: RefCell<Option<SendStream<Bytes>>>,
     out: Out,
     /// The response head, until it is complete.
     head: Vec<u8>,
@@ -106,8 +110,8 @@ impl StreamIo {
             chunked_in,
             started: false,
             head_request: parts.method == http::Method::HEAD,
-            respond: Some(respond),
-            send: None,
+            respond: RefCell::new(Some(respond)),
+            send: RefCell::new(None),
             out: Out::Head,
             head: Vec::new(),
             counters,
@@ -313,14 +317,15 @@ impl StreamIo {
         let end = matches!(out, Out::Done);
         let respond = self
             .respond
+            .get_mut()
             .as_mut()
             .ok_or_else(|| invalid("a second response"))?;
         let send = respond
             .send_response(response, end)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        self.respond = None;
+        *self.respond.get_mut() = None;
         if !end {
-            self.send = Some(send);
+            *self.send.get_mut() = Some(send);
         }
         self.out = out;
         Ok(())
@@ -344,7 +349,7 @@ impl StreamIo {
         if fields.is_empty() {
             return self.send_data(&[], true).await;
         }
-        match self.send.as_mut() {
+        match self.send.get_mut().as_mut() {
             Some(send) => send
                 .send_trailers(fields)
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e)),
@@ -356,7 +361,7 @@ impl StreamIo {
     /// The whole body, owned, as the stream's last DATA frames: split,
     /// not copied.
     async fn send_data_owned(&mut self, mut data: Bytes) -> io::Result<()> {
-        let Some(send) = self.send.as_mut() else {
+        let Some(send) = self.send.get_mut().as_mut() else {
             return Ok(());
         };
         let broken = |e: h2::Error| io::Error::new(io::ErrorKind::BrokenPipe, e);
@@ -384,7 +389,7 @@ impl StreamIo {
     }
 
     async fn send_data(&mut self, mut data: &[u8], end: bool) -> io::Result<()> {
-        let Some(send) = self.send.as_mut() else {
+        let Some(send) = self.send.get_mut().as_mut() else {
             return Ok(());
         };
         let broken = |e: h2::Error| io::Error::new(io::ErrorKind::BrokenPipe, e);
@@ -432,11 +437,11 @@ impl Drop for StreamIo {
     /// ends now; a response cut short (or none at all, `return 444`) resets
     /// the stream, as nginx does.
     fn drop(&mut self) {
-        if let Some(respond) = self.respond.as_mut() {
+        if let Some(respond) = self.respond.get_mut().as_mut() {
             respond.send_reset(h2::Reason::INTERNAL_ERROR);
             return;
         }
-        let Some(send) = self.send.as_mut() else {
+        let Some(send) = self.send.get_mut().as_mut() else {
             return;
         };
         match self.out {
@@ -625,6 +630,26 @@ impl super::super::ConnIo for StreamIo {
 
     async fn wait_writable(&self) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// The client reset the stream (RST_STREAM), or the connection failed:
+    /// nginx's ngx_http_v2_state_rst_stream sets `fc->error` and runs the
+    /// request's handler, so an upstream exchange ends with 499
+    /// (ngx_http_upstream_check_broken_connection). Without this, the work
+    /// behind a reset stream would go on until the upstream answered
+    /// (CVE-2023-44487). Pending once the response is all sent.
+    async fn peer_closed(&self) {
+        poll_fn(|cx| {
+            // No borrow can be out: the other users have `&mut self`.
+            if let Some(send) = self.send.borrow_mut().as_mut() {
+                return send.poll_reset(cx).map(drop);
+            }
+            match self.respond.borrow_mut().as_mut() {
+                Some(respond) => respond.poll_reset(cx).map(drop),
+                None => std::task::Poll::Pending,
+            }
+        })
+        .await
     }
 
     fn h2(&self) -> bool {

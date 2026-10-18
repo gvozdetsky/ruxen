@@ -103,8 +103,9 @@ where
     // the connection window to the maximum with a WINDOW_UPDATE
     // (ngx_http_v2_init). Clients such as Test::Nginx wait for both.
     let h2conf = listen.servers[listen.default_server].h2;
+    let max_streams = h2conf.max_concurrent_streams.unwrap_or(128);
     let handshake = h2::server::Builder::new()
-        .max_concurrent_streams(h2conf.max_concurrent_streams.unwrap_or(128))
+        .max_concurrent_streams(max_streams)
         .initial_window_size(h2conf.body_preread_size.unwrap_or(64 * 1024))
         .max_frame_size((1 << 24) - 1)
         .initial_connection_window_size((1 << 31) - 1)
@@ -119,7 +120,15 @@ where
         Ok(Ok(conn)) => conn,
         _ => return,
     };
-    drive(conn, &ctx, timeouts, writing_since, header_blocks).await;
+    drive(
+        conn,
+        &ctx,
+        timeouts,
+        max_streams as usize,
+        writing_since,
+        header_blocks,
+    )
+    .await;
     // The `h2` connection, and with it every operation on the stream, is
     // gone. Close as nginx does (ngx_http_v2_finalize_connection →
     // lingering close): what the client still sends (a WINDOW_UPDATE, a
@@ -132,10 +141,22 @@ where
 
 /// Accept streams and keep the connection going until the client or a
 /// GOAWAY ends it.
+///
+/// At most `max_streams` streams are served at once. The crate counts a
+/// stream as open until it is closed, and a client's RST_STREAM closes it
+/// at once while the work behind it may go on: without a count of its own,
+/// a client could open and reset streams (CVE-2023-44487, "rapid reset")
+/// and run as many requests as it liked, keepalive_requests of them per
+/// connection. nginx counts its streams until their requests end
+/// (`h2c->processing`, ngx_http_v2_state_headers). With all of them busy,
+/// new streams wait in the crate, whose own limits then apply: no more than
+/// `max_streams` open, and a GOAWAY ENHANCE_YOUR_CALM once 20 of those
+/// waiting are reset (`max_pending_accept_reset_streams`).
 async fn drive<IO>(
     mut conn: h2::server::Connection<IO, Bytes>,
     ctx: &Rc<ConnCtx>,
     timeouts: super::PreparedClientTimeouts,
+    max_streams: usize,
     writing_since: Rc<Cell<Option<std::time::Instant>>>,
     header_blocks: Rc<compat::HeaderBlocks>,
 ) where
@@ -153,8 +174,11 @@ async fn drive<IO>(
     let started = std::time::Instant::now();
     let mut requests: u64 = 0;
     // Streams in progress; the last to end wakes the loop, for the idle
-    // timer.
-    let streams = Rc::new(Streams::default());
+    // timer, and so does one that makes room under `max_streams`.
+    let streams = Rc::new(Streams {
+        limit: max_streams,
+        ..Streams::default()
+    });
     let mut idle_since = monoio::time::Instant::now();
     let mut going_away = false;
     // Gone away with nothing left to send: closed shortly after, also for a
@@ -184,6 +208,9 @@ async fn drive<IO>(
                 None => std::future::pending().await,
             }
         };
+        // Every stream busy: the connection is driven (frames in and out,
+        // new streams queued in the crate) but nothing is accepted.
+        let full = streams.active.get() >= max_streams;
         let event = std::future::poll_fn(|cx| {
             if !going_away && ctx.state.is_shutting_down() {
                 return std::task::Poll::Ready(());
@@ -191,12 +218,21 @@ async fn drive<IO>(
             if streams.ended_at.get().is_some() {
                 return std::task::Poll::Ready(());
             }
+            if full && streams.active.get() < max_streams {
+                return std::task::Poll::Ready(());
+            }
             watch.register(cx.waker());
             streams.waker.set(Some(cx.waker().clone()));
             std::task::Poll::Pending
         });
+        let next = std::future::poll_fn(|cx| {
+            if !full {
+                return conn.poll_accept(cx);
+            }
+            conn.poll_closed(cx).map(|closed| closed.err().map(Err))
+        });
         let accepted = monoio::select! {
-            accepted = conn.accept() => Some(accepted),
+            accepted = next => Some(accepted),
             _ = timer => None,
             _ = event => None,
         };
@@ -272,6 +308,8 @@ async fn drive<IO>(
 #[derive(Default)]
 struct Streams {
     active: Cell<usize>,
+    /// `max_streams`: at this many, the loop waits for one to end.
+    limit: usize,
     /// When the last one ended, until the loop looks.
     ended_at: Cell<Option<monoio::time::Instant>>,
     waker: Cell<Option<std::task::Waker>>,
@@ -279,12 +317,15 @@ struct Streams {
 
 impl Streams {
     fn end(&self) {
-        self.active.set(self.active.get() - 1);
-        if self.active.get() == 0 {
+        let active = self.active.get() - 1;
+        self.active.set(active);
+        if active == 0 {
             self.ended_at.set(Some(monoio::time::Instant::now()));
-            if let Some(waker) = self.waker.take() {
-                waker.wake();
-            }
+        }
+        if (active == 0 || active + 1 == self.limit)
+            && let Some(waker) = self.waker.take()
+        {
+            waker.wake();
         }
     }
 }
