@@ -805,6 +805,16 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 record_failure(failures, &plan, current.peer_idx, error);
                 return crate::worker::internal_error_response(plan.method);
             }
+            AttemptOutcome::TooBig => {
+                upstream::report_success(upstream, current.peer_idx);
+                record_failure(
+                    failures,
+                    &plan,
+                    current.peer_idx,
+                    Box::new(UpstreamError::TooBigBody),
+                );
+                return Response::Prebuilt(plan.bad_gateway.pick(plan.method));
+            }
             AttemptOutcome::PooledStale => {
                 // The pre-match collapses PooledStale into either a fresh
                 // retry or a Failed; reaching here is a logic bug.
@@ -1422,6 +1432,11 @@ enum AttemptOutcome {
     /// (`proxy_bind`): the request ends with a 500, the peer not blamed
     /// (ngx_http_upstream_connect on NGX_ERROR).
     LocalError(Box<UpstreamError>),
+    /// The body is over `MAX_BUFFERED_BODY`: a limit of ours, not a
+    /// failure of the peer, which answered (#513). A 502, without failing
+    /// over (the next peer would answer the same) or counting against
+    /// the peer's `max_fails`.
+    TooBig,
 }
 
 /// A `proxy_bind` address, resolved for one request.
@@ -2032,6 +2047,7 @@ async fn attempt(
                     overrun = Some(UpstreamError::ExtraAfterFinalChunk);
                 }
             }
+            Err((_, UpstreamError::TooBigBody)) => return AttemptOutcome::TooBig,
             Err((stale, error)) => {
                 if stale && from_pool && body.is_empty() {
                     return AttemptOutcome::PooledStale;
@@ -2048,11 +2064,7 @@ async fn attempt(
         // Refused before reading, like the chunked and close-delimited
         // bodies once they pass the cap.
         if cl > MAX_BUFFERED_BODY as u64 {
-            return AttemptOutcome::Failed(
-                Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                FailKind::Error,
-                Box::new(UpstreamError::TooBigBody),
-            );
+            return AttemptOutcome::TooBig;
         }
         let cl_usize = cl as usize;
         // More than cl_usize bytes in the header pull: only cl_usize go to
@@ -2140,11 +2152,7 @@ async fn attempt(
                 }
             }
             if body_len_in_accum > MAX_BUFFERED_BODY {
-                return AttemptOutcome::Failed(
-                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                    FailKind::Error,
-                    Box::new(UpstreamError::TooBigBody),
-                );
+                return AttemptOutcome::TooBig;
             }
         }
     }
@@ -3067,8 +3075,9 @@ fn decode_chunked(
 }
 
 /// Largest upstream body we buffer, however it is framed: past it the
-/// answer is a 502. Responses are buffered whole until they stream (#88),
-/// so without this one response could take a worker's memory.
+/// answer is a 502, the peer not blamed (`AttemptOutcome::TooBig`).
+/// Responses are buffered whole until they stream (#88), so without this
+/// one response could take a worker's memory.
 const MAX_BUFFERED_BODY: usize = 64 * 1024 * 1024;
 
 /// Upper bound on the up-front reservation for a `Content-Length` body.
