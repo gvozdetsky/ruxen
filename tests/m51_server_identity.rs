@@ -2,8 +2,8 @@
 //! the footer of built-in HTML error pages, e.g. `return 404;`);
 //! `server_tokens off` drops the version. Under
 //! nginx-tests (`RUXEN_NGINX_IDENTITY=1`, set by
-//! scripts/run_nginx_tests.sh) they name nginx/1.29.2, the version `-V`
-//! reports, because the upstream tests assert it.
+//! scripts/run_nginx_tests.sh) they name nginx/1.29.2, because the upstream
+//! tests assert it, and `-V` adds its `nginx version:` line.
 
 mod common;
 
@@ -127,4 +127,26 @@ fn nginx_identity_for_the_test_harness() {
     let resp = get(server.port, "/quiet/");
     assert!(resp.contains("\r\nServer: nginx\r\n"), "{resp}");
     assert!(resp.contains("<center>nginx</center>"), "{resp}");
+}
+
+fn version(nginx_identity: bool) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ruxen"));
+    cmd.arg("-V").env_remove("RUXEN_NGINX_IDENTITY");
+    if nginx_identity {
+        cmd.env("RUXEN_NGINX_IDENTITY", "1");
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn version_names_nginx_only_for_the_test_harness() {
+    let ruxen = version(false);
+    let first = format!("ruxen version: ruxen/{}\n", env!("CARGO_PKG_VERSION"));
+    assert!(ruxen.starts_with(&first), "{ruxen}");
+    assert!(!ruxen.contains("nginx version"), "{ruxen}");
+
+    let nginx = version(true);
+    assert_eq!(nginx, format!("nginx version: nginx/1.29.2\n{ruxen}"));
 }
