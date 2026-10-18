@@ -2,9 +2,7 @@ use crate::http;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -154,13 +152,13 @@ pub fn build_unauthorized_with(
 
 fn verify_stored_password(stored: &[u8], password: &[u8]) -> bool {
     if let Some(plain) = stored.strip_prefix(b"{PLAIN}") {
-        return plain == password;
+        return ct_eq(plain, password);
     }
     if let Some(sha_raw) = stored.strip_prefix(b"{SHA}") {
         let Some(expected) = decode_base64(sha_raw) else {
             return false;
         };
-        return expected.as_slice() == sha1_digest(password);
+        return ct_eq(&expected, &sha1_digest(password));
     }
     if let Some(ssha_raw) = stored.strip_prefix(b"{SSHA}") {
         let Some(decoded) = decode_base64(ssha_raw) else {
@@ -173,15 +171,18 @@ fn verify_stored_password(stored: &[u8], password: &[u8]) -> bool {
         let mut salted = Vec::with_capacity(password.len() + salt.len());
         salted.extend_from_slice(password);
         salted.extend_from_slice(salt);
-        return expected == sha1_digest(&salted);
+        return ct_eq(expected, &sha1_digest(&salted));
     }
-    if stored.starts_with(b"$apr1$") {
-        return verify_crypt(stored, password)
-            || verify_openssl_password(stored, password, b"$apr1$", "-apr1");
-    }
-    if stored.starts_with(b"$1$") {
-        return verify_crypt(stored, password)
-            || verify_openssl_password(stored, password, b"$1$", "-1");
+    // nginx hashes `$apr1$` itself; libxcrypt doesn't know it. `$1$` is the
+    // same algorithm, which nginx leaves to libc: done here too, so it
+    // doesn't depend on the libc having MD5-crypt.
+    for magic in [&b"$apr1$"[..], b"$1$"] {
+        if stored.starts_with(magic) {
+            if password.contains(&0) {
+                return false;
+            }
+            return ct_eq(&md5_crypt(magic, stored, password), stored);
+        }
     }
     if stored.starts_with(b"{") {
         return false;
@@ -189,61 +190,110 @@ fn verify_stored_password(stored: &[u8], password: &[u8]) -> bool {
     verify_crypt(stored, password)
 }
 
-/// Fallback for `$apr1$` / `$1$` (MD5-crypt) verification when the system
-/// `crypt(3)` doesn't recognize the prefix. On glibc this path is dormant
-/// — libc handles both already — so the subprocess cost stays off the hot
-/// path on our target (Linux 6.17). We keep it for portability to libcs
-/// that only ship DES+SHA-crypt. Spawning `openssl passwd` blocks the
-/// monoio worker; acceptable only because of the dormancy.
-fn verify_openssl_password(stored: &[u8], password: &[u8], prefix: &[u8], mode: &str) -> bool {
-    let Some(salt) = crypt_salt(stored, prefix) else {
-        return false;
-    };
-    let Ok(salt) = std::str::from_utf8(salt) else {
-        return false;
-    };
-    let Ok(mut child) = Command::new("openssl")
-        .args(["passwd", mode, "-salt", salt, "-stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    if let Some(stdin) = child.stdin.as_mut() {
-        if stdin.write_all(password).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
+/// Poul-Henning Kamp's MD5-crypt with `magic` (`$1$`, or Apache's `$apr1$`),
+/// as nginx's ngx_crypt_apr1: `salt` is the stored hash, whose salt ends at
+/// the first `$`, at most 8 bytes.
+fn md5_crypt(magic: &[u8], salt: &[u8], key: &[u8]) -> Vec<u8> {
+    let salt = &salt[magic.len()..];
+    let salt = &salt[..salt.iter().take(8).take_while(|&&b| b != b'$').count()];
+
+    let mut md5 = Md5::new();
+    md5.update(key);
+    md5.update(magic);
+    md5.update(salt);
+
+    let mut ctx1 = Md5::new();
+    ctx1.update(key);
+    ctx1.update(salt);
+    ctx1.update(key);
+    let mut fin = ctx1.finish();
+
+    for chunk in key.chunks(16) {
+        md5.update(&fin[..chunk.len()]);
+    }
+
+    fin = [0; 16];
+    let mut i = key.len();
+    while i != 0 {
+        if i & 1 != 0 {
+            md5.update(&fin[..1]);
+        } else {
+            md5.update(&key[..1]);
         }
-    } else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return false;
+        i >>= 1;
     }
-    let Ok(output) = child.wait_with_output() else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
+    fin = md5.finish();
+
+    for i in 0..1000 {
+        let mut ctx1 = Md5::new();
+        if i & 1 != 0 {
+            ctx1.update(key);
+        } else {
+            ctx1.update(&fin);
+        }
+        if i % 3 != 0 {
+            ctx1.update(salt);
+        }
+        if i % 7 != 0 {
+            ctx1.update(key);
+        }
+        if i & 1 != 0 {
+            ctx1.update(&fin);
+        } else {
+            ctx1.update(key);
+        }
+        fin = ctx1.finish();
     }
-    let actual = output
-        .stdout
-        .strip_suffix(b"\n")
-        .or_else(|| output.stdout.strip_suffix(b"\r\n"))
-        .unwrap_or(output.stdout.as_slice());
-    actual == stored
+
+    let mut out = Vec::with_capacity(magic.len() + salt.len() + 1 + 22);
+    out.extend_from_slice(magic);
+    out.extend_from_slice(salt);
+    out.push(b'$');
+    let f = |i: usize| u32::from(fin[i]);
+    crypt_to64(&mut out, (f(0) << 16) | (f(6) << 8) | f(12), 4);
+    crypt_to64(&mut out, (f(1) << 16) | (f(7) << 8) | f(13), 4);
+    crypt_to64(&mut out, (f(2) << 16) | (f(8) << 8) | f(14), 4);
+    crypt_to64(&mut out, (f(3) << 16) | (f(9) << 8) | f(15), 4);
+    crypt_to64(&mut out, (f(4) << 16) | (f(10) << 8) | f(5), 4);
+    crypt_to64(&mut out, f(11), 2);
+    out
 }
 
-fn crypt_salt<'a>(stored: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    if !stored.starts_with(prefix) {
-        return None;
+fn crypt_to64(out: &mut Vec<u8>, mut v: u32, n: usize) {
+    const ITOA64: &[u8; 64] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    for _ in 0..n {
+        out.push(ITOA64[(v & 0x3f) as usize]);
+        v >>= 6;
     }
-    let salt_start = prefix.len();
-    let salt_tail = &stored[salt_start..];
-    let salt_end = salt_tail.iter().position(|&b| b == b'$')?;
-    Some(&salt_tail[..salt_end])
+}
+
+/// MD5 from the AWS-LC that rustls already links.
+struct Md5(aws_lc_sys::MD5_CTX);
+
+impl Md5 {
+    fn new() -> Self {
+        // MD5_CTX is plain data; MD5_Init sets every field.
+        let mut ctx: aws_lc_sys::MD5_CTX = unsafe { std::mem::zeroed() };
+        unsafe { aws_lc_sys::MD5_Init(&mut ctx) };
+        Md5(ctx)
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        unsafe { aws_lc_sys::MD5_Update(&mut self.0, data.as_ptr().cast(), data.len()) };
+    }
+
+    fn finish(mut self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        unsafe { aws_lc_sys::MD5_Final(out.as_mut_ptr(), &mut self.0) };
+        out
+    }
+}
+
+/// Compares a computed hash with the stored one in time that doesn't
+/// depend on where they differ.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && unsafe { aws_lc_sys::CRYPTO_memcmp(a.as_ptr().cast(), b.as_ptr().cast(), a.len()) } == 0
 }
 
 fn append_escaped_realm(out: &mut Vec<u8>, realm: &[u8]) {
@@ -462,7 +512,7 @@ fn verify_crypt(stored: &[u8], password: &[u8]) -> bool {
             return false;
         }
         let out = unsafe { CStr::from_ptr(ptr) }.to_bytes();
-        out == stored
+        ct_eq(out, stored)
     })
 }
 
@@ -563,6 +613,42 @@ mod tests {
         assert!(!verify_stored_password(
             b"$apr1$salt$VEpBc9VHGUKwI9.yg13Iu0",
             b"nope"
+        ));
+        assert!(!verify_stored_password(
+            b"$1$salt$ez2vlPGdaLYkJam5pWs/Y1",
+            b"nope"
+        ));
+    }
+
+    // Vectors from `openssl passwd`; md5_crypt runs without it (#519).
+    #[test]
+    fn md5_crypt_matches_openssl_passwd() {
+        let long = b"correct-horse-battery-staple-xyz";
+        for (stored, key) in [
+            (&b"$apr1$abcdefgh$f0WRNdlLse428rLJj4pW9/"[..], &long[..]),
+            (b"$apr1$Q$YUyAkJFdbcKveyKiHvvuA/", b"x"),
+            (b"$apr1$e$884UIJwaHzNF9yPyifJmN1", b""),
+            (b"$1$12345678$AUgxp1tAyBUrjUNZb3kvq1", long),
+            (b"$1$s/.Z$C2fr7q.Kb72EWjzrj7Ahs1", b"0123456789abcdef"),
+        ] {
+            assert!(verify_stored_password(stored, key), "{stored:?}");
+            assert!(!verify_stored_password(stored, b"wrong"), "{stored:?}");
+        }
+        // The salt is at most 8 bytes and ends at the first `$`, as in
+        // ngx_crypt_apr1; openssl keeps the whole `-salt`, so these hashes
+        // never match in nginx either.
+        assert!(!verify_stored_password(
+            b"$apr1$abcdefghij$82JubPF2dQkt1tVfvLnXS.",
+            b"x"
+        ));
+        assert!(!verify_stored_password(
+            b"$apr1$ab$cd$7rEYXqIP64KlXze0eLGSI1",
+            b"x"
+        ));
+        assert!(!verify_stored_password(b"$apr1$", b""));
+        assert!(!verify_stored_password(
+            b"$apr1$Q$YUyAkJFdbcKveyKiHvvuA/",
+            b"x\0"
         ));
     }
 
