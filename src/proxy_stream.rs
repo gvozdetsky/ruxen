@@ -96,6 +96,38 @@ pub struct RelayEnd {
 /// holds, up to this, and goes out in one write (nginx reads until EAGAIN
 /// before it writes).
 const RELAY_BUF: usize = 64 * 1024;
+const RELAY_POOL_LIMIT: usize = 32;
+
+thread_local! {
+    // Relay buffers have a pool of their own: back in the proxy's pool, one
+    // would become the next header read's buffer, which then takes a whole
+    // 64 KiB response in, copies it into `accum` and sends it buffered.
+    // nginx reads the header into `proxy_buffer_size` (a page).
+    static RELAY_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_relay_buf() -> Vec<u8> {
+    RELAY_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| Vec::with_capacity(RELAY_BUF))
+}
+
+/// Return a relay's read buffer to its pool, or a header-sized one to the
+/// proxy's.
+fn return_read_buf(mut v: Vec<u8>) {
+    if v.capacity() != RELAY_BUF {
+        crate::proxy::return_proxy_buf(v);
+        return;
+    }
+    v.clear();
+    RELAY_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < RELAY_POOL_LIMIT {
+            pool.push(v);
+        }
+    });
+}
 
 /// Write `head`, then relay the body: the bytes that came with the
 /// header, then each upstream read, re-chunked when `chunked_out`. Each
@@ -168,10 +200,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
     }
 
     if s.read_buf.capacity() < RELAY_BUF {
-        crate::proxy::return_proxy_buf(std::mem::replace(
-            &mut s.read_buf,
-            Vec::with_capacity(RELAY_BUF),
-        ));
+        crate::proxy::return_proxy_buf(std::mem::replace(&mut s.read_buf, take_relay_buf()));
     }
     loop {
         // proxy_limit_rate: wait until the body read so far is due.
@@ -388,7 +417,7 @@ fn finish(
         end.failure = Some(failure(&s, error));
     }
     let s = *s;
-    crate::proxy::return_proxy_buf(s.read_buf);
+    return_read_buf(s.read_buf);
     if end.complete
         && !extra
         && let Some(pool) = s.pool
