@@ -887,6 +887,42 @@ thread_local! {
         RefCell::new(HashMap::default());
 }
 
+/// How long a pooled connection sits idle before `pool_take` checks that
+/// the upstream hasn't closed it. Upstreams close idle keep-alive
+/// connections after seconds (Node.js 5 s, gunicorn 2 s); under load a
+/// connection comes back within milliseconds, and isn't checked (at 1 ms
+/// the peeks cost `proxy_hello` 1.3% on the i7).
+const CLOSE_CHECK_IDLE: Duration = Duration::from_millis(100);
+
+/// Whether an idle pooled connection is still open (#488): a peek that
+/// would block. EOF, an error or unexpected bytes (nginx's
+/// `ngx_http_upstream_keepalive_close_handler` closes on those too) mean
+/// it goes. A TLS connection is looked at on its socket.
+#[cold]
+fn idle_conn_open(stream: &crate::upstream_io::UpstreamIo) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = match stream {
+        crate::upstream_io::UpstreamIo::Plain(s) => s.as_raw_fd(),
+        crate::upstream_io::UpstreamIo::Tls(t) => t.stream.io().as_raw_fd(),
+    };
+    let mut byte = 0u8;
+    // SAFETY: `fd` is the open socket `stream` owns; one byte is peeked
+    // into a local buffer and nothing is consumed.
+    let n = unsafe {
+        libc::recv(
+            fd,
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n < 0
+        && matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN | libc::EINTR)
+        )
+}
+
 /// Take an idle connection from the pool. Drops entries that are past
 /// idle timeout; keepalive-time is enforced on release so over-age conns
 /// may be reused once and then retired (nginx behavior).
@@ -913,7 +949,15 @@ pub fn pool_take(
         // opened for this name.
         let mut i = 0;
         while i < q.len() {
-            if now.saturating_duration_since(q[i].last_used) >= idle_max {
+            let idle = now.saturating_duration_since(q[i].last_used);
+            if idle >= idle_max {
+                q.remove(i);
+                continue;
+            }
+            // The upstream may have closed it while it sat here (#488):
+            // look, as nginx's keep-alive close handler does, unless it
+            // came back a moment ago (under load, every take).
+            if idle >= CLOSE_CHECK_IDLE && !idle_conn_open(&q[i].stream) {
                 q.remove(i);
                 continue;
             }
@@ -976,6 +1020,64 @@ pub fn pool_release(upstream: &'static PreparedUpstream, peer_idx: usize, mut co
         }
         q.push_front(conn);
     });
+    arm_close_sweep();
+}
+
+thread_local! {
+    /// The worker's sweep of its idle pooled connections is running.
+    static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How often a worker looks at its idle pooled connections (#488).
+const CLOSE_SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+/// Start the worker's sweep of its pool if it isn't running: once a
+/// second it drops the idle connections their upstream has closed, as
+/// nginx's keep-alive close handler does when such a socket turns readable,
+/// so they don't sit in CLOSE_WAIT until a request takes them. It ends when
+/// the pool is empty.
+#[inline]
+fn arm_close_sweep() {
+    if SWEEPING.with(|s| s.replace(true)) {
+        return;
+    }
+    start_close_sweep();
+}
+
+#[cold]
+fn start_close_sweep() {
+    // Contained (#496): a panic ends the sweep, and the next release starts
+    // it again.
+    crate::worker::spawn_contained(
+        "the upstream keep-alive sweep",
+        || SWEEPING.with(|s| s.set(false)),
+        async {
+            loop {
+                monoio::time::sleep(CLOSE_SWEEP_EVERY).await;
+                if !sweep_closed() {
+                    break;
+                }
+            }
+            SWEEPING.with(|s| s.set(false));
+        },
+    );
+}
+
+/// Drop the pooled connections idle for `CLOSE_CHECK_IDLE` or more that
+/// are closed. `false` when the pool is empty after it.
+fn sweep_closed() -> bool {
+    let now = Instant::now();
+    POOL.with(|p| {
+        let mut map = p.borrow_mut();
+        map.retain(|_, q| {
+            q.retain(|c| {
+                now.saturating_duration_since(c.last_used) < CLOSE_CHECK_IDLE
+                    || idle_conn_open(&c.stream)
+            });
+            !q.is_empty()
+        });
+        !map.is_empty()
+    })
 }
 
 #[cfg(test)]
