@@ -368,6 +368,12 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             "The plain HTTP request was sent to HTTPS port\n",
             http_server_bytes,
         ),
+        uri_too_large: Prebuilt::leak_error(414, "Request-URI Too Large\n", http_server_bytes),
+        header_too_large: Prebuilt::leak_error(
+            494,
+            "Request Header Or Cookie Too Large\n",
+            http_server_bytes,
+        ),
         cert_error: Prebuilt::leak_error(495, "The SSL certificate error\n", http_server_bytes),
         no_cert: Prebuilt::leak_error(
             496,
