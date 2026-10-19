@@ -139,6 +139,10 @@ fn upstream_request_target_is_never_the_raw_decoded_uri() {
         ("/r/a%20b", "/n/a%20b"),
         // With variables, a clean URI goes as rendered.
         ("/v/ok", "/v/ok"),
+        // Bytes nginx takes unencoded in a target (#483): as sent without
+        // a URI part, escaped with one.
+        ("/a?j={\"x\":1}&q=a|b", "/a?j={\"x\":1}&q=a|b"),
+        ("/p/a{b}^c", "/x/a%7Bb%7D%5Ec"),
     ] {
         let resp = get(server.port, target);
         assert!(resp.starts_with("HTTP/1.1 200"), "{target}: {resp}");
