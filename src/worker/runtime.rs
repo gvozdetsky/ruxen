@@ -3607,18 +3607,31 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // pipelined next request isn't consumed. A body
                                 // that stays in memory is read straight into
                                 // its buffer: no copy, no second buffer (#289).
-                                let mut chunk: Vec<u8> = Vec::new();
-                                // Past client_body_buffer_size: through a read
-                                // buffer of that size, as nginx reuses its body
-                                // buffer. Pooled, as the body buffers are (#289).
-                                let chunk_size = (body_buffer as usize).clamp(4096, 64 * 1024);
-                                // From the start of the body: the body goes to
-                                // the temp file when it fires.
-                                let mut spill_timer = std::pin::pin!(monoio::time::sleep(
-                                    crate::worker::BODY_IN_MEMORY_FOR
-                                ));
-                                while sink.len() < cl {
-                                    if let Some((mem, room)) = sink.take_read_buf() {
+                                if sink.len() < cl {
+                                    // From the start of the body: past
+                                    // client_body_buffer_size, the body goes
+                                    // to the temp file BODY_IN_MEMORY_FOR on.
+                                    let started = monoio::time::Instant::now();
+                                    while sink.len() < cl {
+                                        let Some((mem, room)) = sink.take_read_buf() else {
+                                            // Boxed: its timer and select!
+                                            // stay out of every request's
+                                            // future.
+                                            if !Box::pin(read_body_past_buffer(
+                                                stream,
+                                                &mut sink,
+                                                cl,
+                                                body_buffer,
+                                                started,
+                                                timers.io.as_mut(),
+                                                body_timeout,
+                                            ))
+                                            .await
+                                            {
+                                                return;
+                                            }
+                                            break;
+                                        };
                                         let start = mem.len();
                                         let end = (start as u64 + (cl - sink.len()))
                                             .min(room as u64)
@@ -3638,51 +3651,8 @@ pub(crate) async fn handle<S: ConnIo>(
                                             Ok(0) | Err(_) => return,
                                             Ok(n) => sink.put_read_buf(returned.into_inner(), n),
                                         }
-                                        continue;
-                                    }
-                                    if chunk.capacity() == 0 {
-                                        chunk = crate::worker::take_body_buffer(chunk_size);
-                                    }
-                                    let want = (cl - sink.len()).min(chunk_size as u64) as usize;
-                                    chunk.clear();
-                                    let slice = std::mem::take(&mut chunk).slice_mut(0..want);
-                                    let mut read = std::pin::pin!(stream.read(slice));
-                                    let mut done = None;
-                                    if sink.past_buffer() {
-                                        monoio::select! {
-                                            r = &mut read => done = Some(r),
-                                            _ = spill_timer.as_mut() => {
-                                                if !sink.spill() {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // client_body_timeout between reads.
-                                    let (res, returned) = match done {
-                                        Some(r) => r,
-                                        None => match with_timeout(
-                                            timers.io.as_mut(),
-                                            body_timeout,
-                                            read,
-                                        )
-                                        .await
-                                        {
-                                            Some(r) => r,
-                                            None => return,
-                                        },
-                                    };
-                                    chunk = returned.into_inner();
-                                    match res {
-                                        Ok(0) | Err(_) => return,
-                                        Ok(n) => {
-                                            if !sink.extend(&chunk[..n]) {
-                                                return;
-                                            }
-                                        }
                                     }
                                 }
-                                drop(crate::worker::PooledBody(chunk));
                                 (take, cl)
                             }
                         } else if req.transfer_encoding_chunked {

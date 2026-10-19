@@ -1136,6 +1136,68 @@ pub(crate) async fn discard_request_body<S: ConnIo>(
     ok
 }
 
+/// The rest of a body that has grown past `client_body_buffer_size`
+/// (`buffer`), through a pooled read buffer of that size, as nginx reuses
+/// its body buffer (#289). It stays in memory while it arrives within
+/// `BODY_IN_MEMORY_FOR` of `started`, and moves to the temp file when that
+/// passes. Apart from `handle`'s in-place reads, and boxed there, so this
+/// timer and `select!` don't weigh on every request's future. `false` on
+/// EOF, an error, `client_body_timeout`, or a temp file that fails.
+#[cold]
+pub(crate) async fn read_body_past_buffer<S: ConnIo>(
+    stream: &mut S,
+    sink: &mut BodySink<'_>,
+    cl: u64,
+    buffer: u64,
+    started: monoio::time::Instant,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    read_timeout: Duration,
+) -> bool {
+    use monoio::buf::IoBufMut;
+    let chunk_size = (buffer as usize).clamp(4096, 64 * 1024);
+    let mut spill_timer = std::pin::pin!(monoio::time::sleep_until(started + BODY_IN_MEMORY_FOR));
+    let mut chunk = super::take_body_buffer(chunk_size);
+    let ok = loop {
+        if sink.len() >= cl {
+            break true;
+        }
+        let want = (cl - sink.len()).min(chunk_size as u64) as usize;
+        chunk.clear();
+        let slice = std::mem::take(&mut chunk).slice_mut(0..want);
+        let mut read = std::pin::pin!(stream.read(slice));
+        let mut done = None;
+        if sink.past_buffer() {
+            monoio::select! {
+                r = &mut read => done = Some(r),
+                _ = spill_timer.as_mut() => {
+                    if !sink.spill() {
+                        break false;
+                    }
+                }
+            }
+        }
+        // client_body_timeout between reads.
+        let (res, returned) = match done {
+            Some(r) => r,
+            None => match with_timeout(timer.as_mut(), read_timeout, read).await {
+                Some(r) => r,
+                None => break false,
+            },
+        };
+        chunk = returned.into_inner();
+        match res {
+            Ok(0) | Err(_) => break false,
+            Ok(n) => {
+                if !sink.extend(&chunk[..n]) {
+                    break false;
+                }
+            }
+        }
+    };
+    drop(super::PooledBody(chunk));
+    ok
+}
+
 /// Read and decode a chunked request body from the connection into `sink`
 /// (memory, then a temp file for large bodies). Chunk data is passed on as
 /// it arrives and consumed input is dropped, so memory stays bounded
