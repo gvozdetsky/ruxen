@@ -1141,6 +1141,29 @@ pub(crate) fn escape_args_into(input: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// nginx's `ngx_escape_uri(... NGX_ESCAPE_URI)` (`src/core/ngx_string.c`):
+/// control bytes, space, `"`, `#`, `%`, `<`, `>`, `?`, `\\`, `^`, `` ` ``,
+/// `{`, `|`, `}`, DEL and bytes over 0x7f, as `%XX`. The decoded URI goes
+/// into an upstream request line through this (#541).
+pub(crate) fn escape_uri_into(input: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in input {
+        let escape = b <= 0x20
+            || b >= 0x7f
+            || matches!(
+                b,
+                b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
+            );
+        if escape {
+            out.push(b'%');
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0x0f) as usize]);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
 pub(crate) fn condition_is_truthy(raw: &[u8]) -> bool {
     let mut s = raw;
     while let Some((&c, rest)) = s.split_first() {
@@ -1415,4 +1438,24 @@ pub(crate) fn render_variable_to_vec(var: &Variable, ctx: &RenderCtx<'_>) -> Vec
     let mut out = Vec::with_capacity(32);
     ctx.write_var(var, &mut out);
     out
+}
+
+#[cfg(test)]
+mod escape_uri_tests {
+    use super::escape_uri_into;
+
+    /// NGX_ESCAPE_URI (#541): what nginx escapes in an upstream URI.
+    #[test]
+    fn escapes_as_ngx_escape_uri() {
+        let mut out = Vec::new();
+        escape_uri_into(b"/a\r\nb c\"#%<>?\\^`{|}\x7f\xc3\xa9\x00", &mut out);
+        assert_eq!(
+            out,
+            b"/a%0D%0Ab%20c%22%23%25%3C%3E%3F%5C%5E%60%7B%7C%7D%7F%C3%A9%00".to_vec()
+        );
+        out.clear();
+        let safe = b"/az-AZ_09.~!$&'()*+,;=:@[]/";
+        escape_uri_into(safe, &mut out);
+        assert_eq!(out, safe.to_vec());
+    }
 }

@@ -490,6 +490,7 @@ pub(crate) fn execute_rewrite_ops(
                 // proxy_pass http://up/PATH;` would still send `PATH` to
                 // upstream — see nginx-tests/rewrite.t valid_location reset.
                 rewrite_state.valid_location = false;
+                rewrite_state.unparsed_uri = false;
                 match flag {
                     PreparedRewriteFlag::Last => return RewriteControl::Reroute,
                     PreparedRewriteFlag::Break => return RewriteControl::Stop,
