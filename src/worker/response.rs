@@ -94,6 +94,7 @@ pub(crate) fn last_modified_override_for_conditionals(
         }
         let mut rendered = Vec::with_capacity(64);
         render_parts(h.value, &ctx, &mut rendered);
+        http::make_header_value_safe(&mut rendered);
         out = Some(rendered);
     }
     out
@@ -334,6 +335,7 @@ pub(crate) fn inject_add_headers(
             local_ctx.sent_headers = sent_view.as_slice();
             render_parts(h.value, &local_ctx, &mut rendered);
         }
+        http::make_header_value_safe(&mut rendered);
         if is_last_modified && rendered.is_empty() {
             // Explicit empty value means "suppress Last-Modified entirely".
             continue;
@@ -1245,6 +1247,7 @@ pub(crate) fn inject_add_trailers(
             local_ctx.sent_trailers = trailer_block.as_slice();
             render_parts(t.value, &local_ctx, &mut rendered);
         }
+        http::make_header_value_safe(&mut rendered);
         if rendered.is_empty() {
             continue;
         }
