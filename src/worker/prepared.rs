@@ -1652,6 +1652,10 @@ pub struct PreparedClientTimeouts {
     pub header: Duration,
     pub body: Duration,
     pub send: Duration,
+    /// `large_client_header_buffers` (#482): the longest line of a request
+    /// head, and the largest head, `size × number`.
+    pub large_header_line: usize,
+    pub large_header: usize,
 }
 
 impl PreparedHttp {
@@ -1666,10 +1670,14 @@ impl PreparedHttp {
 impl PreparedClientTimeouts {
     pub(crate) fn resolve(t: crate::config::ClientTimeouts) -> Self {
         const DEFAULT_MS: u64 = 60_000;
+        // nginx's default, `4 8k`.
+        let (num, size) = t.large_header_buffers.unwrap_or((4, 8192));
         PreparedClientTimeouts {
             header: Duration::from_millis(t.header_ms.unwrap_or(DEFAULT_MS)),
             body: Duration::from_millis(t.body_ms.unwrap_or(DEFAULT_MS)),
             send: Duration::from_millis(t.send_ms.unwrap_or(DEFAULT_MS)),
+            large_header_line: size as usize,
+            large_header: (num.saturating_mul(size)).min(usize::MAX as u64) as usize,
         }
     }
 }
@@ -1974,6 +1982,12 @@ pub struct PreparedHttp {
     pub bad_request: Prebuilt,
     /// nginx's 497 page: plain HTTP on an `ssl` port, sent as 400 (#384).
     pub plain_http: Prebuilt,
+    /// A request line longer than `large_client_header_buffers` allows: 414
+    /// (#482).
+    pub uri_too_large: Prebuilt,
+    /// A header line or head over `large_client_header_buffers`: nginx's
+    /// 494, sent as 400 "Request Header Or Cookie Too Large" (#482).
+    pub header_too_large: Prebuilt,
     /// nginx's 495 and 496 pages, sent as 400, and its 421 (#113).
     pub cert_error: Prebuilt,
     pub no_cert: Prebuilt,

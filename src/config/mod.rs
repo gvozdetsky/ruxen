@@ -915,7 +915,10 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 keepalive_disable = Some(parse_keepalive_disable_args(&args[1..])?);
             }
             (
-                name @ ("client_header_timeout" | "client_body_timeout" | "send_timeout"),
+                name @ ("client_header_timeout"
+                | "client_body_timeout"
+                | "send_timeout"
+                | "large_client_header_buffers"),
                 Terminator::Semi,
             ) => {
                 client_timeouts.parse(name, &args)?;
@@ -1003,7 +1006,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "client_max_body_size",
     "client_header_buffer_size",
     "client_header_timeout",
-    "large_client_header_buffers",
     "send_timeout",
     "connection_pool_size",
     "request_pool_size",
@@ -2359,6 +2361,7 @@ mod tests {
                 header_ms: Some(5_000),
                 body_ms: Some(3_000),
                 send_ms: Some(9_000),
+                large_header_buffers: None,
             }
         );
         assert_eq!(
@@ -2367,6 +2370,7 @@ mod tests {
                 header_ms: Some(5_000),
                 body_ms: None,
                 send_ms: Some(7_000),
+                large_header_buffers: None,
             }
         );
         assert!(matches!(
