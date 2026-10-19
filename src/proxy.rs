@@ -1088,6 +1088,12 @@ pub enum UpstreamError {
     LengthAndTransferEncoding,
     InvalidContentLength(String),
     UnknownTransferEncoding(String),
+    /// A header line nginx's parser refuses (#514): the line up to the
+    /// byte, and the byte.
+    InvalidHeader {
+        start: String,
+        byte: u8,
+    },
 }
 
 impl UpstreamError {
@@ -1254,6 +1260,11 @@ impl std::fmt::Display for UpstreamError {
             UnknownTransferEncoding(value) => write!(
                 f,
                 "upstream sent unknown \"Transfer-Encoding\": \"{value}\" while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            InvalidHeader { start, byte } => write!(
+                f,
+                "upstream sent invalid header: \"{start}\\x{byte:02x}...\" while {}",
                 Stage::ReadingHeader.as_str()
             ),
         }
@@ -1847,6 +1858,16 @@ async fn attempt(
             };
             let line = &head_after_status[cursor..cursor + line_len];
             cursor += line_len + t;
+            if let Some(bad) = invalid_header_byte(line) {
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                    FailKind::InvalidHeader,
+                    Box::new(UpstreamError::InvalidHeader {
+                        start: String::from_utf8_lossy(&line[..bad]).into_owned(),
+                        byte: line[bad],
+                    }),
+                );
+            }
             let Some(colon) = line.iter().position(|&b| b == b':') else {
                 continue;
             };
@@ -3268,6 +3289,40 @@ fn is_hop_by_hop(name: &[u8]) -> bool {
     false
 }
 
+/// Where a header line of an upstream head (without its line end) breaks
+/// nginx's `ngx_http_parse_header_line` (`src/http/ngx_http_parse.c:819`),
+/// a 502 there: a first byte that is a control byte, a space, DEL or `:`;
+/// one of those but `:` in the name; a NUL in the value; a CR followed by
+/// anything but CRs (and the line end). Forwarded, a bare CR would end the
+/// line for some clients and inject a header (#514). A duplicate status
+/// line (`HTTP/…`, sent by IIS) is ignored, as nginx does.
+fn invalid_header_byte(line: &[u8]) -> Option<usize> {
+    let cr_tail = |at: usize| (!line[at..].iter().all(|&b| b == b'\r')).then_some(at);
+    match line.first() {
+        None => return None,
+        Some(&b) if b <= 0x20 || b == 0x7f || b == b':' => return Some(0),
+        Some(_) => {}
+    }
+    let mut i = 1;
+    while i < line.len() {
+        match line[i] {
+            b':' => break,
+            b'\r' => return cr_tail(i),
+            b'/' if i == 4 && line.starts_with(b"HTTP") => return None,
+            b if b <= 0x20 || b == 0x7f => return Some(i),
+            _ => i += 1,
+        }
+    }
+    for (j, &b) in line.iter().enumerate().skip(i) {
+        match b {
+            0 => return Some(j),
+            b'\r' => return cr_tail(j),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// `name` is `lower` (lowercase), whatever its case. The length goes
 /// first, inline: most header names differ in it, and the scan of an
 /// upstream head (`attempt`) then makes no call for them (#451).
@@ -3291,6 +3346,42 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use super::invalid_header_byte;
+
+    /// nginx's ngx_http_parse_header_line on upstream header lines (#514).
+    #[test]
+    fn upstream_header_bytes_as_nginx() {
+        for (line, want) in [
+            (&b"X-A: b"[..], None),
+            (b"X-A: a\x01\x7fb", None),
+            (b"X-A: one\r", None),
+            (b"X-A: one\r\r", None),
+            (b"X-A:", None),
+            (b"NoColon", None),
+            (b"X-\xC3\xA9: b", None),
+            (b"HTTP/1.1 200 OK", None),
+            (b"X-A: one\rX-Injected: 1", Some(8)),
+            (b"X-A: a\x00b", Some(6)),
+            (b"X-A:\x00", Some(4)),
+            (b"X A: b", Some(1)),
+            (b"X\tA: b", Some(1)),
+            (b"X-A : b", Some(3)),
+            (b"X\x7fA: b", Some(1)),
+            (b" X-A: b", Some(0)),
+            (b": b", Some(0)),
+            (b"\x7fA: b", Some(0)),
+            (b"No Colon", Some(2)),
+            (b"X\rA: b", Some(1)),
+        ] {
+            assert_eq!(
+                invalid_header_byte(line),
+                want,
+                "{:?}",
+                line.escape_ascii().to_string()
+            );
+        }
+    }
+
     use super::*;
 
     /// The single pass finds what the two whole-buffer searches it replaced
