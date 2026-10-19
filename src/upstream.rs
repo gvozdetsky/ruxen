@@ -890,8 +890,9 @@ thread_local! {
 /// How long a pooled connection sits idle before `pool_take` checks that
 /// the upstream hasn't closed it. Upstreams close idle keep-alive
 /// connections after seconds (Node.js 5 s, gunicorn 2 s); under load a
-/// connection comes back within microseconds, and isn't checked.
-const CLOSE_CHECK_IDLE: Duration = Duration::from_millis(1);
+/// connection comes back within milliseconds, and isn't checked (at 1 ms
+/// the peeks cost `proxy_hello` 1.3% on the i7).
+const CLOSE_CHECK_IDLE: Duration = Duration::from_millis(100);
 
 /// Whether an idle pooled connection is still open (#488): a peek that
 /// would block. EOF, an error or unexpected bytes (nginx's
