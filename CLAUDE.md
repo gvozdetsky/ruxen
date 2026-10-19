@@ -40,6 +40,17 @@ Sibling checkouts are expected one directory up:
 - Access restrictions ruxen can't enforce yet fail closed (`[emerg]`), never
   go on the allowlist (`config::reject_unenforced`).
 
+## Measuring a PR
+
+A PR on the hot path (the request, response, proxy or TLS path) merges after
+an ABBA run: `bench/scripts/pair.sh <scenario> --a-bin <A> --b-bin <B>`, with
+A built from the PR's merge-base with main and B from its head, on a quiet
+machine. A short run (2–4 scenarios the change touches, 6 pairs) is enough
+unless the change is about performance. While one waits, the PR has the
+`needs-abba` label, and the results arrive as a PR comment starting with
+"ABBA on"; merge when B / A is within noise (about ±0.5%) or better. A PR
+that changes only startup, configuration or docs doesn't need one.
+
 ## Backlog
 
 The backlog is GitHub issues, nothing else; there is no backlog file.
