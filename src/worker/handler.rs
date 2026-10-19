@@ -984,6 +984,7 @@ pub(crate) fn run_location_handler(
         for sh in proxy.set_headers {
             let mut value = Vec::with_capacity(32);
             render_parts(sh.value, &proxy_render_ctx, &mut value);
+            http::make_header_value_safe(&mut value);
             if sh.name.eq_ignore_ascii_case(b"host") {
                 have_host_override = true;
             }

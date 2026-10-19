@@ -1515,6 +1515,60 @@ fn redirect_page_title(status: u16) -> Option<&'static [u8]> {
     })
 }
 
+/// Whether a value rendered from variables has a CR, LF or NUL: a decoded
+/// `$uri` or capture with `%0D%0A` in it (#516). One pass the compiler
+/// vectorizes.
+#[inline]
+pub fn has_line_break(value: &[u8]) -> bool {
+    value.iter().fold(false, |found, &b| {
+        found | (b == b'\r') | (b == b'\n') | (b == 0)
+    })
+}
+
+/// A rendered header value as it may go into a head (#516): each CR, LF
+/// or NUL becomes a space, as RFC 9110 §5.5 lets a recipient do, so a
+/// `%0D%0A` in a request path can't add a header line. nginx sends them
+/// as they are.
+#[inline]
+pub fn make_header_value_safe(value: &mut [u8]) {
+    if has_line_break(value) {
+        replace_line_breaks(value);
+    }
+}
+
+#[cold]
+fn replace_line_breaks(value: &mut [u8]) {
+    for b in value.iter_mut() {
+        if matches!(*b, b'\r' | b'\n' | 0) {
+            *b = b' ';
+        }
+    }
+}
+
+/// `location` into a `Location` header, a CR, LF or NUL percent-encoded
+/// (#516), as `rewrite … redirect` escapes them: the URL keeps its meaning
+/// and the head its lines.
+#[inline]
+fn extend_location(out: &mut Vec<u8>, location: &[u8]) {
+    if has_line_break(location) {
+        escape_line_breaks(out, location);
+    } else {
+        out.extend_from_slice(location);
+    }
+}
+
+#[cold]
+fn escape_line_breaks(out: &mut Vec<u8>, location: &[u8]) {
+    for &b in location {
+        match b {
+            b'\r' => out.extend_from_slice(b"%0D"),
+            b'\n' => out.extend_from_slice(b"%0A"),
+            0 => out.extend_from_slice(b"%00"),
+            _ => out.push(b),
+        }
+    }
+}
+
 /// Hot-path variant of `build_redirect_response`.
 pub fn write_redirect_response(
     out: &mut Vec<u8>,
@@ -1539,7 +1593,7 @@ pub fn write_redirect_response(
     out.extend_from_slice(reason_phrase(status).as_bytes());
     write_server_and_date(out, server);
     out.extend_from_slice(b"\r\nLocation: ");
-    out.extend_from_slice(location);
+    extend_location(out, location);
     out.extend_from_slice(b"\r\nContent-Type: text/html\r\nContent-Length: ");
     write_usize(out, body_len);
     out.extend_from_slice(b"\r\n\r\n");
@@ -2426,5 +2480,28 @@ mod tests {
         assert!(off_str.contains(&footer(identity().plain)));
         assert!(!off_str.contains(std::str::from_utf8(identity().versioned).unwrap()));
         assert!(default_error_page_body(200, On).is_none());
+    }
+}
+
+#[cfg(test)]
+mod line_break_tests {
+    use super::{extend_location, make_header_value_safe};
+
+    /// #516: rendered values keep to one header line.
+    #[test]
+    fn rendered_values_keep_to_one_line() {
+        let mut v = b"/a\r\nX-Injected: 1\x00z".to_vec();
+        make_header_value_safe(&mut v);
+        assert_eq!(v, b"/a  X-Injected: 1 z".to_vec());
+        let mut v = b"plain value".to_vec();
+        make_header_value_safe(&mut v);
+        assert_eq!(v, b"plain value".to_vec());
+
+        let mut out = Vec::new();
+        extend_location(&mut out, b"http://h/a\r\nX: 1\x00");
+        assert_eq!(out, b"http://h/a%0D%0AX: 1%00".to_vec());
+        out.clear();
+        extend_location(&mut out, b"/plain?x=1");
+        assert_eq!(out, b"/plain?x=1".to_vec());
     }
 }
