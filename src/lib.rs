@@ -116,7 +116,8 @@ pub mod fuzzing {
         RUNTIME.with(|rt| {
             rt.borrow_mut().block_on(async {
                 let temp = crate::worker::BodyTempDir::new(None);
-                let mut sink = crate::worker::BodySink::with_capacity(0, &temp, false);
+                let mut sink =
+                    crate::worker::BodySink::with_capacity(0, 1 << 20, 1 << 20, &temp, false);
                 let timer =
                     std::pin::pin!(monoio::time::sleep(std::time::Duration::from_secs(3600)));
                 let decoded = crate::worker::read_chunked_request_body(
