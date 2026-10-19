@@ -8,12 +8,16 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// `client_header_timeout`, `client_body_timeout` and `send_timeout`
-/// (milliseconds); `None` means nginx's default, 60 s.
+/// (milliseconds); `None` means nginx's default, 60 s. Also
+/// `large_client_header_buffers` (#482): like `client_header_timeout`, the
+/// default server's applies while a request head is read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClientTimeouts {
     pub header_ms: Option<u64>,
     pub body_ms: Option<u64>,
     pub send_ms: Option<u64>,
+    /// `large_client_header_buffers number size`.
+    pub large_header_buffers: Option<(u64, u64)>,
 }
 
 impl ClientTimeouts {
@@ -29,6 +33,9 @@ impl ClientTimeouts {
             "client_header_timeout" => (&mut self.header_ms, "client_header_timeout"),
             "client_body_timeout" => (&mut self.body_ms, "client_body_timeout"),
             "send_timeout" => (&mut self.send_ms, "send_timeout"),
+            "large_client_header_buffers" => {
+                return self.parse_large_header_buffers(args).map(|()| true);
+            }
             _ => return Ok(false),
         };
         if slot.is_some() {
@@ -39,12 +46,48 @@ impl ClientTimeouts {
         Ok(true)
     }
 
+    /// `large_client_header_buffers number size;`, as nginx's
+    /// `ngx_conf_set_bufs_slot`: both above 0. nginx also wants the size
+    /// at least `connection_pool_size`, a directive ruxen takes and
+    /// ignores, so that check isn't made.
+    fn parse_large_header_buffers(&mut self, args: &[String]) -> Result<(), super::error::Error> {
+        use super::error::Error;
+        const WHAT: &str = "large_client_header_buffers";
+        if self.large_header_buffers.is_some() {
+            return Err(Error::Duplicate(WHAT));
+        }
+        let (Some(num_raw), Some(size_raw)) = (args.get(1), args.get(2)) else {
+            return Err(Error::MissingArg(WHAT));
+        };
+        if args.len() > 3 {
+            return Err(Error::BadValue {
+                what: WHAT,
+                got: args[1..].join(" "),
+            });
+        }
+        let bad = |got: &String| Error::BadValue {
+            what: WHAT,
+            got: got.clone(),
+        };
+        let num = num_raw
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| bad(num_raw))?;
+        let size = super::parse_server::parse_size_bytes(size_raw)
+            .filter(|&s| s > 0)
+            .ok_or_else(|| bad(size_raw))?;
+        self.large_header_buffers = Some((num, size));
+        Ok(())
+    }
+
     /// Server values win; unset ones come from http scope.
     pub(crate) fn inherit(self, parent: ClientTimeouts) -> ClientTimeouts {
         ClientTimeouts {
             header_ms: self.header_ms.or(parent.header_ms),
             body_ms: self.body_ms.or(parent.body_ms),
             send_ms: self.send_ms.or(parent.send_ms),
+            large_header_buffers: self.large_header_buffers.or(parent.large_header_buffers),
         }
     }
 }

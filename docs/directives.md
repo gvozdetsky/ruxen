@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 170 implemented, 30 accepted with a difference, 74 accepted with no effect, 1 refused, 275 unknown.
+Of 550 directives: 171 implemented, 30 accepted with a difference, 73 accepted with no effect, 1 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -101,7 +101,7 @@ Not supported: `ssl_engine`.
 | `request_pool_size` | accepted, no effect | any |  |
 | `client_header_timeout` | yes | any |  |
 | `client_header_buffer_size` | accepted, no effect | any |  |
-| `large_client_header_buffers` | accepted, no effect | any |  |
+| `large_client_header_buffers` | yes | http, server |  |
 | `ignore_invalid_headers` | yes | any |  |
 | `merge_slashes` | yes | http, server |  |
 | `underscores_in_headers` | yes | any |  |

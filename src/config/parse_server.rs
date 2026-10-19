@@ -384,7 +384,10 @@ pub(crate) fn parse_server_block(
                 keepalive_disable = Some(parse_keepalive_disable_args(&args[1..])?);
             }
             (
-                name @ ("client_header_timeout" | "client_body_timeout" | "send_timeout"),
+                name @ ("client_header_timeout"
+                | "client_body_timeout"
+                | "send_timeout"
+                | "large_client_header_buffers"),
                 Terminator::Semi,
             ) => {
                 client_timeouts.parse(name, &args)?;

@@ -186,8 +186,16 @@ fn if_locations_follow_nginx() {
     let two_a = get(port, "/two?a=1");
     let two_ab = get(port, "/two?a=1&b=1");
     let late = get(port, "/late/?h=1");
-    sleep(Duration::from_millis(100));
-    let log = std::fs::read_to_string(dir.join("access.log")).unwrap_or_default();
+    // The line of `/h` is written after its response: wait for it rather
+    // than a fixed time, which the full test run's load can outlast.
+    let mut log = String::new();
+    for _ in 0..60 {
+        log = std::fs::read_to_string(dir.join("access.log")).unwrap_or_default();
+        if log.contains("GET /h ") {
+            break;
+        }
+        sleep(Duration::from_millis(50));
+    }
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 

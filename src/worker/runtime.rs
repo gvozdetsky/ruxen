@@ -305,8 +305,11 @@ async fn write_buffered_access_line(
     if appended.arm_timer
         && let Some(ms) = buffer.flush_ms
     {
-        monoio::spawn(async move {
+        super::panics::spawn_contained("an access_log flush timer", || {}, async move {
             monoio::time::sleep(Duration::from_millis(ms)).await;
+            if super::panics::test_panic() == super::panics::TestPanic::Task {
+                panic!("RUXEN_TEST_PANIC=task");
+            }
             if let Some((file_index, data)) = super::logbuf::take_for_timer(buffer)
                 && let Some(files) = access_log_files(http.access_logs)
                 && let Some(AccessLogSink::File(file)) = files.get(file_index)
@@ -500,6 +503,102 @@ async fn write_response_paced<S: ConnIo>(
             .map_err(|n| len as u64 + n),
         None => Ok(()),
     }
+}
+
+/// Grow the read buffer for a head that doesn't fit (#482): by half
+/// again, up to `limit` (`large_client_header_buffers`, `size × number`).
+#[cold]
+#[inline(never)]
+fn grow_head_buffer(buf: &mut Vec<u8>, limit: usize) {
+    let len = (buf.len() + buf.len() / 2).clamp(buf.len() + 1, limit);
+    buf.resize(len, 0);
+}
+
+/// Back to `READ_BUF` after a large head, once nothing of it is left.
+#[cold]
+#[inline(never)]
+fn shrink_head_buffer(buf: &mut Vec<u8>) {
+    buf.truncate(READ_BUF);
+    buf.shrink_to_fit();
+}
+
+/// The start of the first line of `head` longer than `max` bytes, without
+/// its line end (0 for the request line), or of the line that takes the
+/// head past `total`, as nginx's large buffers would run out there.
+#[cold]
+#[inline(never)]
+fn overlong_head_line(head: &[u8], max: usize, total: usize) -> Option<usize> {
+    let mut start = 0;
+    for line in head.split(|&b| b == b'\n') {
+        let len = line.strip_suffix(b"\r").unwrap_or(line).len();
+        if len > max || (start > 0 && start + line.len() > total) {
+            return Some(start);
+        }
+        start += line.len() + 1;
+    }
+    None
+}
+
+/// A request head over `large_client_header_buffers` (#482), answered and
+/// logged as nginx does (`src/http/ngx_http_request.c:1189`, `:1370`): a
+/// request line that doesn't fit gets 414 and `client sent too long URI`;
+/// a header line, or a head past `size × number`, 400 "Request Header Or
+/// Cookie Too Large" (494) and `client sent too long header line`.
+/// `header_line`: where the header line that didn't fit starts, `None`
+/// for the request line.
+#[cold]
+#[inline(never)]
+async fn head_too_large<S: ConnIo>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    http: &'static PreparedHttp,
+    head: &[u8],
+    header_line: Option<usize>,
+    conn: &ConnLogCtx<'_>,
+) {
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
+    let request_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    // nginx's NGX_MAX_ERROR_STR - 300.
+    const SHOWN: usize = 2048 - 300;
+    let request_line = &head[..request_end.min(SHOWN)];
+    let (message, response) = match header_line {
+        None => (
+            "client sent too long URI while reading client request line".to_string(),
+            http.uri_too_large.pick(Method::Get),
+        ),
+        Some(start) => {
+            let line = &head[start..];
+            let line = &line[..line
+                .iter()
+                .position(|&b| b == b'\r' || b == b'\n')
+                .unwrap_or(line.len())
+                .min(SHOWN)];
+            (
+                format!(
+                    "client sent too long header line: \"{}...\" while reading client request \
+                     headers",
+                    String::from_utf8_lossy(line)
+                ),
+                http.header_too_large.pick(Method::Get),
+            )
+        }
+    };
+    write_worker_log(
+        server.error_logs,
+        ErrorLogLevel::Info,
+        &format!(
+            "*{} {message}, client: {}, server: {}, request: \"{}\"",
+            conn.connection_id,
+            String::from_utf8_lossy(conn.remote_addr),
+            String::from_utf8_lossy(server.primary_server_name),
+            String::from_utf8_lossy(request_line),
+        ),
+    );
+    reject_request(stream, scratch, http, response, head, conn).await;
 }
 
 /// A response head for the access log when a timed-out write took the
@@ -3219,7 +3318,8 @@ pub(crate) async fn handle<S: ConnIo>(
                 // Fall through to the parse loop with what idle_read read.
             } else {
                 let taken = std::mem::take(&mut *buf);
-                let slice = taken.slice_mut(filled..READ_BUF);
+                let end = taken.len();
+                let slice = taken.slice_mut(filled..end);
                 let deadline = *header_deadline
                     .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
                 let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
@@ -3239,6 +3339,26 @@ pub(crate) async fn handle<S: ConnIo>(
                 let view = &buf[read_start..filled];
                 match http::parse_request(view, &mut parse_state) {
                     Parse::Complete(req) => {
+                        // Only a head longer than one line may hold: is
+                        // each line within `large_client_header_buffers`?
+                        if req.consumed > timeouts.large_header_line
+                            && let Some(line) = overlong_head_line(
+                                &buf[read_start..read_start + req.consumed],
+                                timeouts.large_header_line,
+                                timeouts.large_header,
+                            )
+                        {
+                            head_too_large(
+                                stream,
+                                &mut *scratch,
+                                http,
+                                &buf[read_start..read_start + req.consumed],
+                                (line > 0).then_some(line),
+                                conn_log!(),
+                            )
+                            .await;
+                            return;
+                        }
                         conn_stats.request();
                         let request_start = Instant::now();
                         // Counted up front so a request refused below logs
@@ -4457,15 +4577,35 @@ pub(crate) async fn handle<S: ConnIo>(
 
             if read_start == filled {
                 // Drained everything — release the buffer and wait idle.
+                if buf.len() > READ_BUF {
+                    // A large head grew it (#482): back to the usual size,
+                    // as nginx frees its large buffers for keep-alive.
+                    shrink_head_buffer(buf);
+                }
                 continue 'idle;
             }
 
-            if filled == READ_BUF {
+            if filled == buf.len() {
                 // No tail room left. If we have a prefix of consumed bytes,
                 // compact the remaining partial request down to offset 0 and
-                // keep reading. Otherwise the request itself is larger than
-                // the buffer — close.
+                // keep reading. Otherwise the head itself is larger than the
+                // buffer: it grows up to `large_client_header_buffers`, as
+                // nginx moves it into a large buffer (#482), and past that
+                // gets nginx's 414 or 400.
                 if read_start == 0 {
+                    if buf.len() < timeouts.large_header {
+                        grow_head_buffer(buf, timeouts.large_header);
+                        continue;
+                    }
+                    head_too_large(
+                        stream,
+                        &mut *scratch,
+                        http,
+                        &buf[..filled],
+                        parse_state.rline_done.then_some(parse_state.cursor),
+                        conn_log!(),
+                    )
+                    .await;
                     return;
                 }
                 buf.copy_within(read_start..filled, 0);
