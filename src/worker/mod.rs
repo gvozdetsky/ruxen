@@ -479,28 +479,6 @@ impl SpilledBody {
     }
 }
 
-pub(crate) fn maybe_spill_request_body_to_file(
-    body: &[u8],
-    temp: &BodyTempDir,
-    persistent: bool,
-    buffer_size: u64,
-) -> Option<SpilledBody> {
-    if body.len() as u64 <= buffer_size {
-        return None;
-    }
-    let spilled = new_body_file(temp, persistent)?;
-    if (&spilled.file).write_all(body).is_err() {
-        spilled.discard();
-        return None;
-    }
-    Some(spilled)
-}
-
-/// Request bodies up to this size stay in memory, where the proxy forwards
-/// them without a copy; larger ones go to a temp file as they arrive, like
-/// nginx past `client_body_buffer_size`.
-pub(crate) const REQUEST_BODY_IN_MEMORY: usize = 1 << 20;
-
 /// nginx's default `client_max_body_size`.
 pub(crate) const DEFAULT_CLIENT_MAX_BODY_SIZE: u64 = 1 << 20;
 
@@ -560,10 +538,28 @@ impl Drop for PooledBody {
     }
 }
 
-/// Collects a request body: in memory up to `REQUEST_BODY_IN_MEMORY`, then
-/// in a temp file (see `SpilledBody`).
+/// How long a request body over `client_body_buffer_size` may stay in
+/// memory: one that hasn't all arrived by then goes to a temp file
+/// (`BodySink::past_buffer`, #507).
+pub(crate) const BODY_IN_MEMORY_FOR: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A request body held in memory at most: past it, it goes to a temp file
+/// whatever the time. The largest buffer the pool keeps, too.
+pub(crate) const BODY_IN_MEMORY_MAX: u64 = BODY_POOL_KEEP as u64;
+
+/// Collects a request body: in memory, where the proxy forwards it without
+/// a copy, or in a temp file (see `SpilledBody`). nginx keeps
+/// `client_body_buffer_size` (`buffer`) in memory and writes the rest out
+/// as it arrives (ngx_http_write_request_body), so a slow upload holds no
+/// more than that (#507). ruxen keeps a body up to `max` in memory while it
+/// arrives quickly: the caller moves it to the file (`spill`) once it is
+/// past `buffer` and has taken `BODY_IN_MEMORY_FOR`, so a fast 64 KiB POST
+/// costs no file, and a stalled one holds `buffer` again soon. With `max`
+/// equal to `buffer`, it is nginx's rule.
 pub(crate) struct BodySink<'t> {
     mem: Vec<u8>,
+    buffer: usize,
+    max: usize,
     file: Option<SpilledBody>,
     len: u64,
     temp: &'t BodyTempDir,
@@ -572,9 +568,19 @@ pub(crate) struct BodySink<'t> {
 }
 
 impl<'t> BodySink<'t> {
-    pub(crate) fn with_capacity(expected: u64, temp: &'t BodyTempDir, persistent: bool) -> Self {
+    pub(crate) fn with_capacity(
+        expected: u64,
+        buffer: u64,
+        max: u64,
+        temp: &'t BodyTempDir,
+        persistent: bool,
+    ) -> Self {
+        let buffer = buffer.min(usize::MAX as u64) as usize;
+        let max = max.min(usize::MAX as u64) as usize;
         BodySink {
-            mem: take_body_buffer(expected.min(REQUEST_BODY_IN_MEMORY as u64) as usize),
+            mem: take_body_buffer(expected.min(max as u64) as usize),
+            buffer,
+            max,
             file: None,
             len: 0,
             temp,
@@ -588,16 +594,8 @@ impl<'t> BodySink<'t> {
 
     /// Append `data`; `false` if the temp file couldn't be written.
     pub(crate) fn extend(&mut self, data: &[u8]) -> bool {
-        if self.file.is_none() && self.mem.len() + data.len() > REQUEST_BODY_IN_MEMORY {
-            let Some(spilled) = new_body_file(self.temp, self.persistent) else {
-                return false;
-            };
-            if (&spilled.file).write_all(&self.mem).is_err() {
-                spilled.discard();
-                return false;
-            }
-            self.mem = Vec::new();
-            self.file = Some(spilled);
+        if self.file.is_none() && self.mem.len() + data.len() > self.max && !self.spill() {
+            return false;
         }
         let ok = match &self.file {
             Some(spilled) => {
@@ -616,6 +614,29 @@ impl<'t> BodySink<'t> {
         ok
     }
 
+    /// In memory and past `buffer`: to `spill` once it has taken too long.
+    pub(crate) fn past_buffer(&self) -> bool {
+        self.file.is_none() && self.mem.len() >= self.buffer && self.max > self.buffer
+    }
+
+    /// Move the body so far to a temp file, where the rest goes too;
+    /// `false` if it couldn't be written.
+    pub(crate) fn spill(&mut self) -> bool {
+        if self.file.is_some() {
+            return true;
+        }
+        let Some(spilled) = new_body_file(self.temp, self.persistent) else {
+            return false;
+        };
+        if (&spilled.file).write_all(&self.mem).is_err() {
+            spilled.discard();
+            return false;
+        }
+        drop(PooledBody(std::mem::take(&mut self.mem)));
+        self.file = Some(spilled);
+        true
+    }
+
     /// The in-memory body (empty when spilled) and the file, if any.
     pub(crate) fn finish(self) -> (PooledBody, Option<SpilledBody>) {
         match self.file {
@@ -624,12 +645,18 @@ impl<'t> BodySink<'t> {
         }
     }
 
-    /// The in-memory buffer to read the rest of the body into, in place:
-    /// `Some` while the body is in memory and the buffer has room. Hand it
-    /// back with `put_read_buf`.
-    pub(crate) fn take_read_buf(&mut self) -> Option<Vec<u8>> {
-        (self.file.is_none() && self.mem.capacity() > self.mem.len())
-            .then(|| std::mem::take(&mut self.mem))
+    /// The in-memory buffer to read the rest of the body into, in place,
+    /// and the length it may grow to (`max`; a pooled buffer may have
+    /// more): `Some` while the body is in memory and under `buffer`. A
+    /// read waiting on it then holds less than `buffer` of the body, and
+    /// one read takes what has come, a whole 64 KiB POST as often as not
+    /// (#289). Past `buffer`, reads go through a buffer of their own, so
+    /// the body can be spilled while one waits. Hand it back with
+    /// `put_read_buf`.
+    pub(crate) fn take_read_buf(&mut self) -> Option<(Vec<u8>, usize)> {
+        let end = self.mem.capacity().min(self.max);
+        (self.file.is_none() && self.mem.len() < self.buffer && end > self.mem.len())
+            .then(|| (std::mem::take(&mut self.mem), end))
     }
 
     /// The buffer from `take_read_buf`, `n` bytes longer.

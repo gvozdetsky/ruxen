@@ -3543,15 +3543,29 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             }
                         }
-                        // Request bodies stay in memory up to
-                        // REQUEST_BODY_IN_MEMORY and go to a temp file past
-                        // that (`BodySink`), within `max_body` above.
+                        // Request bodies stay in memory up to the location's
+                        // client_body_buffer_size and go to a temp file past
+                        // that (`BodySink`), within `max_body` above. Past
+                        // it, a body that arrives within BODY_IN_MEMORY_FOR
+                        // stays in memory, unless something can tell: the
+                        // body variables show whether it went to a file, and
+                        // a chunked body is read without that timer.
                         let mut pipelined_tail: Vec<u8> = Vec::new();
+                        let nginx_rule = http.uses_request_body
+                            || http.uses_request_body_file
+                            || body_buffer == 0
+                            || req.transfer_encoding_chunked;
                         let mut sink = BodySink::with_capacity(
                             if discard_body {
                                 0
                             } else {
                                 req.content_length.unwrap_or(0)
+                            },
+                            body_buffer,
+                            if nginx_rule {
+                                body_buffer
+                            } else {
+                                body_buffer.max(crate::worker::BODY_IN_MEMORY_MAX)
                             },
                             body_temp,
                             persistent_body,
@@ -3593,12 +3607,34 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // pipelined next request isn't consumed. A body
                                 // that stays in memory is read straight into
                                 // its buffer: no copy, no second buffer (#289).
-                                let mut chunk: Vec<u8> = Vec::new();
-                                while sink.len() < cl {
-                                    if let Some(mem) = sink.take_read_buf() {
+                                if sink.len() < cl {
+                                    // From the start of the body: past
+                                    // client_body_buffer_size, the body goes
+                                    // to the temp file BODY_IN_MEMORY_FOR on.
+                                    let started = monoio::time::Instant::now();
+                                    while sink.len() < cl {
+                                        let Some((mem, room)) = sink.take_read_buf() else {
+                                            // Boxed: its timer and select!
+                                            // stay out of every request's
+                                            // future.
+                                            if !Box::pin(read_body_past_buffer(
+                                                stream,
+                                                &mut sink,
+                                                cl,
+                                                body_buffer,
+                                                started,
+                                                timers.io.as_mut(),
+                                                body_timeout,
+                                            ))
+                                            .await
+                                            {
+                                                return;
+                                            }
+                                            break;
+                                        };
                                         let start = mem.len();
                                         let end = (start as u64 + (cl - sink.len()))
-                                            .min(mem.capacity() as u64)
+                                            .min(room as u64)
                                             as usize;
                                         let slice = mem.slice_mut(start..end);
                                         // client_body_timeout between reads.
@@ -3614,35 +3650,6 @@ pub(crate) async fn handle<S: ConnIo>(
                                         match res {
                                             Ok(0) | Err(_) => return,
                                             Ok(n) => sink.put_read_buf(returned.into_inner(), n),
-                                        }
-                                        continue;
-                                    }
-                                    // Past the in-memory part: through a read
-                                    // buffer into the temp file.
-                                    if chunk.capacity() == 0 {
-                                        chunk.reserve(64 * 1024);
-                                    }
-                                    let want =
-                                        (cl - sink.len()).min(chunk.capacity() as u64) as usize;
-                                    chunk.clear();
-                                    let slice = std::mem::take(&mut chunk).slice_mut(0..want);
-                                    // client_body_timeout between reads.
-                                    let Some((res, returned)) = with_timeout(
-                                        timers.io.as_mut(),
-                                        body_timeout,
-                                        stream.read(slice),
-                                    )
-                                    .await
-                                    else {
-                                        return;
-                                    };
-                                    chunk = returned.into_inner();
-                                    match res {
-                                        Ok(0) | Err(_) => return,
-                                        Ok(n) => {
-                                            if !sink.extend(&chunk[..n]) {
-                                                return;
-                                            }
                                         }
                                     }
                                 }
@@ -3703,24 +3710,10 @@ pub(crate) async fn handle<S: ConnIo>(
                             bytes::Bytes::from_owner(body_vec)
                         };
                         // Bound to this request iteration; holds the
-                        // temp-file path bytes for `$request_body_file`.
-                        let request_body_file = match spooled {
-                            Some(file) => Some(file),
-                            // A body in memory goes to a file only when
-                            // something reads it there: `$request_body_file`
-                            // in the config, or client_body_in_file_only
-                            // (buffer 0). Otherwise the file would only cost
-                            // a create, write, unlink and close (#246).
-                            None if http.uses_request_body_file || body_buffer == 0 => {
-                                maybe_spill_request_body_to_file(
-                                    &body_vec,
-                                    body_temp,
-                                    persistent_body,
-                                    body_buffer,
-                                )
-                            }
-                            None => None,
-                        };
+                        // temp-file path bytes for `$request_body_file`. A
+                        // body over client_body_buffer_size (any body, with
+                        // client_body_in_file_only) is already there.
+                        let request_body_file = spooled;
                         let body_file = request_body_file.as_ref();
                         let request_total_consumed = req.consumed + body_in_buf;
                         // HTTP/2: the header block, and the body as it was
