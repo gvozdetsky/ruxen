@@ -133,7 +133,7 @@ impl Ticket {
             r.live += 1;
             if !r.ticking {
                 r.ticking = true;
-                monoio::spawn(tick());
+                super::panics::spawn_contained("the client-close ticker", tick_stopped, tick());
             }
             Ticket { slot }
         })
@@ -178,6 +178,11 @@ fn is_due(since: u32, now: u32) -> bool {
 
 /// Counts the ticks while any exchange waits, waking those that became
 /// due; ends when none is left (the next `Ticket` starts it again).
+/// The ticker ended by a panic: the next ticket starts it again.
+fn tick_stopped() {
+    REGISTRY.with(|r| r.borrow_mut().ticking = false);
+}
+
 async fn tick() {
     loop {
         monoio::time::sleep(TICK).await;
