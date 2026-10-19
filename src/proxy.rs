@@ -1858,18 +1858,19 @@ async fn attempt(
             };
             let line = &head_after_status[cursor..cursor + line_len];
             cursor += line_len + t;
-            if let Some(bad) = invalid_header_byte(line) {
-                return AttemptOutcome::Failed(
-                    Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                    FailKind::InvalidHeader,
-                    Box::new(UpstreamError::InvalidHeader {
-                        start: String::from_utf8_lossy(&line[..bad]).into_owned(),
-                        byte: line[bad],
-                    }),
-                );
-            }
-            let Some(colon) = line.iter().position(|&b| b == b':') else {
-                continue;
+            let colon = match header_line_colon(line) {
+                Ok(Some(colon)) => colon,
+                Ok(None) => continue,
+                Err(bad) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::InvalidHeader,
+                        Box::new(UpstreamError::InvalidHeader {
+                            start: String::from_utf8_lossy(&line[..bad]).into_owned(),
+                            byte: line[bad],
+                        }),
+                    );
+                }
             };
             let name = trim_ascii(&line[..colon]);
             // The value is trimmed only for the names below.
@@ -3289,38 +3290,71 @@ fn is_hop_by_hop(name: &[u8]) -> bool {
     false
 }
 
-/// Where a header line of an upstream head (without its line end) breaks
-/// nginx's `ngx_http_parse_header_line` (`src/http/ngx_http_parse.c:819`),
-/// a 502 there: a first byte that is a control byte, a space, DEL or `:`;
-/// one of those but `:` in the name; a NUL in the value; a CR followed by
-/// anything but CRs (and the line end). Forwarded, a bare CR would end the
-/// line for some clients and inject a header (#514). A duplicate status
-/// line (`HTTP/…`, sent by IIS) is ignored, as nginx does.
-fn invalid_header_byte(line: &[u8]) -> Option<usize> {
-    let cr_tail = |at: usize| (!line[at..].iter().all(|&b| b == b'\r')).then_some(at);
-    match line.first() {
-        None => return None,
-        Some(&b) if b <= 0x20 || b == 0x7f || b == b':' => return Some(0),
-        Some(_) => {}
-    }
-    let mut i = 1;
+/// The colon of an upstream header line (without its line end), checked
+/// as nginx's `ngx_http_parse_header_line` (`src/http/ngx_http_parse.c:819`)
+/// checks it (#514). `Ok(None)`: a line without one, or a duplicate status
+/// line (`HTTP/…`, sent by IIS) that nginx ignores. `Err(at)`: the byte
+/// nginx refuses with a 502: a control byte, space, DEL or `:` first; a
+/// control byte, space or DEL in the name; a NUL in the value; a CR
+/// followed by anything but CRs. Forwarded, a bare CR would end the line
+/// for some clients and inject a header. One pass over the name, which
+/// also finds the colon, and one over the value that the compiler
+/// vectorizes; the exact place only when something is wrong.
+#[inline(always)]
+fn header_line_colon(line: &[u8]) -> Result<Option<usize>, usize> {
+    let mut i = 0;
     while i < line.len() {
-        match line[i] {
-            b':' => break,
-            b'\r' => return cr_tail(i),
-            b'/' if i == 4 && line.starts_with(b"HTTP") => return None,
-            b if b <= 0x20 || b == 0x7f => return Some(i),
-            _ => i += 1,
+        let b = line[i];
+        if b == b':' {
+            if i == 0 {
+                return Err(0);
+            }
+            break;
+        }
+        if b <= 0x20 || b == 0x7f {
+            return name_byte(line, i);
+        }
+        if b == b'/' && i == 4 && line.starts_with(b"HTTP") {
+            return Ok(None);
+        }
+        i += 1;
+    }
+    if i == line.len() {
+        return Ok(None);
+    }
+    let value = &line[i + 1..];
+    if value
+        .iter()
+        .fold(false, |bad, &b| bad | (b == 0) | (b == b'\r'))
+    {
+        if let Some(at) = value_byte(line, i + 1) {
+            return Err(at);
         }
     }
-    for (j, &b) in line.iter().enumerate().skip(i) {
-        match b {
-            0 => return Some(j),
-            b'\r' => return cr_tail(j),
-            _ => {}
-        }
+    Ok(Some(i))
+}
+
+/// A control byte, space or DEL in a header name: only a CR followed by
+/// nothing but CRs passes (nginx's `sw_almost_done`), and not as the
+/// line's first byte (`sw_start`).
+#[cold]
+fn name_byte(line: &[u8], at: usize) -> Result<Option<usize>, usize> {
+    if at > 0 && line[at..].iter().all(|&b| b == b'\r') {
+        Ok(None)
+    } else {
+        Err(at)
     }
-    None
+}
+
+/// The NUL, or the CR followed by something else, in a header value.
+#[cold]
+fn value_byte(line: &[u8], from: usize) -> Option<usize> {
+    let at = from + line[from..].iter().position(|&b| b == 0 || b == b'\r')?;
+    if line[at] == b'\r' && line[at..].iter().all(|&b| b == b'\r') {
+        None
+    } else {
+        Some(at)
+    }
 }
 
 /// `name` is `lower` (lowercase), whatever its case. The length goes
@@ -3346,7 +3380,7 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::invalid_header_byte;
+    use super::header_line_colon;
 
     /// nginx's ngx_http_parse_header_line on upstream header lines (#514).
     #[test]
@@ -3372,9 +3406,12 @@ mod tests {
             (b"\x7fA: b", Some(0)),
             (b"No Colon", Some(2)),
             (b"X\rA: b", Some(1)),
+            (b"NoColon\r\r", None),
+            (b"\rX: b", Some(0)),
+            (b"X-A: a\r\x00", Some(6)),
         ] {
             assert_eq!(
-                invalid_header_byte(line),
+                header_line_colon(line).err(),
                 want,
                 "{:?}",
                 line.escape_ascii().to_string()
