@@ -852,6 +852,9 @@ fn process_with_meta_inner(
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
         let internal_request = !refusing || hop > 0;
+        if internal_request {
+            rewrite_state.unparsed_uri = false;
+        }
         let mut loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
                 Some(loc) => loc,

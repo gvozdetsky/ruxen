@@ -237,6 +237,11 @@ pub struct RewriteState {
     /// to decide whether to apply its configured URI prefix substitution
     /// (when false, the rewritten URI is forwarded as-is to upstream).
     pub(crate) valid_location: bool,
+    /// nginx's `r->valid_unparsed_uri`: the URI is still the one the client
+    /// sent, so `proxy_pass` without a URI part forwards the client's own
+    /// request target (#541). Cleared by a `rewrite` of the URI and by an
+    /// internal redirect.
+    pub(crate) unparsed_uri: bool,
     /// `map` results already computed for this request, by map slot: nginx
     /// caches a variable's value in `r->variables` for the rest of the
     /// request, internal redirects included, unless the map is `volatile`.
@@ -263,6 +268,7 @@ impl Default for RewriteState {
             user_vars: Vec::new(),
             numbered_captures: Vec::new(),
             valid_location: true,
+            unparsed_uri: true,
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
             limit_req_status: 0,

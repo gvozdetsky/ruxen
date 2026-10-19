@@ -287,6 +287,21 @@ fn dynamic_client_config(
         .map_err(|e| crate::fs_resolve::note_failed_lookup(e, false))
 }
 
+/// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
+/// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
+/// a request line split in two (#541).
+#[cold]
+fn bad_proxy_uri(uri: &[u8], method: Method) -> Response {
+    crate::fs_resolve::note_failed_lookup(
+        format!(
+            "invalid URI \"{}\" to proxy: a CR, LF or NUL byte",
+            uri.escape_ascii()
+        ),
+        false,
+    );
+    crate::worker::internal_error_response(method)
+}
+
 /// `proxy_cache` for one request (#233, ngx_http_upstream_cache): the
 /// zone, the key, and what the cache holds for it. `None` when the method
 /// isn't cached or `proxy_cache $var` renders empty or `off`; `Err` (a
@@ -869,25 +884,34 @@ pub(crate) fn run_location_handler(
         } else {
             b""
         };
+        // The upstream request target, as ngx_http_proxy_create_request
+        // builds it (#541). The decoded URI never goes into the request
+        // line as it is: a `%0D%0A` in the client's path would split it.
         let rewritten_uri: Vec<u8>;
         let request_uri: &[u8] = if let Some(uri) = variable.as_ref().and_then(|v| v.uri.as_deref())
         {
-            // With variables, a URI part is the whole upstream URI
-            // (ngx_http_proxy_create_request).
+            // With variables, a URI part is the whole upstream URI. nginx
+            // copies it as rendered; one that a decoded variable gave a CR,
+            // LF or NUL is refused instead.
+            if uri.iter().any(|&b| matches!(b, b'\r' | b'\n' | 0)) {
+                return bad_proxy_uri(uri, req.method);
+            }
             uri
         } else if request_path.is_empty() {
-            if args.is_empty() {
-                let mut buf = Vec::with_capacity(url_path.len());
-                buf.extend_from_slice(url_path);
-                rewritten_uri = buf;
+            if rewrite_state.unparsed_uri && current_args.is_none() && req.path.starts_with(b"/") {
+                // Unchanged: the client's own request target (nginx's
+                // `r->unparsed_uri`).
+                req.path
             } else {
                 let mut buf = Vec::with_capacity(url_path.len() + 1 + args.len());
-                buf.extend_from_slice(url_path);
-                buf.push(b'?');
-                buf.extend_from_slice(args);
+                crate::worker::render::escape_uri_into(url_path, &mut buf);
+                if !args.is_empty() {
+                    buf.push(b'?');
+                    buf.extend_from_slice(args);
+                }
                 rewritten_uri = buf;
+                rewritten_uri.as_slice()
             }
-            rewritten_uri.as_slice()
         } else {
             // Strip the location prefix. nginx normalizes both sides
             // before matching, but our match_location did the work
@@ -899,7 +923,7 @@ pub(crate) fn run_location_handler(
             let qlen = if args.is_empty() { 0 } else { args.len() + 1 };
             let mut buf = Vec::with_capacity(request_path.len() + suffix.len() + qlen);
             buf.extend_from_slice(request_path);
-            buf.extend_from_slice(suffix);
+            crate::worker::render::escape_uri_into(suffix, &mut buf);
             if !args.is_empty() {
                 buf.push(b'?');
                 buf.extend_from_slice(args);
