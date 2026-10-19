@@ -324,3 +324,74 @@ fn error_log_inherits_from_http_and_top_level() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Header lines nginx's parser refuses are a 502 with its log line (#514):
+/// a bare CR in a value would end the line for some clients and inject a
+/// header. Other control bytes and a bare LF line end pass, as in nginx.
+#[test]
+fn invalid_upstream_header_bytes_are_502() {
+    let ports = setup_lock();
+    let up = TcpListener::bind("127.0.0.1:0").unwrap();
+    let up_port = up.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in up.incoming().flatten() {
+            let mut s = s;
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let line: &[u8] = match req.split(' ').nth(1).unwrap_or("") {
+                "/cr" => b"X-A: one\rX-Injected: 1",
+                "/nul" => b"X-A: a\x00b",
+                "/namesp" => b"X A: b",
+                "/lead" => b" X-A: b",
+                "/ctl" => b"X-A: a\x01\x7fb",
+                "/lf" => b"X-A: one\nX-B: two",
+                "/crs" => b"X-A: one\r\r",
+                _ => b"X-A: ok",
+            };
+            let mut resp = b"HTTP/1.1 200 OK\r\n".to_vec();
+            resp.extend_from_slice(line);
+            resp.extend_from_slice(b"\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n");
+            let _ = s.write_all(&resp);
+        }
+    });
+    drop(ports);
+    let server = start(
+        "badhead",
+        &format!(
+            "server {{ listen 127.0.0.1:%%PORT%%; server_name example.test; \
+               location / {{ proxy_pass http://127.0.0.1:{up_port}; }} }}"
+        ),
+    );
+    for (path, ok) in [
+        ("/cr", false),
+        ("/nul", false),
+        ("/namesp", false),
+        ("/lead", false),
+        ("/ctl", true),
+        ("/lf", true),
+        ("/crs", true),
+        ("/plain", true),
+    ] {
+        let resp = get(server.port, path);
+        let want = if ok { "HTTP/1.1 200" } else { "HTTP/1.1 502" };
+        assert!(resp.starts_with(want), "{path}: {resp:?}");
+        assert!(!resp.contains("X-Injected"), "{path}: {resp:?}");
+    }
+    let log = read(&server.dir.join("stderr.log"));
+    for (path, shown) in [
+        ("/cr", "X-A: one\\x0d..."),
+        ("/nul", "X-A: a\\x00..."),
+        ("/namesp", "X\\x20..."),
+        ("/lead", "\\x20..."),
+    ] {
+        let line = line_with(&log, &format!("GET {path} "));
+        assert!(
+            line.contains(&format!(
+                "upstream sent invalid header: \"{shown}\" while reading response header from \
+                 upstream"
+            )),
+            "{line}"
+        );
+    }
+}
