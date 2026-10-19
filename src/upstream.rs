@@ -1046,15 +1046,21 @@ fn arm_close_sweep() {
 
 #[cold]
 fn start_close_sweep() {
-    monoio::spawn(async {
-        loop {
-            monoio::time::sleep(CLOSE_SWEEP_EVERY).await;
-            if !sweep_closed() {
-                break;
+    // Contained (#496): a panic ends the sweep, and the next release starts
+    // it again.
+    crate::worker::spawn_contained(
+        "the upstream keep-alive sweep",
+        || SWEEPING.with(|s| s.set(false)),
+        async {
+            loop {
+                monoio::time::sleep(CLOSE_SWEEP_EVERY).await;
+                if !sweep_closed() {
+                    break;
+                }
             }
-        }
-        SWEEPING.with(|s| s.set(false));
-    });
+            SWEEPING.with(|s| s.set(false));
+        },
+    );
 }
 
 /// Drop the pooled connections idle for `CLOSE_CHECK_IDLE` or more that
