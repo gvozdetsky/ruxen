@@ -1061,19 +1061,11 @@ fn classify_header(hash: u32, lc: &[u8]) -> Option<KnownHeader> {
 
 #[inline(always)]
 fn is_uri_char(c: u8) -> bool {
-    matches!(
-        c,
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-        // unreserved
-        | b'-' | b'.' | b'_' | b'~'
-        // gen-delims allowed in request-target
-        | b'/' | b'?' | b'#' | b'[' | b']' | b'@' | b':'
-        // sub-delims
-        | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
-        | b'*' | b'+' | b',' | b';' | b'='
-        // pct-encoded triplet marker (we don't decode in v0.1 but must accept)
-        | b'%'
-    )
+    // nginx's rule (`ngx_http_parse_request_line`, `sw_check_uri` /
+    // `sw_uri`), not RFC 3986's set (#483): only control bytes and DEL are
+    // refused; `{ } | " ^ \ < >`, backtick and raw UTF-8 are served, as
+    // clients send them unencoded. A space ends the target before this.
+    c > 0x20 && c != 0x7f
 }
 
 /// Reg-name character set for a hostname in authority (RFC 3986 §3.2.2):
@@ -2168,10 +2160,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delim_chars_in_path() {
-        // `<`, `>`, `{`, `}`, `|`, `\`, `^`, backtick, `"` are all outside
-        // RFC 3986's URI char set. Also DEL (0x7f).
-        for bad in [b'<', b'>', b'{', b'}', b'|', b'\\', b'^', b'`', b'"', 0x7f] {
+    fn rejects_control_bytes_in_path() {
+        // nginx refuses control bytes and DEL in a request target (#483).
+        for bad in [0x7f, 0x08, 0x00, 0x1f, b'\t'] {
             let mut req = Vec::new();
             req.extend_from_slice(b"GET /a");
             req.push(bad);
@@ -2179,6 +2170,25 @@ mod tests {
             assert!(
                 matches!(parse_fresh(&req), Parse::Invalid),
                 "byte 0x{bad:02x} should be rejected in path"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_the_bytes_nginx_accepts_in_path() {
+        // Outside RFC 3986's set, but nginx serves them (#483).
+        for ok in [
+            b'<', b'>', b'{', b'}', b'|', b'\\', b'^', b'`', b'"', 0x80, 0xc3, 0xff,
+        ] {
+            let mut req = Vec::new();
+            req.extend_from_slice(b"GET /a");
+            req.push(ok);
+            req.extend_from_slice(b"b?q=");
+            req.push(ok);
+            req.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert!(
+                matches!(parse_fresh(&req), Parse::Complete(_)),
+                "byte 0x{ok:02x} should be accepted in path and query"
             );
         }
     }
