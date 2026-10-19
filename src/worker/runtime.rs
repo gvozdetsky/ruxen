@@ -305,8 +305,11 @@ async fn write_buffered_access_line(
     if appended.arm_timer
         && let Some(ms) = buffer.flush_ms
     {
-        monoio::spawn(async move {
+        super::panics::spawn_contained("an access_log flush timer", || {}, async move {
             monoio::time::sleep(Duration::from_millis(ms)).await;
+            if super::panics::test_panic() == super::panics::TestPanic::Task {
+                panic!("RUXEN_TEST_PANIC=task");
+            }
             if let Some((file_index, data)) = super::logbuf::take_for_timer(buffer)
                 && let Some(files) = access_log_files(http.access_logs)
                 && let Some(AccessLogSink::File(file)) = files.get(file_index)

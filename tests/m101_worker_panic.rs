@@ -129,3 +129,53 @@ fn m101_worker_that_panics_stops_the_server() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn m101_panic_in_a_background_task_ends_only_that_task() {
+    // A task outside any connection (#496): here a buffered access_log's
+    // flush timer, which `RUXEN_TEST_PANIC=task` makes panic.
+    let (dir, port, setup) = setup("task");
+    let d = dir.display();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "worker_processes 1;\nerror_log {d}/error.log;\npid {d}/ruxen.pid;\n\
+             events {{}}\nhttp {{ access_log {d}/access.log combined buffer=4k flush=100ms;\n\
+             server {{ listen 127.0.0.1:{port}; location / {{ return 200 ok; }} }} }}\n"
+        ),
+    )
+    .unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .env("RUXEN_TEST_PANIC", "task")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child.0, &dir.join("ruxen.pid"), Duration::from_secs(5));
+    drop(setup);
+    // The first request arms the timer; it panics 100 ms later.
+    assert!(request(port, "GET").ends_with("\r\n\r\nok"));
+    std::thread::sleep(Duration::from_millis(400));
+    // The worker is still there, and keeps answering (each request arms the
+    // timer again, which panics again).
+    for _ in 0..3 {
+        let response = request(port, "GET");
+        assert!(response.ends_with("\r\n\r\nok"), "{response}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(child.0.try_wait().unwrap().is_none(), "ruxen exited");
+    child.stop();
+    let log = std::fs::read_to_string(dir.join("error.log")).unwrap();
+    assert!(log.contains(": RUXEN_TEST_PANIC=task\n"), "{log}");
+    assert!(
+        log.contains("[alert] ")
+            && log.contains("an access_log flush timer stopped after the panic above"),
+        "{log}"
+    );
+    assert!(!log.contains("exited after a panic"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

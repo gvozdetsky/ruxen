@@ -556,7 +556,11 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
         if let Some(hit) = cache.hit.take() {
             let response = cached_response(&plan, hit, report);
             if plan.cache.as_ref().is_some_and(|c| c.background) {
-                monoio::spawn(background_update(plan));
+                crate::worker::spawn_contained(
+                    "a proxy_cache background update",
+                    || {},
+                    background_update(plan),
+                );
             }
             return response;
         }

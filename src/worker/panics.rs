@@ -21,7 +21,8 @@ use super::{PreparedHttp, write_worker_log};
 /// Set to make ruxen panic on purpose, for the tests of what then happens:
 /// `trace` panics while serving a TRACE request (a path nothing else
 /// takes, since TRACE is always refused), `worker` panics each worker once
-/// it is ready to accept. Read once.
+/// it is ready to accept, `task` panics in the flush timer of a buffered
+/// `access_log` (a task outside any connection, #496). Read once.
 pub const TEST_PANIC_ENV: &str = "RUXEN_TEST_PANIC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub(crate) enum TestPanic {
     Off,
     Trace,
     Worker,
+    Task,
 }
 
 pub(crate) fn test_panic() -> TestPanic {
@@ -36,6 +38,7 @@ pub(crate) fn test_panic() -> TestPanic {
     *MODE.get_or_init(|| match std::env::var(TEST_PANIC_ENV).as_deref() {
         Ok("trace") => TestPanic::Trace,
         Ok("worker") => TestPanic::Worker,
+        Ok("task") => TestPanic::Task,
         _ => TestPanic::Off,
     })
 }
@@ -132,6 +135,61 @@ impl<F: Future<Output = ()>> Future for Contained<F> {
             }
         }
     }
+}
+
+/// Run a task the worker keeps outside any connection (#496): the
+/// background update of `proxy_cache_background_update`, the flush timer
+/// of a buffered `access_log`, the ticker of the client-close watch. A
+/// panic in it ends that task only: it is logged, `on_panic` puts back
+/// what the task held (such as the flag that says it runs, so the next
+/// use starts it again), and the worker carries on. monoio doesn't catch
+/// a panic in a spawned task: it would end the worker thread, and with it
+/// the server.
+pub(crate) fn spawn_contained<F: Future<Output = ()> + 'static>(
+    what: &'static str,
+    on_panic: fn(),
+    fut: F,
+) {
+    monoio::spawn(ContainedTask {
+        fut,
+        what,
+        on_panic,
+    });
+}
+
+struct ContainedTask<F> {
+    fut: F,
+    what: &'static str,
+    on_panic: fn(),
+}
+
+impl<F: Future<Output = ()>> Future for ContainedTask<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: as in `Contained::poll`: `fut` is structurally pinned.
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.poll(cx))) {
+            Ok(poll) => poll,
+            Err(_) => {
+                task_panic(this.what);
+                (this.on_panic)();
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn task_panic(what: &str) {
+    let logs = super::worker_http().map_or(&[][..], |h| h.error_logs);
+    write_worker_log(
+        logs,
+        ErrorLogLevel::Alert,
+        &format!("{what} stopped after the panic above"),
+    );
 }
 
 #[cold]
