@@ -1766,6 +1766,83 @@ fn write_usize(out: &mut Vec<u8>, mut n: usize) {
     out.extend_from_slice(&tmp[k..]);
 }
 
+/// The size on a chunk-size line (without its line end), as nginx's
+/// `ngx_http_parse_chunked` reads it, for request and upstream bodies alike:
+/// hex digits first, then nothing, or a space, tab or `;` and an extension
+/// with no CR or LF in it. No sign, no whitespace before the digits, and not
+/// past nginx's `off_t` (it refuses a size over `NGX_MAX_OFF_T_VALUE / 16`
+/// before each further byte). `None` for anything else, a 400 (or a 502
+/// from an upstream).
+pub fn parse_chunk_size(line: &[u8]) -> Option<u64> {
+    const MAX: u64 = i64::MAX as u64 / 16;
+    let digits = line.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let mut size: u64 = 0;
+    for &b in &line[..digits] {
+        if size > MAX {
+            return None;
+        }
+        size = size * 16 + (b as char).to_digit(16).unwrap_or(0) as u64;
+    }
+    if size > MAX {
+        return None;
+    }
+    match line.get(digits) {
+        None => Some(size),
+        Some(b' ' | b'\t' | b';') => {
+            (!line[digits..].iter().any(|&b| b == b'\r' || b == b'\n')).then_some(size)
+        }
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod chunk_size_tests {
+    use super::parse_chunk_size;
+
+    /// nginx's ngx_http_parse_chunked (#508): what it takes and what it
+    /// refuses with 400.
+    #[test]
+    fn chunk_sizes_parse_as_nginx() {
+        for (line, want) in [
+            (&b"5"[..], Some(5)),
+            (b"0", Some(0)),
+            (b"1A", Some(26)),
+            (b"1a", Some(26)),
+            (b"00000005", Some(5)),
+            (b"5 ", Some(5)),
+            (b"5\t", Some(5)),
+            (b"5;name=value", Some(5)),
+            (b"5;a\x00b", Some(5)),
+            (b"5 x", Some(5)),
+            (b"7ffffffffffffff", Some(0x7ff_ffff_ffff_ffff)),
+            (b"", None),
+            (b"+5", None),
+            (b"-5", None),
+            (b" 5", None),
+            (b"\t5", None),
+            (b"\xC2\xA05", None),
+            (b"5\xC2\xA0", None),
+            (b"5;a\rb", None),
+            (b"5;a\nb", None),
+            (b"5x", None),
+            (b"0x5", None),
+            (b";5", None),
+            (b"800000000000000", None),
+            (b"ffffffffffffffffffff", None),
+        ] {
+            assert_eq!(
+                parse_chunk_size(line),
+                want,
+                "{:?}",
+                line.escape_ascii().to_string()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// nginx's special responses (#34): the page, `text/html`; 497 as 400
