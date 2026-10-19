@@ -559,14 +559,12 @@ impl ChunkedDecoder {
                             }
                         }
                         _ => {
-                            let size = line.split(|&b| b == b';').next().unwrap_or(&[]);
-                            let size = std::str::from_utf8(size).map_err(|_| ())?.trim();
-                            match u64::from_str_radix(size, 16) {
-                                Ok(0) => ChunkState::Trailer,
-                                // nginx refuses sizes past its off_t
-                                // (ngx_http_parse_chunked).
-                                Ok(n) if n <= i64::MAX as u64 => ChunkState::Data(n),
-                                _ => return Err(()),
+                            // nginx's rules, past its off_t refused too
+                            // (ngx_http_parse_chunked, #508).
+                            match crate::http::parse_chunk_size(line) {
+                                Some(0) => ChunkState::Trailer,
+                                Some(n) => ChunkState::Data(n),
+                                None => return Err(()),
                             }
                         }
                     };

@@ -1198,13 +1198,7 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
         if end - cursor > MAX_CHUNK_LINE_BYTES {
             return Err(Invalid);
         }
-        let line = &raw[cursor..end];
-        let size_field = line.split(|&b| b == b';').next().unwrap_or(line);
-        let size_text = std::str::from_utf8(size_field).map_err(|_| Invalid)?.trim();
-        if size_text.is_empty() {
-            return Err(Invalid);
-        }
-        let chunk_len = u64::from_str_radix(size_text, 16).map_err(|_| Invalid)?;
+        let chunk_len = http::parse_chunk_size(&raw[cursor..end]).ok_or(Invalid)?;
         cursor = end + 2;
 
         if chunk_len == 0 {

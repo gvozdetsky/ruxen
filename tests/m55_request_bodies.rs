@@ -432,3 +432,41 @@ fn in_memory_bodies_are_proxied_intact_through_short_writes() {
         }
     }
 }
+
+/// Chunk-size lines as nginx's ngx_http_parse_chunked reads them (#508):
+/// hex digits first, then a space, tab or `;` and an extension without a
+/// bare CR. A sign, whitespace before the digits or a bare CR is a 400.
+#[test]
+fn chunk_size_lines_parse_as_nginx() {
+    let upstream = spawn_echo_upstream();
+    let server = start(&proxy_conf(upstream));
+    let head = "POST /default/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for (size, ok) in [
+        (&b"5"[..], true),
+        (b"5 ", true),
+        (b"5;a\x00b", true),
+        (b"5;name=value", true),
+        (b"+5", false),
+        (b" 5", false),
+        (b"\xC2\xA05", false),
+        (b"5;a\rb", false),
+        (b"0x5", false),
+    ] {
+        let mut body = size.to_vec();
+        body.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+        let resp = exchange(server.port, head, &body);
+        let want = if ok { "HTTP/1.1 200" } else { "HTTP/1.1 400" };
+        assert!(
+            resp.starts_with(want),
+            "{:?}: {resp}",
+            size.escape_ascii().to_string()
+        );
+        if ok {
+            assert!(
+                resp.contains("len=5"),
+                "{:?}: {resp}",
+                size.escape_ascii().to_string()
+            );
+        }
+    }
+}
