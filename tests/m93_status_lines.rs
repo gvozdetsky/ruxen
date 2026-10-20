@@ -2,7 +2,8 @@
 //! (ngx_http_header_filter_module.c). Before, codes missing from ruxen's
 //! tables fell back to "OK" (`413 OK`), and a few phrases differed from
 //! nginx's. Codes nginx has no phrase for get an empty one (`418 `).
-//! Taken from the nginx 1.24.0 source (ngx_http_header_filter_module.c).
+//! Taken from the nginx 1.24.0 source (ngx_http_header_filter_module.c),
+//! with 407's phrase, which nginx has since 1.29.7.
 
 mod common;
 
@@ -44,6 +45,7 @@ fn status_lines_match_nginx() {
              access_log off;\n\
              server {{ listen 127.0.0.1:{port}; root {dd}/html;\n\
                location = /413 {{ return 413; }}\n\
+               location = /407 {{ return 407; }}\n\
                location = /504 {{ return 504; }}\n\
                location = /503 {{ return 503; }}\n\
                location = /418 {{ return 418; }}\n\
@@ -73,6 +75,7 @@ fn status_lines_match_nginx() {
 
     let cases = [
         ("/413", "HTTP/1.1 413 Request Entity Too Large"),
+        ("/407", "HTTP/1.1 407 Proxy Authentication Required"),
         ("/504", "HTTP/1.1 504 Gateway Time-out"),
         ("/503", "HTTP/1.1 503 Service Temporarily Unavailable"),
         // nginx has no phrase for these, so it sends the code and a space.
