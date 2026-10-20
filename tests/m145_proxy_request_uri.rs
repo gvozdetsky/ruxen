@@ -70,7 +70,10 @@ fn start(up: u16) -> Server {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
     };
-    let dir = std::env::temp_dir().join(format!("ruxen-m145-{}", std::process::id()));
+    // One directory per server: the tests run in parallel.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ruxen-m145-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -81,6 +84,12 @@ fn start(up: u16) -> Server {
                location /p/ {{ proxy_pass http://127.0.0.1:{up}/x/; }}\n\
                location /r/ {{ rewrite ^/r/(.*)$ /n/$1 break; proxy_pass http://127.0.0.1:{up}; }}\n\
                location /v/ {{ proxy_pass http://127.0.0.1:{up}$uri; }}\n\
+               location /sa/ {{ set $args \"a=1\"; proxy_pass http://127.0.0.1:{up}; }}\n\
+               location /se/ {{ set $args \"\"; proxy_pass http://127.0.0.1:{up}; }}\n\
+               location /si/ {{ if ($arg_b) {{ set $args \"$args&i=1\"; }}\n\
+                 proxy_pass http://127.0.0.1:{up}; }}\n\
+               location /sr/ {{ set $args \"a=1\";\n\
+                 return 200 \"$args|$arg_a|$arg_b|$is_args|$query_string|$request_uri\"; }}\n\
              }} }}\n"
         ),
     )
@@ -162,4 +171,31 @@ fn upstream_request_target_is_never_the_raw_decoded_uri() {
                 .contains("invalid URI \"/v/a\\r\\nX-Injected: 1\" to proxy: a CR, LF or NUL byte"),
         "{log}"
     );
+}
+
+/// #543: `set $args` replaces the request's arguments, as nginx's
+/// ngx_http_variable_set_args replaces `r->args`: `$args`, `$arg_*` and the
+/// upstream request see the new ones.
+#[test]
+fn set_args_replaces_the_arguments() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, upstream_gets) in [
+        ("/sa/x?b=2", "/sa/x?a=1"),
+        ("/sa/x", "/sa/x?a=1"),
+        ("/sa/a%20b?b=2", "/sa/a%20b?a=1"),
+        // Empty: no `?` at all.
+        ("/se/x?b=2", "/se/x"),
+        // In an `if`, from the old value.
+        ("/si/x?b=2", "/si/x?b=2&i=1"),
+        ("/si/x", "/si/x"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
+    let resp = get(server.port, "/sr/x?b=2");
+    assert!(resp.ends_with("\r\n\r\na=1|1||?|a=1|/sr/x?b=2"), "{resp}");
 }
