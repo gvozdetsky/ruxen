@@ -724,6 +724,9 @@ pub struct PreparedProxy {
     pub url: Option<&'static [PreparedValuePart]>,
     /// Inheritance-resolved `proxy_bind`; `None` when unset or `off`.
     pub bind: Option<&'static PreparedBind>,
+    /// `resolver` (#133): turns a host name in `url` into addresses.
+    pub resolver: Option<&'static crate::resolver::Resolver>,
+    pub resolver_timeout_ms: u64,
     /// `proxy_pass https://` (#116); for a URL with variables, always
     /// set, and used when the rendered URL says `https://`.
     pub tls: Option<&'static crate::upstream_tls::PreparedUpstreamTls>,
@@ -833,6 +836,9 @@ pub(crate) struct ProxyEffective {
     pub pass_headers: Option<&'static [String]>,
     /// `proxy_bind`; `None` when unset or `off`.
     pub bind: Option<&'static PreparedBind>,
+    /// `resolver` (#133) and `resolver_timeout`.
+    pub resolver: Option<&'static crate::resolver::Resolver>,
+    pub resolver_timeout_ms: u64,
     /// The location's `error_page` list (for the proxy's own 502/504).
     pub error_pages: &'static [PreparedErrorPage],
     pub recursive_error_pages: bool,
@@ -1004,6 +1010,8 @@ impl ProxyEffective {
             hide_headers: None,
             pass_headers: None,
             bind: None,
+            resolver: None,
+            resolver_timeout_ms: 30_000,
             error_pages: &[],
             recursive_error_pages: false,
             proxy_method: None,

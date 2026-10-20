@@ -1035,10 +1035,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "etag",
     "msie_padding",
     "msie_refresh",
-    // DNS resolver: accepted and unused, since proxy_pass addresses are
-    // resolved at startup (runtime DNS is #133).
-    "resolver",
-    "resolver_timeout",
     // Proxy tuning knobs we don't implement yet but accept as no-ops so
     // upstream nginx-tests configs (which inject these via TEST_GLOBALS_HTTP)
     // load.

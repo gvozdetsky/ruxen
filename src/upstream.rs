@@ -837,6 +837,11 @@ pub struct LeasedPeer {
 }
 
 impl LeasedPeer {
+    /// Peer `peer_idx` of a request's own set (`ProxyPlan::adhoc`), which
+    /// `upstream`, a placeholder, doesn't count.
+    pub fn adhoc(upstream: &'static PreparedUpstream, peer_idx: usize) -> LeasedPeer {
+        LeasedPeer { upstream, peer_idx }
+    }
     #[allow(dead_code)]
     pub fn addr(&self) -> crate::worker::PeerAddr {
         self.upstream.peers[self.peer_idx].addr

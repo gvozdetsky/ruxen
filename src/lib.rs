@@ -23,6 +23,7 @@ mod proxy;
 mod proxy_cache;
 mod proxy_protocol;
 mod proxy_stream;
+mod resolver;
 mod syslog;
 mod tls;
 mod tls_certs;
@@ -240,5 +241,22 @@ pub mod fuzzing {
             None,
         )
         .is_ok()
+    }
+
+    /// A name server's response, as the resolver checks it (#133): the
+    /// header and question, then the answers, and the CNAME's target.
+    /// `Some((addresses, target length))` for one it would take.
+    pub fn dns_response(data: &[u8], tcp: bool) -> Option<(usize, Option<usize>)> {
+        let head = crate::resolver::parse_head(data, tcp).ok()?;
+        assert!(head.at <= data.len());
+        if head.code != 0 || head.answers == 0 {
+            return Some((0, None));
+        }
+        let answers = crate::resolver::parse_answers(data, &head).ok()?;
+        let target = answers
+            .cname
+            .and_then(|at| crate::resolver::copy_name(data, at).ok())
+            .map(|name| name.len());
+        Some((answers.addrs.len(), target))
     }
 }

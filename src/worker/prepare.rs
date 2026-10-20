@@ -372,6 +372,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let canonical_access_logs = alp.finish();
 
     let max_request_body = largest_body_limit(&listens);
+    RESOLVERS.with(|r| r.borrow_mut().clear());
     Ok(crate::arena::leak(Box::new(PreparedHttp {
         worker_connections: runtime.worker_connections.unwrap_or(512),
         error_logs: main_error_logs,
@@ -893,6 +894,9 @@ thread_local! {
     /// prepared (#233).
     static CACHE_ZONES: std::cell::RefCell<Vec<&'static crate::proxy_cache::CacheZone>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The `resolver` directives seen while a config is prepared, by id.
+    static RESOLVERS: std::cell::RefCell<Vec<(usize, &'static crate::resolver::Resolver)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Filled by `build_proxy` while a config is prepared, taken into
     /// `PreparedHttp::implicit_upstreams`.
     static IMPLICIT_UPSTREAMS: std::cell::Cell<
@@ -1298,6 +1302,8 @@ pub(crate) fn build_proxy(
                 cache,
                 url: None,
                 bind: eff.bind,
+                resolver: eff.resolver,
+                resolver_timeout_ms: eff.resolver_timeout_ms,
                 tls: tls
                     .then(|| prepare_upstream_tls(eff.tls, host_header_static))
                     .transpose()?,
@@ -1344,6 +1350,8 @@ pub(crate) fn build_proxy(
                 cache,
                 url: None,
                 bind: eff.bind,
+                resolver: eff.resolver,
+                resolver_timeout_ms: eff.resolver_timeout_ms,
                 tls: tls
                     .then(|| prepare_upstream_tls(eff.tls, host_header_static))
                     .transpose()?,
@@ -1401,6 +1409,8 @@ pub(crate) fn build_proxy(
                 cache,
                 url: Some(prepare_value_parts(url)),
                 bind: eff.bind,
+                resolver: eff.resolver,
+                resolver_timeout_ms: eff.resolver_timeout_ms,
                 tls: Some(prepare_upstream_tls(eff.tls, b"")?),
                 proxy_method: eff.proxy_method,
             }
@@ -1655,6 +1665,8 @@ pub(crate) struct ServerProxyDefaults {
     pub cache: &'static crate::config::ProxyCacheConf,
     pub cache_ignore: crate::proxy_cache::Ignore,
     pub bind: Option<&'static PreparedBind>,
+    pub resolver: Option<&'static crate::resolver::Resolver>,
+    pub resolver_timeout_ms: u64,
     pub tls: super::prepared::UpstreamTlsSettings,
 }
 
@@ -1740,8 +1752,32 @@ impl ServerProxyDefaults {
             tls,
             cache: crate::arena::leak(Box::new(conf.cache)),
             bind: conf.bind.and_then(prepare_bind),
+            resolver: conf.resolver.map(prepare_resolver),
+            resolver_timeout_ms: conf
+                .resolver_timeout_ms
+                .unwrap_or(defaults.resolver_timeout_ms),
         }
     }
+}
+
+/// One `Resolver` per `resolver` directive, however many scopes inherit
+/// it: they share its cache (nginx's `clcf->resolver` pointer).
+fn prepare_resolver(conf: crate::config::ResolverConf) -> &'static crate::resolver::Resolver {
+    RESOLVERS.with(|r| {
+        let mut all = r.borrow_mut();
+        if let Some((_, resolver)) = all.iter().find(|(id, _)| *id == conf.id) {
+            return *resolver;
+        }
+        let resolver: &'static crate::resolver::Resolver =
+            crate::arena::leak(Box::new(crate::resolver::Resolver {
+                servers: conf.servers.into_boxed_slice(),
+                valid: conf.valid_secs.map(std::time::Duration::from_secs),
+                ipv4: conf.ipv4,
+                ipv6: conf.ipv6,
+            }));
+        all.push((conf.id, resolver));
+        resolver
+    })
 }
 
 /// `proxy_bind`, `None` for `off`. A literal address was checked by the
@@ -1847,6 +1883,13 @@ pub(crate) fn resolve_proxy_effective(
             Some(bind) => prepare_bind(bind),
             None => server_defaults.bind,
         },
+        resolver: match location.resolver {
+            Some(resolver) => Some(prepare_resolver(resolver)),
+            None => server_defaults.resolver,
+        },
+        resolver_timeout_ms: location
+            .resolver_timeout_ms
+            .unwrap_or(server_defaults.resolver_timeout_ms),
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
