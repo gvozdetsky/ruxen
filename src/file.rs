@@ -38,7 +38,7 @@ pub struct Conditionals<'a> {
 
 /// Several ranges are read into memory for their multipart response up to
 /// this many bytes in total; beyond it the file goes whole, a 200 (#401).
-const MULTIPART_MAX: u64 = 1 << 20;
+pub(crate) const MULTIPART_MAX: u64 = 1 << 20;
 
 struct FileMeta {
     size: u64,
@@ -411,7 +411,7 @@ fn if_range_matches(value: &[u8], meta: &FileMeta, conditional_last_modified: Op
 /// Uses `pread(2)` so the fd's file position isn't touched — lets the
 /// same fd be handed to the streaming path afterwards without extra seeks,
 /// and skips the second `open` that the old `read_slice` paid.
-fn read_at_into(
+pub(crate) fn read_at_into(
     fd: std::os::unix::io::RawFd,
     start: u64,
     len: u64,

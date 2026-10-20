@@ -2868,12 +2868,11 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
     }
     let skip_body = report.accel.as_ref().is_some_and(|a| a.redirect.is_some());
     let body_has_content = !skip_body && status >= 200 && status != 204 && status != 304;
-    let body = entry.body();
     let mut out = client_head(
         plan,
         head,
         first_line_end,
-        Some(body.len()),
+        Some(entry.body_len() as usize),
         body_has_content,
         skip_body,
         true,
@@ -2881,10 +2880,19 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         &mut report.redirect_header,
         &mut report.range_allow,
     );
-    if body_has_content && !matches!(plan.method, Method::Head) {
-        out.extend_from_slice(body);
+    if !body_has_content || matches!(plan.method, Method::Head) || entry.body_len() == 0 {
+        return Response::Owned(out);
     }
-    Response::Owned(out)
+    // A small body came with the header; a larger one is sent from the
+    // file, as a static file is.
+    if let Some(body) = entry.body_in_memory() {
+        out.extend_from_slice(body);
+        return Response::Owned(out);
+    }
+    Response::File {
+        headers: out,
+        body: entry.into_file_body(),
+    }
 }
 
 /// nginx's `ngx_http_not_modified_header_filter` (1.24) for a 200 the

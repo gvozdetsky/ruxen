@@ -301,3 +301,158 @@ fn m116_conditional_hits() {
     assert_eq!(status_of(&r), "BYPASS", "{r}");
     assert_eq!(body_of(&r), "", "{r}");
 }
+
+/// The response to `raw`, as bytes, with `Connection: close` added.
+fn request_bytes(port: u16, raw: &str) -> (String, Vec<u8>) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(
+        raw.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let body = out.split_off(end);
+    (String::from_utf8(out).unwrap(), body)
+}
+
+/// The peak resident memory of process `pid`, in kB.
+fn vm_hwm(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().strip_suffix(" kB"))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// #515: a hit sends the body from the cache file, as nginx's
+/// ngx_http_cache_send does, instead of reading the file into memory:
+/// over HTTP/1.1 with and without sendfile, TLS and HTTP/2, cut by ranges.
+#[test]
+fn m116_large_hits_come_from_the_file() {
+    let setup_lock = common::ports::setup_lock();
+    let dir = std::env::temp_dir().join(format!("ruxen-m116-large-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("html")).unwrap();
+    let _cleanup = Setup {
+        dir: dir.clone(),
+        port: 0,
+    };
+    let big: Vec<u8> = (0..8u32 << 20).map(|i| (i * 7 % 251) as u8).collect();
+    std::fs::write(dir.join("html/big.bin"), &big).unwrap();
+    // Just past what a hit reads with the header.
+    let mid = &big[..20_000];
+    std::fs::write(dir.join("html/mid.bin"), mid).unwrap();
+    let cert = common::tls::make_self_signed("localhost");
+    let [port, tls, backend] = common::ports::free_ports();
+    let d = dir.display();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "events {{}}\nhttp {{ access_log off;\n\
+             proxy_cache_path {d}/cache levels=1:2 keys_zone=one:1m;\n\
+             server {{ listen 127.0.0.1:{port}; listen 127.0.0.1:{tls} ssl; http2 on;\n\
+               ssl_certificate {}; ssl_certificate_key {};\n\
+               add_header X-Cache $upstream_cache_status;\n\
+               proxy_cache one; proxy_cache_valid 200 1m;\n\
+               location / {{ proxy_pass http://127.0.0.1:{backend}; }}\n\
+               location /sf/ {{ proxy_pass http://127.0.0.1:{backend}/; sendfile on; }}\n\
+             }}\n\
+             server {{ listen 127.0.0.1:{backend}; root {d}/html; }} }}\n",
+            cert.cert_path().display(),
+            cert.key_path().display(),
+        ),
+    )
+    .unwrap();
+    let conf = dir.join("nginx.conf");
+    let get = |path: &str, extra: &str| {
+        request_bytes(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra}\r\n"),
+        )
+    };
+    {
+        let _server = start(&conf);
+        // `/sf/big.bin` has the same key, the upstream URL.
+        for path in ["/big.bin", "/mid.bin"] {
+            let (head, _) = get(path, "");
+            assert!(head.contains("\r\nX-Cache: MISS\r\n"), "{head}");
+        }
+    }
+    // After a restart, so that the misses' buffering doesn't count.
+    let server = start(&conf);
+    drop(setup_lock);
+    let before = vm_hwm(server.0.id());
+
+    for path in ["/big.bin", "/sf/big.bin"] {
+        let (head, body) = get(path, "");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.contains("\r\nX-Cache: HIT\r\n"), "{head}");
+        assert!(
+            head.contains(&format!("\r\nContent-Length: {}\r\n", big.len())),
+            "{head}"
+        );
+        assert!(body == big, "{path}: {} bytes", body.len());
+    }
+    let (head, body) = get("/mid.bin", "");
+    assert!(head.contains("\r\nX-Cache: HIT\r\n"), "{head}");
+    assert!(body == mid, "{} bytes", body.len());
+    let after = vm_hwm(server.0.id());
+    assert!(
+        after < before + 4096,
+        "VmHWM {before} kB before the hits, {after} kB after"
+    );
+
+    // HEAD: the length, no body.
+    let (head, body) = request_bytes(port, "HEAD /big.bin HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        head.contains(&format!("\r\nContent-Length: {}\r\n", big.len())),
+        "{head}"
+    );
+    assert!(body.is_empty());
+
+    // Ranges: one is a part of the file, several a multipart response.
+    for path in ["/big.bin", "/sf/big.bin"] {
+        let (head, body) = get(path, "Range: bytes=1000000-1000099\r\n");
+        assert!(head.starts_with("HTTP/1.1 206 "), "{head}");
+        assert!(
+            head.contains(&format!(
+                "\r\nContent-Range: bytes 1000000-1000099/{}\r\n",
+                big.len()
+            )),
+            "{head}"
+        );
+        assert!(body == big[1_000_000..1_000_100], "{body:?}");
+    }
+    let (head, body) = get("/big.bin", "Range: bytes=0-9,5000000-5000009\r\n");
+    assert!(head.contains("multipart/byteranges; boundary="), "{head}");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains(&format!(
+        "Content-Range: bytes 5000000-5000009/{}",
+        big.len()
+    )));
+    assert!(body.contains(&*String::from_utf8_lossy(&big[5_000_000..5_000_010])));
+    let (head, _) = get("/big.bin", "Range: bytes=9000000-\r\n");
+    assert!(head.starts_with("HTTP/1.1 416 "), "{head}");
+
+    // TLS, HTTP/1.1 and HTTP/2.
+    let out = dir.join("out.bin");
+    for proto in ["--http1.1", "--http2"] {
+        let status = Command::new("curl")
+            .args(["-sSk", "--max-time", "20", proto, "-o"])
+            .arg(&out)
+            .args(["-w", "%{http_version} %{http_code}"])
+            .arg(format!("https://localhost:{tls}/big.bin"))
+            .args(["--resolve", &format!("localhost:{tls}:127.0.0.1")])
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout).into_owned();
+        assert!(status.ends_with(" 200"), "{proto}: {status}");
+        assert!(std::fs::read(&out).unwrap() == big, "{proto}");
+    }
+}
