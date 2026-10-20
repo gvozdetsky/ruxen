@@ -222,8 +222,13 @@ impl TlsAcceptor {
                 }
             }
             let mut pending = &buf[..];
+            // rustls documents `Ok(0)` as EOF (or a close_notify already
+            // received); without this check the loop, which never awaits,
+            // would spin past the handshake timeout and stall the worker.
             while !pending.is_empty() {
-                acceptor.read_tls(&mut pending)?;
+                if acceptor.read_tls(&mut pending)? == 0 {
+                    return Err(handshake_eof());
+                }
             }
             match acceptor.accept() {
                 Ok(Some(accepted)) => break accepted,
