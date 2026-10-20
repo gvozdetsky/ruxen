@@ -6,7 +6,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -37,11 +37,10 @@ fn content_types_like_nginx() {
     ] {
         std::fs::write(dir.join("www").join(f), "x").unwrap();
     }
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Both ports at once, held from the pick until ruxen listens: two
+    // picks one after the other may return the same port (#565).
+    let setup = common::ports::setup_lock();
+    let [port, port2] = common::ports::free_ports();
     let www = dir.join("www").display().to_string();
     std::fs::write(
         dir.join("nginx.conf"),
@@ -61,11 +60,6 @@ fn content_types_like_nginx() {
     )
     .unwrap();
     // A second configuration with no `types` and no `default_type` at all.
-    let port2 = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     std::fs::create_dir_all(dir.join("bare")).unwrap();
     std::fs::write(
         dir.join("bare/nginx.conf"),
@@ -76,7 +70,6 @@ fn content_types_like_nginx() {
         ),
     )
     .unwrap();
-    let setup = common::ports::setup_lock();
     let mut servers = Vec::new();
     for (conf, pid) in [
         (dir.join("nginx.conf"), dir.join("ruxen.pid")),
