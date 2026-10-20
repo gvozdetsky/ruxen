@@ -848,7 +848,7 @@ pub(crate) fn run_location_handler(
         // `proxy_pass` with variables: where this request goes (#100).
         let variable = match proxy.url {
             None => None,
-            Some(url) => match resolve_variable_url(http, proxy.upstream, url, &render_ctx_base) {
+            Some(url) => match resolve_variable_url(http, proxy, url, &render_ctx_base) {
                 Ok(target) => Some(target),
                 Err(status) => {
                     return variable_url_failed(
@@ -1208,7 +1208,7 @@ pub(crate) fn run_location_handler(
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             tls,
-            adhoc_peer: variable.as_ref().and_then(|v| v.adhoc_peer).map(Box::new),
+            adhoc: variable.and_then(|v| v.adhoc).map(Box::new),
             initial_peer,
             request: bytes::Bytes::from_owner(crate::worker::PooledBody(request)),
             body: separate_body,
@@ -1628,9 +1628,10 @@ fn prebuilt_with_literal_add_headers(
 /// Where a `proxy_pass` with variables sends one request (#100).
 struct VariableTarget {
     upstream: &'static PreparedUpstream,
-    /// The URL's own address (an IP literal or `unix:` path); `None` when
-    /// it named an `upstream` block.
-    adhoc_peer: Option<crate::worker::PeerAddr>,
+    /// The URL's own address (an IP literal or `unix:` path), or its host
+    /// name for the resolver (#133); `None` when it named an `upstream`
+    /// block.
+    adhoc: Option<crate::proxy::Adhoc>,
     /// `$proxy_host` and the default `Host`.
     host_header: Vec<u8>,
     /// The URL's URI part, sent as the whole request URI; `None`: the
@@ -1643,18 +1644,25 @@ struct VariableTarget {
 /// Render and parse a `proxy_pass` URL with variables, as nginx's
 /// ngx_http_proxy_eval and ngx_http_upstream_init_request do: an `upstream`
 /// block of that name (when the URL has no port), else an IP literal or a
-/// `unix:` path as the one peer, else a name only a resolver could turn
-/// into an address, which ruxen doesn't have: 502 and nginx's `no resolver
-/// defined to resolve` line. A malformed URL is a 500. The error lines are
-/// logged with the request's context once processing returns.
+/// `unix:` path as the one peer, else a name for the location's `resolver`
+/// (#133), which `run_proxy` resolves; without one, a 502 and nginx's `no
+/// resolver defined to resolve` line. A malformed URL is a 500. The error
+/// lines are logged with the request's context once processing returns.
 #[cold]
 #[inline(never)]
 fn resolve_variable_url(
     http: &'static PreparedHttp,
-    placeholder: &'static PreparedUpstream,
+    proxy: &PreparedProxy,
     url: &[PreparedValuePart],
     ctx: &RenderCtx<'_>,
 ) -> Result<VariableTarget, u16> {
+    let placeholder = proxy.upstream;
+    let one = |peer| {
+        Some(crate::proxy::Adhoc {
+            peers: vec![peer],
+            resolve: None,
+        })
+    };
     use crate::config::ErrorLogLevel;
     use crate::worker::PeerAddr;
     let mut rendered = Vec::with_capacity(64);
@@ -1701,7 +1709,7 @@ fn resolve_variable_url(
         };
         return Ok(VariableTarget {
             upstream: placeholder,
-            adhoc_peer: Some(PeerAddr::Unix(path)),
+            adhoc: one(PeerAddr::Unix(path)),
             host_header: b"localhost".to_vec(),
             uri: (!uri.is_empty()).then(|| uri.to_vec()),
             tls,
@@ -1763,7 +1771,7 @@ fn resolve_variable_url(
     if let Some(ip) = literal {
         return Ok(VariableTarget {
             upstream: placeholder,
-            adhoc_peer: Some(PeerAddr::Inet(std::net::SocketAddr::new(
+            adhoc: one(PeerAddr::Inet(std::net::SocketAddr::new(
                 ip,
                 port.unwrap_or(default_port),
             ))),
@@ -1793,19 +1801,36 @@ fn resolve_variable_url(
     if let Some(upstream) = port.is_none().then(block).flatten().or_else(implicit) {
         return Ok(VariableTarget {
             upstream,
-            adhoc_peer: None,
+            adhoc: None,
             host_header,
             uri,
             tls,
         });
     }
-    fail(
-        502,
-        format!(
-            "no resolver defined to resolve {}",
-            String::from_utf8_lossy(host)
-        ),
-    )
+    let Some(resolver) = proxy.resolver else {
+        return fail(
+            502,
+            format!(
+                "no resolver defined to resolve {}",
+                String::from_utf8_lossy(host)
+            ),
+        );
+    };
+    Ok(VariableTarget {
+        upstream: placeholder,
+        adhoc: Some(crate::proxy::Adhoc {
+            peers: Vec::new(),
+            resolve: Some(crate::proxy::ResolveName {
+                resolver,
+                host: host.into(),
+                port: port.unwrap_or(default_port),
+                timeout: std::time::Duration::from_millis(proxy.resolver_timeout_ms),
+            }),
+        }),
+        host_header,
+        uri,
+        tls,
+    })
 }
 
 thread_local! {

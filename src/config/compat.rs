@@ -253,11 +253,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         Some("off"),
         "proxied responses are not stored",
     ),
-    (
-        "resolver",
-        None,
-        "upstream names are resolved once at startup, not at run time (#133)",
-    ),
     // The ssl_* lines the server parser takes and doesn't apply.
     (
         "ssl_early_data",

@@ -382,6 +382,66 @@ pub(crate) fn resolve_host_port(s: &str) -> Result<Vec<SocketAddr>, String> {
     Ok(addrs)
 }
 
+/// `resolver address … [valid=time] [ipv4=on|off] [ipv6=on|off]`, as
+/// ngx_resolver_create reads it: an address is `host[:port]` (port 53),
+/// and a host name stands for all its addresses, looked up now.
+pub(crate) fn parse_resolver_args(args: &[String]) -> Result<ResolverConf, Error> {
+    static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if args.is_empty() {
+        return Err(Error::MissingArg("resolver"));
+    }
+    let invalid = |arg: &str| Error::BadValue {
+        what: "resolver parameter",
+        got: arg.to_string(),
+    };
+    let mut conf = ResolverConf {
+        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        servers: Vec::new(),
+        valid_secs: None,
+        ipv4: true,
+        ipv6: true,
+    };
+    for arg in args {
+        if let Some(time) = arg.strip_prefix("valid=") {
+            let secs = super::parse_server::parse_duration_secs(time, "resolver valid")
+                .map_err(|_| invalid(arg))?;
+            conf.valid_secs = (secs > 0).then_some(secs);
+        } else if let Some(on) = arg.strip_prefix("ipv4=") {
+            conf.ipv4 = match on {
+                "on" => true,
+                "off" => false,
+                _ => return Err(invalid(arg)),
+            };
+        } else if let Some(on) = arg.strip_prefix("ipv6=") {
+            conf.ipv6 = match on {
+                "on" => true,
+                "off" => false,
+                _ => return Err(invalid(arg)),
+            };
+        } else {
+            let addrs =
+                resolve_host_port(&with_default_port(arg, 53)).map_err(|e| Error::BadValue {
+                    what: "resolver",
+                    got: format!("{e} in resolver \"{arg}\""),
+                })?;
+            conf.servers.extend(addrs);
+        }
+    }
+    if !conf.ipv4 && !conf.ipv6 {
+        return Err(Error::BadValue {
+            what: "resolver",
+            got: "\"ipv4\" and \"ipv6\" cannot both be \"off\"".into(),
+        });
+    }
+    if conf.servers.is_empty() {
+        return Err(Error::BadValue {
+            what: "resolver",
+            got: "no name servers defined".into(),
+        });
+    }
+    Ok(conf)
+}
+
 /// Parse a `[N]s` / bare integer seconds value. Allows the `s` suffix only
 /// (we don't need ms/m/h here — nginx's full time-value grammar is overkill
 /// for `fail_timeout`).
@@ -700,6 +760,8 @@ impl ProxyConf {
         "proxy_ssl_certificate",
         "proxy_ssl_certificate_key",
         "proxy_ssl_password_file",
+        "resolver",
+        "resolver_timeout",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -749,6 +811,19 @@ impl ProxyConf {
                 }
                 self.pass_request_body =
                     Some(parse_on_off_args(&args[1..], "proxy_pass_request_body")?);
+            }
+            "resolver" => {
+                if self.resolver.is_some() {
+                    return Err(Error::Duplicate("resolver"));
+                }
+                self.resolver = Some(parse_resolver_args(&args[1..])?);
+            }
+            "resolver_timeout" => {
+                if self.resolver_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("resolver_timeout"));
+                }
+                self.resolver_timeout_ms =
+                    Some(parse_proxy_timeout_args(&args[1..], "resolver_timeout")?);
             }
             "proxy_connect_timeout" => {
                 if self.connect_timeout_ms.is_some() {
@@ -1567,5 +1642,41 @@ mod tests {
         assert!(parse(&["proxy_bind", "$arg_b"]).is_ok());
         assert!(parse(&["proxy_bind", "bogus"]).is_err());
         assert!(parse(&["proxy_bind", "127.0.0.2", "foo"]).is_err());
+    }
+
+    #[test]
+    fn resolver_args() {
+        let parse = |line: &str| {
+            let mut conf = ProxyConf::default();
+            let args: Vec<String> = line.split(' ').map(String::from).collect();
+            conf.parse(&args, None).map(|()| conf.resolver.unwrap())
+        };
+        let r = parse("resolver 127.0.0.1 [::1]:5353 valid=5s ipv6=off").unwrap();
+        assert_eq!(
+            r.servers,
+            vec![
+                "127.0.0.1:53".parse::<SocketAddr>().unwrap(),
+                "[::1]:5353".parse().unwrap()
+            ]
+        );
+        assert_eq!(r.valid_secs, Some(5));
+        assert!(r.ipv4 && !r.ipv6);
+        // Each directive is its own resolver.
+        assert_ne!(parse("resolver 127.0.0.1").unwrap().id, r.id);
+        assert_eq!(
+            parse("resolver 127.0.0.1 valid=0").unwrap().valid_secs,
+            None
+        );
+        assert!(parse("resolver valid=5s").is_err());
+        assert!(parse("resolver 127.0.0.1 ipv4=off ipv6=off").is_err());
+        assert!(parse("resolver 127.0.0.1 ipv6=no").is_err());
+        assert!(parse("resolver 127.0.0.1 valid=x").is_err());
+        assert!(parse("resolver 127.0.0.1:x").is_err());
+
+        let mut conf = ProxyConf::default();
+        let args = |line: &str| line.split(' ').map(String::from).collect::<Vec<_>>();
+        conf.parse(&args("resolver_timeout 1500ms"), None).unwrap();
+        assert_eq!(conf.resolver_timeout_ms, Some(1500));
+        assert!(conf.parse(&args("resolver_timeout 2s"), None).is_err());
     }
 }

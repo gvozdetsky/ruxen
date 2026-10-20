@@ -159,6 +159,10 @@ pub struct ProxyConf {
     pub ssl_certificate_key: Option<Option<CertPath>>,
     /// `proxy_ssl_password_file` (#139).
     pub ssl_password_file: Option<std::path::PathBuf>,
+    /// `resolver` and `resolver_timeout` (#133), core directives in nginx;
+    /// only `proxy_pass` with variables uses them here.
+    pub resolver: Option<ResolverConf>,
+    pub resolver_timeout_ms: Option<u64>,
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -331,8 +335,24 @@ impl ProxyConf {
             ssl_password_file: self
                 .ssl_password_file
                 .or_else(|| parent.ssl_password_file.clone()),
+            resolver: self.resolver.or_else(|| parent.resolver.clone()),
+            resolver_timeout_ms: self.resolver_timeout_ms.or(parent.resolver_timeout_ms),
         }
     }
+}
+
+/// `resolver address … [valid=time] [ipv4=on|off] [ipv6=on|off]` (#133).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolverConf {
+    /// Which directive: the levels that inherit one share its cache, as
+    /// they share nginx's `ngx_resolver_t`.
+    pub id: usize,
+    /// The name servers; a name stands for all its addresses.
+    pub servers: Vec<SocketAddr>,
+    /// `valid=`, seconds; `None` (or `0`) keeps the answers' TTL.
+    pub valid_secs: Option<u64>,
+    pub ipv4: bool,
+    pub ipv6: bool,
 }
 
 /// `user name [group];`. Without a group, nginx uses a group named like

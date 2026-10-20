@@ -81,11 +81,11 @@ pub(crate) fn return_proxy_buf(mut v: Vec<u8>) {
 pub struct ProxyPlan {
     /// Pointer to the prepared upstream (owns peers + keepalive config).
     pub upstream: &'static PreparedUpstream,
-    /// `proxy_pass` with variables naming an address (#100): the one peer
-    /// to use instead of `upstream`'s, which is then a placeholder.
-    /// Boxed: only a `proxy_pass` with variables has one, and the plan
-    /// moves with every proxied response.
-    pub adhoc_peer: Option<Box<PeerAddr>>,
+    /// `proxy_pass` with variables naming an address (#100) or a host
+    /// name to resolve (#133): the peers to use instead of `upstream`'s,
+    /// which is then a placeholder. Boxed: only a `proxy_pass` with
+    /// variables has one, and the plan moves with every proxied response.
+    pub adhoc: Option<Box<Adhoc>>,
     /// `proxy_pass https://` (#116): TLS over the connection to the peer.
     pub tls: Option<Box<crate::upstream_tls::TlsPlan>>,
     /// First peer to try, leased at plan-build time. Subsequent
@@ -185,6 +185,23 @@ pub struct ProxyPlan {
     /// `proxy_ignore_client_abort`: when off, a client that closes while
     /// the upstream is awaited ends the exchange with 499 (#136).
     pub ignore_client_abort: bool,
+}
+
+/// The peers of one request's `proxy_pass` with variables: nginx's
+/// `u->resolved`, a round-robin set of its own
+/// (ngx_http_upstream_create_round_robin_peer).
+pub struct Adhoc {
+    /// Empty until `resolve` is resolved.
+    pub peers: Vec<PeerAddr>,
+    pub resolve: Option<ResolveName>,
+}
+
+/// A host name `run_proxy` resolves before connecting (#133).
+pub struct ResolveName {
+    pub resolver: &'static crate::resolver::Resolver,
+    pub host: Box<[u8]>,
+    pub port: u16,
+    pub timeout: Duration,
 }
 
 /// An upstream that answered 101 to a client asking to upgrade: the
@@ -535,9 +552,60 @@ fn upstream_uri(plan: &ProxyPlan) -> &[u8] {
 impl ProxyPlan {
     /// The address of `upstream.peers[peer_idx]`, or the request's own peer.
     fn peer_addr(&self, peer_idx: usize) -> PeerAddr {
-        match &self.adhoc_peer {
-            Some(addr) => **addr,
+        match &self.adhoc {
+            Some(adhoc) => adhoc.peers[peer_idx],
             None => self.upstream.peers[peer_idx].addr,
+        }
+    }
+
+    /// The next peer to try after those in `tried`. A resolved name's
+    /// addresses go in their order, as nginx's round robin over a set of
+    /// equal weights picks them.
+    fn next_peer(&mut self, tried: &upstream::Tried) -> Option<LeasedPeer> {
+        match self.adhoc.as_deref() {
+            Some(adhoc) if adhoc.peers.len() > 1 => (0..adhoc.peers.len())
+                .find(|&i| !tried.contains(i))
+                .map(|i| LeasedPeer::adhoc(self.upstream, i)),
+            _ => upstream::pick_peer(self.upstream, tried, self.hash.as_deref_mut()),
+        }
+    }
+}
+
+/// Resolve the plan's host name into its peers (#133), as
+/// ngx_http_upstream_resolve_handler does: a name that doesn't resolve is
+/// a 502, logged as `<name> could not be resolved (3: Host not found)`.
+#[cold]
+#[inline(never)]
+async fn resolve_peers(
+    plan: &mut ProxyPlan,
+    failures: &mut Vec<AttemptFailure>,
+) -> Result<(), Response> {
+    let Some(adhoc) = plan.adhoc.as_deref_mut() else {
+        return Ok(());
+    };
+    let Some(name) = adhoc.resolve.take() else {
+        return Ok(());
+    };
+    match crate::resolver::resolve(name.resolver, &name.host, name.timeout).await {
+        Ok(addrs) if !addrs.is_empty() => {
+            adhoc.peers = addrs
+                .into_iter()
+                .map(|ip| PeerAddr::Inet(std::net::SocketAddr::new(ip, name.port)))
+                .collect();
+            Ok(())
+        }
+        result => {
+            let failure = result
+                .err()
+                .unwrap_or(crate::resolver::Failure(crate::resolver::NXDOMAIN));
+            failures.push(AttemptFailure {
+                error: UpstreamError::ResolveFailed {
+                    name: crate::resolver::normalize(&name.host),
+                    failure,
+                },
+                upstream: String::new(),
+            });
+            Err(Response::Prebuilt(plan.bad_gateway.pick(plan.method)))
         }
     }
 }
@@ -574,9 +642,17 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
     let states = &mut report.states;
     let attempt_started = &mut report.attempt_started;
     let upstream = plan.upstream;
+    if plan.adhoc.as_ref().is_some_and(|a| a.resolve.is_some())
+        && let Err(response) = Box::pin(resolve_peers(&mut plan, failures)).await
+    {
+        return response;
+    }
     // nginx's `peer.tries`: the servers not marked `down`
-    // (ngx_http_upstream_tries).
-    let live = upstream.peers.iter().filter(|p| !p.down).count();
+    // (ngx_http_upstream_tries), or a resolved name's addresses.
+    let live = match plan.adhoc.as_deref() {
+        Some(adhoc) => adhoc.peers.len(),
+        None => upstream.peers.iter().filter(|p| !p.down).count(),
+    };
     let max_tries = compute_max_tries(plan.next_upstream_tries, live);
     let overall_deadline = if plan.next_upstream_timeout.is_zero() {
         None
@@ -724,9 +800,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                     } else {
                         upstream::report_failure(upstream, current.peer_idx);
                     }
-                    let Some(next) =
-                        upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
-                    else {
+                    let Some(next) = plan.next_peer(&tried) else {
                         // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
                         // covers (ngx_http_proxy_merge_loc_conf).
                         let resp = no_live_upstreams(&plan, states, failures);
@@ -850,8 +924,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                     return last_failure
                         .unwrap_or_else(|| Response::Prebuilt(plan.bad_gateway.pick(plan.method)));
                 }
-                let Some(next) = upstream::pick_peer(upstream, &tried, plan.hash.as_deref_mut())
-                else {
+                let Some(next) = plan.next_peer(&tried) else {
                     // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
                     // covers (ngx_http_proxy_merge_loc_conf).
                     let resp = no_live_upstreams(&plan, states, failures);
@@ -1085,6 +1158,11 @@ pub enum UpstreamError {
     ExtraAfterLength,
     ExtraAfterFinalChunk,
     NoLiveUpstreams,
+    /// The host of a `proxy_pass` with variables didn't resolve (#133).
+    ResolveFailed {
+        name: Box<[u8]>,
+        failure: crate::resolver::Failure,
+    },
     DuplicateHeader {
         line: String,
         previous: String,
@@ -1244,6 +1322,11 @@ impl std::fmt::Display for UpstreamError {
                 Stage::ReadingBody.as_str()
             ),
             NoLiveUpstreams => write!(f, "no live upstreams while {}", Stage::Connecting.as_str()),
+            ResolveFailed { name, failure } => write!(
+                f,
+                "{} could not be resolved ({failure})",
+                String::from_utf8_lossy(name)
+            ),
             DuplicateHeader { line, previous } => write!(
                 f,
                 "upstream sent duplicate header line: \"{line}\", previous value: \"{previous}\" \

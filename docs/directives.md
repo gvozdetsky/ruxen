@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 175 implemented, 26 accepted with a difference, 73 accepted with no effect, 1 refused, 275 unknown.
+Of 550 directives: 177 implemented, 25 accepted with a difference, 72 accepted with no effect, 1 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -167,8 +167,8 @@ Not supported: `ssl_engine`.
 | `open_file_cache_min_uses` | accepted, no effect | any |  |
 | `open_file_cache_errors` | accepted, no effect | any |  |
 | `open_file_cache_events` | no |  |  |
-| `resolver` | accepted, differs | any | upstream names are resolved once at startup, not at run time (#133) |
-| `resolver_timeout` | accepted, no effect | any |  |
+| `resolver` | yes | http, server, location |  |
+| `resolver_timeout` | yes | http, server, location |  |
 | `gzip_vary` | yes | any |  |
 | `gzip_http_version` | yes | any |  |
 | `gzip_proxied` | yes | any |  |

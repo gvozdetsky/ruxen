@@ -228,7 +228,7 @@ Supported functionality includes:
 
 ruxen supports a growing subset of nginx's proxy functionality, including:
 
-- `proxy_pass`, with variables (literal addresses, `upstream` names and `unix:` paths; no `resolver` yet), to TCP and `unix:` upstreams
+- `proxy_pass`, with variables (literal addresses, `upstream` names, `unix:` paths, and host names through `resolver` / `resolver_timeout`), to TCP and `unix:` upstreams
 - HTTPS upstreams (`proxy_pass https://`): `proxy_ssl_server_name`, `proxy_ssl_name`, `proxy_ssl_session_reuse`, `proxy_ssl_protocols`, with nginx's defaults (no SNI, sessions reused, the certificate not verified); certificate verification with `proxy_ssl_verify`, `proxy_ssl_trusted_certificate`, `proxy_ssl_verify_depth` and `proxy_ssl_crl`, by OpenSSL's rules (AWS-LC's X.509 code: commonName fallback, depth, CRLs) and nginx's error-log lines; client certificates to upstreams with `proxy_ssl_certificate` / `proxy_ssl_certificate_key` (`""` cancels an inherited one, `proxy_ssl_password_file` for an encrypted key; paths with variables are rendered per request, and an empty certificate means none)
 - named `upstream` blocks
 - path rewriting
@@ -357,6 +357,7 @@ The HTTPS integration tests use the system `curl` binary and generate temporary 
 - `uri`: path normalization;
 - `proxy_protocol`: PROXY protocol v1/v2;
 - `upstream_head` and `upstream_chunked`: an upstream's response head and a relayed chunked body, as a broken or hostile upstream would send them;
+- `dns_response`: a name server's response to the resolver;
 - `config`: the configuration parser.
 
 They need a nightly toolchain:
@@ -416,7 +417,6 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 
 - HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
-- the `resolver` (a `proxy_pass` with variables reaches literal addresses and `upstream` names only)
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
 - a proxied response is still read whole before it is sent in a few cases: a cache store, `add_trailer`, failover and interception (#463)
 - OCSP checks of client certificates (#142), 0-RTT / TLS early data
