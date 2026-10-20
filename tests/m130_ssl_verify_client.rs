@@ -210,6 +210,54 @@ fn one(port: u16, sni: &str, cert: Option<(&Path, &Path)>) -> (u16, String) {
         .unwrap_or((0, String::new()))
 }
 
+/// Sends no certificate; notes the CA names of the CertificateRequest.
+#[derive(Debug, Default)]
+struct CaNames(std::sync::Mutex<Option<Vec<Vec<u8>>>>);
+
+impl rustls::client::ResolvesClientCert for CaNames {
+    fn resolve(
+        &self,
+        hints: &[&[u8]],
+        _: &[SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        *self.0.lock().unwrap() = Some(hints.iter().map(|h| h.to_vec()).collect());
+        None
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// The CA names the server sends with its CertificateRequest to a client
+/// naming `sni`; `None` when it asks for no certificate.
+fn ca_names(port: u16, sni: &str) -> Option<Vec<Vec<u8>>> {
+    let names = Arc::new(CaNames::default());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServer(provider)))
+        .with_client_cert_resolver(names.clone());
+    let conn = rustls::ClientConnection::new(
+        Arc::new(config),
+        ServerName::try_from(sni.to_string()).unwrap(),
+    )
+    .unwrap();
+    let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    write!(
+        tls,
+        "GET / HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    tls.flush().unwrap();
+    read_response(&mut tls).expect("a response");
+    names.0.lock().unwrap().take()
+}
+
 #[test]
 fn ssl_verify_client_like_nginx() {
     let server = common::tls::make_self_signed("localhost");
@@ -239,6 +287,12 @@ fn ssl_verify_client_like_nginx() {
              server {{ {tls} server_name vars;\n\
                ssl_verify_client optional; ssl_client_certificate {ca};\n\
                location / {{ return 200 \"$ssl_client_s_dn|$ssl_client_i_dn_legacy|$ssl_client_v_remain\"; }} }}\n\
+             server {{ {tls} server_name trusted;\n\
+               ssl_verify_client on; ssl_trusted_certificate {ca};\n\
+               location / {{ return 200 \"$ssl_client_verify\"; }} }}\n\
+             server {{ {tls} server_name trusted-optional;\n\
+               ssl_verify_client optional; ssl_trusted_certificate {ca};\n\
+               location / {{ return 200 \"$ssl_client_verify\"; }} }}\n\
              server {{ {tls} server_name page;\n\
                ssl_verify_client on; ssl_client_certificate {ca};\n\
                error_page 495 496 /denied;\n\
@@ -275,6 +329,26 @@ fn ssl_verify_client_like_nginx() {
     assert_eq!(one(port, "optional", None), (200, "NONE".into()));
     assert_eq!(one(port, "optional", good), (200, "SUCCESS".into()));
     assert_eq!(one(port, "optional", bad).0, 400);
+
+    // Only `ssl_trusted_certificate` (nginx ≥ 1.27.2, #587): verified
+    // against it, with no CA names in the CertificateRequest.
+    assert_eq!(one(port, "trusted", good), (200, "SUCCESS".into()));
+    assert_eq!(one(port, "trusted", None).0, 400);
+    assert_eq!(one(port, "trusted", bad).0, 400);
+    assert_eq!(one(port, "trusted-optional", None), (200, "NONE".into()));
+    assert_eq!(one(port, "trusted-optional", good), (200, "SUCCESS".into()));
+    assert_eq!(one(port, "trusted-optional", bad).0, 400);
+    assert_eq!(ca_names(port, "trusted"), Some(vec![]));
+    // `ssl_client_certificate`'s subject is the list.
+    let names = ca_names(port, "on").expect("a CertificateRequest");
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(
+        names[0]
+            .windows(b"ruxen-test-ca-ca".len())
+            .any(|w| w == b"ruxen-test-ca-ca"),
+        "{names:?}"
+    );
+    assert_eq!(ca_names(port, "off"), None);
 
     // `optional_no_ca`: a certificate nobody vouches for passes, and says
     // so in OpenSSL's words.
@@ -330,8 +404,9 @@ fn ssl_verify_client_like_nginx() {
 }
 
 /// nginx's checks at load: `on` and `optional` need
-/// `ssl_client_certificate`; `optional_no_ca` doesn't; a server without a
-/// certificate of its own isn't checked.
+/// `ssl_client_certificate` or, since 1.27.2, `ssl_trusted_certificate`;
+/// `optional_no_ca` needs neither; a server without a certificate of its
+/// own isn't checked.
 #[test]
 fn ssl_verify_client_needs_a_client_certificate() {
     let server = common::tls::make_self_signed("localhost");
@@ -361,6 +436,13 @@ fn ssl_verify_client_needs_a_client_certificate() {
         server.key_path().display()
     );
     let on = check(&format!("server {{ {tls} ssl_verify_client on; }}"));
+    let client = common::tls::make_ca_and_leaf("client.test");
+    let ca = client.ca_path().unwrap().display().to_string();
+    let trusted_only = ["on", "optional"].map(|mode| {
+        check(&format!(
+            "server {{ {tls} ssl_verify_client {mode}; ssl_trusted_certificate {ca}; }}"
+        ))
+    });
     let no_ca = check(&format!(
         "server {{ {tls} ssl_verify_client optional_no_ca; }}"
     ));
@@ -373,12 +455,15 @@ fn ssl_verify_client_needs_a_client_certificate() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !on.0
-            && on
-                .1
-                .contains("no ssl_client_certificate for ssl_verify_client"),
+            && on.1.contains(
+                "no ssl_client_certificate or ssl_trusted_certificate for ssl_verify_client"
+            ),
         "{}",
         on.1
     );
+    for (ok, stderr) in &trusted_only {
+        assert!(ok, "{stderr}");
+    }
     assert!(no_ca.0, "{}", no_ca.1);
     assert!(no_cert.0, "{}", no_cert.1);
     assert!(
