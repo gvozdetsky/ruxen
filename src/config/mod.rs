@@ -1807,6 +1807,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_modifiers_written_against_the_pattern() {
+        // nginx takes `location ~\.php$` as `location ~ \.php$` (#577).
+        let src = r#"
+            http {
+                server {
+                    listen 80;
+                    location =/x       { return 200 "x"; }
+                    location ^~/assets/ { return 200 "a"; }
+                    location ~\.gif$   { return 200 "g"; }
+                    location ~*\.png$  { return 200 "p"; }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let locs = &cfg.servers[0].locations;
+        assert_eq!(locs[0].mode, MatchMode::Exact);
+        assert_eq!(locs[0].pattern, "/x");
+        assert_eq!(locs[1].mode, MatchMode::Prefix);
+        assert!(locs[1].noregex);
+        assert_eq!(locs[1].pattern, "/assets/");
+        assert_eq!(
+            locs[2].mode,
+            MatchMode::Regex {
+                case_insensitive: false
+            }
+        );
+        assert_eq!(locs[2].pattern, "\\.gif$");
+        assert_eq!(
+            locs[3].mode,
+            MatchMode::Regex {
+                case_insensitive: true
+            }
+        );
+        assert_eq!(locs[3].pattern, "\\.png$");
+    }
+
+    #[test]
     fn rejects_invalid_regex_at_parse_time() {
         // `[unclosed` is not a valid Rust-regex pattern. Failing at -t is
         // the whole reason we compile the regex during config parsing.
