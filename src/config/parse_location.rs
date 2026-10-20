@@ -1031,6 +1031,16 @@ pub(crate) fn parse_location_block(
             (name @ ("client_body_timeout" | "send_timeout"), Terminator::Semi) => {
                 client_timeouts.parse(name, &args)?;
             }
+            // Location settings of ngx_http_v2_module too (#594): the
+            // largest DATA frame of the location's responses, and the
+            // server push ones, obsolete since nginx 1.25.1, with the
+            // warning they get at server level.
+            ("http2_chunk_size", Terminator::Semi) => {
+                client_timeouts.parse("http2_chunk_size", &args)?;
+            }
+            ("http2_push" | "http2_push_preload", Terminator::Semi) => {
+                Http2Conf::default().parse(&args, lx.warnings_mut())?;
+            }
             // An optional argument is ignored, as nginx does for old
             // configurations (`stub_status on;`).
             ("stub_status", Terminator::Semi) if args.len() <= 2 => {

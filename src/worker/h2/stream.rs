@@ -702,6 +702,10 @@ impl super::super::ConnIo for StreamIo {
         Some(self.header_block)
     }
 
+    fn set_h2_chunk(&mut self, chunk: usize) {
+        self.chunk = chunk.max(1);
+    }
+
     fn conn_counters(&self) -> Option<(std::time::Instant, u64)> {
         Some(self.counters)
     }

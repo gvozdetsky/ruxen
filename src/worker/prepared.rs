@@ -1667,6 +1667,9 @@ pub struct PreparedClientTimeouts {
     /// head, and the largest head, `size × number`.
     pub large_header_line: usize,
     pub large_header: usize,
+    /// `http2_chunk_size` (#594): the largest DATA frame of a response on
+    /// an HTTP/2 stream, nginx's 8k by default.
+    pub h2_chunk: usize,
 }
 
 impl PreparedHttp {
@@ -1689,6 +1692,7 @@ impl PreparedClientTimeouts {
             send: Duration::from_millis(t.send_ms.unwrap_or(DEFAULT_MS)),
             large_header_line: size as usize,
             large_header: (num.saturating_mul(size)).min(usize::MAX as u64) as usize,
+            h2_chunk: t.h2_chunk_size.unwrap_or(8 * 1024) as usize,
         }
     }
 }

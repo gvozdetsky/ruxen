@@ -916,7 +916,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 name @ ("client_header_timeout"
                 | "client_body_timeout"
                 | "send_timeout"
-                | "large_client_header_buffers"),
+                | "large_client_header_buffers"
+                | "http2_chunk_size"),
                 Terminator::Semi,
             ) => {
                 client_timeouts.parse(name, &args)?;
@@ -2385,8 +2386,11 @@ mod tests {
             http {
                 client_header_timeout 5s;
                 send_timeout 7s;
-                server { listen 80; client_body_timeout 3s; send_timeout 9s; }
+                server { listen 80; client_body_timeout 3s; send_timeout 9s;
+                         http2_chunk_size 1;
+                         location / { http2_chunk_size 16k; http2_push_preload on; } }
                 server { listen 81; }
+                http2_chunk_size 4k;
             }
         "#,
         )
@@ -2398,6 +2402,14 @@ mod tests {
                 body_ms: Some(3_000),
                 send_ms: Some(9_000),
                 large_header_buffers: None,
+                h2_chunk_size: Some(1),
+            }
+        );
+        assert_eq!(
+            cfg.servers[0].locations[0].client_timeouts,
+            ClientTimeouts {
+                h2_chunk_size: Some(16384),
+                ..ClientTimeouts::default()
             }
         );
         assert_eq!(
@@ -2407,13 +2419,26 @@ mod tests {
                 body_ms: None,
                 send_ms: Some(7_000),
                 large_header_buffers: None,
+                h2_chunk_size: Some(4096),
             }
+        );
+        assert_eq!(
+            cfg.warnings,
+            ["the \"http2_push_preload\" directive is obsolete, ignored"]
         );
         assert!(matches!(
             parse("http { send_timeout 1s; send_timeout 2s; }"),
             Err(Error::Duplicate("send_timeout"))
         ));
         assert!(parse("http { client_body_timeout soon; }").is_err());
+        assert!(matches!(
+            parse("http { server { location / { http2_chunk_size 1; http2_chunk_size 2; } } }"),
+            Err(Error::Duplicate("http2_chunk_size"))
+        ));
+        // Not in an `if` (no NGX_HTTP_LIF_CONF in nginx).
+        assert!(
+            parse("http { server { location / { if ($uri) { http2_chunk_size 1; } } } }").is_err()
+        );
     }
 
     #[test]

@@ -152,6 +152,10 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         None
     }
 
+    /// For an HTTP/2 stream, the largest DATA frame of the response: the
+    /// `http2_chunk_size` of the request's location (#594).
+    fn set_h2_chunk(&mut self, _chunk: usize) {}
+
     /// For an HTTP/2 stream, its connection's start and the requests it
     /// carried before this one (`$connection_time`, `$connection_requests`).
     fn conn_counters(&self) -> Option<(Instant, u64)> {
