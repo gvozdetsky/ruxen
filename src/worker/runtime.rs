@@ -411,16 +411,25 @@ async fn reject_request<S: ConnIo>(
     request_head: &[u8],
     conn: &ConnLogCtx<'_>,
 ) {
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
     scratch.clear();
     scratch.extend_from_slice(response);
     inject_connection_header(scratch, true);
     refresh_date_header(scratch);
-    let sent = scratch.len() as u64;
     let taken = std::mem::take(scratch);
-    let _ = stream.write_all(taken).await;
+    let len = taken.len();
+    let head_len = taken
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(len, |p| p + 4) as u64;
+    // Under send_timeout, as nginx sends any response
+    // (ngx_http_set_write_handler): a client that pipelined requests and
+    // doesn't read can't hold the connection with a full socket buffer.
+    let timer = std::pin::pin!(monoio::time::sleep(server.timeouts.send));
+    let (res, _) = write_all_timed(stream, taken, len, timer, server.timeouts.send).await;
+    let sent = res.map_or_else(|written| written, |()| len) as u64;
 
-    let listen = &http.listens[conn.listen_index];
-    let server = &listen.servers[listen.default_server];
     if server.access_logs.is_empty() {
         return;
     }
@@ -434,10 +443,6 @@ async fn reject_request<S: ConnIo>(
     let mut words = request_line.split(|&b| b == b' ').filter(|w| !w.is_empty());
     let method = words.next().unwrap_or(b"");
     let uri = words.next().unwrap_or(b"");
-    let header_len = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map_or(response.len(), |p| p + 4) as u64;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -461,7 +466,7 @@ async fn reject_request<S: ConnIo>(
         b'.',
         request_head.len() as u64,
         sent,
-        (response.len() as u64).saturating_sub(header_len),
+        sent.saturating_sub(head_len),
         now.as_secs(),
         now.subsec_millis() as u16,
         conn.tls,
@@ -3688,8 +3693,19 @@ pub(crate) async fn handle<S: ConnIo>(
                                 b"expect",
                             ) {
                                 if expect.eq_ignore_ascii_case(b"100-continue") {
+                                    // nginx sends it in one send() and gives up
+                                    // the connection if it doesn't all go out;
+                                    // here send_timeout bounds the wait.
                                     let resp: Vec<u8> = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
-                                    let (res, _) = stream.write_all(resp).await;
+                                    let len = resp.len();
+                                    let (res, _) = write_all_timed(
+                                        stream,
+                                        resp,
+                                        len,
+                                        timers.io.as_mut(),
+                                        timeouts.send,
+                                    )
+                                    .await;
                                     if res.is_err() {
                                         return;
                                     }
