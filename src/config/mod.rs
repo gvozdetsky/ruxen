@@ -1173,8 +1173,9 @@ pub(crate) fn parse_mime(
 /// Fail closed on directives that restrict access, when ruxen can't
 /// enforce them yet. The allowlist above is for tuning knobs; silently
 /// dropping one of these would serve what the config says to protect.
-/// Called by the lexer for every directive, so no scope can miss it.
-pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
+/// Called by the lexer for every directive, so no scope can miss it;
+/// `term` tells a block from a line.
+pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
@@ -1190,11 +1191,27 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
         Some("root" | "alias") if value.is_some_and(|v| v.contains('$')) => {
             "variables in the path aren't expanded yet (#232), so other files would be served than nginx serves"
         }
+        // `location $var` (one argument, a leading `$`) is a predicate
+        // location since nginx 1.31.5: it matches when the variable is
+        // non-empty and not "0" (ngx_http_core_location). Read as a prefix,
+        // as nginx 1.24 did, it never matches, and `location $blocked
+        // { return 403; }` would block nothing (#596). A modifier, apart
+        // or glued (`= $x`, `=$x`), still makes it literal in nginx. Only a
+        // block: `location $x;` can be a `map` entry.
+        Some("location")
+            if *term == Terminator::BlockOpen
+                && args.len() == 2
+                && value.is_some_and(|v| v.starts_with('$')) =>
+        {
+            "predicate locations (nginx 1.31.5) aren't implemented, and as a literal prefix it \
+             would never match"
+        }
         _ => return Ok(()),
     };
-    // For a path, the whole directive: "root" alone isn't what's missing.
+    // For a path or a location, the whole directive: "root" alone isn't
+    // what's missing.
     let name = match args.first().map(String::as_str) {
-        Some("root" | "alias") => args.join(" "),
+        Some("root" | "alias" | "location") => args.join(" "),
         _ => args[0].clone(),
     };
     Err(Error::Unenforced { name, consequence })
@@ -2204,6 +2221,48 @@ mod tests {
         );
         // Without variables, as before.
         parse("http { server { listen 80; root /srv; location /a/ { alias /srv/a/; } } }").unwrap();
+    }
+
+    #[test]
+    fn predicate_locations_are_refused() {
+        // #596: nginx 1.31.5 matches `location $var` when the variable is
+        // non-empty and not "0"; ruxen would take it as a prefix that never
+        // matches. Refused at server level, nested, and quoted.
+        for (src, name) in [
+            (
+                "http { map $arg_x $blocked { default 0; 1 1; }
+                 server { listen 80; location $blocked { return 403; } } }",
+                "location $blocked",
+            ),
+            (
+                "http { server { listen 80; location / { location $arg_b { return 403; } } } }",
+                "location $arg_b",
+            ),
+            (
+                "http { server { listen 80; location \"$arg_a\" { return 403; } } }",
+                "location $arg_a",
+            ),
+        ] {
+            assert_eq!(
+                unenforced_err(src),
+                format!(
+                    "\"{name}\" is not supported yet, and ignoring it is unsafe: predicate \
+                     locations (nginx 1.31.5) aren't implemented, and as a literal prefix it \
+                     would never match"
+                )
+            );
+        }
+        // A modifier makes the `$` literal in nginx too, apart or glued
+        // (#577); and a `map` entry named `location` is no location.
+        for src in [
+            "http { server { listen 80; location = $x { return 200; } } }",
+            "http { server { listen 80; location =$x { return 200; } } }",
+            "http { server { listen 80; location ^~ $x { return 200; } } }",
+            "http { server { listen 80; location ~\\.php$ { return 403; } } }",
+            "http { map $uri $m { default 0; location $uri; } server { listen 80; } }",
+        ] {
+            parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        }
     }
 
     #[test]
