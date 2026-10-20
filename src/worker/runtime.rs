@@ -426,7 +426,9 @@ async fn reject_request<S: ConnIo>(
     // Under send_timeout, as nginx sends any response
     // (ngx_http_set_write_handler): a client that pipelined requests and
     // doesn't read can't hold the connection with a full socket buffer.
-    let timer = std::pin::pin!(monoio::time::sleep(server.timeouts.send));
+    // The timer starts far off, as a connection's do: `Timed` takes one
+    // already set near the deadline for armed, and wouldn't poll it.
+    let timer = std::pin::pin!(monoio::time::sleep(Duration::from_secs(3600)));
     let (res, _) = write_all_timed(stream, taken, len, timer, server.timeouts.send).await;
     let sent = res.map_or_else(|written| written, |()| len) as u64;
 
