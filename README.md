@@ -152,7 +152,7 @@ ruxen --compat -c /etc/nginx/nginx.conf
 ```text
 ruxen 0.2.0: checking /etc/nginx/nginx.conf
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
-/etc/nginx/nginx.conf:41: differs: ssl_stapling on — OCSP responses are not stapled (#141)
+/etc/nginx/nginx.conf:41: differs: ssl_early_data on — TLS 1.3 early data is not accepted
 -: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
 ruxen does not start with this configuration: 1 unsupported, 2 behaving differently
@@ -265,6 +265,7 @@ Currently supported:
 - multiple certificates per server
 - SNI, and `ssl_reject_handshake`
 - client certificates: `ssl_verify_client on|optional|optional_no_ca`, `ssl_client_certificate`, `ssl_trusted_certificate`, `ssl_verify_depth`, `ssl_crl`, per server, checked by OpenSSL's rules (AWS-LC's X.509 code); refused requests get nginx's 400 pages (495 / 496, which `error_page` can take) and a Host naming another verifying server 421; `$ssl_client_verify` and the certificate's fields (`$ssl_client_cert`, `_raw_cert`, `_escaped_cert`, `_s_dn`, `_i_dn` and their `_legacy` forms, `_serial`, `_fingerprint`, `_v_start`, `_v_end`, `_v_remain`), printed as OpenSSL prints them
+- OCSP stapling: `ssl_stapling`, `ssl_stapling_file`, `ssl_stapling_responder`, `ssl_stapling_verify`; responses fetched from the responder (`http://`, resolved at startup) in the background, verified, and refreshed as nginx does, one fetch for all workers
 - `ssl_session_cache` (in memory, shared by the workers, kept across a reload), `ssl_session_tickets`, `ssl_session_ticket_key` in nginx's ticket layout, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 
@@ -418,7 +419,7 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 - the `resolver` (a `proxy_pass` with variables reaches literal addresses and `upstream` names only)
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
 - a proxied response is still read whole before it is sent in a few cases: a cache store, `add_trailer`, failover and interception (#463)
-- OCSP stapling and OCSP checks of client certificates (#141, #142), 0-RTT / TLS early data
+- OCSP checks of client certificates (#142), 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
 - nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
 - variables in `root` and `alias` (#232), `proxy_cookie_domain` / `_path` / `_flags` (#40)

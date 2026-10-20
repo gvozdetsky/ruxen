@@ -292,14 +292,44 @@ pub(crate) fn active_provider() -> Arc<CryptoProvider> {
 /// alert.
 #[derive(Debug, Default)]
 pub struct ServerNameResolver {
-    exact: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    exact: HashMap<String, Vec<ServerKey>>,
     /// Lowercased suffix (without leading `*.`), in declaration order.
-    wildcard: Vec<(String, Vec<Arc<CertifiedKey>>)>,
+    wildcard: Vec<(String, Vec<ServerKey>)>,
     /// Lowercased head (without trailing `.*`) of `www.example.*` names.
-    wildcard_trailing: Vec<(String, Vec<Arc<CertifiedKey>>)>,
+    wildcard_trailing: Vec<(String, Vec<ServerKey>)>,
     /// `~regex` names, in declaration order.
-    regex: Vec<(regex::Regex, Vec<Arc<CertifiedKey>>)>,
-    default: Vec<Arc<CertifiedKey>>,
+    regex: Vec<(regex::Regex, Vec<ServerKey>)>,
+    default: Vec<ServerKey>,
+}
+
+/// A server's certificate, and its OCSP stapling (#141) when it staples.
+#[derive(Debug, Clone)]
+pub struct ServerKey {
+    key: Arc<CertifiedKey>,
+    stapling: Option<Arc<crate::ocsp::Stapling>>,
+}
+
+impl ServerKey {
+    pub fn stapled(key: Arc<CertifiedKey>, stapling: Option<Arc<crate::ocsp::Stapling>>) -> Self {
+        ServerKey { key, stapling }
+    }
+
+    /// The certificate for a handshake: with its OCSP response, if any.
+    fn for_handshake(&self) -> Arc<CertifiedKey> {
+        match &self.stapling {
+            Some(stapling) => stapling.for_handshake(),
+            None => self.key.clone(),
+        }
+    }
+}
+
+impl From<Arc<CertifiedKey>> for ServerKey {
+    fn from(key: Arc<CertifiedKey>) -> Self {
+        ServerKey {
+            key,
+            stapling: None,
+        }
+    }
 }
 
 impl ServerNameResolver {
@@ -309,15 +339,16 @@ impl ServerNameResolver {
 
     /// Register `key` under an exact-match hostname. Repeated calls with
     /// the same name accumulate (RSA + ECDSA on the same server).
-    pub fn add_exact(&mut self, name: &str, key: Arc<CertifiedKey>) {
+    pub fn add_exact(&mut self, name: &str, key: impl Into<ServerKey>) {
         let normalized = normalize_host(name);
-        self.exact.entry(normalized).or_default().push(key);
+        self.exact.entry(normalized).or_default().push(key.into());
     }
 
     /// Register `key` under a leading-wildcard suffix. `suffix` must be
     /// the form *without* the `*.` prefix (e.g. `example.com`).
-    pub fn add_wildcard(&mut self, suffix: &str, key: Arc<CertifiedKey>) {
+    pub fn add_wildcard(&mut self, suffix: &str, key: impl Into<ServerKey>) {
         let normalized = normalize_host(suffix);
+        let key = key.into();
         if let Some((_, slot)) = self.wildcard.iter_mut().find(|(s, _)| *s == normalized) {
             slot.push(key);
             return;
@@ -327,8 +358,9 @@ impl ServerNameResolver {
 
     /// Register `key` under a trailing wildcard, `head` being the name
     /// without its `.*` (`www.example` for `www.example.*`).
-    pub fn add_wildcard_trailing(&mut self, head: &str, key: Arc<CertifiedKey>) {
+    pub fn add_wildcard_trailing(&mut self, head: &str, key: impl Into<ServerKey>) {
         let normalized = normalize_host(head);
+        let key = key.into();
         if let Some((_, slot)) = self
             .wildcard_trailing
             .iter_mut()
@@ -342,7 +374,8 @@ impl ServerNameResolver {
 
     /// Register `key` under a `~regex` server name. A regex registered
     /// again (same server, RSA + ECDSA) adds to its slot.
-    pub fn add_regex(&mut self, regex: &regex::Regex, key: Arc<CertifiedKey>) {
+    pub fn add_regex(&mut self, regex: &regex::Regex, key: impl Into<ServerKey>) {
+        let key = key.into();
         if let Some((_, slot)) = self
             .regex
             .iter_mut()
@@ -356,7 +389,7 @@ impl ServerNameResolver {
 
     /// Set the keys returned when no SNI hostname matches (or when the
     /// client sent no SNI). Empty means "abort the handshake".
-    pub fn set_default(&mut self, keys: Vec<Arc<CertifiedKey>>) {
+    pub fn set_default(&mut self, keys: Vec<ServerKey>) {
         self.default = keys;
     }
 
@@ -368,25 +401,25 @@ impl ServerNameResolver {
             && self.default.is_empty()
     }
 
-    fn select(
-        candidates: &[Arc<CertifiedKey>],
+    fn select<'a>(
+        candidates: &'a [ServerKey],
         schemes: &[SignatureScheme],
-    ) -> Option<Arc<CertifiedKey>> {
+    ) -> Option<&'a ServerKey> {
         if candidates.is_empty() {
             return None;
         }
         for c in candidates {
-            if c.key.choose_scheme(schemes).is_some() {
-                return Some(c.clone());
+            if c.key.key.choose_scheme(schemes).is_some() {
+                return Some(c);
             }
         }
         // Nothing matched the client's announced signature schemes; hand
         // back the first cert anyway so rustls produces a clean handshake
         // alert rather than us silently choosing not to serve.
-        Some(candidates[0].clone())
+        Some(&candidates[0])
     }
 
-    fn lookup(&self, host: &str, schemes: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+    fn lookup(&self, host: &str, schemes: &[SignatureScheme]) -> Option<&ServerKey> {
         let normalized = normalize_host(host);
         if let Some(slot) = self.exact.get(&normalized) {
             return Self::select(slot, schemes);
@@ -430,10 +463,10 @@ impl ResolvesServerCert for ServerNameResolver {
         let schemes = client_hello.signature_schemes();
         if let Some(name) = client_hello.server_name() {
             if let Some(found) = self.lookup(name, schemes) {
-                return Some(found);
+                return Some(found.for_handshake());
             }
         }
-        Self::select(&self.default, schemes)
+        Self::select(&self.default, schemes).map(ServerKey::for_handshake)
     }
 }
 
@@ -784,11 +817,11 @@ mod tests {
         r.add_exact("test.ruxen.local", primary.clone());
         r.add_exact("alt.ruxen.local", alt.clone());
 
-        let got = r.lookup("test.ruxen.local", ALL_SCHEMES).expect("hit");
-        assert!(Arc::ptr_eq(&got, &primary));
+        let got = &r.lookup("test.ruxen.local", ALL_SCHEMES).expect("hit").key;
+        assert!(Arc::ptr_eq(got, &primary));
 
-        let got = r.lookup("alt.ruxen.local", ALL_SCHEMES).expect("hit");
-        assert!(Arc::ptr_eq(&got, &alt));
+        let got = &r.lookup("alt.ruxen.local", ALL_SCHEMES).expect("hit").key;
+        assert!(Arc::ptr_eq(got, &alt));
 
         assert!(r.lookup("nope.example.com", ALL_SCHEMES).is_none());
     }
@@ -828,25 +861,27 @@ mod tests {
         r.add_wildcard("ruxen.local", wild.clone());
         r.add_exact("test.ruxen.local", exact.clone());
 
-        let got = r.lookup("test.ruxen.local", ALL_SCHEMES).expect("hit");
-        assert!(Arc::ptr_eq(&got, &exact));
+        let got = &r.lookup("test.ruxen.local", ALL_SCHEMES).expect("hit").key;
+        assert!(Arc::ptr_eq(got, &exact));
 
-        let got = r.lookup("other.ruxen.local", ALL_SCHEMES).expect("hit");
-        assert!(Arc::ptr_eq(&got, &wild));
+        let got = &r.lookup("other.ruxen.local", ALL_SCHEMES).expect("hit").key;
+        assert!(Arc::ptr_eq(got, &wild));
     }
 
     #[test]
     fn resolver_default_fallback() {
         let default = ck(RSA_CRT, RSA_KEY_PKCS8);
         let mut r = ServerNameResolver::new();
-        r.set_default(vec![default.clone()]);
+        r.set_default(vec![default.clone().into()]);
 
         // `lookup` only handles SNI hits; the default path is exercised
         // through the public `resolve` trait method, but constructing a
         // `ClientHello` requires private fields. Verify the storage and
         // the `select` helper directly instead.
-        let got = ServerNameResolver::select(&r.default, ALL_SCHEMES).expect("default");
-        assert!(Arc::ptr_eq(&got, &default));
+        let got = &ServerNameResolver::select(&r.default, ALL_SCHEMES)
+            .expect("default")
+            .key;
+        assert!(Arc::ptr_eq(got, &default));
     }
 
     #[test]
@@ -861,13 +896,13 @@ mod tests {
         // Client only offers ECDSA — should pick the ECDSA cert even
         // though RSA was registered first.
         let ecdsa_only = &[SignatureScheme::ECDSA_NISTP256_SHA256];
-        let got = r.lookup("test.ruxen.local", ecdsa_only).expect("hit");
-        assert!(Arc::ptr_eq(&got, &ec));
+        let got = &r.lookup("test.ruxen.local", ecdsa_only).expect("hit").key;
+        assert!(Arc::ptr_eq(got, &ec));
 
         // Client only offers RSA — should pick the RSA cert.
         let rsa_only = &[SignatureScheme::RSA_PSS_SHA256];
-        let got = r.lookup("test.ruxen.local", rsa_only).expect("hit");
-        assert!(Arc::ptr_eq(&got, &rsa));
+        let got = &r.lookup("test.ruxen.local", rsa_only).expect("hit").key;
+        assert!(Arc::ptr_eq(got, &rsa));
     }
 
     #[test]
@@ -879,8 +914,8 @@ mod tests {
         // Client offers only schemes the RSA key doesn't speak; we still
         // hand it back so rustls produces a clear handshake alert.
         let unsupported = &[SignatureScheme::ED25519];
-        let got = r.lookup("test.ruxen.local", unsupported).expect("hit");
-        assert!(Arc::ptr_eq(&got, &rsa));
+        let got = &r.lookup("test.ruxen.local", unsupported).expect("hit").key;
+        assert!(Arc::ptr_eq(got, &rsa));
     }
 
     #[test]
@@ -898,7 +933,7 @@ mod tests {
         use crate::config::SessionResumption;
         let build = |cache, tickets| {
             let mut r = ServerNameResolver::new();
-            r.set_default(vec![ck(RSA_CRT, RSA_KEY_PKCS8)]);
+            r.set_default(vec![ck(RSA_CRT, RSA_KEY_PKCS8).into()]);
             build_server_config(
                 r,
                 TlsVersionSet::default(),

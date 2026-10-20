@@ -717,6 +717,8 @@ pub struct ServerSsl {
     pub client_verify: ClientVerifyConf,
     /// `ssl_password_file` (#139), merged with http scope.
     pub password_file: Option<PathBuf>,
+    /// `ssl_stapling` and its companions (#141), merged with http scope.
+    pub stapling: StaplingConf,
 }
 
 /// `ssl_verify_client`'s modes (ngx_http_ssl_verify).
@@ -821,6 +823,81 @@ impl ClientVerifyConf {
                 .or_else(|| parent.trusted_certificate.clone()),
             depth: self.depth.or(parent.depth),
             crl: self.crl.or_else(|| parent.crl.clone()),
+        }
+    }
+}
+
+/// `ssl_stapling`, `ssl_stapling_file`, `ssl_stapling_responder` and
+/// `ssl_stapling_verify` of one level (#141). `None` until set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaplingConf {
+    pub on: Option<bool>,
+    /// A DER OCSP response stapled as it is, never fetched.
+    pub file: Option<PathBuf>,
+    /// The responder's URL, instead of the certificate's own.
+    pub responder: Option<String>,
+    pub verify: Option<bool>,
+}
+
+impl StaplingConf {
+    pub(crate) fn takes(name: &str) -> bool {
+        matches!(
+            name,
+            "ssl_stapling" | "ssl_stapling_file" | "ssl_stapling_responder" | "ssl_stapling_verify"
+        )
+    }
+
+    /// One of `takes`'s directives into `self`.
+    pub(crate) fn parse(
+        &mut self,
+        args: &[String],
+        conf_prefix: Option<&std::path::Path>,
+    ) -> Result<(), super::error::Error> {
+        use super::error::Error;
+        let name: &'static str = match args[0].as_str() {
+            "ssl_stapling" => "ssl_stapling",
+            "ssl_stapling_file" => "ssl_stapling_file",
+            "ssl_stapling_responder" => "ssl_stapling_responder",
+            _ => "ssl_stapling_verify",
+        };
+        let duplicate = match name {
+            "ssl_stapling" | "ssl_stapling_verify" => {
+                let on = super::parse_location::parse_on_off_args(&args[1..], name)?;
+                let slot = if name == "ssl_stapling" {
+                    &mut self.on
+                } else {
+                    &mut self.verify
+                };
+                slot.replace(on).is_some()
+            }
+            _ => {
+                let [_, value] = args else {
+                    return Err(Error::BadValue {
+                        what: name,
+                        got: args[1..].join(" "),
+                    });
+                };
+                if name == "ssl_stapling_file" {
+                    let path = super::resolve_conf_path(conf_prefix, PathBuf::from(value));
+                    self.file.replace(path).is_some()
+                } else {
+                    self.responder.replace(value.clone()).is_some()
+                }
+            }
+        };
+        if duplicate {
+            return Err(Error::Duplicate(name));
+        }
+        Ok(())
+    }
+
+    /// Unset values come from `parent`, each on its own.
+    pub(crate) fn inherit(self, parent: &StaplingConf) -> StaplingConf {
+        StaplingConf {
+            on: self.on.or(parent.on),
+            file: self.file.or_else(|| parent.file.clone()),
+            responder: self.responder.or_else(|| parent.responder.clone()),
+            verify: self.verify.or(parent.verify),
         }
     }
 }
