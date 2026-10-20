@@ -222,7 +222,7 @@ impl Lexer {
             }
             let mut args = args;
             super::compat::precheck(self, &mut args);
-            if let Err(err) = super::reject_unenforced(&args) {
+            if let Err(err) = super::reject_unenforced(&args, &term) {
                 super::compat::unenforced(self, &args, err)?;
             }
             return Ok((args, term));
