@@ -1385,6 +1385,8 @@ fn error_page_title(status: u16) -> Option<(&'static str, &'static str)> {
         404 => "404 Not Found",
         405 => "405 Not Allowed",
         406 => "406 Not Acceptable",
+        // nginx 1.29.7+ (ngx_http_error_407_page).
+        407 => "407 Proxy Authentication Required",
         408 => "408 Request Time-out",
         409 => "409 Conflict",
         410 => "410 Gone",
@@ -1700,9 +1702,10 @@ fn write_head_with_content_type(
 }
 
 /// Reason phrases for the status line, copied from `ngx_http_status_lines[]`
-/// in `ngx_http_header_filter_module.c`. Like nginx, the table only holds
-/// 200-206, 301-308, 400-429 and 500-507 back to back, and "" stands for
-/// the codes nginx leaves out (its `ngx_null_string` entries).
+/// in `ngx_http_header_filter_module.c` (with 407, which nginx has since
+/// 1.29.7). Like nginx, the table only holds 200-206, 301-308, 400-429
+/// and 500-507 back to back, and "" stands for the codes nginx leaves out
+/// (its `ngx_null_string` entries).
 const STATUS_REASONS: [&str; 53] = [
     // 2xx, from 200
     "OK",
@@ -1729,7 +1732,7 @@ const STATUS_REASONS: [&str; 53] = [
     "Not Found",
     "Not Allowed",
     "Not Acceptable",
-    "", // 407
+    "Proxy Authentication Required",
     "Request Time-out",
     "Conflict",
     "Gone",
@@ -1917,6 +1920,18 @@ mod tests {
         let head = build_error_response(503, Method::Head, b"ruxen").unwrap();
         assert!(full.starts_with(&head) && head.ends_with(b"\r\n\r\n"));
         assert!(build_error_response(418, Method::Get, b"ruxen").is_none());
+        // nginx 1.29.7+ has a page for 407.
+        let r =
+            String::from_utf8(build_error_response(407, Method::Get, b"ruxen").unwrap()).unwrap();
+        assert!(
+            r.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n"),
+            "{r}"
+        );
+        assert!(r.ends_with(
+            "\r\n\r\n<html>\r\n<head><title>407 Proxy Authentication Required</title></head>\r\n\
+             <body>\r\n<center><h1>407 Proxy Authentication Required</h1></center>\r\n\
+             <hr><center>ruxen</center>\r\n</body>\r\n</html>\r\n"
+        ), "{r}");
     }
 
     use super::*;
@@ -1951,7 +1966,6 @@ mod tests {
             // holes inside the ranges (null entries in nginx)
             (203, ""),
             (205, ""),
-            (407, ""),
             (418, ""),
             (422, ""),
             (506, ""),
@@ -1961,6 +1975,8 @@ mod tests {
             (416, "Requested Range Not Satisfiable"),
             (503, "Service Temporarily Unavailable"),
             (504, "Gateway Time-out"),
+            // nginx 1.29.7+
+            (407, "Proxy Authentication Required"),
         ];
         for (status, want) in cases {
             assert_eq!(reason_phrase(status), want, "{status}");

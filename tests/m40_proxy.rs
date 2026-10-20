@@ -518,6 +518,27 @@ http {{
     )
 }
 
+/// A proxied status keeps the upstream's reason phrase (nginx copies its
+/// status line, ngx_http_upstream_process_headers), also for 407, which
+/// ruxen's own table names since nginx 1.29.7 does.
+#[test]
+fn m40_proxied_407_keeps_the_upstream_reason() {
+    let backend = Backend::spawn(
+        b"HTTP/1.1 407 Who Goes There\r\nProxy-Authenticate: Basic\r\n\
+          Content-Length: 4\r\n\r\nnope"
+            .to_vec(),
+    );
+    let (_guard, port, _dir) = spawn_ruxen(&proxy_conf(backend.addr.port()));
+    let resp = http_get_close(port, "/up/");
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 407 Who Goes There\r\n"),
+        "{text}"
+    );
+    assert!(has_header(&resp, "proxy-authenticate"), "{text}");
+    assert_eq!(body(&resp), b"nope", "{text}");
+}
+
 /// Upstream framing is validated like nginx
 /// (ngx_http_upstream_process_content_length / _transfer_encoding): each
 /// of these is a 502, never forwarded. A duplicated Content-Length used to
