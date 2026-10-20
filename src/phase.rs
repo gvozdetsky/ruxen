@@ -1403,8 +1403,8 @@ fn forwarded_addr(
     }
 }
 
-/// `ngx_parse_addr_port`: an address, or `addr:port` / `[addr]:port`.
-/// The port is 0 when there is none.
+/// `ngx_parse_addr_port`: an address, `[addr]`, or `addr:port` /
+/// `[addr]:port`. The port is 0 when there is none.
 fn parse_addr_port(text: &[u8]) -> Option<(IpAddr, u16)> {
     let text = std::str::from_utf8(text).ok()?;
     let addr = |s: &str| {
@@ -1418,6 +1418,10 @@ fn parse_addr_port(text: &[u8]) -> Option<(IpAddr, u16)> {
     let (host, port) = match text.strip_prefix('[') {
         Some(rest) => {
             let (host, after) = rest.split_once(']')?;
+            // 1.27.3+: `]` last, no port (ngx_inet.c, `p == last - 1`).
+            if after.is_empty() {
+                return Some((addr(host)?, 0));
+            }
             (host, after.strip_prefix(':')?)
         }
         None => text.split_once(':')?,
@@ -2672,6 +2676,17 @@ mod tests {
             Some((ip("2001:db8::1"), 99))
         );
         assert_eq!(get("2001:db8::1", false), Some((ip("2001:db8::1"), 0)));
+        // Brackets without a port (nginx 1.27.3+), as ngx_parse_addr
+        // reads what is inside: IPv6 or IPv4.
+        assert_eq!(
+            get("10.0.0.1, [2001:db8::2]", false),
+            Some((ip("2001:db8::2"), 0))
+        );
+        assert_eq!(get("[192.0.2.9]", true), Some((ip("192.0.2.9"), 0)));
+        assert_eq!(get("[2001:db8::1]]", false), None);
+        assert_eq!(get("[2001:db8::1", false), None);
+        assert_eq!(get("[]", false), None);
+        assert_eq!(get("[bogus]", false), None);
         // A bad last entry: nothing; a bad entry further left: the last
         // good one.
         assert_eq!(get("10.0.0.1, bogus", true), None);
