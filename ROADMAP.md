@@ -40,15 +40,12 @@ Some of these (#16, #17, #18, #35) are marked `good first issue` / `help wanted`
 - Rate and connection limits (#94, #95), `stub_status` (#96), `hash` / `ip_hash` (#97).
 - Variables in `proxy_pass` (#100), `unix:` upstreams (#101), HTTPS upstreams and their verification (#116, #117), cookie rewriting (#40).
 - Proxy caching (#233). Reverse-proxy configurations cache upstream responses often enough that the corpus counts cache directives among its top blockers.
+- Request-body streaming to upstreams (`proxy_request_buffering off`, #134), reworked together with the 64 KiB POST rate (#289), and OCSP checks of client certificates (#142) on the stapling code from #141.
 - The performance contract on every bench scenario (#127, #128, #129), and nginx's error pages and status phrases (#33, #34).
 
 ## Phase 2: first production users
 
-Goal: a few sites run ruxen in production and report back. The work then follows their reports, and the likely next items are:
-- client certificates and OCSP (#112–#115, #141, #142);
-- the resolver (#133);
-- request-body streaming to upstreams (#134);
-- metrics.
+Goal: a few sites run ruxen in production and report back. Milestone v0.4.0. It starts with metrics (#481), so that a pilot can be judged; the rest follows the pilots' reports. Client certificates, OCSP stapling and the resolver, once listed here, are done (#112–#115, #141, #133).
 
 The most valuable single step is running ruxen in front of something real, starting with non-critical services.
 
