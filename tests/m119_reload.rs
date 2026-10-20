@@ -123,6 +123,11 @@ fn start(name: &str, main: &str, http: &str) -> Server {
 /// configuration listens on until here: released earlier, another test
 /// could take the same port, and requests would reach its server.
 fn spawn(name: &str, main: &str, http: &str) -> Server {
+    spawn_with(name, main, http, &[])
+}
+
+/// `spawn` with extra environment variables.
+fn spawn_with(name: &str, main: &str, http: &str, env: &[(&str, &str)]) -> Server {
     let dir = std::env::temp_dir().join(format!("ruxen-m119-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -130,6 +135,7 @@ fn spawn(name: &str, main: &str, http: &str) -> Server {
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg("-c")
         .arg(dir.join("nginx.conf"))
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -555,4 +561,72 @@ fn reloads_free_the_retired_configuration() {
     unsafe {
         assert_eq!(kill(s.child.id() as i32, SIGQUIT), 0);
     }
+}
+
+/// SIGHUPs closer together than a reload takes: each turn of `main` then
+/// reloads, and each reload retires four workers. `main` used to read one
+/// worker exit per turn, so retired generations waited for it and kept
+/// their configuration until the SIGHUPs stopped (#503). Each one holds its
+/// `root` directory open until freed, so the open descriptors show it.
+#[test]
+fn back_to_back_reloads_free_the_retired_configurations() {
+    let setup = common::ports::setup_lock();
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!("ruxen-m119-hups-root-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A map that takes a while to prepare: the next SIGHUP arrives before
+    // the reload is over.
+    let entries: String = (0..5000).map(|n| format!("/k{n} v{n};\n")).collect();
+    let http = format!(
+        "map $uri $m {{ default \"\";\n{entries}}}\n\
+         server {{ listen 127.0.0.1:{port}; location / {{ root {}; }} }}",
+        dir.display()
+    );
+    // epoll: io_uring rings are freed by the kernel some time after their
+    // workers exit, and a ring per worker every few milliseconds left the
+    // other tests' servers without memory for theirs (`io_uring_setup()`
+    // ENOMEM). The bug was in `main`, whatever the driver.
+    let s = spawn_with(
+        "hups",
+        "worker_processes 4;",
+        &http,
+        &[("RUXEN_DRIVER", "epoll")],
+    );
+    drop(setup);
+    let fds = || {
+        std::fs::read_dir(format!("/proc/{}/fd", s.child.id()))
+            .unwrap()
+            .count()
+    };
+    let reloads = || s.error_log().matches("reconfiguring").count();
+    let before = fds();
+    let pid = s.child.id() as i32;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hups = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe { kill(pid, SIGHUP) };
+                sleep(Duration::from_millis(2));
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while reloads() < 40 && Instant::now() < deadline {
+        sleep(Duration::from_millis(20));
+    }
+    let during = fds();
+    let done = reloads();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    hups.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(done >= 40, "{done} reloads in 30 s");
+    // The current generation's root, a retired one whose workers are
+    // still on their way out, the one being prepared; not one per reload.
+    assert!(
+        during <= before + 4,
+        "{before} descriptors open before, {during} after {done} reloads"
+    );
+    s.wait_threads(5);
+    assert_eq!(get(port, "/").unwrap()[9..12].to_string(), "404");
 }

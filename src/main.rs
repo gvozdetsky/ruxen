@@ -573,31 +573,40 @@ impl Master {
             // panicked ends the server: the others stop as on SIGQUIT, and
             // ruxen exits 1 for a supervisor to restart it (#130; see
             // worker/panics.rs).
-            match exited_rx.recv_timeout(Duration::from_millis(10)) {
-                // A generation that failed to start was joined already.
-                Ok((id, i, panicked)) => {
-                    let Some(generation) = self.generation(id) else {
-                        continue;
-                    };
-                    generation.alive -= 1;
-                    let http = generation.http;
-                    if panicked && !worker_panicked {
-                        worker_panicked = true;
-                        worker::write_worker_log(
-                            http.error_logs,
-                            config::ErrorLogLevel::Alert,
-                            &format!("worker {i} exited after a panic, stopping"),
-                        );
-                        self.begin_shutdown();
-                        // Refused, not queued for nobody, while the others
-                        // finish (#495).
-                        self.listeners.close();
-                        quit_at.get_or_insert_with(Instant::now);
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            let first = match exited_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(exit) => Some(exit),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            // Every exit waiting, not one per turn: a turn that reloads
+            // lasts as long as the reload, and each reload retires a
+            // generation's worth of workers. Read one at a time, SIGHUPs
+            // closer than a reload left retired generations unfreed until
+            // they stopped (#503), as nginx's ngx_reap_children reaps all.
+            let pending = std::iter::from_fn(|| exited_rx.try_recv().ok());
+            for (id, i, panicked) in first.into_iter().chain(pending) {
+                // A generation that failed to start was joined already.
+                let Some(generation) = self.generation(id) else {
+                    continue;
+                };
+                generation.alive -= 1;
+                let http = generation.http;
+                if panicked && !worker_panicked {
+                    worker_panicked = true;
+                    worker::write_worker_log(
+                        http.error_logs,
+                        config::ErrorLogLevel::Alert,
+                        &format!("worker {i} exited after a panic, stopping"),
+                    );
+                    self.begin_shutdown();
+                    // Refused, not queued for nobody, while the others
+                    // finish (#495).
+                    self.listeners.close();
+                    quit_at.get_or_insert_with(Instant::now);
+                }
             }
+            // Before a reload below: what can be freed is, before the next
+            // configuration is prepared.
             self.finish_retired();
             if self.current.alive == 0 && self.retiring.is_empty() {
                 break;
