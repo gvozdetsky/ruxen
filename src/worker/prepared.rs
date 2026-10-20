@@ -121,6 +121,9 @@ pub enum PreparedRewriteOp {
         name: &'static [u8],
         value: &'static [PreparedValuePart],
     },
+    /// `set $args`: the request's arguments, as nginx's
+    /// ngx_http_variable_set_args replaces `r->args` (#543).
+    SetArgs(&'static [PreparedValuePart]),
     If {
         guard: PreparedGuard,
         body: &'static [PreparedRewriteOp],

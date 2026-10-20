@@ -2588,6 +2588,9 @@ pub(crate) fn prepare_rewrite_ops(
     let mut prepared: Vec<PreparedRewriteOp> = Vec::with_capacity(ops.len());
     for op in ops {
         let prepared_op = match op {
+            RewriteOp::Set { name, value } if name.eq_ignore_ascii_case("args") => {
+                PreparedRewriteOp::SetArgs(prepare_value_parts(value))
+            }
             RewriteOp::Set { name, value } => PreparedRewriteOp::Set {
                 name: leak_bytes(name.as_bytes()),
                 value: prepare_value_parts(value),

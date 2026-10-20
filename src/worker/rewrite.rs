@@ -347,6 +347,23 @@ pub(crate) fn execute_rewrite_ops(
                 render_parts(value, &ctx, &mut rendered);
                 rewrite_state.set_user_var(name, rendered);
             }
+            PreparedRewriteOp::SetArgs(value) => {
+                let args = current_args
+                    .as_deref()
+                    .unwrap_or_else(|| request_args(request_uri));
+                let ctx = build_rewrite_ctx(
+                    http,
+                    server,
+                    req,
+                    uri_path.as_slice(),
+                    args,
+                    captures_slice,
+                    rewrite_state,
+                );
+                let mut rendered = Vec::with_capacity(64);
+                render_parts(value, &ctx, &mut rendered);
+                *current_args = Some(rendered);
+            }
             PreparedRewriteOp::If {
                 guard,
                 body,
