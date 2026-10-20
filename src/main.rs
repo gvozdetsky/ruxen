@@ -25,6 +25,7 @@ mod file;
 mod fs_resolve;
 mod http;
 mod http_date;
+mod ocsp;
 mod phase;
 mod privileges;
 mod proxy;
@@ -282,6 +283,9 @@ fn real_main() -> Result<(), Failure> {
     arena::open();
     let prepared = worker::prepare(cfg);
     let arena = arena::close();
+    for w in worker::take_prepare_warnings() {
+        eprintln!("ruxen: [warn] {w}");
+    }
     let http: &'static worker::PreparedHttp =
         prepared.map_err(|e| report_emerg(&e, &cli, &main_path))?;
     warn_if_fd_limit_too_low(http, settings.worker_connections, settings.rlimit_nofile);
@@ -849,11 +853,12 @@ fn load_for_reload(
     let cfg =
         config::parse_with_main(main_path, file_src, globals_src).map_err(|e| e.to_string())?;
     let settings = Settings::from_config(&cfg);
-    let warnings = cfg.warnings.clone();
+    let mut warnings = cfg.warnings.clone();
     arena::open();
     let prepared = worker::prepare(cfg);
     // On an error the arena is dropped: what was leaked stays.
     let arena = arena::close();
+    warnings.extend(worker::take_prepare_warnings());
     Ok((settings, prepared?, arena, warnings))
 }
 
@@ -896,14 +901,16 @@ fn check_compat(
             return Err(Failure::Reported);
         }
     };
-    let warnings = cfg.warnings.clone();
+    let mut warnings = cfg.warnings.clone();
     let unsupported = findings
         .iter()
         .any(|f| f.severity == config::compat::Severity::Unsupported);
     let prepare_error = if unsupported {
         None
     } else {
-        worker::prepare(cfg).err()
+        let error = worker::prepare(cfg).err();
+        warnings.extend(worker::take_prepare_warnings());
+        error
     };
     print!(
         "{}",

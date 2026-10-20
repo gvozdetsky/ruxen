@@ -260,26 +260,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
     ),
     // The ssl_* lines the server parser takes and doesn't apply.
     (
-        "ssl_stapling",
-        Some("off"),
-        "OCSP responses are not stapled (#141)",
-    ),
-    (
-        "ssl_stapling_file",
-        None,
-        "OCSP responses are not stapled (#141)",
-    ),
-    (
-        "ssl_stapling_responder",
-        None,
-        "OCSP responses are not stapled (#141)",
-    ),
-    (
-        "ssl_stapling_verify",
-        Some("off"),
-        "OCSP responses are not stapled (#141)",
-    ),
-    (
         "ssl_early_data",
         Some("off"),
         "TLS 1.3 early data is not accepted",

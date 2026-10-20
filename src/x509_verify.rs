@@ -58,7 +58,7 @@ impl std::fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 /// An owned X509.
-struct Cert(*mut ffi::X509);
+pub(crate) struct Cert(pub(crate) *mut ffi::X509);
 
 impl Drop for Cert {
     fn drop(&mut self) {
@@ -67,7 +67,7 @@ impl Drop for Cert {
 }
 
 impl Cert {
-    fn from_der(der: &[u8]) -> Option<Self> {
+    pub(crate) fn from_der(der: &[u8]) -> Option<Self> {
         let mut p = der.as_ptr();
         let x = unsafe { ffi::d2i_X509(ptr::null_mut(), &mut p, der.len() as c_long) };
         (!x.is_null()).then_some(Cert(x))
@@ -76,7 +76,7 @@ impl Cert {
 
 /// The most recent error of this thread's queue, as OpenSSL prints it;
 /// the queue is cleared.
-fn ssl_error() -> String {
+pub(crate) fn ssl_error() -> String {
     let code = unsafe { ffi::ERR_get_error() };
     unsafe { ffi::ERR_clear_error() };
     if code == 0 {
@@ -109,6 +109,21 @@ impl Store {
         }
         unsafe { ffi::X509_STORE_set_depth(store, depth.min(c_int::MAX as u32) as c_int) };
         Ok(Store(store))
+    }
+
+    /// A store with no depth of its own: a server's SSL_CTX store as
+    /// OCSP_basic_verify uses it (`ssl_stapling_verify`, #141), since
+    /// `ssl_verify_depth` limits the SSL_CTX, not its store.
+    pub fn without_depth() -> Result<Store, String> {
+        let store = unsafe { ffi::X509_STORE_new() };
+        if store.is_null() {
+            return Err(ssl_error());
+        }
+        Ok(Store(store))
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut ffi::X509_STORE {
+        self.0
     }
 
     /// More trusted certificates (`ssl_client_certificate`, then
@@ -519,7 +534,7 @@ unsafe fn print_to(out: &mut Vec<u8>, print: impl FnOnce(*mut ffi::BIO) -> c_int
 }
 
 /// nginx's ngx_escape_uri with NGX_ESCAPE_URI_COMPONENT.
-fn escape_uri_component(input: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn escape_uri_component(input: &[u8], out: &mut Vec<u8>) {
     const ESCAPE: [u32; 8] = [
         0xffffffff, 0xfc009fff, 0x78000001, 0xb8000001, 0xffffffff, 0xffffffff, 0xffffffff,
         0xffffffff,

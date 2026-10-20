@@ -28,6 +28,7 @@ pub(crate) fn parse_server_block(
     let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut client_verify = ClientVerifyConf::default();
+    let mut stapling = StaplingConf::default();
     let mut ssl_password_file: Option<PathBuf> = None;
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
@@ -115,6 +116,7 @@ pub(crate) fn parse_server_block(
                         resumption,
                         client_verify,
                         password_file: ssl_password_file,
+                        stapling,
                     };
                     let mut listens_iter = listens.into_iter();
                     let first_listen = listens_iter
@@ -297,15 +299,12 @@ pub(crate) fn parse_server_block(
                 saw_any_ssl_directive = true;
                 client_verify.parse(&args, lx.conf_prefix())?;
             }
+            (name, Terminator::Semi) if StaplingConf::takes(name) => {
+                saw_any_ssl_directive = true;
+                stapling.parse(&args, lx.conf_prefix())?;
+            }
             (
-                "ssl_buffer_size"
-                | "ssl_dhparam"
-                | "ssl_ecdh_curve"
-                | "ssl_stapling"
-                | "ssl_stapling_file"
-                | "ssl_stapling_responder"
-                | "ssl_stapling_verify"
-                | "ssl_early_data"
+                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data"
                 | "ssl_conf_command",
                 Terminator::Semi,
             ) => {

@@ -330,6 +330,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_reject_handshake: Option<bool> = None;
     let mut resumption = SessionResumption::default();
     let mut client_verify = ClientVerifyConf::default();
+    let mut stapling = StaplingConf::default();
     let mut ssl_password_file: Option<PathBuf> = None;
     let mut warnings: Vec<String> = Vec::new();
     loop {
@@ -413,6 +414,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         if ssl.password_file.is_none() {
                             ssl.password_file.clone_from(&ssl_password_file);
                         }
+                        ssl.stapling = std::mem::take(&mut ssl.stapling).inherit(&stapling);
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -675,15 +677,11 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             (name, Terminator::Semi) if ClientVerifyConf::takes(name) => {
                 client_verify.parse(&args, lx.conf_prefix())?
             }
+            (name, Terminator::Semi) if StaplingConf::takes(name) => {
+                stapling.parse(&args, lx.conf_prefix())?
+            }
             (
-                "ssl_buffer_size"
-                | "ssl_dhparam"
-                | "ssl_ecdh_curve"
-                | "ssl_stapling"
-                | "ssl_stapling_file"
-                | "ssl_stapling_responder"
-                | "ssl_stapling_verify"
-                | "ssl_early_data"
+                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data"
                 | "ssl_conf_command",
                 Terminator::Semi,
             ) => {
@@ -2702,6 +2700,42 @@ mod tests {
         let cfg = parse(src).unwrap();
         // Directives parsed without error and didn't disturb the populated SSL state.
         assert_eq!(cfg.servers[0].ssl.certs.len(), 1);
+    }
+
+    #[test]
+    fn ssl_stapling_merges_one_line_at_a_time() {
+        let cfg = parse(
+            "http { ssl_stapling on; ssl_stapling_responder http://ocsp.example/; \
+             ssl_stapling_file /etc/ssl/a.der; \
+             server { listen 443 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_stapling_verify on; ssl_stapling_file b.der; } \
+             server { listen 444 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_stapling off; } }",
+        )
+        .unwrap();
+        let a = &cfg.servers[0].ssl.stapling;
+        assert_eq!(a.on, Some(true));
+        assert_eq!(a.verify, Some(true));
+        assert_eq!(a.responder.as_deref(), Some("http://ocsp.example/"));
+        let file = a.file.as_deref().unwrap();
+        assert!(file.ends_with("b.der"), "{file:?}");
+        let b = &cfg.servers[1].ssl.stapling;
+        assert_eq!((b.on, b.verify), (Some(false), None));
+        assert_eq!(
+            b.file.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/a.der"))
+        );
+        for bad in [
+            "ssl_stapling on; ssl_stapling off;",
+            "ssl_stapling_file a; ssl_stapling_file b;",
+            "ssl_stapling_verify maybe;",
+            "ssl_stapling_responder;",
+        ] {
+            assert!(
+                parse(&format!("http {{ server {{ listen 80; {bad} }} }}")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

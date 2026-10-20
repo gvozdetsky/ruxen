@@ -419,8 +419,8 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   `ServerSessionMemoryCache` (4096 entries) shared by all workers, with
   `ssl_session_timeout` enforced on lookup. `ssl_session_tickets` is on
   by default. A `shared:` cache is kept across a reload, not a restart.
-  Client cert auth, OCSP stapling, 0-RTT, password-protected keys and
-  `proxy_ssl_*` aren't implemented yet (README, Limitations).
+  0-RTT and OCSP checks of client certificates aren't implemented yet
+  (README, Limitations).
 - **Session ticket keys are nginx's (#140).** `tls_ticket::NginxTicketer`
   builds tickets in the layout OpenSSL uses for nginx's key callback
   (`key name | IV | AES-CBC | HMAC-SHA256`), so the key name is visible.
@@ -473,6 +473,33 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   `X509_NAME_oneline`, `i2a_ASN1_INTEGER`, `ASN1_TIME_print`), so the text is
   OpenSSL's, escaping and attribute names included; the certificate is
   parsed only when such a variable is rendered.
+- **OCSP stapling (#141)** follows ngx_event_openssl_stapling.c, with
+  the OCSP code of the AWS-LC that rustls links (`ocsp`), as `x509_verify`
+  checks chains. Each certificate of a server with `ssl_stapling on` gets
+  an `ocsp::Stapling`, which the SNI resolver asks for the certificate of
+  each handshake (`tls_certs::ServerKey`): a `CertifiedKey` carrying the
+  response while it is valid, which rustls staples when the client asks
+  (TLS 1.2 and 1.3). `ssl_stapling_file` is read at startup and stapled as
+  it is, whatever it says. Otherwise the startup finds the issuer (the
+  certificates after the leaf, then the store `ssl_trusted_certificate`
+  makes) and the responder (`ssl_stapling_responder`, else the AIA URL,
+  `http://` only, resolved then, as nginx resolves it without a
+  `resolver`), and warns `"ssl_stapling" ignored, …` where nginx does.
+  The first handshake starts a fetch and goes without, as in nginx: a
+  GET with the base64 request, then OCSP_basic_verify (`OCSP_NOVERIFY`,
+  or `OCSP_TRUSTOTHER` with `ssl_stapling_verify`), the CertID's status,
+  OCSP_check_validity with 5 minutes of drift. A `good` response is
+  stapled until its nextUpdate and fetched again 5 minutes before, at
+  least hourly; after a failure in 5 minutes. Unlike nginx's worker
+  processes, the workers share a `Stapling`, so one fetch serves them
+  all. The fetch is a `spawn_contained` task of the worker whose handshake
+  started it, so it can't outlive its generation's arena, and it takes an
+  upstream connection slot as ngx_event_connect_peer does. Error lines
+  are nginx's, context included (`while requesting certificate status,
+  responder: …, peer: …, certificate: "…"`). The handshake cost is a lock
+  to clone an `Arc`, for stapling certificates only. A server on several
+  addresses staples once: `prepare` keeps the stapling certificates of a
+  load by their files and settings.
 - **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
   rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
   When the variable is used and the listen resumes sessions, a full

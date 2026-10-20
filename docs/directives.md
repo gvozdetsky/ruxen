@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 171 implemented, 30 accepted with a difference, 73 accepted with no effect, 1 refused, 275 unknown.
+Of 550 directives: 175 implemented, 26 accepted with a difference, 73 accepted with no effect, 1 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -603,10 +603,10 @@ Not supported: `slice`.
 | `ssl_ocsp` | no |  |  |
 | `ssl_ocsp_responder` | no |  |  |
 | `ssl_ocsp_cache` | no |  |  |
-| `ssl_stapling` | accepted, differs | http, server | OCSP responses are not stapled (#141) |
-| `ssl_stapling_file` | accepted, differs | http, server | OCSP responses are not stapled (#141) |
-| `ssl_stapling_responder` | accepted, differs | http, server | OCSP responses are not stapled (#141) |
-| `ssl_stapling_verify` | accepted, differs | http, server | OCSP responses are not stapled (#141) |
+| `ssl_stapling` | yes | http, server |  |
+| `ssl_stapling_file` | yes | http, server |  |
+| `ssl_stapling_responder` | yes | http, server |  |
+| `ssl_stapling_verify` | yes | http, server |  |
 | `ssl_early_data` | accepted, differs | http, server | TLS 1.3 early data is not accepted |
 | `ssl_conf_command` | accepted, differs | http, server | OpenSSL commands are not applied: ruxen's TLS is rustls |
 | `ssl_reject_handshake` | yes | http, server |  |

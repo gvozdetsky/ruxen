@@ -60,9 +60,33 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 /// message `main` prints after `[emerg]`.
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     crate::tls_certs::forget_files();
+    STAPLED_KEYS.with(|k| k.borrow_mut().clear());
     let prepared = prepare_http(cfg);
     crate::tls_certs::forget_files();
+    STAPLED_KEYS.with(|k| k.borrow_mut().clear());
     prepared
+}
+
+thread_local! {
+    /// The `[warn]` lines of the last `prepare` on this thread (nginx's
+    /// warnings while it initialises modules), for `take_prepare_warnings`.
+    static PREPARE_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The stapling certificates of the configuration being prepared, by
+    /// what makes them (#141): a server on two addresses (`listen 443
+    /// ssl; listen [::]:443 ssl;`) staples once, as nginx's one SSL_CTX
+    /// per server does, and warns once.
+    static STAPLED_KEYS: std::cell::RefCell<Vec<(StapledKeyId, crate::tls_certs::ServerKey)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The `[warn]` lines `prepare` had, taken: the caller logs them.
+pub fn take_prepare_warnings() -> Vec<String> {
+    PREPARE_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
+fn prepare_warning(line: String) {
+    PREPARE_WARNINGS.with(|w| w.borrow_mut().push(line));
 }
 
 fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
@@ -463,13 +487,7 @@ pub(crate) fn build_listen_tls(
                 _ => Arc::from(Vec::new()),
             };
             for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
-                crate::tls_certs::load_certified_key(cert, key, &passwords).map_err(|e| {
-                    format!(
-                        "cannot load certificate \"{}\" with key \"{}\": {e}",
-                        cert.display(),
-                        key.display()
-                    )
-                })?;
+                server_key(input, cert, key, &passwords)?;
             }
         }
         return Ok(None);
@@ -499,27 +517,19 @@ pub(crate) fn build_listen_tls(
         .map(|ms| (ms / 1000).clamp(1, u32::MAX as u64) as u32);
 
     let mut resolver = crate::tls_certs::ServerNameResolver::new();
-    let mut default_keys: Vec<Arc<rustls::sign::CertifiedKey>> = Vec::new();
+    let mut default_keys: Vec<crate::tls_certs::ServerKey> = Vec::new();
 
     for (idx, input) in inputs.iter().enumerate() {
         if input.ssl.certs.is_empty() {
             continue;
         }
-        let mut keys: Vec<Arc<rustls::sign::CertifiedKey>> =
-            Vec::with_capacity(input.ssl.certs.len());
+        let mut keys: Vec<crate::tls_certs::ServerKey> = Vec::with_capacity(input.ssl.certs.len());
         let passwords = match &input.ssl.password_file {
             Some(path) => crate::tls_certs::password_file(path)?,
             None => Arc::from(Vec::new()),
         };
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
-            let ck = crate::tls_certs::load_certified_key(cert, key, &passwords).map_err(|e| {
-                format!(
-                    "cannot load certificate \"{}\" with key \"{}\": {e}",
-                    cert.display(),
-                    key.display()
-                )
-            })?;
-            keys.push(Arc::new(ck));
+            keys.push(server_key(input, cert, key, &passwords)?);
         }
 
         // Register each registered server_name against every key so an RSA
@@ -652,6 +662,119 @@ pub(crate) fn build_listen_tls(
         }),
         contexts,
     )))
+}
+
+/// What makes a stapling certificate: the files, the server's stapling
+/// lines and the trusted certificates its responses are checked with.
+#[derive(PartialEq, Eq)]
+struct StapledKeyId {
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    password_file: Option<std::path::PathBuf>,
+    stapling: crate::config::StaplingConf,
+    trust: crate::config::ClientVerifyConf,
+}
+
+/// A server's certificate `cert` with its key, loaded, and its OCSP
+/// stapling set up when the server has `ssl_stapling on` (#141).
+fn server_key(
+    input: &TlsServerInput,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    passwords: &[Vec<u8>],
+) -> Result<crate::tls_certs::ServerKey, String> {
+    let load = || {
+        crate::tls_certs::load_certified_key(cert, key, passwords)
+            .map(Arc::new)
+            .map_err(|e| {
+                format!(
+                    "cannot load certificate \"{}\" with key \"{}\": {e}",
+                    cert.display(),
+                    key.display()
+                )
+            })
+    };
+    let conf = &input.ssl.stapling;
+    if conf.on != Some(true) {
+        return load().map(Into::into);
+    }
+    let id = StapledKeyId {
+        cert: cert.to_path_buf(),
+        key: key.to_path_buf(),
+        password_file: input.ssl.password_file.clone(),
+        stapling: conf.clone(),
+        trust: stapling_trust(&input.ssl.client_verify),
+    };
+    if let Some(found) = STAPLED_KEYS.with(|k| {
+        k.borrow()
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, key)| key.clone())
+    }) {
+        return Ok(found);
+    }
+    let certified = load()?;
+    let settings = crate::ocsp::Settings {
+        file: conf.file.as_deref(),
+        responder: conf.responder.as_deref(),
+        verify: conf.verify.unwrap_or(false),
+        store: Arc::new(stapling_store(&id.trust)?),
+    };
+    let stapling =
+        crate::ocsp::Stapling::new(certified.clone(), cert, &settings, &mut prepare_warning)?;
+    let server_key = crate::tls_certs::ServerKey::stapled(certified, stapling);
+    STAPLED_KEYS.with(|k| k.borrow_mut().push((id, server_key.clone())));
+    Ok(server_key)
+}
+
+/// Of a server's `ssl_verify_client` lines, what goes into its store:
+/// `ssl_client_certificate` only when client certificates are asked for.
+fn stapling_trust(verify: &crate::config::ClientVerifyConf) -> crate::config::ClientVerifyConf {
+    let asks = verify
+        .mode
+        .is_some_and(|m| m != crate::config::VerifyClient::Off);
+    crate::config::ClientVerifyConf {
+        mode: None,
+        client_certificate: verify.client_certificate.clone().filter(|_| asks),
+        trusted_certificate: verify.trusted_certificate.clone(),
+        depth: None,
+        crl: verify.crl.clone(),
+    }
+}
+
+/// A server's SSL_CTX store, as OCSP stapling sees it: what
+/// `ssl_client_certificate` (with `ssl_verify_client`),
+/// `ssl_trusted_certificate` and `ssl_crl` load into it
+/// (ngx_http_ssl_merge_srv_conf).
+fn stapling_store(
+    trust: &crate::config::ClientVerifyConf,
+) -> Result<crate::x509_verify::Store, String> {
+    let fail = |what: &str, e: String| format!("{what} failed (SSL: {e})");
+    let read = |path: &std::path::Path, call: &str| {
+        crate::tls_certs::pem_file(path)
+            .map_err(|e| format!("{call}(\"{}\") failed ({})", path.display(), errno_text(&e)))
+    };
+    let mut store =
+        crate::x509_verify::Store::without_depth().map_err(|e| fail("X509_STORE_new()", e))?;
+    if let Some(path) = &trust.client_certificate {
+        let pem = read(path, "SSL_CTX_load_verify_locations")?;
+        store
+            .add_trusted(&pem)
+            .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_client_certificate)", e))?;
+    }
+    if let Some(path) = &trust.trusted_certificate {
+        let pem = read(path, "SSL_CTX_load_verify_locations")?;
+        store
+            .add_trusted(&pem)
+            .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_trusted_certificate)", e))?;
+    }
+    if let Some(path) = &trust.crl {
+        let pem = read(path, "X509_LOOKUP_load_file")?;
+        store
+            .add_crl(&pem)
+            .map_err(|e| fail("X509_LOOKUP_load_file(ssl_crl)", e))?;
+    }
+    Ok(store)
 }
 
 /// What a client-certificate context is made of: the files' contents and
