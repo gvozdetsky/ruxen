@@ -221,6 +221,8 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 default_server: s.listen.default_server,
                 ssl: s.ssl.clone(),
                 server_names: s.server_names.clone(),
+                resolver: s.proxy.resolver.clone(),
+                resolver_timeout_ms: s.proxy.resolver_timeout_ms,
             })
             .collect();
         let proxy_protocol = servers_for_addr.iter().any(|s| s.listen.proxy_protocol);
@@ -459,6 +461,9 @@ pub(crate) struct TlsServerInput {
     default_server: bool,
     ssl: crate::config::ServerSsl,
     server_names: Vec<crate::config::ServerNameSpec>,
+    /// The server's `resolver` and `resolver_timeout`, for OCSP stapling.
+    resolver: Option<crate::config::ResolverConf>,
+    resolver_timeout_ms: Option<u64>,
 }
 
 /// Build the per-listen `TlsAcceptor`, or `None` when no server on this
@@ -674,6 +679,8 @@ struct StapledKeyId {
     password_file: Option<std::path::PathBuf>,
     stapling: crate::config::StaplingConf,
     trust: crate::config::ClientVerifyConf,
+    resolver: Option<crate::config::ResolverConf>,
+    resolver_timeout_ms: Option<u64>,
 }
 
 /// A server's certificate `cert` with its key, loaded, and its OCSP
@@ -705,6 +712,8 @@ fn server_key(
         password_file: input.ssl.password_file.clone(),
         stapling: conf.clone(),
         trust: stapling_trust(&input.ssl.client_verify),
+        resolver: input.resolver.clone(),
+        resolver_timeout_ms: input.resolver_timeout_ms,
     };
     if let Some(found) = STAPLED_KEYS.with(|k| {
         k.borrow()
@@ -720,6 +729,11 @@ fn server_key(
         responder: conf.responder.as_deref(),
         verify: conf.verify.unwrap_or(false),
         store: Arc::new(stapling_store(&id.trust)?),
+        resolver: id.resolver.clone().map(prepare_resolver),
+        resolver_timeout: std::time::Duration::from_millis(
+            id.resolver_timeout_ms
+                .unwrap_or(ProxyEffective::defaults().resolver_timeout_ms),
+        ),
     };
     let stapling =
         crate::ocsp::Stapling::new(certified.clone(), cert, &settings, &mut prepare_warning)?;

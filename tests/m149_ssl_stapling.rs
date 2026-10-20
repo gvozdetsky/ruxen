@@ -356,6 +356,8 @@ fn responses_are_fetched_verified_and_stapled() {
     assert!(!target.contains(['/', '+', '=']), "{target}");
     let log = std::fs::read_to_string(s.dir.join("error.log")).unwrap();
     assert!(!log.contains("[error]") && !log.contains("[crit]"), "{log}");
+    // An IPv4 address isn't resolved, so no resolver is missed.
+    assert!(!log.contains("no resolver defined"), "{log}");
     let _ = std::fs::remove_dir_all(&pki);
 }
 
@@ -409,6 +411,101 @@ fn bad_responses_are_not_stapled() {
         heads.iter().any(|h| h.starts_with("GET /ocsp/MEMwQTA")),
         "{heads:?}"
     );
+    let _ = std::fs::remove_dir_all(&pki);
+}
+
+/// A name server on UDP that answers `localhost` with 127.0.0.1 (A), or
+/// every name with NXDOMAIN when `nx`; and the number of queries for
+/// `localhost` it got.
+fn dns(nx: bool) -> (u16, Arc<Mutex<u32>>) {
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = udp.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(0));
+    let s = seen.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            let query = &buf[..n];
+            let mut i = 12;
+            while query[i] != 0 {
+                i += 1 + query[i] as usize;
+            }
+            let qtype = u16::from_be_bytes([query[i + 1], query[i + 2]]);
+            if &query[12..i] == b"\x09localhost" {
+                *s.lock().unwrap() += 1;
+            }
+            let a = !nx && qtype == 1 && &query[12..i] == b"\x09localhost";
+            let mut reply = query[..2].to_vec();
+            reply.extend_from_slice(&[0x81, if nx { 0x83 } else { 0x80 }, 0, 1, 0, a as u8]);
+            reply.extend_from_slice(&[0, 0, 0, 0]);
+            reply.extend_from_slice(&query[12..i + 5]);
+            if a {
+                reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+            }
+            let _ = udp.send_to(&reply, from);
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn responder_names_are_resolved_on_each_fetch() {
+    let r = responder();
+    let pki = make_pki("resolve", r.port);
+    let p = pki.display();
+    let good = std::fs::read(pki.join("good.der")).unwrap();
+    *r.answer.lock().unwrap() = good.clone();
+    let (dns_port, dns_seen) = dns(false);
+    let (nx_port, nx_seen) = dns(true);
+    let setup = common::ports::setup_lock();
+    let [none, resolved, unresolved] = common::ports::free_ports();
+    let s = start(
+        "resolve",
+        setup,
+        &format!(
+            "ssl_certificate {p}/end-int.crt; ssl_certificate_key {p}/end.key; ssl_stapling on;\n\
+             ssl_stapling_responder http://localhost:{}/;\n\
+             server {{ listen 127.0.0.1:{none} ssl; }}\n\
+             server {{ listen 127.0.0.1:{resolved} ssl; resolver 127.0.0.1:{dns_port}; }}\n\
+             server {{ listen 127.0.0.1:{unresolved} ssl; resolver 127.0.0.1:{nx_port}; \
+             resolver_timeout 2s; }}",
+            r.port
+        ),
+    );
+    let log_has = |what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let log = std::fs::read_to_string(s.dir.join("error.log")).unwrap_or_default();
+            if log.contains(what) {
+                return log;
+            }
+            assert!(Instant::now() < deadline, "no {what:?} in\n{log}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // Without a resolver: the startup addresses, with a warning.
+    assert_eq!(staples(none).1.as_ref(), Some(&good));
+    let warning = format!(
+        "no resolver defined to resolve localhost while requesting certificate status, \
+         responder: localhost, certificate: \"{p}/end-int.crt\""
+    );
+    let log = log_has(&warning);
+    let line = log.lines().find(|l| l.contains(&warning)).unwrap();
+    assert!(line.contains("[warn]"), "{line}");
+    // With one: asked on the fetch.
+    assert_eq!(*dns_seen.lock().unwrap(), 0);
+    assert_eq!(staples(resolved).1.as_ref(), Some(&good));
+    assert!(*dns_seen.lock().unwrap() > 0);
+    // A name it doesn't know fails the fetch.
+    assert_eq!(staple(unresolved, &rustls::version::TLS13), None);
+    let log = log_has(&format!(
+        "localhost could not be resolved (3: Host not found) while requesting certificate \
+         status, responder: localhost, certificate: \"{p}/end-int.crt\""
+    ));
+    assert!(*nx_seen.lock().unwrap() > 0);
+    assert_eq!(staple(unresolved, &rustls::version::TLS13), None);
+    assert_eq!(log.matches("no resolver defined").count(), 1, "{log}");
+    assert_eq!(r.heads.lock().unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(&pki);
 }
 
