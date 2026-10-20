@@ -643,6 +643,11 @@ impl Master {
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
                 self.begin_shutdown();
+                // New connections are refused during the drain, not queued
+                // for nobody: nginx closes its listening sockets at once,
+                // in the master and in each worker (#552). No reload
+                // follows, so they aren't needed again.
+                self.listeners.close();
                 quit_at = Some(Instant::now());
             }
             // Several HUPs within one turn make one reload.

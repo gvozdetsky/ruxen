@@ -132,6 +132,55 @@ fn the_timeout_closes_in_flight_connections() {
     );
 }
 
+/// SIGQUIT closes the listening sockets at once, as nginx does
+/// (ngx_close_listening_sockets in the master and each worker): a client
+/// that connects during the drain is refused instead of waiting in a
+/// backlog nobody accepts from, while the download in flight goes on (#552).
+#[test]
+fn quit_refuses_new_connections_during_the_drain() {
+    let dir = std::env::temp_dir().join(format!("ruxen-m79-refuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::File::create(dir.join("big.bin"))
+        .unwrap()
+        .set_len(256 << 20)
+        .unwrap();
+    // Two workers: each has its own socket for the address.
+    let (mut child, port) = start(&dir, "worker_processes 2;");
+    let mut client = stalled_download(port);
+    // Held from here: once ruxen lets the port go, another test could take
+    // it, and the connect below would reach that test's server.
+    let _setup = common::ports::setup_lock();
+    unsafe {
+        assert_eq!(kill(child.id() as i32, SIGQUIT), 0);
+    }
+    let sent = Instant::now();
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+            other => assert!(
+                sent.elapsed() < Duration::from_secs(1),
+                "still accepting connections: {other:?}"
+            ),
+        }
+        sleep(Duration::from_millis(10));
+    }
+    // The download goes on, and keeps the server up.
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut buf = vec![0; 1 << 20];
+    for _ in 0..16 {
+        assert!(client.read(&mut buf).unwrap() > 0);
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "exited during the drain"
+    );
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The timeout closes the connections and lets their requests end, as
 /// nginx's ngx_shutdown_timer_handler does: a request waiting for a silent
 /// upstream sees it close, and that is logged before the process exits.
