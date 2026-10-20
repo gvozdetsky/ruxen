@@ -226,7 +226,7 @@ fn reload_applies_the_new_configuration() {
 #[test]
 fn reload_moves_listen_addresses() {
     let setup = common::ports::setup_lock();
-    let (a, b) = (free_port(), free_port());
+    let [a, b] = common::ports::free_ports();
     let s = spawn("listen", "worker_processes 2;", &returning(a, "a"));
     let unix = s.dir.join("u.sock");
     let both = format!(

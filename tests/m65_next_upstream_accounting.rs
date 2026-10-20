@@ -9,7 +9,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -28,13 +28,6 @@ impl Drop for Server {
     }
 }
 
-fn free_ports<const N: usize>() -> [u16; N] {
-    let probes: Vec<TcpListener> = (0..N)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    std::array::from_fn(|i| probes[i].local_addr().unwrap().port())
-}
-
 /// `front` proxies to an upstream of `a` and `b`, and has `/err` for
 /// error pages. The backends answer `/bad` with `a_bad` / `b_bad` and
 /// everything else with their name.
@@ -42,7 +35,7 @@ fn start(tag: &str, location_extra: &str, a_bad: u16, b_bad: u16) -> (Server, u1
     // Held until ruxen listens on all three: released earlier, another
     // test could take one of these free ports.
     let setup = common::ports::setup_lock();
-    let [front, a, b] = free_ports::<3>();
+    let [front, a, b] = common::ports::free_ports();
     let dir = std::env::temp_dir().join(format!("ruxen-m65-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -176,7 +169,7 @@ fn the_last_try_goes_through_intercept_errors() {
 fn failover_reaches_every_peer_of_a_large_upstream() {
     let setup = common::ports::setup_lock();
     let dead = common::ports::DeadPort::new();
-    let [front, live] = free_ports::<2>();
+    let [front, live] = common::ports::free_ports();
     let dir = std::env::temp_dir().join(format!("ruxen-m65-large-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

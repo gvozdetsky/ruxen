@@ -7,7 +7,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -21,14 +21,6 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn start() -> (Server, u16, [u16; 3]) {
     let dir = std::env::temp_dir().join(format!("ruxen-m113-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -37,9 +29,8 @@ fn start() -> (Server, u16, [u16; 3]) {
     // test could take one of these free ports, and ruxen would fail to
     // bind it.
     let setup = common::ports::setup_lock();
-    let port = free_port();
-    let b = [free_port(), free_port(), free_port()];
-    let refused = free_port();
+    let [port, b0, b1, b2, refused] = common::ports::free_ports();
+    let b = [b0, b1, b2];
     let servers = || {
         b.iter()
             .map(|p| format!("server 127.0.0.1:{p};"))

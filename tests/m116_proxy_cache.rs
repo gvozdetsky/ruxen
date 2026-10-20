@@ -5,7 +5,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -17,14 +17,6 @@ impl Drop for Server {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// Start ruxen and wait for its pid file, written once every worker is
@@ -91,8 +83,7 @@ fn setup(name: &str) -> Setup {
     let dir = std::env::temp_dir().join(format!("ruxen-m116-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html")).unwrap();
-    let port = free_port();
-    let backend = free_port();
+    let [port, backend] = common::ports::free_ports();
     let d = dir.display();
     std::fs::write(
         dir.join("nginx.conf"),

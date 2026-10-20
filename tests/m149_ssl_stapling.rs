@@ -366,7 +366,7 @@ fn bad_responses_are_not_stapled() {
     let p = pki.display();
     *r.answer.lock().unwrap() = std::fs::read(pki.join("revoked.der")).unwrap();
     let setup = common::ports::setup_lock();
-    let (revoked, untrusted) = (free_port(), free_port());
+    let [revoked, untrusted] = common::ports::free_ports();
     let s = start(
         "bad",
         setup,

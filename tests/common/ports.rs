@@ -37,6 +37,19 @@ pub fn wait_for_pid_file(child: &mut Child, pid_file: &Path, timeout: Duration) 
     }
 }
 
+/// `N` distinct free ports, for a test that needs several at once: all `N`
+/// listeners are held until every port is read. Bound and dropped one at
+/// a time, the kernel can hand out the same port twice (about 1 run in
+/// 1300 for five ports); two backends then share one address, and a
+/// round-robin over three servers sees two (m113 on CI, 2026-10-20).
+/// Take `setup_lock` first, as for a single port.
+pub fn free_ports<const N: usize>() -> [u16; N] {
+    let probes: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    std::array::from_fn(|i| probes[i].local_addr().unwrap().port())
+}
+
 /// A `DeadPort`, made under `setup_lock`.
 pub fn dead_port() -> DeadPort {
     let _setup = setup_lock();

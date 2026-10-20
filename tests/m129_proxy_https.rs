@@ -91,7 +91,7 @@ fn get(port: u16, path: &str) -> (u16, String) {
 fn https_upstreams_like_nginx() {
     let cert = common::tls::make_self_signed("backend.test");
     let setup = common::ports::setup_lock();
-    let (front, backend, plain) = (free_port(), free_port(), free_port());
+    let [front, backend, plain] = common::ports::free_ports();
     let s = start("main", setup, |_| {
         format!(
             "upstream b {{ server 127.0.0.1:{backend}; keepalive 4; }}\n\
@@ -204,8 +204,7 @@ fn proxy_ssl_verify_like_nginx() {
     let ca_leaf = data.join("rsa.crt");
     let v1 = data.join("v1_ec.crt");
     let setup = common::ports::setup_lock();
-    let (front, signed, ca_true, old) = (free_port(), free_port(), free_port(), free_port());
-    let deep = free_port();
+    let [front, signed, ca_true, old, deep] = common::ports::free_ports();
     let s = start("verify", setup, |dir| {
         let (deep_crt, deep_key, root) = chain_with_intermediate(dir, "deep.test");
         format!(
@@ -298,7 +297,7 @@ fn pooled_connections_keep_their_verification() {
     let chain = common::tls::make_ca_and_leaf("backend.test");
     let other = common::tls::make_ca_and_leaf("backend.test");
     let setup = common::ports::setup_lock();
-    let (front, backend) = (free_port(), free_port());
+    let [front, backend] = common::ports::free_ports();
     let s = start("pool-verify", setup, |_| {
         format!(
             "upstream b {{ server 127.0.0.1:{backend}; keepalive 4; }}\n\
