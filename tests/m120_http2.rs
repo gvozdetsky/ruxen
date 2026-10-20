@@ -6,7 +6,6 @@
 
 mod common;
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread::sleep;
@@ -23,14 +22,6 @@ impl Drop for Server {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// `setup` is the port lock, taken before the test picked its ports:
@@ -96,7 +87,7 @@ fn curl(args: &[&str]) -> (String, String) {
 #[test]
 fn cleartext_http2_with_prior_knowledge() {
     let setup = common::ports::setup_lock();
-    let (port, backend) = (free_port(), free_port());
+    let [port, backend] = common::ports::free_ports();
     let s = start("h2c", setup, |dir| {
         std::fs::write(dir.join("html/index.html"), "static\n").unwrap();
         // More than the 64 KiB initial stream window.
@@ -157,7 +148,7 @@ fn cleartext_http2_with_prior_knowledge() {
 fn http2_over_tls_through_alpn() {
     let certs = common::tls::make_self_signed("localhost");
     let setup = common::ports::setup_lock();
-    let (port, plain) = (free_port(), free_port());
+    let [port, plain] = common::ports::free_ports();
     let (cert, key) = (certs.cert_path().to_owned(), certs.key_path().to_owned());
     let _s = start("tls", setup, |dir| {
         std::fs::write(dir.join("html/index.html"), "static\n").unwrap();

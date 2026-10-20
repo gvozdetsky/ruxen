@@ -9,18 +9,10 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn get(port: u16, path: &str) -> String {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -45,7 +37,7 @@ fn if_blocks_switch_the_location() {
     std::fs::write(dir.join("other/static/index.html"), "other\n").unwrap();
     // Held from the port pick until ruxen listens.
     let setup = common::ports::setup_lock();
-    let (port, up) = (free_port(), free_port());
+    let [port, up] = common::ports::free_ports();
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
@@ -126,7 +118,7 @@ fn if_locations_follow_nginx() {
     std::fs::write(dir.join("html/static/index.html"), "main\n").unwrap();
     // Held from the port pick until ruxen listens.
     let setup = common::ports::setup_lock();
-    let (port, up) = (free_port(), free_port());
+    let [port, up] = common::ports::free_ports();
     std::fs::write(
         dir.join("nginx.conf"),
         format!(

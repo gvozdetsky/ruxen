@@ -6,7 +6,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -18,14 +18,6 @@ impl Drop for Server {
         let _ = self.0.wait();
         let _ = std::fs::remove_dir_all(&self.1);
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn get(port: u16, path: &str) -> String {
@@ -57,8 +49,7 @@ fn m117_use_stale_and_background_update() {
     std::fs::write(html.join("e.txt"), "OLD-E").unwrap();
     std::fs::write(html.join("b.txt"), "OLD-B").unwrap();
     let setup = common::ports::setup_lock();
-    let port = free_port();
-    let backend = free_port();
+    let [port, backend] = common::ports::free_ports();
     let d = dir.display();
     std::fs::write(
         dir.join("nginx.conf"),
