@@ -152,6 +152,12 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         None
     }
 
+    /// For an HTTP/2 stream, whether its `:authority` and `Host` differ,
+    /// which nginx refuses with 400 (#592).
+    fn h2_authority_mismatch(&self) -> bool {
+        false
+    }
+
     /// For an HTTP/2 stream, its connection's start and the requests it
     /// carried before this one (`$connection_time`, `$connection_requests`).
     fn conn_counters(&self) -> Option<(Instant, u64)> {
