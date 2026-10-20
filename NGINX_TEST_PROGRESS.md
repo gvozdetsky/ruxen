@@ -7,13 +7,13 @@ Last run: 2026-10-19 against `nginx-tests` 0b70854 (2026-09-30).
 ## Summary
 
 - **Total tests tracked:** 505
-- **Passing in ruxen:** 165
+- **Passing in ruxen:** 170
 - **Intentionally skipped (`-V` banner excludes the module):** 314
-- **Failing — work in progress:** 26
+- **Failing — work in progress:** 21
 
 The three groups below are mutually exclusive and sum to 505.
 
-## Passing in ruxen (165)
+## Passing in ruxen (170)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -63,6 +63,10 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `http_location_auto.t`
 - `http_method.t`
 - `http_request_port.t`
+- `http_resolver.t`
+- `http_resolver_aaaa.t`
+- `http_resolver_cname.t`
+- `http_resolver_ipv4.t`
 - `http_server_name.t`
 - `http_try_files.t`
 - `http_uri.t`
@@ -113,6 +117,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_merge_headers.t`
 - `proxy_method.t`
 - `proxy_next_upstream.t`
+- `proxy_next_upstream_tries.t`
 - `proxy_noclose.t`
 - `proxy_non_idempotent.t`
 - `proxy_pass_request.t`
@@ -183,7 +188,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout_h2.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (26)
+## Failing — actively being worked on (21)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -197,17 +202,12 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `h2_request_body.t` — 8/51
 - `h2_request_body_extra.t` — 2/52
 - `h2_request_body_preread.t` — 1/11
-- `http_resolver.t` — 25/40
-- `http_resolver_aaaa.t` — 49/74
 - `http_resolver_cleanup.t` — 0/3
-- `http_resolver_cname.t` — 3/13
-- `http_resolver_ipv4.t` — 3/5
 - `limit_conn.t` — 1/10
 - `proxy_cache_convert_head.t` — 2/10
 - `proxy_cookie.t` — 8/11
 - `proxy_cookie_flags.t` — 0/0
 - `proxy_if.t` — 1/17
-- `proxy_next_upstream_tries.t` — 1/10
 - `proxy_request_buffering.t` — 2/20
 - `proxy_request_buffering_chunked.t` — 3/24
 - `proxy_request_buffering_ssl.t` — 3/20
