@@ -452,7 +452,10 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   the key. The chain is checked once after the handshake, resumed ones
   included, against the server's store (`x509_verify`, OpenSSL's rules:
   `ssl_client_certificate` + `ssl_trusted_certificate`, `ssl_verify_depth`,
-  `ssl_crl`), and the result rides in `HandshakeInfo`. Requests are refused
+  `ssl_crl`), and the result rides in `HandshakeInfo`. As in nginx ≥
+  1.27.2, `on` / `optional` load with only `ssl_trusted_certificate`
+  (#587): the CertificateRequest then has no CA names; 1.24's `[emerg]`
+  for it is gone. Requests are refused
   where nginx refuses them (ngx_http_process_request): 495 for a
   certificate the server rejects (`optional_no_ca` lets through the errors
   of ngx_ssl_verify_error_optional), 496 for none with `on`, both sent as

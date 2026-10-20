@@ -21,7 +21,8 @@ pub struct ClientAuth {
     /// `ssl_verify_depth` and `ssl_crl`.
     pub store: Arc<crate::x509_verify::Store>,
     /// The subjects of `ssl_client_certificate` only, each once: the CA
-    /// list of the CertificateRequest (SSL_CTX_set_client_CA_list).
+    /// list of the CertificateRequest (SSL_CTX_set_client_CA_list). Empty
+    /// with only `ssl_trusted_certificate` (nginx ≥ 1.27.2, #587).
     pub hints: Vec<DistinguishedName>,
 }
 

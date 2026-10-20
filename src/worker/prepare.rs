@@ -804,7 +804,9 @@ struct ClientAuthKey {
 
 /// A server's `ssl_verify_client` settings, read: `None` with it off.
 /// The files load as nginx loads them (ngx_http_ssl_merge_srv_conf), and
-/// fail as it fails: `on` / `optional` need `ssl_client_certificate`.
+/// fail as it fails: `on` / `optional` need `ssl_client_certificate` or,
+/// since nginx 1.27.2, `ssl_trusted_certificate` alone (#587), which
+/// verifies without sending a CA list.
 fn client_auth_key(input: &TlsServerInput) -> Result<Option<ClientAuthKey>, String> {
     use crate::config::VerifyClient;
     let conf = &input.ssl.client_verify;
@@ -823,8 +825,14 @@ fn client_auth_key(input: &TlsServerInput) -> Result<Option<ClientAuthKey>, Stri
     if mode == VerifyClient::Off {
         return Ok(None);
     }
-    if conf.client_certificate.is_none() && mode != VerifyClient::OptionalNoCa {
-        return Err("no ssl_client_certificate for ssl_verify_client".to_string());
+    if conf.client_certificate.is_none()
+        && conf.trusted_certificate.is_none()
+        && mode != VerifyClient::OptionalNoCa
+    {
+        return Err(
+            "no ssl_client_certificate or ssl_trusted_certificate for ssl_verify_client"
+                .to_string(),
+        );
     }
     Ok(Some(ClientAuthKey {
         client_certificate: read(&conf.client_certificate, "SSL_CTX_load_verify_locations")?,
