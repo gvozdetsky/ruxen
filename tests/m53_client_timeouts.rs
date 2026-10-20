@@ -184,3 +184,81 @@ fn stalled_reader_is_cut_off_by_send_timeout() {
 fn stalled_reader_is_cut_off_by_send_timeout_with_sendfile() {
     stalled_reader_is_cut_off(true);
 }
+
+/// The server's ESTABLISHED TCP sockets on 127.0.0.1:`port`, from
+/// /proc/net/tcp (local address, then state `01`).
+fn established_on(port: u16) -> usize {
+    let local = format!("0100007F:{port:04X}");
+    std::fs::read_to_string("/proc/net/tcp")
+        .unwrap()
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let mut f = l.split_whitespace();
+            f.nth(1) == Some(&local) && f.nth(1) == Some("01")
+        })
+        .count()
+}
+
+/// #510: the 400 for a bad request is sent under send_timeout. Clients
+/// pipeline `n` good requests and a bad one and never read: for some `n`
+/// the responses fill the buffers just before the 400, which then waits
+/// for the client. nginx closes every such connection; ruxen kept one.
+#[test]
+fn rejected_request_is_cut_off_by_send_timeout() {
+    let dir = std::env::temp_dir().join(format!("ruxen-m53-reject-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let setup = common::ports::setup_lock();
+    let [port] = common::ports::free_ports();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "events {{}}\nhttp {{ access_log off; send_timeout 1s;\n\
+             server {{ listen 127.0.0.1:{port} sndbuf=4k;\n\
+               location / {{ return 200 \"{}\"; }} }} }}\n",
+            "a".repeat(512)
+        ),
+    )
+    .unwrap();
+    let mut server = Server {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {}/ruxen.pid;", dir.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        port,
+        dir,
+    };
+    let pid_file = server.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut server.child, &pid_file, Duration::from_secs(3));
+    drop(setup);
+
+    let clients: Vec<socket2::Socket> = (0..40)
+        .map(|n| {
+            let s =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            s.set_recv_buffer_size(1024).unwrap();
+            s.connect(&std::net::SocketAddr::from(([127, 0, 0, 1], server.port)).into())
+                .unwrap();
+            let mut requests = "GET / HTTP/1.1\r\nHost: x\r\n\r\n".repeat(n);
+            requests.push_str("BAD\x01 / HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut s = s;
+            s.write_all(requests.as_bytes()).unwrap();
+            s
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while established_on(server.port) > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} connections still open",
+            established_on(server.port)
+        );
+        sleep(Duration::from_millis(100));
+    }
+    drop(clients);
+}
