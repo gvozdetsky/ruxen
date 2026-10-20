@@ -33,11 +33,16 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn start(name: &str, http: impl FnOnce(&Path) -> String) -> Server {
+/// `setup` is the port lock, taken before the test picked its ports:
+/// released only once ruxen listens, so no parallel test takes them.
+fn start(
+    name: &str,
+    setup: std::sync::MutexGuard<'static, ()>,
+    http: impl FnOnce(&Path) -> String,
+) -> Server {
     let dir = std::env::temp_dir().join(format!("ruxen-m129-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let setup = common::ports::setup_lock();
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
@@ -85,8 +90,9 @@ fn get(port: u16, path: &str) -> (u16, String) {
 #[test]
 fn https_upstreams_like_nginx() {
     let cert = common::tls::make_self_signed("backend.test");
+    let setup = common::ports::setup_lock();
     let (front, backend, plain) = (free_port(), free_port(), free_port());
-    let s = start("main", |_| {
+    let s = start("main", setup, |_| {
         format!(
             "upstream b {{ server 127.0.0.1:{backend}; keepalive 4; }}\n\
              server {{ listen 127.0.0.1:{backend} ssl;\n\
@@ -197,9 +203,10 @@ fn proxy_ssl_verify_like_nginx() {
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/tls");
     let ca_leaf = data.join("rsa.crt");
     let v1 = data.join("v1_ec.crt");
+    let setup = common::ports::setup_lock();
     let (front, signed, ca_true, old) = (free_port(), free_port(), free_port(), free_port());
     let deep = free_port();
-    let s = start("verify", |dir| {
+    let s = start("verify", setup, |dir| {
         let (deep_crt, deep_key, root) = chain_with_intermediate(dir, "deep.test");
         format!(
             "server {{ listen 127.0.0.1:{signed} ssl;\n\
@@ -290,8 +297,9 @@ fn proxy_ssl_verify_like_nginx() {
 fn pooled_connections_keep_their_verification() {
     let chain = common::tls::make_ca_and_leaf("backend.test");
     let other = common::tls::make_ca_and_leaf("backend.test");
+    let setup = common::ports::setup_lock();
     let (front, backend) = (free_port(), free_port());
-    let s = start("pool-verify", |_| {
+    let s = start("pool-verify", setup, |_| {
         format!(
             "upstream b {{ server 127.0.0.1:{backend}; keepalive 4; }}\n\
              server {{ listen 127.0.0.1:{backend} ssl;\n\
@@ -429,8 +437,9 @@ fn upgrade_through_an_https_upstream() {
             tls.flush().unwrap();
         }
     });
+    let setup = common::ports::setup_lock();
     let front = free_port();
-    let _s = start("upgrade", |_| {
+    let _s = start("upgrade", setup, |_| {
         format!(
             "server {{ listen 127.0.0.1:{front};\n\
                location / {{ proxy_pass https://127.0.0.1:{backend};\n\
@@ -539,8 +548,9 @@ fn client_certificates_to_upstreams() {
             let _ = tls.flush();
         }
     });
+    let setup = common::ports::setup_lock();
     let front = free_port();
-    let _s = start("client-cert", |_| {
+    let _s = start("client-cert", setup, |_| {
         format!(
             "server {{ listen 127.0.0.1:{front};\n\
                proxy_ssl_certificate {cert}; proxy_ssl_certificate_key {key};\n\

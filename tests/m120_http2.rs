@@ -33,11 +33,16 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn start(name: &str, http: impl FnOnce(&Path) -> String) -> Server {
+/// `setup` is the port lock, taken before the test picked its ports:
+/// released only once ruxen listens, so no parallel test takes them.
+fn start(
+    name: &str,
+    setup: std::sync::MutexGuard<'static, ()>,
+    http: impl FnOnce(&Path) -> String,
+) -> Server {
     let dir = std::env::temp_dir().join(format!("ruxen-m120-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html")).unwrap();
-    let setup = common::ports::setup_lock();
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
@@ -90,8 +95,9 @@ fn curl(args: &[&str]) -> (String, String) {
 
 #[test]
 fn cleartext_http2_with_prior_knowledge() {
+    let setup = common::ports::setup_lock();
     let (port, backend) = (free_port(), free_port());
-    let s = start("h2c", |dir| {
+    let s = start("h2c", setup, |dir| {
         std::fs::write(dir.join("html/index.html"), "static\n").unwrap();
         // More than the 64 KiB initial stream window.
         std::fs::write(dir.join("html/big.bin"), vec![b'x'; 300_000]).unwrap();
@@ -150,9 +156,10 @@ fn cleartext_http2_with_prior_knowledge() {
 #[test]
 fn http2_over_tls_through_alpn() {
     let certs = common::tls::make_self_signed("localhost");
+    let setup = common::ports::setup_lock();
     let (port, plain) = (free_port(), free_port());
     let (cert, key) = (certs.cert_path().to_owned(), certs.key_path().to_owned());
-    let _s = start("tls", |dir| {
+    let _s = start("tls", setup, |dir| {
         std::fs::write(dir.join("html/index.html"), "static\n").unwrap();
         format!(
             "ssl_certificate {c}; ssl_certificate_key {k};\n\
