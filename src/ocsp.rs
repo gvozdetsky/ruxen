@@ -12,6 +12,10 @@
 //!   `ssl_stapling_verify`) and says `good` is stapled until its
 //!   nextUpdate, and fetched again 5 minutes before that, at least every
 //!   hour; after a failure, in 5 minutes.
+//! - The responder's host is resolved at startup, and again for each
+//!   fetch with the server's `resolver` (ngx_ssl_ocsp_request); without
+//!   one, a fetch warns and uses the startup addresses. An IPv4 address
+//!   is used as written.
 //!
 //! One `Stapling` per certificate of a server, shared by the workers. The
 //! fetch runs on the worker whose handshake started it, as a task of its
@@ -20,7 +24,7 @@
 //! `Arc`, and only for certificates that staple.
 
 use std::ffi::{CStr, c_char, c_int, c_long, c_ulong, c_void};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -75,6 +79,9 @@ struct Fetch {
     store: Arc<Store>,
     verify: bool,
     responder: Responder,
+    /// The server's `resolver` and `resolver_timeout`.
+    resolver: Option<&'static crate::resolver::Resolver>,
+    resolver_timeout: Duration,
     /// The certificate file, for log lines.
     name: String,
 }
@@ -83,6 +90,8 @@ struct Responder {
     /// As written in the URL, for `Host` and log lines.
     host: String,
     uri: String,
+    port: u16,
+    /// As resolved at startup.
     addrs: Vec<SocketAddr>,
 }
 
@@ -93,6 +102,8 @@ pub struct Settings<'a> {
     pub responder: Option<&'a str>,
     pub verify: bool,
     pub store: Arc<Store>,
+    pub resolver: Option<&'static crate::resolver::Resolver>,
+    pub resolver_timeout: Duration,
 }
 
 impl Stapling {
@@ -161,6 +172,8 @@ impl Stapling {
                 store: settings.store.clone(),
                 verify: settings.verify,
                 responder,
+                resolver: settings.resolver,
+                resolver_timeout: settings.resolver_timeout,
                 name,
             }),
             loading: AtomicBool::new(false),
@@ -271,7 +284,8 @@ impl Fetch {
                 return None;
             }
         };
-        for &addr in &self.responder.addrs {
+        let addrs = self.responder_addrs().await?;
+        for addr in addrs {
             // A connection like an upstream's (ngx_event_connect_peer):
             // with none left, the fetch fails.
             let _slot = crate::worker::take_upstream_slot()?;
@@ -282,6 +296,34 @@ impl Fetch {
             }
         }
         None
+    }
+
+    /// Where this fetch connects (ngx_ssl_ocsp_request): an IPv4 address
+    /// as written (ngx_resolve_start's quick path), else what the
+    /// server's `resolver` answers now, else the startup addresses, with
+    /// a warning. `None` after logging why the name gave none.
+    async fn responder_addrs(&self) -> Option<Vec<SocketAddr>> {
+        let host = &self.responder.host;
+        if host.parse::<Ipv4Addr>().is_ok() {
+            return Some(self.responder.addrs.clone());
+        }
+        let Some(resolver) = self.resolver else {
+            let line = format!("no resolver defined to resolve {host}");
+            self.log(ErrorLogLevel::Warn, &line, None);
+            return Some(self.responder.addrs.clone());
+        };
+        match crate::resolver::resolve(resolver, host.as_bytes(), self.resolver_timeout).await {
+            Ok(ips) => Some(
+                ips.into_iter()
+                    .map(|ip| SocketAddr::new(ip, self.responder.port))
+                    .collect(),
+            ),
+            Err(failure) => {
+                let line = format!("{host} could not be resolved ({failure})");
+                self.log(ErrorLogLevel::Error, &line, None);
+                None
+            }
+        }
     }
 
     /// One try at `addr`: the status code and the body, or what went
@@ -698,6 +740,7 @@ fn parse_responder(url: &str) -> Result<Responder, (&'static str, String)> {
     Ok(Responder {
         host: host.to_string(),
         uri: if uri.is_empty() { "/" } else { uri }.to_string(),
+        port,
         addrs,
     })
 }
