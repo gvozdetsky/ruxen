@@ -1507,6 +1507,7 @@ pub fn run(
         let own: Vec<_> = adopted.iter().map(|(_, fd)| fd.as_raw_fd()).collect();
         super::listeners::inherited_fds(&own)
     });
+    let inherited_on_panic = inherited.clone();
     if let Some(c) = cpu {
         // Pin before building the runtime so io_uring setup + the submission
         // queue end up on the target CPU's kernel workers too.
@@ -1557,6 +1558,14 @@ pub fn run(
         if test_panic() == TestPanic::Worker {
             panic!("{TEST_PANIC_ENV}=worker");
         }
+        if test_panic() == TestPanic::Later
+            && std::thread::current().name() == Some("ruxen-worker-1")
+        {
+            monoio::spawn(async {
+                monoio::time::sleep(Duration::from_secs(1)).await;
+                panic!("{TEST_PANIC_ENV}=later");
+            });
+        }
 
         if listeners.len() == 1 && unix_listeners.is_empty() {
             // Single-listen fast path: keep the accept loop in this top-level
@@ -1600,7 +1609,7 @@ pub fn run(
                         );
                     }
                     Ok(None) => {}
-                    Err(e) => accept_failed(http, &e).await,
+                    Err(e) => accept_failed(http, state, &e).await,
                 }
             }
         } else {
@@ -1648,7 +1657,9 @@ pub fn run(
             .with_entries(4096)
             .build()
         {
-            Ok(mut rt) => rt.block_on(body),
+            Ok(mut rt) => {
+                end_connections_on_panic(inherited_on_panic.as_deref(), || rt.block_on(body))
+            }
             Err(e) => {
                 let _ = ready_on_failure
                     .send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
@@ -1658,12 +1669,29 @@ pub fn run(
             .enable_timer()
             .build()
         {
-            Ok(mut rt) => rt.block_on(body),
+            Ok(mut rt) => {
+                end_connections_on_panic(inherited_on_panic.as_deref(), || rt.block_on(body))
+            }
             Err(e) => {
                 let _ = ready_on_failure
                     .send(Err(format!("epoll_create() failed ({})", errno_text(&e))));
             }
         },
+    }
+}
+
+/// A worker that panicked outside a connection (where `Contained` doesn't
+/// catch it) shuts its connections down before its thread ends, as
+/// `force_close` would, so their clients see the end at once: an io_uring
+/// keeps the operations in flight, and with them the sockets, after the
+/// thread is gone (#495). `inherited` is `None` without a private fd table,
+/// where the worker's connections can't be told apart.
+fn end_connections_on_panic(inherited: Option<&[std::os::fd::RawFd]>, run: impl FnOnce()) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        if let Some(inherited) = inherited {
+            super::listeners::shut_down_sockets(inherited);
+        }
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -1758,7 +1786,7 @@ pub(crate) async fn run_unix_listener(
                 );
             }
             Ok(None) => {}
-            Err(e) => accept_failed(http, &e).await,
+            Err(e) => accept_failed(http, state, &e).await,
         }
     }
 }
@@ -1994,7 +2022,7 @@ pub(crate) async fn run_listener(
                 );
             }
             Ok(None) => {}
-            Err(e) => accept_failed(http, &e).await,
+            Err(e) => accept_failed(http, state, &e).await,
         }
     }
 }
@@ -2340,8 +2368,13 @@ fn setsockopt_int(
 /// epoll reports a pending connection), so the worker waits 500 ms, as
 /// nginx's `accept_mutex_delay` does for EMFILE, instead of spinning. A
 /// denied `IORING_OP_ACCEPT` under an io_uring restriction policy fails
-/// that way on every call with no client at all (#280).
-pub(crate) async fn accept_failed(http: &PreparedHttp, err: &std::io::Error) {
+/// that way on every call with no client at all (#280). Nothing is said
+/// once the worker is stopping: after a worker panicked, `main` shuts the
+/// listening sockets down, which fails the accepts in flight (#495).
+pub(crate) async fn accept_failed(http: &PreparedHttp, state: &RuntimeState, err: &std::io::Error) {
+    if state.is_shutting_down() {
+        return;
+    }
     let level = match err.raw_os_error() {
         Some(libc::EAGAIN | libc::EINTR | libc::ECANCELED) => return,
         Some(libc::ECONNABORTED) => ErrorLogLevel::Error,

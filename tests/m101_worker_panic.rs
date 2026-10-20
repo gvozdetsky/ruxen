@@ -179,3 +179,108 @@ fn m101_panic_in_a_background_task_ends_only_that_task() {
     assert!(!log.contains("exited after a panic"), "{log}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn m101_stop_after_a_worker_panic_is_bounded() {
+    // #495: worker 1 panics while downloads run on both workers. New
+    // connections are refused at once instead of waiting in a backlog
+    // nobody accepts from, the panicked worker's downloads end, and ruxen
+    // exits 1 within the default bound, though the downloads on worker 0
+    // would take minutes.
+    // The lock stays held: once ruxen closes the port, another test could
+    // take it, and the refused connect below would reach that test's server.
+    let (dir, port, _setup) = setup("later");
+    let d = dir.display();
+    std::fs::create_dir_all(dir.join("html")).unwrap();
+    std::fs::write(dir.join("html/big"), vec![b'x'; 8 << 20]).unwrap();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "worker_processes 2;\nerror_log {d}/error.log;\npid {d}/ruxen.pid;\n\
+             events {{}}\nhttp {{ access_log off;\n\
+             server {{ listen 127.0.0.1:{port}; root {d}/html; limit_rate 64k; }} }}\n"
+        ),
+    )
+    .unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .env("RUXEN_TEST_PANIC", "later")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child.0, &dir.join("ruxen.pid"), Duration::from_secs(5));
+    // Spread over both workers by the kernel; each has started when its
+    // first bytes arrive. Worker 1 panics a second after it began to accept.
+    let mut downloads: Vec<TcpStream> = (0..16)
+        .map(|_| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(s, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            let mut first = [0u8; 1];
+            assert_eq!(s.read(&mut first).unwrap(), 1);
+            s
+        })
+        .collect();
+    let panicked = ": worker 1 exited after a panic, stopping\n";
+    let started = std::time::Instant::now();
+    while !std::fs::read_to_string(dir.join("error.log"))
+        .unwrap_or_default()
+        .contains(panicked)
+    {
+        assert!(started.elapsed() < Duration::from_secs(5), "no panic");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stopping = std::time::Instant::now();
+    // Refused, not queued.
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+            other => assert!(
+                stopping.elapsed() < Duration::from_secs(1),
+                "still accepting connections: {other:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The panicked worker's downloads end at once; the others go on.
+    for s in &downloads {
+        s.set_nonblocking(true).unwrap();
+    }
+    let mut ended = vec![false; downloads.len()];
+    let mut buf = vec![0u8; 1 << 16];
+    while stopping.elapsed() < Duration::from_millis(1500) {
+        for (s, ended) in downloads.iter_mut().zip(&mut ended) {
+            while !*ended {
+                match s.read(&mut buf) {
+                    Ok(0) => *ended = true,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => *ended = true,
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ended = ended.iter().filter(|&&e| e).count();
+    assert!(ended > 0 && ended < downloads.len(), "{ended} ended");
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            stopping.elapsed() < Duration::from_secs(10),
+            "still running after the panic"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(1));
+    // The downloads on worker 0 kept the server up until the bound.
+    assert!(stopping.elapsed() >= Duration::from_secs(4));
+    assert!(!dir.join("ruxen.pid").exists(), "pid file left behind");
+    drop(downloads);
+    let _ = std::fs::remove_dir_all(&dir);
+}

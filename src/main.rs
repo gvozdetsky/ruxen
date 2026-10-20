@@ -60,6 +60,12 @@ static SIGUSR1_SEEN: AtomicBool = AtomicBool::new(false);
 /// leaves without them.
 const FORCED_EXIT_AFTER: Duration = Duration::from_secs(1);
 
+/// How long the other workers get to finish their requests after a worker
+/// panicked, or `worker_shutdown_timeout` if shorter (#495). The listening
+/// sockets are closed by then, so the stop is downtime until the supervisor
+/// starts ruxen again.
+const PANIC_STOP_AFTER: Duration = Duration::from_secs(5);
+
 #[cfg(unix)]
 const SIGHUP: i32 = 1;
 #[cfg(unix)]
@@ -578,6 +584,10 @@ impl Master {
                             &format!("worker {i} exited after a panic, stopping"),
                         );
                         self.begin_shutdown();
+                        // Refused, not queued for nobody, while the others
+                        // finish (#495).
+                        self.listeners.close();
+                        quit_at.get_or_insert_with(Instant::now);
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -592,8 +602,13 @@ impl Master {
             // (ngx_shutdown_timer_handler), their requests end as on a
             // closed peer and are logged, and the workers then exit. The
             // workers here shut their sockets down the same way (`drain`).
+            let limit = match self.settings.shutdown_timeout {
+                _ if !worker_panicked => self.settings.shutdown_timeout,
+                Some(limit) => Some(limit.min(PANIC_STOP_AFTER)),
+                None => Some(PANIC_STOP_AFTER),
+            };
             let timed_out = matches!(
-                (quit_at, self.settings.shutdown_timeout),
+                (quit_at, limit),
                 (Some(at), Some(limit)) if Instant::now().duration_since(at) >= limit
             );
             if timed_out && forced_at.is_none() {
@@ -624,7 +639,7 @@ impl Master {
                 // them on their way out.
                 worker::logbuf::flush_at_exit();
                 self.listeners.remove_unix_files();
-                std::process::exit(0);
+                std::process::exit(if worker_panicked { 1 } else { 0 });
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
                 self.begin_shutdown();

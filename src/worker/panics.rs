@@ -3,9 +3,11 @@
 //! catches the unwind, and the worker carries on with its other
 //! connections. The panic hook writes the message and where it happened to
 //! the error log at `alert`, not only to stderr. A panic anywhere else ends
-//! the worker thread; `main` then stops the other workers gracefully,
-//! removes the pid file and exits with status 1, for systemd's `Restart=`
-//! to take over. Respawning the worker in place, as nginx's master does,
+//! the worker thread, which shuts its connections down first; `main` then
+//! closes the listening sockets, so new connections are refused, stops the
+//! other workers gracefully for at most 5 s (or `worker_shutdown_timeout`
+//! if shorter), removes the pid file and exits with status 1, for systemd's
+//! `Restart=` to take over (#495). Respawning the worker in place, as nginx's master does,
 //! would mean binding its listeners again after the switch to `user`,
 //! which can't bind ports below 1024.
 
@@ -21,8 +23,10 @@ use super::{PreparedHttp, write_worker_log};
 /// Set to make ruxen panic on purpose, for the tests of what then happens:
 /// `trace` panics while serving a TRACE request (a path nothing else
 /// takes, since TRACE is always refused), `worker` panics each worker once
-/// it is ready to accept, `task` panics in the flush timer of a buffered
-/// `access_log` (a task outside any connection, #496). Read once.
+/// it is ready to accept, `later` panics worker 1 one second after it
+/// starts accepting, from a task of its own, while the others keep serving
+/// (#495), `task` panics in the flush timer of a buffered `access_log` (a
+/// task outside any connection, #496). Read once.
 pub const TEST_PANIC_ENV: &str = "RUXEN_TEST_PANIC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +34,7 @@ pub(crate) enum TestPanic {
     Off,
     Trace,
     Worker,
+    Later,
     Task,
 }
 
@@ -38,6 +43,7 @@ pub(crate) fn test_panic() -> TestPanic {
     *MODE.get_or_init(|| match std::env::var(TEST_PANIC_ENV).as_deref() {
         Ok("trace") => TestPanic::Trace,
         Ok("worker") => TestPanic::Worker,
+        Ok("later") => TestPanic::Later,
         Ok("task") => TestPanic::Task,
         _ => TestPanic::Off,
     })
