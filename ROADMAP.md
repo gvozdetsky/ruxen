@@ -58,7 +58,7 @@ A written compatibility statement (what is supported, and where ruxen deliberate
 
 ## Releases
 
-Minor versions (v0.2.0, v0.3.0) are the milestones above, and the plan is made there. Patch releases in between (v0.1.x, v0.2.x) have no milestone and no scope of their own: each is a snapshot of `main`, cut when there is a reason, such as a security fix, a regression, or enough user-visible change. `main` stays releasable because a feature reaches the directive allowlist and `-V` only together with its implementation.
+Minor versions (v0.2.0, v0.3.0) are the milestones above, and the plan is made there. Patch releases in between (v0.2.1, v0.2.2, …) have milestones too, which order the work that comes next, mostly fixes, hardening and small compatibility items (since 0.2.0, the audit in #529). Each release is still a snapshot of `main`, cut when there is a reason, such as a security fix, a regression, or a finished patch milestone; what isn't done moves to the next one. `main` stays releasable because a feature reaches the directive allowlist and `-V` only together with its implementation.
 
 ## How progress is measured
 
