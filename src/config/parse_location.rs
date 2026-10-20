@@ -213,6 +213,14 @@ pub(crate) fn parse_location_spec(args: &[String]) -> Result<LocationSpec, Error
     match args {
         [] => Err(Error::MissingArg("location pattern")),
         [single] => {
+            // A modifier written against the pattern (`location ~\.php$`,
+            // `location =/x`) is read off its front, as nginx's
+            // `ngx_http_core_location` does with a single argument (#577).
+            for modifier in ["=", "^~", "~*", "~"] {
+                if let Some(pattern) = single.strip_prefix(modifier) {
+                    return parse_location_spec(&[modifier.to_string(), pattern.to_string()]);
+                }
+            }
             if single.starts_with('@') {
                 if single.len() == 1 {
                     return Err(Error::BadValue {
