@@ -834,22 +834,37 @@ impl EntryParts<'_> {
     }
 }
 
-/// A cached response read back.
+/// What a hit reads first: the fixed header, the key, `Vary` and the
+/// upstream's head, and a small body with them. A longer body stays in the
+/// file, sent from it (ngx_http_file_cache_read reads `body_start` bytes,
+/// ngx_http_cache_send sends the rest as a file buffer).
+const FIRST_READ: usize = 16 * 1024;
+
+/// A cached response read back: its header in memory, its body in the
+/// file, which stays open so that an eviction or a newer response renamed
+/// over it doesn't change what this hit sends.
 pub struct Entry {
     pub valid_sec: i64,
     pub updating_sec: i64,
     pub error_sec: i64,
+    /// The file's start, through the head at least.
     bytes: Vec<u8>,
     variant: CacheHash,
     vary: (usize, usize),
     head: (usize, usize),
-    body: (usize, usize),
+    /// The body's offset in the file, and its length.
+    body: (u64, u64),
+    file: std::fs::File,
 }
 
 impl Entry {
     /// The file for `key`, if it is one of ours and holds that key.
     pub fn read(path: &Path, key: &[u8]) -> Option<Entry> {
-        let bytes = std::fs::read(path).ok()?;
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let size = file.metadata().ok()?.len();
+        let mut bytes = vec![0u8; (size as usize).min(FIRST_READ)];
+        file.read_exact(&mut bytes).ok()?;
         if bytes.len() < FIXED + 16 || &bytes[..4] != MAGIC {
             return None;
         }
@@ -861,14 +876,23 @@ impl Entry {
         let key_len = u32_at(28);
         let vary_len = u32_at(32);
         let head_len = u32_at(36);
-        let body_len = i64_at(40) as usize;
+        let body_len = i64_at(40) as u64;
         let mut variant = [0u8; 16];
         variant.copy_from_slice(&bytes[FIXED..FIXED + 16]);
         let key_at = FIXED + 16;
         let vary_at = key_at.checked_add(key_len)?;
         let head_at = vary_at.checked_add(vary_len)?;
         let body_at = head_at.checked_add(head_len)?;
-        if body_at.checked_add(body_len)? != bytes.len() || &bytes[key_at..vary_at] != key {
+        if (body_at as u64).checked_add(body_len)? != size {
+            return None;
+        }
+        // A head longer than the first read: the rest of it.
+        if body_at > bytes.len() {
+            let have = bytes.len();
+            bytes.resize(body_at, 0);
+            file.read_exact(&mut bytes[have..]).ok()?;
+        }
+        if &bytes[key_at..vary_at] != key {
             return None;
         }
         Some(Entry {
@@ -878,8 +902,9 @@ impl Entry {
             variant,
             vary: (vary_at, head_at),
             head: (head_at, body_at),
-            body: (body_at, bytes.len()),
+            body: (body_at as u64, body_len),
             bytes,
+            file,
         })
     }
 
@@ -887,12 +912,28 @@ impl Entry {
         &self.bytes[self.head.0..self.head.1]
     }
 
-    pub fn body(&self) -> &[u8] {
-        &self.bytes[self.body.0..self.body.1]
+    pub fn body_len(&self) -> u64 {
+        self.body.1
     }
 
+    /// The body, when the first read got it whole.
+    pub fn body_in_memory(&self) -> Option<&[u8]> {
+        let at = self.body.0 as usize;
+        (self.bytes.len() as u64 == self.body.0 + self.body.1).then(|| &self.bytes[at..])
+    }
+
+    /// The body as a part of the open file.
+    pub fn into_file_body(self) -> crate::phase::FileBody {
+        crate::phase::FileBody {
+            fd: self.file.into(),
+            offset: self.body.0,
+            len: self.body.1,
+        }
+    }
+
+    /// The file's size.
     pub fn len(&self) -> u64 {
-        self.bytes.len() as u64
+        self.body.0 + self.body.1
     }
 
     /// `Last-Modified` and `ETag` to revalidate with, kept only for 200 and
@@ -1441,7 +1482,7 @@ mod tests {
         assert_eq!(z.lookup(&hash, 1, NOW), Lookup::Hit);
         let entry = Entry::read(&path, key).unwrap();
         assert_eq!(entry.head(), b"HTTP/1.1 200 OK\r\nX-A: 1");
-        assert_eq!(entry.body(), b"body");
+        assert_eq!(entry.body_in_memory(), Some(&b"body"[..]));
         assert!(Entry::read(&path, b"other").is_none());
         let stale = z.lookup(&hash, 1, NOW + 61);
         let Lookup::Stale {

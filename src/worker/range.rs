@@ -1,5 +1,6 @@
-//! nginx's range filter (`ngx_http_range_filter_module`) over a response
-//! held whole in memory: a proxied response (#370) or a cached one. Static
+//! nginx's range filter (`ngx_http_range_filter_module`) over a proxied
+//! response held whole in memory (#370), or a cached one, whose body may
+//! be in its file (#515). Static
 //! files (`file.rs`) use its parse, multipart layout and 416 page, with the
 //! parts read from the file (#401).
 //!
@@ -254,6 +255,102 @@ pub(crate) fn relayed_head(head: Vec<u8>, max_ranges: Option<u32>) -> Vec<u8> {
     )
 }
 
+/// What the filter does to a response.
+enum Cut {
+    /// It goes out as it is.
+    Pass,
+    /// Whole, with `Accept-Ranges: bytes`.
+    Whole,
+    /// The 416 for a body of this length.
+    NotSatisfiable(u64),
+    /// These ranges of a body of this length.
+    Ranges(Ranges, u64),
+}
+
+/// nginx's range header filter over a response whose head is `head`
+/// (status line included, final CRLF not) and whose body is `body_len`
+/// bytes.
+fn decide(
+    head: &[u8],
+    body_len: u64,
+    allow: RangeAllow,
+    max_ranges: Option<u32>,
+    req: RangeRequest<'_>,
+) -> Cut {
+    if head.get(9..12) != Some(b"200") || header(head, b"transfer-encoding").is_some() {
+        return Cut::Pass;
+    }
+    let Some(len) = header(head, b"content-length")
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&l| req.head_only || l == body_len)
+    else {
+        return Cut::Pass;
+    };
+    let Some(range) = req
+        .range
+        .filter(|r| r.len() >= 7 && r[..6].eq_ignore_ascii_case(b"bytes="))
+    else {
+        return Cut::Whole;
+    };
+    // Checked above.
+    let range = &range[6..];
+    if let Some(if_range) = req.if_range {
+        let matches = if if_range.len() >= 2 && if_range.ends_with(b"\"") {
+            header(head, b"etag") == Some(if_range)
+        } else {
+            match header(head, b"last-modified") {
+                Some(lm) => {
+                    crate::file::parse_http_date(if_range).is_some()
+                        && crate::file::parse_http_date(if_range)
+                            == crate::file::parse_http_date(lm)
+                }
+                None => false,
+            }
+        };
+        if !matches {
+            return Cut::Whole;
+        }
+    }
+    let limit = match allow {
+        RangeAllow::Single => 1,
+        _ => max_ranges.map_or(u64::MAX, u64::from),
+    };
+    match parse(range, len, limit) {
+        Parsed::Declined => Cut::Whole,
+        Parsed::NotSatisfiable => Cut::NotSatisfiable(len),
+        Parsed::Ranges(ranges) => Cut::Ranges(ranges, len),
+    }
+}
+
+/// `head` with `Accept-Ranges: bytes`.
+fn with_accept_ranges(head: &[u8]) -> Vec<u8> {
+    let status_line = head.split(|&b| b == b'\n').next().unwrap_or(head);
+    let status_line = status_line.strip_suffix(b"\r").unwrap_or(status_line);
+    rebuild(
+        status_line,
+        head,
+        &[b"accept-ranges"],
+        b"\r\nAccept-Ranges: bytes",
+    )
+}
+
+/// The 206's head for the one range `[start, end)` of `len` bytes.
+fn single_head(head: &[u8], start: u64, end: u64, len: u64) -> Vec<u8> {
+    let add = format!(
+        "\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{len}",
+        end - start,
+        start,
+        end - 1
+    );
+    rebuild(
+        b"HTTP/1.1 206 Partial Content",
+        head,
+        &[b"content-length", b"content-range", b"accept-ranges"],
+        add.as_bytes(),
+    )
+}
+
 /// Run the filter over `response` (head and body). `max_ranges`: the
 /// location's `max_ranges` (`None`: no limit; 0 turns ranges off).
 /// `not_satisfiable(len, server)` builds the 416 answer (`server`: the
@@ -273,81 +370,25 @@ pub(crate) fn filter(
     };
     let head = &response[..head_end];
     let body = &response[head_end + 4..];
-    if head.get(9..12) != Some(b"200") || header(head, b"transfer-encoding").is_some() {
-        return response;
-    }
-    let Some(len) = header(head, b"content-length")
-        .and_then(|v| std::str::from_utf8(v).ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&l| req.head_only || l == body.len() as u64)
-    else {
-        return response;
-    };
-    let accept_ranges = |response: Vec<u8>| {
-        let head = &response[..head_end];
-        let status_line = head.split(|&b| b == b'\n').next().unwrap_or(head);
-        let status_line = status_line.strip_suffix(b"\r").unwrap_or(status_line);
-        let mut out = rebuild(
-            status_line,
-            head,
-            &[b"accept-ranges"],
-            b"\r\nAccept-Ranges: bytes",
-        );
-        out.extend_from_slice(&response[head_end + 4..]);
-        out
-    };
-    let Some(range) = req
-        .range
-        .filter(|r| r.len() >= 7 && r[..6].eq_ignore_ascii_case(b"bytes="))
-    else {
-        return accept_ranges(response);
-    };
-    // Checked above.
-    let range = &range[6..];
-    if let Some(if_range) = req.if_range {
-        let matches = if if_range.len() >= 2 && if_range.ends_with(b"\"") {
-            header(head, b"etag") == Some(if_range)
-        } else {
-            match header(head, b"last-modified") {
-                Some(lm) => {
-                    crate::file::parse_http_date(if_range).is_some()
-                        && crate::file::parse_http_date(if_range)
-                            == crate::file::parse_http_date(lm)
-                }
-                None => false,
-            }
-        };
-        if !matches {
-            return accept_ranges(response);
+    match decide(head, body.len() as u64, allow, max_ranges, req) {
+        Cut::Pass => response,
+        Cut::Whole => {
+            let mut out = with_accept_ranges(head);
+            out.extend_from_slice(body);
+            out
         }
-    }
-    let limit = match allow {
-        RangeAllow::Single => 1,
-        _ => max_ranges.map_or(u64::MAX, u64::from),
-    };
-    match parse(range, len, limit) {
-        Parsed::Declined => accept_ranges(response),
-        Parsed::NotSatisfiable => not_satisfiable(len, header(head, b"server").unwrap_or_default()),
-        Parsed::Ranges(ranges) if ranges.len() == 1 => {
+        Cut::NotSatisfiable(len) => {
+            not_satisfiable(len, header(head, b"server").unwrap_or_default())
+        }
+        Cut::Ranges(ranges, len) if ranges.len() == 1 => {
             let (start, end) = ranges.first;
-            let add = format!(
-                "\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{len}",
-                end - start,
-                start,
-                end - 1
-            );
-            let mut out = rebuild(
-                b"HTTP/1.1 206 Partial Content",
-                head,
-                &[b"content-length", b"content-range", b"accept-ranges"],
-                add.as_bytes(),
-            );
+            let mut out = single_head(head, start, end, len);
             if !req.head_only {
                 out.extend_from_slice(&body[start as usize..end as usize]);
             }
             out
         }
-        Parsed::Ranges(ranges) => {
+        Cut::Ranges(ranges, len) => {
             let read = |start: u64, end: u64, out: &mut Vec<u8>| {
                 out.extend_from_slice(&body[start as usize..end as usize]);
                 Ok(())
@@ -355,6 +396,60 @@ pub(crate) fn filter(
             multipart(head, len, &ranges, req.head_only, read).unwrap_or_default()
         }
     }
+}
+
+/// `filter` for a response whose body is in a file (a cache hit): one
+/// range is a part of the file, several are read for their multipart
+/// response up to `multipart_max` bytes, beyond which the body goes whole,
+/// as a static file's does (#401).
+pub(crate) fn filter_file(
+    headers: Vec<u8>,
+    body: crate::phase::FileBody,
+    allow: RangeAllow,
+    max_ranges: Option<u32>,
+    req: RangeRequest<'_>,
+    not_satisfiable: impl FnOnce(u64, &[u8]) -> Vec<u8>,
+) -> std::io::Result<crate::phase::Response> {
+    use crate::phase::{FileBody, Response};
+    if allow == RangeAllow::No || max_ranges == Some(0) {
+        return Ok(Response::File { headers, body });
+    }
+    let Some(head_end) = headers.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Ok(Response::File { headers, body });
+    };
+    let head = &headers[..head_end];
+    let whole = |body| Response::File {
+        headers: with_accept_ranges(head),
+        body,
+    };
+    Ok(match decide(head, body.len, allow, max_ranges, req) {
+        Cut::Pass => Response::File { headers, body },
+        Cut::Whole => whole(body),
+        Cut::NotSatisfiable(len) => Response::Owned(not_satisfiable(
+            len,
+            header(head, b"server").unwrap_or_default(),
+        )),
+        Cut::Ranges(ranges, len) if ranges.len() == 1 => {
+            let (start, end) = ranges.first;
+            Response::File {
+                headers: single_head(head, start, end, len),
+                body: FileBody {
+                    offset: body.offset + start,
+                    len: end - start,
+                    fd: body.fd,
+                },
+            }
+        }
+        Cut::Ranges(ranges, _) if ranges.size() > crate::file::MULTIPART_MAX => whole(body),
+        Cut::Ranges(ranges, len) => {
+            use std::os::fd::AsRawFd;
+            let fd = body.fd.as_raw_fd();
+            let read = |start: u64, end: u64, out: &mut Vec<u8>| {
+                crate::file::read_at_into(fd, body.offset + start, end - start, out)
+            };
+            Response::Owned(multipart(head, len, &ranges, req.head_only, read)?)
+        }
+    })
 }
 
 /// nginx's multipart/byteranges 206 (ngx_http_range_multipart_header,

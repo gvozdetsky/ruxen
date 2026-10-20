@@ -825,11 +825,20 @@ fn finish_proxy_response(
         report.passes_date && !matches!(upstream_resp, Response::Prebuilt(_));
     // A relayed body (#88): the head is filtered as an `Owned` response
     // with no body, then goes back with the upstream connection.
-    let (upstream_resp, relayed) = match upstream_resp {
-        Response::ProxyStream(mut body) => {
-            (Response::Owned(std::mem::take(&mut body.head)), Some(body))
+    // A body in the cache file (#515) likewise: the head is filtered,
+    // the ranges cut the file.
+    let (upstream_resp, relayed, file) = match upstream_resp {
+        Response::ProxyStream(mut body) => (
+            Response::Owned(std::mem::take(&mut body.head)),
+            Some(body),
+            None,
+        ),
+        Response::File { headers, body } if process_meta.proxy_add_trailers.is_empty() => {
+            (Response::Owned(headers), None, Some(body))
         }
-        other => (other, None),
+        // Trailers go after a chunked body built in memory.
+        Response::File { headers, body } => (read_file_body(headers, body, ctx), None, None),
+        other => (other, None, None),
     };
     // `X-Accel-Limit-Rate` is the response's `limit_rate`.
     if let Some(rate) = report.accel.as_ref().and_then(|a| a.limit_rate) {
@@ -854,12 +863,23 @@ fn finish_proxy_response(
     // The range filter (#370). nginx runs it after gzip, which then
     // leaves the response alone, and before the chunked filter writes
     // the trailers: here before `add_trailer`, on what gzip won't compress.
-    let upstream_resp = if process_meta.range_allow != super::range::RangeAllow::No
+    let (upstream_resp, file) = if process_meta.range_allow != super::range::RangeAllow::No
         && may_cut_ranges(&process_meta, ctx.http_11, ctx.headers_raw, &upstream_resp)
     {
-        range_filter(upstream_resp, relayed.is_some(), &process_meta, ctx)
+        match (upstream_resp, file) {
+            (Response::Owned(head), Some(body)) => {
+                match range_filter_file(head, body, &process_meta, ctx) {
+                    Response::File { headers, body } => (Response::Owned(headers), Some(body)),
+                    other => (other, None),
+                }
+            }
+            (upstream_resp, file) => (
+                range_filter(upstream_resp, relayed.is_some(), &process_meta, ctx),
+                file,
+            ),
+        }
     } else {
-        upstream_resp
+        (upstream_resp, file)
     };
     let response = apply_proxy_add_headers(
         upstream_resp,
@@ -869,12 +889,13 @@ fn finish_proxy_response(
         &report.upstream_headers,
         uri,
     );
-    let response = match (response, relayed) {
-        (Response::Owned(head), Some(mut body)) => {
+    let response = match (response, relayed, file) {
+        (Response::Owned(head), Some(mut body), _) => {
             body.head = head;
             Response::ProxyStream(body)
         }
-        (response, _) => response,
+        (Response::Owned(headers), _, Some(body)) => Response::File { headers, body },
+        (response, ..) => response,
     };
     // The header is filtered. A buffered body is already read, so the
     // upstream request is over; a relayed one ends after the write, where
@@ -937,6 +958,47 @@ fn range_filter(
             |len, server| super::range::not_satisfiable(len, req.head_only, server),
         )),
         other => other,
+    }
+}
+
+/// `range_filter` for a cached response whose body is in its file.
+#[cold]
+#[inline(never)]
+fn range_filter_file(
+    head: Vec<u8>,
+    body: phase::FileBody,
+    meta: &phase::ProcessMeta,
+    ctx: &phase::RequestCtx<'_>,
+) -> Response {
+    let req = super::range::RangeRequest {
+        range: ctx.range,
+        if_range: ctx.if_range,
+        head_only: matches!(ctx.method, Method::Head),
+    };
+    super::range::filter_file(
+        head,
+        body,
+        meta.range_allow,
+        meta.max_ranges,
+        req,
+        |len, server| super::range::not_satisfiable(len, req.head_only, server),
+    )
+    .unwrap_or_else(|_| internal_error_response(ctx.method))
+}
+
+/// A cached response's body read from its file after `head`, for the
+/// filters that need it in memory (`add_trailer`).
+#[cold]
+#[inline(never)]
+fn read_file_body(
+    mut head: Vec<u8>,
+    body: phase::FileBody,
+    ctx: &phase::RequestCtx<'_>,
+) -> Response {
+    use std::os::fd::AsRawFd;
+    match crate::file::read_at_into(body.fd.as_raw_fd(), body.offset, body.len, &mut head) {
+        Ok(()) => Response::Owned(head),
+        Err(_) => internal_error_response(ctx.method),
     }
 }
 
