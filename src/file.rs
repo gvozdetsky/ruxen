@@ -265,8 +265,8 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
     }
 
     // nginx's range filter: its parse, up to max_ranges ranges.
-    use crate::worker::range::{Parsed, parse_header};
-    let limit = cond.max_ranges.map_or(u64::MAX, u64::from);
+    use crate::worker::range::{Parsed, limit, parse_header};
+    let limit = limit(cond.max_ranges);
     match range.and_then(|value| parse_header(value, meta.size, limit)) {
         None | Some(Parsed::Declined) => Decision::Full,
         Some(Parsed::NotSatisfiable) => Decision::UnsatisfiableRange,
