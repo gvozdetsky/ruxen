@@ -338,6 +338,17 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
         if args.is_empty() {
             return match term {
                 Terminator::BlockClose => {
+                    // Every listen was `quic` (#593): nginx would serve
+                    // QUIC only, ruxen serves nothing; say so.
+                    if servers.is_empty()
+                        && warnings.iter().any(|w| w.starts_with(QUIC_LISTEN_IGNORED))
+                    {
+                        warnings.push(
+                            "no TCP listen is left (\"quic\" listens are ignored): \
+                             no connections will be accepted"
+                                .into(),
+                        );
+                    }
                     // After the whole block: an http-level proxy_* line
                     // below a server still applies to it, as in nginx.
                     for server in &mut servers {
@@ -2088,6 +2099,75 @@ mod tests {
             }
         "#;
         let err = parse(src).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BadValue {
+                what: "listen flag",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn listen_quic_opens_no_socket() {
+        // #593: nginx opens a UDP socket for `quic`; ruxen has no HTTP/3 and
+        // must not open a TCP one in its place. A server whose listens are
+        // all `quic` doesn't get the default `*:80` either.
+        let cfg =
+            parse("http { server { listen 127.0.0.1:28099 quic; location / { return 200 x; } } }")
+                .unwrap();
+        assert!(cfg.servers.is_empty(), "{:?}", cfg.servers);
+        assert_eq!(
+            cfg.warnings,
+            [
+                QUIC_LISTEN_IGNORED.to_string(),
+                "no TCP listen is left (\"quic\" listens are ignored): no connections will be \
+                 accepted"
+                    .to_string(),
+            ]
+        );
+        // The usual pair keeps its TLS socket; one warning per line, also
+        // for a port range.
+        let cfg = parse(
+            "http { server { listen 127.0.0.1:443 ssl; listen 127.0.0.1:443 quic reuseport;
+                             listen 127.0.0.1:8000-8003 quic;
+                             ssl_certificate a.pem; ssl_certificate_key a.key; } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.servers[0].listen.addr.port(), 443);
+        assert!(cfg.servers[0].listen.ssl);
+        assert_eq!(
+            cfg.warnings,
+            [
+                QUIC_LISTEN_IGNORED.to_string(),
+                QUIC_LISTEN_IGNORED.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn listen_quic_rejects_tcp_parameters() {
+        // ngx_http_core_listen's checks, in its order.
+        for (flags, param) in [
+            ("ssl quic", "ssl"),
+            ("quic http2", "http2"),
+            ("quic fastopen=10", "fastopen"),
+            ("quic backlog=10 deferred", "backlog"),
+            ("quic deferred", "deferred"),
+            ("quic so_keepalive=on", "so_keepalive"),
+            ("quic proxy_protocol", "proxy_protocol"),
+        ] {
+            let err = parse(&format!("http {{ server {{ listen 443 {flags}; }} }}")).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("\"listen\" directive \"{param}\" parameter is incompatible with \"quic\""),
+                "{flags}"
+            );
+        }
+        // `http3` (the nginx-quic branch's spelling) is no nginx release's
+        // parameter, and used to open a plain TCP socket too.
+        let err = parse("http { server { listen 443 http3; } }").unwrap_err();
         assert!(matches!(
             err,
             Error::BadValue {

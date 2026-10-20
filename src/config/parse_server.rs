@@ -8,6 +8,10 @@ use super::*;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+/// The `[warn]` for a `listen … quic` line, which opens no socket (#593).
+pub(crate) const QUIC_LISTEN_IGNORED: &str = "the \"quic\" parameter of the \"listen\" directive \
+     is not supported (ruxen has no HTTP/3), the listen is ignored";
+
 /// One `server {}` block, with only its own settings: the http-level ones
 /// are merged in once the whole `http {}` block is read
 /// (`parse_http_block`), as nginx's `ngx_http_merge_servers` does, so a
@@ -18,6 +22,7 @@ pub(crate) fn parse_server_block(
 ) -> Result<Vec<Server>, Error> {
     let mut client_timeouts = ClientTimeouts::default();
     let mut listens: Vec<Listen> = Vec::new();
+    let mut saw_listen = false;
     let mut ssl_certs: Vec<PathBuf> = Vec::new();
     let mut ssl_keys: Vec<PathBuf> = Vec::new();
     let mut saw_local_ssl_cert_or_key = false;
@@ -85,7 +90,11 @@ pub(crate) fn parse_server_block(
         if args.is_empty() {
             return match term {
                 Terminator::BlockClose => {
-                    if listens.is_empty() {
+                    // Only a server without any `listen` gets the default
+                    // one (ngx_http_core_server checks `cscf->listen`, set
+                    // by every `listen` line): one whose listens are all
+                    // `quic` listens nowhere.
+                    if listens.is_empty() && !saw_listen {
                         listens.push(Listen::from_addr(default_listen_addr()));
                     }
                     // Whether this server's certificates are required, and
@@ -124,9 +133,10 @@ pub(crate) fn parse_server_block(
                         Vec::new()
                     };
                     let mut listens_iter = listens.into_iter();
-                    let first_listen = listens_iter
-                        .next()
-                        .expect("a default listen is added above");
+                    let Some(first_listen) = listens_iter.next() else {
+                        // Only `quic` listens, each warned about.
+                        return Ok(Vec::new());
+                    };
                     let mut out: Vec<Server> = Vec::new();
                     out.push(Server {
                         listen: first_listen,
@@ -206,7 +216,22 @@ pub(crate) fn parse_server_block(
                 parse_mime(lx, &args, &term, &mut mime)?;
             }
             ("listen", Terminator::Semi) => {
-                listens.extend(parse_listen_range_args(&args[1..])?);
+                saw_listen = true;
+                let parsed = parse_listen_range_args(&args[1..])?;
+                // nginx opens a UDP socket for `quic` (ngx_http_core_listen
+                // sets SOCK_DGRAM). ruxen has no HTTP/3, and a TCP socket in
+                // its place would serve plain HTTP where the config means
+                // QUIC only (#593): no socket at all. The usual
+                // `listen 443 ssl; listen 443 quic;` pair keeps its TLS one.
+                if parsed.iter().any(|l| l.quic) {
+                    let mut w = QUIC_LISTEN_IGNORED.to_string();
+                    if let Some(position) = lx.position() {
+                        w.push_str(&format!(" in {position}"));
+                    }
+                    warnings.push(w);
+                } else {
+                    listens.extend(parsed);
+                }
             }
             ("ssl_certificate", Terminator::Semi) => {
                 saw_any_ssl_directive = true;
@@ -1047,7 +1072,8 @@ pub(crate) fn parse_listen_args(args: &[String]) -> Result<Listen, Error> {
             ("default_server" | "default", None) => listen.default_server = true,
             ("reuseport", None) => listen.reuseport = true,
             ("http2", None) => listen.http2 = true,
-            ("http3", None) => listen.http3 = true,
+            // No `http3`: that was the nginx-quic branch's name for `quic`;
+            // no nginx release takes it (#593).
             ("quic", None) => listen.quic = true,
             ("proxy_protocol", None) => listen.proxy_protocol = true,
             ("deferred", None) => listen.deferred = true,
@@ -1097,6 +1123,25 @@ pub(crate) fn parse_listen_args(args: &[String]) -> Result<Listen, Error> {
                     got: raw.clone(),
                 });
             }
+        }
+    }
+    if listen.quic {
+        // ngx_http_core_listen: the TCP-only parameters can't go with a
+        // UDP socket, in nginx's order.
+        let tcp_only = [
+            ("fastopen", listen.fastopen.is_some()),
+            ("backlog", listen.backlog.is_some()),
+            ("deferred", listen.deferred),
+            ("ssl", listen.ssl),
+            ("http2", listen.http2),
+            ("so_keepalive", listen.so_keepalive.is_some()),
+            ("proxy_protocol", listen.proxy_protocol),
+        ];
+        if let Some((param, _)) = tcp_only.iter().find(|(_, set)| *set) {
+            return Err(Error::Directive {
+                name: "listen",
+                msg: format!("\"{param}\" parameter is incompatible with \"quic\""),
+            });
         }
     }
     Ok(listen)

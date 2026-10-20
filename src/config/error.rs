@@ -41,6 +41,12 @@ pub enum Error {
         name: String,
         consequence: &'static str,
     },
+    /// Arguments of a directive that don't go together, as nginx's
+    /// `"listen" directive "ssl" parameter is incompatible with "quic"`.
+    Directive {
+        name: &'static str,
+        msg: String,
+    },
     /// `$name` that is neither a variable nginx knows nor one the config
     /// defines (`set`, `map`, `split_clients`, a named regex capture).
     UnknownVariable(String),
@@ -80,6 +86,7 @@ impl std::fmt::Display for Error {
                 f,
                 "\"{name}\" is not supported yet, and ignoring it is unsafe: {consequence}"
             ),
+            Error::Directive { name, msg } => write!(f, "\"{name}\" directive {msg}"),
             Error::UnknownVariable(name) => write!(f, "unknown \"{name}\" variable"),
             Error::At { error, position } => write!(f, "{error} in {position}"),
         }
