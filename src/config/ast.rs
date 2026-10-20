@@ -614,9 +614,9 @@ pub struct Listen {
     /// `http2`: HTTP/2 on this address, the nginx 1.24 spelling of
     /// `http2 on` (#144).
     pub http2: bool,
-    /// `http3` — accepted, ignored.
-    pub http3: bool,
-    /// `quic` — accepted, ignored.
+    /// `quic`: a UDP (QUIC, HTTP/3) socket in nginx. ruxen has no HTTP/3:
+    /// `parse_server_block` drops such a listen with a warning, so it never
+    /// becomes a TCP socket (#593).
     pub quic: bool,
     /// `proxy_protocol` — connections start with a PROXY protocol header.
     pub proxy_protocol: bool,
@@ -658,7 +658,6 @@ impl Listen {
             default_server: false,
             reuseport: false,
             http2: false,
-            http3: false,
             quic: false,
             proxy_protocol: false,
             deferred: false,
