@@ -165,6 +165,23 @@ impl ListenerSet {
         });
     }
 
+    /// Stop listening and close every socket, and remove the `listen unix:`
+    /// socket files, as ngx_close_listening_sockets does: new connections
+    /// are refused, and those queued are reset. Shut down first, since
+    /// closing ends a socket only with its last reference, and a worker
+    /// that died from a panic leaves its accept in flight in its io_uring,
+    /// which holds the socket after the thread is gone (#495). An accept in
+    /// flight fails then, so the workers must be stopping already.
+    pub fn close(&mut self) {
+        let sockets = self.tcp.iter().flat_map(|g| &g.slots);
+        for fd in sockets.chain(self.unix.iter().map(|(_, fd)| fd)) {
+            let _ = socket2::SockRef::from(fd).shutdown(std::net::Shutdown::Both);
+        }
+        self.remove_unix_files();
+        self.tcp.clear();
+        self.unix.clear();
+    }
+
     /// Remove the `listen unix:` socket files on exit, as
     /// ngx_close_listening_sockets does.
     pub fn remove_unix_files(&self) {
