@@ -1225,11 +1225,16 @@ pub(crate) fn warn_ignored_tls_policy(args: &[String], warnings: &mut Vec<String
 /// listens with `ssl` (the flag belongs to the socket, as in nginx). Warn
 /// only when none does: then they are ignored.
 fn warn_ssl_without_ssl_listen(servers: &[Server], mut warnings: Vec<String>) -> Vec<String> {
+    // `ssl` belongs to the listening socket: a block's ssl_* lines apply
+    // on any of its addresses that some server makes TLS.
     let ignored = servers.iter().any(|s| {
-        s.ssl_directives
-            && !servers
-                .iter()
-                .any(|other| other.listen.addr == s.listen.addr && other.listen.ssl)
+        !s.ssl_directives.is_empty()
+            && !servers.iter().any(|other| {
+                other.listen.ssl
+                    && s.ssl_directives.iter().any(|(addr, unix)| {
+                        other.listen.addr == *addr && other.listen.unix == *unix
+                    })
+            })
     });
     if ignored {
         warnings.push(
@@ -2541,6 +2546,22 @@ mod tests {
         // Nobody on the address does.
         assert!(warned(
             "http { server { listen 127.0.0.1:80; ssl_certificate b.pem; ssl_certificate_key b.key; } }"
+        ));
+        // The block's other address is TLS (#553), its own or another
+        // server's `listen … ssl`.
+        assert!(!warned(
+            "http { server { listen 127.0.0.1:80; listen 127.0.0.1:443 ssl; \
+             ssl_certificate a.pem; ssl_certificate_key a.key; } }"
+        ));
+        assert!(!warned(
+            "http { server { listen 127.0.0.1:443 ssl; ssl_certificate a.pem; ssl_certificate_key a.key; }
+                    server { listen 127.0.0.1:80; listen 127.0.0.1:443; server_name b;
+                             ssl_certificate b.pem; ssl_certificate_key b.key; } }"
+        ));
+        // Unix sockets count by path, not by their placeholder address.
+        assert!(warned(
+            "http { server { listen unix:/tmp/a.sock ssl; ssl_certificate a.pem; ssl_certificate_key a.key; }
+                    server { listen unix:/tmp/b.sock; ssl_certificate b.pem; ssl_certificate_key b.key; } }"
         ));
     }
 

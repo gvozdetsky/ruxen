@@ -118,6 +118,11 @@ pub(crate) fn parse_server_block(
                         password_file: ssl_password_file,
                         stapling,
                     };
+                    let ssl_directives = if saw_any_ssl_directive || saw_local_ssl_cert_or_key {
+                        listens.iter().map(|l| (l.addr, l.unix.clone())).collect()
+                    } else {
+                        Vec::new()
+                    };
                     let mut listens_iter = listens.into_iter();
                     let first_listen = listens_iter
                         .next()
@@ -136,7 +141,7 @@ pub(crate) fn parse_server_block(
                         keepalive_requests,
                         keepalive_time_ms,
                         keepalive_disable,
-                        ssl_directives: saw_any_ssl_directive || saw_local_ssl_cert_or_key,
+                        ssl_directives,
                         client_timeouts,
                         merge_slashes,
                         ignore_invalid_headers,

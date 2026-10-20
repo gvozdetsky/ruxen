@@ -1063,9 +1063,10 @@ pub struct Server {
     /// `client_header_timeout` / `client_body_timeout` / `send_timeout`,
     /// merged with the http-scope values.
     pub client_timeouts: ClientTimeouts,
-    /// The block has its own ssl_* lines (for the "TLS settings ignored"
-    /// warning when no server on its address listens with `ssl`).
-    pub ssl_directives: bool,
+    /// When the block has its own ssl_* lines, the addresses of all its
+    /// `listen`s (the block is one `Server` per listen): its settings are
+    /// ignored only if none of them is an `ssl` address. Empty otherwise.
+    pub ssl_directives: Vec<(SocketAddr, Option<PathBuf>)>,
     /// `merge_slashes off` disables the `//` → `/` collapse in URI
     /// normalization. `None` inherits from http scope (default `on`).
     pub merge_slashes: Option<bool>,
