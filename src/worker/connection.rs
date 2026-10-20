@@ -162,7 +162,8 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// see EOF), for a response that waits between writes: nginx's
     /// `ngx_http_test_reading` ends the request then (#383). Pending
     /// otherwise, also once bytes arrive (a pipelined request, left for
-    /// the next read). Plain TCP watches; other transports never complete.
+    /// the next read). Plain TCP and TLS watch the socket, an HTTP/2
+    /// stream its reset; other transports never complete.
     async fn peer_closed(&self) {
         std::future::pending::<()>().await
     }
@@ -320,7 +321,42 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     fn begin_tunnel(&mut self) {
         crate::tls_stream::TlsStream::begin_tunnel(self);
     }
+
+    /// The TCP socket under the TLS, as nginx checks a TLS client: on the
+    /// raw fd (#489). Bytes there don't end the watch as they do on plain
+    /// TCP, since a client that closes cleanly sends a close_notify alert
+    /// ahead of its FIN; `POLLRDHUP` sees the FIN behind them, as nginx's
+    /// `EPOLLRDHUP` does. What the stream and the socket hold stays for
+    /// the next read.
+    async fn peer_closed(&self) {
+        use std::os::unix::io::AsRawFd;
+        let io = self.io();
+        loop {
+            if io.readable(false).await.is_err() {
+                return;
+            }
+            let mut fd = libc::pollfd {
+                fd: io.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLRDHUP,
+                revents: 0,
+            };
+            // SAFETY: one pollfd of our own; a zero timeout doesn't wait.
+            let n = unsafe { libc::poll(&mut fd, 1, 0) };
+            if n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+                return;
+            }
+            if n != 0 {
+                // Bytes and no FIN yet: the readiness wait would complete
+                // at once again, so look again a while later.
+                monoio::time::sleep(PEER_RECHECK).await;
+            }
+        }
+    }
 }
+
+/// How often a TLS client with bytes waiting in its socket is checked for
+/// the FIN behind them (`peer_closed`).
+const PEER_RECHECK: Duration = Duration::from_millis(100);
 
 /// A plain TCP connection whose first bytes are already read: plain HTTP
 /// sent to an `ssl` port, read by the TLS acceptor (#384). Those bytes
@@ -886,9 +922,11 @@ pub(crate) async fn write_all_paced<S: ConnIo>(
         let n = match pacer.next(len - written) {
             Ok(n) => n,
             Err(wait) => {
+                // Boxed: TLS's watch inline would grow the response
+                // writers' futures for every response, paced or not.
                 let closed = monoio::select! {
                     _ = monoio::time::sleep(wait) => false,
-                    _ = stream.peer_closed() => true,
+                    _ = Box::pin(stream.peer_closed()) => true,
                 };
                 if closed {
                     return (Err(written), buf);
