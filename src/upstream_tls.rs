@@ -3,7 +3,7 @@
 //! `proxy_ssl_server_name on`, session reuse on, and the certificate not
 //! verified unless `proxy_ssl_verify on` (#117, `x509_verify`).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use std::path::Path;
 
@@ -196,7 +196,9 @@ pub struct VerifySettings {
 /// changed loads them again. `Err` is nginx's `[emerg]` text.
 pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::Store>, String> {
     type Key = (Vec<u8>, Option<Vec<u8>>, u32);
-    static STORES: Mutex<Vec<(Key, Arc<crate::x509_verify::Store>)>> = Mutex::new(Vec::new());
+    // Weak (#500): the prepared configurations own the stores, through
+    // their client configs, and a retired one's go with it (#343).
+    static STORES: Mutex<Vec<(Key, Weak<crate::x509_verify::Store>)>> = Mutex::new(Vec::new());
     let read = |path: &Path, call: &str| {
         crate::tls_certs::pem_file(path)
             .map(|b| b.to_vec())
@@ -215,8 +217,11 @@ pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::S
         .transpose()?;
     let key = (trusted, crl, settings.depth);
     let mut stores = STORES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, store)) = stores.iter().find(|(k, _)| *k == key) {
-        return Ok(store.clone());
+    if let Some(store) = stores
+        .iter()
+        .find_map(|(k, store)| (*k == key).then(|| store.upgrade()).flatten())
+    {
+        return Ok(store);
     }
     let mut store = crate::x509_verify::Store::new(&key.0, key.2).map_err(|e| {
         format!(
@@ -233,7 +238,8 @@ pub fn trust_store(settings: VerifySettings) -> Result<Arc<crate::x509_verify::S
         })?;
     }
     let store = Arc::new(store);
-    stores.push((key, store.clone()));
+    stores.retain(|(_, store)| store.strong_count() > 0);
+    stores.push((key, Arc::downgrade(&store)));
     Ok(store)
 }
 
@@ -259,7 +265,8 @@ fn certificate_pair(
     read_file: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Result<Arc<CertifiedKey>, String> {
     type Key = (Vec<u8>, Vec<u8>);
-    static KEYS: Mutex<Vec<(Key, Arc<CertifiedKey>)>> = Mutex::new(Vec::new());
+    // Weak, as the trust stores (#500).
+    static KEYS: Mutex<Vec<(Key, Weak<CertifiedKey>)>> = Mutex::new(Vec::new());
     let fail = |e: &dyn std::fmt::Display| {
         format!(
             "cannot load certificate \"{}\" with key \"{}\": {e}",
@@ -278,13 +285,17 @@ fn certificate_pair(
     };
     let k = (read(cert)?, read(key)?);
     let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, certified)) = keys.iter().find(|(known, _)| *known == k) {
-        return Ok(certified.clone());
+    if let Some(certified) = keys
+        .iter()
+        .find_map(|(known, certified)| (*known == k).then(|| certified.upgrade()).flatten())
+    {
+        return Ok(certified);
     }
     let certified = crate::tls_certs::parse_certified_key(&k.0, &k.1, cert, key, passwords)
         .map_err(|e| fail(&e))?;
     let certified = Arc::new(certified);
-    keys.push((k, certified.clone()));
+    keys.retain(|(_, certified)| certified.strong_count() > 0);
+    keys.push((k, Arc::downgrade(&certified)));
     Ok(certified)
 }
 
@@ -300,36 +311,29 @@ pub fn client_config(
     verify: Option<Arc<crate::x509_verify::Store>>,
     client_cert: Option<Arc<CertifiedKey>>,
 ) -> Result<Arc<ClientConfig>, String> {
-    type Key = (
-        bool,
-        bool,
-        bool,
-        bool,
-        Option<Arc<crate::x509_verify::Store>>,
-        Option<Arc<CertifiedKey>>,
-    );
-    static CONFIGS: Mutex<Vec<(Key, Arc<ClientConfig>)>> = Mutex::new(Vec::new());
-    let key = (
+    // The store and the pair by address: an entry is used only while its
+    // config is alive, which holds them, so an address can't be another's.
+    // Weak, as the stores and pairs (#500).
+    type Key = (bool, bool, bool, bool, usize, usize);
+    static CONFIGS: Mutex<Vec<(Key, Weak<ClientConfig>)>> = Mutex::new(Vec::new());
+    fn addr<T>(arc: &Option<Arc<T>>) -> usize {
+        arc.as_ref().map_or(0, |a| Arc::as_ptr(a) as usize)
+    }
+    let wanted: Key = (
         protocols.tlsv1_2,
         protocols.tlsv1_3,
         sni,
         reuse,
-        verify,
-        client_cert,
+        addr(&verify),
+        addr(&client_cert),
     );
-    fn same_arc<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
-        match (a, b) {
-            (None, None) => true,
-            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-            _ => false,
-        }
-    }
-    let same = |a: &Key, b: &Key| {
-        (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3) && same_arc(&a.4, &b.4) && same_arc(&a.5, &b.5)
-    };
+    let key = (verify, client_cert);
     let mut configs = CONFIGS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, config)) = configs.iter().find(|(k, _)| same(k, &key)) {
-        return Ok(config.clone());
+    if let Some(config) = configs
+        .iter()
+        .find_map(|(k, config)| (*k == wanted).then(|| config.upgrade()).flatten())
+    {
+        return Ok(config);
     }
     let provider = crate::tls_certs::active_provider();
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::new();
@@ -339,7 +343,7 @@ pub fn client_config(
     if protocols.tlsv1_2 {
         versions.push(&rustls::version::TLS12);
     }
-    let verifier: Arc<dyn ServerCertVerifier> = match &key.4 {
+    let verifier: Arc<dyn ServerCertVerifier> = match &key.0 {
         Some(store) => Arc::new(Verification {
             store: store.clone(),
             provider: provider.clone(),
@@ -353,7 +357,7 @@ pub fn client_config(
         .with_custom_certificate_verifier(verifier);
     // Sent when the server asks for one (a CertificateRequest), as OpenSSL
     // sends it.
-    let mut config = match &key.5 {
+    let mut config = match &key.1 {
         Some(certified) => {
             builder.with_client_cert_resolver(Arc::new(ClientCert(certified.clone())))
         }
@@ -364,7 +368,8 @@ pub fn client_config(
         config.resumption = rustls::client::Resumption::disabled();
     }
     let config = Arc::new(config);
-    configs.push((key, config.clone()));
+    configs.retain(|(_, config)| config.strong_count() > 0);
+    configs.push((wanted, Arc::downgrade(&config)));
     Ok(config)
 }
 
@@ -526,5 +531,39 @@ mod tests {
         assert_eq!(server_name(b"127.0.0.1:8443"), dns("127.0.0.1"));
         assert_eq!(server_name(b"[::1]:8443"), dns("::1"));
         assert_eq!(server_name(b"backend"), dns("backend"));
+    }
+
+    /// The caches hold their entries weakly (#500): the same files give the
+    /// same store and config while someone holds them, and once the last
+    /// holder (a retired configuration) is gone, a new one is made.
+    #[test]
+    fn caches_share_while_held_and_let_go_after() {
+        let dir = std::env::temp_dir().join(format!("ruxen-utls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = rcgen::generate_simple_self_signed(vec!["ca.test".to_string()]).unwrap();
+        let path: &'static Path = Box::leak(dir.join("ca.pem").into_boxed_path());
+        std::fs::write(path, ca.cert.pem()).unwrap();
+        let settings = || VerifySettings {
+            trusted: path,
+            depth: 1,
+            crl: None,
+        };
+        let protocols = TlsVersionSet {
+            tlsv1_2: true,
+            tlsv1_3: true,
+        };
+        let a = trust_store(settings()).unwrap();
+        let b = trust_store(settings()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let config_a = client_config(protocols, true, true, Some(a.clone()), None).unwrap();
+        let config_b = client_config(protocols, true, true, Some(b.clone()), None).unwrap();
+        assert!(Arc::ptr_eq(&config_a, &config_b));
+        // The config holds its store: dropping the configs lets both go.
+        let weak = Arc::downgrade(&a);
+        drop((a, b, config_a, config_b));
+        assert_eq!(weak.strong_count(), 0);
+        // Made again on the next call.
+        assert!(trust_store(settings()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
