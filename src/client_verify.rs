@@ -45,7 +45,7 @@ impl ClientAuth {
         match self.store.verify_client(&ders) {
             Ok(()) => ClientVerify::Success,
             Err(crate::x509_verify::Failure::Verify(code, text)) => {
-                ClientVerify::Failed(code as i64, text.into())
+                ClientVerify::Failed(code, text.into())
             }
             // X509_V_ERR_UNSPECIFIED: the chain didn't even parse.
             Err(_) => ClientVerify::Failed(1, "unspecified certificate verification error".into()),

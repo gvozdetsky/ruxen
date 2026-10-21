@@ -2020,8 +2020,8 @@ pub(crate) fn prepare_server(
     // Sort wildcard tables by descending length so the longest match
     // wins on a linear scan — mirrors nginx's hash-bucket choice
     // (`ngx_hash_combined_t`) which orders keys by suffix specificity.
-    wildcard_leading.sort_by(|a, b| b.len().cmp(&a.len()));
-    wildcard_trailing.sort_by(|a, b| b.len().cmp(&a.len()));
+    wildcard_leading.sort_by_key(|a| std::cmp::Reverse(a.len()));
+    wildcard_trailing.sort_by_key(|a| std::cmp::Reverse(a.len()));
 
     let primary_server_name: &'static [u8] = first_display.unwrap_or(b"");
 
@@ -2321,7 +2321,7 @@ pub(crate) fn prepare_server(
         }
     }
     exact.sort_by(|a, b| a.pattern.cmp(b.pattern));
-    prefix.sort_by(|a, b| b.pattern.len().cmp(&a.pattern.len()));
+    prefix.sort_by_key(|a| std::cmp::Reverse(a.pattern.len()));
     // regex_locations stay in declaration order — first match wins.
 
     // Synthesize a nameless catch-all PreparedLocation for requests the
@@ -4141,6 +4141,75 @@ pub(crate) fn prepare_try_files(
     crate::arena::leak(Box::new(PreparedTryFiles { probes, fallback }))
 }
 
+/// The effective `gzip*` settings of a location, or `None` when gzip is
+/// off there: the filter then costs one check per response.
+pub(crate) fn prepare_gzip(
+    conf: crate::config::GzipConf,
+) -> Result<Option<&'static PreparedGzip>, String> {
+    if conf.enable != Some(true) {
+        return Ok(None);
+    }
+    let mut any_type = false;
+    // nginx always compresses text/html (ngx_http_html_default_types).
+    let mut types: Vec<&'static str> = vec!["text/html"];
+    for t in conf.types.unwrap_or_default() {
+        if t == "*" {
+            any_type = true;
+        } else if !types.contains(&t.as_str()) {
+            types.push(crate::arena::leak(t.into_boxed_str()));
+        }
+    }
+    let mut disable_msie6 = false;
+    let mut patterns = Vec::new();
+    for d in conf.disable.unwrap_or_default() {
+        match d.as_str() {
+            "msie6" => disable_msie6 = true,
+            "degradation" => {}
+            _ => patterns.push(format!("(?i){d}")),
+        }
+    }
+    let disable = if patterns.is_empty() {
+        None
+    } else {
+        Some(regex::RegexSet::new(&patterns).map_err(|e| format!("gzip_disable: {e}"))?)
+    };
+    Ok(Some(crate::arena::leak(Box::new(PreparedGzip {
+        any_type,
+        types: crate::arena::leak(types.into_boxed_slice()),
+        min_length: conf.min_length.unwrap_or(20),
+        comp_level: conf.comp_level.unwrap_or(1),
+        vary: conf.vary.unwrap_or(false),
+        http_10: conf.http_version == Some(10),
+        proxied: conf.proxied.unwrap_or(crate::config::gzip_proxied::OFF),
+        disable_msie6,
+        disable,
+    }))))
+}
+
+/// `pattern` as a `RegexSet` member, with the case flag its own `Regex`
+/// was built with.
+pub(crate) fn set_pattern(pattern: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        format!("(?i:{pattern})")
+    } else {
+        pattern.to_string()
+    }
+}
+
+/// One `RegexSet` over a list of regexes nginx tries in order: the lowest
+/// matching index is the first match, found in one pass (#248). `None`
+/// for fewer than two (a set gains nothing), or if the set doesn't build
+/// (size limits): the caller then tries the regexes one by one.
+pub(crate) fn first_match_set<'a>(
+    patterns: impl IntoIterator<Item = &'a str>,
+) -> Option<regex::bytes::RegexSet> {
+    let patterns: Vec<&str> = patterns.into_iter().collect();
+    if patterns.len() < 2 {
+        return None;
+    }
+    regex::bytes::RegexSet::new(&patterns).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::without_default_port;
@@ -4262,73 +4331,4 @@ mod tests {
         };
         assert!(!p.force_ranges);
     }
-}
-
-/// The effective `gzip*` settings of a location, or `None` when gzip is
-/// off there: the filter then costs one check per response.
-pub(crate) fn prepare_gzip(
-    conf: crate::config::GzipConf,
-) -> Result<Option<&'static PreparedGzip>, String> {
-    if conf.enable != Some(true) {
-        return Ok(None);
-    }
-    let mut any_type = false;
-    // nginx always compresses text/html (ngx_http_html_default_types).
-    let mut types: Vec<&'static str> = vec!["text/html"];
-    for t in conf.types.unwrap_or_default() {
-        if t == "*" {
-            any_type = true;
-        } else if !types.contains(&t.as_str()) {
-            types.push(crate::arena::leak(t.into_boxed_str()));
-        }
-    }
-    let mut disable_msie6 = false;
-    let mut patterns = Vec::new();
-    for d in conf.disable.unwrap_or_default() {
-        match d.as_str() {
-            "msie6" => disable_msie6 = true,
-            "degradation" => {}
-            _ => patterns.push(format!("(?i){d}")),
-        }
-    }
-    let disable = if patterns.is_empty() {
-        None
-    } else {
-        Some(regex::RegexSet::new(&patterns).map_err(|e| format!("gzip_disable: {e}"))?)
-    };
-    Ok(Some(crate::arena::leak(Box::new(PreparedGzip {
-        any_type,
-        types: crate::arena::leak(types.into_boxed_slice()),
-        min_length: conf.min_length.unwrap_or(20),
-        comp_level: conf.comp_level.unwrap_or(1),
-        vary: conf.vary.unwrap_or(false),
-        http_10: conf.http_version == Some(10),
-        proxied: conf.proxied.unwrap_or(crate::config::gzip_proxied::OFF),
-        disable_msie6,
-        disable,
-    }))))
-}
-
-/// `pattern` as a `RegexSet` member, with the case flag its own `Regex`
-/// was built with.
-pub(crate) fn set_pattern(pattern: &str, case_insensitive: bool) -> String {
-    if case_insensitive {
-        format!("(?i:{pattern})")
-    } else {
-        pattern.to_string()
-    }
-}
-
-/// One `RegexSet` over a list of regexes nginx tries in order: the lowest
-/// matching index is the first match, found in one pass (#248). `None`
-/// for fewer than two (a set gains nothing), or if the set doesn't build
-/// (size limits): the caller then tries the regexes one by one.
-pub(crate) fn first_match_set<'a>(
-    patterns: impl IntoIterator<Item = &'a str>,
-) -> Option<regex::bytes::RegexSet> {
-    let patterns: Vec<&str> = patterns.into_iter().collect();
-    if patterns.len() < 2 {
-        return None;
-    }
-    regex::bytes::RegexSet::new(&patterns).ok()
 }

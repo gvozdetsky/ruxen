@@ -188,7 +188,7 @@ fn unix_now() -> u64 {
 
 /// Exactly one `Date`, directly after `Server`, within a couple of seconds
 /// of now. Returns its value.
-fn assert_current_date<'a>(head: &'a str, after_server: bool) -> &'a str {
+fn assert_current_date(head: &str, after_server: bool) -> &str {
     assert_eq!(head.matches("\r\nDate: ").count(), 1, "{head}");
     if after_server {
         let server = format!("\r\nServer: ruxen/{}\r\nDate: ", env!("CARGO_PKG_VERSION"));

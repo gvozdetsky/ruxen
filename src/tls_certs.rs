@@ -428,10 +428,10 @@ impl ServerNameResolver {
             if &normalized == suffix {
                 return Self::select(slot, schemes);
             }
-            if let Some(prefix) = normalized.strip_suffix(suffix.as_str()) {
-                if prefix.ends_with('.') {
-                    return Self::select(slot, schemes);
-                }
+            if let Some(prefix) = normalized.strip_suffix(suffix.as_str())
+                && prefix.ends_with('.')
+            {
+                return Self::select(slot, schemes);
             }
         }
         // Then, as for `Host` (and nginx's ngx_http_find_virtual_server):
@@ -461,10 +461,10 @@ impl ServerNameResolver {
 impl ResolvesServerCert for ServerNameResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let schemes = client_hello.signature_schemes();
-        if let Some(name) = client_hello.server_name() {
-            if let Some(found) = self.lookup(name, schemes) {
-                return Some(found.for_handshake());
-            }
+        if let Some(name) = client_hello.server_name()
+            && let Some(found) = self.lookup(name, schemes)
+        {
+            return Some(found.for_handshake());
         }
         Self::select(&self.default, schemes).map(ServerKey::for_handshake)
     }

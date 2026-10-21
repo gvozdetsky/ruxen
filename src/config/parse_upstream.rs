@@ -18,13 +18,13 @@ use std::net::SocketAddr;
 /// at the end of `parse()` so `ruxen -t` catches typos before startup.
 pub(crate) fn validate_proxy_upstream_refs(http: &HttpConfig) -> Result<(), Error> {
     fn walk(loc: &Location, names: &[&str]) -> Result<(), Error> {
-        if let Handler::Proxy(ProxyPass::UpstreamRef { name, .. }) = &loc.handler {
-            if !names.iter().any(|n| *n == name) {
-                return Err(Error::BadValue {
-                    what: "proxy_pass upstream",
-                    got: format!("undeclared upstream `{name}`"),
-                });
-            }
+        if let Handler::Proxy(ProxyPass::UpstreamRef { name, .. }) = &loc.handler
+            && !names.iter().any(|n| *n == name)
+        {
+            return Err(Error::BadValue {
+                what: "proxy_pass upstream",
+                got: format!("undeclared upstream `{name}`"),
+            });
         }
         Ok(())
     }

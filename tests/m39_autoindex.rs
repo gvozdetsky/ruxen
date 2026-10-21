@@ -111,10 +111,10 @@ fn header(resp: &[u8], name: &str) -> Option<String> {
     let head_end = s.find("\r\n\r\n")?;
     let head = &s[..head_end];
     for line in head.lines().skip(1) {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case(name) {
-                return Some(v.trim().to_string());
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case(name)
+        {
+            return Some(v.trim().to_string());
         }
     }
     None

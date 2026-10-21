@@ -229,17 +229,17 @@ fn header_value<'a>(resp: &'a [u8], name: &str) -> Option<&'a str> {
     let head_end = header_end(resp)?;
     for line in resp[..head_end - 2].split(|&b| b == b'\n').skip(1) {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            if line[..colon].eq_ignore_ascii_case(name.as_bytes()) {
-                let mut v = &line[colon + 1..];
-                while v.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
-                    v = &v[1..];
-                }
-                while v.last().is_some_and(|b| *b == b' ' || *b == b'\t') {
-                    v = &v[..v.len() - 1];
-                }
-                return std::str::from_utf8(v).ok();
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && line[..colon].eq_ignore_ascii_case(name.as_bytes())
+        {
+            let mut v = &line[colon + 1..];
+            while v.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
+                v = &v[1..];
             }
+            while v.last().is_some_and(|b| *b == b' ' || *b == b'\t') {
+                v = &v[..v.len() - 1];
+            }
+            return std::str::from_utf8(v).ok();
         }
     }
     None

@@ -106,10 +106,10 @@ fn header_value<'a>(resp: &'a [u8], name: &str) -> Option<&'a str> {
     let s = std::str::from_utf8(resp).ok()?;
     let header_end = s.find("\r\n\r\n").unwrap_or(s.len());
     for line in s[..header_end].split("\r\n").skip(1) {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case(name) {
-                return Some(v.trim());
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case(name)
+        {
+            return Some(v.trim());
         }
     }
     None

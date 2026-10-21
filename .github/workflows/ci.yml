@@ -120,6 +120,24 @@ jobs:
           docker stop ruxen-epoll
           test "$(docker inspect ruxen-epoll --format '{{.State.ExitCode}}')" = 0
 
+  clippy:
+    # Pinned: a new clippy brings new lints, which would turn CI red with
+    # no code change. Bump the version on purpose, with the fixes it asks
+    # for. The three allowed lints are structural and go in a follow-up
+    # to #152.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: >
+          cargo clippy --all-targets --locked -- -D warnings
+          -A clippy::too_many_arguments -A clippy::type_complexity
+          -A clippy::large_enum_variant
+
   msrv:
     # Keeps `rust-version` in Cargo.toml honest.
     runs-on: ubuntu-24.04

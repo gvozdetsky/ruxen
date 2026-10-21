@@ -142,10 +142,10 @@ impl Backend {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&tmp[..n]);
-                            if head_end.is_none() {
-                                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                    head_end = Some(p + 4);
-                                }
+                            if head_end.is_none()
+                                && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                head_end = Some(p + 4);
                             }
                             if let Some(he) = head_end {
                                 let cl = std::str::from_utf8(&buf[..he])
