@@ -165,8 +165,27 @@ impl AccessLogSink {
     }
 }
 
+/// A worker's first sinks: a `dup` of the file `prepare` opened (#523),
+/// else as a reopen does.
 fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AccessLogSink]>, String> {
-    logs.iter().map(open_access_log).collect()
+    logs.iter()
+        .map(|log| match log.file {
+            Some(file) => {
+                let failed = |e: std::io::Error| {
+                    format!(
+                        "dup() of \"{}\" failed ({})",
+                        log.path.display(),
+                        errno_text(&e)
+                    )
+                };
+                let own = file.try_clone().map_err(failed)?;
+                Ok(AccessLogSink::File(
+                    AsyncFile::from_std(own).map_err(failed)?,
+                ))
+            }
+            None => open_access_log(log),
+        })
+        .collect()
 }
 
 fn open_access_log(log: &PreparedAccessLog) -> Result<AccessLogSink, String> {
@@ -223,9 +242,9 @@ fn reopen_access_logs(
     reopened.unwrap_or_else(|_| old.clone())
 }
 
-/// `prepare` already opened every access_log once, so a failure here
-/// means the file changed underneath us during startup; it is reported
-/// like any other startup error.
+/// The worker's access_log sinks, from the files `prepare` opened; a
+/// failure (out of descriptors, a `syslog:` socket) is reported like any
+/// other startup error.
 pub(crate) fn init_access_logs_for_worker(logs: &[PreparedAccessLog]) -> Result<(), String> {
     if ACCESS_LOG_FILES.with(|cell| cell.borrow().1.is_some()) {
         return Ok(());

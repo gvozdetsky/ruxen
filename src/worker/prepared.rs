@@ -416,6 +416,11 @@ pub struct PreparedAddHeader {
 #[derive(Debug, Copy, Clone)]
 pub struct PreparedAccessLog {
     pub path: &'static Path,
+    /// The file `prepare` opened, once per path as nginx's master does
+    /// (`ngx_init_cycle`, `open_files`); each worker writes to a `dup` of it
+    /// (#523). Closed with the configuration. `None` for `syslog:` and a
+    /// path with variables.
+    pub file: Option<&'static std::fs::File>,
     pub format: &'static [PreparedValuePart],
     pub escape: crate::config::LogEscape,
     /// The format uses `$upstream_http_*` / `$upstream_cookie_*`, so the
