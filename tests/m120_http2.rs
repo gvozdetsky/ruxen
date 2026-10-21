@@ -312,3 +312,116 @@ fn authority_and_a_different_host_are_refused() {
     let log = std::fs::read_to_string(s.dir.join("access.log")).unwrap();
     assert!(log.contains("\"GET / HTTP/2.0\" 400"), "{log}");
 }
+
+/// GET `/` with `:authority` `a` and these fields (literals without
+/// indexing, of any length) on a connection of its own: the response's
+/// status, or the GOAWAY's error code.
+fn h2_fields(port: u16, fields: &[(&str, &str)]) -> Result<u16, u32> {
+    use std::io::{Read, Write};
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend_from_slice(&[kind, flags]);
+        f.extend_from_slice(&stream.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+    // A string literal, its length a 7-bit prefix integer (RFC 7541, 5.1).
+    fn string(block: &mut Vec<u8>, s: &str) {
+        let mut n = s.len();
+        if n < 127 {
+            block.push(n as u8);
+        } else {
+            block.push(127);
+            n -= 127;
+            while n >= 128 {
+                block.push((n % 128) as u8 | 0x80);
+                n /= 128;
+            }
+            block.push(n as u8);
+        }
+        block.extend_from_slice(s.as_bytes());
+    }
+    // :method GET, :scheme http, :path / (static table 2, 6, 4), then
+    // :authority a, its name from the static table (1).
+    let mut block = vec![0x82, 0x86, 0x84, 0x01];
+    string(&mut block, "a");
+    for (name, value) in fields {
+        block.push(0x00);
+        string(&mut block, name);
+        string(&mut block, value);
+    }
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    c.write_all(&frame(0x4, 0, 0, &[])).unwrap();
+    c.write_all(&frame(0x1, 0x5, 1, &block)).unwrap();
+    loop {
+        let mut head = [0u8; 9];
+        c.read_exact(&mut head).expect("a response or GOAWAY");
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let mut payload = vec![0; len];
+        c.read_exact(&mut payload).unwrap();
+        match head[3] {
+            // `:status` 200 and 400 are in the static table (8, 12).
+            0x1 => {
+                return Ok(match payload.first() {
+                    Some(0x88) => 200,
+                    Some(0x8c) => 400,
+                    _ => panic!("status other than 200 or 400: {payload:x?}"),
+                });
+            }
+            0x7 => return Err(u32::from_be_bytes(payload[4..8].try_into().unwrap())),
+            _ => {}
+        }
+    }
+}
+
+/// `large_client_header_buffers` on HTTP/2 (#623), as
+/// ngx_http_v2_state_field_len and ngx_http_v2_state_process_header: a
+/// name or value over the buffer size, or names and values together
+/// (pseudo-headers included) over size × number, end the connection with
+/// GOAWAY ENHANCE_YOUR_CALM. The rebuilt head's lines aren't checked: two
+/// `cookie` fields within the size are served, though joined they aren't.
+#[test]
+fn large_client_header_buffers_bound_fields_and_the_list() {
+    const ENHANCE_YOUR_CALM: u32 = 0xb;
+    let setup = common::ports::setup_lock();
+    let [field, list] = common::ports::free_ports();
+    let s = start("header-limits", setup, |_| {
+        format!(
+            "server {{ listen 127.0.0.1:{field}; http2 on; large_client_header_buffers 4 512;\n\
+               location / {{ return 200; }} }}\n\
+             server {{ listen 127.0.0.1:{list}; http2 on; large_client_header_buffers 1 512;\n\
+               location / {{ return 200; }} }}"
+        )
+    });
+
+    let x = |n| "x".repeat(n);
+    assert_eq!(h2_fields(field, &[(&x(512), "v")]), Ok(200));
+    assert_eq!(h2_fields(field, &[("n", &x(512))]), Ok(200));
+    assert_eq!(h2_fields(field, &[(&x(513), "v")]), Err(ENHANCE_YOUR_CALM));
+    assert_eq!(h2_fields(field, &[("n", &x(513))]), Err(ENHANCE_YOUR_CALM));
+    let (a, b) = (format!("a={}", x(300)), format!("b={}", x(300)));
+    assert_eq!(h2_fields(field, &[("cookie", &a), ("cookie", &b)]), Ok(200));
+
+    // :method GET 10, :scheme http 11, :path / 6, :authority a 11, and
+    // `longname` 8: 46 bytes before the value.
+    assert_eq!(h2_fields(list, &[("longname", &x(466))]), Ok(200));
+    assert_eq!(
+        h2_fields(list, &[("longname", &x(467))]),
+        Err(ENHANCE_YOUR_CALM)
+    );
+
+    let errors = std::fs::read_to_string(s.dir.join("error.log")).unwrap();
+    for message in [
+        "client sent too large header field while processing HTTP/2 connection",
+        "client sent too large header while processing HTTP/2 connection",
+    ] {
+        assert!(
+            errors
+                .lines()
+                .any(|l| l.contains("[info] ") && l.contains(message)),
+            "{errors}"
+        );
+    }
+}
