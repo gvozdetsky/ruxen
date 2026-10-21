@@ -2025,6 +2025,8 @@ pub struct PreparedHttp {
     /// `$request_body` appears in the config. If not, a body that a
     /// `return` location gets is dropped as it is read (#289).
     pub uses_request_body: bool,
+    /// `$request_id` appears in the config: each request draws one (#487).
+    pub uses_request_id: bool,
     /// An `error_log stderr` appears in the config: `-e` doesn't take over
     /// stderr (nginx's `log_use_stderr`; #309).
     pub uses_stderr_log: bool,

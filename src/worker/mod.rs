@@ -562,6 +562,29 @@ thread_local! {
 const BODY_POOL_MAX: usize = 16;
 const BODY_POOL_KEEP: usize = 256 * 1024;
 
+/// A request's `$request_id` when the config uses it (#487), else 0.
+#[inline]
+pub(crate) fn draw_request_id(http: &PreparedHttp) -> u128 {
+    if http.uses_request_id {
+        random_request_id()
+    } else {
+        0
+    }
+}
+
+/// 16 random bytes, as nginx's ngx_http_variable_request_id takes from
+/// OpenSSL's RAND_bytes; AWS-LC's here, and the kernel's should it fail.
+#[cold]
+#[inline(never)]
+fn random_request_id() -> u128 {
+    let mut bytes = [0u8; 16];
+    if aws_lc_rs::rand::fill(&mut bytes).is_err() {
+        // SAFETY: getrandom fills at most the buffer's length.
+        unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+    }
+    u128::from_ne_bytes(bytes)
+}
+
 /// An empty buffer with room for `capacity` bytes, from the pool if one is
 /// there.
 pub(crate) fn take_body_buffer(capacity: usize) -> Vec<u8> {
@@ -1125,6 +1148,7 @@ mod tests {
             underscores_in_headers: false,
             sent_headers: b"",
             connection_id: 0,
+            request_id: 0,
             connection_requests: 0,
             connection_time_us: 0,
             request_time_us: 0,
@@ -1192,6 +1216,7 @@ mod tests {
             if_range: None,
             headers_raw: b"",
             connection_id: 0,
+            request_id: 0,
             connection_requests: 0,
             connection_time_us: 0,
             request_time_us: 0,
@@ -1323,6 +1348,7 @@ mod tests {
             underscores_in_headers: false,
             sent_headers: b"",
             connection_id: 0,
+            request_id: 0,
             connection_requests: 0,
             connection_time_us: 0,
             request_time_us: 0,
@@ -1381,6 +1407,7 @@ mod tests {
             underscores_in_headers: false,
             sent_headers: b"",
             connection_id: 0,
+            request_id: 0,
             connection_requests: 0,
             connection_time_us: 0,
             request_time_us: 0,
@@ -1447,6 +1474,7 @@ mod tests {
             underscores_in_headers: false,
             sent_headers: b"",
             connection_id: 0,
+            request_id: 0,
             connection_requests: 0,
             connection_time_us: 0,
             request_time_us: 0,

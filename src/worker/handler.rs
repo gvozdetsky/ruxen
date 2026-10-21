@@ -694,6 +694,7 @@ fn location_render_ctx<'a>(
         underscores_in_headers: server.underscores_in_headers,
         sent_headers: &[],
         connection_id: req.connection_id,
+        request_id: req.request_id,
         connection_requests: req.connection_requests,
         connection_time_us: req.connection_time_us,
         request_time_us: req.request_time_us,

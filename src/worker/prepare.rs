@@ -102,6 +102,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         limit_conn_zones,
         uses_request_body_file,
         uses_request_body,
+        uses_request_id,
         uses_stderr_log,
         uses_stats,
         runtime,
@@ -385,6 +386,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         max_request_body,
         uses_request_body_file,
         uses_request_body,
+        uses_request_id,
         uses_stderr_log,
         stats: uses_stats,
         body_temp: BodyTempDir::new(client_body_temp_path),
@@ -2688,6 +2690,7 @@ fn request_constant(parts: &[ValuePart]) -> bool {
                 | Variable::RealIpRemotePort
                 | Variable::Hostname
                 | Variable::Pid
+                | Variable::RequestId
                 | Variable::Connection
                 | Variable::ConnectionRequests
                 | Variable::ServerPort

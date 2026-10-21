@@ -466,6 +466,8 @@ pub struct HttpConfig {
     pub uses_request_body_file: bool,
     /// `$request_body` appears somewhere in the config.
     pub uses_request_body: bool,
+    /// `$request_id` appears somewhere in the config (#487).
+    pub uses_request_id: bool,
     /// An `error_log stderr` appears somewhere in the config (#309).
     pub uses_stderr_log: bool,
     /// `stub_status` or a `$connections_*` variable appears in the config:
@@ -2421,6 +2423,9 @@ pub enum Variable {
     /// process, so it is the same for all of them; `kill` of it reaches
     /// the server, as of nginx's worker PID.
     Pid,
+    /// `$request_id` (#487): 16 random bytes drawn when the request
+    /// starts, as 32 lowercase hex digits.
+    RequestId,
     /// `$http_NAME` — request header lookup. Name is stored lowercased
     /// with underscores replaced by dashes so a linear scan of the raw
     /// header block compares directly.

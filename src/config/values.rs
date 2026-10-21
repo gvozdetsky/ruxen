@@ -178,6 +178,7 @@ struct VariableRegistry {
     request_body_file: bool,
     /// `$request_body` appears somewhere in the config.
     request_body: bool,
+    request_id: bool,
     /// An `error_log stderr` appears somewhere in the config (not a
     /// variable, but noted the same way, while parsing).
     stderr_log: bool,
@@ -189,6 +190,12 @@ struct VariableRegistry {
 /// a `return` location can drop a body unread (#289).
 pub(crate) fn request_body_used() -> bool {
     VARIABLES.with(|v| v.borrow().request_body)
+}
+
+/// Whether the config just parsed uses `$request_id`: if not, requests
+/// don't draw one (#487).
+pub(crate) fn request_id_used() -> bool {
+    VARIABLES.with(|v| v.borrow().request_id)
 }
 
 /// `error_log stderr` was parsed (#309).
@@ -291,7 +298,6 @@ fn is_nginx_variable(name: &str) -> bool {
         "proxy_internal_chunked",
         "quic",
         "request_completion",
-        "request_id",
         "secure_link",
         "secure_link_expires",
         "slice_range",
@@ -429,6 +435,10 @@ fn classify_builtin(name: &[u8]) -> Result<Option<Variable>, Error> {
         b"request_body" => {
             VARIABLES.with(|v| v.borrow_mut().request_body = true);
             Variable::RequestBody
+        }
+        b"request_id" => {
+            VARIABLES.with(|v| v.borrow_mut().request_id = true);
+            Variable::RequestId
         }
         b"limit_req_status" => Variable::LimitReqStatus,
         b"limit_conn_status" => Variable::LimitConnStatus,
