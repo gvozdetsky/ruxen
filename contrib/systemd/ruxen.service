@@ -20,7 +20,13 @@ Wants=network-online.target
 [Service]
 # ruxen stays in the foreground (it ignores `daemon`), so no forking and
 # no PIDFile. Its stderr, where error_log goes by default, is the journal.
-Type=exec
+# It tells systemd when it accepts (READY=1), around a reload
+# (RELOADING=1, READY=1) and when it stops (STOPPING=1).
+Type=notify
+# The watchdog: ruxen answers it only while every worker makes progress,
+# so a worker stuck in a busy loop or a blocking call (a hung NFS mount, a
+# FIFO) gets ruxen restarted, with an alert in the error log.
+WatchdogSec=30s
 ExecStartPre=/usr/local/bin/ruxen -t -q -c /etc/ruxen/ruxen.conf
 ExecStart=/usr/local/bin/ruxen -c /etc/ruxen/ruxen.conf
 # SIGHUP reloads the configuration without dropping connections, as
