@@ -345,7 +345,9 @@ fn real_main() -> Result<(), Failure> {
     // them: a failure becomes one `[emerg]` and exit 1 instead of a panic
     // per worker, and the pid file (which Test::Nginx polls for) appears
     // only once the server accepts connections.
-    let generation = Generation::start(0, http, arena, &settings, worker_listeners, &exited_tx);
+    // A failed start ends the process: nothing to free.
+    let generation = Generation::start(0, http, arena, &settings, worker_listeners, &exited_tx)
+        .map_err(|(e, _)| e);
     let mut startup_error = generation.as_ref().err().cloned();
     // The pid file goes where root may write (/run), so before the switch.
     let mut pid_written = false;
@@ -481,7 +483,7 @@ impl Generation {
         settings: &Settings,
         listeners: Vec<worker::listeners::WorkerListeners>,
         exited_tx: &std::sync::mpsc::Sender<(u64, usize, bool)>,
-    ) -> Result<Generation, String> {
+    ) -> Result<Generation, (String, Option<arena::Arena>)> {
         let state: &'static worker::RuntimeState = Box::leak(Box::default());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let mut generation = Generation {
@@ -530,8 +532,10 @@ impl Generation {
         match error {
             None => Ok(generation),
             Some(e) => {
+                // Freed by the caller once nothing reads the configuration.
+                let arena = generation.arena.take();
                 generation.stop();
-                Err(e)
+                Err((e, arena))
             }
         }
     }
@@ -777,14 +781,20 @@ impl Master {
         let loaded = thread::Builder::new()
             .name("ruxen-reload".into())
             .spawn(move || load_for_reload(&cli))
-            .map_err(|e| format!("spawning a thread failed ({e})"))
+            .map_err(|e| (format!("spawning a thread failed ({e})"), None))
             .and_then(|t| {
                 t.join()
-                    .unwrap_or_else(|_| Err("reading the configuration panicked".into()))
+                    .unwrap_or_else(|_| Err(("reading the configuration panicked".into(), None)))
             });
         let (settings, http, arena, warnings) = match loaded {
             Ok(loaded) => loaded,
-            Err(e) => return log(old_http, config::ErrorLogLevel::Emerg, &e),
+            Err((e, arena)) => {
+                // The reload thread is gone, and with it its thread locals.
+                if let Some(arena) = arena {
+                    free_failed(arena);
+                }
+                return log(old_http, config::ErrorLogLevel::Emerg, &e);
+            }
         };
         for w in &warnings {
             log(old_http, config::ErrorLogLevel::Warn, w);
@@ -793,6 +803,7 @@ impl Master {
             Ok(l) => l,
             Err(e) => {
                 http.close_root_fds();
+                free_failed(arena);
                 return log(old_http, config::ErrorLogLevel::Emerg, &e);
             }
         };
@@ -807,10 +818,13 @@ impl Master {
             &self.exited_tx,
         ) {
             Ok(g) => g,
-            Err(e) => {
+            Err((e, arena)) => {
                 self.listeners
                     .retain(self.current.http, self.current.workers);
                 http.close_root_fds();
+                if let Some(arena) = arena {
+                    free_failed(arena);
+                }
                 return log(old_http, config::ErrorLogLevel::Emerg, &e);
             }
         };
@@ -843,19 +857,20 @@ impl Master {
     }
 }
 
+/// A configuration read and prepared for a reload, and its warnings.
+type Loaded = (
+    Settings,
+    &'static worker::PreparedHttp,
+    arena::Arena,
+    Vec<String>,
+);
+
+/// Why a reload failed, and what it prepared, for `main` to free.
+type LoadFailed = (String, Option<arena::Arena>);
+
 /// Read, parse and prepare the configuration as at startup, for a reload.
-fn load_for_reload(
-    cli: &Cli,
-) -> Result<
-    (
-        Settings,
-        &'static worker::PreparedHttp,
-        arena::Arena,
-        Vec<String>,
-    ),
-    String,
-> {
-    let (main_path, file_src) = read_main_config(cli).map_err(|e| e.to_string())?;
+fn load_for_reload(cli: &Cli) -> Result<Loaded, LoadFailed> {
+    let (main_path, file_src) = read_main_config(cli).map_err(|e| (e.to_string(), None))?;
     let globals_src = (!cli.globals.is_empty()).then(|| {
         cli.globals
             .iter()
@@ -868,16 +883,30 @@ fn load_for_reload(
             })
             .collect::<String>()
     });
-    let cfg =
-        config::parse_with_main(main_path, file_src, globals_src).map_err(|e| e.to_string())?;
+    let cfg = config::parse_with_main(main_path, file_src, globals_src)
+        .map_err(|e| (e.to_string(), None))?;
     let settings = Settings::from_config(&cfg);
     let mut warnings = cfg.warnings.clone();
     arena::open();
     let prepared = worker::prepare(cfg);
-    // On an error the arena is dropped: what was leaked stays.
     let arena = arena::close();
     warnings.extend(worker::take_prepare_warnings());
-    Ok((settings, prepared?, arena, warnings))
+    match prepared {
+        Ok(prepared) => Ok((settings, prepared, arena, warnings)),
+        // `main` frees what it leaked once this thread is gone (#499).
+        Err(e) => Err((e, Some(arena))),
+    }
+}
+
+/// Free what a reload that failed prepared (#499), as nginx destroys the
+/// pools of a cycle `ngx_init_cycle` couldn't finish.
+fn free_failed(arena: arena::Arena) {
+    syslog::forget_error_log_sockets();
+    // SAFETY: no worker runs with the configuration (none was started, or
+    // they are joined), its root directories are closed, and what a later
+    // generation keeps (zone state, cache zones, the buffered log
+    // registry) is leaked outside the arena, as for a retired one.
+    unsafe { arena.free() };
 }
 
 /// Held by a worker thread: tells `main` the worker (generation, index) is
