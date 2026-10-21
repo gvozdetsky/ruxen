@@ -122,13 +122,13 @@ impl<'a> ErrorLogRequest<'a> {
 }
 
 /// `2026/10/02 14:00:00 [error] 1234#1235: ` — nginx's error-log line
-/// prefix (UTC here, like `$time_local`).
+/// prefix, in local time like `$time_local` (#614).
 fn log_line_prefix(level: ErrorLogLevel) -> Vec<u8> {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (year, mon, day, hour, minute, second) = civil_from_secs(secs);
+    let ((year, mon, day, hour, minute, second), _) = super::local_civil(secs);
     let mut stamp = *b"0000/00/00 00:00:00";
     write_u4(&mut stamp[0..4], year);
     write_u2(&mut stamp[5..7], mon + 1);
@@ -184,7 +184,7 @@ fn syslog_severity(level: ErrorLogLevel) -> u8 {
 
 /// Write one line about `req` to `sinks` (or stderr when none apply), in
 /// nginx's layout: `2026/10/02 14:00:00 [error] 1234#1235: *7 <message>,
-/// client: …`. Times are UTC, like `$time_local` here. Error paths only:
+/// client: …`. Times are local, like `$time_local`. Error paths only:
 /// the sinks are opened and written synchronously.
 pub(crate) fn write_error_log(
     sinks: &[PreparedErrorLog],

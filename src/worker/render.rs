@@ -1373,12 +1373,65 @@ pub(crate) fn civil_from_secs(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (year, mon, day_of_year as u32, hour, minute, second)
 }
 
-/// `2026-04-23T12:34:56+00:00` — UTC. nginx renders local time with the
-/// system TZ offset; ruxen always emits `+00:00`. Both shapes match the
-/// `\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d` pattern that
-/// `access_log_variables.t` checks for.
+/// The local zone's offset from UTC at `secs`, in minutes: `tm_gmtoff`
+/// from `localtime_r`, as nginx's ngx_time_update takes it (#614). Looked
+/// up once a minute per thread, so a DST change shows within the minute.
+pub(crate) fn utc_offset_minutes(secs: u64) -> i32 {
+    thread_local! {
+        static CACHED: std::cell::Cell<(u64, i32)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+    }
+    let minute = secs / 60;
+    CACHED.with(|c| {
+        let (at, offset) = c.get();
+        if at == minute {
+            return offset;
+        }
+        let offset = local_offset_minutes(secs);
+        c.set((minute, offset));
+        offset
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn local_offset_minutes(secs: u64) -> i32 {
+    let t = secs as libc::time_t;
+    // SAFETY: `localtime_r` with pointers to locals.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            0
+        } else {
+            (tm.tm_gmtoff / 60) as i32
+        }
+    }
+}
+
+/// `secs` in local time, the zone's offset applied.
+pub(crate) fn local_civil(secs: u64) -> ((u32, u32, u32, u32, u32, u32), i32) {
+    let offset = utc_offset_minutes(secs);
+    let local = (secs as i64 + i64::from(offset) * 60).max(0) as u64;
+    (civil_from_secs(local), offset)
+}
+
+/// `+hhmm` (or `+hh:mm` with `colon`) for an offset in minutes.
+fn write_offset(buf: &mut [u8], offset: i32, colon: bool) {
+    buf[0] = if offset < 0 { b'-' } else { b'+' };
+    let abs = offset.unsigned_abs();
+    write_u2(&mut buf[1..3], abs / 60);
+    let at = if colon { 4 } else { 3 };
+    write_u2(&mut buf[at..at + 2], abs % 60);
+}
+
+/// `2026-04-23T14:34:56+02:00` — local time with the zone's offset, as
+/// nginx's `cached_http_log_iso8601`.
 pub(crate) fn write_time_iso8601(out: &mut Vec<u8>, secs: u64) {
-    let (year, mon, day, hour, minute, second) = civil_from_secs(secs);
+    let (civil, offset) = local_civil(secs);
+    format_time_iso8601(out, civil, offset);
+}
+
+fn format_time_iso8601(out: &mut Vec<u8>, civil: (u32, u32, u32, u32, u32, u32), offset: i32) {
+    let (year, mon, day, hour, minute, second) = civil;
     let mut buf = *b"0000-00-00T00:00:00+00:00";
     write_u4(&mut buf[0..4], year);
     write_u2(&mut buf[5..7], mon + 1);
@@ -1386,19 +1439,23 @@ pub(crate) fn write_time_iso8601(out: &mut Vec<u8>, secs: u64) {
     write_u2(&mut buf[11..13], hour);
     write_u2(&mut buf[14..16], minute);
     write_u2(&mut buf[17..19], second);
+    write_offset(&mut buf[19..25], offset, true);
     out.extend_from_slice(&buf);
 }
 
-/// `23/Apr/2026:12:34:56 +0000` — Common Log Format date in UTC. Matches
-/// the regex `\d\d/[A-Z][a-z]{2}/\d{4}:\d\d:\d\d:\d\d [+-]\d{4}` used by
-/// `access_log_variables.t`. nginx emits local time; we emit UTC for
-/// reproducibility.
+/// `23/Apr/2026:14:34:56 +0200` — the Common Log Format date in local time
+/// with the zone's offset, as nginx's `cached_http_log_time`.
 pub(crate) fn write_time_local(out: &mut Vec<u8>, secs: u64) {
+    let (civil, offset) = local_civil(secs);
+    format_time_local(out, civil, offset);
+}
+
+fn format_time_local(out: &mut Vec<u8>, civil: (u32, u32, u32, u32, u32, u32), offset: i32) {
     const MON: [&[u8; 3]; 12] = [
         b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
         b"Dec",
     ];
-    let (year, mon, day, hour, minute, second) = civil_from_secs(secs);
+    let (year, mon, day, hour, minute, second) = civil;
     let mut buf = *b"00/Mon/0000:00:00:00 +0000";
     write_u2(&mut buf[0..2], day + 1);
     buf[3..6].copy_from_slice(MON[mon as usize]);
@@ -1406,6 +1463,7 @@ pub(crate) fn write_time_local(out: &mut Vec<u8>, secs: u64) {
     write_u2(&mut buf[12..14], hour);
     write_u2(&mut buf[15..17], minute);
     write_u2(&mut buf[18..20], second);
+    write_offset(&mut buf[21..26], offset, false);
     out.extend_from_slice(&buf);
 }
 
@@ -1429,13 +1487,14 @@ fn proxy_port(proxy_host: &[u8], tls: bool) -> &[u8] {
 }
 
 /// `Oct  5 09:04:07` — the RFC 3164 timestamp nginx puts in syslog
-/// messages (`ngx_cached_syslog_time`: the day space-padded), in UTC.
+/// messages (`ngx_cached_syslog_time`: the day space-padded), in local
+/// time.
 pub(crate) fn write_time_syslog(out: &mut Vec<u8>, secs: u64) {
     const MON: [&[u8; 3]; 12] = [
         b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
         b"Dec",
     ];
-    let (_, mon, day, hour, minute, second) = civil_from_secs(secs);
+    let ((_, mon, day, hour, minute, second), _) = local_civil(secs);
     let mut buf = *b"Mon 00 00:00:00";
     buf[0..3].copy_from_slice(MON[mon as usize]);
     write_u2(&mut buf[4..6], day + 1);
@@ -1495,5 +1554,44 @@ mod escape_uri_tests {
         let safe = b"/az-AZ_09.~!$&'()*+,;=:@[]/";
         escape_uri_into(safe, &mut out);
         assert_eq!(out, safe.to_vec());
+    }
+}
+
+#[cfg(test)]
+mod time_format_tests {
+    use super::{civil_from_secs, format_time_iso8601, format_time_local};
+
+    /// nginx's `%c%02i%02i` / `%c%02i:%02i` (#614): the sign, then hours
+    /// and minutes of the offset's absolute value.
+    #[test]
+    fn local_times_carry_the_offset() {
+        // 2026-10-21 14:00:58 UTC.
+        let secs = 1_792_591_258;
+        for (offset, local, iso) in [
+            (0, "21/Oct/2026:14:00:58 +0000", "2026-10-21T14:00:58+00:00"),
+            (
+                150,
+                "21/Oct/2026:16:30:58 +0230",
+                "2026-10-21T16:30:58+02:30",
+            ),
+            (
+                -300,
+                "21/Oct/2026:09:00:58 -0500",
+                "2026-10-21T09:00:58-05:00",
+            ),
+            (
+                -570,
+                "21/Oct/2026:04:30:58 -0930",
+                "2026-10-21T04:30:58-09:30",
+            ),
+        ] {
+            let civil = civil_from_secs((secs + i64::from(offset) * 60) as u64);
+            let mut out = Vec::new();
+            format_time_local(&mut out, civil, offset);
+            assert_eq!(String::from_utf8(out).unwrap(), local);
+            let mut out = Vec::new();
+            format_time_iso8601(&mut out, civil, offset);
+            assert_eq!(String::from_utf8(out).unwrap(), iso);
+        }
     }
 }

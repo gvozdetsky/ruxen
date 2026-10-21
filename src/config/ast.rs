@@ -2452,12 +2452,11 @@ pub enum Variable {
     BytesSent,
     /// Body bytes only — `$bytes_sent` minus the response-header size.
     BodyBytesSent,
-    /// ISO 8601 with TZ offset (`2026-04-23T12:34:56+00:00`). Always UTC
-    /// in ruxen — nginx renders local time, but the test regex (and
-    /// production log shipping) accepts any TZ offset.
+    /// ISO 8601 in local time with the zone's offset
+    /// (`2026-04-23T14:34:56+02:00`), as nginx (#614).
     TimeIso8601,
-    /// `[28/Sep/1970:06:00:00 +0000]`-style timestamp (Common Log Format
-    /// date). Always UTC in ruxen for the same reason as `time_iso8601`.
+    /// `[28/Sep/1970:08:00:00 +0200]`-style timestamp (Common Log Format
+    /// date), local time with the zone's offset, as nginx (#614).
     TimeLocal,
     /// Unix epoch with millisecond fraction (`1234567890.123`).
     Msec,
