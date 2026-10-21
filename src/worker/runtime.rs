@@ -3578,7 +3578,10 @@ pub(crate) async fn handle<S: ConnIo>(
                     Parse::Complete(req) => {
                         // Only a head longer than one line may hold: is
                         // each line within `large_client_header_buffers`?
+                        // An HTTP/2 stream's fields were checked as nginx
+                        // does when it arrived (#623); its head is rebuilt.
                         if req.consumed > timeouts.large_header_line
+                            && !stream.h2()
                             && let Some(line) = overlong_head_line(
                                 &buf[read_start..read_start + req.consumed],
                                 timeouts.large_header_line,
@@ -4854,8 +4857,16 @@ pub(crate) async fn handle<S: ConnIo>(
                 // nginx moves it into a large buffer (#482), and past that
                 // gets nginx's 414 or 400.
                 if read_start == 0 {
-                    if buf.len() < timeouts.large_header {
-                        grow_head_buffer(buf, timeouts.large_header);
+                    // An HTTP/2 stream's rebuilt head adds the request
+                    // line and `: ` and CRLF to fields within the total
+                    // (#623): the crate's bound is its limit.
+                    let limit = if stream.h2() {
+                        super::h2::max_header_list(timeouts.large_header) as usize
+                    } else {
+                        timeouts.large_header
+                    };
+                    if buf.len() < limit {
+                        grow_head_buffer(buf, limit);
                         continue;
                     }
                     head_too_large(

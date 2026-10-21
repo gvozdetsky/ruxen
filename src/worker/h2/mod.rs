@@ -113,9 +113,10 @@ where
         .initial_window_size(h2conf.body_preread_size.unwrap_or(64 * 1024))
         .initial_connection_window_size((1 << 31) - 1)
         // The decoded request head is held whole before `handle` sees it:
-        // bounded, as nginx's large_client_header_buffers bound a head
-        // (4 × 8k by default), with room for big cookies.
-        .max_header_list_size(64 * 1024)
+        // bounded, with room above large_client_header_buffers' total,
+        // which `fields_over_limit` checks, as the crate counts 32 bytes
+        // per field on top and would answer 431 first.
+        .max_header_list_size(max_header_list(timeouts.large_header))
         .handshake::<_, Bytes>(io);
     // The preface and SETTINGS come under client_header_timeout, as the
     // first request line would.
@@ -246,6 +247,25 @@ async fn drive<IO>(
         }
         match accepted {
             Some(Some(Ok((request, respond)))) => {
+                if let Some(what) =
+                    fields_over_limit(&request, timeouts.large_header_line, timeouts.large_header)
+                {
+                    // A connection error in nginx: GOAWAY, and the crate
+                    // ends the connection once it is sent.
+                    super::write_worker_log(
+                        listen.servers[listen.default_server].error_logs,
+                        super::ErrorLogLevel::Info,
+                        &format!(
+                            "*{} client sent {what} while processing HTTP/2 connection, \
+                             client: {}, server: {}",
+                            ctx.connection_id,
+                            ctx.peer_addr.ip(),
+                            listen.addr
+                        ),
+                    );
+                    conn.abrupt_shutdown(h2::Reason::ENHANCE_YOUR_CALM);
+                    continue;
+                }
                 streams.active.set(streams.active.get() + 1);
                 let counters = (started, requests);
                 let header_block = header_blocks.take(u32::from(respond.stream_id()));
@@ -305,6 +325,56 @@ async fn drive<IO>(
             going_away = true;
         }
     }
+}
+
+/// The crate's bound on a decoded request head (`max_header_list_size`):
+/// twice `large_client_header_buffers`' total, and at least 64 KiB.
+pub(crate) fn max_header_list(large_header: usize) -> u32 {
+    large_header
+        .saturating_mul(2)
+        .max(64 * 1024)
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+/// What nginx says when a request's fields are over
+/// `large_client_header_buffers` (ngx_http_v2_state_field_len,
+/// ngx_http_v2_state_process_header): a name or value longer than `field`
+/// (the buffer size), or the names and values together, pseudo-headers
+/// included, longer than `total` (size × number). nginx compares a
+/// Huffman-coded string's length as sent; the crate gives the decoded one.
+fn fields_over_limit(
+    request: &http::Request<h2::RecvStream>,
+    field: usize,
+    total: usize,
+) -> Option<&'static str> {
+    let uri = request.uri();
+    let pseudo = [
+        (":method", Some(request.method().as_str())),
+        (":scheme", uri.scheme_str()),
+        (":authority", uri.authority().map(|a| a.as_str())),
+        (":path", uri.path_and_query().map(|p| p.as_str())),
+    ];
+    let fields = pseudo
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.len(), value?.len())))
+        .chain(
+            request
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str().len(), value.len())),
+        );
+    let mut sum = 0usize;
+    for (name, value) in fields {
+        if name > field || value > field {
+            return Some("too large header field");
+        }
+        sum += name + value;
+        if sum > total {
+            return Some("too large header");
+        }
+    }
+    None
 }
 
 /// A connection's streams in progress, shared with their tasks.

@@ -195,7 +195,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
 - `h2_error_page.t` — 1/4
-- `h2_headers.t` — 0/0
+- `h2_headers.t` — 35/112
 - `h2_host.t` — 4/62
 - `h2_keepalive.t` — 3/21
 - `h2_priority.t` — 11/24
