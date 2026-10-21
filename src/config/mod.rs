@@ -3055,6 +3055,45 @@ mod tests {
         }
     }
 
+    /// `listen` takes nginx's address forms (#654): `*`, a host without a
+    /// port (port 80), a bracketed IPv6 address alone, and a host name,
+    /// one listen per address it resolves to.
+    #[test]
+    fn listen_takes_nginx_address_forms() {
+        let addrs = |listen: &str| -> Vec<String> {
+            parse(&format!(
+                "http {{ server {{ listen {listen}; location / {{ return 204; }} }} }}"
+            ))
+            .unwrap()
+            .servers
+            .iter()
+            .map(|s| s.listen.addr.to_string())
+            .collect()
+        };
+        assert_eq!(addrs("*:8000"), ["0.0.0.0:8000"]);
+        assert_eq!(addrs("*"), ["0.0.0.0:80"]);
+        assert_eq!(addrs("127.0.0.1"), ["127.0.0.1:80"]);
+        assert_eq!(addrs("[::1]"), ["[::1]:80"]);
+        assert_eq!(addrs("*:8000-8001"), ["0.0.0.0:8000", "0.0.0.0:8001"]);
+        assert!(addrs("localhost:8000").contains(&"127.0.0.1:8000".to_string()));
+        let err = parse("http { server { listen nosuch.invalid:80; location / { return 204; } } }")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("host not found in \"nosuch.invalid:80\" of the \"listen\" directive"),
+            "{err}"
+        );
+        for bad in [":80", "127.0.0.1:", "[::1]x", "[::1", "127.0.0.1:x"] {
+            assert!(
+                parse(&format!(
+                    "http {{ server {{ listen {bad}; location / {{ return 204; }} }} }}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     #[test]
     fn log_format_and_access_log_parse_at_http_scope() {
         let src = r#"

@@ -50,6 +50,12 @@ pub enum Error {
     /// One server listing an address twice, nginx's `a duplicate listen
     /// 127.0.0.1:80` (ngx_http_add_server); the address as nginx prints it.
     DuplicateListen(String),
+    /// A host name that doesn't resolve, nginx's `host not found in
+    /// "name:80" of the "listen" directive`.
+    HostNotFound {
+        url: String,
+        directive: &'static str,
+    },
     /// `$name` that is neither a variable nginx knows nor one the config
     /// defines (`set`, `map`, `split_clients`, a named regex capture).
     UnknownVariable(String),
@@ -93,6 +99,12 @@ impl std::fmt::Display for Error {
             ),
             Error::Directive { name, msg } => write!(f, "\"{name}\" directive {msg}"),
             Error::DuplicateListen(addr) => write!(f, "a duplicate listen {addr}"),
+            Error::HostNotFound { url, directive } => {
+                write!(
+                    f,
+                    "host not found in \"{url}\" of the \"{directive}\" directive"
+                )
+            }
             Error::UnknownVariable(name) => write!(f, "unknown \"{name}\" variable"),
             Error::DuplicateVariable(name) => write!(f, "the duplicate \"{name}\" variable"),
             Error::At { error, position } => write!(f, "{error} in {position}"),
