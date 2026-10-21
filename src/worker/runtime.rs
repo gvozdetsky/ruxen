@@ -3768,34 +3768,24 @@ pub(crate) async fn handle<S: ConnIo>(
                         // All offsets in `req` are relative to `view`; shift
                         // to absolute buffer offsets before indexing.
                         let base = read_start;
-                        // Copy the method into a small stack buffer up
-                        // front (from when the host was lowercased in the
-                        // read buffer; it costs a few bytes on the stack).
-                        // Methods are short ASCII tokens
-                        // (longest standardized: `OPTIONS` / `CONNECT` =
-                        // 7 bytes); 16 covers any future additions before
-                        // we'd need to revisit. Requests with a longer
-                        // method tag get clipped — they'll classify as
-                        // `Method::Other` either way and the proxy path
-                        // would forward a truncated method, which we'd
-                        // rather reject. Bound it.
+                        // Copy the method out of the read buffer up front
+                        // (from when the host was lowercased in it): onto
+                        // the stack, or, for one longer than any standard
+                        // method, to the heap; nginx has no length limit
+                        // (#485).
                         let method_len = req.method_end - req.method_start;
-                        if method_len > 16 {
-                            reject_request(
-                                stream,
-                                &mut *scratch,
-                                http,
-                                http.bad_request.pick(Method::Other),
-                                &buf[read_start..filled],
-                                conn_log!(),
-                            )
-                            .await;
-                            return;
-                        }
                         let mut method_buf: [u8; 16] = [0; 16];
-                        method_buf[..method_len]
-                            .copy_from_slice(&buf[base + req.method_start..base + req.method_end]);
-                        let method_bytes: &[u8] = &method_buf[..method_len];
+                        let long_method: Vec<u8>;
+                        let method_bytes: &[u8] = if method_len <= method_buf.len() {
+                            method_buf[..method_len].copy_from_slice(
+                                &buf[base + req.method_start..base + req.method_end],
+                            );
+                            &method_buf[..method_len]
+                        } else {
+                            long_method =
+                                buf[base + req.method_start..base + req.method_end].to_vec();
+                            &long_method
+                        };
                         let method = http::classify_method(method_bytes);
                         let method_is_post = method_bytes.eq_ignore_ascii_case(b"POST");
                         // Refused below at the server level, where its
