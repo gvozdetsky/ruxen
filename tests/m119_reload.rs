@@ -630,3 +630,58 @@ fn back_to_back_reloads_free_the_retired_configurations() {
     s.wait_threads(5);
     assert_eq!(get(port, "/").unwrap()[9..12].to_string(), "404");
 }
+
+/// The process's resident memory, in KiB.
+fn rss_kib(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap()
+}
+
+/// A reload that fails frees what it prepared (#499), as nginx destroys a
+/// failed cycle's pools: a configuration that keeps failing doesn't grow
+/// the process. Each failure here prepares a 20,000-entry `map` (some MB)
+/// before an `access_log` it can't open stops it.
+#[test]
+fn failed_reloads_free_what_they_prepared() {
+    let setup = common::ports::setup_lock();
+    let port = free_port();
+    let s = spawn("failed", "worker_processes 1;", &returning(port, "ok"));
+    drop(setup);
+    let map: String = (0..20_000).map(|i| format!("/u{i} /t{i};\n")).collect();
+    std::fs::write(s.dir.join("map.conf"), map).unwrap();
+    s.write_conf(
+        "worker_processes 1;",
+        &format!(
+            "map $uri $target {{ default \"\"; include {d}/map.conf; }}\n\
+             server {{ listen 127.0.0.1:{port};\n\
+             location / {{ access_log {d}/no-such-dir/x.log; return 200 \"bad\\n\"; }} }}",
+            d = s.dir.display()
+        ),
+    );
+    let failures = |s: &Server| s.error_log().matches("no-such-dir").count();
+    let fail_once = |s: &Server| {
+        let before = failures(s);
+        s.hup();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while failures(s) == before {
+            assert!(Instant::now() < deadline, "the reload didn't fail");
+            sleep(Duration::from_millis(20));
+        }
+    };
+    // The first few settle the allocator; growth is measured after them.
+    for _ in 0..3 {
+        fail_once(&s);
+    }
+    let before = rss_kib(s.child.id());
+    for _ in 0..20 {
+        fail_once(&s);
+    }
+    let grown = rss_kib(s.child.id()).saturating_sub(before);
+    // Kept, each failure added about 2.8 MB: some 56 MB here.
+    assert!(grown < 16 * 1024, "grew {grown} KiB over 20 failed reloads");
+    assert_eq!(body(port), "ok\n");
+}
