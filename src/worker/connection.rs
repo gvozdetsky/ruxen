@@ -1305,6 +1305,12 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
             // Trailers: zero or more header-style lines, then an empty line.
             loop {
                 let end = line_end!(1024);
+                // A bare LF or CR in a trailer line is a 400, as in nginx
+                // since 1.29.4: `0\r\n\n` must not swallow the next
+                // pipelined request as trailer lines (#578).
+                if raw[cursor..end].iter().any(|&b| b == b'\r' || b == b'\n') {
+                    return Err(Invalid);
+                }
                 let trailer_len = end - cursor;
                 trailer_bytes = trailer_bytes.saturating_add(trailer_len + 2);
                 if trailer_bytes > MAX_TRAILER_BLOCK_BYTES {
