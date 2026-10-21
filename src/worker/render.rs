@@ -609,20 +609,45 @@ pub(crate) fn write_all_request_header_values(out: &mut Vec<u8>, block: &[u8], n
 /// `underscores_in_headers` is false. nginx rejects such headers at parse
 /// time so they're invisible to `$http_*` / `$cookie_*` lookups; we apply
 /// the filter at iteration time to keep the parser policy-agnostic.
+///
+/// `$http_*` (#624): a header nginx doesn't serve from `headers_in` is
+/// found as ngx_http_variable_unknown_header compares, with the header's
+/// `-` and `_` alike, so `$http_x_foo` finds `x_foo` too; the six it
+/// does (ngx_http_core_variables) only by their own names.
 pub(crate) fn write_all_request_header_values_with_policy(
     out: &mut Vec<u8>,
     block: &[u8],
     name: &[u8],
     underscores_in_headers: bool,
 ) {
-    write_all_header_values_filtered(out, block, name, underscores_in_headers);
+    const HEADERS_IN: [&[u8]; 6] = [
+        b"host",
+        b"user-agent",
+        b"referer",
+        b"via",
+        b"x-forwarded-for",
+        b"cookie",
+    ];
+    let underscore_is_dash = underscores_in_headers && !HEADERS_IN.contains(&name);
+    write_all_header_values_matching(out, block, name, underscores_in_headers, underscore_is_dash);
 }
 
 pub(crate) fn write_all_header_values_filtered(
     out: &mut Vec<u8>,
+    block: &[u8],
+    name: &[u8],
+    underscores_in_headers: bool,
+) {
+    write_all_header_values_matching(out, block, name, underscores_in_headers, false);
+}
+
+/// `underscore_is_dash`: a header's `_` matches the `-` of `name`.
+fn write_all_header_values_matching(
+    out: &mut Vec<u8>,
     mut block: &[u8],
     name: &[u8],
     underscores_in_headers: bool,
+    underscore_is_dash: bool,
 ) {
     let sep: &[u8] = if name == b"cookie" { b"; " } else { b", " };
     let mut first = true;
@@ -643,7 +668,12 @@ pub(crate) fn write_all_header_values_filtered(
         if !underscores_in_headers && header_name.contains(&b'_') {
             continue;
         }
-        if !header_name_eq_ci(header_name, name) {
+        let matches = if underscore_is_dash {
+            header_name_eq_var(header_name, name)
+        } else {
+            header_name_eq_ci(header_name, name)
+        };
+        if !matches {
             continue;
         }
 
@@ -833,6 +863,15 @@ pub(crate) fn header_name_eq_ci(name: &[u8], target: &[u8]) -> bool {
     name.iter()
         .zip(target.iter())
         .all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+/// `header_name_eq_ci`, with an `_` in `name` matching a `-` in `target`.
+fn header_name_eq_var(name: &[u8], target: &[u8]) -> bool {
+    name.len() == target.len()
+        && name.iter().zip(target).all(|(&a, &b)| {
+            let a = a.to_ascii_lowercase();
+            a == b || (a == b'_' && b == b'-')
+        })
 }
 
 pub(crate) fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
