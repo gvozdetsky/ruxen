@@ -291,7 +291,9 @@ fn dynamic_client_config(
 /// a request line split in two (#541).
 #[cold]
 /// nginx's `r->quoted_uri`: a `%` in the path of the client's request
-/// target (not in its arguments).
+/// target (not in its arguments). Out of line, as `write_upstream_path`:
+/// inlined, both made the proxy handler slower for every request (#575).
+#[inline(never)]
 fn path_is_quoted(target: &[u8]) -> bool {
     let path = target.split(|&b| b == b'?').next().unwrap_or(target);
     path.contains(&b'%')
@@ -299,6 +301,7 @@ fn path_is_quoted(target: &[u8]) -> bool {
 
 /// The (decoded) path into the upstream request target: escaped as
 /// NGX_ESCAPE_URI, or as it is (#575).
+#[inline(never)]
 fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
     if escape {
         crate::worker::render::escape_uri_into(path, out);
