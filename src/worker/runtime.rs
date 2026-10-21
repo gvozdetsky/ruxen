@@ -72,6 +72,7 @@ pub(crate) async fn write_access_logs(
     response: &[u8],
     connection_id: u64,
     connection_requests: u64,
+    request_id: u128,
     connection_time_us: u64,
     request_time_us: u64,
     server_port: u16,
@@ -144,6 +145,7 @@ pub(crate) async fn write_access_logs(
         underscores_in_headers: false,
         sent_headers: response,
         connection_id,
+        request_id,
         connection_requests,
         connection_time_us,
         request_time_us,
@@ -486,6 +488,7 @@ async fn reject_request<S: ConnIo>(
         response,
         conn.connection_id,
         conn.connection_requests,
+        super::draw_request_id(http),
         conn.connection_start.elapsed().as_micros() as u64,
         0,
         server.listen_port,
@@ -1531,6 +1534,7 @@ async fn run_post_action(
             response_for_logs,
             base_ctx.connection_id,
             base_ctx.connection_requests,
+            base_ctx.request_id,
             base_ctx.connection_time_us,
             // Nginx's post_action runs as an internal redirect on the
             // same `r`, so its access log sees `$request_time` measured
@@ -3936,6 +3940,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         let pipe_byte: u8 = if read_start > 0 { b'p' } else { b'.' };
                         let request_line =
                             trim_crlf(&buf[base + req.method_start..base + req.headers_start]);
+                        // `$request_id`, one for the request (#487).
+                        let request_id = super::draw_request_id(http);
                         macro_rules! request_ctx {
                             ($body:expr, $body_len:expr, $body_file:expr, $request_length:expr,
                              $epoch_secs:expr, $epoch_ms:expr) => {
@@ -3959,6 +3965,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     if_range,
                                     headers_raw,
                                     connection_id,
+                                    request_id,
                                     connection_requests: request_count,
                                     connection_time_us,
                                     request_time_us,
@@ -4459,6 +4466,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     &head,
                                     connection_id,
                                     request_count,
+                                    request_id,
                                     connection_time_us,
                                     request_time_us,
                                     process_meta.server_port,
@@ -4535,6 +4543,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     logged,
                                     connection_id,
                                     request_count,
+                                    request_id,
                                     connection_time_us,
                                     request_start.elapsed().as_micros() as u64,
                                     process_meta.server_port,
@@ -4920,6 +4929,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 response_for_logs,
                                 connection_id,
                                 request_count,
+                                request_id,
                                 connection_time_us,
                                 request_time_us,
                                 process_meta.server_port,

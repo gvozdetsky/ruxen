@@ -179,6 +179,9 @@ pub struct RequestCtx<'a> {
     pub headers_raw: &'a [u8],
     /// Process-global monotonic connection id (nginx's `$connection`).
     pub connection_id: u64,
+    /// `$request_id` (#487), drawn when the request starts if the config
+    /// uses it, else 0.
+    pub request_id: u128,
     /// Requests already served on this connection before the current one
     /// (nginx's `$connection_requests`). Zero on the first request.
     pub connection_requests: u64,
@@ -2619,6 +2622,7 @@ mod tests {
             if_range: None,
             headers_raw: &[],
             connection_id: 0,
+            request_id: 0,
             connection_requests: 0,
             connection_time_us: 0,
             request_time_us: 0,

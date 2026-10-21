@@ -64,6 +64,8 @@ pub(crate) struct RenderCtx<'a> {
     pub underscores_in_headers: bool,
     pub sent_headers: &'a [u8],
     pub connection_id: u64,
+    /// `$request_id` (#487); 0 when the config doesn't use it.
+    pub request_id: u128,
     pub connection_requests: u64,
     pub connection_time_us: u64,
     pub request_time_us: u64,
@@ -352,6 +354,14 @@ impl RenderCtx<'_> {
             Variable::Hostname => out.extend_from_slice(self.hostname),
             // Read when used: a daemon's PID is its child's, after the fork.
             Variable::Pid => write_u64_decimal(out, u64::from(std::process::id())),
+            Variable::RequestId => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.extend(
+                    (0..32)
+                        .rev()
+                        .map(|i| HEX[(self.request_id >> (i * 4)) as usize & 15]),
+                );
+            }
             Variable::LimitConnStatus => {
                 if let Some(state) = self.rewrite_state {
                     out.extend_from_slice(super::limit_conn::status::text(state.limit_conn_status));

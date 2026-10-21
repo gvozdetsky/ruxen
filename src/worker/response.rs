@@ -861,6 +861,7 @@ fn proxy_render_ctx<'a>(
         // per-iteration, so the placeholder we pass here is unused.
         sent_headers: &[],
         connection_id: ctx.connection_id,
+        request_id: ctx.request_id,
         connection_requests: ctx.connection_requests,
         connection_time_us: ctx.connection_time_us,
         request_time_us: ctx.request_time_us,
@@ -933,6 +934,7 @@ pub(crate) fn render_in_subrequest(
         underscores_in_headers: false,
         sent_headers,
         connection_id: req.connection_id,
+        request_id: req.request_id,
         connection_requests: req.connection_requests,
         connection_time_us: req.connection_time_us,
         request_time_us: req.request_time_us,
@@ -1003,6 +1005,7 @@ pub(crate) fn finish_server_response(
         underscores_in_headers: server.underscores_in_headers,
         sent_headers: &[],
         connection_id: req.connection_id,
+        request_id: req.request_id,
         connection_requests: req.connection_requests,
         connection_time_us: req.connection_time_us,
         request_time_us: req.request_time_us,

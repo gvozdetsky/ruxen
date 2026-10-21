@@ -131,3 +131,75 @@ fn m106_http_variables_find_header_names_with_underscores() {
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `$request_id` (#487): 32 lowercase hex digits, one value for the whole
+/// request (a header, the body and the access log agree), another for the
+/// next request.
+#[test]
+fn m106_request_id_is_one_per_request() {
+    let dir = std::env::temp_dir().join(format!("ruxen-m106-rid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let setup = common::ports::setup_lock();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let d = dir.display();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "events {{}}\nhttp {{ log_format rid '$request_id'; access_log {d}/access.log rid;\n\
+             server {{ listen 127.0.0.1:{port};\n\
+             location / {{ add_header X-Request-ID $request_id; return 200 $request_id; }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {d}/ruxen.pid;"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child.0, &dir.join("ruxen.pid"), Duration::from_secs(5));
+    drop(setup);
+    let get = || {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        let (head, body) = out.split_once("\r\n\r\n").unwrap();
+        let header = head
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Request-ID: "))
+            .unwrap()
+            .to_string();
+        assert_eq!(header, body, "{out}");
+        assert_eq!(body.len(), 32, "{out}");
+        assert!(
+            body.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        body.to_string()
+    };
+    let (first, second) = (get(), get());
+    assert_ne!(first, second);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let log = loop {
+        let log = std::fs::read_to_string(dir.join("access.log")).unwrap_or_default();
+        if log.lines().count() >= 2 || std::time::Instant::now() > deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(log, format!("{first}\n{second}\n"));
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
