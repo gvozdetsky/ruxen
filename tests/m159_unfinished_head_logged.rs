@@ -23,8 +23,8 @@ impl Drop for Server {
     }
 }
 
-fn start() -> (Server, u16) {
-    let dir = std::env::temp_dir().join(format!("ruxen-m159-{}", std::process::id()));
+fn start(name: &str) -> (Server, u16) {
+    let dir = std::env::temp_dir().join(format!("ruxen-m159-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Held until ruxen listens: released earlier, another test could take
@@ -91,7 +91,7 @@ fn send(port: u16, data: &[u8], hang_up: bool) -> Vec<u8> {
 
 #[test]
 fn m159_a_head_cut_short_is_logged() {
-    let (server, port) = start();
+    let (server, port) = start("cut");
     std::thread::scope(|scope| {
         scope.spawn(|| assert!(send(port, b"GET / HTTP/1.1\r\nHost: x\r\n", false).is_empty()));
         scope.spawn(|| assert!(send(port, b"G", false).is_empty()));
@@ -135,5 +135,26 @@ fn m159_a_head_cut_short_is_logged() {
             "client timed out (110: Connection timed out) while reading client request line, \
              client: 127.0.0.1, server: , request: \"G\"",
         ]
+    );
+}
+
+/// The first request's head is due `client_header_timeout` after the
+/// accept, the wait for its first bytes included, as under nginx's accept
+/// timer (#484); it used to start again with the first bytes.
+#[test]
+fn m159_the_first_head_is_timed_from_the_accept() {
+    let (_server, port) = start("first");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let connected = Instant::now();
+    std::thread::sleep(Duration::from_millis(600));
+    s.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let took = connected.elapsed();
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_millis(1400),
+        "{took:?}"
     );
 }
