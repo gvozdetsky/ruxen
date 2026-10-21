@@ -41,7 +41,7 @@ body:
     attributes:
       label: Versions
       description: nginx version (nginx -v) and ruxen commit (git rev-parse --short HEAD).
-      placeholder: "nginx 1.24.0, ruxen a1b2c3d"
+      placeholder: "nginx 1.30.6, ruxen a1b2c3d"
     validations:
       required: true
   - type: textarea

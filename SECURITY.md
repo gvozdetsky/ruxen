@@ -14,7 +14,7 @@ Useful to include:
 
 - the ruxen version or commit (`ruxen -V`);
 - a minimal configuration and the request(s) that trigger it;
-- what happens, and what nginx 1.24 does with the same configuration if you
+- what happens, and what nginx 1.30 does with the same configuration if you
   checked.
 
 ruxen is maintained by one person, so replies are best effort. You will get an

@@ -1,6 +1,6 @@
 # Directives
 
-Every directive of nginx 1.24.0's core, events and http modules, and what ruxen
+Every directive of nginx 1.30.6's core, events and http modules, and what ruxen
 does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 `ruxen -t` takes each directive (main, http, server, location, upstream) and what
 `ruxen --compat` says about it. Don't edit by hand; rerun the script.
@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 550 directives: 177 implemented, 25 accepted with a difference, 72 accepted with no effect, 1 refused, 275 unknown.
+Of 564 directives: 178 implemented, 25 accepted with a difference, 72 accepted with no effect, 1 refused, 288 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -76,6 +76,10 @@ Of 550 directives: 177 implemented, 25 accepted with a difference, 72 accepted w
 
 Not supported: `ssl_engine`.
 
+## event_openssl_cache
+
+Not supported: `ssl_object_cache_inheritable`.
+
 ## http
 
 | directive | ruxen | contexts | notes |
@@ -102,6 +106,7 @@ Not supported: `ssl_engine`.
 | `client_header_timeout` | yes | any |  |
 | `client_header_buffer_size` | accepted, no effect | any |  |
 | `large_client_header_buffers` | yes | http, server |  |
+| `max_headers` | no |  |  |
 | `ignore_invalid_headers` | yes | any |  |
 | `merge_slashes` | yes | http, server |  |
 | `underscores_in_headers` | yes | any |  |
@@ -138,6 +143,7 @@ Not supported: `ssl_engine`.
 | `limit_rate_after` | yes | http, server, location |  |
 | `keepalive_time` | yes | http, server, location, upstream |  |
 | `keepalive_timeout` | yes | http, server, location, upstream |  |
+| `keepalive_min_timeout` | no |  |  |
 | `keepalive_requests` | yes | http, server, location, upstream |  |
 | `keepalive_disable` | yes | http, server, location |  |
 | `satisfy` | yes | http, server, location |  |
@@ -160,6 +166,7 @@ Not supported: `ssl_engine`.
 | `max_ranges` | yes | http, server, location |  |
 | `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in location only) |
 | `etag` | accepted, differs | any | static responses still carry an ETag |
+| `early_hints` | no |  |  |
 | `error_page` | yes | http, server, location |  |
 | `post_action` | yes | http, server, location |  |
 | `open_file_cache` | accepted, no effect | any |  |
@@ -309,7 +316,7 @@ Not supported: `geoip_country`, `geoip_org`, `geoip_city`, `geoip_proxy`, `geoip
 
 ## http_grpc
 
-Not supported: `grpc_pass`, `grpc_bind`, `grpc_socket_keepalive`, `grpc_connect_timeout`, `grpc_send_timeout`, `grpc_intercept_errors`, `grpc_buffer_size`, `grpc_read_timeout`, `grpc_next_upstream`, `grpc_next_upstream_tries`, `grpc_next_upstream_timeout`, `grpc_set_header`, `grpc_pass_header`, `grpc_hide_header`, `grpc_ignore_headers`, `grpc_ssl_session_reuse`, `grpc_ssl_protocols`, `grpc_ssl_ciphers`, `grpc_ssl_name`, `grpc_ssl_server_name`, `grpc_ssl_verify`, `grpc_ssl_verify_depth`, `grpc_ssl_trusted_certificate`, `grpc_ssl_crl`, `grpc_ssl_certificate`, `grpc_ssl_certificate_key`, `grpc_ssl_password_file`, `grpc_ssl_conf_command`.
+Not supported: `grpc_pass`, `grpc_bind`, `grpc_socket_keepalive`, `grpc_connect_timeout`, `grpc_send_timeout`, `grpc_intercept_errors`, `grpc_buffer_size`, `grpc_read_timeout`, `grpc_next_upstream`, `grpc_next_upstream_tries`, `grpc_next_upstream_timeout`, `grpc_set_header`, `grpc_pass_header`, `grpc_hide_header`, `grpc_ignore_headers`, `grpc_ssl_session_reuse`, `grpc_ssl_protocols`, `grpc_ssl_ciphers`, `grpc_ssl_name`, `grpc_ssl_server_name`, `grpc_ssl_verify`, `grpc_ssl_verify_depth`, `grpc_ssl_trusted_certificate`, `grpc_ssl_crl`, `grpc_ssl_certificate`, `grpc_ssl_certificate_key`, `grpc_ssl_certificate_cache`, `grpc_ssl_password_file`, `grpc_ssl_conf_command`.
 
 ## http_gunzip_filter
 
@@ -342,6 +349,8 @@ Not supported: `gunzip`, `gunzip_buffers`.
 | `expires` | yes | http, server, location |  |
 | `add_header` | yes | http, server, location |  |
 | `add_trailer` | yes | http, server, location |  |
+| `add_header_inherit` | no |  |  |
+| `add_trailer_inherit` | no |  |  |
 
 ## http_image_filter
 
@@ -428,6 +437,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_method` | yes | http, server, location |  |
 | `proxy_pass_request_headers` | yes | http, server, location |  |
 | `proxy_pass_request_body` | yes | http, server, location |  |
+| `proxy_pass_trailers` | no |  |  |
 | `proxy_buffer_size` | accepted, no effect | any |  |
 | `proxy_read_timeout` | yes | http, server, location |  |
 | `proxy_buffers` | accepted, no effect | any |  |
@@ -471,6 +481,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_ssl_crl` | yes | http, server, location |  |
 | `proxy_ssl_certificate` | yes | http, server, location |  |
 | `proxy_ssl_certificate_key` | yes | http, server, location |  |
+| `proxy_ssl_certificate_cache` | no |  |  |
 | `proxy_ssl_password_file` | yes | http, server, location |  |
 | `proxy_ssl_conf_command` | no |  |  |
 
@@ -581,10 +592,12 @@ Not supported: `slice`.
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `ssl` | no |  |  |
 | `ssl_certificate` | yes | http, server |  |
 | `ssl_certificate_key` | yes | http, server |  |
+| `ssl_certificate_cache` | no |  |  |
+| `ssl_ech_file` | no |  |  |
 | `ssl_password_file` | yes | http, server |  |
+| `ssl_certificate_compression` | no |  |  |
 | `ssl_dhparam` | accepted, no effect | http, server |  |
 | `ssl_ecdh_curve` | accepted, differs | http, server | "ssl_ecdh_curve" is not supported yet and is ignored: rustls's default key exchange groups are used |
 | `ssl_protocols` | yes | http, server |  |
@@ -654,6 +667,10 @@ Not supported: `sub_filter`, `sub_filter_types`, `sub_filter_once`, `sub_filter_
 ## http_upstream_random
 
 Not supported: `random`.
+
+## http_upstream_sticky
+
+Not supported: `sticky`.
 
 ## http_upstream_zone
 
@@ -727,6 +744,7 @@ Not supported: `userid`, `userid_service`, `userid_name`, `userid_domain`, `user
 | `uwsgi_ssl_crl` | no |  |  |
 | `uwsgi_ssl_certificate` | no |  |  |
 | `uwsgi_ssl_certificate_key` | no |  |  |
+| `uwsgi_ssl_certificate_cache` | no |  |  |
 | `uwsgi_ssl_password_file` | no |  |  |
 | `uwsgi_ssl_conf_command` | no |  |  |
 
@@ -738,6 +756,7 @@ Not supported: `xml_entities`, `xslt_stylesheet`, `xslt_param`, `xslt_string_par
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
+| `http2` | yes | http, server |  |
 | `http2_recv_buffer_size` | yes | http, server |  |
 | `http2_pool_size` | yes | http, server |  |
 | `http2_max_concurrent_streams` | yes | http, server |  |

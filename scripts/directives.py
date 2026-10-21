@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Render docs/directives.md (#18): every directive of nginx 1.24.0's http,
+"""Render docs/directives.md (#18): every directive of nginx 1.30.6's http,
 core and events modules, and what ruxen does with it.
 
 The facts come from the binary, not from a hand-kept list:
-- the directive names, from ../nginx (the release-1.24.0 checkout), the
+- the directive names, from ../nginx (the release-1.30.6 checkout), the
   `ngx_command_t` tables of src/core, src/event and src/http;
 - where ruxen takes each one: `ruxen -t` on a configuration with the
   directive in main, http, server and location; anything but "unknown
@@ -128,7 +128,7 @@ def main():
     lines = [
         "# Directives",
         "",
-        "Every directive of nginx 1.24.0's core, events and http modules, and what ruxen",
+        "Every directive of nginx 1.30.6's core, events and http modules, and what ruxen",
         "does with it. Rendered by `scripts/directives.py` from a build of ruxen: where",
         "`ruxen -t` takes each directive (main, http, server, location, upstream) and what",
         "`ruxen --compat` says about it. Don't edit by hand; rerun the script.",
