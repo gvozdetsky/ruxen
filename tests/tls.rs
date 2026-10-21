@@ -1034,3 +1034,79 @@ fn ssl_reject_handshake_refuses_unknown_names() {
         );
     }
 }
+
+/// A server chosen by SNI has its own `ssl_protocols` (#586), as in nginx
+/// 1.29.2+, which selects the server before the version is negotiated:
+/// the default server takes TLSv1.2 only, `b.test` TLSv1.3 only.
+const SNI_PROTOCOLS_CONF: &str = r#"
+daemon off;
+events { }
+
+http {
+    server {
+        listen 127.0.0.1:%%PORT%% ssl default_server;
+        server_name a.test;
+        ssl_protocols TLSv1.2;
+        ssl_certificate     %%CERT_0%%;
+        ssl_certificate_key %%KEY_0%%;
+        location / { return 200 "server-A\n"; }
+    }
+
+    server {
+        listen 127.0.0.1:%%PORT%%;
+        server_name b.test;
+        ssl_protocols TLSv1.3;
+        ssl_certificate     %%CERT_1%%;
+        ssl_certificate_key %%KEY_1%%;
+        location / { return 200 "server-B\n"; }
+    }
+}
+"#;
+
+/// The version a handshake for `name` limited to `version` agrees on, or
+/// `None` when the server refuses it.
+fn handshake_version(
+    port: u16,
+    name: &str,
+    ca_pem: &Path,
+    version: &'static rustls::SupportedProtocolVersion,
+) -> Option<rustls::ProtocolVersion> {
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read(ca_pem).unwrap();
+    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock).ok()?;
+    }
+    conn.protocol_version()
+}
+
+#[test]
+fn ssl_protocols_of_the_server_chosen_by_sni() {
+    use rustls::ProtocolVersion::{TLSv1_2, TLSv1_3};
+    use rustls::version::{TLS12, TLS13};
+    let cert_a = make_ca_and_leaf("a.test");
+    let cert_b = make_ca_and_leaf("b.test");
+    let ca_a = cert_a.ca_path().unwrap().to_path_buf();
+    let ca_b = cert_b.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server_multi(SNI_PROTOCOLS_CONF, vec![cert_a, cert_b]);
+    let port = server.port;
+    assert_eq!(
+        handshake_version(port, "a.test", &ca_a, &TLS12),
+        Some(TLSv1_2)
+    );
+    assert_eq!(handshake_version(port, "a.test", &ca_a, &TLS13), None);
+    assert_eq!(
+        handshake_version(port, "b.test", &ca_b, &TLS13),
+        Some(TLSv1_3)
+    );
+    assert_eq!(handshake_version(port, "b.test", &ca_b, &TLS12), None);
+}

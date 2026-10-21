@@ -515,8 +515,11 @@ pub(crate) fn build_listen_tls(
              (listen {addr})"
         ));
     }
-    // One rustls config per address: protocols and the session timeout
-    // follow the default server.
+    // The address's rustls config is the default server's: its protocols,
+    // and the session timeout and ticket keys for every server, as nginx
+    // keeps the default server's session context. A server chosen by SNI
+    // has its own protocols (#586), as nginx 1.29.2+ selects the server
+    // before the version is negotiated.
     let protocols = default.ssl.protocols.unwrap_or_default();
     let session_timeout_secs = default
         .ssl
@@ -605,9 +608,10 @@ pub(crate) fn build_listen_tls(
     if http2 && let Some(cfg) = Arc::get_mut(&mut cfg) {
         cfg.alpn_protocols.insert(0, b"h2".to_vec());
     }
-    // Client certificates (#113): each server with certificates of its own
-    // has its context; one without takes the default server's, whose
-    // SSL_CTX its SNI name keeps in nginx. Equal contexts are one.
+    // Client certificates (#113) and protocols (#586): each server with
+    // certificates of its own has its context; one without takes the
+    // default server's, whose SSL_CTX its SNI name keeps in nginx. Equal
+    // contexts are one.
     let mut auths: Vec<(ClientAuthKey, Arc<crate::client_verify::ClientAuth>)> = Vec::new();
     let mut auth_of = |input: &TlsServerInput| -> Result<Option<usize>, String> {
         let Some(key) = client_auth_key(input)? else {
@@ -620,45 +624,49 @@ pub(crate) fn build_listen_tls(
         auths.push((key, Arc::new(auth)));
         Ok(Some(auths.len() - 1))
     };
-    let default_auth = auth_of(default)?;
-    let mut server_auth: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+    type ContextKey = (Option<usize>, crate::config::TlsVersionSet);
+    let default_key: ContextKey = (auth_of(default)?, protocols);
+    let mut server_keys: Vec<ContextKey> = Vec::with_capacity(inputs.len());
     for input in inputs {
-        server_auth.push(if input.ssl.certs.is_empty() {
-            default_auth
+        server_keys.push(if input.ssl.certs.is_empty() {
+            default_key
         } else {
-            auth_of(input)?
+            (auth_of(input)?, input.ssl.protocols.unwrap_or_default())
         });
     }
     // The address's config is the default server's context; the others
     // are configs of their own, indexed in `contexts`.
-    let with_auth = |auth: Option<usize>| -> Arc<rustls::ServerConfig> {
-        match auth {
-            Some(i) => crate::tls_certs::with_client_verifier(
+    let context_config =
+        |(auth, versions): ContextKey| -> Result<Arc<rustls::ServerConfig>, String> {
+            if (auth, versions) == (None, protocols) {
+                return Ok(cfg.clone());
+            }
+            crate::tls_certs::with_context(
                 &cfg,
-                protocols,
-                auths[i].1.verifier(crate::tls_certs::active_provider()),
-            ),
-            None => cfg.clone(),
-        }
-    };
-    let mut others: Vec<Option<usize>> = Vec::new();
-    let contexts: Vec<Option<u16>> = server_auth
+                versions,
+                auth.map(|i| auths[i].1.verifier(crate::tls_certs::active_provider())),
+            )
+            .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))
+        };
+    let mut others: Vec<ContextKey> = Vec::new();
+    let contexts: Vec<Option<u16>> = server_keys
         .iter()
-        .map(|&auth| {
-            (auth != default_auth).then(|| {
-                let i = others.iter().position(|&o| o == auth).unwrap_or_else(|| {
-                    others.push(auth);
+        .map(|&key| {
+            (key != default_key).then(|| {
+                let i = others.iter().position(|&o| o == key).unwrap_or_else(|| {
+                    others.push(key);
                     others.len() - 1
                 });
                 i as u16
             })
         })
         .collect();
-    let main = with_auth(default_auth);
+    let main = context_config(default_key)?;
     let other_configs = others
         .iter()
-        .map(|&auth| (with_auth(auth), auth.map(|i| auths[i].1.clone())))
-        .collect();
+        .map(|&key| Ok((context_config(key)?, key.0.map(|i| auths[i].1.clone()))))
+        .collect::<Result<Vec<_>, String>>()?;
+    let default_auth = default_key.0;
     let acceptor = crate::tls::acceptor_from_config(main)
         .with_contexts(default_auth.map(|i| auths[i].1.clone()), other_configs);
     Ok(Some((

@@ -655,16 +655,18 @@ pub fn forget_files() {
         .clear();
 }
 
-/// `base` with a client-certificate verifier (#113): a config of its own,
-/// since rustls keeps the verifier private, with everything else `base`'s,
-/// its session cache and ticket keys included. A session can't cross
-/// contexts anyway: resumption needs the same SNI name, which picks the
-/// context, and the certificate is checked again after every handshake.
-pub fn with_client_verifier(
+/// A server's own context: `base` with its protocol versions (#586) and
+/// client-certificate verifier (#113), if any. A config of its own, since
+/// rustls keeps both private, with everything else `base`'s, its session
+/// cache and ticket keys included (nginx keeps the default server's too).
+/// A session can't cross contexts anyway: resumption needs the same SNI
+/// name, which picks the context, and the certificate is checked again
+/// after every handshake.
+pub fn with_context(
     base: &ServerConfig,
     protocols: TlsVersionSet,
-    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
-) -> Arc<ServerConfig> {
+    verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<Arc<ServerConfig>, rustls::Error> {
     let versions: Vec<&'static SupportedProtocolVersion> = [
         (protocols.tlsv1_3, &rustls::version::TLS13),
         (protocols.tlsv1_2, &rustls::version::TLS12),
@@ -672,11 +674,18 @@ pub fn with_client_verifier(
     .into_iter()
     .filter_map(|(on, v)| on.then_some(v))
     .collect();
-    let mut cfg = ServerConfig::builder_with_provider(base.crypto_provider().clone())
-        .with_protocol_versions(&versions)
-        .expect("the base config's versions")
-        .with_client_cert_verifier(verifier)
-        .with_cert_resolver(base.cert_resolver.clone());
+    if versions.is_empty() {
+        return Err(rustls::Error::General(
+            "no TLS protocol versions enabled".into(),
+        ));
+    }
+    let builder = ServerConfig::builder_with_provider(base.crypto_provider().clone())
+        .with_protocol_versions(&versions)?;
+    let builder = match verifier {
+        Some(verifier) => builder.with_client_cert_verifier(verifier),
+        None => builder.with_no_client_auth(),
+    };
+    let mut cfg = builder.with_cert_resolver(base.cert_resolver.clone());
     // Every public field, as rustls 0.23 has them.
     cfg.ignore_client_order = base.ignore_client_order;
     cfg.max_fragment_size = base.max_fragment_size;
@@ -693,7 +702,7 @@ pub fn with_client_verifier(
     cfg.cert_compressors = base.cert_compressors.clone();
     cfg.cert_compression_cache = base.cert_compression_cache.clone();
     cfg.cert_decompressors = base.cert_decompressors.clone();
-    Arc::new(cfg)
+    Ok(Arc::new(cfg))
 }
 
 #[cfg(test)]
