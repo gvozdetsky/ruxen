@@ -1644,6 +1644,10 @@ pub fn run(
         drop(ready);
         // Accept only once `main` has switched to the configured `user`.
         state.wait_released();
+        // From now on its accept loop turns at least every ACCEPT_TICK.
+        HEARTBEAT.with(|beat| {
+            let _ = beat.set(state.heartbeat());
+        });
         if test_panic() == TestPanic::Worker {
             panic!("{TEST_PANIC_ENV}=worker");
         }
@@ -3031,11 +3035,24 @@ fn wake_idle_in(w: &WorkerConns) {
     }
 }
 
+thread_local! {
+    /// This worker's beat for systemd's watchdog (#502), set once it may
+    /// accept.
+    static HEARTBEAT: std::cell::OnceCell<std::sync::Arc<AtomicU64>> =
+        const { std::cell::OnceCell::new() };
+}
+
 /// Called by the accept loops on every turn (they wake at least every
 /// 50 ms): when shutdown began or a reload came since this worker last
 /// looked, its idle connections are woken to close. Two atomic loads when
 /// nothing changed.
 pub(crate) fn notice_runtime_events(state: &RuntimeState) {
+    // A turn of the accept loop: the worker isn't stuck.
+    HEARTBEAT.with(|beat| {
+        if let Some(beat) = beat.get() {
+            beat.fetch_add(1, Ordering::Relaxed);
+        }
+    });
     WORKER_CONNS.with(|w| {
         let shutdown = state.is_shutting_down();
         let generation = state.reload_gen();

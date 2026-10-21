@@ -2088,9 +2088,33 @@ pub struct RuntimeState {
     /// report ready, and wait for it before accepting.
     released: std::sync::Mutex<bool>,
     released_cv: std::sync::Condvar,
+    /// One counter per worker, bumped on every turn of its accept loop
+    /// (`notice_runtime_events`), for systemd's watchdog (#502): a worker
+    /// whose counter stands still is stuck.
+    heartbeats: std::sync::Mutex<Vec<std::sync::Arc<AtomicU64>>>,
 }
 
 impl RuntimeState {
+    /// A worker of this generation starts beating.
+    pub(crate) fn heartbeat(&self) -> std::sync::Arc<AtomicU64> {
+        let beat = std::sync::Arc::new(AtomicU64::new(0));
+        self.heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(beat.clone());
+        beat
+    }
+
+    /// Every worker's beat count, in order.
+    pub fn heartbeats(&self) -> Vec<u64> {
+        self.heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect()
+    }
+
     /// Lets the workers start accepting.
     pub fn release_workers(&self) {
         *self.released.lock().unwrap_or_else(|e| e.into_inner()) = true;

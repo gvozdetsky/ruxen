@@ -33,6 +33,7 @@ mod proxy_cache;
 mod proxy_protocol;
 mod proxy_stream;
 mod resolver;
+mod sd_notify;
 mod syslog;
 mod tls;
 mod tls_certs;
@@ -443,6 +444,16 @@ fn real_main() -> Result<(), Failure> {
     }
 
     let reopen_stderr = cli.errlog.clone().filter(|_| !http.uses_stderr_log);
+    // Every listener bound, the pid file written, the workers accepting:
+    // systemd's `Type=notify` takes ruxen as started now (#502).
+    sd_notify::notify("READY=1");
+    let watchdog = sd_notify::watchdog_interval().map(|interval| Watchdog {
+        every: interval / 2,
+        next_at: Instant::now(),
+        generation: generation.id,
+        beats: Vec::new(),
+        stuck_since: None,
+    });
     let mut master = Master {
         cli,
         settings,
@@ -451,6 +462,7 @@ fn real_main() -> Result<(), Failure> {
         listeners,
         exited_tx,
         next_id: 1,
+        watchdog,
     };
     master.run(exited_rx, reopen_stderr)
 }
@@ -620,6 +632,20 @@ struct Master {
     listeners: worker::listeners::ListenerSet,
     exited_tx: std::sync::mpsc::Sender<(u64, usize, bool)>,
     next_id: u64,
+    /// systemd's watchdog (`WatchdogSec=`), when it watches ruxen (#502).
+    watchdog: Option<Watchdog>,
+}
+
+/// What `Master::watchdog_turn` keeps between its looks.
+struct Watchdog {
+    /// Half of systemd's interval, as sd_watchdog_enabled(3) advises.
+    every: Duration,
+    next_at: Instant,
+    /// The generation and its workers' beats at the last look.
+    generation: u64,
+    beats: Vec<u64>,
+    /// Since when a worker hasn't beaten, logged once.
+    stuck_since: Option<Instant>,
 }
 
 impl Master {
@@ -642,6 +668,9 @@ impl Master {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            if quit_at.is_none() {
+                self.watchdog_turn();
+            }
             // Every exit waiting, not one per turn: a turn that reloads
             // lasts as long as the reload, and each reload retires a
             // generation's worth of workers. Read one at a time, SIGHUPs
@@ -711,6 +740,7 @@ impl Master {
                     config::ErrorLogLevel::Notice,
                     &signal_line(SIGQUIT, "shutting down"),
                 );
+                sd_notify::notify("STOPPING=1");
                 self.begin_shutdown();
                 // New connections are refused during the drain, not queued
                 // for nobody: nginx closes its listening sockets at once,
@@ -779,6 +809,7 @@ impl Master {
         if SIGTERM_SEEN.load(Ordering::SeqCst) {
             log(&signal_line(TERM_SIGNAL.load(Ordering::Relaxed), "exiting"));
         }
+        sd_notify::notify("STOPPING=1");
         self.begin_shutdown();
         if let Some(path) = &self.settings.pid {
             privileges::remove_pid_file_on_exit(path);
@@ -812,6 +843,9 @@ impl Master {
         if SIGTERM_SEEN.load(Ordering::SeqCst) {
             self.exit_now(0);
         }
+        // The running generation serves meanwhile: systemd's watchdog
+        // still hears from it (#502).
+        self.watchdog_turn();
         if !*warned && started.elapsed() >= RELOAD_SLOW {
             *warned = true;
             worker::write_worker_log(
@@ -820,6 +854,52 @@ impl Master {
                 &format!(
                     "the reload has waited {} s for {step}",
                     started.elapsed().as_secs()
+                ),
+            );
+        }
+    }
+
+    /// systemd's watchdog (#502): `WATCHDOG=1` every half interval, but
+    /// only while every worker of the running generation turns its accept
+    /// loop. A worker stuck in a busy loop or a blocking call stops the
+    /// pings, logged once at `alert`, and systemd restarts ruxen
+    /// (`Restart=on-failure`). nginx has no such check: its master only
+    /// respawns a worker that exited.
+    fn watchdog_turn(&mut self) {
+        let Some(dog) = self.watchdog.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < dog.next_at {
+            return;
+        }
+        dog.next_at = now + dog.every;
+        let beats = self.current.state.heartbeats();
+        let same_generation = dog.generation == self.current.id;
+        let stuck: Vec<usize> = if same_generation {
+            (0..beats.len())
+                .filter(|&i| dog.beats.get(i) == Some(&beats[i]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        dog.generation = self.current.id;
+        dog.beats = beats;
+        if stuck.is_empty() {
+            dog.stuck_since = None;
+            sd_notify::notify("WATCHDOG=1");
+            return;
+        }
+        if dog.stuck_since.is_none() {
+            dog.stuck_since = Some(now);
+            let workers: Vec<String> = stuck.iter().map(usize::to_string).collect();
+            worker::write_worker_log(
+                self.current.http.error_logs,
+                config::ErrorLogLevel::Alert,
+                &format!(
+                    "worker {} made no progress for {} ms, not answering systemd's watchdog",
+                    workers.join(", "),
+                    dog.every.as_millis()
                 ),
             );
         }
@@ -885,6 +965,16 @@ impl Master {
             worker::write_worker_log(http.error_logs, level, message)
         };
         let old_http = self.current.http;
+        // systemd (`Type=notify`): reloading until this returns, whatever
+        // the outcome (#502).
+        sd_notify::reloading();
+        struct Ready;
+        impl Drop for Ready {
+            fn drop(&mut self) {
+                sd_notify::notify("READY=1");
+            }
+        }
+        let _ready = Ready;
         log(
             old_http,
             config::ErrorLogLevel::Notice,
