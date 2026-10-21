@@ -106,7 +106,7 @@ Not supported: `ssl_object_cache_inheritable`.
 | `client_header_timeout` | yes | any |  |
 | `client_header_buffer_size` | accepted, no effect | any |  |
 | `large_client_header_buffers` | yes | http, server |  |
-| `max_headers` | no |  |  |
+| `max_headers` | yes | http, server |  |
 | `ignore_invalid_headers` | yes | any |  |
 | `merge_slashes` | yes | http, server |  |
 | `underscores_in_headers` | yes | any |  |

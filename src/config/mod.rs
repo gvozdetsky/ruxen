@@ -929,6 +929,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "client_body_timeout"
                 | "send_timeout"
                 | "large_client_header_buffers"
+                | "max_headers"
                 | "http2_chunk_size"),
                 Terminator::Semi,
             ) => {
@@ -2526,8 +2527,9 @@ mod tests {
             http {
                 client_header_timeout 5s;
                 send_timeout 7s;
+                max_headers 50;
                 server { listen 80; client_body_timeout 3s; send_timeout 9s;
-                         http2_chunk_size 1;
+                         http2_chunk_size 1; max_headers 0;
                          location / { http2_chunk_size 16k; http2_push_preload on; } }
                 server { listen 81; }
                 http2_chunk_size 4k;
@@ -2543,6 +2545,7 @@ mod tests {
                 send_ms: Some(9_000),
                 large_header_buffers: None,
                 h2_chunk_size: Some(1),
+                max_headers: Some(0),
             }
         );
         assert_eq!(
@@ -2560,6 +2563,7 @@ mod tests {
                 send_ms: Some(7_000),
                 large_header_buffers: None,
                 h2_chunk_size: Some(4096),
+                max_headers: Some(50),
             }
         );
         assert_eq!(

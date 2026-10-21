@@ -162,6 +162,13 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         false
     }
 
+    /// For an HTTP/2 stream, the head's lines that aren't fields of the
+    /// request as nginx counts them for `max_headers` (#584): the `Host`
+    /// made from `:authority`, the joined `Cookie`, `Transfer-Encoding`.
+    fn h2_synthetic_lines(&self) -> usize {
+        0
+    }
+
     /// For an HTTP/2 stream, its connection's start and the requests it
     /// carried before this one (`$connection_time`, `$connection_requests`).
     fn conn_counters(&self) -> Option<(Instant, u64)> {
