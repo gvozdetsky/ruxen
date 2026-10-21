@@ -459,11 +459,36 @@ async fn reject_request<S: ConnIo>(
     let (res, _) = write_all_timed(stream, taken, len, timer, server.timeouts.send).await;
     let sent = res.map_or_else(|written| written, |()| len) as u64;
 
+    log_before_routing(
+        http,
+        response,
+        request_head,
+        request_head.len() as u64,
+        sent,
+        sent.saturating_sub(head_len),
+        conn,
+    )
+    .await;
+}
+
+/// The access-log line of a request that ended before a server was chosen,
+/// to the address's default server's logs: `response` holds the status,
+/// `$request` is whatever of the request line arrived (nginx's then is up
+/// to the first CR or LF).
+async fn log_before_routing(
+    http: &'static PreparedHttp,
+    response: &[u8],
+    request_head: &[u8],
+    request_length: u64,
+    sent: u64,
+    body_sent: u64,
+    conn: &ConnLogCtx<'_>,
+) {
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
     if server.access_logs.is_empty() {
         return;
     }
-    // Whatever of the request line arrived (nginx's `$request` then is up
-    // to the first CR or LF): method, then URI.
     let line_end = request_head
         .iter()
         .position(|&b| b == b'\r' || b == b'\n')
@@ -494,9 +519,9 @@ async fn reject_request<S: ConnIo>(
         server.listen_port,
         b"",
         b'.',
-        request_head.len() as u64,
+        request_length,
         sent,
-        sent.saturating_sub(head_len),
+        body_sent,
         now.as_secs(),
         now.subsec_millis() as u16,
         conn.tls,
@@ -506,6 +531,70 @@ async fn reject_request<S: ConnIo>(
         None,
     )
     .await;
+}
+
+/// How a request head ended before it was complete (#509).
+#[derive(Clone, Copy)]
+enum HeadCut<'e> {
+    /// `client_header_timeout` passed.
+    TimedOut,
+    /// The client closed the connection.
+    Closed,
+    /// The read failed.
+    Failed(&'e std::io::Error),
+}
+
+/// A request whose head never completed, logged as nginx does
+/// (ngx_http_process_request_line / _headers, ngx_http_read_request_header):
+/// no response, an `[info]` line in the default server's error log, and an
+/// access-log line with 408 when it timed out, 400 otherwise, `$bytes_sent`
+/// 0 and `$request_length` the complete lines that came.
+#[cold]
+#[inline(never)]
+async fn log_unfinished_head(
+    http: &'static PreparedHttp,
+    head: &[u8],
+    rline_done: bool,
+    cut: HeadCut<'_>,
+    conn: &ConnLogCtx<'_>,
+) {
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
+    let what = match cut {
+        HeadCut::TimedOut => "client timed out (110: Connection timed out)".to_string(),
+        HeadCut::Closed => "client prematurely closed connection".to_string(),
+        HeadCut::Failed(e) => format!("recv() failed ({})", errno_text(e)),
+    };
+    let part = if rline_done { "headers" } else { "line" };
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    // The Host header once its line is complete (nginx's
+    // r->headers_in.host).
+    let complete = head.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let host = rline_done
+        .then(|| lookup_request_header(&head[line_end.min(complete)..complete], b"host"))
+        .flatten();
+    write_error_log(
+        server.error_logs,
+        ErrorLogLevel::Info,
+        &ErrorLogRequest {
+            connection_id: conn.connection_id,
+            client: conn.remote_addr,
+            server: server.primary_server_name,
+            request_line: &head[..line_end],
+            host,
+        },
+        format!("{what} while reading client request {part}").as_bytes(),
+        None,
+    );
+    let status = match cut {
+        HeadCut::TimedOut => 408,
+        _ => 400,
+    };
+    // `$request_length`: the lines parsed, as nginx's r->request_length.
+    log_before_routing(http, &lost_head(status), head, complete as u64, 0, 0, conn).await;
 }
 
 /// A response under `limit_rate`: the head, then the file body if any,
@@ -3709,27 +3798,60 @@ pub(crate) async fn handle<S: ConnIo>(
             if std::mem::take(&mut skip_read) {
                 // Fall through to the parse loop with what idle_read read.
             } else {
+                // The read takes the buffer, and one that times out keeps
+                // it: what came of the head is put aside for its log line
+                // (#509). Only a head that didn't come in one read.
+                if filled > read_start {
+                    scratch.clear();
+                    scratch.extend_from_slice(&buf[read_start..filled]);
+                }
                 let taken = std::mem::take(&mut *buf);
                 let end = taken.len();
                 let slice = taken.slice_mut(filled..end);
                 let deadline = *header_deadline
                     .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
                 let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
-                // client_header_timeout: nginx closes without a response.
+                // client_header_timeout: nginx closes without a response,
+                // and logs the request if it had begun (#509).
                 let Some((res, returned)) = read.await else {
+                    if filled > read_start {
+                        log_unfinished_head(
+                            http,
+                            &scratch[..],
+                            parse_state.rline_done,
+                            HeadCut::TimedOut,
+                            conn_log!(),
+                        )
+                        .await;
+                    }
                     return;
                 };
                 *buf = returned.into_inner();
                 match res {
-                    Ok(0) => return,
-                    Ok(n) => filled += n,
+                    Ok(n) if n > 0 => filled += n,
                     // What a TLS stream couldn't decrypt or rustls refused
                     // (#595); plain TCP never says InvalidData.
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                         tls_read_failed(http, listen_index, connection_id, peer_addr, filled, &e);
                         return;
                     }
-                    Err(_) => return,
+                    res => {
+                        if filled > read_start {
+                            let cut = match &res {
+                                Ok(_) => HeadCut::Closed,
+                                Err(e) => HeadCut::Failed(e),
+                            };
+                            log_unfinished_head(
+                                http,
+                                &buf[read_start..filled],
+                                parse_state.rline_done,
+                                cut,
+                                conn_log!(),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
                 }
             }
 
