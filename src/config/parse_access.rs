@@ -63,10 +63,12 @@ pub(crate) fn parse_access_directive(
                     got: var.clone(),
                 });
             };
-            conf.auth_request_set.push((
-                name.to_ascii_lowercase(),
-                super::values::parse_value_with_vars(value)?,
-            ));
+            let name = name.to_ascii_lowercase();
+            if !super::values::settable(&name) {
+                return Err(Error::DuplicateVariable(name));
+            }
+            conf.auth_request_set
+                .push((name, super::values::parse_value_with_vars(value)?));
         }
         "real_ip_header" => {
             if conf.realip.header.is_some() {

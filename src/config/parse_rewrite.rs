@@ -383,12 +383,68 @@ pub(crate) fn parse_rewrite_variable_name(raw: &str, what: &'static str) -> Resu
         });
     }
     // Case-insensitive, as every variable name (`classify_variable`).
-    Ok(name.to_ascii_lowercase())
+    let name = name.to_ascii_lowercase();
+    // `set`, `map` and `split_clients` define it: not over a built-in that
+    // can't change (#574).
+    if !settable(&name) {
+        return Err(Error::DuplicateVariable(name));
+    }
+    Ok(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nginx refuses to define a variable over a built-in that isn't
+    /// NGX_HTTP_VAR_CHANGEABLE (#574), with `set`, `map`, `split_clients`
+    /// and `auth_request_set` alike; the changeable ones and prefixed
+    /// names are fine (checked against nginx 1.30.6's `-t`).
+    #[test]
+    fn defining_a_read_only_built_in_is_refused() {
+        let conf = |http: &str, loc: &str| {
+            crate::config::parse(&format!(
+                "http {{ {http} server {{ listen 80; location / {{ {loc} return 200; }} }} }}"
+            ))
+        };
+        for name in [
+            "uri",
+            "URI",
+            "query_string",
+            "remote_addr",
+            "status",
+            "request_id",
+        ] {
+            match conf("", &format!("set ${name} x;")) {
+                Err(Error::DuplicateVariable(n)) => assert_eq!(n, name.to_ascii_lowercase()),
+                other => panic!("set ${name}: {other:?}"),
+            }
+        }
+        for name in [
+            "args",
+            "limit_rate",
+            "proxy_host",
+            "ssl_protocol",
+            "arg_a",
+            "http_x",
+            "mine",
+        ] {
+            assert!(conf("", &format!("set ${name} x;")).is_ok(), "set ${name}");
+        }
+        assert!(matches!(
+            conf("map $host $uri { default 1; }", ""),
+            Err(Error::DuplicateVariable(_))
+        ));
+        assert!(matches!(
+            conf("split_clients $host $uri { * a; }", ""),
+            Err(Error::DuplicateVariable(_))
+        ));
+        assert!(matches!(
+            conf("", "auth_request /a; auth_request_set $uri x;"),
+            Err(Error::DuplicateVariable(_))
+        ));
+        assert!(conf("map $host $args { default 1; }", "").is_ok());
+    }
 
     fn guard(src: &[&str]) -> IfGuard {
         let args: Vec<String> = src.iter().map(|s| s.to_string()).collect();
