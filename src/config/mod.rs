@@ -3034,6 +3034,7 @@ mod tests {
             ),
             ("listen 127.0.0.1:81; listen 127.0.0.1:081;", "127.0.0.1:81"),
             ("listen 81; listen 0.0.0.0:81;", "0.0.0.0:81"),
+            ("listen 81; listen *:81;", "0.0.0.0:81"),
             ("listen [::1]:81; listen [::1]:80-82;", "[::1]:81"),
             ("listen unix:/tmp/s; listen unix:/tmp/s;", "unix:/tmp/s"),
         ] {
