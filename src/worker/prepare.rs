@@ -2751,6 +2751,8 @@ pub(crate) struct AccessLogPrep<'a> {
     caches: std::collections::HashMap<u32, &'static OpenLogFileCache>,
     /// Buffered files by path.
     buffers: std::collections::HashMap<std::path::PathBuf, &'static PreparedLogBuffer>,
+    /// Each file opened once, by path (#523).
+    files: std::collections::HashMap<std::path::PathBuf, &'static std::fs::File>,
 }
 
 impl<'a> AccessLogPrep<'a> {
@@ -2767,6 +2769,7 @@ impl<'a> AccessLogPrep<'a> {
             server_cache: None,
             caches: std::collections::HashMap::new(),
             buffers: std::collections::HashMap::new(),
+            files: std::collections::HashMap::new(),
         }
     }
 
@@ -2790,14 +2793,21 @@ impl<'a> AccessLogPrep<'a> {
         // Create the file up front, as nginx does at startup: an unwritable
         // path fails here rather than in every worker, and tests that read
         // the log don't hit ENOENT when no request matches `if=...`.
-        let syslog = match &log.syslog {
-            Some(peer) => Some(prepare_syslog_peer(peer)?),
+        // Once per path, kept open for the workers (#523): a FIFO's reader
+        // sees one writer, not an open and close per worker.
+        let (syslog, file) = match &log.syslog {
+            Some(peer) => (Some(prepare_syslog_peer(peer)?), None),
             // Opened per line, under a name only a request gives.
-            None if log.path_vars.is_some() => None,
-            None => {
-                open_log_file(&log.path)?;
-                None
-            }
+            None if log.path_vars.is_some() => (None, None),
+            None => match self.files.get(&log.path) {
+                Some(file) => (None, Some(*file)),
+                None => {
+                    let file: &'static std::fs::File =
+                        crate::arena::leak(Box::new(open_access_log_file(&log.path)?));
+                    self.files.insert(log.path.clone(), file);
+                    (None, Some(file))
+                }
+            },
         };
 
         let buffer = match log.buffer {
@@ -2844,6 +2854,7 @@ impl<'a> AccessLogPrep<'a> {
                 )
             });
         let prepared = PreparedAccessLog {
+            file,
             buffer,
             open_cache: None,
             path_vars,
@@ -3372,6 +3383,19 @@ pub(crate) fn resolve_error_pages(
 
 /// Create (or append-open) a log file the way nginx does at startup, so a
 /// bad path is an `[emerg]` instead of a silent loss of log lines.
+/// An access_log file, opened for appending (created if missing) and kept:
+/// the workers write to `dup`s of it.
+fn open_access_log_file(path: &Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))?;
+    // Reopened after logrotate by the `user` ruxen switches to.
+    crate::privileges::note_file(path);
+    Ok(file)
+}
+
 fn open_log_file(path: &Path) -> Result<(), String> {
     std::fs::OpenOptions::new()
         .create(true)
