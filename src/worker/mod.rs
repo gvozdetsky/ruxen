@@ -59,7 +59,7 @@ pub(crate) mod listeners;
 mod log;
 pub(crate) mod logbuf;
 pub(crate) mod open_log_cache;
-mod panics;
+pub(crate) mod panics;
 mod prepare;
 mod prepared;
 pub(crate) mod range;
