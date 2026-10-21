@@ -230,6 +230,17 @@ pub(crate) fn parse_server_block(
                     }
                     warnings.push(w);
                 } else {
+                    // The same address twice in one server is an error, as
+                    // nginx's ngx_http_add_server (#564); two servers on
+                    // one address are name-based virtual hosts.
+                    for l in &parsed {
+                        if listens.iter().any(|o| o.addr == l.addr && o.unix == l.unix) {
+                            return Err(Error::DuplicateListen(match &l.unix {
+                                Some(path) => format!("unix:{}", path.display()),
+                                None => l.addr.to_string(),
+                            }));
+                        }
+                    }
                     listens.extend(parsed);
                 }
             }

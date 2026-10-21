@@ -3022,6 +3022,39 @@ mod tests {
         }
     }
 
+    /// One server listing an address twice is refused, as nginx's "a
+    /// duplicate listen" (#564); the address is compared parsed, and two
+    /// servers on one address are name-based virtual hosts.
+    #[test]
+    fn a_duplicate_listen_in_one_server_is_refused() {
+        for (listens, addr) in [
+            (
+                "listen 127.0.0.1:81; listen 127.0.0.1:81 ssl;",
+                "127.0.0.1:81",
+            ),
+            ("listen 127.0.0.1:81; listen 127.0.0.1:081;", "127.0.0.1:81"),
+            ("listen 81; listen 0.0.0.0:81;", "0.0.0.0:81"),
+            ("listen [::1]:81; listen [::1]:80-82;", "[::1]:81"),
+            ("listen unix:/tmp/s; listen unix:/tmp/s;", "unix:/tmp/s"),
+        ] {
+            let err = parse(&format!(
+                "http {{ server {{ {listens} location / {{ return 204; }} }} }}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.starts_with(&format!("a duplicate listen {addr}")),
+                "{err}"
+            );
+        }
+        for fine in [
+            "server { listen 127.0.0.1:81; listen 127.0.0.2:81; listen [::1]:81; }",
+            "server { listen 127.0.0.1:81; } server { listen 127.0.0.1:81; server_name b; }",
+        ] {
+            parse(&format!("http {{ {fine} }}")).unwrap();
+        }
+    }
+
     #[test]
     fn log_format_and_access_log_parse_at_http_scope() {
         let src = r#"
