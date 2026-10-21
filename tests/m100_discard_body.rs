@@ -3,6 +3,7 @@
 //! `post_action` or `limit_except`, in a config that never reads
 //! `$request_body` or `$request_body_file`, reads the body through a small
 //! buffer and drops it, as nginx's ngx_http_discard_request_body does. The
+//! response goes out first, before the body has come (#627). The
 //! connection stays usable: keep-alive and a pipelined request after the
 //! body work, and `$request_length` still counts the whole body.
 
@@ -154,7 +155,44 @@ fn m100_client_stopping_mid_body_closes_the_connection() {
         .unwrap();
     s.write_all(&[b'x'; 1000]).unwrap();
     s.shutdown(std::net::Shutdown::Write).unwrap();
+    // The response went out at once (#627); the rest of the body never
+    // comes, so the connection then closes.
     let mut out = Vec::new();
     let _ = s.read_to_end(&mut out);
-    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+    assert_eq!(out.matches("HTTP/1.1").count(), 1, "{out}");
+}
+
+/// The response doesn't wait for a body nothing reads (#627): it comes
+/// while the body is still on its way, as nginx answers before discarding.
+/// A chunked body that is still coming gets the response too, and then the
+/// connection closes, its end being unknown.
+#[test]
+fn m100_the_response_comes_before_the_body() {
+    let (_server, port) = start("first");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+        .unwrap();
+    assert_eq!(
+        responses(&mut s, 1),
+        ["HTTP/1.1 200 OK | ok 10\n".to_string()]
+    );
+    // The rest of it, and a next request on the same connection.
+    s.write_all(b"defghijGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    assert_eq!(
+        responses(&mut s, 1),
+        ["HTTP/1.1 200 OK | ok \n".to_string()]
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
 }

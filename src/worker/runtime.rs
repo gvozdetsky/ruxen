@@ -3525,6 +3525,39 @@ where
     ))
 }
 
+/// The rest of a body nobody reads, after the response went out (#627):
+/// `true` when it was read and dropped and the connection may serve the
+/// next request. An HTTP/2 stream ends instead (the `h2` crate then resets
+/// it with NO_ERROR, which tells the client to stop sending, as nginx's
+/// ngx_http_v2_close_stream does); a chunked body, or a connection that
+/// closes anyway, gets a lingering close so the response isn't lost to a
+/// reset.
+#[cold]
+#[inline(never)]
+async fn discard_after_response<S: ConnIo>(
+    stream: &mut S,
+    rest: u64,
+    close_after: bool,
+    scratch: &mut Vec<u8>,
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+) -> bool {
+    if stream.h2() {
+        return false;
+    }
+    if rest == u64::MAX || close_after {
+        lingering_close(stream, scratch).await;
+        return false;
+    }
+    // nginx reads it under `lingering_timeout` per read and `lingering_time`
+    // in all (ngx_http_finalize_connection), not `client_body_timeout`.
+    monoio::time::timeout(
+        LINGERING_TIME,
+        discard_request_body(stream, rest, timer, LINGERING_TIMEOUT),
+    )
+    .await
+    .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) async fn handle<S: ConnIo>(
     stream: &mut S,
@@ -4078,6 +4111,12 @@ pub(crate) async fn handle<S: ConnIo>(
                         // location answers 413 through its error_page, and
                         // the connection closes after it (lingering).
                         let mut body_too_large = false;
+                        // What of a body nobody reads is still to come: the
+                        // response goes first, as nginx's
+                        // ngx_http_discard_request_body, and the rest is
+                        // read and dropped after it (#627). `u64::MAX`: a
+                        // chunked one, whose end isn't known.
+                        let mut pending_discard: Option<u64> = None;
                         let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
                             (0, 0)
                         } else if let Some(cl) = req.content_length {
@@ -4092,15 +4131,8 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let already = filled.saturating_sub(body_start);
                                 let take = (already as u64).min(cl) as usize;
                                 if discard_body {
-                                    if !discard_request_body(
-                                        stream,
-                                        cl - take as u64,
-                                        timers.io.as_mut(),
-                                        body_timeout,
-                                    )
-                                    .await
-                                    {
-                                        return;
+                                    if cl > take as u64 {
+                                        pending_discard = Some(cl - take as u64);
                                     }
                                     break 'read (take, cl);
                                 }
@@ -4159,6 +4191,9 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                                 (take, cl)
                             }
+                        } else if req.transfer_encoding_chunked && discard_body {
+                            pending_discard = Some(u64::MAX);
+                            (0, 0)
                         } else if req.transfer_encoding_chunked {
                             let body_start = base + req.consumed;
                             let initial = &buf[body_start..filled];
@@ -4909,6 +4944,18 @@ pub(crate) async fn handle<S: ConnIo>(
                                 .await;
                         }
                         if cut_short {
+                            return;
+                        }
+                        if let Some(rest) = pending_discard
+                            && !Box::pin(discard_after_response(
+                                stream,
+                                rest,
+                                close_after,
+                                &mut *scratch,
+                                timers.io.as_mut(),
+                            ))
+                            .await
+                        {
                             return;
                         }
 

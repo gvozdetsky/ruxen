@@ -25,7 +25,7 @@ NOTES = {
     "h2_keepalive.t": "by design: the two-step GOAWAY, #347",
     "h2_priority.t": "by design: priorities ignored, as RFC 9113 deprecates them, #347",
     "h2_request_body.t": "partly by design: Content-Length mismatches, the WINDOW_UPDATE size "
-    "and a malformed request's 400, #347; the rest #493, #627, #628",
+    "and a malformed request's 400, #347; the discarded body's RST_STREAM, #627",
     "h2_request_body_preread.t": "by design: #347",
 }
 

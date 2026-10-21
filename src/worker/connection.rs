@@ -839,6 +839,12 @@ pub(crate) async fn write_all_timed<S: monoio::io::AsyncWriteRent>(
     (Ok(()), buf)
 }
 
+/// nginx's `lingering_time` default: how long a lingering close, or the
+/// discard of a body after the response, reads in all.
+pub(crate) const LINGERING_TIME: Duration = Duration::from_secs(30);
+/// nginx's `lingering_timeout` default: how long such a read waits.
+pub(crate) const LINGERING_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// nginx's lingering close (`ngx_http_set_lingering_close`): after an
 /// early answer the client may still be sending the request body, and
 /// closing a socket with unread input makes the kernel reset the
@@ -846,8 +852,6 @@ pub(crate) async fn write_all_timed<S: monoio::io::AsyncWriteRent>(
 /// and discard until the client is done (EOF), at most `lingering_timeout`
 /// (5 s) per read and `lingering_time` (30 s) in total, then close.
 pub(crate) async fn lingering_close<S: ConnIo>(stream: &mut S, buf: &mut Vec<u8>) {
-    const LINGERING_TIME: Duration = Duration::from_secs(30);
-    const LINGERING_TIMEOUT: Duration = Duration::from_secs(5);
     let _ = monoio::io::AsyncWriteRent::shutdown(stream).await;
     let deadline = Instant::now() + LINGERING_TIME;
     let mut scratch = std::mem::take(buf);

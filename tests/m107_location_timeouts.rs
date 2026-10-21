@@ -2,7 +2,8 @@
 //! location a request is routed to (#147), not only of the address's
 //! default server: a stalled body under a name-based server's or a
 //! location's 1 s timeout is cut after a second, while the default server
-//! keeps its 60 s.
+//! keeps its 60 s. The locations read the body (`$request_body`): one
+//! nobody reads is answered at once and dropped afterwards (#627).
 
 mod common;
 
@@ -45,11 +46,12 @@ fn start() -> (Server, u16) {
         dir.join("nginx.conf"),
         format!(
             "events {{}}\nhttp {{ access_log off; root {d}/html;\n\
-             server {{ listen 127.0.0.1:{port}; server_name default; location / {{ return 200; }} }}\n\
+             server {{ listen 127.0.0.1:{port}; server_name default;\n\
+               location / {{ return 200 $request_body; }} }}\n\
              server {{ listen 127.0.0.1:{port}; server_name vhost; client_body_timeout 1s;\n\
-               location / {{ return 200; }} }}\n\
+               location / {{ return 200 $request_body; }} }}\n\
              server {{ listen 127.0.0.1:{port}; server_name loc;\n\
-               location / {{ client_body_timeout 1s; return 200; }}\n\
+               location / {{ client_body_timeout 1s; return 200 $request_body; }}\n\
                location /big {{ send_timeout 1s; }} }}\n\
              }}\n"
         ),

@@ -425,3 +425,47 @@ fn large_client_header_buffers_bound_fields_and_the_list() {
         );
     }
 }
+
+/// A stream whose body nothing reads gets its response at once, then
+/// RST_STREAM NO_ERROR, which asks the client to stop sending, as nginx's
+/// ngx_http_v2_close_stream (#627): the body is never waited for.
+#[test]
+fn a_body_nothing_reads_is_reset_with_no_error_after_the_response() {
+    use std::io::{Read, Write};
+    let setup = common::ports::setup_lock();
+    let [port] = common::ports::free_ports();
+    let _s = start("discard", setup, |_| {
+        format!("server {{ listen 127.0.0.1:{port}; http2 on; location / {{ return 200 ok; }} }}")
+    });
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend_from_slice(&[kind, flags]);
+        f.extend_from_slice(&stream.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    c.write_all(&frame(0x4, 0, 0, &[])).unwrap();
+    // POST / with :authority a, END_HEADERS only: a body is to follow.
+    c.write_all(&frame(0x1, 0x4, 1, &[0x83, 0x86, 0x84, 0x01, 1, b'a']))
+        .unwrap();
+    let (mut status, mut reset) = (None, None);
+    while reset.is_none() {
+        let mut head = [0u8; 9];
+        c.read_exact(&mut head).expect("a frame");
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+        let mut payload = vec![0; len];
+        c.read_exact(&mut payload).unwrap();
+        match (head[3], stream) {
+            (0x1, 1) => status = payload.first().copied(),
+            (0x3, 1) => reset = Some(u32::from_be_bytes(payload[..4].try_into().unwrap())),
+            _ => {}
+        }
+    }
+    // `:status` 200 is static-table entry 8.
+    assert_eq!(status, Some(0x88));
+    assert_eq!(reset, Some(0), "RST_STREAM NO_ERROR");
+}
