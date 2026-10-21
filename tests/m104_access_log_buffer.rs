@@ -186,3 +186,32 @@ fn m104_conflicting_buffers_for_one_file_are_refused() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Reloads retire generations whose buffers are freed with their
+/// configuration (#528): their lines are written when their workers stop,
+/// and a SIGTERM after them writes the running generation's lines without
+/// touching the freed ones.
+#[test]
+fn m104_buffers_of_retired_generations_go_with_them() {
+    let (dir, port, setup) = setup("reload");
+    let mut child = start(&dir, setup);
+    for i in 0..5 {
+        get(port, &format!("/k/gen{i}"));
+        signal(&child, "-HUP");
+        // The old generation stops (writing its buffer) once idle.
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    get(port, "/k/last");
+    signal(&child, "-TERM");
+    assert!(child.0.wait().unwrap().success());
+    let log = std::fs::read_to_string(dir.join("k.log")).unwrap();
+    let mut got: Vec<&str> = log.lines().collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        [
+            "/k/gen0", "/k/gen1", "/k/gen2", "/k/gen3", "/k/gen4", "/k/last"
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

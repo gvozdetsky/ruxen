@@ -2805,15 +2805,15 @@ impl<'a> AccessLogPrep<'a> {
                     }
                     Some(*known)
                 } else {
-                    // Not in the arena: `logbuf`'s registry keeps it for
-                    // the SIGTERM write after a reload too.
+                    // In the arena: `logbuf`'s registry lets go of it
+                    // when the generation is retired (#528).
                     let buffer: &'static PreparedLogBuffer =
-                        Box::leak(Box::new(PreparedLogBuffer {
+                        crate::arena::leak(Box::new(PreparedLogBuffer {
                             slot: self.buffers.len(),
                             size: wanted.0,
                             flush_ms: wanted.1,
                             gzip: wanted.2,
-                            path: Box::leak(log.path.clone().into_boxed_path()),
+                            path: crate::arena::leak(log.path.clone().into_boxed_path()),
                         }));
                     self.buffers.insert(log.path.clone(), buffer);
                     Some(buffer)

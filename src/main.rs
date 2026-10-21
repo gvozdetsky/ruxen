@@ -758,6 +758,8 @@ impl Master {
             // Keyed by peer address: a freed peer's entry could match a
             // later one at the same address.
             syslog::forget_error_log_sockets();
+            // The buffered access logs point into the arena (#528).
+            worker::logbuf::forget(generation.http.access_logs);
             if let Some(arena) = generation.arena.take() {
                 // SAFETY: its workers are joined, and what a later
                 // generation keeps (zone state, cache zones, the buffered
@@ -830,6 +832,7 @@ impl Master {
                 self.listeners
                     .retain(self.current.http, self.current.workers);
                 http.close_root_fds();
+                worker::logbuf::forget(http.access_logs);
                 if let Some(arena) = arena {
                     free_failed(arena);
                 }
