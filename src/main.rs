@@ -57,6 +57,9 @@ static SIGTERM_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGHUP_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGUSR1_SEEN: AtomicBool = AtomicBool::new(false);
 
+/// A reload step that takes longer is logged (#497).
+const RELOAD_SLOW: Duration = Duration::from_secs(5);
+
 /// How long the workers get to end their requests once
 /// `worker_shutdown_timeout` closed their connections, before the process
 /// leaves without them.
@@ -388,8 +391,16 @@ fn real_main() -> Result<(), Failure> {
     // per worker, and the pid file (which Test::Nginx polls for) appears
     // only once the server accepts connections.
     // A failed start ends the process: nothing to free.
-    let generation = Generation::start(0, http, arena, &settings, worker_listeners, &exited_tx)
-        .map_err(|(e, _)| e);
+    let generation = Generation::start(
+        0,
+        http,
+        arena,
+        &settings,
+        worker_listeners,
+        &exited_tx,
+        &mut |_| {},
+    )
+    .map_err(|(e, _)| e);
     let mut startup_error = generation.as_ref().err().cloned();
     // The pid file goes where root may write (/run), so before the switch.
     let mut pid_written = false;
@@ -525,6 +536,7 @@ impl Generation {
         settings: &Settings,
         listeners: Vec<worker::listeners::WorkerListeners>,
         exited_tx: &std::sync::mpsc::Sender<(u64, usize, bool)>,
+        on_wait: &mut dyn FnMut(&str),
     ) -> Result<Generation, (String, Option<arena::Arena>)> {
         let state: &'static worker::RuntimeState = Box::leak(Box::default());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -561,14 +573,19 @@ impl Generation {
         }
         drop(ready_tx);
         generation.alive = generation.handles.len();
-        for _ in 0..generation.handles.len() {
-            match ready_rx.recv() {
-                Ok(Ok(())) => {}
+        let mut pending = generation.handles.len();
+        while pending > 0 {
+            // `on_wait` between polls: a reload's `main` stays responsive
+            // while a worker blocks starting (#497).
+            match ready_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(Ok(())) => pending -= 1,
                 Ok(Err(e)) => {
                     error.get_or_insert(e);
+                    pending -= 1;
                 }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => on_wait("the new workers"),
                 // A worker died before reporting; the join below says so.
-                Err(_) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         match error {
@@ -686,41 +703,7 @@ impl Master {
             // without waiting for their requests, and the master deletes
             // the pid file and exits 0. Leaving the process does both.
             if SIGTERM_SEEN.load(Ordering::SeqCst) || stuck {
-                let log = |message: &str| {
-                    worker::write_worker_log(
-                        self.current.http.error_logs,
-                        config::ErrorLogLevel::Notice,
-                        message,
-                    )
-                };
-                if SIGTERM_SEEN.load(Ordering::SeqCst) {
-                    log(&signal_line(TERM_SIGNAL.load(Ordering::Relaxed), "exiting"));
-                }
-                self.begin_shutdown();
-                if let Some(path) = &self.settings.pid {
-                    privileges::remove_pid_file_on_exit(path);
-                }
-                // Request-body temp files in flight have no names (they
-                // were unlinked at creation), so the private directory is
-                // empty unless `client_body_in_file_only on` kept some.
-                for generation in self.retiring.iter().chain([&self.current]) {
-                    generation.http.body_temp.remove_private_if_empty();
-                }
-                // Buffered access_log lines (#151): nginx's workers write
-                // them on their way out.
-                worker::logbuf::flush_at_exit();
-                self.listeners.remove_unix_files();
-                // Without exit handlers or destructors (#525): the workers
-                // still run, and aws-lc's destructors free the global DRBG
-                // a worker may be seeding from. nginx's master exits only
-                // once its workers are gone; here the process ends them.
-                // nginx's master says so on its way out
-                // (ngx_master_process_exit).
-                log("exit");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                // SAFETY: `_exit` ends the process at once; nothing after
-                // it runs.
-                unsafe { libc::_exit(if worker_panicked { 1 } else { 0 }) }
+                self.exit_now(if worker_panicked { 1 } else { 0 });
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
                 worker::write_worker_log(
@@ -780,6 +763,66 @@ impl Master {
             return Err(Failure::Reported);
         }
         Ok(())
+    }
+
+    /// SIGTERM / SIGINT: nginx's fast shutdown. Its workers exit without
+    /// waiting for their requests, and the master deletes the pid file and
+    /// exits. Leaving the process does both.
+    fn exit_now(&mut self, status: i32) -> ! {
+        let log = |message: &str| {
+            worker::write_worker_log(
+                self.current.http.error_logs,
+                config::ErrorLogLevel::Notice,
+                message,
+            )
+        };
+        if SIGTERM_SEEN.load(Ordering::SeqCst) {
+            log(&signal_line(TERM_SIGNAL.load(Ordering::Relaxed), "exiting"));
+        }
+        self.begin_shutdown();
+        if let Some(path) = &self.settings.pid {
+            privileges::remove_pid_file_on_exit(path);
+        }
+        // Request-body temp files in flight have no names (they were
+        // unlinked at creation), so the private directory is empty unless
+        // `client_body_in_file_only on` kept some.
+        for generation in self.retiring.iter().chain([&self.current]) {
+            generation.http.body_temp.remove_private_if_empty();
+        }
+        // Buffered access_log lines (#151): nginx's workers write them on
+        // their way out.
+        worker::logbuf::flush_at_exit();
+        self.listeners.remove_unix_files();
+        // nginx's master says so on its way out (ngx_master_process_exit).
+        log("exit");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // Without exit handlers or destructors (#525): the workers still
+        // run, and aws-lc's destructors free the global DRBG a worker may
+        // be seeding from. nginx's master exits only once its workers are
+        // gone; here the process ends them, a reload's blocked threads too.
+        // SAFETY: `_exit` ends the process at once; nothing after it runs.
+        unsafe { libc::_exit(status) }
+    }
+
+    /// A turn of a reload's wait (#497): `main` stays responsive while the
+    /// reload thread prepares the configuration or the new workers start,
+    /// where nginx's master would block. SIGTERM exits as usual; a step
+    /// that takes longer than `RELOAD_SLOW` is logged once, by name.
+    fn wait_step(&mut self, started: Instant, warned: &mut bool, step: &str) {
+        if SIGTERM_SEEN.load(Ordering::SeqCst) {
+            self.exit_now(0);
+        }
+        if !*warned && started.elapsed() >= RELOAD_SLOW {
+            *warned = true;
+            worker::write_worker_log(
+                self.current.http.error_logs,
+                config::ErrorLogLevel::Warn,
+                &format!(
+                    "the reload has waited {} s for {step}",
+                    started.elapsed().as_secs()
+                ),
+            );
+        }
     }
 
     fn generation(&mut self, id: u64) -> Option<&mut Generation> {
@@ -850,14 +893,25 @@ impl Master {
         let cli = self.cli.clone();
         // Its own thread: parsing and preparing keep state in thread
         // locals, which then start empty, as at startup.
-        let loaded = thread::Builder::new()
+        let started = Instant::now();
+        let mut warned = false;
+        let loaded = match thread::Builder::new()
             .name("ruxen-reload".into())
             .spawn(move || load_for_reload(&cli))
-            .map_err(|e| (format!("spawning a thread failed ({e})"), None))
-            .and_then(|t| {
-                t.join()
-                    .unwrap_or_else(|_| Err(("reading the configuration panicked".into(), None)))
-            });
+        {
+            Err(e) => Err((format!("spawning a thread failed ({e})"), None)),
+            // Polled, not joined (#497): a blocked open (a FIFO without a
+            // reader) mustn't keep `main` from SIGTERM.
+            Ok(t) => loop {
+                if t.is_finished() {
+                    break t.join().unwrap_or_else(|_| {
+                        Err(("reading the configuration panicked".into(), None))
+                    });
+                }
+                self.wait_step(started, &mut warned, "reading the configuration");
+                thread::sleep(Duration::from_millis(10));
+            },
+        };
         let (settings, http, arena, warnings) = match loaded {
             Ok(loaded) => loaded,
             Err((e, arena)) => {
@@ -881,13 +935,15 @@ impl Master {
         };
         let id = self.next_id;
         self.next_id += 1;
+        let exited_tx = self.exited_tx.clone();
         let generation = match Generation::start(
             id,
             http,
             arena,
             &settings,
             worker_listeners,
-            &self.exited_tx,
+            &exited_tx,
+            &mut |step| self.wait_step(started, &mut warned, step),
         ) {
             Ok(g) => g,
             Err((e, arena)) => {

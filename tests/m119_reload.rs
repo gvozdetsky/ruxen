@@ -732,3 +732,42 @@ fn signals_are_logged_with_their_sender() {
         "{log}"
     );
 }
+
+/// A reload blocked in `prepare` (an access_log FIFO without a reader:
+/// `open` waits for one) doesn't keep `main` from SIGTERM (#497): it
+/// exits as usual, the pid file removed, instead of until SIGKILL.
+#[test]
+fn sigterm_ends_a_blocked_reload() {
+    let setup = common::ports::setup_lock();
+    let port = free_port();
+    let mut s = spawn("blocked", "worker_processes 1;", &returning(port, "ok"));
+    drop(setup);
+    let fifo = s.dir.join("fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    s.write_conf(
+        "worker_processes 1;",
+        &format!("access_log {};\n{}", fifo.display(), returning(port, "new")),
+    );
+    s.hup();
+    // The old workers still answer while the reload waits.
+    assert_eq!(body(port), "ok\n");
+    // SAFETY: a signal to the child we started.
+    unsafe {
+        assert_eq!(kill(s.child.id() as i32, libc::SIGTERM), 0);
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = s.child.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SIGTERM didn't end the blocked reload"
+        );
+        sleep(Duration::from_millis(20));
+    }
+    assert!(!s.dir.join("ruxen.pid").exists());
+}
