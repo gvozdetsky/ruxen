@@ -350,6 +350,8 @@ impl RenderCtx<'_> {
                 }
             }
             Variable::Hostname => out.extend_from_slice(self.hostname),
+            // Read when used: a daemon's PID is its child's, after the fork.
+            Variable::Pid => write_u64_decimal(out, u64::from(std::process::id())),
             Variable::LimitConnStatus => {
                 if let Some(state) = self.rewrite_state {
                     out.extend_from_slice(super::limit_conn::status::text(state.limit_conn_status));

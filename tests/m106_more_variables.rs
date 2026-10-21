@@ -1,6 +1,7 @@
-//! M106 — `$binary_remote_addr`, `$document_uri` and `$https`, which were
-//! empty with a "not supported yet" warning: the client address as 4 (or
-//! 16) bytes, `$uri` under its other name, and `on` over TLS only.
+//! M106 — `$binary_remote_addr`, `$document_uri`, `$https` and `$pid`,
+//! which were empty with a "not supported yet" warning: the client address
+//! as 4 (or 16) bytes, `$uri` under its other name, `on` over TLS only, and
+//! the process ID (#559).
 
 mod common;
 
@@ -38,7 +39,7 @@ fn m106_binary_remote_addr_document_uri_https() {
         format!(
             "events {{}}\nhttp {{ server {{ listen 127.0.0.1:{port};\n\
              location / {{ rewrite ^/old(.*)$ /new$1 break;\n\
-             return 200 \"[$binary_remote_addr][$document_uri][$https]\"; }}\n\
+             return 200 \"[$binary_remote_addr][$document_uri][$https][$pid]\"; }}\n\
              }} }}\n"
         ),
     )
@@ -69,7 +70,9 @@ fn m106_binary_remote_addr_document_uri_https() {
     let mut out = Vec::new();
     let _ = s.read_to_end(&mut out);
     let body = &out[out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..];
-    assert_eq!(body, b"[\x7f\x00\x00\x01][/new/x][]");
+    let mut want = b"[\x7f\x00\x00\x01][/new/x][]".to_vec();
+    want.extend_from_slice(format!("[{}]", child.0.id()).as_bytes());
+    assert_eq!(body, want);
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }

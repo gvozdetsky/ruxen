@@ -2680,6 +2680,7 @@ fn request_constant(parts: &[ValuePart]) -> bool {
                 | Variable::RealIpRemoteAddr
                 | Variable::RealIpRemotePort
                 | Variable::Hostname
+                | Variable::Pid
                 | Variable::Connection
                 | Variable::ConnectionRequests
                 | Variable::ServerPort

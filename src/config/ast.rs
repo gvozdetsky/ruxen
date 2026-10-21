@@ -2417,6 +2417,10 @@ pub enum Variable {
     /// Machine hostname, lowercased, captured once at startup
     /// (`gethostname`).
     Hostname,
+    /// `$pid`: the process ID (#559). ruxen's workers are threads of one
+    /// process, so it is the same for all of them; `kill` of it reaches
+    /// the server, as of nginx's worker PID.
+    Pid,
     /// `$http_NAME` — request header lookup. Name is stored lowercased
     /// with underscores replaced by dashes so a linear scan of the raw
     /// header block compares directly.
