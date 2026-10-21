@@ -2,7 +2,7 @@
 //! the footer of built-in HTML error pages, e.g. `return 404;`);
 //! `server_tokens off` drops the version. Under
 //! nginx-tests (`RUXEN_NGINX_IDENTITY=1`, set by
-//! scripts/run_nginx_tests.sh) they name nginx/1.29.2, because the upstream
+//! scripts/run_nginx_tests.sh) they name nginx/1.30.6, because the upstream
 //! tests assert it, and `-V` adds its `nginx version:` line.
 
 mod common;
@@ -122,8 +122,8 @@ fn responses_name_ruxen_by_default() {
 fn nginx_identity_for_the_test_harness() {
     let server = start(true);
     let resp = get(server.port, "/gone");
-    assert!(resp.contains("\r\nServer: nginx/1.29.2\r\n"), "{resp}");
-    assert!(resp.contains("<center>nginx/1.29.2</center>"), "{resp}");
+    assert!(resp.contains("\r\nServer: nginx/1.30.6\r\n"), "{resp}");
+    assert!(resp.contains("<center>nginx/1.30.6</center>"), "{resp}");
     let resp = get(server.port, "/quiet/");
     assert!(resp.contains("\r\nServer: nginx\r\n"), "{resp}");
     assert!(resp.contains("<center>nginx</center>"), "{resp}");
@@ -148,5 +148,5 @@ fn version_names_nginx_only_for_the_test_harness() {
     assert!(!ruxen.contains("nginx version"), "{ruxen}");
 
     let nginx = version(true);
-    assert_eq!(nginx, format!("nginx version: nginx/1.29.2\n{ruxen}"));
+    assert_eq!(nginx, format!("nginx version: nginx/1.30.6\n{ruxen}"));
 }

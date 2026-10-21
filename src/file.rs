@@ -982,7 +982,7 @@ mod tests {
             open_for_test(&file_path),
             Method::Get,
             no_cond(),
-            b"nginx/1.29.2",
+            b"nginx/1.30.6",
             false,
         );
         match r {
@@ -1017,7 +1017,7 @@ mod tests {
             open_for_test(&file_path),
             Method::Head,
             no_cond(),
-            b"nginx/1.29.2",
+            b"nginx/1.30.6",
             false,
         );
         match r {
@@ -1050,7 +1050,7 @@ mod tests {
             open_for_test(&file_path),
             Method::Get,
             no_cond(),
-            b"nginx/1.29.2",
+            b"nginx/1.30.6",
             false,
         );
         match r {
@@ -1083,7 +1083,7 @@ mod tests {
             open_for_test(&file_path),
             Method::Get,
             no_cond(),
-            b"nginx/1.29.2",
+            b"nginx/1.30.6",
             false,
         );
         match r {
@@ -1568,7 +1568,7 @@ mod tests {
                     max_ranges: Some(0),
                     ..no_cond()
                 },
-                b"nginx/1.29.2",
+                b"nginx/1.30.6",
                 false,
             );
             let Response::Owned(bytes) = r else {
@@ -1753,20 +1753,20 @@ mod tests {
     #[test]
     fn not_modified_response_has_no_content_length() {
         let meta = meta(10, 100);
-        let out = build_not_modified_response(&meta, b"nginx/1.29.2");
+        let out = build_not_modified_response(&meta, b"nginx/1.30.6");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 304 Not Modified\r\n"));
         assert!(!s.contains("Content-Length:"));
         // nginx's not_modified filter clears Accept-Ranges on a 304.
         assert!(!s.contains("Accept-Ranges"));
-        assert!(s.contains("\r\nServer: nginx/1.29.2\r\nDate: "));
+        assert!(s.contains("\r\nServer: nginx/1.30.6\r\nDate: "));
         assert!(s.ends_with("\r\n\r\n"));
     }
 
     #[test]
     fn content_headers_head_shape_has_no_body_bytes() {
         let meta = meta(5, 100);
-        let out = build_content_headers(&meta, 200, None, true, b"nginx/1.29.2");
+        let out = build_content_headers(&meta, 200, None, true, b"nginx/1.30.6");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 5\r\n"));
@@ -1780,7 +1780,7 @@ mod tests {
     #[test]
     fn content_headers_206_include_content_range_without_body() {
         let meta = meta(100, 100);
-        let out = build_content_headers(&meta, 206, Some((5, 14)), true, b"nginx/1.29.2");
+        let out = build_content_headers(&meta, 206, Some((5, 14)), true, b"nginx/1.30.6");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(s.contains("Content-Length: 10\r\n"));
@@ -1804,7 +1804,7 @@ mod tests {
                     range: Some(range),
                     ..no_cond()
                 },
-                b"nginx/1.29.2",
+                b"nginx/1.30.6",
                 false,
             );
             let Response::Owned(bytes) = r else {
@@ -1861,7 +1861,7 @@ mod tests {
                 open_for_test(path),
                 Method::Get,
                 no_cond(),
-                b"nginx/1.29.2",
+                b"nginx/1.30.6",
                 sendfile,
             )
         };

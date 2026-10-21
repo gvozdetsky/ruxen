@@ -128,7 +128,7 @@ for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
     logfile="${OUT_DIR}/logs/${name}.log"
 
-    # RUXEN_NGINX_IDENTITY=1: answer as nginx/1.29.2 (Server header,
+    # RUXEN_NGINX_IDENTITY=1: answer as nginx/1.30.6 (Server header,
     # error-page footer), as the tests assert, and report that version in
     # -V, which Test::Nginx needs to decide which tests apply.
     RUXEN_NGINX_IDENTITY=1 TEST_NGINX_BINARY="${RUXEN_BIN}" TEST_NGINX_GLOBALS='' \

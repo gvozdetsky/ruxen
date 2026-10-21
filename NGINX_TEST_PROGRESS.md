@@ -198,13 +198,13 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 
 - `h2_error_page.t` — 1/4; by design: RFC 9113, #347
 - `h2_headers.t` — 33/112; by design: RFC 9113 and 7541, #347; frames over the announced size, #506
-- `h2_host.t` — 4/62; by design: RFC 9113, #347
+- `h2_host.t` — 6/62; by design: RFC 9113, #347
 - `h2_keepalive.t` — 3/21; by design: the two-step GOAWAY, #347
 - `h2_priority.t` — 11/24; by design: priorities ignored, as RFC 9113 deprecates them, #347
 - `h2_proxy_request_buffering.t` — 49/51
 - `h2_proxy_request_buffering_ssl.t` — 40/42
 - `h2_request_body.t` — 8/51; partly by design: Content-Length mismatches, the WINDOW_UPDATE size and a malformed request's 400, #347; the rest #493, #627, #628
-- `h2_request_body_extra.t` — 3/52
+- `h2_request_body_extra.t` — 2/52
 - `h2_request_body_preread.t` — 1/11; by design: #347
 - `http_resolver_cleanup.t` — 0/3
 - `limit_conn.t` — 1/10
