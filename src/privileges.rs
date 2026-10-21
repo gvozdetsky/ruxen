@@ -305,10 +305,14 @@ pub(crate) fn start_helper(
     for f in extra_files {
         note_file(f);
     }
+    // The child runs Rust code (it allocates, takes `HANDOVER`): a lock
+    // another thread held at the fork would stay held in it for good, and
+    // the helper hang (#527). nginx's master forks from one thread too.
+    single_threaded(user_threads())?;
     let (server_end, helper_end) = std::os::unix::net::UnixStream::pair()
         .map_err(|e| format!("socketpair() failed ({})", errno_text(&e)))?;
-    // SAFETY: fork while single-threaded (checked by the caller's
-    // position in startup); the child never returns from `helper_main`.
+    // SAFETY: fork while single-threaded (checked above); the child never
+    // returns from `helper_main`.
     match unsafe { libc::fork() } {
         -1 => Err(os_error("fork()")),
         0 => {
@@ -327,6 +331,34 @@ pub(crate) fn start_helper(
             *HELPER.lock().unwrap_or_else(|e| e.into_inner()) = Some(server_end);
             Ok(())
         }
+    }
+}
+
+/// The threads of this process that run its code, from `/proc/self/task`:
+/// io_uring's kernel workers (`iou-wrk-*`, `iou-sqp-*`) hold none of its
+/// locks and don't count. `None` without `/proc`.
+fn user_threads() -> Option<usize> {
+    let tasks = std::fs::read_dir("/proc/self/task").ok()?;
+    Some(
+        tasks
+            .filter_map(Result::ok)
+            .filter(|task| {
+                let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+                !is_io_uring_worker(comm.trim_end())
+            })
+            .count(),
+    )
+}
+
+fn is_io_uring_worker(comm: &str) -> bool {
+    comm.starts_with("iou-wrk-") || comm.starts_with("iou-sqp-")
+}
+
+/// `Err` unless the count is one; without `/proc` the check is skipped.
+fn single_threaded(threads: Option<usize>) -> Result<(), String> {
+    match threads {
+        Some(n) if n != 1 => Err(format!("start_helper: {n} threads, the fork needs one")),
+        _ => Ok(()),
     }
 }
 
@@ -512,5 +544,22 @@ mod tests {
         assert_eq!(err, "getgrnam(\"no-such-group-ruxen\") failed");
         let err = resolve(0, Some(&user("no-such-user-ruxen", None))).unwrap_err();
         assert_eq!(err, "getpwnam(\"no-such-user-ruxen\") failed");
+    }
+
+    /// The fork of the root helper needs one thread (#527); io_uring's
+    /// kernel workers don't count, and without `/proc` there's no check.
+    #[test]
+    fn the_helper_forks_from_one_thread() {
+        assert!(single_threaded(Some(1)).is_ok());
+        assert!(single_threaded(None).is_ok());
+        assert_eq!(
+            single_threaded(Some(3)).unwrap_err(),
+            "start_helper: 3 threads, the fork needs one"
+        );
+        assert!(is_io_uring_worker("iou-wrk-12345"));
+        assert!(is_io_uring_worker("iou-sqp-12345"));
+        assert!(!is_io_uring_worker("ruxen"));
+        // The test harness runs threads of its own, this one at least.
+        assert!(user_threads().is_some_and(|n| n >= 1));
     }
 }
