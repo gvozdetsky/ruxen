@@ -506,12 +506,17 @@ fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) 
         out.extend_from_slice(b"\r\n");
     }
     let mut authority_mismatch = false;
+    let mut host_seen = false;
     for (name, value) in &parts.headers {
         if name == http::header::COOKIE {
             continue;
         }
+        // The first `host` stands with the `:authority`; a second one goes
+        // into the head, where the parser refuses a duplicate Host as
+        // nginx does, `:authority` being its Host (#609).
         if name == http::header::HOST
             && let Some(authority) = authority
+            && !std::mem::replace(&mut host_seen, true)
         {
             authority_mismatch |= value.as_bytes() != authority.as_str().as_bytes();
             continue;
@@ -857,5 +862,33 @@ mod tests {
             head("/", Some("b.test")),
             (false, "GET / HTTP/2.0\r\nhost: b.test\r\n\r\n".to_string())
         );
+    }
+
+    /// A second `host` next to the `:authority` goes into the head, which
+    /// the parser then refuses for a duplicate Host, as nginx does (#609).
+    #[test]
+    fn a_second_host_goes_into_the_head() {
+        let (parts, ()) = http::Request::builder()
+            .uri("http://a.test/")
+            .header("host", "a.test")
+            .header("host", "a.test")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let mut out = Vec::new();
+        let (mismatch, _) = request_head(&parts, false, &mut out);
+        assert!(!mismatch);
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            "GET / HTTP/2.0\r\nHost: a.test\r\nhost: a.test\r\n\r\n"
+        );
+        let mut state = crate::http::ParseState {
+            h2: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            crate::http::parse_request(&out, &mut state),
+            crate::http::Parse::Invalid
+        ));
     }
 }
