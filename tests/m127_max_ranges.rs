@@ -2,6 +2,7 @@
 //! nginx's range filter declines (ngx_http_range_header_filter), so a
 //! `Range` gets the whole file as a 200 and there is no `Accept-Ranges`.
 //! The setting is inherited from the server into nested locations.
+//! Without it, many small ranges get the whole file too (nginx 1.29.5).
 
 mod common;
 
@@ -46,9 +47,10 @@ fn free_port() -> u16 {
 fn max_ranges_0_serves_static_files_whole_without_accept_ranges() {
     let dir = std::env::temp_dir().join(format!("ruxen-m127-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["off", "on", "srv"] {
+    for sub in ["off", "on", "srv", "many"] {
         std::fs::create_dir_all(dir.join("html").join(sub)).unwrap();
         std::fs::write(dir.join("html").join(sub).join("f.txt"), b"abcdefghij").unwrap();
+        std::fs::write(dir.join("html").join(sub).join("f100"), [b'x'; 100]).unwrap();
     }
     // Held until ruxen listens.
     let setup = common::ports::setup_lock();
@@ -60,7 +62,8 @@ fn max_ranges_0_serves_static_files_whole_without_accept_ranges() {
             "worker_processes 1;\npid {d}/ruxen.pid;\nevents {{}}\nhttp {{\n\
              server {{ listen 127.0.0.1:{port}; root {d}/html;\n\
              location /off/ {{ max_ranges 0; }}\n\
-             location /on/ {{ }} }}\n\
+             location /on/ {{ }}\n\
+             location /many/ {{ max_ranges 17; }} }}\n\
              server {{ listen 127.0.0.1:{port_srv}; root {d}/html; max_ranges 0;\n\
              location /srv/ {{ location /srv/f {{ }} }} }} }}\n"
         ),
@@ -107,6 +110,26 @@ fn max_ranges_0_serves_static_files_whole_without_accept_ranges() {
     assert!(r.ends_with("\r\n\r\nab"), "{r}");
     let r = request(port, "GET", "/on/f.txt", None);
     assert!(r.contains("\r\nAccept-Ranges: bytes\r\n"), "{r}");
+
+    // nginx 1.29.5 (ngx_http_range_parse): without max_ranges, several
+    // ranges that with 256 bytes each for the part headers pass the file
+    // and 4096 get the whole file. 16 one-byte ranges of 100 bytes fit
+    // (4112 <= 4196), 17 don't (4369).
+    let one_byte = |n: u64| {
+        let list: Vec<String> = (0..n).map(|i| format!("{0}-{0}", 2 * i)).collect();
+        format!("bytes={}", list.join(","))
+    };
+    let r = request(port, "GET", "/on/f100", Some(&one_byte(17)));
+    assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
+    assert!(r.contains("\r\nContent-Length: 100\r\n"), "{r}");
+    assert!(!r.contains("multipart"), "{r}");
+    let r = request(port, "GET", "/on/f100", Some(&one_byte(16)));
+    assert!(r.starts_with("HTTP/1.1 206 "), "{r}");
+    assert_eq!(r.matches("Content-Range: bytes ").count(), 16, "{r}");
+    // An explicit max_ranges: only the old limit, the ranges' sum.
+    let r = request(port, "GET", "/many/f100", Some(&one_byte(17)));
+    assert!(r.starts_with("HTTP/1.1 206 "), "{r}");
+    assert_eq!(r.matches("Content-Range: bytes ").count(), 17, "{r}");
 
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);

@@ -204,3 +204,111 @@ fn http2_over_tls_through_alpn() {
     ]);
     assert_ne!(status, "2 200");
 }
+
+/// One request on a connection of its own, in hand-made frames (curl turns
+/// a `Host` into the `:authority` and sends no `host`): GET `/` with these
+/// `:authority` and `host` fields, HPACK literals without indexing. The
+/// answer's status (200 or 400) and body.
+fn h2_get(port: u16, authority: Option<&str>, host: Option<&str>) -> (u16, String) {
+    use std::io::{Read, Write};
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend_from_slice(&[kind, flags]);
+        f.extend_from_slice(&stream.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+    // :method GET, :scheme http, :path / (static table 2, 6, 4).
+    let mut block = vec![0x82, 0x86, 0x84];
+    if let Some(a) = authority {
+        // :authority, its name from the static table (1).
+        block.extend_from_slice(&[0x01, a.len() as u8]);
+        block.extend_from_slice(a.as_bytes());
+    }
+    if let Some(h) = host {
+        // host, a literal name.
+        block.extend_from_slice(&[0x00, 4]);
+        block.extend_from_slice(b"host");
+        block.push(h.len() as u8);
+        block.extend_from_slice(h.as_bytes());
+    }
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    c.write_all(&frame(0x4, 0, 0, &[])).unwrap();
+    c.write_all(&frame(0x1, 0x5, 1, &block)).unwrap();
+    let (mut status, mut body) = (0, Vec::new());
+    loop {
+        let mut head = [0u8; 9];
+        c.read_exact(&mut head).expect("a response");
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+        let mut payload = vec![0; len];
+        c.read_exact(&mut payload).unwrap();
+        let (kind, flags) = (head[3], head[4]);
+        if stream != 1 {
+            continue;
+        }
+        match kind {
+            0x1 => {
+                // `:status` 200 and 400 are in the static table (8, 12).
+                status = match payload.first() {
+                    Some(0x88) => 200,
+                    Some(0x8c) => 400,
+                    _ => panic!("status other than 200 or 400: {payload:x?}"),
+                };
+            }
+            0x0 => body.extend_from_slice(&payload),
+            0x3 => panic!("RST_STREAM"),
+            _ => {}
+        }
+        // END_STREAM on HEADERS or DATA.
+        if kind <= 0x1 && flags & 0x1 != 0 {
+            return (status, String::from_utf8_lossy(&body).into_owned());
+        }
+    }
+}
+
+/// `:authority` and a `Host` that differs: 400, as nginx since 1.29.1
+/// (ngx_http_v2_run_request), from the server `:authority` names, whose
+/// `error_page` applies. Equal values, or either field alone, are served.
+#[test]
+fn authority_and_a_different_host_are_refused() {
+    let setup = common::ports::setup_lock();
+    let [port] = common::ports::free_ports();
+    let s = start("authority", setup, |dir| {
+        std::fs::write(dir.join("html/e400.html"), "custom 400\n").unwrap();
+        format!(
+            "server {{ listen 127.0.0.1:{port}; http2 on; server_name a.test; root {d}/html;\n\
+               error_page 400 /e400.html;\n\
+               location / {{ return 200 \"a $http_host\\n\"; }}\n\
+               location = /e400.html {{ }} }}\n\
+             server {{ listen 127.0.0.1:{port}; http2 on; server_name b.test;\n\
+               location / {{ return 200 \"b $http_host\\n\"; }} }}",
+            d = dir.display()
+        )
+    });
+
+    let (status, body) = h2_get(port, Some("a.test"), Some("b.test"));
+    assert_eq!((status, body.as_str()), (400, "custom 400\n"));
+    let (status, body) = h2_get(port, Some("b.test"), Some("a.test"));
+    assert_eq!(status, 400);
+    assert!(body.contains("400 Bad Request"), "{body}");
+    // Compared as sent, as nginx's memcmp: case and port count.
+    assert_eq!(h2_get(port, Some("a.test"), Some("A.test")).0, 400);
+    assert_eq!(h2_get(port, Some("a.test"), Some("a.test:80")).0, 400);
+
+    let ok = (200, "b b.test\n".to_string());
+    assert_eq!(h2_get(port, Some("b.test"), Some("b.test")), ok);
+    assert_eq!(h2_get(port, Some("b.test"), None), ok);
+    assert_eq!(h2_get(port, None, Some("b.test")), ok);
+
+    let errors = std::fs::read_to_string(s.dir.join("error.log")).unwrap();
+    assert!(
+        errors.lines().any(|l| l.contains("[info] ")
+            && l.contains("client sent \":authority\" and \"Host\" headers with different values")),
+        "{errors}"
+    );
+    let log = std::fs::read_to_string(s.dir.join("access.log")).unwrap();
+    assert!(log.contains("\"GET / HTTP/2.0\" 400"), "{log}");
+}

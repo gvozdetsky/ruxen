@@ -61,6 +61,9 @@ pub(crate) struct StreamIo {
     /// The request's header block as sent (`compat::HeaderBlocks`), for
     /// `$request_length` (#409).
     header_block: u64,
+    /// The request has an `:authority` and a `Host` that differs from it
+    /// (`request_head`): refused with 400.
+    authority_mismatch: bool,
 }
 
 enum Out {
@@ -102,7 +105,7 @@ impl StreamIo {
         let length = parts.headers.contains_key(http::header::CONTENT_LENGTH);
         let chunked_in = has_body && !length;
         let mut pending = Vec::with_capacity(512);
-        request_head(parts, chunked_in, &mut pending);
+        let authority_mismatch = request_head(parts, chunked_in, &mut pending);
         StreamIo {
             pending,
             pos: 0,
@@ -117,6 +120,7 @@ impl StreamIo {
             counters,
             chunk: chunk.max(1),
             header_block,
+            authority_mismatch,
         }
     }
 
@@ -458,7 +462,14 @@ impl Drop for StreamIo {
 /// `:authority`, the fields with every `cookie` joined into one (RFC 9113,
 /// 8.2.3, as nginx does for `$http_cookie`), and `Transfer-Encoding:
 /// chunked` for a body without a length.
-fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) {
+///
+/// `true` when there is an `:authority` and a `Host` field that isn't the
+/// same bytes: nginx (since 1.29.1, ngx_http_v2_run_request) answers 400,
+/// comparing the two as sent, not normalised (case, a port, a trailing
+/// dot all count). The head carries
+/// the `:authority` alone, by which the request was routed, as nginx's
+/// `ngx_http_v2_parse_authority` chose the server.
+fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) -> bool {
     out.extend_from_slice(parts.method.as_str().as_bytes());
     out.push(b' ');
     let target = parts.uri.path_and_query().map_or("/", |p| p.as_str());
@@ -485,8 +496,15 @@ fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) 
         }
         out.extend_from_slice(b"\r\n");
     }
+    let mut authority_mismatch = false;
     for (name, value) in &parts.headers {
-        if name == http::header::COOKIE || (name == http::header::HOST && authority.is_some()) {
+        if name == http::header::COOKIE {
+            continue;
+        }
+        if name == http::header::HOST
+            && let Some(authority) = authority
+        {
+            authority_mismatch |= value.as_bytes() != authority.as_str().as_bytes();
             continue;
         }
         out.extend_from_slice(name.as_str().as_bytes());
@@ -498,6 +516,7 @@ fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) 
         out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     }
     out.extend_from_slice(b"\r\n");
+    authority_mismatch
 }
 
 /// The status and fields of a response head `handle` wrote.
@@ -706,6 +725,10 @@ impl super::super::ConnIo for StreamIo {
         self.chunk = chunk.max(1);
     }
 
+    fn h2_authority_mismatch(&self) -> bool {
+        self.authority_mismatch
+    }
+
     fn conn_counters(&self) -> Option<(std::time::Instant, u64)> {
         Some(self.counters)
     }
@@ -778,11 +801,42 @@ mod tests {
             .unwrap();
         let (parts, ()) = request.into_parts();
         let mut out = Vec::new();
-        request_head(&parts, true, &mut out);
+        assert!(!request_head(&parts, true, &mut out));
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "POST /p?q=1 HTTP/2.0\r\nHost: example.com:8080\r\nCookie: a=1; b=2\r\n\
              x-y: z\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_host_other_than_the_authority_is_a_mismatch() {
+        let head = |uri: &str, host: Option<&str>| {
+            let mut request = http::Request::builder().uri(uri);
+            if let Some(host) = host {
+                request = request.header("host", host);
+            }
+            let (parts, ()) = request.body(()).unwrap().into_parts();
+            let mut out = Vec::new();
+            let mismatch = request_head(&parts, false, &mut out);
+            (mismatch, String::from_utf8(out).unwrap())
+        };
+        // The client's Host isn't passed on: the head has the authority's.
+        assert_eq!(
+            head("http://a.test/", Some("b.test")),
+            (true, "GET / HTTP/2.0\r\nHost: a.test\r\n\r\n".to_string())
+        );
+        assert!(head("http://a.test/", Some("A.test")).0);
+        assert!(head("http://a.test/", Some("a.test:80")).0);
+        assert!(head("http://a.test/", Some("a.test.")).0);
+        assert_eq!(
+            head("http://a.test/", Some("a.test")),
+            (false, "GET / HTTP/2.0\r\nHost: a.test\r\n\r\n".to_string())
+        );
+        assert!(!head("http://a.test/", None).0);
+        assert_eq!(
+            head("/", Some("b.test")),
+            (false, "GET / HTTP/2.0\r\nhost: b.test\r\n\r\n".to_string())
         );
     }
 }

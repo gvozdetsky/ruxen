@@ -121,6 +121,13 @@ fn realip_sets_the_client_address() {
             format!("GET /on HTTP/1.1{}{}", xff("10.0.0.1:81"), xff("192.0.2.7")),
             "200 10.0.0.1 [81] 127.0.0.1",
         ),
+        // A bracketed IPv6 address without a port (nginx 1.27.3+).
+        (
+            port,
+            "",
+            format!("GET /off HTTP/1.1{}", xff("10.0.0.1, [2001:db8::2]")),
+            "200 2001:db8::2 [] 127.0.0.1",
+        ),
         // A bad entry: the peer stays.
         (
             port,

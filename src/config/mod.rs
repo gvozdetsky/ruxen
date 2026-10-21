@@ -338,6 +338,17 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
         if args.is_empty() {
             return match term {
                 Terminator::BlockClose => {
+                    // Every listen was `quic` (#593): nginx would serve
+                    // QUIC only, ruxen serves nothing; say so.
+                    if servers.is_empty()
+                        && warnings.iter().any(|w| w.starts_with(QUIC_LISTEN_IGNORED))
+                    {
+                        warnings.push(
+                            "no TCP listen is left (\"quic\" listens are ignored): \
+                             no connections will be accepted"
+                                .into(),
+                        );
+                    }
                     // After the whole block: an http-level proxy_* line
                     // below a server still applies to it, as in nginx.
                     for server in &mut servers {
@@ -1174,8 +1185,9 @@ pub(crate) fn parse_mime(
 /// Fail closed on directives that restrict access, when ruxen can't
 /// enforce them yet. The allowlist above is for tuning knobs; silently
 /// dropping one of these would serve what the config says to protect.
-/// Called by the lexer for every directive, so no scope can miss it.
-pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
+/// Called by the lexer for every directive, so no scope can miss it;
+/// `term` tells a block from a line.
+pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
         // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
@@ -1191,11 +1203,27 @@ pub(crate) fn reject_unenforced(args: &[String]) -> Result<(), Error> {
         Some("root" | "alias") if value.is_some_and(|v| v.contains('$')) => {
             "variables in the path aren't expanded yet (#232), so other files would be served than nginx serves"
         }
+        // `location $var` (one argument, a leading `$`) is a predicate
+        // location since nginx 1.31.5: it matches when the variable is
+        // non-empty and not "0" (ngx_http_core_location). Read as a prefix,
+        // as nginx 1.24 did, it never matches, and `location $blocked
+        // { return 403; }` would block nothing (#596). A modifier, apart
+        // or glued (`= $x`, `=$x`), still makes it literal in nginx. Only a
+        // block: `location $x;` can be a `map` entry.
+        Some("location")
+            if *term == Terminator::BlockOpen
+                && args.len() == 2
+                && value.is_some_and(|v| v.starts_with('$')) =>
+        {
+            "predicate locations (nginx 1.31.5) aren't implemented, and as a literal prefix it \
+             would never match"
+        }
         _ => return Ok(()),
     };
-    // For a path, the whole directive: "root" alone isn't what's missing.
+    // For a path or a location, the whole directive: "root" alone isn't
+    // what's missing.
     let name = match args.first().map(String::as_str) {
-        Some("root" | "alias") => args.join(" "),
+        Some("root" | "alias" | "location") => args.join(" "),
         _ => args[0].clone(),
     };
     Err(Error::Unenforced { name, consequence })
@@ -2099,6 +2127,75 @@ mod tests {
     }
 
     #[test]
+    fn listen_quic_opens_no_socket() {
+        // #593: nginx opens a UDP socket for `quic`; ruxen has no HTTP/3 and
+        // must not open a TCP one in its place. A server whose listens are
+        // all `quic` doesn't get the default `*:80` either.
+        let cfg =
+            parse("http { server { listen 127.0.0.1:28099 quic; location / { return 200 x; } } }")
+                .unwrap();
+        assert!(cfg.servers.is_empty(), "{:?}", cfg.servers);
+        assert_eq!(
+            cfg.warnings,
+            [
+                QUIC_LISTEN_IGNORED.to_string(),
+                "no TCP listen is left (\"quic\" listens are ignored): no connections will be \
+                 accepted"
+                    .to_string(),
+            ]
+        );
+        // The usual pair keeps its TLS socket; one warning per line, also
+        // for a port range.
+        let cfg = parse(
+            "http { server { listen 127.0.0.1:443 ssl; listen 127.0.0.1:443 quic reuseport;
+                             listen 127.0.0.1:8000-8003 quic;
+                             ssl_certificate a.pem; ssl_certificate_key a.key; } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.servers[0].listen.addr.port(), 443);
+        assert!(cfg.servers[0].listen.ssl);
+        assert_eq!(
+            cfg.warnings,
+            [
+                QUIC_LISTEN_IGNORED.to_string(),
+                QUIC_LISTEN_IGNORED.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn listen_quic_rejects_tcp_parameters() {
+        // ngx_http_core_listen's checks, in its order.
+        for (flags, param) in [
+            ("ssl quic", "ssl"),
+            ("quic http2", "http2"),
+            ("quic fastopen=10", "fastopen"),
+            ("quic backlog=10 deferred", "backlog"),
+            ("quic deferred", "deferred"),
+            ("quic so_keepalive=on", "so_keepalive"),
+            ("quic proxy_protocol", "proxy_protocol"),
+        ] {
+            let err = parse(&format!("http {{ server {{ listen 443 {flags}; }} }}")).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("\"listen\" directive \"{param}\" parameter is incompatible with \"quic\""),
+                "{flags}"
+            );
+        }
+        // `http3` (the nginx-quic branch's spelling) is no nginx release's
+        // parameter, and used to open a plain TCP socket too.
+        let err = parse("http { server { listen 443 http3; } }").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BadValue {
+                what: "listen flag",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn ssl_protocols_accepts_tls12_tls13_and_rejects_insecure() {
         let src = r#"
             http {
@@ -2205,6 +2302,48 @@ mod tests {
         );
         // Without variables, as before.
         parse("http { server { listen 80; root /srv; location /a/ { alias /srv/a/; } } }").unwrap();
+    }
+
+    #[test]
+    fn predicate_locations_are_refused() {
+        // #596: nginx 1.31.5 matches `location $var` when the variable is
+        // non-empty and not "0"; ruxen would take it as a prefix that never
+        // matches. Refused at server level, nested, and quoted.
+        for (src, name) in [
+            (
+                "http { map $arg_x $blocked { default 0; 1 1; }
+                 server { listen 80; location $blocked { return 403; } } }",
+                "location $blocked",
+            ),
+            (
+                "http { server { listen 80; location / { location $arg_b { return 403; } } } }",
+                "location $arg_b",
+            ),
+            (
+                "http { server { listen 80; location \"$arg_a\" { return 403; } } }",
+                "location $arg_a",
+            ),
+        ] {
+            assert_eq!(
+                unenforced_err(src),
+                format!(
+                    "\"{name}\" is not supported yet, and ignoring it is unsafe: predicate \
+                     locations (nginx 1.31.5) aren't implemented, and as a literal prefix it \
+                     would never match"
+                )
+            );
+        }
+        // A modifier makes the `$` literal in nginx too, apart or glued
+        // (#577); and a `map` entry named `location` is no location.
+        for src in [
+            "http { server { listen 80; location = $x { return 200; } } }",
+            "http { server { listen 80; location =$x { return 200; } } }",
+            "http { server { listen 80; location ^~ $x { return 200; } } }",
+            "http { server { listen 80; location ~\\.php$ { return 403; } } }",
+            "http { map $uri $m { default 0; location $uri; } server { listen 80; } }",
+        ] {
+            parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        }
     }
 
     #[test]

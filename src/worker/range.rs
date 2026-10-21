@@ -66,6 +66,16 @@ impl Ranges {
     }
 }
 
+/// The range limit without `max_ranges`: nginx merges an unset
+/// `max_ranges` to `NGX_MAX_INT32_VALUE`, and `ngx_http_range_parse`
+/// tells the default by that value.
+pub(crate) const DEFAULT_LIMIT: u64 = i32::MAX as u64;
+
+/// The range limit for a location's `max_ranges` (`None`: unset).
+pub(crate) fn limit(max_ranges: Option<u32>) -> u64 {
+    max_ranges.map_or(DEFAULT_LIMIT, u64::from)
+}
+
 /// A `Range` header's ranges for a body of `len` bytes: `None` when the
 /// filter passes it by (no `bytes=` unit), as nginx's header filter does.
 pub(crate) fn parse_header(value: &[u8], len: u64, limit: u64) -> Option<Parsed> {
@@ -74,7 +84,10 @@ pub(crate) fn parse_header(value: &[u8], len: u64, limit: u64) -> Option<Parsed>
 }
 
 /// `value` after `bytes=`, against a body of `len` bytes, at most `limit`
-/// ranges (nginx's `ranges`; more is declined).
+/// ranges (nginx's `ranges`; more is declined). Several ranges are
+/// declined when they add up to more than the body, and with the default
+/// limit also when, with 256 bytes per part for the multipart headers,
+/// they add up to more than the body plus 4096 (nginx 1.29.5).
 fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
     let mut p = 0;
     let at = |i: usize| value.get(i).copied().unwrap_or(0);
@@ -183,7 +196,15 @@ fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
     let Some(first) = first else {
         return Parsed::NotSatisfiable;
     };
+    // ngx_http_range_parse (1.30.6): one range is always taken.
+    if rest.is_empty() {
+        return Parsed::Ranges(Ranges { first, rest });
+    }
     if size > len {
+        return Parsed::Declined;
+    }
+    let parts = rest.len() as u64 + 1;
+    if limit == DEFAULT_LIMIT && size.saturating_add(parts * 256) > len.saturating_add(4096) {
         return Parsed::Declined;
     }
     Parsed::Ranges(Ranges { first, rest })
@@ -314,7 +335,7 @@ fn decide(
     }
     let limit = match allow {
         RangeAllow::Single => 1,
-        _ => max_ranges.map_or(u64::MAX, u64::from),
+        _ => limit(max_ranges),
     };
     match parse(range, len, limit) {
         Parsed::Declined => Cut::Whole,
@@ -578,6 +599,48 @@ mod tests {
         assert_eq!(parse(b"x", 8, 9), Parsed::NotSatisfiable);
         // More than the whole body in total: the whole body instead.
         assert_eq!(parse(b"0-7,0-7", 8, 9), Parsed::Declined);
+    }
+
+    /// nginx 1.29.5: without `max_ranges`, several ranges are declined
+    /// when they and 256 bytes per part pass the body and 4096.
+    #[test]
+    fn default_limit_counts_the_multipart_overhead() {
+        let one_byte = |n: u64| {
+            (0..n)
+                .map(|i| format!("{0}-{0}", 2 * i))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        // 16 + 16 * 256 = 4112 <= 100 + 4096; 17 + 17 * 256 > it.
+        let r16 = one_byte(16);
+        let r17 = one_byte(17);
+        assert!(
+            matches!(parse(r16.as_bytes(), 100, DEFAULT_LIMIT), Parsed::Ranges(r) if r.len() == 16)
+        );
+        assert_eq!(parse(r17.as_bytes(), 100, DEFAULT_LIMIT), Parsed::Declined);
+        // At the edge: 16 + 16 * 256 == 16 + 4096 is taken.
+        let edge = (0..16)
+            .map(|i| format!("{i}-{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            matches!(parse(edge.as_bytes(), 16, DEFAULT_LIMIT), Parsed::Ranges(r) if r.len() == 16)
+        );
+        // An explicit max_ranges keeps the old rule only.
+        assert!(matches!(parse(r17.as_bytes(), 100, 17), Parsed::Ranges(r) if r.len() == 17));
+        assert!(matches!(parse(r17.as_bytes(), 100, 100), Parsed::Ranges(_)));
+        // One range is always taken, whatever its size.
+        assert_eq!(parse(b"0-0", 1, DEFAULT_LIMIT), ranges((0, 1), &[]));
+        // nginx's unset is NGX_MAX_INT32_VALUE: `max_ranges 2147483647`
+        // is the default too.
+        assert_eq!(limit(None), DEFAULT_LIMIT);
+        assert_eq!(limit(Some(i32::MAX as u32)), DEFAULT_LIMIT);
+        assert_eq!(limit(Some(u32::MAX)), u64::from(u32::MAX));
+        // No overflow on a huge length (a HEAD's Content-Length).
+        assert!(matches!(
+            parse(b"0-0,2-2", u64::MAX, DEFAULT_LIMIT),
+            Parsed::Ranges(_)
+        ));
     }
 
     #[test]

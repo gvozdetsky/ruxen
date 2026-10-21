@@ -156,6 +156,12 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// `http2_chunk_size` of the request's location (#594).
     fn set_h2_chunk(&mut self, _chunk: usize) {}
 
+    /// For an HTTP/2 stream, whether its `:authority` and `Host` differ,
+    /// which nginx refuses with 400 (#592).
+    fn h2_authority_mismatch(&self) -> bool {
+        false
+    }
+
     /// For an HTTP/2 stream, its connection's start and the requests it
     /// carried before this one (`$connection_time`, `$connection_requests`).
     fn conn_counters(&self) -> Option<(Instant, u64)> {
@@ -1309,6 +1315,12 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
             // Trailers: zero or more header-style lines, then an empty line.
             loop {
                 let end = line_end!(1024);
+                // A bare LF or CR in a trailer line is a 400, as in nginx
+                // since 1.29.4: `0\r\n\n` must not swallow the next
+                // pipelined request as trailer lines (#578).
+                if raw[cursor..end].iter().any(|&b| b == b'\r' || b == b'\n') {
+                    return Err(Invalid);
+                }
                 let trailer_len = end - cursor;
                 trailer_bytes = trailer_bytes.saturating_add(trailer_len + 2);
                 if trailer_bytes > MAX_TRAILER_BLOCK_BYTES {

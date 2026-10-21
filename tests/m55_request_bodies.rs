@@ -470,3 +470,28 @@ fn chunk_size_lines_parse_as_nginx() {
         }
     }
 }
+
+/// The trailer section ends at an empty CRLF line, and a bare LF or CR
+/// inside a trailer line is a 400, as in nginx since 1.29.4 (#578): with
+/// `0\r\n\n`, a request pipelined after it must not become trailer lines.
+#[test]
+fn trailer_lines_refuse_a_bare_lf_or_cr() {
+    let upstream = spawn_echo_upstream();
+    let server = start(&proxy_conf(upstream));
+    let head = "POST /default/ HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let second = "GET /default/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    for (trailer, ok) in [
+        ("\r\n", true),
+        ("X-T: a\r\n\r\n", true),
+        ("\n", false),
+        ("X-T: a\n", false),
+        ("X-T: a\rb\r\n\r\n", false),
+    ] {
+        let body = format!("5\r\nhello\r\n0\r\n{trailer}{second}");
+        let resp = exchange(server.port, head, body.as_bytes());
+        let want = if ok { "HTTP/1.1 200" } else { "HTTP/1.1 400" };
+        assert!(resp.starts_with(want), "{trailer:?}: {resp}");
+        let responses = resp.matches("HTTP/1.1 ").count();
+        assert_eq!(responses, if ok { 2 } else { 1 }, "{trailer:?}: {resp}");
+    }
+}

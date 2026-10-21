@@ -1150,6 +1150,8 @@ pub enum UpstreamError {
     PrematurelyClosed(Stage),
     TooBigHeader,
     InvalidStatusLine,
+    /// A 103 in an HTTP/1.0 response (#581).
+    EarlyHintsHttp10,
     Status444,
     InvalidChunked,
     TooBigBody,
@@ -1294,6 +1296,11 @@ impl std::fmt::Display for UpstreamError {
             InvalidStatusLine => write!(
                 f,
                 "upstream sent no valid HTTP/1.0 header while {}",
+                Stage::ReadingHeader.as_str()
+            ),
+            EarlyHintsHttp10 => write!(
+                f,
+                "upstream sent HTTP/1.0 response with early hints while {}",
                 Stage::ReadingHeader.as_str()
             ),
             Status444 => write!(
@@ -1811,84 +1818,121 @@ async fn attempt(
     // safe — the kernel writes before we read.
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
-    let head_end_terminator: (usize, usize); // (head_end, terminator_len)
+    let mut head_end_terminator: (usize, usize); // (head_end, terminator_len)
     let mut scanned = 0;
-    loop {
-        let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                return AttemptOutcome::Failed(
-                    Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
-                    FailKind::Timeout,
-                    Box::new(UpstreamError::TimedOut(Stage::ReadingHeader)),
-                );
-            }
-        };
-        read_buf = returned;
-        match res {
-            Ok(0) => {
-                if accum.is_empty() && from_pool {
-                    return AttemptOutcome::PooledStale;
+    // Bytes of 103 heads dropped from the front of `accum` (#581): not
+    // part of the body for `$upstream_response_length`.
+    let mut interim_len: usize = 0;
+    let (first_line_end, upstream_is_11, status_code) = 'head: loop {
+        loop {
+            let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+                        FailKind::Timeout,
+                        Box::new(UpstreamError::TimedOut(Stage::ReadingHeader)),
+                    );
                 }
+            };
+            read_buf = returned;
+            match res {
+                Ok(0) => {
+                    if state.bytes_received == 0 && from_pool {
+                        return AttemptOutcome::PooledStale;
+                    }
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::Error,
+                        Box::new(UpstreamError::PrematurelyClosed(Stage::ReadingHeader)),
+                    );
+                }
+                Ok(n) => {
+                    state.bytes_received += n as u64;
+                    accum.extend_from_slice(&read_buf[..n]);
+                }
+                Err(e) => {
+                    if state.bytes_received == 0 && from_pool {
+                        return AttemptOutcome::PooledStale;
+                    }
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::Error,
+                        Box::new(UpstreamError::RecvFailed(e, Stage::ReadingHeader)),
+                    );
+                }
+            }
+            if let Some(p) = find_head_end(&accum, scanned) {
+                head_end_terminator = p;
+                break;
+            }
+            // A terminator can start in the last 3 bytes and end in the next read.
+            scanned = accum.len().saturating_sub(3);
+            // Sanity bound on header block size — refuse 64 KiB+ headers.
+            if accum.len() > 64 * 1024 {
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                    FailKind::Error,
-                    Box::new(UpstreamError::PrematurelyClosed(Stage::ReadingHeader)),
+                    FailKind::InvalidHeader,
+                    Box::new(UpstreamError::TooBigHeader),
                 );
             }
-            Ok(n) => {
-                state.bytes_received += n as u64;
-                accum.extend_from_slice(&read_buf[..n]);
-            }
-            Err(e) => {
-                if accum.is_empty() && from_pool {
-                    return AttemptOutcome::PooledStale;
-                }
+        }
+
+        // 4. Parse the status line. Without header fields, its CRLF is part
+        // of the terminator and the whole head is the status line (#323).
+        loop {
+            let head_end = head_end_terminator.0;
+            let first_line_end = find_line_end(&accum[..head_end]).map_or(head_end, |p| p.0);
+            // `status_line` is `accum[..first_line_end]`, but binding it as a
+            // slice would hold an immutable borrow across the body-pull loop
+            // (which mutates accum). Re-borrow on each use instead.
+            let upstream_is_11 = if accum[..first_line_end].starts_with(b"HTTP/1.1 ") {
+                true
+            } else if accum[..first_line_end].starts_with(b"HTTP/1.0 ") {
+                false
+            } else {
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                    FailKind::Error,
-                    Box::new(UpstreamError::RecvFailed(e, Stage::ReadingHeader)),
+                    FailKind::InvalidHeader,
+                    Box::new(UpstreamError::InvalidStatusLine),
                 );
+            };
+            let status_code = parse_status_code(&accum[..first_line_end]);
+            if status_code != 103 {
+                break 'head (first_line_end, upstream_is_11, status_code);
+            }
+            // An interim 103 Early Hints head (#581): dropped, and the final
+            // head read after it, possibly from the bytes already here.
+            match drop_early_hints(
+                &mut accum,
+                head_end_terminator,
+                first_line_end,
+                upstream_is_11,
+            ) {
+                Err(error) => {
+                    return AttemptOutcome::Failed(
+                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+                        FailKind::InvalidHeader,
+                        error,
+                    );
+                }
+                Ok((dropped, next)) => {
+                    interim_len += dropped;
+                    match next {
+                        Some(next) => head_end_terminator = next,
+                        None => {
+                            scanned = accum.len().saturating_sub(3);
+                            continue 'head;
+                        }
+                    }
+                }
             }
         }
-        if let Some(p) = find_head_end(&accum, scanned) {
-            head_end_terminator = p;
-            break;
-        }
-        // A terminator can start in the last 3 bytes and end in the next read.
-        scanned = accum.len().saturating_sub(3);
-        // Sanity bound on header block size — refuse 64 KiB+ headers.
-        if accum.len() > 64 * 1024 {
-            return AttemptOutcome::Failed(
-                Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                FailKind::InvalidHeader,
-                Box::new(UpstreamError::TooBigHeader),
-            );
-        }
-    }
+    };
 
     let head_end = head_end_terminator.0;
     let term_len = head_end_terminator.1;
     let body_start = head_end + term_len;
-
-    // 4. Parse the status line. Without header fields, its CRLF is part
-    // of the terminator and the whole head is the status line (#323).
-    let first_line_end = find_line_end(&accum[..head_end]).map_or(head_end, |p| p.0);
-    // `status_line` is `accum[..first_line_end]`, but binding it as a
-    // slice would hold an immutable borrow across the body-pull loop
-    // (which mutates accum). Re-borrow on each use instead.
-    let upstream_is_11 = if accum[..first_line_end].starts_with(b"HTTP/1.1 ") {
-        true
-    } else if accum[..first_line_end].starts_with(b"HTTP/1.0 ") {
-        false
-    } else {
-        return AttemptOutcome::Failed(
-            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-            FailKind::InvalidHeader,
-            Box::new(UpstreamError::InvalidStatusLine),
-        );
-    };
-    let status_code = parse_status_code(&accum[..first_line_end]);
     state.status = status_code;
     state.header_ms = Some(elapsed_ms(started));
     if status_code == 444 {
@@ -2284,7 +2328,9 @@ async fn attempt(
     //    drop hop-by-hop + Transfer-Encoding (we've decoded chunked for
     //    the client; the client framing is done by the worker write
     //    path), append a synthesized Content-Length when we re-framed.
-    state.response_length = state.bytes_received.saturating_sub(body_start as u64);
+    state.response_length = state
+        .bytes_received
+        .saturating_sub((interim_len + body_start) as u64);
     let body_len = decoded_chunked_body
         .as_ref()
         .map(Vec::len)
@@ -3000,6 +3046,54 @@ fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
     }
     out.extend_from_slice(b"\r\n\r\n");
     out
+}
+
+/// Drop the 103 Early Hints head at the front of `accum` (#581). nginx
+/// parses it as an interim response (1.29.0): its header lines are checked
+/// as any head's, then ignored, and parsing restarts at the next status
+/// line (ngx_http_proxy_process_header, ngx_http_proxy_module.c:1911,
+/// :1938; ngx_http_upstream_process_early_hints, ngx_http_upstream.c:2631,
+/// which with `early_hints` unset sends none). A 103 in an HTTP/1.0
+/// response is an invalid header (ngx_http_proxy_module.c:1840). Returns
+/// the bytes dropped and where the next head ends, when it is already in
+/// `accum`.
+#[cold]
+#[inline(never)]
+fn drop_early_hints(
+    accum: &mut Vec<u8>,
+    (head_end, term_len): (usize, usize),
+    first_line_end: usize,
+    upstream_is_11: bool,
+) -> Result<(usize, Option<(usize, usize)>), Box<UpstreamError>> {
+    if !upstream_is_11 {
+        return Err(Box::new(UpstreamError::EarlyHintsHttp10));
+    }
+    let fields = &accum[headers_start(accum, first_line_end, head_end)..head_end];
+    let invalid = |line: &[u8], bad: usize| {
+        Box::new(UpstreamError::InvalidHeader {
+            start: String::from_utf8_lossy(&line[..bad]).into_owned(),
+            byte: line[bad],
+        })
+    };
+    if let Some(bad) = bare_cr_or_nul(fields) {
+        let start = fields[..bad]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |p| p + 1);
+        return Err(invalid(&fields[start..], bad - start));
+    }
+    let mut cursor = 0;
+    while cursor < fields.len() {
+        let (line_len, t) = find_line_end(&fields[cursor..]).unwrap_or((fields.len() - cursor, 0));
+        let line = &fields[cursor..cursor + line_len];
+        cursor += line_len + t;
+        if let Err(bad) = header_line_colon(line) {
+            return Err(invalid(line, bad));
+        }
+    }
+    let dropped = head_end + term_len;
+    accum.drain(..dropped);
+    Ok((dropped, find_head_end(accum, 0)))
 }
 
 /// The 101 to a client that asked to upgrade (ngx_http_upstream_upgrade):
