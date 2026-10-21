@@ -1002,23 +1002,19 @@ pub(crate) fn run_location_handler(
             overrides_buf.insert(0, (b"Host", host_header.to_vec()));
         }
 
-        // Pool eligibility: HTTP/1.1 + the upstream block opted into
-        // `keepalive N;`. Drives both the Connection-header default
-        // synthesized below and `run_proxy`'s pool-release decision.
+        // Pool eligibility: HTTP/1.1 + the upstream block has a keepalive
+        // pool (every `upstream {}` block unless `keepalive 0;`). Drives
+        // both the Connection-header default below and `run_proxy`'s
+        // pool-release decision.
         let pool_eligible = proxy.http_version == 1 && upstream.keepalive_max_idle.is_some();
 
-        if !have_connection_override {
-            // Default Connection on the upstream side: keep-alive when
-            // pooling is on, close otherwise. Matches nginx's behavior:
-            // without `proxy_set_header Connection ""` the keepalive
-            // module silently overrides Connection itself; without the
-            // keepalive module the proxy emits Connection: close.
-            let value: &[u8] = if pool_eligible {
-                b"keep-alive"
-            } else {
-                b"close"
-            };
-            overrides_buf.push((b"Connection", value.to_vec()));
+        // nginx 1.29.7 sends no Connection header by default
+        // (ngx_http_proxy_headers). Over HTTP/1.1 with no pool to take the
+        // connection back, ruxen still says `close`, as before 1.29.7: the
+        // backend then closes first and holds the TIME_WAIT, not ruxen,
+        // whose ephemeral ports would run out under load (#582).
+        if !have_connection_override && proxy.http_version == 1 && !pool_eligible {
+            overrides_buf.push((b"Connection", b"close".to_vec()));
         }
 
         if cache.as_ref().is_some_and(|c| c.cacheable) {
@@ -1224,6 +1220,7 @@ pub(crate) fn run_location_handler(
             bad_gateway: &http.bad_gateway,
             gateway_timeout: &http.gateway_timeout,
             keepalive_eligible: pool_eligible,
+            pool_tag: proxy.pool_tag(upstream),
             next_upstream: proxy.next_upstream,
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),

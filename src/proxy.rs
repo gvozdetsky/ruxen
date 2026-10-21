@@ -126,9 +126,12 @@ pub struct ProxyPlan {
     /// Cached `Gateway Timeout` prebuilt for any timeout in the attempt.
     pub gateway_timeout: &'static crate::worker::Prebuilt,
     /// True when the upstream attempt is HTTP/1.1 + the upstream block
-    /// has `keepalive N;` configured. Drives whether `run_proxy` returns
-    /// the socket to the pool or drops it.
+    /// has a keepalive pool. Drives whether `run_proxy` returns the socket
+    /// to the pool or drops it.
     pub keepalive_eligible: bool,
+    /// Which location's connections the pool hands out and takes back
+    /// (`PreparedProxy::pool_tag`).
+    pub pool_tag: usize,
     /// `proxy_next_upstream` mask — gates failover triggers across the
     /// retry loop.
     pub next_upstream: ProxyNextUpstream,
@@ -703,7 +706,12 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
         //    stale-retry counts as part of the same `attempt` budget.
-        let pooled = upstream::pool_take(upstream, current.peer_idx, plan.tls.as_deref());
+        let pooled = upstream::pool_take(
+            upstream,
+            current.peer_idx,
+            plan.tls.as_deref(),
+            plan.pool_tag,
+        );
         let outcome = if let Some(c) = pooled {
             match attempt(
                 &plan,
@@ -2166,6 +2174,7 @@ async fn attempt(
                 .then_some(crate::proxy_stream::StreamPool {
                     upstream: plan.upstream,
                     peer_idx,
+                    tag: plan.pool_tag,
                     opened_at,
                     requests_served,
                 });
@@ -2375,7 +2384,7 @@ async fn attempt(
     }
 
     // 8. Pool eligibility — return the socket only if all of these hold:
-    //    - upstream block opted into keepalive (plan.keepalive_eligible)
+    //    - upstream block has a keepalive pool (plan.keepalive_eligible)
     //    - the response isn't a 101: the connection now speaks another
     //      protocol, and a later request from another client would be
     //      written into that tunnel (nginx sets u->keepalive = 0 for it)
@@ -2399,6 +2408,7 @@ async fn attempt(
         upstream::pool_release(
             plan.upstream,
             peer_idx,
+            plan.pool_tag,
             upstream::PooledConn {
                 stream,
                 last_used: Instant::now(),

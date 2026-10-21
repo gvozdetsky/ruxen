@@ -149,12 +149,12 @@ fn m99_proxy_pass_to_a_unix_socket() {
     // location prefix, and the upstream sees `Host: localhost`.
     let response = get(port, "/abc");
     assert!(
-        body(&response).ends_with(" GET /abc HTTP/1.0 localhost\n"),
+        body(&response).ends_with(" GET /abc HTTP/1.1 localhost\n"),
         "{response}"
     );
     // No URI part (and a scheme in any case, as ngx_parse_url): the
     // client URI goes through unchanged.
-    assert!(body(&get(port, "/bare/q?x=1")).ends_with(" GET /bare/q?x=1 HTTP/1.0 localhost\n"));
+    assert!(body(&get(port, "/bare/q?x=1")).ends_with(" GET /bare/q?x=1 HTTP/1.1 localhost\n"));
     let dir = &server.1;
     assert_eq!(
         log_line(&dir.join("access.log"), "unix:"),

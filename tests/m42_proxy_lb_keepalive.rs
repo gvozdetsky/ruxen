@@ -96,6 +96,8 @@ struct Backend {
     stop: Arc<AtomicBool>,
     accepts: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
+    /// The request heads received, in order.
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl Backend {
@@ -111,6 +113,8 @@ impl Backend {
         let stop = Arc::new(AtomicBool::new(false));
         let accepts = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let heads_c = heads.clone();
         let stop_c = stop.clone();
         let accepts_c = accepts.clone();
         let requests_c = requests.clone();
@@ -130,8 +134,9 @@ impl Backend {
                 accepts_c.fetch_add(1, Ordering::SeqCst);
                 let requests_inner = requests_c.clone();
                 let stop_inner = stop_c.clone();
+                let heads_inner = heads_c.clone();
                 thread::spawn(move || {
-                    handle_conn(s, response, &requests_inner, &stop_inner);
+                    handle_conn(s, response, &requests_inner, &heads_inner, &stop_inner);
                 });
             }
         });
@@ -140,11 +145,27 @@ impl Backend {
             stop,
             accepts,
             requests,
+            heads,
         }
+    }
+
+    fn last_head(&self) -> String {
+        self.heads
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
-fn handle_conn(mut s: TcpStream, response: &[u8], requests: &AtomicUsize, stop: &AtomicBool) {
+fn handle_conn(
+    mut s: TcpStream,
+    response: &[u8],
+    requests: &AtomicUsize,
+    heads: &Mutex<Vec<String>>,
+    stop: &AtomicBool,
+) {
     s.set_read_timeout(Some(Duration::from_secs(2))).ok();
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -175,6 +196,10 @@ fn handle_conn(mut s: TcpStream, response: &[u8], requests: &AtomicUsize, stop: 
             if buf.len() < head_end + cl {
                 break;
             }
+            heads
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(head).into_owned());
             requests.fetch_add(1, Ordering::SeqCst);
             if s.write_all(response).is_err() {
                 return;
@@ -429,11 +454,37 @@ http {{
     );
 }
 
+/// The value of the request head's header `name`, if it has one.
+fn head_header(head: &str, name: &str) -> Option<String> {
+    head.lines().skip(1).find_map(|line| {
+        let (n, v) = line.split_once(':')?;
+        n.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+    })
+}
+
+/// `n` client requests to `paths` in turn, each on a new client connection.
+fn get_n(port: u16, paths: &[&str], n: usize) {
+    for i in 0..n {
+        let path = paths[i % paths.len()];
+        let resp = http_send(
+            port,
+            format!("GET {path} HTTP/1.1\r\nHost: c\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        assert!(
+            resp.starts_with(b"HTTP/1.1 200"),
+            "got: {:?}",
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    }
+    sleep(Duration::from_millis(50));
+}
+
 #[test]
-fn m42_pool_disabled_without_keepalive_directive() {
-    // No `keepalive` directive on the upstream → fresh socket per request,
-    // even with proxy_http_version 1.1.
-    let backend = Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nN");
+fn m42_upstream_block_pools_by_default() {
+    // nginx 1.29.7: an `upstream {}` block keeps idle connections with no
+    // `keepalive` directive, and the proxy speaks HTTP/1.1 with no
+    // Connection header.
+    let backend = Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nK");
     let conf = format!(
         r#"
 http {{
@@ -444,7 +495,6 @@ http {{
         listen %%PORT%%;
         location / {{
             proxy_pass http://pool;
-            proxy_http_version 1.1;
         }}
     }}
 }}
@@ -452,20 +502,157 @@ http {{
         backend.addr.port(),
     );
     let (_g, port) = spawn_ruxen(&conf);
-
     const N: usize = 4;
-    for _ in 0..N {
-        let _ = http_send(
-            port,
-            b"GET / HTTP/1.1\r\nHost: c\r\nConnection: close\r\n\r\n",
-        );
-    }
-    sleep(Duration::from_millis(50));
+    get_n(port, &["/"], N);
+    assert_eq!(backend.requests.load(Ordering::SeqCst), N);
+    assert_eq!(backend.accepts.load(Ordering::SeqCst), 1);
+    let head = backend.last_head();
+    assert!(head.starts_with("GET / HTTP/1.1\r\n"), "{head}");
+    assert_eq!(head_header(&head, "Connection"), None, "{head}");
+}
+
+#[test]
+fn m42_keepalive_zero_turns_the_pool_off() {
+    // `keepalive 0;` → fresh socket per request, closed by the backend.
+    let backend = Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nN");
+    let conf = format!(
+        r#"
+http {{
+    upstream pool {{
+        server 127.0.0.1:{};
+        keepalive 0;
+    }}
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://pool;
+        }}
+    }}
+}}
+"#,
+        backend.addr.port(),
+    );
+    let (_g, port) = spawn_ruxen(&conf);
+    const N: usize = 4;
+    get_n(port, &["/"], N);
     assert_eq!(
         backend.accepts.load(Ordering::SeqCst),
         N,
-        "expected one upstream socket per request when keepalive is unset"
+        "expected one upstream socket per request with keepalive 0"
     );
+    // Not 1.29.7's empty header: the backend closes first and holds the
+    // TIME_WAIT (#582).
+    let head = backend.last_head();
+    assert!(head.starts_with("GET / HTTP/1.1\r\n"), "{head}");
+    assert_eq!(head_header(&head, "Connection").as_deref(), Some("close"));
+}
+
+#[test]
+fn m42_proxy_pass_without_upstream_block_does_not_pool() {
+    // An implicit upstream has no keepalive pool (1.29.7 skips it too).
+    let backend = Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nN");
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://127.0.0.1:{};
+        }}
+        location /h10 {{
+            proxy_pass http://127.0.0.1:{};
+            proxy_http_version 1.0;
+        }}
+    }}
+}}
+"#,
+        backend.addr.port(),
+        backend.addr.port(),
+    );
+    let (_g, port) = spawn_ruxen(&conf);
+    const N: usize = 3;
+    get_n(port, &["/"], N);
+    assert_eq!(backend.accepts.load(Ordering::SeqCst), N);
+    let head = backend.last_head();
+    assert!(head.starts_with("GET / HTTP/1.1\r\n"), "{head}");
+    assert_eq!(head_header(&head, "Connection").as_deref(), Some("close"));
+    // HTTP/1.0 closes anyway: no Connection header, as in 1.29.7.
+    get_n(port, &["/h10"], 1);
+    let head = backend.last_head();
+    assert!(head.starts_with("GET /h10 HTTP/1.0\r\n"), "{head}");
+    assert_eq!(head_header(&head, "Connection"), None, "{head}");
+}
+
+/// Two locations proxying to one upstream, requests alternating between
+/// them: the upstream connections the backend accepted.
+fn accepts_across_two_locations(keepalive: &str) -> usize {
+    let backend = Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nK");
+    let conf = format!(
+        r#"
+http {{
+    upstream pool {{
+        server 127.0.0.1:{};
+        {keepalive}
+    }}
+    server {{
+        listen %%PORT%%;
+        location /a {{
+            proxy_pass http://pool;
+        }}
+        location /b {{
+            proxy_pass http://pool;
+        }}
+    }}
+}}
+"#,
+        backend.addr.port(),
+    );
+    let (_g, port) = spawn_ruxen(&conf);
+    get_n(port, &["/a", "/b"], 6);
+    assert_eq!(backend.requests.load(Ordering::SeqCst), 6);
+    backend.accepts.load(Ordering::SeqCst)
+}
+
+#[test]
+fn m42_local_pool_keeps_connections_per_location() {
+    // `local` (and the 1.29.7 default): a connection goes back to the
+    // location that opened it; without it, every location shares them.
+    assert_eq!(accepts_across_two_locations(""), 2);
+    assert_eq!(accepts_across_two_locations("keepalive 4 local;"), 2);
+    assert_eq!(accepts_across_two_locations("keepalive 4;"), 1);
+}
+
+#[test]
+fn m42_keepalive_caps_the_upstream_not_each_peer() {
+    // `keepalive 1;` with two peers taken in turn: the one idle slot is
+    // the upstream's, so each release evicts the other peer's connection
+    // and every request connects anew. A slot per peer would reuse both.
+    let a = Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nA");
+    let b = Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nB");
+    let conf = format!(
+        r#"
+http {{
+    upstream pool {{
+        server 127.0.0.1:{};
+        server 127.0.0.1:{};
+        keepalive 1;
+    }}
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://pool;
+        }}
+    }}
+}}
+"#,
+        a.addr.port(),
+        b.addr.port(),
+    );
+    let (_g, port) = spawn_ruxen(&conf);
+    const N: usize = 6;
+    get_n(port, &["/"], N);
+    let accepts = a.accepts.load(Ordering::SeqCst) + b.accepts.load(Ordering::SeqCst);
+    assert_eq!(accepts, N);
 }
 
 #[test]

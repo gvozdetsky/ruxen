@@ -62,6 +62,8 @@ pub(crate) enum StreamFraming {
 pub(crate) struct StreamPool {
     pub upstream: &'static PreparedUpstream,
     pub peer_idx: usize,
+    /// `PreparedProxy::pool_tag`.
+    pub tag: usize,
     pub opened_at: Instant,
     pub requests_served: u32,
 }
@@ -425,6 +427,7 @@ fn finish(
         upstream::pool_release(
             pool.upstream,
             pool.peer_idx,
+            pool.tag,
             upstream::PooledConn {
                 stream: s.upstream,
                 last_used: Instant::now(),

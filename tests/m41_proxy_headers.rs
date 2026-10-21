@@ -242,7 +242,7 @@ http {{
     assert!(
         std::str::from_utf8(&req)
             .unwrap()
-            .starts_with("GET /hi HTTP/1.0\r\n"),
+            .starts_with("GET /hi HTTP/1.1\r\n"),
         "request line: {}",
         String::from_utf8_lossy(&req[..req.len().min(80)])
     );

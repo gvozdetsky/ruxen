@@ -27,9 +27,10 @@
 // ratio, breaking ties via the same smoothed-weight pick — matches nginx
 // behavior where a tied least-conn fallback is round-robin-fair.
 //
-// The pool is a `VecDeque` per (upstream, peer_index) pair. Take from the
-// front; push back to the front so the most-recently-used connection is
-// the next to be reused (LIFO). Eviction is opportunistic at take-time
+// The pool is a `VecDeque` per upstream, shared by its peers as nginx's
+// keepalive cache is. Take the first one for the peer from the front; push
+// back to the front so the most-recently-used connection is the next to
+// be reused (LIFO). Eviction is opportunistic at take-time
 // (drop entries past idle/lifetime/max-requests) — a separate sweeper
 // would be O(idle slots) per request and isn't worth it at v0.1 scale.
 //
@@ -877,17 +878,26 @@ pub struct PooledConn {
     pub slot: crate::worker::UpstreamSlot,
 }
 
-/// Upstream, peer index, and the TLS config's `config_id` (0 for plain TCP).
-type PoolKey = (*const PreparedUpstream, usize, usize);
+/// An idle connection and what it may be taken for: its peer, the TLS
+/// config's `config_id` (0 for plain TCP) and, for a `local` pool, the
+/// location that opened it (`PreparedProxy::pool_tag`; 0 otherwise).
+struct Idle {
+    peer_idx: usize,
+    tls: usize,
+    tag: usize,
+    conn: PooledConn,
+}
 
 thread_local! {
-    /// Keyed by upstream, peer and, for TLS, the rustls config the
-    /// connection was opened with (0 for plain TCP): a location proxying
-    /// over `https://` never gets a plain connection to the same peer, nor
-    /// one opened with other `proxy_ssl_*` settings, such as without
-    /// verification (#116, #117). Within a queue a TLS connection is only
-    /// taken for the name it was opened for (`PooledConn::tls`).
-    static POOL: RefCell<HashMap<PoolKey, VecDeque<PooledConn>, FxBuild>> =
+    /// One queue per upstream, most recently used first, as nginx's
+    /// keepalive cache: `keepalive N` caps the idle connections of the
+    /// upstream, not of each peer. A connection is taken only for its peer
+    /// and, for TLS, the rustls config it was opened with: a location
+    /// proxying over `https://` never gets a plain connection to the same
+    /// peer, nor one opened with other `proxy_ssl_*` settings, such as
+    /// without verification (#116, #117), and only for the name it was
+    /// opened for (`UpstreamIo::tls_identity`).
+    static POOL: RefCell<HashMap<*const PreparedUpstream, VecDeque<Idle>, FxBuild>> =
         RefCell::new(HashMap::default());
 }
 
@@ -934,41 +944,43 @@ pub fn pool_take(
     upstream: &'static PreparedUpstream,
     peer_idx: usize,
     tls: Option<&crate::upstream_tls::TlsPlan>,
+    tag: usize,
 ) -> Option<PooledConn> {
     upstream.keepalive_max_idle?;
     let idle_max = Duration::from_millis(upstream.keepalive_idle_timeout_ms);
     let now = Instant::now();
+    let config = tls.map_or(0, |t| t.config_id());
     POOL.with(|p| {
         let mut map = p.borrow_mut();
-        let key = (
-            upstream as *const PreparedUpstream,
-            peer_idx,
-            tls.map_or(0, |t| t.config_id()),
-        );
-        let q = map.get_mut(&key)?;
-        // From the front; LIFO since we push at the front. Drop any
-        // entries that have aged out on the way to the first live one
-        // opened for this name.
+        let q = map.get_mut(&std::ptr::from_ref(upstream))?;
+        // From the front: LIFO, since we push at the front.
         let mut i = 0;
         while i < q.len() {
-            let idle = now.saturating_duration_since(q[i].last_used);
+            let e = &q[i];
+            let idle = now.saturating_duration_since(e.conn.last_used);
             if idle >= idle_max {
-                q.remove(i);
+                // The queue is in `last_used` order: the rest is older.
+                q.truncate(i);
+                break;
+            }
+            if e.peer_idx != peer_idx || e.tls != config || e.tag != tag {
+                i += 1;
                 continue;
             }
             // The upstream may have closed it while it sat here (#488):
             // look, as nginx's keep-alive close handler does, unless it
             // came back a moment ago (under load, every take).
-            if idle >= CLOSE_CHECK_IDLE && !idle_conn_open(&q[i].stream) {
+            if idle >= CLOSE_CHECK_IDLE && !idle_conn_open(&e.conn.stream) {
                 q.remove(i);
                 continue;
             }
             if tls.is_none_or(|t| {
-                q[i].stream
+                e.conn
+                    .stream
                     .tls_identity()
                     .is_some_and(|(_, name)| *name == t.name)
             }) {
-                return q.remove(i);
+                return q.remove(i).map(|e| e.conn);
             }
             i += 1;
         }
@@ -986,16 +998,21 @@ pub fn pool_close_one() -> bool {
     })
 }
 
-/// Return an upstream connection to the pool. Caller has already verified
-/// the connection is reusable (no Connection: close from upstream, no
-/// protocol error, request fully sent + response fully read).
+/// Return an upstream connection to the pool, for the location `tag`
+/// names (`PreparedProxy::pool_tag`). Caller has already verified the
+/// connection is reusable (no Connection: close from upstream, no protocol
+/// error, request fully sent + response fully read).
 ///
 /// Drops the conn instead of pooling when:
-///  - upstream has no `keepalive` configured
-///  - the pool is at `keepalive_max_idle` capacity
+///  - upstream has no `keepalive` pool
 ///  - `requests_served` has reached `keepalive_requests`
 ///  - lifetime exceeds `keepalive_time`
-pub fn pool_release(upstream: &'static PreparedUpstream, peer_idx: usize, mut conn: PooledConn) {
+pub fn pool_release(
+    upstream: &'static PreparedUpstream,
+    peer_idx: usize,
+    tag: usize,
+    mut conn: PooledConn,
+) {
     let Some(max_idle) = upstream.keepalive_max_idle else {
         return;
     };
@@ -1012,15 +1029,18 @@ pub fn pool_release(upstream: &'static PreparedUpstream, peer_idx: usize, mut co
     let tls = conn.stream.tls_identity().map_or(0, |(config, _)| *config);
     POOL.with(|p| {
         let mut map = p.borrow_mut();
-        let key = (upstream as *const PreparedUpstream, peer_idx, tls);
-        let q = map.entry(key).or_default();
+        let q = map.entry(std::ptr::from_ref(upstream)).or_default();
         if q.len() as u32 >= max_idle {
-            // Pool full — evict the oldest (back of the deque) to make
-            // room. Matches nginx's `ngx_http_upstream_keepalive_module`
-            // FIFO drop policy when the queue is at capacity.
+            // Full: the least recently used one goes, whichever peer it
+            // is for (ngx_http_upstream_free_keepalive_peer).
             q.pop_back();
         }
-        q.push_front(conn);
+        q.push_front(Idle {
+            peer_idx,
+            tls,
+            tag,
+            conn,
+        });
     });
     arm_close_sweep();
 }
@@ -1072,9 +1092,9 @@ fn sweep_closed() -> bool {
     POOL.with(|p| {
         let mut map = p.borrow_mut();
         map.retain(|_, q| {
-            q.retain(|c| {
-                now.saturating_duration_since(c.last_used) < CLOSE_CHECK_IDLE
-                    || idle_conn_open(&c.stream)
+            q.retain(|e| {
+                now.saturating_duration_since(e.conn.last_used) < CLOSE_CHECK_IDLE
+                    || idle_conn_open(&e.conn.stream)
             });
             !q.is_empty()
         });
@@ -1118,6 +1138,7 @@ mod tests {
             name: b"t",
             peers,
             keepalive_max_idle: None,
+            keepalive_local: false,
             keepalive_requests: 1000,
             keepalive_idle_timeout_ms: 60_000,
             keepalive_max_lifetime_ms: 3_600_000,
@@ -1317,6 +1338,7 @@ mod tests {
             name: b"t",
             peers,
             keepalive_max_idle: None,
+            keepalive_local: false,
             keepalive_requests: 1000,
             keepalive_idle_timeout_ms: 60_000,
             keepalive_max_lifetime_ms: 3_600_000,
@@ -1440,6 +1462,7 @@ mod tests {
             name: b"z",
             peers,
             keepalive_max_idle: None,
+            keepalive_local: false,
             keepalive_requests: 1000,
             keepalive_idle_timeout_ms: 60_000,
             keepalive_max_lifetime_ms: 3_600_000,
