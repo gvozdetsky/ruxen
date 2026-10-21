@@ -461,3 +461,58 @@ http {{
         assert_eq!(header_value(&seen, "X-Level"), Some(level), "{text}");
     }
 }
+
+/// Content-Length upstream is the length of the body forwarded when the
+/// client framed one (a Content-Length, a chunked body, even empty),
+/// whatever the method; a request without body framing gets none, as
+/// nginx's `$proxy_internal_body_length` (#493).
+#[test]
+fn m41_content_length_follows_the_clients_body_framing() {
+    let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://127.0.0.1:{};
+        }}
+    }}
+}}
+"#,
+        backend.addr.port()
+    );
+    let (_guard, port) = spawn_ruxen(&conf);
+    let head = "Host: c\r\nConnection: close\r\n";
+    for (request, want) in [
+        (format!("GET / HTTP/1.1\r\n{head}\r\n"), None),
+        (format!("POST / HTTP/1.1\r\n{head}\r\n"), None),
+        (format!("DELETE / HTTP/1.1\r\n{head}\r\n"), None),
+        (format!("FOO / HTTP/1.1\r\n{head}\r\n"), None),
+        (
+            format!("GET / HTTP/1.1\r\n{head}Content-Length: 0\r\n\r\n"),
+            Some("0"),
+        ),
+        (
+            format!("POST / HTTP/1.1\r\n{head}Content-Length: 0\r\n\r\n"),
+            Some("0"),
+        ),
+        (
+            format!("GET / HTTP/1.1\r\n{head}Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+            Some("0"),
+        ),
+        (
+            format!("POST / HTTP/1.1\r\n{head}Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+            Some("0"),
+        ),
+    ] {
+        let resp = http_send(port, request.as_bytes());
+        assert!(resp.starts_with(b"HTTP/1.1 200"), "{request:?}");
+        let captured = backend.last_request().unwrap();
+        assert_eq!(
+            header_value(&captured, "Content-Length"),
+            want,
+            "{request:?}"
+        );
+    }
+}

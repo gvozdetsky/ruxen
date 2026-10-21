@@ -286,10 +286,18 @@ fn dynamic_client_config(
         .map_err(|e| crate::fs_resolve::note_failed_lookup(e, false))
 }
 
-/// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
-/// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
-/// a request line split in two (#541).
-#[cold]
+/// The client framed a body (even an empty one): it sent Content-Length
+/// or Transfer-Encoding. nginx's `content_length_n` is -1 otherwise. One
+/// pass over the header lines: a proxied GET without a body asks.
+#[inline(never)]
+fn body_framed(headers: &[u8]) -> bool {
+    headers.split(|&b| b == b'\n').any(|line| {
+        let name = line.split(|&b| b == b':').next().unwrap_or(line);
+        crate::worker::header_name_eq_ci(name, b"content-length")
+            || crate::worker::header_name_eq_ci(name, b"transfer-encoding")
+    })
+}
+
 /// nginx's `r->quoted_uri`: a `%` in the path of the client's request
 /// target (not in its arguments). Out of line, as `write_upstream_path`:
 /// inlined, both made the proxy handler slower for every request (#575).
@@ -310,6 +318,10 @@ fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
+/// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
+/// a request line split in two (#541).
+#[cold]
 fn bad_proxy_uri(uri: &[u8], method: Method) -> Response {
     crate::fs_resolve::note_failed_lookup(
         format!(
@@ -1099,17 +1111,15 @@ pub(crate) fn run_location_handler(
                 file,
                 len: forward_len,
             });
-        // Synthesize Content-Length when forwarding a body; nginx always
-        // emits CL on the upstream side, recomputed from the actual
-        // forwarded byte count regardless of the client header.
+        // Content-Length is the length of the body forwarded, as nginx's
+        // `$proxy_internal_body_length`: an empty one says 0 when the
+        // client framed a body (a Content-Length, a chunked body, an
+        // HTTP/2 stream with DATA) or `proxy_set_body` gave one, whatever
+        // the method; a request without body framing has none (#493).
         if !have_content_length_override {
             if forward_len > 0 {
                 overrides_buf.push((b"Content-Length", forward_len.to_string().into_bytes()));
-            } else if matches!(req.method, Method::Get | Method::Head) {
-                // Drop Content-Length entirely for GET/HEAD with no body.
-            } else {
-                // Non-GET/HEAD with no forwarded body — emit CL: 0 so
-                // the upstream doesn't wait for a body.
+            } else if set_body.is_some() || body_framed(req.headers_raw) {
                 overrides_buf.push((b"Content-Length", b"0".to_vec()));
             }
         }
