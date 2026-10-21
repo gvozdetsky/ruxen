@@ -1,7 +1,8 @@
 //! M145 — the upstream request target (#541), as nginx's
 //! ngx_http_proxy_create_request builds it: without a URI part the client's
-//! own target while the URI is unchanged, else the decoded URI escaped
-//! (NGX_ESCAPE_URI). A `%0D%0A` in the path never becomes a CR LF in the
+//! own target while the URI is unchanged, else the decoded URI, escaped
+//! (NGX_ESCAPE_URI) when the client's path had a `%` or the request is
+//! internal (#575). A `%0D%0A` in the path never becomes a CR LF in the
 //! upstream request line. With variables, a rendered URI with a CR, LF or
 //! NUL is a 500.
 
@@ -141,17 +142,20 @@ fn upstream_request_target_is_never_the_raw_decoded_uri() {
         ),
         ("/a/../b%2Fc?x=1&y=%0D", "/a/../b%2Fc?x=1&y=%0D"),
         ("/plain?q", "/plain?q"),
-        // A URI part: the decoded path past the prefix, escaped.
+        // A URI part: the decoded path past the prefix, escaped when the
+        // client's path had a `%`.
         ("/p/a%0D%0AX%20%22%7B?q=1", "/x/a%0D%0AX%20%22%7B?q=1"),
         ("/p/caf%C3%A9", "/x/caf%C3%A9"),
-        // Rewritten: the new URI, escaped.
+        // Rewritten: the new URI, escaped (the request is internal).
         ("/r/a%20b", "/n/a%20b"),
+        ("/r/a{b}^c", "/n/a%7Bb%7D%5Ec"),
         // With variables, a clean URI goes as rendered.
         ("/v/ok", "/v/ok"),
-        // Bytes nginx takes unencoded in a target (#483): as sent without
-        // a URI part, escaped with one.
+        // Bytes nginx takes unencoded in a target (#483): as sent, with a
+        // URI part too while the path has no `%` (#575), escaped with one.
         ("/a?j={\"x\":1}&q=a|b", "/a?j={\"x\":1}&q=a|b"),
-        ("/p/a{b}^c", "/x/a%7Bb%7D%5Ec"),
+        ("/p/a{b}^c", "/x/a{b}^c"),
+        ("/p/a{b}%20c", "/x/a%7Bb%7D%20c"),
     ] {
         let resp = get(server.port, target);
         assert!(resp.starts_with("HTTP/1.1 200"), "{target}: {resp}");

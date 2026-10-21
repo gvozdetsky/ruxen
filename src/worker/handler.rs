@@ -290,6 +290,23 @@ fn dynamic_client_config(
 /// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
 /// a request line split in two (#541).
 #[cold]
+/// nginx's `r->quoted_uri`: a `%` in the path of the client's request
+/// target (not in its arguments).
+fn path_is_quoted(target: &[u8]) -> bool {
+    let path = target.split(|&b| b == b'?').next().unwrap_or(target);
+    path.contains(&b'%')
+}
+
+/// The (decoded) path into the upstream request target: escaped as
+/// NGX_ESCAPE_URI, or as it is (#575).
+fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
+    if escape {
+        crate::worker::render::escape_uri_into(path, out);
+    } else {
+        out.extend_from_slice(path);
+    }
+}
+
 fn bad_proxy_uri(uri: &[u8], method: Method) -> Response {
     crate::fs_resolve::note_failed_lookup(
         format!(
@@ -887,8 +904,13 @@ pub(crate) fn run_location_handler(
             b""
         };
         // The upstream request target, as ngx_http_proxy_create_request
-        // builds it (#541). The decoded URI never goes into the request
-        // line as it is: a `%0D%0A` in the client's path would split it.
+        // builds it (#541). The decoded URI goes into the request line
+        // escaped (NGX_ESCAPE_URI) when the client's path had a `%` (nginx's
+        // `r->quoted_uri`: a `%0D%0A` would otherwise split the line) or
+        // the request is internal (`r->internal`: a rewrite of the URI or
+        // an internal redirect cleared `unparsed_uri`); otherwise nginx
+        // copies it as it is (#575).
+        let escape = || !rewrite_state.unparsed_uri || path_is_quoted(req.path);
         let rewritten_uri: Vec<u8>;
         let request_uri: &[u8] = if let Some(uri) = variable.as_ref().and_then(|v| v.uri.as_deref())
         {
@@ -906,7 +928,7 @@ pub(crate) fn run_location_handler(
                 req.path
             } else {
                 let mut buf = Vec::with_capacity(url_path.len() + 1 + args.len());
-                crate::worker::render::escape_uri_into(url_path, &mut buf);
+                write_upstream_path(url_path, escape(), &mut buf);
                 if !args.is_empty() {
                     buf.push(b'?');
                     buf.extend_from_slice(args);
@@ -925,7 +947,7 @@ pub(crate) fn run_location_handler(
             let qlen = if args.is_empty() { 0 } else { args.len() + 1 };
             let mut buf = Vec::with_capacity(request_path.len() + suffix.len() + qlen);
             buf.extend_from_slice(request_path);
-            crate::worker::render::escape_uri_into(suffix, &mut buf);
+            write_upstream_path(suffix, escape(), &mut buf);
             if !args.is_empty() {
                 buf.push(b'?');
                 buf.extend_from_slice(args);
