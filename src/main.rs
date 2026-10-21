@@ -943,6 +943,7 @@ impl Master {
             // Keyed by peer address: a freed peer's entry could match a
             // later one at the same address.
             syslog::forget_error_log_sockets();
+            worker::forget_error_log_files();
             // The buffered access logs point into the arena (#528).
             worker::logbuf::forget(generation.http.access_logs);
             if let Some(arena) = generation.arena.take() {
@@ -1110,6 +1111,7 @@ fn load_for_reload(cli: &Cli) -> Result<Loaded, LoadFailed> {
 /// pools of a cycle `ngx_init_cycle` couldn't finish.
 fn free_failed(arena: arena::Arena) {
     syslog::forget_error_log_sockets();
+    worker::forget_error_log_files();
     // SAFETY: no worker runs with the configuration (none was started, or
     // they are joined), its root directories are closed, and what a later
     // generation keeps (zone state, cache zones, the buffered log

@@ -50,8 +50,13 @@ static DEFAULT_FILE_LOGS: std::sync::OnceLock<&'static [PreparedErrorLog]> =
 /// Lines with no `error_log` of their own go to `path`, not to stderr.
 pub fn default_error_log_file(path: &std::path::Path) {
     let path: &'static std::path::Path = Box::leak(path.to_path_buf().into_boxed_path());
+    let file: &'static PreparedErrorLogFile = Box::leak(Box::new(PreparedErrorLogFile {
+        path,
+        file: None,
+        opened_gen: 0,
+    }));
     let logs: &'static [PreparedErrorLog] = Box::leak(Box::new([PreparedErrorLog {
-        target: PreparedErrorLogTarget::File(path),
+        target: PreparedErrorLogTarget::File(file),
         level: ErrorLogLevel::Error,
     }]));
     let _ = DEFAULT_FILE_LOGS.set(logs);
@@ -214,6 +219,67 @@ pub(crate) fn write_error_log(
     emit(sinks, level, &line);
 }
 
+thread_local! {
+    /// This thread's `error_log` files, by path, and the SIGUSR1 generation
+    /// each was opened at (#648): not opened per line.
+    static ERROR_LOG_FILES: RefCell<Vec<(std::path::PathBuf, u64, std::fs::File)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The main thread retires a configuration: its files may be gone from the
+/// next one, so the descriptors it kept for them go too.
+pub(crate) fn forget_error_log_files() {
+    ERROR_LOG_FILES.with(|files| files.borrow_mut().clear());
+}
+
+/// One line to an `error_log` file, through this thread's descriptor for
+/// it: a `dup` of the one `prepare` opened, or, after SIGUSR1, the path
+/// opened again (a failure keeps the old one, as nginx's reopen does).
+fn write_error_log_file(target: &PreparedErrorLogFile, line: &[u8]) {
+    let generation = LOG_REOPEN_GEN.load(Ordering::Relaxed);
+    ERROR_LOG_FILES.with(|files| {
+        let mut files = files.borrow_mut();
+        let at = files.iter().position(|(path, _, _)| path == target.path);
+        let current = at.is_some_and(|i| files[i].1 == generation);
+        if !current {
+            let fresh = match &target.file {
+                Some(file) if target.opened_gen == generation && at.is_none() => file.try_clone(),
+                _ => std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(target.path),
+            };
+            match (fresh, at) {
+                (Ok(file), Some(i)) => files[i] = (target.path.to_path_buf(), generation, file),
+                (Ok(file), None) => files.push((target.path.to_path_buf(), generation, file)),
+                (Err(e), Some(i)) => {
+                    // Keep writing to the old one; say so once.
+                    files[i].1 = generation;
+                    eprintln!(
+                        "ruxen: error_log open {} failed: {e}",
+                        target.path.display()
+                    );
+                }
+                (Err(e), None) => {
+                    eprintln!(
+                        "ruxen: error_log open {} failed: {e}",
+                        target.path.display()
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some((_, _, file)) = files.iter_mut().find(|(path, _, _)| path == target.path)
+            && let Err(e) = file.write_all(line)
+        {
+            eprintln!(
+                "ruxen: error_log write to {} failed: {e}",
+                target.path.display()
+            );
+        }
+    })
+}
+
 /// Write a finished line to every sink that takes `level`; syslog gets it
 /// without the newline, after its own header, as nginx sends it.
 fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8]) {
@@ -226,20 +292,7 @@ fn emit(sinks: &[PreparedErrorLog], level: ErrorLogLevel, line: &[u8]) {
             PreparedErrorLogTarget::Stderr => {
                 let _ = std::io::stderr().write_all(line);
             }
-            PreparedErrorLogTarget::File(path) => {
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    Ok(mut file) => {
-                        if let Err(e) = file.write_all(line) {
-                            eprintln!("ruxen: error_log write to {} failed: {e}", path.display());
-                        }
-                    }
-                    Err(e) => eprintln!("ruxen: error_log open {} failed: {e}", path.display()),
-                }
-            }
+            PreparedErrorLogTarget::File(target) => write_error_log_file(target, line),
             PreparedErrorLogTarget::Syslog(target) => {
                 let line = line.strip_suffix(b"\n").unwrap_or(line);
                 if let Err(e) = crate::syslog::send_error_line(target, syslog_severity(level), line)
