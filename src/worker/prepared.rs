@@ -1813,10 +1813,11 @@ pub struct PreparedServer {
     /// Effective server-scope access-phase settings, for requests that
     /// match no location.
     pub access: PreparedAccess,
-    /// Effective server-scope `underscores_in_headers`. When false,
-    /// dynamic-name request-header lookups (`$http_*`, `$cookie_*`,
-    /// `$sent_http_*` interpolation feed) skip headers whose names
-    /// contain `_`, mirroring nginx.
+    /// Effective server-scope `underscores_in_headers`, or
+    /// `ignore_invalid_headers off`: whether nginx's parser keeps a header
+    /// whose name has `_`. When false, dynamic-name request-header lookups
+    /// (`$http_*`, `$cookie_*`, `$sent_http_*` interpolation feed) skip
+    /// such headers, mirroring nginx.
     pub underscores_in_headers: bool,
     /// Effective server-scope `post_action`, used for server-default and
     /// no-location fallback paths.

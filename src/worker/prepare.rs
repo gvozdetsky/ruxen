@@ -2332,7 +2332,8 @@ pub(crate) fn prepare_server(
         server_header: server_header_bytes,
         access_logs: server_access_logs,
         access: server_access,
-        underscores_in_headers: server_underscores_in_headers,
+        // nginx's parser keeps a name with `_` with either (#624).
+        underscores_in_headers: server_underscores_in_headers || !server_ignore_invalid_headers,
         post_action: server_post_action,
         rewrite_program: server_rewrite_program,
         add_headers: server_add_headers,
