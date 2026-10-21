@@ -15,11 +15,12 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
 
-use super::{AccessLogSink, PreparedLogBuffer};
+use super::{AccessLogSink, PreparedAccessLog, PreparedLogBuffer};
 
 type Shared = Arc<Mutex<Vec<u8>>>;
 
-/// Every worker's buffers, for the SIGTERM write.
+/// Every running worker's buffers, for the SIGTERM write. A retired
+/// generation's go once its workers are joined (`forget`).
 static ALL: Mutex<Vec<(&'static PreparedLogBuffer, Shared)>> = Mutex::new(Vec::new());
 
 struct Slot {
@@ -134,6 +135,19 @@ pub(crate) fn flush_all(files: &[AccessLogSink]) {
             let _ = fd.write_all(&encode(slot.buffer, &data));
         }
     });
+}
+
+/// A generation's workers are joined, having written their buffers out:
+/// drop them from the registry (#528), before the configuration they point
+/// into is freed, as nginx's buffers go with the old cycle's pool.
+pub(crate) fn forget(logs: &[PreparedAccessLog]) {
+    let ours = |b: &PreparedLogBuffer| {
+        logs.iter()
+            .any(|log| log.buffer.is_some_and(|own| std::ptr::eq(own, b)))
+    };
+    ALL.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(buffer, _)| !ours(buffer));
 }
 
 /// At SIGTERM, from the main thread: write what every worker has buffered,
