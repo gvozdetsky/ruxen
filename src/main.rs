@@ -654,7 +654,14 @@ impl Master {
                 // them on their way out.
                 worker::logbuf::flush_at_exit();
                 self.listeners.remove_unix_files();
-                std::process::exit(if worker_panicked { 1 } else { 0 });
+                // Without exit handlers or destructors (#525): the workers
+                // still run, and aws-lc's destructors free the global DRBG
+                // a worker may be seeding from. nginx's master exits only
+                // once its workers are gone; here the process ends them.
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                // SAFETY: `_exit` ends the process at once; nothing after
+                // it runs.
+                unsafe { libc::_exit(if worker_panicked { 1 } else { 0 }) }
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
                 self.begin_shutdown();
