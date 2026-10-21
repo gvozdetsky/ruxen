@@ -630,6 +630,23 @@ fn client_closed_log(meta: &phase::ProcessMeta, ctx: &phase::RequestCtx<'_>) {
     );
 }
 
+/// nginx's `[info]` line when an HTTP/2 request's `:authority` and `Host`
+/// differ (ngx_http_v2_run_request), in the error log of the server that
+/// refused it. Its `host:` is the `:authority`, the only Host the head
+/// carries; nginx's is the client's `Host`.
+#[cold]
+#[inline(never)]
+fn authority_mismatch_log(meta: &phase::ProcessMeta, ctx: &phase::RequestCtx<'_>) {
+    write_error_log(
+        meta.log.error_logs,
+        ErrorLogLevel::Info,
+        &ErrorLogRequest::new(ctx, meta.server_name).with_realip(meta),
+        b"client sent \":authority\" and \"Host\" headers with different values \
+          while reading client request headers",
+        None,
+    );
+}
+
 async fn settle_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
@@ -3613,6 +3630,14 @@ pub(crate) async fn handle<S: ConnIo>(
                         let if_match = req.if_match.map(|(s, e)| &buf[base + s..base + e]);
                         let range = req.range.map(|(s, e)| &buf[base + s..base + e]);
                         let if_range = req.if_range.map(|(s, e)| &buf[base + s..base + e]);
+                        // HTTP/2 with an `:authority` and a `Host` that
+                        // differs (#592): nginx answers 400 once the head is
+                        // read, from the server the `:authority` chose
+                        // (ngx_http_v2_run_request, since 1.29.1).
+                        let authority_mismatch = stream.h2_authority_mismatch();
+                        if authority_mismatch && refuse.is_none() {
+                            refuse = Some(400);
+                        }
                         // Plain HTTP on an `ssl` port (#384): once its head is
                         // read, nginx finalizes the request with 497
                         // (ngx_http_process_request), unless it was refused
@@ -3973,6 +3998,9 @@ pub(crate) async fn handle<S: ConnIo>(
                         );
                         let (mut response, mut process_meta) =
                             phase::process_with_meta(http, &ctx, &mut *url_scratch);
+                        if authority_mismatch {
+                            authority_mismatch_log(&process_meta, &ctx);
+                        }
                         // limit_req delayed the request (#94): processing
                         // stopped before the content handler. Boxed, so the
                         // wait's timer isn't part of every connection's
