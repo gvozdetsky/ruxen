@@ -64,6 +64,8 @@ pub(crate) struct StreamIo {
     /// The request has an `:authority` and a `Host` that differs from it
     /// (`request_head`): refused with 400.
     authority_mismatch: bool,
+    /// The head's lines that aren't the client's fields (`request_head`).
+    synthetic_lines: usize,
 }
 
 enum Out {
@@ -105,7 +107,7 @@ impl StreamIo {
         let length = parts.headers.contains_key(http::header::CONTENT_LENGTH);
         let chunked_in = has_body && !length;
         let mut pending = Vec::with_capacity(512);
-        let authority_mismatch = request_head(parts, chunked_in, &mut pending);
+        let (authority_mismatch, synthetic_lines) = request_head(parts, chunked_in, &mut pending);
         StreamIo {
             pending,
             pos: 0,
@@ -121,6 +123,7 @@ impl StreamIo {
             chunk: chunk.max(1),
             header_block,
             authority_mismatch,
+            synthetic_lines,
         }
     }
 
@@ -469,7 +472,12 @@ impl Drop for StreamIo {
 /// dot all count). The head carries
 /// the `:authority` alone, by which the request was routed, as nginx's
 /// `ngx_http_v2_parse_authority` chose the server.
-fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) -> bool {
+///
+/// And how many of the head's lines aren't fields nginx counts for
+/// `max_headers` (#584): it counts each field but `cookie`, and no
+/// pseudo-header.
+fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) -> (bool, usize) {
+    let mut synthetic = usize::from(chunked);
     out.extend_from_slice(parts.method.as_str().as_bytes());
     out.push(b' ');
     let target = parts.uri.path_and_query().map_or("/", |p| p.as_str());
@@ -487,6 +495,7 @@ fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) 
         .iter()
         .peekable();
     if cookies.peek().is_some() {
+        synthetic += 1;
         out.extend_from_slice(b"Cookie: ");
         for (i, c) in cookies.enumerate() {
             if i > 0 {
@@ -516,7 +525,12 @@ fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) 
         out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    authority_mismatch
+    // The `Host` line stands for the client's `host` field if there was
+    // one, else for `:authority`, which isn't counted.
+    if authority.is_some() && !parts.headers.contains_key(http::header::HOST) {
+        synthetic += 1;
+    }
+    (authority_mismatch, synthetic)
 }
 
 /// The status and fields of a response head `handle` wrote.
@@ -729,6 +743,10 @@ impl super::super::ConnIo for StreamIo {
         self.authority_mismatch
     }
 
+    fn h2_synthetic_lines(&self) -> usize {
+        self.synthetic_lines
+    }
+
     fn conn_counters(&self) -> Option<(std::time::Instant, u64)> {
         Some(self.counters)
     }
@@ -801,7 +819,8 @@ mod tests {
             .unwrap();
         let (parts, ()) = request.into_parts();
         let mut out = Vec::new();
-        assert!(!request_head(&parts, true, &mut out));
+        // Of 5 lines: one field nginx counts (`x-y`).
+        assert_eq!(request_head(&parts, true, &mut out), (false, 3));
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "POST /p?q=1 HTTP/2.0\r\nHost: example.com:8080\r\nCookie: a=1; b=2\r\n\
@@ -818,7 +837,7 @@ mod tests {
             }
             let (parts, ()) = request.body(()).unwrap().into_parts();
             let mut out = Vec::new();
-            let mismatch = request_head(&parts, false, &mut out);
+            let (mismatch, _) = request_head(&parts, false, &mut out);
             (mismatch, String::from_utf8(out).unwrap())
         };
         // The client's Host isn't passed on: the head has the authority's.

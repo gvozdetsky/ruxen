@@ -23,6 +23,9 @@ pub struct ClientTimeouts {
     pub large_header_buffers: Option<(u64, u64)>,
     /// `http2_chunk_size`: the largest DATA frame of a response.
     pub h2_chunk_size: Option<u32>,
+    /// `max_headers` (nginx 1.29.8, #584): the most header lines a request
+    /// may have.
+    pub max_headers: Option<u64>,
 }
 
 impl ClientTimeouts {
@@ -40,6 +43,18 @@ impl ClientTimeouts {
             "send_timeout" => (&mut self.send_ms, "send_timeout"),
             "large_client_header_buffers" => {
                 return self.parse_large_header_buffers(args).map(|()| true);
+            }
+            "max_headers" => {
+                if self.max_headers.is_some() {
+                    return Err(Error::Duplicate("max_headers"));
+                }
+                // ngx_conf_set_num_slot: a number, 0 included.
+                let raw = args.get(1).ok_or(Error::MissingArg("max_headers"))?;
+                self.max_headers = Some(raw.parse::<u64>().map_err(|_| Error::BadValue {
+                    what: "max_headers",
+                    got: raw.clone(),
+                })?);
+                return Ok(true);
             }
             "http2_chunk_size" => {
                 if self.h2_chunk_size.is_some() {
@@ -101,6 +116,7 @@ impl ClientTimeouts {
             send_ms: self.send_ms.or(parent.send_ms),
             large_header_buffers: self.large_header_buffers.or(parent.large_header_buffers),
             h2_chunk_size: self.h2_chunk_size.or(parent.h2_chunk_size),
+            max_headers: self.max_headers.or(parent.max_headers),
         }
     }
 }

@@ -1720,6 +1720,11 @@ pub struct PreparedClientTimeouts {
     /// `http2_chunk_size` (#594): the largest DATA frame of a response on
     /// an HTTP/2 stream, nginx's 8k by default.
     pub h2_chunk: usize,
+    /// `max_headers` (#584), nginx's 1000 by default, and the shortest
+    /// header block that can hold more lines (each takes 3 bytes at
+    /// least, `a:\n`): a shorter one isn't counted.
+    pub max_headers: usize,
+    pub max_headers_span: usize,
 }
 
 impl PreparedHttp {
@@ -1736,6 +1741,7 @@ impl PreparedClientTimeouts {
         const DEFAULT_MS: u64 = 60_000;
         // nginx's default, `4 8k`.
         let (num, size) = t.large_header_buffers.unwrap_or((4, 8192));
+        let max_headers = t.max_headers.unwrap_or(1000).min(usize::MAX as u64) as usize;
         PreparedClientTimeouts {
             header: Duration::from_millis(t.header_ms.unwrap_or(DEFAULT_MS)),
             body: Duration::from_millis(t.body_ms.unwrap_or(DEFAULT_MS)),
@@ -1743,6 +1749,8 @@ impl PreparedClientTimeouts {
             large_header_line: size as usize,
             large_header: (num.saturating_mul(size)).min(usize::MAX as u64) as usize,
             h2_chunk: t.h2_chunk_size.unwrap_or(8 * 1024) as usize,
+            max_headers,
+            max_headers_span: max_headers.saturating_add(1).saturating_mul(3),
         }
     }
 }

@@ -571,6 +571,50 @@ fn overlong_head_line(head: &[u8], max: usize, total: usize) -> Option<usize> {
     None
 }
 
+/// Whether a header block has more than `max` lines.
+#[cold]
+#[inline(never)]
+fn too_many_header_lines(block: &[u8], max: usize) -> bool {
+    block.iter().filter(|&&b| b == b'\n').count() > max
+}
+
+/// A request with more header lines than `max_headers` (#584), answered
+/// and logged as nginx 1.30 does (`src/http/ngx_http_request.c:1497`,
+/// `src/http/v2/ngx_http_v2.c:1828`): `[info] client sent too many header
+/// lines` and 400 "Request Header Or Cookie Too Large" (494).
+#[cold]
+#[inline(never)]
+async fn many_header_lines<S: ConnIo>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    http: &'static PreparedHttp,
+    head: &[u8],
+    conn: &ConnLogCtx<'_>,
+) {
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
+    let request_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    let host = lookup_request_header(&head[request_end..], b"host");
+    write_error_log(
+        server.error_logs,
+        ErrorLogLevel::Info,
+        &ErrorLogRequest {
+            connection_id: conn.connection_id,
+            client: conn.remote_addr,
+            server: server.primary_server_name,
+            request_line: &head[..request_end],
+            host,
+        },
+        b"client sent too many header lines while reading client request headers",
+        None,
+    );
+    let response = http.header_too_large.pick(Method::Get);
+    reject_request(stream, scratch, http, response, head, conn).await;
+}
+
 /// A request head over `large_client_header_buffers` (#482), answered and
 /// logged as nginx does (`src/http/ngx_http_request.c:1189`, `:1370`): a
 /// request line that doesn't fit gets 414 and `client sent too long URI`;
@@ -3751,6 +3795,26 @@ pub(crate) async fn handle<S: ConnIo>(
                                 http,
                                 &buf[read_start..read_start + req.consumed],
                                 (line > 0).then_some(line),
+                                conn_log!(),
+                            )
+                            .await;
+                            return;
+                        }
+                        // `max_headers` (#584): only a block long enough
+                        // to hold more lines is counted.
+                        if req.headers_end - req.headers_start >= timeouts.max_headers_span
+                            && too_many_header_lines(
+                                &buf[read_start + req.headers_start..read_start + req.headers_end],
+                                timeouts
+                                    .max_headers
+                                    .saturating_add(stream.h2_synthetic_lines()),
+                            )
+                        {
+                            many_header_lines(
+                                stream,
+                                &mut *scratch,
+                                http,
+                                &buf[read_start..read_start + req.consumed],
                                 conn_log!(),
                             )
                             .await;
