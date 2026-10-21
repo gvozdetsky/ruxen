@@ -2447,6 +2447,7 @@ pub(crate) fn spawn_connection(
                     state,
                     connection_id,
                     None,
+                    Instant::now(),
                     guard,
                 ),
                 http,
@@ -2522,6 +2523,7 @@ async fn handle_proxy_protocol(
                 state,
                 connection_id,
                 Some(header),
+                accepted_at,
                 guard,
             )
             .await
@@ -3386,6 +3388,7 @@ pub(crate) async fn handle_plain(
     state: &'static RuntimeState,
     connection_id: u64,
     proxy_protocol: Option<crate::proxy_protocol::ProxyHeader>,
+    accepted_at: Instant,
     _guard: ConnectionGuard,
 ) {
     let conn = phase::ConnInfo {
@@ -3395,6 +3398,7 @@ pub(crate) async fn handle_plain(
         realip: None,
         proxy_protocol,
         plain_http: false,
+        accepted_at: Some(accepted_at),
     };
     let listen = &http.listens[listen_index];
     // Boxed, here and in `handle_tls`: awaited in place, the HTTP/2
@@ -3530,6 +3534,7 @@ pub(crate) async fn handle_tls(
         realip: None,
         proxy_protocol,
         plain_http: false,
+        accepted_at: Some(accepted_at),
     };
     let budget = budget.saturating_sub(accepted_at.elapsed());
     let accepted =
@@ -3751,9 +3756,19 @@ pub(crate) async fn handle<S: ConnIo>(
         let listen = &http.listens[listen_index];
         &listen.servers[listen.default_server].timeouts
     };
-    // A new connection gets client_header_timeout to send its first request
-    // (nginx's post-accept timeout); later waits use keepalive_timeout.
-    let mut keepalive_idle_timeout: Option<Duration> = Some(timeouts.header);
+    // A new connection's first request head, the wait for it included, is
+    // due client_header_timeout after the accept, as under nginx's one
+    // accept timer, which a TLS handshake or a PROXY header used part of
+    // (#484). Later heads get it from their first bytes, and the waits
+    // for them keepalive_timeout. An HTTP/2 stream's head comes whole.
+    let mut first_head_due = conn
+        .accepted_at
+        .filter(|_| !stream.h2())
+        .map(|at| at + timeouts.header);
+    let mut keepalive_idle_timeout: Option<Duration> =
+        Some(first_head_due.map_or(timeouts.header, |due| {
+            due.saturating_duration_since(Instant::now())
+        }));
     // When the current request's header must be complete; set on the first
     // read for it, cleared once the request is handled.
     let mut header_deadline: Option<monoio::time::Instant>;
@@ -3831,8 +3846,12 @@ pub(crate) async fn handle<S: ConnIo>(
         conn_stats.set(super::stats::Phase::Reading);
         keepalive_idle_timeout = None;
         // The header's time starts with its first bytes, as nginx's
-        // client_header_timeout after the keep-alive read.
-        header_deadline = (filled > 0).then(|| monoio::time::Instant::now() + timeouts.header);
+        // client_header_timeout after the keep-alive read; the first
+        // request's runs from the accept.
+        header_deadline = match first_head_due.take() {
+            Some(due) => Some(monoio::time::Instant::from_std(due)),
+            None => (filled > 0).then(|| monoio::time::Instant::now() + timeouts.header),
+        };
 
         let mut read_start: usize = 0; // first unread byte of the current request
         // The first bytes came with the idle wait: parse before reading.

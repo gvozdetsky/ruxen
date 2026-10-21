@@ -71,6 +71,10 @@ pub struct ConnInfo {
     /// Plain HTTP on an `ssl` port (#384): the request is refused with
     /// nginx's 497, sent as 400 unless `error_page 497` says otherwise.
     pub plain_http: bool,
+    /// When the connection was accepted: its first request head is due
+    /// `client_header_timeout` after it, as nginx's one accept timer
+    /// (#484). `None` where there is no such connection (tests).
+    pub accepted_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +93,7 @@ impl ConnInfo {
         peer_unix: false,
         realip: None,
         plain_http: false,
+        accepted_at: None,
     };
 }
 
