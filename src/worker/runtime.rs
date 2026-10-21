@@ -1552,13 +1552,15 @@ fn unshare_fd_table() -> bool {
 /// by `main`, see `listeners`), or the `[emerg]` text of the first
 /// failure, after which the worker exits. `main` waits for all of them
 /// before writing the pid file, or before a reload retires the workers of
-/// the configuration before.
+/// the configuration before. `ring_entries` is the io_uring ring size
+/// (`ring_entries`).
 pub fn run(
     http: &'static PreparedHttp,
     cpu: Option<usize>,
     state: &'static RuntimeState,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     listeners: super::listeners::WorkerListeners,
+    ring_entries: u32,
 ) {
     let unshared = unshare_fd_table();
     let adopted = match super::listeners::adopt(listeners, unshared) {
@@ -1721,17 +1723,21 @@ pub fn run(
     };
 
     match driver() {
-        Driver::IoUring => match RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .with_entries(4096)
-            .build()
-        {
+        Driver::IoUring => match io_uring_runtime(http, ring_entries) {
             Ok(mut rt) => {
                 end_connections_on_panic(inherited_on_panic.as_deref(), || rt.block_on(body))
             }
             Err(e) => {
-                let _ = ready_on_failure
-                    .send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
+                let hint = if e.raw_os_error() == Some(libc::ENOMEM) {
+                    "; the rings count against RLIMIT_MEMLOCK: raise it \
+                     (LimitMEMLOCK=, ulimit -l) or set RUXEN_DRIVER=epoll"
+                } else {
+                    ""
+                };
+                let _ = ready_on_failure.send(Err(format!(
+                    "io_uring_setup() failed ({}){hint}",
+                    errno_text(&e)
+                )));
             }
         },
         Driver::Epoll => match RuntimeBuilder::<monoio::LegacyDriver>::new()
@@ -1746,6 +1752,111 @@ pub fn run(
                     .send(Err(format!("epoll_create() failed ({})", errno_text(&e))));
             }
         },
+    }
+}
+
+/// Ring sizes, largest first: the size of a generation's rings, and the
+/// smaller ones a worker tries on ENOMEM.
+const RING_ENTRIES: [u32; 3] = [4096, 1024, 256];
+
+/// What a ring takes per entry, rounded up: a 64-byte SQE, two 16-byte
+/// CQEs and the SQ index, in page-rounded regions.
+const RING_BYTES_PER_ENTRY: u64 = 128;
+
+/// The ring size for a generation of `workers`. Without `CAP_IPC_LOCK`,
+/// Linux 7.0 charges each ring to the user's `RLIMIT_MEMLOCK`, summed over
+/// all of the user's processes: a 4096-entry ring is about 0.5 MiB, so the
+/// common 8 MiB limit holds about 16 workers (#612). Chosen up front, as
+/// the largest size whose rings all fit the limit, with a `[warn]` when
+/// that is less than 4096. Workers that took the limit first would leave
+/// the later ones none.
+pub fn ring_entries(http: &PreparedHttp, workers: usize) -> u32 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the struct we pass.
+    if driver() != Driver::IoUring
+        || unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0
+        || limit.rlim_cur == libc::RLIM_INFINITY
+        || may_lock_memory()
+    {
+        return RING_ENTRIES[0];
+    }
+    let fits = |n: u32| workers as u64 * n as u64 * RING_BYTES_PER_ENTRY <= limit.rlim_cur;
+    let size = RING_ENTRIES
+        .iter()
+        .copied()
+        .find(|&n| fits(n))
+        .unwrap_or(RING_ENTRIES[RING_ENTRIES.len() - 1]);
+    if size != RING_ENTRIES[0] {
+        write_worker_log(
+            http.error_logs,
+            ErrorLogLevel::Warn,
+            &format!(
+                "the io_uring rings of {workers} workers at {} entries exceed \
+                 RLIMIT_MEMLOCK ({} KiB), using {size} entries: \
+                 raise it (LimitMEMLOCK=, ulimit -l)",
+                RING_ENTRIES[0],
+                limit.rlim_cur >> 10
+            ),
+        );
+    }
+    size
+}
+
+/// `CAP_IPC_LOCK` in the effective set: the kernel then charges no ring to
+/// `RLIMIT_MEMLOCK`.
+fn may_lock_memory() -> bool {
+    const CAP_IPC_LOCK: u32 = 14;
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let caps = status.lines().find_map(|l| l.strip_prefix("CapEff:"))?;
+            u64::from_str_radix(caps.trim(), 16).ok()
+        })
+        .is_some_and(|caps| caps & (1 << CAP_IPC_LOCK) != 0)
+}
+
+/// The worker's io_uring runtime, with a ring of `entries`. On ENOMEM (the
+/// limit is shared with the user's other processes, and the rings of
+/// workers a reload retired are freed some time after) a smaller ring,
+/// with one `[warn]` per process.
+fn io_uring_runtime(
+    http: &PreparedHttp,
+    entries: u32,
+) -> std::io::Result<monoio::Runtime<monoio::time::TimeDriver<monoio::IoUringDriver>>> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let mut sizes = RING_ENTRIES
+        .iter()
+        .copied()
+        .filter(|&n| n <= entries)
+        .peekable();
+    loop {
+        let size = sizes.next().unwrap_or(entries);
+        match RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .with_entries(size)
+            .build()
+        {
+            Ok(rt) => {
+                if size != entries && !WARNED.swap(true, Ordering::Relaxed) {
+                    write_worker_log(
+                        http.error_logs,
+                        ErrorLogLevel::Warn,
+                        &format!(
+                            "io_uring_setup() of {entries} entries failed \
+                             (12: Cannot allocate memory), using {size}: \
+                             the rings count against RLIMIT_MEMLOCK \
+                             (LimitMEMLOCK=, ulimit -l)"
+                        ),
+                    );
+                }
+                return Ok(rt);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) && sizes.peek().is_some() => {}
+            Err(e) => return Err(e),
+        }
     }
 }
 
