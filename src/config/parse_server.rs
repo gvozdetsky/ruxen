@@ -994,9 +994,11 @@ pub(crate) fn parse_listen(s: &str) -> Result<SocketAddr, Error> {
     })
 }
 
-/// `listen` with a port range (`127.0.0.1:8000-8003`, `8000-8003`,
-/// `[::1]:8000-8003`): one listen per port, the flags on each, as nginx's
-/// `ngx_parse_inet_url`. A single port is one listen.
+/// `listen`'s address as nginx's `ngx_parse_inet_url` takes it: a port
+/// (`8000`), `host:port`, or a host alone with port 80; the host an IPv4
+/// address, a bracketed IPv6 one, `*` (any address) or a name resolved now,
+/// one listen per address (#654). The port may be a range (`8000-8003`):
+/// one listen per port, the flags on each.
 pub(crate) fn parse_listen_range_args(args: &[String]) -> Result<Vec<Listen>, Error> {
     let addr_s = args.first().ok_or(Error::MissingArg("listen"))?;
     if addr_s.starts_with("unix:") {
@@ -1006,28 +1008,82 @@ pub(crate) fn parse_listen_range_args(args: &[String]) -> Result<Vec<Listen>, Er
         what: "listen address",
         got: addr_s.to_string(),
     };
-    let (host, ports) = match addr_s.rfind(':') {
-        Some(i) if !addr_s.ends_with(']') => (Some(&addr_s[..i]), &addr_s[i + 1..]),
-        _ => (None, addr_s.as_str()),
+    let (host, ports) = split_listen_address(addr_s).ok_or_else(bad)?;
+    let (first, last) = match ports {
+        None => (80, 80),
+        Some(ports) => match ports.split_once('-') {
+            Some((first, last)) => {
+                let first: u16 = first.parse().map_err(|_| bad())?;
+                let last: u16 = last.parse().map_err(|_| bad())?;
+                if first == 0 || last < first {
+                    return Err(bad());
+                }
+                (first, last)
+            }
+            None => {
+                let port: u16 = ports.parse().map_err(|_| bad())?;
+                (port, port)
+            }
+        },
     };
-    let Some((first, last)) = ports.split_once('-') else {
-        return Ok(vec![parse_listen_args(args)?]);
+    let ips: Vec<std::net::IpAddr> = match host {
+        None | Some("*") => vec![std::net::Ipv4Addr::UNSPECIFIED.into()],
+        Some(host) => {
+            if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+                vec![v6.parse::<std::net::Ipv6Addr>().map_err(|_| bad())?.into()]
+            } else if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+                vec![v4.into()]
+            } else {
+                resolve_listen_host(host).ok_or_else(|| Error::HostNotFound {
+                    url: addr_s.to_string(),
+                    directive: "listen",
+                })?
+            }
+        }
     };
-    let first: u16 = first.parse().map_err(|_| bad())?;
-    let last: u16 = last.parse().map_err(|_| bad())?;
-    if first == 0 || last < first {
-        return Err(bad());
-    }
-    let mut listens = Vec::with_capacity(usize::from(last - first) + 1);
-    for port in first..=last {
-        let mut one = args.to_vec();
-        one[0] = match host {
-            Some(host) => format!("{host}:{port}"),
-            None => port.to_string(),
-        };
-        listens.push(parse_listen_args(&one)?);
+    let mut listens = Vec::with_capacity(ips.len() * (usize::from(last - first) + 1));
+    for ip in ips {
+        for port in first..=last {
+            let mut one = args.to_vec();
+            one[0] = SocketAddr::new(ip, port).to_string();
+            listens.push(parse_listen_args(&one)?);
+        }
     }
     Ok(listens)
+}
+
+/// `listen`'s address split into its host and port parts, either absent;
+/// `None` when it can't be one.
+fn split_listen_address(s: &str) -> Option<(Option<&str>, Option<&str>)> {
+    if s.starts_with('[') {
+        let end = s.find(']')?;
+        let (host, rest) = s.split_at(end + 1);
+        return match rest.strip_prefix(':') {
+            Some(port) => Some((Some(host), Some(port))),
+            None if rest.is_empty() => Some((Some(host), None)),
+            None => None,
+        };
+    }
+    match s.rsplit_once(':') {
+        Some(("", _)) => None,
+        Some((host, port)) => Some((Some(host), Some(port))),
+        None if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') => Some((None, Some(s))),
+        None => Some((Some(s), None)),
+    }
+}
+
+/// The addresses of a `listen` host name, as nginx's
+/// `ngx_inet_resolve_host` at config load (the system resolver, not
+/// `resolver`), each once, in the resolver's order.
+fn resolve_listen_host(host: &str) -> Option<Vec<std::net::IpAddr>> {
+    use std::net::ToSocketAddrs;
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    for addr in (host, 0).to_socket_addrs().ok()? {
+        if !ips.contains(&addr.ip()) {
+            ips.push(addr.ip());
+        }
+    }
+    (!ips.is_empty()).then_some(ips)
 }
 
 /// Parse a `listen` directive's argument list (address + zero or more flags).
