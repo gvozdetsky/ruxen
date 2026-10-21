@@ -163,3 +163,38 @@ fn bad_levels_are_rejected_like_nginx() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `$request_body_file` of a raw request (the whole of it, with its head).
+fn body_file_of(port: u16, request: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(request.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    out.split("\r\n\r\n").nth(1).unwrap().to_string()
+}
+
+/// An empty body that the client framed (`Content-Length: 0`, or chunked
+/// with only the last chunk) gets an empty file with
+/// client_body_in_file_only, as ngx_http_write_request_body creates one;
+/// a request without body framing has no body and no file (#628).
+#[test]
+fn an_empty_framed_body_gets_its_file() {
+    let server = start("empty", "");
+    let head = "Host: x\r\nConnection: close\r\n";
+    for request in [
+        format!("POST / HTTP/1.1\r\n{head}Content-Length: 0\r\n\r\n"),
+        format!("POST / HTTP/1.1\r\n{head}Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+        format!("GET / HTTP/1.1\r\n{head}Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+    ] {
+        let file = PathBuf::from(body_file_of(server.port, &request));
+        assert_eq!(std::fs::read(&file).unwrap(), b"", "{request:?}");
+        assert_eq!(mode(&file), 0o600);
+        std::fs::remove_file(&file).unwrap();
+    }
+    assert_eq!(
+        body_file_of(server.port, &format!("GET / HTTP/1.1\r\n{head}\r\n")),
+        ""
+    );
+}

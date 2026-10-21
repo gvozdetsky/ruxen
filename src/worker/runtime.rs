@@ -3839,8 +3839,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut discard_body = false;
                         // The routed location's client_body_timeout (#147).
                         let mut body_timeout = timeouts.body;
-                        let has_body = req.content_length.is_some_and(|cl| cl > 0)
-                            || req.transfer_encoding_chunked;
+                        // A body is framed, even an empty one (`Content-Length:
+                        // 0`, or chunked): nginx reads it, and with
+                        // client_body_in_file_only writes its file (#628).
+                        let has_body =
+                            req.content_length.is_some() || req.transfer_encoding_chunked;
                         if refuse.is_none() && has_body {
                             let cl = req.content_length.unwrap_or(0);
                             let probe = request_ctx!(
@@ -4077,6 +4080,17 @@ pub(crate) async fn handle<S: ConnIo>(
                         } else {
                             sink.len()
                         };
+                        // client_body_in_file_only (a zero buffer): an empty
+                        // body gets its file too (ngx_http_write_request_body).
+                        if body_buffer == 0
+                            && has_body
+                            && !discard_body
+                            && !body_too_large
+                            && sink.len() == 0
+                            && !sink.spill()
+                        {
+                            return;
+                        }
                         let (body_vec, spooled) = sink.finish();
                         // Shared, so a proxied request sends it from here
                         // instead of a copy (#289); the buffer goes back to
