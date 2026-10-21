@@ -33,6 +33,31 @@ use crate::{autoindex, file, fs_resolve, uri};
 
 use super::*;
 
+/// An access-log write: `pwrite` at 0, as an `O_APPEND` file appends
+/// anyway and io_uring takes 0 on a pipe as no offset. The epoll driver's
+/// `pwrite` fails on a FIFO (ESPIPE): a plain `write` then (#523).
+async fn write_log_file<T: monoio::buf::IoBuf>(file: &AsyncFile, data: T) -> std::io::Result<()> {
+    let (res, data) = file.write_all_at(data, 0).await;
+    match res {
+        Err(e) if e.raw_os_error() == Some(libc::ESPIPE) => write_stream_log(file, &data),
+        res => res,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn write_stream_log<T: monoio::buf::IoBuf>(file: &AsyncFile, data: &T) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: borrows the open descriptor `file` owns for one write; the
+    // ManuallyDrop keeps it from being closed here.
+    let mut fd =
+        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) });
+    // SAFETY: `read_ptr` and `bytes_init` describe the buffer's bytes.
+    std::io::Write::write_all(&mut *fd, unsafe {
+        std::slice::from_raw_parts(data.read_ptr(), data.bytes_init())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_access_logs(
     logs: &'static [PreparedAccessLog],
@@ -206,7 +231,7 @@ pub(crate) async fn write_access_logs(
         let Some(AccessLogSink::File(file)) = files.get(log.file_index) else {
             continue;
         };
-        let (res, _buf) = file.write_all_at(line, 0).await;
+        let res = write_log_file(file, line).await;
         if let Err(e) = res {
             eprintln!(
                 "ruxen: access_log write to {} failed: {e}",
@@ -283,7 +308,7 @@ async fn write_access_line_by_path(
             return;
         }
     };
-    let (res, _) = file.write_all_at(line, 0).await;
+    let res = write_log_file(&file, line).await;
     if let Err(e) = res {
         eprintln!("ruxen: access_log write to {} failed: {e}", path.display());
     }
@@ -314,7 +339,7 @@ async fn write_buffered_access_line(
                 && let Some(files) = access_log_files(http.access_logs, http.error_logs)
                 && let Some(AccessLogSink::File(file)) = files.get(file_index)
             {
-                let (res, _) = file.write_all_at(data, 0).await;
+                let res = write_log_file(file, data).await;
                 if let Err(e) = res {
                     eprintln!(
                         "ruxen: access_log write to {} failed: {e}",
@@ -328,7 +353,7 @@ async fn write_buffered_access_line(
         return;
     };
     for data in appended.write {
-        let (res, _) = file.write_all_at(data, 0).await;
+        let res = write_log_file(file, data).await;
         if let Err(e) = res {
             eprintln!(
                 "ruxen: access_log write to {} failed: {e}",
