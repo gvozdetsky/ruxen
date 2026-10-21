@@ -36,8 +36,9 @@ Sibling checkouts are expected one directory up:
   minimal on purpose. Widening either unlocks nginx-tests files, so do it only
   together with the implementation.
 - Code is rustfmt-clean and CI enforces `cargo fmt --check`; run `cargo fmt`
-  before committing. Clippy still has ~100 warnings and is not gated — don't
-  mix clippy cleanups into feature changes.
+  before committing. CI also runs `cargo clippy --all-targets -- -D warnings`
+  on a pinned toolchain (the `clippy` job in `.github/workflows/ci.yml`);
+  keep it clean.
 - Access restrictions ruxen can't enforce yet fail closed (`[emerg]`), never
   go on the allowlist (`config::reject_unenforced`).
 

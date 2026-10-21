@@ -827,9 +827,11 @@ fn process_with_meta_inner(
             rewrite_state.set_numbered_capture(n + 1, value);
         }
     }
-    let mut meta = ProcessMeta::default();
-    meta.server_port = server.listen_port;
-    meta.server_name = server.primary_server_name;
+    let mut meta = ProcessMeta {
+        server_port: server.listen_port,
+        server_name: server.primary_server_name,
+        ..ProcessMeta::default()
+    };
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
@@ -1519,9 +1521,7 @@ fn run_access_control(
 /// restored. `None` on any other pass, or where auth_request is off.
 #[inline]
 fn take_auth_resume(access: &PreparedAccess, state: &mut RewriteState) -> Option<AuthResume> {
-    if access.auth_request.is_none() {
-        return None;
-    }
+    access.auth_request?;
     let uri = access.auth_request?;
     let resume = AUTH_RESUME.with(|r| {
         r.borrow()
@@ -1977,7 +1977,7 @@ pub(crate) fn first_body_limit(
     })
 }
 
-fn select_listen<'h>(http: &'h PreparedHttp, listen_index: usize) -> Option<&'h PreparedListen> {
+fn select_listen(http: &PreparedHttp, listen_index: usize) -> Option<&PreparedListen> {
     http.listens.get(listen_index)
 }
 
@@ -2184,9 +2184,9 @@ pub(crate) fn server_for(
 /// the input bytes differ. Returns `None` when nothing matches so the
 /// caller can chain candidates and only fall back to the default server
 /// once all of them have failed.
-fn match_server_name<'h, 'r>(
+fn match_server_name<'h>(
     listen: &'h PreparedListen,
-    host_raw: &'r [u8],
+    host_raw: &[u8],
 ) -> Option<(&'h PreparedServer, Option<ServerNameCaptures>)> {
     // Lowercase host once for case-insensitive matching against
     // already-lowercased prepared names. Hot path is the all-lowercase
@@ -2252,10 +2252,10 @@ fn match_server_name<'h, 'r>(
     // One pass over every regex name of the listen (#248); without a set,
     // each in turn.
     let first = match &listen.regex_name_set {
-        Some((set, index)) => match set.matches(host_raw).iter().next() {
-            Some(i) => Some(index[i]),
-            None => return None,
-        },
+        Some((set, index)) => {
+            let i = set.matches(host_raw).iter().next()?;
+            Some(index[i])
+        }
         None => None,
     };
     for (si, server) in listen.servers.iter().enumerate() {
@@ -2356,10 +2356,10 @@ pub(crate) fn match_location<'a>(
         .iter()
         .find(|loc| path.starts_with(loc.pattern));
 
-    if let Some(loc) = best {
-        if loc.noregex {
-            return Some(MatchedLocation::from_prefix(loc));
-        }
+    if let Some(loc) = best
+        && loc.noregex
+    {
+        return Some(MatchedLocation::from_prefix(loc));
     }
 
     if !server.regex_locations.is_empty() {

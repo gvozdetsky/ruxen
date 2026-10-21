@@ -94,12 +94,10 @@ pub(crate) fn finalize_location_response(
                 && inject_location.is_none()
                 && inject_www_authenticate.is_empty()
                 && !needs_expires
-            {
-                if let Some(cached) =
+                && let Some(cached) =
                     prebuilt_with_literal_add_headers(bytes, add_headers, status, render_ctx_base)
-                {
-                    return Response::Prebuilt(cached);
-                }
+            {
+                return Response::Prebuilt(cached);
             }
             let mut out = if status == base_status {
                 bytes.to_vec()

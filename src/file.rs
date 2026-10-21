@@ -226,16 +226,13 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
     // `If-Unmodified-Since` is only evaluated when `If-Match` is absent
     // (RFC 9110 §13.1.4 / §13.2.2 ordering). A stale date precondition
     // fails with 412 before cache validators (`If-None-Match` / IMS).
-    if !has_if_match {
-        if let Some(if_unmodified_since) = cond.if_unmodified_since {
-            if let Some(current_last_modified) = conditional_last_modified {
-                if let Some(since) = parse_http_date(if_unmodified_since) {
-                    if current_last_modified > since {
-                        return Decision::PreconditionFailed;
-                    }
-                }
-            }
-        }
+    if !has_if_match
+        && let Some(if_unmodified_since) = cond.if_unmodified_since
+        && let Some(current_last_modified) = conditional_last_modified
+        && let Some(since) = parse_http_date(if_unmodified_since)
+        && current_last_modified > since
+    {
+        return Decision::PreconditionFailed;
     }
 
     if let Some(if_none_match) = cond.if_none_match {
@@ -248,20 +245,19 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
         // Plain `mtime <= since` compare — no weak-validator freshness
         // gate. Tests rely on files written just before the request
         // still 304ing.
-        if let Some(current_last_modified) = conditional_last_modified {
-            if let Some(since) = parse_http_date(if_modified_since) {
-                if current_last_modified <= since {
-                    return Decision::NotModified;
-                }
-            }
+        if let Some(current_last_modified) = conditional_last_modified
+            && let Some(since) = parse_http_date(if_modified_since)
+            && current_last_modified <= since
+        {
+            return Decision::NotModified;
         }
     }
 
     let mut range = cond.range.filter(|_| cond.max_ranges != Some(0));
-    if let (Some(_), Some(if_range)) = (range, cond.if_range) {
-        if !if_range_matches(if_range, meta, conditional_last_modified) {
-            range = None;
-        }
+    if let (Some(_), Some(if_range)) = (range, cond.if_range)
+        && !if_range_matches(if_range, meta, conditional_last_modified)
+    {
+        range = None;
     }
 
     // nginx's range filter: its parse, up to max_ranges ranges.
@@ -284,7 +280,7 @@ fn resolve_conditional_last_modified(
 ) -> Option<u64> {
     match override_value {
         None => Some(meta.mtime),
-        Some(raw) if raw.is_empty() => None,
+        Some([]) => None,
         Some(raw) => parse_http_date(raw),
     }
 }
@@ -397,10 +393,10 @@ fn build_not_modified_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
 
 fn if_range_matches(value: &[u8], meta: &FileMeta, conditional_last_modified: Option<u64>) -> bool {
     // If-Range with an entity-tag uses strong comparison.
-    if let Some(first) = value.first() {
-        if *first == b'"' {
-            return value == meta.etag.as_slice();
-        }
+    if let Some(first) = value.first()
+        && *first == b'"'
+    {
+        return value == meta.etag.as_slice();
     }
 
     // Otherwise parse as HTTP-date and compare against second-granularity mtime.
@@ -909,7 +905,7 @@ fn days_in_month(year: u32, month: u8) -> u8 {
 }
 
 fn is_leap(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 #[cfg(test)]

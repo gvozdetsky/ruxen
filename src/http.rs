@@ -1172,8 +1172,7 @@ pub fn normalize_host(buf: &[u8], start: usize, end: usize) -> Option<Normalized
     let mut port_start: Option<usize> = None;
     let mut uppercase = false;
 
-    for i in start..end {
-        let ch = buf[i];
+    for (i, &ch) in (start..end).zip(&buf[start..end]) {
         match state {
             State::HostStart => {
                 if ch == b'[' {

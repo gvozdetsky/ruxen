@@ -1292,7 +1292,7 @@ fn refuse_unsafe_accel(
     write_error_log(
         process_meta.log.error_logs,
         ErrorLogLevel::Error,
-        &ErrorLogRequest::new(ctx, process_meta.server_name).with_realip(&process_meta),
+        &ErrorLogRequest::new(ctx, process_meta.server_name).with_realip(process_meta),
         &message,
         None,
     );
@@ -1664,7 +1664,7 @@ pub fn run(
             let mut tick = AcceptTick::new();
             loop {
                 // Shutdown or a reload wakes the idle connections.
-                notice_runtime_events(&state);
+                notice_runtime_events(state);
                 if state.is_shutting_down() {
                     // Stop accepting at once: after a reload, the socket
                     // goes on with the next generation's worker, or is
@@ -1721,7 +1721,7 @@ pub fn run(
 
             loop {
                 // Shutdown or a reload wakes the idle connections.
-                notice_runtime_events(&state);
+                notice_runtime_events(state);
                 if state.is_shutting_down() {
                     // The accept loops cancel their accepts and close their
                     // sockets. Dropped with the runtime instead, an accept
@@ -3523,7 +3523,7 @@ pub(crate) async fn handle<S: ConnIo>(
         let (next, returned) = stream
             .idle_read(
                 std::mem::take(&mut *buf),
-                &state,
+                state,
                 keepalive_idle_timeout,
                 std::mem::take(&mut fresh),
                 &mut timers,
@@ -3889,29 +3889,27 @@ pub(crate) async fn handle<S: ConnIo>(
                             && refuse.is_none()
                             && !refused_unread
                             && parse_state.has_expect
-                        {
-                            if let Some(expect) = lookup_request_header(
+                            && let Some(expect) = lookup_request_header(
                                 &buf[base + req.headers_start..base + req.headers_end],
                                 b"expect",
-                            ) {
-                                if expect.eq_ignore_ascii_case(b"100-continue") {
-                                    // nginx sends it in one send() and gives up
-                                    // the connection if it doesn't all go out;
-                                    // here send_timeout bounds the wait.
-                                    let resp: Vec<u8> = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
-                                    let len = resp.len();
-                                    let (res, _) = write_all_timed(
-                                        stream,
-                                        resp,
-                                        len,
-                                        timers.io.as_mut(),
-                                        timeouts.send,
-                                    )
-                                    .await;
-                                    if res.is_err() {
-                                        return;
-                                    }
-                                }
+                            )
+                            && expect.eq_ignore_ascii_case(b"100-continue")
+                        {
+                            // nginx sends it in one send() and gives up
+                            // the connection if it doesn't all go out;
+                            // here send_timeout bounds the wait.
+                            let resp: Vec<u8> = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+                            let len = resp.len();
+                            let (res, _) = write_all_timed(
+                                stream,
+                                resp,
+                                len,
+                                timers.io.as_mut(),
+                                timeouts.send,
+                            )
+                            .await;
+                            if res.is_err() {
+                                return;
                             }
                         }
                         // Request bodies stay in memory up to the location's
@@ -4092,8 +4090,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // nginx counts it in ngx_http_v2_process_request_body.
                         let request_length = match stream.h2_header_block() {
                             Some(block) if discard_body || body_too_large => block,
-                            Some(block) => block + body_len as u64,
-                            None => req.consumed as u64 + request_body_len as u64,
+                            Some(block) => block + body_len,
+                            None => req.consumed as u64 + request_body_len,
                         };
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -4217,7 +4215,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         upstream_send_timeout: send_timeout,
                                         client_send_timeout: timeouts.send,
                                         http,
-                                        state: &state,
+                                        state,
                                         start_reload_gen,
                                     },
                                 ))
@@ -4273,7 +4271,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     method_bytes,
                                     request_line,
                                     host,
-                                    &remote_addr,
+                                    remote_addr,
                                     remote_port,
                                     process_meta.remote_user.as_deref(),
                                     headers_raw,
@@ -4349,7 +4347,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     method_bytes,
                                     request_line,
                                     host,
-                                    &remote_addr,
+                                    remote_addr,
                                     remote_port,
                                     process_meta.remote_user.as_deref(),
                                     headers_raw,
@@ -4451,7 +4449,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut scan = match prebuilt_base {
                             Some(bytes) => cached_scan_response_headers(bytes),
                             None => {
-                                let mut scan = scan_response_headers(&scratch).unwrap_or_default();
+                                let mut scan = scan_response_headers(scratch).unwrap_or_default();
                                 if !process_meta.keep_upstream_date {
                                     stamp_date(&mut *scratch, &mut scan);
                                 }
@@ -4552,14 +4550,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             }
                             response_for_logs = &*scratch;
                         } else {
-                            if !close_after && !scan.has_keep_alive {
-                                if let Some(timeout_secs) =
+                            if !close_after
+                                && !scan.has_keep_alive
+                                && let Some(timeout_secs) =
                                     process_meta.keepalive.header_timeout_secs
-                                {
-                                    let mut buf: [u8; 48] = [0; 48];
-                                    let n = format_keep_alive_header(timeout_secs, &mut buf);
-                                    insert_header_at(&mut *scratch, &mut scan.head_end, &buf[..n]);
-                                }
+                            {
+                                let mut buf: [u8; 48] = [0; 48];
+                                let n = format_keep_alive_header(timeout_secs, &mut buf);
+                                insert_header_at(&mut *scratch, &mut scan.head_end, &buf[..n]);
                             }
                             if !scan.has_connection {
                                 let header: &[u8] = if close_after {
@@ -4571,7 +4569,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             }
                             // For the log, should a timed-out write take the
                             // head with it.
-                            let status = response_status(&scratch);
+                            let status = response_status(scratch);
                             if let Some(body) = proxy_body.take() {
                                 let pacer = process_meta.limit_rate.as_deref().and_then(|l| {
                                     super::Pacer::new(l.rate, l.after, request_start)
@@ -4734,7 +4732,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 method_bytes,
                                 request_line,
                                 host,
-                                &remote_addr,
+                                remote_addr,
                                 remote_port,
                                 process_meta.remote_user.as_deref(),
                                 headers_raw,

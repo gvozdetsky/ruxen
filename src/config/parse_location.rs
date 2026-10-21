@@ -56,14 +56,6 @@ pub(crate) fn parse_post_action_args(args: &[String]) -> Result<String, Error> {
     Ok(target.clone())
 }
 
-/// Parse `expires` directive args (everything after the directive name).
-///
-/// Forms accepted (mirror `ngx_http_headers_expires`):
-/// - `off` / `epoch` / `max`
-/// - `[+|-]<duration>` (seconds when bare; nginx-style suffixes y/M/w/d/h/m/s)
-/// - `modified <duration>`
-/// - `@<time-of-day>` (e.g. `@15h30m33s`; max 24h)
-/// - `$variable` / `modified $variable` — runtime-resolved
 /// `disable_symlinks off|on|if_not_owner [from=part];`, validated as
 /// nginx's ngx_http_disable_symlinks. `from=` takes `$document_root` or a
 /// literal path; other variables are refused rather than ignored, since
@@ -118,6 +110,14 @@ pub(crate) fn parse_disable_symlinks_args(args: &[String]) -> Result<DisableSyml
     Ok(DisableSymlinks { mode, from })
 }
 
+/// Parse `expires` directive args (everything after the directive name).
+///
+/// Forms accepted (mirror `ngx_http_headers_expires`):
+/// - `off` / `epoch` / `max`
+/// - `[+|-]<duration>` (seconds when bare; nginx-style suffixes y/M/w/d/h/m/s)
+/// - `modified <duration>`
+/// - `@<time-of-day>` (e.g. `@15h30m33s`; max 24h)
+/// - `$variable` / `modified $variable` — runtime-resolved
 pub(crate) fn parse_expires_args(args: &[String]) -> Result<ExpiresDirective, Error> {
     let (modified, value) = match args.len() {
         1 => (false, args[0].as_str()),
@@ -161,7 +161,7 @@ pub(crate) fn parse_expires_static(value: &str, modified: bool) -> Result<Expire
             });
         }
         let secs = parse_expires_time(rest)?;
-        if secs < 0 || secs > 24 * 60 * 60 {
+        if !(0..=24 * 60 * 60).contains(&secs) {
             return Err(Error::BadValue {
                 what: "expires (daily time must be < 24h)",
                 got: value.to_string(),

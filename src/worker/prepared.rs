@@ -1886,12 +1886,10 @@ impl std::hash::Hasher for NameHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         let mut h = self.0;
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            let word = u64::from_le_bytes(c.try_into().expect("8 bytes"));
-            h = (h.rotate_left(5) ^ word).wrapping_mul(NAME_HASH_K);
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(*c)).wrapping_mul(NAME_HASH_K);
         }
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             let mut last = [0u8; 8];
             last[..rest.len()].copy_from_slice(rest);

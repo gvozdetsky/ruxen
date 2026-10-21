@@ -495,25 +495,11 @@ pub fn is_hop_by_hop_name(name: &[u8]) -> bool {
     is_hop_by_hop(name)
 }
 
-/// Run an upstream attempt with `proxy_next_upstream` failover. Returns a
-/// `Response` ready to flow into the existing write path. The high-level
-/// shape mirrors nginx's `ngx_http_upstream_next` (line 4573):
-///
-///   - Attempt with the leased peer (or a pooled conn for it).
-///   - On a stale-pool first-write failure with an idempotent method
-///     (or `proxy_next_upstream non_idempotent` set), retry once on a
-///     fresh socket against the same peer.
-///   - On a "real" failure (connect/timeout/protocol/upstream-status):
-///     report the failure to the LB; if `next_upstream` allows AND we
-///     haven't exhausted `next_upstream_tries` AND idempotency permits,
-///     pick the next peer (with the tried mask blocking the failed one)
-///     and retry.
-///   - Pool the upstream socket on success when the upstream and request
-///     framing both permit it.
 /// Record a failed attempt for the error log. Out of line and cold so the
 /// formatting stays out of the retry loop's code.
 #[cold]
 #[inline(never)]
+#[allow(clippy::boxed_local)] // unboxed here, not in the retry loop
 fn record_failure(
     failures: &mut Vec<AttemptFailure>,
     plan: &ProxyPlan,
@@ -613,7 +599,21 @@ async fn resolve_peers(
 /// Run the upstream exchange, with `proxy_next_upstream` failover. Each
 /// failed attempt is appended to `failures` so the worker can log it with
 /// the request's context; on the happy path nothing is pushed and the
-/// caller's empty `Vec` never allocates.
+/// caller's empty `Vec` never allocates. Returns a `Response` ready to flow
+/// into the existing write path. The shape mirrors nginx's
+/// `ngx_http_upstream_next` (`ngx_http_upstream.c:4586`):
+///
+///   - Attempt with the leased peer (or a pooled conn for it).
+///   - On a stale-pool first-write failure with an idempotent method
+///     (or `proxy_next_upstream non_idempotent` set), retry once on a
+///     fresh socket against the same peer.
+///   - On a "real" failure (connect/timeout/protocol/upstream-status):
+///     report the failure to the LB; if `next_upstream` allows AND we
+///     haven't exhausted `next_upstream_tries` AND idempotency permits,
+///     pick the next peer (with the tried mask blocking the failed one)
+///     and retry.
+///   - Pool the upstream socket on success when the upstream and request
+///     framing both permit it.
 pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Response {
     report.passes_date = plan.response.passes_date;
     if let Some(cache) = plan.cache.as_deref_mut() {
@@ -2110,7 +2110,7 @@ async fn attempt(
         && !upstream_head
         && status_code != 204
         && status_code != 304
-        && !(status_code >= 100 && status_code < 200);
+        && !(100..200).contains(&status_code);
     // Neither a length nor chunked: the body ends with the connection,
     // whatever `Connection` says, and the connection isn't reused. nginx
     // takes such a body as of unknown length too (length -1 in
@@ -3504,9 +3504,7 @@ fn is_hop_by_hop(name: &[u8]) -> bool {
 /// flags a CR before another CR too, and `bare_cr_at` then decides.
 #[inline]
 fn bare_cr_or_nul(head: &[u8]) -> Option<usize> {
-    let Some((&last, init)) = head.split_last() else {
-        return None;
-    };
+    let (&last, init) = head.split_last()?;
     let suspect = init
         .iter()
         .zip(&head[1..])
@@ -3657,7 +3655,7 @@ mod tests {
             for mut n in 0..3usize.pow(len) {
                 let buf: Vec<u8> = (0..len)
                     .map(|_| {
-                        let b = [b'\r', b'\n', b'a'][n % 3];
+                        let b = b"\r\na"[n % 3];
                         n /= 3;
                         b
                     })

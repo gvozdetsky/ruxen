@@ -158,11 +158,8 @@ fn handle_conn(mut s: TcpStream, response: &[u8], requests: &AtomicUsize, stop: 
             Err(_) => return,
         }
         // Process as many complete HTTP requests as the buffer holds.
-        loop {
-            let head_end = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                Some(p) => p + 4,
-                None => break,
-            };
+        while let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head_end = p + 4;
             let head = &buf[..head_end];
             let mut cl = 0usize;
             for line in std::str::from_utf8(head).unwrap_or("").lines() {
@@ -170,10 +167,9 @@ fn handle_conn(mut s: TcpStream, response: &[u8], requests: &AtomicUsize, stop: 
                     .to_ascii_lowercase()
                     .strip_prefix("content-length:")
                     .map(|s| s.trim().to_owned())
+                    && let Ok(n) = rest.parse::<usize>()
                 {
-                    if let Ok(n) = rest.parse::<usize>() {
-                        cl = n;
-                    }
+                    cl = n;
                 }
             }
             if buf.len() < head_end + cl {
@@ -212,14 +208,14 @@ fn http_send(port: u16, request: &[u8]) -> Vec<u8> {
     out
 }
 
-fn header_value<'a>(req: &'a [u8], name: &str) -> Option<String> {
+fn header_value(req: &[u8], name: &str) -> Option<String> {
     let head_end = req.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&req[..head_end]).ok()?;
     for line in head.lines().skip(1) {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case(name) {
-                return Some(v.trim().to_string());
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case(name)
+        {
+            return Some(v.trim().to_string());
         }
     }
     None

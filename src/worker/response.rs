@@ -424,14 +424,14 @@ fn scan_response_header_value<'a>(response: &'a [u8], name: &[u8]) -> Option<&'a
         let rel_end = response[cursor..].windows(2).position(|w| w == b"\r\n")?;
         let end = cursor + rel_end;
         let line = &response[cursor..end];
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            if line[..colon].eq_ignore_ascii_case(name) {
-                let mut value = &line[colon + 1..];
-                while let [b' ' | b'\t', rest @ ..] = value {
-                    value = rest;
-                }
-                return Some(value);
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && line[..colon].eq_ignore_ascii_case(name)
+        {
+            let mut value = &line[colon + 1..];
+            while let [b' ' | b'\t', rest @ ..] = value {
+                value = rest;
             }
+            return Some(value);
         }
         cursor = end + 2;
     }
@@ -1683,10 +1683,10 @@ thread_local! {
 
 pub(crate) fn cached_scan_response_headers(bytes: &'static [u8]) -> ResponseHeaderScan {
     let key = bytes.as_ptr() as usize;
-    if let Some((last_key, last_scan)) = PREBUILT_SCAN_LAST.with(|last| last.get()) {
-        if last_key == key {
-            return last_scan;
-        }
+    if let Some((last_key, last_scan)) = PREBUILT_SCAN_LAST.with(|last| last.get())
+        && last_key == key
+    {
+        return last_scan;
     }
     PREBUILT_SCAN_CACHE.with(|cache| {
         if let Some(scan) = cache.borrow().get(&key).copied() {
@@ -1710,10 +1710,10 @@ pub(crate) fn cached_prebuilt_variant(
         close,
         keep_alive_timeout_secs,
     };
-    if let Some((last_key, last_variant)) = PREBUILT_VARIANT_LAST.with(|last| last.get()) {
-        if last_key == key {
-            return last_variant;
-        }
+    if let Some((last_key, last_variant)) = PREBUILT_VARIANT_LAST.with(|last| last.get())
+        && last_key == key
+    {
+        return last_variant;
     }
     PREBUILT_VARIANT_CACHE.with(|cache| {
         if let Some(variant) = cache.borrow().get(&key).copied() {
@@ -1723,12 +1723,13 @@ pub(crate) fn cached_prebuilt_variant(
 
         let mut out = base.to_vec();
         let mut scan = scan_response_headers(&out).unwrap_or_default();
-        if !close && !scan.has_keep_alive {
-            if let Some(timeout_secs) = keep_alive_timeout_secs {
-                let mut buf: [u8; 48] = [0; 48];
-                let n = format_keep_alive_header(timeout_secs, &mut buf);
-                insert_header_at(&mut out, &mut scan.head_end, &buf[..n]);
-            }
+        if !close
+            && !scan.has_keep_alive
+            && let Some(timeout_secs) = keep_alive_timeout_secs
+        {
+            let mut buf: [u8; 48] = [0; 48];
+            let n = format_keep_alive_header(timeout_secs, &mut buf);
+            insert_header_at(&mut out, &mut scan.head_end, &buf[..n]);
         }
         if !scan.has_connection {
             let header: &[u8] = if close {

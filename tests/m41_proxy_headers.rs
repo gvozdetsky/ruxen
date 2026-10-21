@@ -131,10 +131,10 @@ impl Backend {
                         Ok(0) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&tmp[..n]);
-                            if head_end.is_none() {
-                                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                    head_end = Some(p + 4);
-                                }
+                            if head_end.is_none()
+                                && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                head_end = Some(p + 4);
                             }
                             if let Some(he) = head_end {
                                 // Look up Content-Length in headers.
@@ -144,10 +144,9 @@ impl Backend {
                                     if let Some(rest) = line
                                         .strip_prefix("Content-Length:")
                                         .or_else(|| line.strip_prefix("content-length:"))
+                                        && let Ok(n) = rest.trim().parse::<usize>()
                                     {
-                                        if let Ok(n) = rest.trim().parse::<usize>() {
-                                            cl = n;
-                                        }
+                                        cl = n;
                                     }
                                 }
                                 if buf.len() >= he + cl {
@@ -198,10 +197,10 @@ fn header_value<'a>(req: &'a [u8], name: &str) -> Option<&'a str> {
     let head_end = req.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&req[..head_end]).ok()?;
     for line in head.lines().skip(1) {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case(name) {
-                return Some(v.trim());
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case(name)
+        {
+            return Some(v.trim());
         }
     }
     None

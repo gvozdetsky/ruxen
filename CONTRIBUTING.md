@@ -97,8 +97,9 @@ welcome — open an issue with the "Benchmark results" template.
 - **One logical change per PR**, with a test that fails before it and passes
   after. Behaviour changes need an integration test under `tests/`.
 - **`cargo fmt`** before committing; CI runs `cargo fmt --check`, and the
-  hook in `.githooks/` (enabled in Setup) catches it locally. Clippy is
-  not gated yet — please don't mix clippy-only cleanups into feature PRs.
+  hook in `.githooks/` (enabled in Setup) catches it locally. CI also runs
+  `cargo clippy --all-targets -- -D warnings` (on the toolchain pinned in
+  the `clippy` job); a new warning fails the PR.
 - **Run `cargo test --release`.** If you touched request handling, also run
   the relevant nginx-tests files and say which ones in the PR.
 - **Hot-path changes** (parsing, the worker loop, response building, file

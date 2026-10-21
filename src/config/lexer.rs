@@ -351,6 +351,32 @@ fn unescape(raw: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The paths `pattern` matches, as glob(3) with nginx's flags (none:
+/// sorted, `*` doesn't match a leading dot) returns them; no match is an
+/// empty list (ngx_open_glob with `test`).
+fn glob(pattern: &Path) -> std::io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let c_pattern = std::ffi::CString::new(pattern.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut found: libc::glob_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::glob(c_pattern.as_ptr(), 0, None, &mut found) };
+    let paths = match rc {
+        0 => (0..found.gl_pathc)
+            .map(|i| unsafe {
+                let p = std::ffi::CStr::from_ptr(*found.gl_pathv.add(i));
+                PathBuf::from(std::ffi::OsString::from_vec(p.to_bytes().to_vec()))
+            })
+            .collect(),
+        libc::GLOB_NOMATCH => Vec::new(),
+        _ => {
+            unsafe { libc::globfree(&mut found) };
+            return Err(std::io::Error::last_os_error());
+        }
+    };
+    unsafe { libc::globfree(&mut found) };
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,30 +408,4 @@ mod tests {
         // other unlisted pair, the backslash itself stays.
         assert_eq!(args(r"set $a a\;b\ c;"), vec!["set", "$a", r"a\;b\ c"]);
     }
-}
-
-/// The paths `pattern` matches, as glob(3) with nginx's flags (none:
-/// sorted, `*` doesn't match a leading dot) returns them; no match is an
-/// empty list (ngx_open_glob with `test`).
-fn glob(pattern: &Path) -> std::io::Result<Vec<PathBuf>> {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let c_pattern = std::ffi::CString::new(pattern.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut found: libc::glob_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::glob(c_pattern.as_ptr(), 0, None, &mut found) };
-    let paths = match rc {
-        0 => (0..found.gl_pathc)
-            .map(|i| unsafe {
-                let p = std::ffi::CStr::from_ptr(*found.gl_pathv.add(i));
-                PathBuf::from(std::ffi::OsString::from_vec(p.to_bytes().to_vec()))
-            })
-            .collect(),
-        libc::GLOB_NOMATCH => Vec::new(),
-        _ => {
-            unsafe { libc::globfree(&mut found) };
-            return Err(std::io::Error::last_os_error());
-        }
-    };
-    unsafe { libc::globfree(&mut found) };
-    Ok(paths)
 }

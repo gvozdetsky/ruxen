@@ -340,9 +340,7 @@ fn hash_pick(
     now: Instant,
 ) -> Option<usize> {
     let peers = upstream.peers;
-    if primary(peers).nth(1).is_none() {
-        return None;
-    }
+    primary(peers).nth(1)?;
     let total: u32 = primary(peers).map(|(_, p)| p.weight).sum();
     let usable = |rt: &UpstreamRt, i: usize| peer_eligible(rt, upstream, i, false, tried, now);
     match state {
@@ -472,6 +470,7 @@ thread_local! {
 pub struct Tried {
     low: u64,
     /// Peers from index 64 up. Boxed so the set stays two words.
+    #[allow(clippy::box_collection)]
     high: Option<Box<Vec<u64>>>,
 }
 
@@ -588,13 +587,14 @@ fn peer_eligible(
         return false;
     }
     let (fails, fails_started) = fail_state(rt, up, i);
-    if let Some(opened) = fails_started {
-        if fails >= p.max_fails && p.max_fails > 0 {
-            // Cooldown is active until fail_timeout has elapsed since the
-            // most recent failure.
-            if now.saturating_duration_since(opened) < Duration::from_millis(p.fail_timeout_ms) {
-                return false;
-            }
+    if let Some(opened) = fails_started
+        && fails >= p.max_fails
+        && p.max_fails > 0
+    {
+        // Cooldown is active until fail_timeout has elapsed since the
+        // most recent failure.
+        if now.saturating_duration_since(opened) < Duration::from_millis(p.fail_timeout_ms) {
+            return false;
         }
     }
     true
@@ -610,14 +610,14 @@ fn rr_pick_with_filter(
     let peers = up.peers;
     let mut total: i64 = 0;
     let mut best: Option<usize> = None;
-    for i in 0..peers.len() {
+    for (i, peer) in peers.iter().enumerate() {
         if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         let s = &mut rt.peers[i];
         s.current_weight = s.current_weight.saturating_add(s.effective_weight);
         total = total.saturating_add(s.effective_weight);
-        if s.effective_weight < peers[i].weight as i64 {
+        if s.effective_weight < peer.weight as i64 {
             s.effective_weight += 1;
         }
         match best {
@@ -644,14 +644,13 @@ fn least_conn_pick(
     // peers. nginx compares fractions via the cross-multiplication
     // `c1 * w2 vs c2 * w1` to avoid float math; we mirror that with i128.
     let mut best: Option<usize> = None;
-    for i in 0..peers.len() {
+    for (i, pi) in peers.iter().enumerate() {
         if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
         match best {
             None => best = Some(i),
             Some(b) => {
-                let pi = &peers[i];
                 let pb = &peers[b];
                 let ci = active(rt, up, i) as i128;
                 let cb = active(rt, up, b) as i128;
@@ -671,11 +670,10 @@ fn least_conn_pick(
     // exactly what `ngx_http_upstream_get_least_conn_peer` does at the
     // `n == many` fallback (lc.c:171–219).
     let mut tie_count = 0;
-    for i in 0..peers.len() {
+    for (i, pi) in peers.iter().enumerate() {
         if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
-        let pi = &peers[i];
         let ci = active(rt, up, i) as i128;
         let wi = pi.weight.max(1) as i128;
         if ci * candidate_weight == candidate_active as i128 * wi {
@@ -689,11 +687,10 @@ fn least_conn_pick(
     // peer list twice is cheap (peer count tops out in the dozens).
     let mut total: i64 = 0;
     let mut tie_best: Option<usize> = None;
-    for i in 0..peers.len() {
+    for (i, pi) in peers.iter().enumerate() {
         if !peer_eligible(rt, up, i, backup_tier, tried, now) {
             continue;
         }
-        let pi = &peers[i];
         let ci = active(rt, up, i) as i128;
         let wi = pi.weight.max(1) as i128;
         if ci * candidate_weight != candidate_active as i128 * wi {
@@ -755,11 +752,11 @@ pub fn report_failure(upstream: &'static PreparedUpstream, peer_idx: usize) {
                 .fails_started_ms
                 .store(ms_since_origin(now), Ordering::Relaxed);
         } else {
-            if let Some(opened) = s.fails_started {
-                if now.saturating_duration_since(opened) >= window {
-                    // Prior window elapsed — start a fresh failure window.
-                    s.fails = 0;
-                }
+            if let Some(opened) = s.fails_started
+                && now.saturating_duration_since(opened) >= window
+            {
+                // Prior window elapsed — start a fresh failure window.
+                s.fails = 0;
             }
             s.fails = s.fails.saturating_add(1);
             s.fails_started = Some(now);
@@ -817,13 +814,12 @@ pub fn report_success(upstream: &'static PreparedUpstream, peer_idx: usize) {
             return;
         };
         let s = &mut rt.peers[peer_idx];
-        if let Some(opened) = s.fails_started {
-            if Instant::now().saturating_duration_since(opened)
+        if let Some(opened) = s.fails_started
+            && Instant::now().saturating_duration_since(opened)
                 >= Duration::from_millis(peer.fail_timeout_ms)
-            {
-                s.fails = 0;
-                s.fails_started = None;
-            }
+        {
+            s.fails = 0;
+            s.fails_started = None;
         }
     });
 }
@@ -936,9 +932,7 @@ pub fn pool_take(
     peer_idx: usize,
     tls: Option<&crate::upstream_tls::TlsPlan>,
 ) -> Option<PooledConn> {
-    if upstream.keepalive_max_idle.is_none() {
-        return None;
-    }
+    upstream.keepalive_max_idle?;
     let idle_max = Duration::from_millis(upstream.keepalive_idle_timeout_ms);
     let now = Instant::now();
     POOL.with(|p| {

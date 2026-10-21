@@ -524,7 +524,6 @@ where
             // A large run of records over plain TCP goes out at once, while
             // it is still in the cache from being encrypted (#247); what
             // the socket doesn't take goes through io_uring.
-            let mut buf = buf;
             if buf.len() >= DIRECT_SEND_MIN
                 && let Some(tcp) =
                     (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()

@@ -162,11 +162,8 @@ fn handle_conn(
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
             Err(_) => return,
         }
-        loop {
-            let head_end = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                Some(p) => p + 4,
-                None => break,
-            };
+        while let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head_end = p + 4;
             let head = &buf[..head_end];
             let mut cl = 0usize;
             for line in std::str::from_utf8(head).unwrap_or("").lines() {
@@ -174,10 +171,9 @@ fn handle_conn(
                     .to_ascii_lowercase()
                     .strip_prefix("content-length:")
                     .map(|s| s.trim().to_owned())
+                    && let Ok(n) = rest.parse::<usize>()
                 {
-                    if let Ok(n) = rest.parse::<usize>() {
-                        cl = n;
-                    }
+                    cl = n;
                 }
             }
             if buf.len() < head_end + cl {

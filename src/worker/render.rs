@@ -842,7 +842,7 @@ pub(crate) fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) ->
     haystack.windows(needle.len()).any(|w| {
         w.iter()
             .zip(needle.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
 }
 
@@ -1064,7 +1064,7 @@ fn unset_when_empty(v: &Variable) -> bool {
 fn log_escape_into(value: &[u8], out: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in value {
-        if b < 0x20 || b >= 0x7f || b == b'"' || b == b'\\' {
+        if !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\' {
             out.extend_from_slice(&[b'\\', b'x', HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]]);
         } else {
             out.push(b);
@@ -1125,8 +1125,7 @@ pub(crate) fn render_parts_with_arg_escape(
 pub(crate) fn escape_args_into(input: &[u8], out: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in input {
-        let escape = b < 0x21
-            || b >= 0x7f
+        let escape = !(0x21..0x7f).contains(&b)
             || matches!(
                 b,
                 b'"' | b'#' | b'%' | b'&' | b'+' | b'<' | b'>' | b'?' | b'`'
@@ -1299,7 +1298,7 @@ pub(crate) fn write_connection_time(out: &mut Vec<u8>, us: u64) {
 /// but returns the raw components so multiple formatters can share it.
 pub(crate) fn civil_from_secs(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     pub(crate) fn is_leap(y: u32) -> bool {
-        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+        (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
     }
     const DAYS_PER_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let days = secs / 86_400;

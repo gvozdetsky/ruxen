@@ -76,10 +76,11 @@ fn load_htpasswd_cached(user_file: &Path) -> io::Result<std::sync::Arc<Vec<(Vec<
 
     {
         let guard = htpasswd_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = guard.get(user_file) {
-            if hit.mtime == mtime && hit.len == len {
-                return Ok(hit.entries.clone());
-            }
+        if let Some(hit) = guard.get(user_file)
+            && hit.mtime == mtime
+            && hit.len == len
+        {
+            return Ok(hit.entries.clone());
         }
     }
 
@@ -410,7 +411,7 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut w = [0u32; 80];
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         for (i, slot) in w.iter_mut().take(16).enumerate() {
             let base = i * 4;
             *slot = u32::from_be_bytes([

@@ -72,10 +72,10 @@ pub fn parse_with_main(
     globals_src: Option<String>,
 ) -> Result<HttpConfig, Error> {
     let mut lx = Lexer::new_with_main(main_path, src);
-    if let Some(g) = globals_src {
-        if !g.is_empty() {
-            lx.push_inline(g);
-        }
+    if let Some(g) = globals_src
+        && !g.is_empty()
+    {
+        lx.push_inline(g);
     }
     parse_lexer(lx)
 }
@@ -91,7 +91,6 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
 }
 
 fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
-    let mut lx = lx;
     reset_variable_registry();
     let mut runtime = RuntimeOpts::default();
     let mut http: Option<HttpConfig> = None;
@@ -111,7 +110,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 if http.is_some() {
                     return Err(Error::Duplicate("http"));
                 }
-                let block = parse_http_block(&mut lx)?;
+                let block = parse_http_block(lx)?;
                 validate_proxy_upstream_refs(&block)?;
                 http = Some(block);
             }
@@ -121,7 +120,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
-            ("events", Terminator::BlockOpen) => parse_events_block(&mut lx, &mut runtime)?,
+            ("events", Terminator::BlockOpen) => parse_events_block(lx, &mut runtime)?,
             ("events", _) => {
                 return Err(Error::WrongTerminator {
                     name: name.into(),
@@ -1307,7 +1306,7 @@ fn parse_events_block(lx: &mut Lexer, runtime: &mut RuntimeOpts) -> Result<(), E
 
 #[inline]
 pub(crate) fn is_ignored_stmt(name: &str) -> bool {
-    IGNORED_STMT.iter().any(|&d| d == name)
+    IGNORED_STMT.contains(&name)
 }
 
 /// Validate the arguments of the allowlisted directives whose grammar is
@@ -1327,7 +1326,7 @@ pub(crate) fn check_ignored_args(lx: &Lexer, args: &[String]) -> Result<(), Erro
 
 #[inline]
 pub(crate) fn is_ignored_block(name: &str) -> bool {
-    IGNORED_BLOCK.iter().any(|&d| d == name)
+    IGNORED_BLOCK.contains(&name)
 }
 
 pub(crate) fn skip_block(lx: &mut Lexer) -> Result<(), Error> {

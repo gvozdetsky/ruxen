@@ -580,23 +580,20 @@ impl CacheZone {
         let mut freed = Vec::new();
         {
             let mut shard = self.lock(hash);
-            match shard.map.get(hash).copied() {
-                Some(i) => {
-                    let node = &mut shard.nodes[i];
-                    if node.exists {
-                        self.size.fetch_sub(node.fs_size, Ordering::Relaxed);
-                    }
-                    node.exists = true;
-                    node.error = 0;
-                    node.valid_sec = entry.valid_sec;
-                    node.updating_sec = entry.updating_sec;
-                    node.error_sec = entry.error_sec;
-                    node.fs_size = fs_size;
-                    self.size.fetch_add(fs_size, Ordering::Relaxed);
+            // Evicted while the response was fetched: the file stays for
+            // a later lookup to adopt.
+            if let Some(i) = shard.map.get(hash).copied() {
+                let node = &mut shard.nodes[i];
+                if node.exists {
+                    self.size.fetch_sub(node.fs_size, Ordering::Relaxed);
                 }
-                // Evicted while the response was fetched: the file stays
-                // for a later lookup to adopt.
-                None => {}
+                node.exists = true;
+                node.error = 0;
+                node.valid_sec = entry.valid_sec;
+                node.updating_sec = entry.updating_sec;
+                node.error_sec = entry.error_sec;
+                node.fs_size = fs_size;
+                self.size.fetch_add(fs_size, Ordering::Relaxed);
             }
         }
         // `max_size`: the least recently used files go, in the other
