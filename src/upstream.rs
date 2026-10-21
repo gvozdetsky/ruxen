@@ -877,6 +877,9 @@ pub struct PooledConn {
     pub slot: crate::worker::UpstreamSlot,
 }
 
+/// Upstream, peer index, and the TLS config's `config_id` (0 for plain TCP).
+type PoolKey = (*const PreparedUpstream, usize, usize);
+
 thread_local! {
     /// Keyed by upstream, peer and, for TLS, the rustls config the
     /// connection was opened with (0 for plain TCP): a location proxying
@@ -884,7 +887,7 @@ thread_local! {
     /// one opened with other `proxy_ssl_*` settings, such as without
     /// verification (#116, #117). Within a queue a TLS connection is only
     /// taken for the name it was opened for (`PooledConn::tls`).
-    static POOL: RefCell<HashMap<(*const PreparedUpstream, usize, usize), VecDeque<PooledConn>, FxBuild>> =
+    static POOL: RefCell<HashMap<PoolKey, VecDeque<PooledConn>, FxBuild>> =
         RefCell::new(HashMap::default());
 }
 

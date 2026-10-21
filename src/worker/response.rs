@@ -765,6 +765,7 @@ pub(crate) fn apply_proxy_add_headers(
 /// A 502/504 the proxy produced itself (every attempt failed) goes through
 /// the location's `error_page`, as nginx's special response handler does;
 /// `proxy_intercept_errors` is only about responses from the upstream.
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) fn intercept_proxy_error(
     response: Response,
     error_pages: &[PreparedErrorPage],

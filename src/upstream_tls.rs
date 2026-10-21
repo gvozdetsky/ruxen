@@ -44,8 +44,11 @@ pub struct DynamicCert {
     sni: bool,
     reuse: bool,
     verify: Option<Arc<crate::x509_verify::Store>>,
-    configs: Mutex<Vec<(Vec<u8>, Vec<u8>, Arc<ClientConfig>)>>,
+    configs: Mutex<Vec<RenderedConfig>>,
 }
+
+/// `(cert path, key path, the client config with them)`, as rendered.
+type RenderedConfig = (Vec<u8>, Vec<u8>, Arc<ClientConfig>);
 
 /// Pairs kept per location; more distinct renderings start it over.
 const DYNAMIC_CONFIGS: usize = 64;

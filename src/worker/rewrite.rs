@@ -307,6 +307,7 @@ pub(crate) fn build_rewrite_ctx<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) fn execute_rewrite_ops(
     ops: &'static [PreparedRewriteOp],
     http: &'static PreparedHttp,

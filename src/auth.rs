@@ -61,7 +61,7 @@ pub fn verify_credentials(user_file: &Path, creds: &BasicCredentials) -> io::Res
 struct CachedHtpasswd {
     mtime: SystemTime,
     len: u64,
-    entries: std::sync::Arc<Vec<(Vec<u8>, Vec<u8>)>>,
+    entries: std::sync::Arc<Htpasswd>,
 }
 
 fn htpasswd_cache() -> &'static Mutex<HashMap<PathBuf, CachedHtpasswd>> {
@@ -69,7 +69,10 @@ fn htpasswd_cache() -> &'static Mutex<HashMap<PathBuf, CachedHtpasswd>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn load_htpasswd_cached(user_file: &Path) -> io::Result<std::sync::Arc<Vec<(Vec<u8>, Vec<u8>)>>> {
+/// `(user, password hash)` pairs, in file order.
+type Htpasswd = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn load_htpasswd_cached(user_file: &Path) -> io::Result<std::sync::Arc<Htpasswd>> {
     let meta = std::fs::metadata(user_file)?;
     let mtime = meta.modified()?;
     let len = meta.len();
@@ -99,7 +102,7 @@ fn load_htpasswd_cached(user_file: &Path) -> io::Result<std::sync::Arc<Vec<(Vec<
     Ok(entries)
 }
 
-fn parse_htpasswd(raw: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn parse_htpasswd(raw: &[u8]) -> Htpasswd {
     let mut out = Vec::new();
     for line in raw.split(|b| *b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);

@@ -14,6 +14,9 @@ use crate::config::ErrorLogLevel;
 
 use super::PreparedValuePart;
 
+/// Connections per key, for the keys that hash to one shard.
+type Shard = Mutex<HashMap<Box<[u8]>, u32>>;
+
 /// A `limit_conn_zone`.
 pub struct LimitConnZone {
     pub name: &'static str,
@@ -22,7 +25,7 @@ pub struct LimitConnZone {
     pub key_text: &'static str,
     /// Keys a shard may hold at once (from the zone size).
     capacity: usize,
-    shards: &'static [Mutex<HashMap<Box<[u8]>, u32>>],
+    shards: &'static [Shard],
 }
 
 /// The zones' counts, by name, for the next configuration, as for
@@ -36,7 +39,7 @@ struct Kept {
     // Owned: a reload frees the configuration `key_text` came from (#343).
     key_text: String,
     capacity: usize,
-    shards: &'static [Mutex<HashMap<Box<[u8]>, u32>>],
+    shards: &'static [Shard],
 }
 
 impl std::fmt::Debug for LimitConnZone {
@@ -104,7 +107,7 @@ impl LimitConnZone {
         }
     }
 
-    fn shard(&self, key: &[u8]) -> &Mutex<HashMap<Box<[u8]>, u32>> {
+    fn shard(&self, key: &[u8]) -> &Shard {
         use std::hash::{BuildHasher, Hasher};
         static STATE: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
         let mut h = STATE.get_or_init(Default::default).build_hasher();

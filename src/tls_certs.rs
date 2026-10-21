@@ -235,10 +235,13 @@ fn leaf_spki(cert: &[u8]) -> Option<&[u8]> {
     (tag == SEQUENCE).then_some(spki)
 }
 
+/// A DER element as `der_tlv` splits it off.
+type Tlv<'a> = (u8, &'a [u8], &'a [u8], &'a [u8]);
+
 /// Split one DER element off `input`: `(tag, whole element, contents,
 /// rest)`. Single-byte tags only, which is all a certificate's top levels
 /// use; lengths up to 4 bytes.
-fn der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
+fn der_tlv(input: &[u8]) -> Option<Tlv<'_>> {
     let (&tag, after_tag) = input.split_first()?;
     let (&first, after_len) = after_tag.split_first()?;
     let (len, body) = if first < 0x80 {
@@ -622,8 +625,10 @@ pub fn password_file(path: &Path) -> Result<Arc<[Vec<u8>]>, String> {
     Ok(passwords)
 }
 
-static PASSWORD_FILES: std::sync::Mutex<Vec<(PathBuf, Arc<[Vec<u8>]>)>> =
-    std::sync::Mutex::new(Vec::new());
+/// `(file, passwords read from it)`.
+type PasswordFiles = Vec<(PathBuf, Arc<[Vec<u8>]>)>;
+
+static PASSWORD_FILES: std::sync::Mutex<PasswordFiles> = std::sync::Mutex::new(Vec::new());
 
 /// A certificate, key, CA or CRL file, read once per configuration load
 /// however many directives name it, as nginx's SSL object cache does

@@ -409,30 +409,7 @@ fn parse_location_if(args: &[String], lx: &mut Lexer) -> Result<RewriteOp, Error
         pattern: String::new(),
         noregex: false,
     };
-    parse_location_block(
-        spec,
-        lx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &AccessConf::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &mut sink,
-        Some(&mut info),
-    )?;
+    parse_location_block(spec, lx, Inherited::default(), &mut sink, Some(&mut info))?;
     let mut location = sink.pop().expect("an if block makes one location");
     let body = std::mem::take(&mut location.rewrite_ops);
     let location = info.settings.then(|| IfLocation::Parsed {
@@ -498,6 +475,30 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
     }
 }
 
+/// What a nested location inherits from the enclosing one while it is
+/// parsed. Top-level and `if` locations start from `Inherited::default()`.
+#[derive(Default)]
+pub(crate) struct Inherited {
+    pub(crate) root: Option<PathBuf>,
+    pub(crate) alias: Option<(PathBuf, String)>,
+    pub(crate) server_tokens: Option<ServerTokens>,
+    pub(crate) autoindex: Option<bool>,
+    pub(crate) autoindex_exact_size: Option<bool>,
+    pub(crate) autoindex_localtime: Option<bool>,
+    pub(crate) autoindex_format: Option<AutoindexFormat>,
+    pub(crate) auth_basic: Option<AuthBasic>,
+    pub(crate) auth_basic_user_file: Option<PathBuf>,
+    pub(crate) auth_delay_ms: Option<u64>,
+    pub(crate) access: AccessConf,
+    pub(crate) client_max_body_size: Option<u64>,
+    pub(crate) client_body_buffer_size: Option<u64>,
+    pub(crate) post_action: Option<String>,
+    pub(crate) expires: Option<ExpiresDirective>,
+    pub(crate) sendfile: Option<bool>,
+    pub(crate) client_body_temp_path: Option<TempPath>,
+    pub(crate) disable_symlinks: Option<DisableSymlinks>,
+}
+
 /// Parse one `location {}` block and push the resulting `Location` into
 /// `sink`. Nested `location` blocks inside this one get flattened into the
 /// same sink — nginx's own matcher (`ngx_http_core_find_static_location`)
@@ -509,24 +510,7 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
 pub(crate) fn parse_location_block(
     spec: LocationSpec,
     lx: &mut Lexer,
-    inherited_root: Option<PathBuf>,
-    inherited_alias: Option<(PathBuf, String)>,
-    inherited_server_tokens: Option<ServerTokens>,
-    inherited_autoindex: Option<bool>,
-    inherited_autoindex_exact_size: Option<bool>,
-    inherited_autoindex_localtime: Option<bool>,
-    inherited_autoindex_format: Option<AutoindexFormat>,
-    inherited_auth_basic: Option<AuthBasic>,
-    inherited_auth_basic_user_file: Option<PathBuf>,
-    inherited_auth_delay_ms: Option<u64>,
-    inherited_access: &AccessConf,
-    inherited_client_max_body_size: Option<u64>,
-    inherited_client_body_buffer_size: Option<u64>,
-    inherited_post_action: Option<String>,
-    inherited_expires: Option<ExpiresDirective>,
-    inherited_sendfile: Option<bool>,
-    inherited_client_body_temp_path: Option<TempPath>,
-    inherited_disable_symlinks: Option<DisableSymlinks>,
+    inherited: Inherited,
     sink: &mut Vec<Location>,
     mut if_body: Option<&mut IfBody>,
 ) -> Result<(), Error> {
@@ -538,11 +522,11 @@ pub(crate) fn parse_location_block(
     // chain). Track the prefix so the worker can still strip the
     // ancestor's location prefix even when this child is a regex.
     let mut alias_prefix_override: Option<String> = None;
-    let mut root = if let Some((path, prefix)) = inherited_alias.clone() {
+    let mut root = if let Some((path, prefix)) = inherited.alias.clone() {
         alias_prefix_override = Some(prefix);
         Some((path, PathMapping::Alias))
     } else {
-        inherited_root.clone().map(|path| (path, PathMapping::Root))
+        inherited.root.clone().map(|path| (path, PathMapping::Root))
     };
     let mut local_path_mapping: Option<PathMapping> = None;
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -630,7 +614,7 @@ pub(crate) fn parse_location_block(
                     // are set. `proxy_pass` wins over `root`/`alias`
                     // (you can't have both in nginx — content phase
                     // dispatch is single-handler).
-                    let inherits_root = local_path_mapping.is_none() && inherited_alias.is_none();
+                    let inherits_root = local_path_mapping.is_none() && inherited.alias.is_none();
                     let document_root = root
                         .clone()
                         .unwrap_or_else(|| (PathBuf::from("html"), PathMapping::Root));
@@ -659,32 +643,32 @@ pub(crate) fn parse_location_block(
                     // nginx's `merge_loc_conf` chain. The flat
                     // `Vec<Location>` AST doesn't carry the parent link, so
                     // we collapse the inheritance at parse time.
-                    let effective_server_tokens = server_tokens.or(inherited_server_tokens);
-                    let effective_autoindex = autoindex.or(inherited_autoindex);
+                    let effective_server_tokens = server_tokens.or(inherited.server_tokens);
+                    let effective_autoindex = autoindex.or(inherited.autoindex);
                     let effective_autoindex_exact_size =
-                        autoindex_exact_size.or(inherited_autoindex_exact_size);
+                        autoindex_exact_size.or(inherited.autoindex_exact_size);
                     let effective_autoindex_localtime =
-                        autoindex_localtime.or(inherited_autoindex_localtime);
+                        autoindex_localtime.or(inherited.autoindex_localtime);
                     let effective_autoindex_format =
-                        autoindex_format.or(inherited_autoindex_format);
-                    let effective_auth_basic = auth_basic.or(inherited_auth_basic);
+                        autoindex_format.or(inherited.autoindex_format);
+                    let effective_auth_basic = auth_basic.or(inherited.auth_basic);
                     let effective_auth_basic_user_file =
-                        auth_basic_user_file.or(inherited_auth_basic_user_file);
-                    let effective_auth_delay_ms = auth_delay_ms.or(inherited_auth_delay_ms);
-                    let effective_access = access.inherit(inherited_access);
+                        auth_basic_user_file.or(inherited.auth_basic_user_file);
+                    let effective_auth_delay_ms = auth_delay_ms.or(inherited.auth_delay_ms);
+                    let effective_access = access.inherit(&inherited.access);
                     let effective_client_max_body_size =
-                        client_max_body_size.or(inherited_client_max_body_size);
+                        client_max_body_size.or(inherited.client_max_body_size);
                     let effective_client_body_buffer_size =
-                        client_body_buffer_size.or(inherited_client_body_buffer_size);
-                    let effective_post_action = post_action.or(inherited_post_action);
-                    let effective_expires = expires.or(inherited_expires);
-                    let effective_sendfile = sendfile.or(inherited_sendfile);
+                        client_body_buffer_size.or(inherited.client_body_buffer_size);
+                    let effective_post_action = post_action.or(inherited.post_action);
+                    let effective_expires = expires.or(inherited.expires);
+                    let effective_sendfile = sendfile.or(inherited.sendfile);
                     let effective_client_body_temp_path = client_body_temp_path
                         .clone()
-                        .or_else(|| inherited_client_body_temp_path.clone());
+                        .or_else(|| inherited.client_body_temp_path.clone());
                     let effective_disable_symlinks = disable_symlinks
                         .clone()
-                        .or_else(|| inherited_disable_symlinks.clone());
+                        .or_else(|| inherited.disable_symlinks.clone());
                     let location = Location {
                         mode: spec.mode,
                         pattern: spec.pattern,
@@ -1103,32 +1087,32 @@ pub(crate) fn parse_location_block(
                 // Children see the closest ancestor's `server_tokens`:
                 // this block's own value if set, else whatever was inherited
                 // into this block. Their own directive still wins.
-                let pass_tokens = server_tokens.or(inherited_server_tokens);
-                let pass_autoindex = autoindex.or(inherited_autoindex);
+                let pass_tokens = server_tokens.or(inherited.server_tokens);
+                let pass_autoindex = autoindex.or(inherited.autoindex);
                 let pass_autoindex_exact_size =
-                    autoindex_exact_size.or(inherited_autoindex_exact_size);
+                    autoindex_exact_size.or(inherited.autoindex_exact_size);
                 let pass_autoindex_localtime =
-                    autoindex_localtime.or(inherited_autoindex_localtime);
-                let pass_autoindex_format = autoindex_format.or(inherited_autoindex_format);
-                let pass_auth_basic = auth_basic.clone().or(inherited_auth_basic.clone());
+                    autoindex_localtime.or(inherited.autoindex_localtime);
+                let pass_autoindex_format = autoindex_format.or(inherited.autoindex_format);
+                let pass_auth_basic = auth_basic.clone().or(inherited.auth_basic.clone());
                 let pass_auth_file = auth_basic_user_file
                     .clone()
-                    .or(inherited_auth_basic_user_file.clone());
-                let pass_auth_delay_ms = auth_delay_ms.or(inherited_auth_delay_ms);
-                let pass_access = access.inherit(inherited_access);
+                    .or(inherited.auth_basic_user_file.clone());
+                let pass_auth_delay_ms = auth_delay_ms.or(inherited.auth_delay_ms);
+                let pass_access = access.inherit(&inherited.access);
                 let pass_client_max_body_size =
-                    client_max_body_size.or(inherited_client_max_body_size);
+                    client_max_body_size.or(inherited.client_max_body_size);
                 let pass_client_body_buffer_size =
-                    client_body_buffer_size.or(inherited_client_body_buffer_size);
-                let pass_post_action = post_action.clone().or(inherited_post_action.clone());
-                let pass_expires = expires.clone().or(inherited_expires.clone());
-                let pass_sendfile = sendfile.or(inherited_sendfile);
+                    client_body_buffer_size.or(inherited.client_body_buffer_size);
+                let pass_post_action = post_action.clone().or(inherited.post_action.clone());
+                let pass_expires = expires.clone().or(inherited.expires.clone());
+                let pass_sendfile = sendfile.or(inherited.sendfile);
                 let pass_client_body_temp_path = client_body_temp_path
                     .clone()
-                    .or_else(|| inherited_client_body_temp_path.clone());
+                    .or_else(|| inherited.client_body_temp_path.clone());
                 let pass_disable_symlinks = disable_symlinks
                     .clone()
-                    .or_else(|| inherited_disable_symlinks.clone());
+                    .or_else(|| inherited.disable_symlinks.clone());
                 // Cascade alias info to nested children (mirrors nginx's
                 // `merge_loc_conf` for the core module's path bits): a
                 // local `alias` here propagates as Alias-with-this-pattern;
@@ -1144,29 +1128,31 @@ pub(crate) fn parse_location_block(
                         Some((path, spec.pattern.clone()))
                     }
                     Some(PathMapping::Root) => None,
-                    None => inherited_alias.clone(),
+                    None => inherited.alias.clone(),
                 };
                 parse_location_block(
                     child_spec,
                     lx,
-                    inherited_root.clone(),
-                    pass_inherited_alias,
-                    pass_tokens,
-                    pass_autoindex,
-                    pass_autoindex_exact_size,
-                    pass_autoindex_localtime,
-                    pass_autoindex_format,
-                    pass_auth_basic,
-                    pass_auth_file,
-                    pass_auth_delay_ms,
-                    &pass_access,
-                    pass_client_max_body_size,
-                    pass_client_body_buffer_size,
-                    pass_post_action,
-                    pass_expires,
-                    pass_sendfile,
-                    pass_client_body_temp_path,
-                    pass_disable_symlinks,
+                    Inherited {
+                        root: inherited.root.clone(),
+                        alias: pass_inherited_alias,
+                        server_tokens: pass_tokens,
+                        autoindex: pass_autoindex,
+                        autoindex_exact_size: pass_autoindex_exact_size,
+                        autoindex_localtime: pass_autoindex_localtime,
+                        autoindex_format: pass_autoindex_format,
+                        auth_basic: pass_auth_basic,
+                        auth_basic_user_file: pass_auth_file,
+                        auth_delay_ms: pass_auth_delay_ms,
+                        access: pass_access,
+                        client_max_body_size: pass_client_max_body_size,
+                        client_body_buffer_size: pass_client_body_buffer_size,
+                        post_action: pass_post_action,
+                        expires: pass_expires,
+                        sendfile: pass_sendfile,
+                        client_body_temp_path: pass_client_body_temp_path,
+                        disable_symlinks: pass_disable_symlinks,
+                    },
                     &mut children,
                     None,
                 )?;

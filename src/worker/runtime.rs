@@ -1026,6 +1026,7 @@ fn read_file_body(
     }
 }
 
+#[allow(clippy::large_enum_variant)] // per request: boxing waits for #467's measurements
 enum PassOutcome {
     /// The response to send, with its metadata.
     Done(Response, phase::ProcessMeta),
@@ -2306,6 +2307,7 @@ pub(crate) fn spawn_connection(
 /// server's `client_header_timeout`), then serve the connection as usual.
 /// A connection without a valid header is closed with an error-log line,
 /// as nginx does ("broken header: …").
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 async fn handle_proxy_protocol(
     prepared: &'static PreparedListen,
     stream: TcpStream,
@@ -3188,6 +3190,7 @@ fn local_addr_text(stream: &TcpStream) -> std::borrow::Cow<'static, [u8]> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) async fn handle_plain(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -3244,6 +3247,7 @@ pub(crate) async fn handle_plain(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) async fn handle_tls(
     stream: TcpStream,
     acceptor: Arc<crate::tls::TlsAcceptor>,
@@ -3403,6 +3407,7 @@ where
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) async fn handle<S: ConnIo>(
     stream: &mut S,
     peer_addr: SocketAddr,
