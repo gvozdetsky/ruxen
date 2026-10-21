@@ -147,6 +147,7 @@ pub struct ParseState {
     pub has_content_range: bool,
     pub has_expect: bool,
     pub has_authorization: bool,
+    pub has_proxy_authorization: bool,
     /// The request comes from an HTTP/2 stream (#144), translated to a
     /// request head whose version is `HTTP/2.0`, which only then is
     /// valid. Kept across `reset`: it belongs to the connection.
@@ -450,6 +451,13 @@ pub fn parse_request(buf: &[u8], st: &mut ParseState) -> Parse {
                         }
                         st.has_authorization = true;
                     }
+                    // A unique header since nginx 1.29.7 (#590).
+                    Some(KnownHeader::ProxyAuthorization) => {
+                        if st.has_proxy_authorization {
+                            return Parse::Invalid;
+                        }
+                        st.has_proxy_authorization = true;
+                    }
                     Some(KnownHeader::ContentLength) => {
                         // Decimal-only, no leading sign / whitespace beyond
                         // the OWS the parser already trimmed. Reject any
@@ -523,6 +531,7 @@ pub enum KnownHeader {
     TransferEncoding,
     Expect,
     Authorization,
+    ProxyAuthorization,
 }
 
 /// Nginx's header hash (`ngx_hash(key, c) = key * 31 + c`, lowercased).
@@ -585,6 +594,11 @@ const KNOWN_HEADERS: &[(u32, &[u8], KnownHeader)] = &[
         h_hash(b"authorization"),
         b"authorization",
         KnownHeader::Authorization,
+    ),
+    (
+        h_hash(b"proxy-authorization"),
+        b"proxy-authorization",
+        KnownHeader::ProxyAuthorization,
     ),
 ];
 
@@ -2344,6 +2358,18 @@ mod tests {
     fn duplicate_host_is_invalid() {
         let req = b"GET / HTTP/1.1\r\nHost: a.example.com\r\nHost: b.example.com\r\n\r\n";
         assert!(matches!(parse_fresh(req), Parse::Invalid));
+    }
+
+    /// `Proxy-Authorization` is unique since nginx 1.29.7 (#590); one is
+    /// fine, in any case.
+    #[test]
+    fn duplicate_proxy_authorization_is_invalid() {
+        let req = b"GET / HTTP/1.0\r\nProxy-Authorization: Basic a\r\n\
+                    proxy-authorization: Basic b\r\n\r\n";
+        assert!(matches!(parse_fresh(req), Parse::Invalid));
+        let req = b"GET / HTTP/1.0\r\nProxy-Authorization: Basic a\r\n\
+                    Authorization: Basic b\r\n\r\n";
+        assert!(matches!(parse_fresh(req), Parse::Complete(_)));
     }
 
     #[test]
