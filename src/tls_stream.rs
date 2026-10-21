@@ -88,8 +88,8 @@ pub struct TlsAcceptor {
     contexts: Vec<Context>,
 }
 
-/// A server's own client-certificate context (#113): `config` with its
-/// verifier, the rest as the address's.
+/// A server's own context: `config` with its client-certificate verifier
+/// (#113) and protocol versions (#586), the rest as the address's.
 #[derive(Clone)]
 struct Context {
     config: Arc<ServerConfig>,
@@ -141,10 +141,11 @@ impl TlsAcceptor {
         self
     }
 
-    /// Client-certificate contexts (#113): `verify` is the one of the
-    /// address's config, `contexts` the configs of servers with another
-    /// (each built from the address's, with its own verifier), chosen by
-    /// index in `Choice::Accept`. Before `with_choice_of_h2`.
+    /// Server contexts (#113, #586): `verify` is the client-certificate
+    /// context of the address's config, `contexts` the configs of servers
+    /// with another verifier or other protocols (each built from the
+    /// address's), chosen by index in `Choice::Accept`. Before
+    /// `with_choice_of_h2`.
     pub fn with_contexts(
         mut self,
         verify: Option<Arc<crate::client_verify::ClientAuth>>,
