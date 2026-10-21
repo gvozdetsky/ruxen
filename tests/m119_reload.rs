@@ -58,7 +58,22 @@ impl Server {
     }
 
     /// Threads of the process: main and the workers (and none else here).
+    /// A server that exited is a zombie until `Drop` reaps it, and lists
+    /// one task: that is reported as the exit it is (#518).
     fn threads(&self) -> usize {
+        let stat =
+            std::fs::read_to_string(format!("/proc/{}/stat", self.child.id())).unwrap_or_default();
+        // Fields after the `(comm)`: state is field 3, exit_code field 52.
+        let fields: Vec<&str> = stat
+            .rsplit_once(')')
+            .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
+        if fields.first() == Some(&"Z") {
+            panic!(
+                "ruxen exited (wait status {}):\n{}",
+                fields.get(49).copied().unwrap_or("?"),
+                self.error_log()
+            );
+        }
         std::fs::read_dir(format!("/proc/{}/task", self.child.id()))
             .unwrap()
             .count()
@@ -193,7 +208,9 @@ fn reload_applies_the_new_configuration() {
     assert!(
         s.error_log().contains("[notice] ")
             && s.error_log()
-                .contains("signal 1 (SIGHUP) received, reconfiguring"),
+                .lines()
+                .any(|l| l.contains("signal 1 (SIGHUP) received from ")
+                    && l.ends_with(", reconfiguring")),
         "{}",
         s.error_log()
     );
@@ -684,4 +701,34 @@ fn failed_reloads_free_what_they_prepared() {
     // Kept, each failure added about 2.8 MB: some 56 MB here.
     assert!(grown < 16 * 1024, "grew {grown} KiB over 20 failed reloads");
     assert_eq!(body(port), "ok\n");
+}
+
+/// nginx's notice lines for the signals it acts on, with the sender
+/// (ngx_signal_handler), and `exit` when the master leaves (#518).
+#[test]
+fn signals_are_logged_with_their_sender() {
+    let setup = common::ports::setup_lock();
+    let port = free_port();
+    let mut s = spawn("signals", "worker_processes 1;", &returning(port, "ok"));
+    drop(setup);
+    s.hup();
+    s.wait_threads(2);
+    // SAFETY: signals to the child we started.
+    unsafe {
+        assert_eq!(kill(s.child.id() as i32, SIGQUIT), 0);
+    }
+    assert!(s.child.wait().unwrap().success());
+    let log = s.error_log();
+    let me = std::process::id();
+    for line in [
+        "[notice] ".to_string(),
+        format!("signal 1 (SIGHUP) received from {me}, reconfiguring"),
+        format!("signal 3 (SIGQUIT) received from {me}, shutting down"),
+    ] {
+        assert!(log.contains(&line), "{line}:\n{log}");
+    }
+    assert!(
+        log.lines().last().is_some_and(|l| l.ends_with(": exit")),
+        "{log}"
+    );
 }
