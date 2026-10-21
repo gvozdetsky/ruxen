@@ -333,7 +333,15 @@ fn real_main() -> Result<(), Failure> {
     // Still one thread here, which the fork needs.
     if let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0) {
         let extra: Vec<&Path> = cli.errlog.iter().map(PathBuf::as_path).collect();
-        privileges::start_helper(creds, settings.pid.as_deref(), &extra)
+        // After a reload the helper takes the log files from its own parse
+        // of the configuration, as root, never from the server (#498).
+        let reparse_cli = cli.clone();
+        let log_files = Box::new(move || {
+            parse_config(&reparse_cli)
+                .ok()
+                .map(|cfg| cfg.log_file_paths())
+        });
+        privileges::start_helper(creds, settings.pid.as_deref(), &extra, log_files)
             .map_err(|e| report_emerg(&e, &cli, &main_path))?;
     }
 
@@ -854,6 +862,9 @@ impl Master {
             }
         }
         self.settings = settings;
+        // The root helper recreates this configuration's log files on
+        // SIGUSR1 from now on (#498).
+        privileges::reloaded();
     }
 }
 
@@ -870,21 +881,7 @@ type LoadFailed = (String, Option<arena::Arena>);
 
 /// Read, parse and prepare the configuration as at startup, for a reload.
 fn load_for_reload(cli: &Cli) -> Result<Loaded, LoadFailed> {
-    let (main_path, file_src) = read_main_config(cli).map_err(|e| (e.to_string(), None))?;
-    let globals_src = (!cli.globals.is_empty()).then(|| {
-        cli.globals
-            .iter()
-            .map(|g| {
-                if g.ends_with('\n') {
-                    g.clone()
-                } else {
-                    format!("{g}\n")
-                }
-            })
-            .collect::<String>()
-    });
-    let cfg = config::parse_with_main(main_path, file_src, globals_src)
-        .map_err(|e| (e.to_string(), None))?;
+    let cfg = parse_config(cli).map_err(|e| (e, None))?;
     let settings = Settings::from_config(&cfg);
     let mut warnings = cfg.warnings.clone();
     arena::open();
@@ -907,6 +904,24 @@ fn free_failed(arena: arena::Arena) {
     // generation keeps (zone state, cache zones, the buffered log
     // registry) is leaked outside the arena, as for a retired one.
     unsafe { arena.free() };
+}
+
+/// Read and parse the configuration, `-g` included, as a reload does.
+fn parse_config(cli: &Cli) -> Result<config::HttpConfig, String> {
+    let (main_path, file_src) = read_main_config(cli).map_err(|e| e.to_string())?;
+    let globals_src = (!cli.globals.is_empty()).then(|| {
+        cli.globals
+            .iter()
+            .map(|g| {
+                if g.ends_with('\n') {
+                    g.clone()
+                } else {
+                    format!("{g}\n")
+                }
+            })
+            .collect::<String>()
+    });
+    config::parse_with_main(main_path, file_src, globals_src).map_err(|e| e.to_string())
 }
 
 /// Held by a worker thread: tells `main` the worker (generation, index) is

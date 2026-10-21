@@ -291,15 +291,22 @@ static HELPER: Mutex<Option<std::os::unix::net::UnixStream>> = Mutex::new(None);
 const CMD_PID_WRITTEN: u8 = b'P';
 const CMD_REOPEN_LOGS: u8 = b'R';
 const CMD_EXIT: u8 = b'X';
+/// A reload took over: take the log files from a new parse (#498).
+const CMD_RELOADED: u8 = b'L';
 const ACK: u8 = b'k';
 
 /// Forks the helper. Call while the process has one thread: the child
 /// runs Rust code (and allocates) after the fork. `extra_files` are files
 /// opened outside the configuration (`-e`).
+/// The log files of the configuration as it is on disk, from the helper's
+/// own parse; `None` when it doesn't parse.
+pub(crate) type LogFiles = Box<dyn Fn() -> Option<Vec<PathBuf>>>;
+
 pub(crate) fn start_helper(
     creds: &Credentials,
     pid_path: Option<&Path>,
     extra_files: &[&Path],
+    log_files: LogFiles,
 ) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
     for f in extra_files {
@@ -323,7 +330,8 @@ pub(crate) fn start_helper(
                 .files
                 .clone();
             let fd = helper_end.as_raw_fd();
-            helper_main(fd, creds.uid, &files, pid_path)
+            let extra: Vec<PathBuf> = extra_files.iter().map(|f| f.to_path_buf()).collect();
+            helper_main(fd, creds.uid, files, &extra, &log_files, pid_path)
         }
         _ => {
             drop(helper_end);
@@ -362,7 +370,14 @@ fn single_threaded(threads: Option<usize>) -> Result<(), String> {
     }
 }
 
-fn helper_main(sock: libc::c_int, uid: libc::uid_t, files: &[PathBuf], pid: Option<&Path>) -> ! {
+fn helper_main(
+    sock: libc::c_int,
+    uid: libc::uid_t,
+    mut files: Vec<PathBuf>,
+    extra: &[PathBuf],
+    log_files: &LogFiles,
+    pid: Option<&Path>,
+) -> ! {
     // SAFETY: signal dispositions, fd and prctl calls in the child, which
     // owns every fd it inherited.
     unsafe {
@@ -403,8 +418,17 @@ fn helper_main(sock: libc::c_int, uid: libc::uid_t, files: &[PathBuf], pid: Opti
         match cmd[0] {
             CMD_PID_WRITTEN => pid_written = true,
             CMD_REOPEN_LOGS => {
-                for f in files {
+                for f in &files {
                     hand_file(f, uid);
+                }
+            }
+            // nginx's master reopens the files of the current cycle: the
+            // helper parses the configuration the reload took over with.
+            // A file it can't parse keeps the list it has.
+            CMD_RELOADED => {
+                if let Some(mut paths) = log_files() {
+                    paths.extend(extra.iter().cloned());
+                    files = paths;
                 }
             }
             CMD_EXIT => break,
@@ -455,6 +479,14 @@ pub(crate) fn pid_written() {
 pub(crate) fn reopen_logs() {
     if helper_running() {
         ask_helper(CMD_REOPEN_LOGS);
+    }
+}
+
+/// A reload took over: the helper takes the new configuration's log files
+/// from its own parse (#498).
+pub(crate) fn reloaded() {
+    if helper_running() {
+        ask_helper(CMD_RELOADED);
     }
 }
 

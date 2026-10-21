@@ -1474,6 +1474,61 @@ impl Location {
     }
 }
 
+impl HttpConfig {
+    /// The log files `worker::prepare` opens (`open_log_file`): every
+    /// `error_log` file and every `access_log` with a fixed path, at any
+    /// level, `if` locations included. The root helper takes them from
+    /// its own parse after a reload (#498).
+    pub(crate) fn log_file_paths(&self) -> Vec<PathBuf> {
+        fn error_logs<'a>(list: impl IntoIterator<Item = &'a ErrorLog>, out: &mut Vec<PathBuf>) {
+            for log in list {
+                if let ErrorLogTarget::File(path) = &log.target {
+                    out.push(path.clone());
+                }
+            }
+        }
+        fn access_logs<'a>(list: impl IntoIterator<Item = &'a AccessLog>, out: &mut Vec<PathBuf>) {
+            for log in list {
+                if log.syslog.is_none() && log.path_vars.is_none() {
+                    out.push(log.path.clone());
+                }
+            }
+        }
+        fn location(loc: &Location, out: &mut Vec<PathBuf>) {
+            error_logs(loc.error_logs.iter().flatten(), out);
+            access_logs(loc.access_logs.iter().flatten(), out);
+            ifs(&loc.rewrite_ops, out);
+        }
+        fn ifs(ops: &[RewriteOp], out: &mut Vec<PathBuf>) {
+            for op in ops {
+                if let RewriteOp::If {
+                    body, location: l, ..
+                } = op
+                {
+                    if let Some(IfLocation::Parsed { location: l, .. }) = l {
+                        location(l, out);
+                    }
+                    ifs(body, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        error_logs(&self.runtime.error_logs, &mut out);
+        error_logs(self.error_logs.iter().flatten(), &mut out);
+        access_logs(&self.access_logs, &mut out);
+        for server in &self.servers {
+            error_logs(server.error_logs.iter().flatten(), &mut out);
+            access_logs(server.access_logs.iter().flatten(), &mut out);
+            for loc in &server.locations {
+                location(loc, &mut out);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
 fn inherit_redirect_in_ifs(ops: &mut [RewriteOp], parent: &RedirectConf) {
     for op in ops {
         if let RewriteOp::If { body, location, .. } = op {
