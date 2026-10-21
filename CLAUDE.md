@@ -11,8 +11,9 @@ milestones.
 
 Sibling checkouts are expected one directory up:
 
-- `../nginx` — upstream nginx source at tag `release-1.24.0`. The reference
-  implementation: when behavior is unclear, read the C.
+- `../nginx` — upstream nginx source at tag `release-1.30.6`, the reference
+  version since 0.2.1 (DESIGN.md, "Reference version"). When behavior is
+  unclear, read the C. Older notes and issues cite 1.24.0.
 - `../nginx-tests` — upstream Perl test suite, driven by
   `scripts/run_nginx_tests.sh`.
 
@@ -29,7 +30,7 @@ Sibling checkouts are expected one directory up:
 
 ## Rules
 
-- Performance contract (DESIGN.md): ≥95% of nginx 1.24.0 throughput on the
+- Performance contract (DESIGN.md): ≥95% of nginx 1.30 (stable) throughput on the
   bench configs. Re-measure after hot-path changes.
 - Unknown directives are an explicit allowlist, and `-V` feature claims are
   minimal on purpose. Widening either unlocks nginx-tests files, so do it only
@@ -63,7 +64,7 @@ The backlog is GitHub issues, nothing else; there is no backlog file.
   are the phases in `ROADMAP.md`; patch versions (`v0.2.1`, `v0.2.2`, …)
   order the work in between (see `ROADMAP.md`, Releases).
 - One issue = one root cause. Sections: Summary, Repro (minimal config +
-  command, nginx vs ruxen), nginx reference (`file.c:line` at 1.24.0),
+  command, nginx vs ruxen), nginx reference (`file.c:line` at 1.30.6),
   Unlocks (nginx-tests files), Notes, Where in ruxen (files, no line
   numbers), and "Reproduced on `<sha>`". Re-check the repro on main before
   working on an older issue.

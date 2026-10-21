@@ -22,7 +22,9 @@ We are not doing:
 
 ## Performance contract
 
-**ruxen must serve every bench scenario at ≥ 95% of nginx 1.24.0's throughput on the same hardware, with zero errors.**
+**ruxen must serve every bench scenario at ≥ 95% of the throughput of nginx's current stable release (1.30, measured against 1.30.6) on the same hardware, with zero errors.**
+
+**Reference version.** Since 0.2.1 (decided 2026-10-21) ruxen is a drop-in replacement for nginx's current stable branch, 1.30, not for 1.24.0. Where 1.30 behaves differently from 1.24, that is a compatibility gap with an issue: #582 (upstream defaults), #584, #585, #586, #589, #590, #601, #609, #616. On the bench configs, which set the upstream protocol, the two run at the same speed (±1.3%, `bench/campaign-2026-10-21`). The one exception is a `proxy_pass` to an address without `keepalive`: there 1.30's HTTP/1.1 default exhausts the proxy's own ports (#582). The frozen baselines in `bench/*/RESULTS.md` and the notes written before that date measure and cite 1.24.0.
 
 The scenarios are in `bench/scenarios/manifest.tsv`, with nginx's frozen baselines next to each config (for the minimal `return 200` config, [`bench/m1/RESULTS.md`](bench/m1/RESULTS.md)). A change to the hot path is measured before it merges, as ABBA pairs against the build before it on a quiet machine (`bench/README.md`); a regression is fixed, not shipped. The scenarios still below the line have issues (`performance` label).
 
@@ -138,7 +140,7 @@ We use OS threads, not processes. Consequences:
 
 ### `src/http/ngx_http.c` + `ngx_http_core_module.c` — virtual servers, locations, phases
 
-File:line citations are against the stock 1.24.0 checkout one directory up.
+File:line citations in the notes below are against the stock 1.24.0 checkout. Newer ones cite `release-1.30.6`, which the checkout one directory up now tracks.
 
 **Server name match tables are built per-listen-socket.** `ngx_http_server_names` (ngx_http.c:1541–1654) walks every `server_name` directive in every `server {}` under one `listen`, partitions them into four categories by first byte (`ngx_http.c:4486–4523`):
 

@@ -63,7 +63,7 @@ Each release reports these four numbers:
 
 1. **nginx-tests**: files passing, out of those that run (`NGINX_TEST_PROGRESS.md`).
 2. **Config corpus** (#216): the share of a few hundred real-world nginx configurations that ruxen loads, from application docs, popular container images and certbot setups. This is the best proxy for "would ruxen work for me", and its failures say what to build next.
-3. **Performance**: ruxen vs nginx 1.24.0 on every bench scenario, measured as ABBA pairs on a dedicated quiet machine (`bench/README.md`). The contract is ≥ 95% everywhere.
+3. **Performance**: ruxen vs nginx's current stable release (1.30.6) on every bench scenario, measured as ABBA pairs on a dedicated quiet machine (`bench/README.md`). The contract is ≥ 95% everywhere.
 4. **Robustness**: fuzzing hours on the HTTP parser, worker panics (target: none), and time to fix security reports (`SECURITY.md`).
 
 ## Communication

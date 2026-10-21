@@ -55,7 +55,7 @@ the nginx source for reference, next to ruxen:
 ```bash
 cd ..
 git clone https://github.com/nginx/nginx-tests.git
-git clone https://github.com/nginx/nginx.git && git -C nginx checkout release-1.24.0
+git clone https://github.com/nginx/nginx.git && git -C nginx checkout release-1.30.6
 cd ruxen
 
 scripts/run_nginx_tests.sh                       # every .t file, sequential, ~20 min
