@@ -26,7 +26,8 @@ impl Drop for Server {
     }
 }
 
-fn start() -> Server {
+/// `extra`: more directives for the server, with `{d}` for its directory.
+fn start(extra: &str) -> Server {
     // Held from the port pick until ruxen listens: a parallel test's
     // backend can't take the port in between (#230).
     let setup = common::ports::setup_lock();
@@ -36,13 +37,15 @@ fn start() -> Server {
     };
     let dir = std::env::temp_dir().join(format!("ruxen-m59-{}-{port}", std::process::id()));
     std::fs::create_dir_all(dir.join("www")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
     std::fs::write(
         dir.join("nginx.conf"),
         format!(
             "events {{}}\nhttp {{ log_format p $uri; server {{ listen 127.0.0.1:{port};\n\
-             access_log {d}/access.log p;\n\
+             access_log {d}/access.log p;\n{extra}\n\
              location / {{ root {d}/www; }} }} }}\n",
-            d = dir.display()
+            d = dir.display(),
+            extra = extra.replace("{d}", &dir.display().to_string()),
         ),
     )
     .unwrap();
@@ -86,7 +89,7 @@ fn read(path: PathBuf) -> String {
 
 #[test]
 fn sigusr1_reopens_rotated_logs() {
-    let server = start();
+    let server = start("");
     let dir = &server.dir;
     get(server.port, "/before");
     sleep(Duration::from_millis(50));
@@ -116,4 +119,40 @@ fn sigusr1_reopens_rotated_logs() {
     // Still alive.
     assert!(server.child.id() > 0);
     get(server.port, "/again");
+}
+
+/// Each access_log is reopened on its own, as ngx_reopen_files: one that
+/// can't be opened keeps its old file and is logged at `emerg`, and the
+/// others still move to their new files (#522).
+#[test]
+fn a_log_that_cant_be_reopened_keeps_its_file_alone() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root opens the read-only directory anyway
+    }
+    let server = start("access_log {d}/b/b.log p;");
+    let dir = &server.dir;
+    get(server.port, "/before");
+    sleep(Duration::from_millis(50));
+    std::fs::rename(dir.join("access.log"), dir.join("access.log.1")).unwrap();
+    std::fs::rename(dir.join("b/b.log"), dir.join("b/b.log.1")).unwrap();
+    let b = dir.join("b");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let rc = unsafe { libc::kill(server.child.id() as i32, libc::SIGUSR1) };
+    assert_eq!(rc, 0);
+    sleep(Duration::from_millis(100));
+    get(server.port, "/after");
+    sleep(Duration::from_millis(50));
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(read(dir.join("access.log.1")), "/before\n");
+    assert_eq!(read(dir.join("access.log")), "/after\n");
+    assert_eq!(read(dir.join("b/b.log.1")), "/before\n/after\n");
+    assert!(!dir.join("b/b.log").exists());
+    let errors = read(dir.join("error.log"));
+    assert!(
+        errors.contains("[emerg]") && errors.contains("b.log\" failed (13: Permission denied)"),
+        "{errors}"
+    );
 }

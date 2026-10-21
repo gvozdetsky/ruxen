@@ -79,7 +79,7 @@ pub(crate) async fn write_access_logs(
     // The worker opens its access_log fds once at startup (see
     // `init_access_logs_for_worker`); if that hasn't run we have nothing to
     // write to, so bail quietly.
-    let Some(files) = access_log_files(http.access_logs) else {
+    let Some(files) = access_log_files(http.access_logs, http.error_logs) else {
         return;
     };
 
@@ -311,7 +311,7 @@ async fn write_buffered_access_line(
                 panic!("RUXEN_TEST_PANIC=task");
             }
             if let Some((file_index, data)) = super::logbuf::take_for_timer(buffer)
-                && let Some(files) = access_log_files(http.access_logs)
+                && let Some(files) = access_log_files(http.access_logs, http.error_logs)
                 && let Some(AccessLogSink::File(file)) = files.get(file_index)
             {
                 let (res, _) = file.write_all_at(data, 0).await;

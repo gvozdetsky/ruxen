@@ -49,6 +49,15 @@ impl SyslogSocket {
         }
     }
 
+    /// The same socket: what an access_log keeps when its reopen fails
+    /// (#522).
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(match self {
+            SyslogSocket::Udp(sock) => SyslogSocket::Udp(sock.try_clone()?),
+            SyslogSocket::Unix(sock, path) => SyslogSocket::Unix(sock.try_clone()?, path),
+        })
+    }
+
     /// Send one message. A full socket buffer, or a peer that isn't
     /// listening (ECONNREFUSED from an earlier datagram), drops it.
     pub(crate) fn send(&self, msg: &[u8]) -> io::Result<()> {
