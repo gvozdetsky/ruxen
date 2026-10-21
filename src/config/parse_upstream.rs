@@ -56,6 +56,7 @@ pub(crate) fn parse_upstream_block(
     }
     let mut servers: Vec<UpstreamServer> = Vec::new();
     let mut keepalive_max_idle: Option<u32> = None;
+    let mut keepalive_local = false;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_idle_timeout_ms: Option<u64> = None;
     let mut keepalive_max_lifetime_ms: Option<u64> = None;
@@ -73,6 +74,7 @@ pub(crate) fn parse_upstream_block(
                         name,
                         servers,
                         keepalive_max_idle,
+                        keepalive_local,
                         keepalive_requests,
                         keepalive_idle_timeout_ms,
                         keepalive_max_lifetime_ms,
@@ -193,6 +195,8 @@ pub(crate) fn parse_upstream_block(
                 }
                 zone = Some(name.clone());
             }
+            // ngx_http_upstream_keepalive: `keepalive N [local];`, where 0
+            // turns off the pool that 1.29.7 gives every upstream block.
             ("keepalive", Terminator::Semi) => {
                 if keepalive_max_idle.is_some() {
                     return Err(Error::Duplicate("keepalive"));
@@ -202,11 +206,15 @@ pub(crate) fn parse_upstream_block(
                     what: "keepalive",
                     got: v.clone(),
                 })?;
-                if n == 0 {
-                    return Err(Error::BadValue {
-                        what: "keepalive (must be > 0)",
-                        got: v.clone(),
-                    });
+                match args.get(2).map(String::as_str) {
+                    None => {}
+                    Some("local") if args.len() == 3 => keepalive_local = true,
+                    Some(_) => {
+                        return Err(Error::BadValue {
+                            what: "keepalive parameter",
+                            got: args[2..].join(" "),
+                        });
+                    }
                 }
                 keepalive_max_idle = Some(n);
             }
@@ -1466,6 +1474,29 @@ mod tests {
 
     fn proxy_pass(arg: &str) -> Result<ProxyPass, Error> {
         parse_proxy_pass_arg(&[arg.to_string()])
+    }
+
+    /// `keepalive N [local];` (ngx_http_upstream_keepalive), 0 included
+    /// since 1.29.7.
+    #[test]
+    fn keepalive_takes_zero_and_local() {
+        let keepalive = |line: &str| {
+            crate::config::parse(&format!(
+                "http {{ upstream u {{ server 127.0.0.1:1; {line} }} server {{ listen 80; }} }}"
+            ))
+            .map(|c| {
+                let u = &c.upstreams[0];
+                (u.keepalive_max_idle, u.keepalive_local)
+            })
+        };
+        assert_eq!(keepalive("").unwrap(), (None, false));
+        assert_eq!(keepalive("keepalive 0;").unwrap(), (Some(0), false));
+        assert_eq!(keepalive("keepalive 8;").unwrap(), (Some(8), false));
+        assert_eq!(keepalive("keepalive 8 local;").unwrap(), (Some(8), true));
+        assert!(keepalive("keepalive 8 bogus;").is_err());
+        assert!(keepalive("keepalive 8 local local;").is_err());
+        assert!(keepalive("keepalive -1;").is_err());
+        assert!(keepalive("keepalive 8; keepalive 0;").is_err());
     }
 
     #[test]

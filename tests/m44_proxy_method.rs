@@ -240,7 +240,7 @@ http {{
     );
     assert_eq!(status_code(&resp), 200);
     let req = backend.last_request().expect("backend saw request");
-    assert_eq!(request_line(&req), "POST /hi HTTP/1.0");
+    assert_eq!(request_line(&req), "POST /hi HTTP/1.1");
 }
 
 #[test]
@@ -267,7 +267,7 @@ http {{
     );
     assert_eq!(status_code(&resp), 200);
     let req = backend.last_request().expect("backend saw request");
-    assert_eq!(request_line(&req), "PUT /v HTTP/1.0");
+    assert_eq!(request_line(&req), "PUT /v HTTP/1.1");
 }
 
 #[test]
@@ -299,7 +299,7 @@ http {{
     );
     assert_eq!(status_code(&resp), 200);
     let req = backend.last_request().expect("request seen");
-    assert_eq!(request_line(&req), "PUT /inherit HTTP/1.0");
+    assert_eq!(request_line(&req), "PUT /inherit HTTP/1.1");
 
     let resp = http_send(
         port,
@@ -307,7 +307,7 @@ http {{
     );
     assert_eq!(status_code(&resp), 200);
     let req = backend.last_request().expect("request seen");
-    assert_eq!(request_line(&req), "DELETE /own HTTP/1.0");
+    assert_eq!(request_line(&req), "DELETE /own HTTP/1.1");
 }
 
 #[test]
@@ -383,5 +383,5 @@ http {{
     let req = seen_rx
         .recv_timeout(Duration::from_secs(3))
         .expect("backend saw request");
-    assert_eq!(request_line(&req), "HEAD /h HTTP/1.0");
+    assert_eq!(request_line(&req), "HEAD /h HTTP/1.1");
 }

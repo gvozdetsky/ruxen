@@ -681,9 +681,9 @@ pub struct PreparedProxy {
     pub send_timeout_ms: u64,
     /// Inheritance-resolved `proxy_limit_rate` in bytes/sec; `0` is unlimited.
     pub limit_rate: u64,
-    /// 0 = HTTP/1.0 (default), 1 = HTTP/1.1. Drives the upstream
-    /// request-line version and gates pool eligibility (HTTP/1.0 always
-    /// closes after the response).
+    /// 0 = HTTP/1.0, 1 = HTTP/1.1 (the default since nginx 1.29.7).
+    /// Drives the upstream request-line version and gates pool
+    /// eligibility (HTTP/1.0 always closes after the response).
     pub http_version: u8,
     /// `proxy_next_upstream` mask. Default `error timeout`.
     pub next_upstream: crate::config::ProxyNextUpstream,
@@ -714,7 +714,9 @@ pub struct PreparedProxy {
     pub location_prefix: &'static [u8],
     /// `proxy_pass http://up/path;` URI part. Empty when no path rewriting.
     pub request_path: &'static [u8],
-    /// What to do with the upstream's response headers.
+    /// What to do with the upstream's response headers. `build_proxy`
+    /// leaks one per location, so its address also names the location
+    /// (`pool_tag`).
     pub response: &'static ProxyResponseRules,
     /// Inheritance-resolved `proxy_method`: rendered per request and sent
     /// instead of the client's request method.
@@ -772,6 +774,21 @@ pub enum PreparedCacheZone {
     ),
 }
 
+impl PreparedProxy {
+    /// The location a pooled connection of a `keepalive … local` upstream
+    /// is kept for: nginx's cache item `tag`, the location's
+    /// `ngx_http_upstream_conf_t` (ngx_http_upstream_keepalive_module.c).
+    /// 0 when the pool is shared by every location.
+    #[inline]
+    pub fn pool_tag(&self, upstream: &PreparedUpstream) -> usize {
+        if upstream.keepalive_local {
+            std::ptr::from_ref(self.response) as usize
+        } else {
+            0
+        }
+    }
+}
+
 impl PreparedProxyCache {
     /// ngx_http_file_cache_valid: seconds a response with `status` stays
     /// fresh by `proxy_cache_valid`, 0 for not at all.
@@ -819,7 +836,7 @@ pub(crate) struct ProxyEffective {
     pub send_timeout_ms: u64,
     /// `proxy_limit_rate` in bytes/sec; `0` means unlimited.
     pub limit_rate: u64,
-    /// 0 = HTTP/1.0, 1 = HTTP/1.1. Matches nginx's default of 1.0.
+    /// 0 = HTTP/1.0, 1 = HTTP/1.1. Matches nginx's default of 1.1 (1.29.7).
     pub http_version: u8,
     pub next_upstream: crate::config::ProxyNextUpstream,
     pub next_upstream_tries: u32,
@@ -1000,7 +1017,8 @@ impl ProxyEffective {
             read_timeout_ms: 60_000,
             send_timeout_ms: 60_000,
             limit_rate: 0,
-            http_version: 0,
+            // ngx_http_proxy_merge_loc_conf: NGX_HTTP_VERSION_11 (1.29.7).
+            http_version: 1,
             next_upstream: crate::config::ProxyNextUpstream::DEFAULT,
             next_upstream_tries: 0,
             next_upstream_timeout_ms: 0,
@@ -1038,9 +1056,15 @@ pub struct PreparedUpstream {
     /// `$upstream_addr` shows it when no peer could be tried.
     pub name: &'static [u8],
     pub peers: &'static [PreparedPeer],
-    /// Max idle pool slots per worker (`keepalive N;`). `None` means no
-    /// pool — every attempt opens a fresh socket.
+    /// Max idle pool slots per worker (`keepalive N;`), for the whole
+    /// upstream as in nginx, not per peer. `None` means no pool — every
+    /// attempt opens a fresh socket: `keepalive 0;`, or a `proxy_pass` with
+    /// no `upstream {}` block.
     pub keepalive_max_idle: Option<u32>,
+    /// `keepalive N local;`, and the default pool of an `upstream {}`
+    /// block (nginx 1.29.7): a connection goes back only to the location
+    /// that opened it (`PreparedProxy::pool_tag`).
+    pub keepalive_local: bool,
     /// `keepalive_requests N;` — close after N requests on a pooled conn.
     /// Default 1000 to match nginx.
     pub keepalive_requests: u64,

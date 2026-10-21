@@ -895,10 +895,19 @@ pub(crate) fn prepare_upstreams(
             });
         }
         let peers: &'static [PreparedPeer] = crate::arena::leak(peers_vec.into_boxed_slice());
+        // ngx_http_upstream_keepalive_init_main_conf: since 1.29.7 every
+        // `upstream {}` block keeps up to 32 idle connections, each for the
+        // location that opened it, unless it says `keepalive 0;`.
+        let (keepalive_max_idle, keepalive_local) = match u.keepalive_max_idle {
+            None => (Some(32), true),
+            Some(0) => (None, false),
+            Some(n) => (Some(n), u.keepalive_local),
+        };
         let prepared = crate::arena::leak(Box::new(PreparedUpstream {
             name: name_static.as_bytes(),
             peers,
-            keepalive_max_idle: u.keepalive_max_idle,
+            keepalive_max_idle,
+            keepalive_local,
             keepalive_requests: u.keepalive_requests.unwrap_or(1000),
             keepalive_idle_timeout_ms: u.keepalive_idle_timeout_ms.unwrap_or(60_000),
             keepalive_max_lifetime_ms: u.keepalive_max_lifetime_ms.unwrap_or(3_600_000),
@@ -1289,6 +1298,7 @@ pub(crate) fn build_proxy(
                     name: host_header_static,
                     peers,
                     keepalive_max_idle: None,
+                    keepalive_local: false,
                     keepalive_requests: 1000,
                     keepalive_idle_timeout_ms: 60_000,
                     keepalive_max_lifetime_ms: 3_600_000,
@@ -1400,6 +1410,7 @@ pub(crate) fn build_proxy(
                     name: b"",
                     peers,
                     keepalive_max_idle: None,
+                    keepalive_local: false,
                     keepalive_requests: 1000,
                     keepalive_idle_timeout_ms: 60_000,
                     keepalive_max_lifetime_ms: 3_600_000,

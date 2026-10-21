@@ -150,13 +150,13 @@ fn m102_upstream_name_or_ip_literal() {
         get(port, &format!("/a?b=127.0.0.1:{backend}")),
         (
             200,
-            format!("GET /a?b=127.0.0.1:{backend} HTTP/1.0 | 127.0.0.1:{backend}")
+            format!("GET /a?b=127.0.0.1:{backend} HTTP/1.1 | 127.0.0.1:{backend}")
         )
     );
     // An upstream block's name; any case.
     assert_eq!(
         get(port, "/a?b=U"),
-        (200, "GET /a?b=U HTTP/1.0 | U".to_string())
+        (200, "GET /a?b=U HTTP/1.1 | U".to_string())
     );
     // A host name that another location's `proxy_pass` names with the
     // same port: nginx's implicit upstream, no resolver needed.
@@ -164,13 +164,13 @@ fn m102_upstream_name_or_ip_literal() {
         get(port, &format!("/a?b=localhost:{backend}")),
         (
             200,
-            format!("GET /a?b=localhost:{backend} HTTP/1.0 | localhost:{backend}")
+            format!("GET /a?b=localhost:{backend} HTTP/1.1 | localhost:{backend}")
         )
     );
     // A URI part, with a `?` in it, is the whole upstream URI.
     assert_eq!(
         get(port, &format!("/fixed/x?b=127.0.0.1:{backend}&c=?q=1")),
-        (200, format!("GET /up?q=1 HTTP/1.0 | 127.0.0.1:{backend}"))
+        (200, format!("GET /up?q=1 HTTP/1.1 | 127.0.0.1:{backend}"))
     );
     let log = std::fs::read_to_string(server.1.join("access.log")).unwrap();
     let v4 = format!("127.0.0.1:{backend}");
@@ -229,7 +229,7 @@ fn m102_unix_path_in_the_url() {
     });
     assert_eq!(
         get(port, &format!("/a?b=unix:{}:/z", sock.display())),
-        (200, "GET /z HTTP/1.0".to_string())
+        (200, "GET /z HTTP/1.1".to_string())
     );
 }
 

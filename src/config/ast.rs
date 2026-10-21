@@ -532,15 +532,19 @@ pub struct DumpFile {
 /// One `upstream NAME { server <host:port> [params]; ... }` block at http
 /// scope. M42 also parses the upstream-side keepalive directives —
 /// `keepalive N;`, `keepalive_requests N;`, `keepalive_timeout T;`,
-/// `keepalive_time T;`. These configure the per-worker connection pool;
-/// when `keepalive` is unset (`None`) no pool is used.
+/// `keepalive_time T;`. These configure the per-worker connection pool,
+/// on by default since nginx 1.29.7 (`keepalive 32 local`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamBlock {
     pub name: String,
     pub servers: Vec<UpstreamServer>,
-    /// `keepalive N;` — max idle pool slots (per worker). `None` means
-    /// no keepalive pool: each upstream attempt opens a fresh socket.
+    /// `keepalive N;` — max idle pool slots (per worker). `None` (unset)
+    /// is nginx 1.29.7's default, `keepalive 32 local`; `Some(0)` turns
+    /// the pool off: each upstream attempt opens a fresh socket.
     pub keepalive_max_idle: Option<u32>,
+    /// `keepalive N local;`: a pooled connection is reused only by the
+    /// location that opened it.
+    pub keepalive_local: bool,
     /// `keepalive_requests N;` — close a pooled conn after N requests.
     /// `None` defaults to nginx's 1000.
     pub keepalive_requests: Option<u64>,
