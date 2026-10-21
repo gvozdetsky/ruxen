@@ -50,6 +50,8 @@ pub enum Error {
     /// `$name` that is neither a variable nginx knows nor one the config
     /// defines (`set`, `map`, `split_clients`, a named regex capture).
     UnknownVariable(String),
+    /// `set` on a built-in nginx doesn't let change (#574).
+    DuplicateVariable(String),
     /// Any of the above with where it happened, nginx's ` in file:line`.
     At {
         error: Box<Error>,
@@ -88,6 +90,7 @@ impl std::fmt::Display for Error {
             ),
             Error::Directive { name, msg } => write!(f, "\"{name}\" directive {msg}"),
             Error::UnknownVariable(name) => write!(f, "unknown \"{name}\" variable"),
+            Error::DuplicateVariable(name) => write!(f, "the duplicate \"{name}\" variable"),
             Error::At { error, position } => write!(f, "{error} in {position}"),
         }
     }

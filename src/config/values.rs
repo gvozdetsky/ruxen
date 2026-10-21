@@ -372,8 +372,18 @@ pub static SSL_SESSION_ID_USED: std::sync::atomic::AtomicBool =
 /// Variable names are case-insensitive, as nginx lowercases each one it
 /// defines or looks up (ngx_http_add_variable, _get_variable_index).
 pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
+    if let Some(v) = classify_builtin(name)? {
+        return Ok(v);
+    }
+    let name = String::from_utf8_lossy(&name.to_ascii_lowercase()).into_owned();
+    note_unknown_variable(&name);
+    Ok(Variable::Unknown(name))
+}
+
+/// The built-in `name` stands for, `None` for any other name.
+fn classify_builtin(name: &[u8]) -> Result<Option<Variable>, Error> {
     let name = &name.to_ascii_lowercase()[..];
-    Ok(match name {
+    Ok(Some(match name {
         // nginx's `$document_uri` is `$uri` under another name.
         b"uri" | b"document_uri" => Variable::Uri,
         b"request_uri" => Variable::RequestUri,
@@ -511,12 +521,57 @@ pub(crate) fn classify_variable(name: &[u8]) -> Result<Variable, Error> {
             Variable::Cookie(s)
         }
         _ if name.starts_with(b"http_") => Variable::Http(header_var_name(&name[b"http_".len()..])),
-        _ => {
-            let name = String::from_utf8_lossy(name).into_owned();
-            note_unknown_variable(&name);
-            Variable::Unknown(name)
-        }
-    })
+        _ => return Ok(None),
+    }))
+}
+
+/// Whether `set` may assign `name` (#574). nginx refuses a built-in unless
+/// it is NGX_HTTP_VAR_CHANGEABLE (ngx_http_add_variable: `the duplicate
+/// "…" variable`): of ruxen's, `$args`, `$limit_rate`, `$proxy_host`,
+/// `$proxy_port` and `$ssl_*`. A prefixed name (`$arg_x`, `$http_x`, …)
+/// becomes a variable of its own, as nginx adds it without the prefix flag.
+/// Of the ones ruxen lacks, those of nginx's default build are refused too.
+pub(crate) fn settable(name: &str) -> bool {
+    const CHANGEABLE: &[&str] = &["args", "limit_rate", "proxy_host", "proxy_port"];
+    const PREFIXES: &[&str] = &[
+        "arg_",
+        "cookie_",
+        "http_",
+        "sent_http_",
+        "sent_trailer_",
+        "upstream_cookie_",
+        "upstream_http_",
+        "upstream_trailer_",
+        "proxy_protocol_tlv_",
+        "ssl_",
+    ];
+    // nginx's own, not changeable (checked with 1.30.6's `-t`).
+    const NGINX_ONLY: &[&str] = &[
+        "date_gmt",
+        "date_local",
+        "fastcgi_path_info",
+        "fastcgi_script_name",
+        "gzip_ratio",
+        "nginx_version",
+        "pid",
+        "request_completion",
+        "request_id",
+        "tcpinfo_rcv_space",
+        "tcpinfo_rtt",
+        "tcpinfo_rttvar",
+        "tcpinfo_snd_cwnd",
+        "uid_got",
+        "uid_set",
+        "upstream_cache_last_modified",
+    ];
+    let name = name.to_ascii_lowercase();
+    if CHANGEABLE.contains(&name.as_str()) || PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    if NGINX_ONLY.contains(&name.as_str()) {
+        return false;
+    }
+    !matches!(classify_builtin(name.as_bytes()), Ok(Some(_)))
 }
 
 /// Nginx maps `$http_x_forwarded_for` → the `X-Forwarded-For` header: the
