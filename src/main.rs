@@ -99,21 +99,55 @@ unsafe extern "C" {
     fn sigprocmask(how: i32, set: *const SigSet, oldset: *mut SigSet) -> i32;
 }
 
-extern "C" fn sigquit_handler(_sig: i32) {
-    SIGQUIT_SEEN.store(true, Ordering::SeqCst);
+/// The pid that sent each signal last (`si_pid`; 0 when it came from the
+/// kernel or a terminal), for nginx's `received from` (#518).
+static SIGNAL_FROM: [std::sync::atomic::AtomicI32; 32] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; 32];
+/// Which of SIGTERM and SIGINT came.
+static TERM_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(SIGTERM);
+
+/// The handler of the signals `main` acts on: their flags, and who sent
+/// them. Async-signal-safe: atomic stores only.
+extern "C" fn signal_handler(sig: i32, info: *mut libc::siginfo_t, _context: *mut libc::c_void) {
+    // SAFETY: with SA_SIGINFO the kernel passes a valid `siginfo_t`.
+    let from = if info.is_null() {
+        0
+    } else {
+        unsafe { (*info).si_pid() }
+    };
+    if let Some(slot) = SIGNAL_FROM.get(sig as usize) {
+        slot.store(from, Ordering::Relaxed);
+    }
+    match sig {
+        SIGQUIT => SIGQUIT_SEEN.store(true, Ordering::SeqCst),
+        SIGTERM | SIGINT => {
+            TERM_SIGNAL.store(sig, Ordering::Relaxed);
+            SIGTERM_SEEN.store(true, Ordering::SeqCst);
+        }
+        SIGHUP => SIGHUP_SEEN.store(true, Ordering::SeqCst),
+        SIGUSR1 => SIGUSR1_SEEN.store(true, Ordering::SeqCst),
+        _ => {}
+    }
 }
 
-/// SIGTERM and SIGINT.
-extern "C" fn sigterm_handler(_sig: i32) {
-    SIGTERM_SEEN.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn sighup_handler(_sig: i32) {
-    SIGHUP_SEEN.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn sigusr1_handler(_sig: i32) {
-    SIGUSR1_SEEN.store(true, Ordering::SeqCst);
+/// nginx's ngx_signal_handler line, at `notice`: `signal 15 (SIGTERM)
+/// received from 1234, exiting`, without `from` when no process sent it.
+fn signal_line(sig: i32, action: &str) -> String {
+    let name = match sig {
+        SIGHUP => "SIGHUP",
+        SIGINT => "SIGINT",
+        SIGQUIT => "SIGQUIT",
+        SIGUSR1 => "SIGUSR1",
+        SIGTERM => "SIGTERM",
+        _ => "?",
+    };
+    match SIGNAL_FROM
+        .get(sig as usize)
+        .map_or(0, |s| s.load(Ordering::Relaxed))
+    {
+        0 => format!("signal {sig} ({name}) received, {action}"),
+        from => format!("signal {sig} ({name}) received from {from}, {action}"),
+    }
 }
 
 #[derive(Clone)]
@@ -652,6 +686,16 @@ impl Master {
             // without waiting for their requests, and the master deletes
             // the pid file and exits 0. Leaving the process does both.
             if SIGTERM_SEEN.load(Ordering::SeqCst) || stuck {
+                let log = |message: &str| {
+                    worker::write_worker_log(
+                        self.current.http.error_logs,
+                        config::ErrorLogLevel::Notice,
+                        message,
+                    )
+                };
+                if SIGTERM_SEEN.load(Ordering::SeqCst) {
+                    log(&signal_line(TERM_SIGNAL.load(Ordering::Relaxed), "exiting"));
+                }
                 self.begin_shutdown();
                 if let Some(path) = &self.settings.pid {
                     privileges::remove_pid_file_on_exit(path);
@@ -670,12 +714,20 @@ impl Master {
                 // still run, and aws-lc's destructors free the global DRBG
                 // a worker may be seeding from. nginx's master exits only
                 // once its workers are gone; here the process ends them.
+                // nginx's master says so on its way out
+                // (ngx_master_process_exit).
+                log("exit");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 // SAFETY: `_exit` ends the process at once; nothing after
                 // it runs.
                 unsafe { libc::_exit(if worker_panicked { 1 } else { 0 }) }
             }
             if quit_at.is_none() && SIGQUIT_SEEN.load(Ordering::SeqCst) {
+                worker::write_worker_log(
+                    self.current.http.error_logs,
+                    config::ErrorLogLevel::Notice,
+                    &signal_line(SIGQUIT, "shutting down"),
+                );
                 self.begin_shutdown();
                 // New connections are refused during the drain, not queued
                 // for nobody: nginx closes its listening sockets at once,
@@ -694,6 +746,11 @@ impl Master {
             // access_log files before a worker's next write. error_log
             // files are opened per write already.
             if SIGUSR1_SEEN.swap(false, Ordering::SeqCst) {
+                worker::write_worker_log(
+                    self.current.http.error_logs,
+                    config::ErrorLogLevel::Notice,
+                    &signal_line(SIGUSR1, "reopening logs"),
+                );
                 // After a switch to `user`, the root helper recreates the
                 // files logrotate moved, for the user to open.
                 privileges::reopen_logs();
@@ -714,6 +771,11 @@ impl Master {
         if let Some(path) = &self.settings.pid {
             privileges::remove_pid_file_on_exit(path);
         }
+        worker::write_worker_log(
+            self.current.http.error_logs,
+            config::ErrorLogLevel::Notice,
+            "exit",
+        );
         if worker_panicked {
             return Err(Failure::Reported);
         }
@@ -783,7 +845,7 @@ impl Master {
         log(
             old_http,
             config::ErrorLogLevel::Notice,
-            "signal 1 (SIGHUP) received, reconfiguring",
+            &signal_line(SIGHUP, "reconfiguring"),
         );
         let cli = self.cli.clone();
         // Its own thread: parsing and preparing keep state in thread
@@ -1281,21 +1343,20 @@ fn redirect_stderr(_path: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn install_signal_handlers() -> io::Result<()> {
-    let rc = unsafe { signal(SIGQUIT, sigquit_handler as *const () as usize) };
-    if rc == usize::MAX {
-        return Err(io::Error::last_os_error());
-    }
-    for sig in [SIGTERM, SIGINT] {
-        if unsafe { signal(sig, sigterm_handler as *const () as usize) } == usize::MAX {
+    // SA_SIGINFO, for the sender's pid in nginx's notice line (#518);
+    // SA_RESTART, as `signal()` sets.
+    for sig in [SIGQUIT, SIGTERM, SIGINT, SIGHUP, SIGUSR1] {
+        // SAFETY: a zeroed sigaction with our handler and an empty mask.
+        let rc = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = signal_handler as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, std::ptr::null_mut())
+        };
+        if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-    }
-    // SIGHUP: reload the configuration (`Master::reload`).
-    if unsafe { signal(SIGHUP, sighup_handler as *const () as usize) } == usize::MAX {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { signal(SIGUSR1, sigusr1_handler as *const () as usize) } == usize::MAX {
-        return Err(io::Error::last_os_error());
     }
     // SIGUSR2 (binary upgrade) is not implemented, but its default
     // disposition is "terminate" — the upstream test harness sends it and
