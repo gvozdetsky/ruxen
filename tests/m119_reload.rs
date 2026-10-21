@@ -638,10 +638,11 @@ fn back_to_back_reloads_free_the_retired_configurations() {
     hups.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(done >= 40, "{done} reloads in 30 s");
-    // The current generation's root, a retired one whose workers are
-    // still on their way out, the one being prepared; not one per reload.
+    // The current generation's root and error_log (#648), a retired one's
+    // whose workers are still on their way out, the one being prepared's;
+    // not one per reload.
     assert!(
-        during <= before + 4,
+        during <= before + 6,
         "{before} descriptors open before, {during} after {done} reloads"
     );
     s.wait_threads(5);

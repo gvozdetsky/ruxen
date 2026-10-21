@@ -61,13 +61,20 @@ pub(crate) fn errno_text(err: &std::io::Error) -> String {
 pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     crate::tls_certs::forget_files();
     STAPLED_KEYS.with(|k| k.borrow_mut().clear());
+    ERROR_LOG_FILES.with(|f| f.borrow_mut().clear());
     let prepared = prepare_http(cfg);
     crate::tls_certs::forget_files();
     STAPLED_KEYS.with(|k| k.borrow_mut().clear());
+    ERROR_LOG_FILES.with(|f| f.borrow_mut().clear());
     prepared
 }
 
 thread_local! {
+    /// The `error_log` files of the configuration being prepared, by path:
+    /// each opened once (#648).
+    static ERROR_LOG_FILES: std::cell::RefCell<
+        std::collections::HashMap<std::path::PathBuf, &'static PreparedErrorLogFile>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
     /// The `[warn]` lines of the last `prepare` on this thread (nginx's
     /// warnings while it initialises modules), for `take_prepare_warnings`.
     static PREPARE_WARNINGS: std::cell::RefCell<Vec<String>> =
@@ -3397,27 +3404,33 @@ fn open_access_log_file(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-fn open_log_file(path: &Path) -> Result<(), String> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(drop)
-        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))?;
-    // Reopened after logrotate by the `user` ruxen switches to.
-    crate::privileges::note_file(path);
-    Ok(())
-}
-
 pub(crate) fn prepare_error_log_target(
     target: ErrorLogTarget,
 ) -> Result<PreparedErrorLogTarget, String> {
     Ok(match target {
         ErrorLogTarget::File(path) => {
-            // Match access_log behavior: create eagerly so "no writes happened"
-            // still leaves a readable file for assertions.
-            open_log_file(&path)?;
-            PreparedErrorLogTarget::File(crate::arena::leak(path.into_boxed_path()))
+            // Created up front, as nginx does at startup, and kept open
+            // with the configuration, once per path (#648).
+            if let Some(file) = ERROR_LOG_FILES.with(|f| f.borrow().get(&path).copied()) {
+                return Ok(PreparedErrorLogTarget::File(file));
+            }
+            let opened = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| {
+                    format!("open() \"{}\" failed ({})", path.display(), errno_text(&e))
+                })?;
+            // Reopened after logrotate by the `user` ruxen switches to.
+            crate::privileges::note_file(&path);
+            let file: &'static PreparedErrorLogFile =
+                crate::arena::leak(Box::new(PreparedErrorLogFile {
+                    path: crate::arena::leak(path.clone().into_boxed_path()),
+                    file: Some(opened),
+                    opened_gen: crate::worker::LOG_REOPEN_GEN.load(Ordering::Relaxed),
+                }));
+            ERROR_LOG_FILES.with(|f| f.borrow_mut().insert(path, file));
+            PreparedErrorLogTarget::File(file)
         }
         ErrorLogTarget::Stderr => PreparedErrorLogTarget::Stderr,
         ErrorLogTarget::Syslog(peer) => PreparedErrorLogTarget::Syslog(prepare_syslog_peer(&peer)?),

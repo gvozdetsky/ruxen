@@ -477,10 +477,31 @@ pub struct PreparedErrorLog {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PreparedErrorLogTarget {
-    File(&'static Path),
+    File(&'static PreparedErrorLogFile),
     Stderr,
     Syslog(&'static PreparedSyslogPeer),
 }
+
+/// An `error_log` file: opened once by `prepare` and kept with the
+/// configuration, as nginx's master keeps `open_files` (#648). A thread
+/// writes to a `dup` of it (`log::emit`).
+#[derive(Debug)]
+pub struct PreparedErrorLogFile {
+    pub path: &'static Path,
+    /// `None` for the `-e` file as the default log, opened on first use.
+    pub file: Option<std::fs::File>,
+    /// `LOG_REOPEN_GEN` when it was opened: after a SIGUSR1 since, a thread
+    /// opens the path instead.
+    pub opened_gen: u64,
+}
+
+impl PartialEq for PreparedErrorLogFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for PreparedErrorLogFile {}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PreparedErrorLogSyslogServer {
