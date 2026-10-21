@@ -1314,7 +1314,7 @@ mod tests {
         // Test::Nginx matches `nginx version: nginx/<version>` at the top.
         assert_eq!(
             version_output(true),
-            format!("nginx version: nginx/1.29.2\n{}", version_output(false))
+            format!("nginx version: nginx/1.30.6\n{}", version_output(false))
         );
     }
 

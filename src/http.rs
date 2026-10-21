@@ -1301,7 +1301,7 @@ pub const RUXEN_IDENTITY: Identity = Identity {
 /// What nginx-tests expects (`server_tokens.t`, error-page bodies), and
 /// the `nginx version:` line of `-V` under the harness.
 pub const NGINX_IDENTITY: Identity = Identity {
-    versioned: b"nginx/1.29.2",
+    versioned: b"nginx/1.30.6",
     plain: b"nginx",
 };
 
@@ -2427,7 +2427,7 @@ mod tests {
         let out = build_response(200, "hello", NGINX_IDENTITY.versioned);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(s.contains("Server: nginx/1.29.2\r\n"));
+        assert!(s.contains("Server: nginx/1.30.6\r\n"));
         assert!(s.contains("Content-Length: 5\r\n"));
         assert!(s.ends_with("\r\n\r\nhello"));
     }
@@ -2459,7 +2459,7 @@ mod tests {
         );
         assert_eq!(RUXEN_IDENTITY.plain, b"ruxen");
         // Also the `nginx version:` line of `-V`.
-        assert_eq!(NGINX_IDENTITY.versioned, b"nginx/1.29.2");
+        assert_eq!(NGINX_IDENTITY.versioned, b"nginx/1.30.6");
         assert_eq!(NGINX_IDENTITY.plain, b"nginx");
     }
 
