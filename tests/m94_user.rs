@@ -328,3 +328,54 @@ fn m94_no_helper_without_a_switch() {
     assert!(get(port, "/up").starts_with("HTTP/1.1 200"));
     assert_eq!(children(server.child.id()), vec![]);
 }
+
+/// After a reload the helper recreates the new configuration's log files,
+/// which it takes from its own parse, and no longer the old ones (#498).
+#[test]
+fn m94_root_helper_follows_a_reload() {
+    if !is_root() {
+        return;
+    }
+    let conf = |extra: &str| {
+        format!(
+            "pid %%DIR%%/ruxen.pid;\nevents {{}}\nhttp {{ access_log %%DIR%%/a.log; {extra}\n\
+             server {{ listen 127.0.0.1:%%PORT%%; location / {{ return 200 \"ok\\n\"; }} }} }}\n"
+        )
+    };
+    let (server, port, dir) = start("reload", "user nobody nogroup;", &conf(""));
+    let pid = server.child.id();
+    // The user can't create files in the directory: the reload finds
+    // `b.log` made for it, as logrotate's `create` would.
+    let b = dir.join("b.log");
+    std::fs::write(&b, "").unwrap();
+    std::os::unix::fs::chown(&b, Some(65534), Some(65534)).unwrap();
+    let with_b = conf(&format!("access_log {};", b.display()))
+        .replace("%%DIR%%", dir.to_str().unwrap())
+        .replace("%%PORT%%", &port.to_string());
+    std::fs::write(
+        dir.join("ruxen.conf"),
+        format!("user nobody nogroup;\n{with_b}"),
+    )
+    .unwrap();
+    // SAFETY: signalling the child we spawned.
+    unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(get(port, "/before").starts_with("HTTP/1.1 200"));
+
+    std::fs::rename(dir.join("a.log"), dir.join("a.log.1")).unwrap();
+    std::fs::rename(&b, dir.join("b.log.1")).unwrap();
+    // SAFETY: as above.
+    unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(get(port, "/after").starts_with("HTTP/1.1 200"));
+    std::thread::sleep(Duration::from_millis(300));
+    for name in ["a.log", "b.log"] {
+        let log = dir.join(name);
+        assert_eq!(std::fs::metadata(&log).unwrap().uid(), 65534, "{name}");
+        let lines = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            lines.contains("/after") && !lines.contains("/before"),
+            "{name}: {lines}"
+        );
+    }
+}
