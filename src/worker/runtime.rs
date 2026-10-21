@@ -1740,36 +1740,44 @@ pub fn run(
         }
     };
 
+    let run_epoll = |body| match RuntimeBuilder::<monoio::LegacyDriver>::new()
+        .enable_timer()
+        .build()
+    {
+        Ok(mut rt) => end_connections_on_panic(inherited_on_panic.as_deref(), || rt.block_on(body)),
+        Err(e) => {
+            let _ =
+                ready_on_failure.send(Err(format!("epoll_create() failed ({})", errno_text(&e))));
+        }
+    };
     match driver() {
         Driver::IoUring => match io_uring_runtime(http, ring_entries) {
             Ok(mut rt) => {
                 end_connections_on_panic(inherited_on_panic.as_deref(), || rt.block_on(body))
             }
-            Err(e) => {
-                let hint = if e.raw_os_error() == Some(libc::ENOMEM) {
-                    "; the rings count against RLIMIT_MEMLOCK: raise it \
-                     (LimitMEMLOCK=, ulimit -l) or set RUXEN_DRIVER=epoll"
-                } else {
-                    ""
-                };
-                let _ = ready_on_failure.send(Err(format!(
-                    "io_uring_setup() failed ({}){hint}",
-                    errno_text(&e)
-                )));
-            }
-        },
-        Driver::Epoll => match RuntimeBuilder::<monoio::LegacyDriver>::new()
-            .enable_timer()
-            .build()
-        {
-            Ok(mut rt) => {
-                end_connections_on_panic(inherited_on_panic.as_deref(), || rt.block_on(body))
+            // No ring fits what is left of the user's RLIMIT_MEMLOCK: the
+            // old generation's rings during a reload, or another io_uring
+            // process of the user, hold the rest. This worker runs on
+            // epoll then, rather than failing the start or the reload
+            // (#635); every worker has a runtime of its own.
+            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    write_worker_log(
+                        http.error_logs,
+                        ErrorLogLevel::Warn,
+                        "io_uring_setup() failed (12: Cannot allocate memory), using epoll: \
+                         the rings count against RLIMIT_MEMLOCK (LimitMEMLOCK=, ulimit -l)",
+                    );
+                }
+                run_epoll(body)
             }
             Err(e) => {
                 let _ = ready_on_failure
-                    .send(Err(format!("epoll_create() failed ({})", errno_text(&e))));
+                    .send(Err(format!("io_uring_setup() failed ({})", errno_text(&e))));
             }
         },
+        Driver::Epoll => run_epoll(body),
     }
 }
 
