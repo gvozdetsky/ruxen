@@ -735,15 +735,41 @@ pub fn start_manager(zone: &'static CacheZone) {
     if zone.managed.swap(true, Ordering::Relaxed) {
         return;
     }
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name(format!("ruxen-cache-{}", zone.name))
         .spawn(move || {
-            zone.load(now_secs());
+            // A pass that panics is logged by the panic hook, and the next
+            // one runs: the zone keeps its upkeep (`inactive`, `min_free`),
+            // as nginx's master respawns its cache manager (#524). The
+            // shard locks ignore poisoning.
+            let pass = |f: &dyn Fn()| {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            };
+            pass(&|| zone.load(now_secs()));
+            let mut test_panic =
+                crate::worker::panics::test_panic() == crate::worker::panics::TestPanic::Cache;
             while !zone.retired.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                zone.manage(now_secs());
+                let panic_now = std::mem::take(&mut test_panic);
+                pass(&|| {
+                    if panic_now {
+                        panic!("RUXEN_TEST_PANIC=cache");
+                    }
+                    zone.manage(now_secs());
+                });
             }
         });
+    if let Err(e) = spawned {
+        // The next reload that keeps the zone tries again.
+        zone.managed.store(false, Ordering::Relaxed);
+        crate::worker::panics::write_running_log(
+            crate::config::ErrorLogLevel::Alert,
+            &format!(
+                "starting the cache manager of \"{}\" failed ({e})",
+                zone.name
+            ),
+        );
+    }
 }
 
 /// Bytes an unprivileged user may still write on `path`'s file system.

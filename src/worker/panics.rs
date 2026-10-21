@@ -36,6 +36,8 @@ pub(crate) enum TestPanic {
     Worker,
     Later,
     Task,
+    /// The first pass of a cache manager panics (#524).
+    Cache,
 }
 
 pub(crate) fn test_panic() -> TestPanic {
@@ -45,6 +47,7 @@ pub(crate) fn test_panic() -> TestPanic {
         Ok("worker") => TestPanic::Worker,
         Ok("later") => TestPanic::Later,
         Ok("task") => TestPanic::Task,
+        Ok("cache") => TestPanic::Cache,
         _ => TestPanic::Off,
     })
 }
@@ -59,6 +62,14 @@ static HOOK_HTTP: std::sync::Mutex<Option<&'static PreparedHttp>> = std::sync::M
 /// has none of its own: the running generation's.
 pub fn set_panic_hook_config(http: &'static PreparedHttp) {
     *HOOK_HTTP.lock().unwrap_or_else(|e| e.into_inner()) = Some(http);
+}
+
+/// A line from a thread that isn't a worker (a cache manager), to the
+/// running configuration's error log.
+pub(crate) fn write_running_log(level: ErrorLogLevel, message: &str) {
+    if let Some(http) = *HOOK_HTTP.lock().unwrap_or_else(|e| e.into_inner()) {
+        write_worker_log(http.error_logs, level, message);
+    }
 }
 
 /// Send panic messages to the error log. With `RUST_BACKTRACE` set, Rust's
