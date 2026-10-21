@@ -14,6 +14,22 @@ import sys
 from collections import defaultdict
 
 
+# Files whose failures are, wholly or in part, ruxen's HTTP/2 following
+# RFC 9113 / RFC 7541 where nginx doesn't (decided 2026-10-21, #347). Shown
+# next to the file in the failing list; the issues that cover the rest are
+# named too. Keep in step with the sweep: drop an entry once its file passes.
+NOTES = {
+    "h2_error_page.t": "by design: RFC 9113, #347",
+    "h2_headers.t": "by design: RFC 9113 and 7541, #347; frames over the announced size, #506",
+    "h2_host.t": "by design: RFC 9113, #347",
+    "h2_keepalive.t": "by design: the two-step GOAWAY, #347",
+    "h2_priority.t": "by design: priorities ignored, as RFC 9113 deprecates them, #347",
+    "h2_request_body.t": "partly by design: Content-Length mismatches, the WINDOW_UPDATE size "
+    "and a malformed request's 400, #347; the rest #493, #627, #628",
+    "h2_request_body_preread.t": "by design: #347",
+}
+
+
 def read_results(path: str) -> list[tuple[str, str, str, str, str]]:
     rows: list[tuple[str, str, str, str, str]] = []
     with open(path, encoding="utf-8") as fh:
@@ -89,8 +105,21 @@ def main() -> int:
         "(`0/0` means harness died during setup before reaching the plan; `0/N` means subtests "
         "passed but the file exited non-zero — typically `-t` config check).\n\n"
     )
+    parts.append(
+        "**HTTP/2 follows the RFCs where nginx doesn't (decided 2026-10-21, #347).** ruxen is a "
+        "drop-in replacement for nginx, and a product of its own: where nginx's HTTP/2 is more "
+        "lenient than RFC 9113 and RFC 7541, or answers with other error codes, ruxen keeps the "
+        "RFC behaviour of the `h2` crate. A malformed request is a stream error (RST_STREAM), "
+        "not a 400; HPACK and frame errors get the RFC's GOAWAY codes; Huffman padding longer "
+        "than 7 bits is refused; a graceful GOAWAY comes in two steps; priorities are ignored. "
+        "Real clients don't depend on any of these. nginx-tests checks of them fail on purpose: "
+        "the files marked *by design* below fail only for that, or name the issues behind the "
+        "rest.\n\n"
+    )
     for name, failed, total in failing:
-        parts.append(f"- `{name}` — {failed}/{total}\n")
+        note = NOTES.get(name)
+        suffix = f"; {note}" if note else ""
+        parts.append(f"- `{name}` — {failed}/{total}{suffix}\n")
     parts.append("\n")
 
     parts.append(f"## Intentionally skipped ({n_skip})\n\n")

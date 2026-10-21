@@ -194,16 +194,18 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
-- `h2_error_page.t` — 1/4
-- `h2_headers.t` — 35/112
-- `h2_host.t` — 4/62
-- `h2_keepalive.t` — 3/21
-- `h2_priority.t` — 11/24
+**HTTP/2 follows the RFCs where nginx doesn't (decided 2026-10-21, #347).** ruxen is a drop-in replacement for nginx, and a product of its own: where nginx's HTTP/2 is more lenient than RFC 9113 and RFC 7541, or answers with other error codes, ruxen keeps the RFC behaviour of the `h2` crate. A malformed request is a stream error (RST_STREAM), not a 400; HPACK and frame errors get the RFC's GOAWAY codes; Huffman padding longer than 7 bits is refused; a graceful GOAWAY comes in two steps; priorities are ignored. Real clients don't depend on any of these. nginx-tests checks of them fail on purpose: the files marked *by design* below fail only for that, or name the issues behind the rest.
+
+- `h2_error_page.t` — 1/4; by design: RFC 9113, #347
+- `h2_headers.t` — 33/112; by design: RFC 9113 and 7541, #347; frames over the announced size, #506
+- `h2_host.t` — 4/62; by design: RFC 9113, #347
+- `h2_keepalive.t` — 3/21; by design: the two-step GOAWAY, #347
+- `h2_priority.t` — 11/24; by design: priorities ignored, as RFC 9113 deprecates them, #347
 - `h2_proxy_request_buffering.t` — 49/51
 - `h2_proxy_request_buffering_ssl.t` — 40/42
-- `h2_request_body.t` — 8/51
-- `h2_request_body_extra.t` — 2/52
-- `h2_request_body_preread.t` — 1/11
+- `h2_request_body.t` — 8/51; partly by design: Content-Length mismatches, the WINDOW_UPDATE size and a malformed request's 400, #347; the rest #493, #627, #628
+- `h2_request_body_extra.t` — 3/52
+- `h2_request_body_preread.t` — 1/11; by design: #347
 - `http_resolver_cleanup.t` — 0/3
 - `limit_conn.t` — 1/10
 - `proxy_cache_convert_head.t` — 2/10
