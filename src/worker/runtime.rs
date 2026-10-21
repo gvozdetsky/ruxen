@@ -3255,6 +3255,77 @@ pub(crate) async fn handle_plain(
     .await;
 }
 
+/// A TLS handshake that failed, to the default server's error log at
+/// `info` in nginx's words (ngx_ssl_handshake, ngx_ssl_connection_error;
+/// 1.30.6 logs these at `info`), not on stderr (#595).
+#[cold]
+#[inline(never)]
+fn handshake_failed(
+    http: &PreparedHttp,
+    listen_index: usize,
+    connection_id: u64,
+    peer_addr: SocketAddr,
+    e: &crate::tls::AcceptError,
+) {
+    let listen = &http.listens[listen_index];
+    let reason = match e {
+        crate::tls::AcceptError::Timeout => {
+            "client timed out (110: Connection timed out)".to_string()
+        }
+        crate::tls::AcceptError::Tls(e) => match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => {
+                "peer closed connection in SSL handshake".to_string()
+            }
+            // What rustls refused: the ClientHello or a later message.
+            std::io::ErrorKind::InvalidData => {
+                let inner = e.get_ref().map_or_else(|| e.to_string(), |i| i.to_string());
+                format!("SSL_do_handshake() failed (SSL: {inner})")
+            }
+            _ => format!("recv() failed ({})", errno_text(e)),
+        },
+    };
+    write_worker_log(
+        listen.servers[listen.default_server].error_logs,
+        ErrorLogLevel::Info,
+        &format!(
+            "*{connection_id} {reason} while SSL handshaking, client: {}, server: {}",
+            peer_addr.ip(),
+            listen.addr
+        ),
+    );
+}
+
+/// A TLS record after the handshake that rustls refused, as nginx's
+/// `SSL_read() failed` at `info` (#595): `while waiting for request` before
+/// any byte of one, else while reading its head.
+#[cold]
+#[inline(never)]
+fn tls_read_failed(
+    http: &PreparedHttp,
+    listen_index: usize,
+    connection_id: u64,
+    peer_addr: SocketAddr,
+    filled: usize,
+    e: &std::io::Error,
+) {
+    let listen = &http.listens[listen_index];
+    let inner = e.get_ref().map_or_else(|| e.to_string(), |i| i.to_string());
+    let action = if filled == 0 {
+        "waiting for request"
+    } else {
+        "reading client request headers"
+    };
+    write_worker_log(
+        listen.servers[listen.default_server].error_logs,
+        ErrorLogLevel::Info,
+        &format!(
+            "*{connection_id} SSL_read() failed (SSL: {inner}) while {action}, client: {}, server: {}",
+            peer_addr.ip(),
+            listen.addr
+        ),
+    );
+}
+
 #[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) async fn handle_tls(
     stream: TcpStream,
@@ -3322,10 +3393,7 @@ pub(crate) async fn handle_tls(
             return;
         }
         Err(e) => {
-            // nginx logs SSL handshake failures at info level. We don't have
-            // a structured logging sink yet (m33's error_log only fires from
-            // request scope); stderr is an acceptable v0.1 placeholder.
-            eprintln!("ruxen: tls handshake from {peer_addr} failed: {e}");
+            handshake_failed(http, listen_index, connection_id, peer_addr, &e);
             return;
         }
     };
@@ -3576,6 +3644,12 @@ pub(crate) async fn handle<S: ConnIo>(
                 match res {
                     Ok(0) => return,
                     Ok(n) => filled += n,
+                    // What a TLS stream couldn't decrypt or rustls refused
+                    // (#595); plain TCP never says InvalidData.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        tls_read_failed(http, listen_index, connection_id, peer_addr, filled, &e);
+                        return;
+                    }
                     Err(_) => return,
                 }
             }
