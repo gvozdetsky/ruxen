@@ -45,6 +45,7 @@ const DIRECT_SEND_MIN: usize = 16 * 1024;
 const WRITE_BUF_KEEP: usize = 32 * 1024;
 
 /// What a client opened on a TLS port with.
+#[allow(clippy::large_enum_variant)] // once per connection; its size is part of #467
 pub enum Accepted<IO> {
     /// A completed handshake, and the client-certificate context of the
     /// config it ran with (`ssl_verify_client`, #113).

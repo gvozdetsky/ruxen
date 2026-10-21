@@ -126,6 +126,7 @@ struct Rotation {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // one per TLS context, built at startup and never moved
 enum Keys {
     /// From files, or a single random key: the first encrypts.
     Fixed(Vec<TicketKey>),

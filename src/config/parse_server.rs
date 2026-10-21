@@ -617,30 +617,7 @@ pub(crate) fn parse_server_block(
                 // through this chain.
                 // The root is filled in when the http block closes
                 // (`Location::inherits_root`): the server's may come below.
-                parse_location_block(
-                    spec,
-                    lx,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &AccessConf::default(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &mut locations,
-                    None,
-                )?;
+                parse_location_block(spec, lx, Inherited::default(), &mut locations, None)?;
             }
             ("add_header", Terminator::Semi) => {
                 let entry = parse_add_header_args(&args[1..])?;

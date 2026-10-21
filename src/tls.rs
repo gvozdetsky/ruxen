@@ -39,6 +39,7 @@ impl std::fmt::Display for AcceptError {
 impl std::error::Error for AcceptError {}
 
 /// A finished accept on a TLS port.
+#[allow(clippy::large_enum_variant)] // once per connection; its size is part of #467
 pub enum Handshake<IO> {
     /// The established stream plus its `HandshakeInfo` snapshot.
     Tls(ServerTlsStream<IO>, HandshakeInfo),

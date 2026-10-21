@@ -1636,6 +1636,7 @@ async fn connect_unix(path: &'static std::path::Path) -> std::io::Result<TcpStre
     TcpStream::from_std(unsafe { std::net::TcpStream::from_raw_fd(fd) })
 }
 
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 async fn attempt(
     plan: &ProxyPlan,
     peer_idx: usize,
@@ -3048,6 +3049,9 @@ fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
     out
 }
 
+/// Where a head ends, and the length of the blank line that ends it.
+type HeadEnd = (usize, usize);
+
 /// Drop the 103 Early Hints head at the front of `accum` (#581). nginx
 /// parses it as an interim response (1.29.0): its header lines are checked
 /// as any head's, then ignored, and parsing restarts at the next status
@@ -3061,10 +3065,10 @@ fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
 #[inline(never)]
 fn drop_early_hints(
     accum: &mut Vec<u8>,
-    (head_end, term_len): (usize, usize),
+    (head_end, term_len): HeadEnd,
     first_line_end: usize,
     upstream_is_11: bool,
-) -> Result<(usize, Option<(usize, usize)>), Box<UpstreamError>> {
+) -> Result<(usize, Option<HeadEnd>), Box<UpstreamError>> {
     if !upstream_is_11 {
         return Err(Box::new(UpstreamError::EarlyHintsHttp10));
     }

@@ -140,7 +140,8 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     // Group server blocks by listen address while preserving declaration
     // order both across listen buckets and within each bucket.
     // A `unix:` socket is its own address (#263).
-    let mut grouped: Vec<((SocketAddr, Option<std::path::PathBuf>), Vec<Server>)> = Vec::new();
+    type ListenKey = (SocketAddr, Option<std::path::PathBuf>);
+    let mut grouped: Vec<(ListenKey, Vec<Server>)> = Vec::new();
     for server in servers {
         let key = (server.listen.addr, server.listen.unix.clone());
         if let Some((_, bucket)) = grouped.iter_mut().find(|(k, _)| *k == key) {
@@ -208,6 +209,26 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let prepared_upstreams: std::collections::HashMap<&'static str, &'static PreparedUpstream> =
         prepare_upstreams(upstreams);
 
+    let http_scope = HttpScope {
+        tokens: http_tokens,
+        access_logs: http_access_logs,
+        error_logs: http_error_logs,
+        autoindex: http_autoindex,
+        autoindex_exact_size: http_autoindex_exact_size,
+        autoindex_localtime: http_autoindex_localtime,
+        autoindex_format: http_autoindex_format,
+        access: http_access,
+        client_max_body_size: http_client_max_body_size,
+        max_ranges: http_max_ranges,
+        client_body_buffer_size: http_client_body_buffer_size,
+        sendfile: http_sendfile,
+        disable_symlinks: http_disable_symlinks,
+        limit_rate: http_limit_rate,
+        post_action: http_post_action,
+        expires: http_expires,
+        ignore_invalid_headers: http_ignore_invalid_headers,
+        underscores_in_headers: http_underscores_in_headers,
+    };
     let mut listens: Vec<PreparedListen> = Vec::with_capacity(grouped.len());
     for ((addr, unix), servers_for_addr) in grouped {
         let unix: Option<&'static Path> = unix.map(|p| &*crate::arena::leak(p.into_boxed_path()));
@@ -255,31 +276,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         let socket = ListenSocket::from_listen(options);
         let mut servers: Vec<PreparedServer> = servers_for_addr
             .into_iter()
-            .map(|s| {
-                prepare_server(
-                    s,
-                    http_tokens,
-                    http_access_logs,
-                    http_error_logs,
-                    http_autoindex,
-                    http_autoindex_exact_size,
-                    http_autoindex_localtime,
-                    http_autoindex_format,
-                    http_access,
-                    http_client_max_body_size,
-                    http_max_ranges,
-                    http_client_body_buffer_size,
-                    http_sendfile,
-                    http_disable_symlinks.clone(),
-                    http_limit_rate,
-                    http_post_action,
-                    http_expires,
-                    http_ignore_invalid_headers,
-                    http_underscores_in_headers,
-                    &prepared_upstreams,
-                    &mut alp,
-                )
-            })
+            .map(|s| prepare_server(s, &http_scope, &prepared_upstreams, &mut alp))
             .collect::<Result<_, _>>()?;
         for ((server, on), h2) in servers.iter_mut().zip(&server_http2).zip(&server_h2) {
             server.http2 = *on;
@@ -466,6 +463,10 @@ pub(crate) struct TlsServerInput {
     resolver_timeout_ms: Option<u64>,
 }
 
+/// A listen address's TLS acceptor, with each server's client-certificate
+/// context (`tls_context`).
+type ListenTls = (Arc<crate::tls::TlsAcceptor>, Vec<Option<u16>>);
+
 /// Build the per-listen `TlsAcceptor`, or `None` when no server on this
 /// address declared `listen … ssl;`. The parser already validated that
 /// ssl listens carry `ssl_certificate`/`ssl_certificate_key` pairs, so a
@@ -477,7 +478,7 @@ pub(crate) fn build_listen_tls(
     inputs: &[TlsServerInput],
     http2: bool,
     h2_by_sni: bool,
-) -> Result<Option<(Arc<crate::tls::TlsAcceptor>, Vec<Option<u16>>)>, String> {
+) -> Result<Option<ListenTls>, String> {
     use crate::config::ServerNameSpec;
 
     // As in nginx, `ssl` belongs to the listening socket: one `listen …
@@ -1922,26 +1923,31 @@ pub(crate) fn resolve_proxy_effective(
     }
 }
 
+/// What every server inherits from the http block, resolved once.
+pub(crate) struct HttpScope {
+    pub(crate) tokens: crate::config::ServerTokens,
+    pub(crate) access_logs: &'static [PreparedAccessLog],
+    pub(crate) error_logs: &'static [PreparedErrorLog],
+    pub(crate) autoindex: bool,
+    pub(crate) autoindex_exact_size: bool,
+    pub(crate) autoindex_localtime: bool,
+    pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) access: PreparedAccess,
+    pub(crate) client_max_body_size: Option<u64>,
+    pub(crate) max_ranges: Option<u32>,
+    pub(crate) client_body_buffer_size: Option<u64>,
+    pub(crate) sendfile: Option<bool>,
+    pub(crate) disable_symlinks: Option<crate::config::DisableSymlinks>,
+    pub(crate) limit_rate: PreparedLimitRate,
+    pub(crate) post_action: Option<&'static [u8]>,
+    pub(crate) expires: PreparedExpires,
+    pub(crate) ignore_invalid_headers: bool,
+    pub(crate) underscores_in_headers: bool,
+}
+
 pub(crate) fn prepare_server(
     mut server: Server,
-    http_tokens: crate::config::ServerTokens,
-    http_access_logs: &'static [PreparedAccessLog],
-    http_error_logs: &'static [PreparedErrorLog],
-    http_autoindex: bool,
-    http_autoindex_exact_size: bool,
-    http_autoindex_localtime: bool,
-    http_autoindex_format: AutoindexFormat,
-    http_access: PreparedAccess,
-    http_client_max_body_size: Option<u64>,
-    http_max_ranges: Option<u32>,
-    http_client_body_buffer_size: Option<u64>,
-    http_sendfile: Option<bool>,
-    http_disable_symlinks: Option<crate::config::DisableSymlinks>,
-    http_limit_rate: PreparedLimitRate,
-    http_post_action: Option<&'static [u8]>,
-    http_expires: PreparedExpires,
-    http_ignore_invalid_headers: bool,
-    http_underscores_in_headers: bool,
+    http: &HttpScope,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedServer, String> {
@@ -1949,10 +1955,10 @@ pub(crate) fn prepare_server(
     let merge_slashes = server.merge_slashes.unwrap_or(true);
     let server_ignore_invalid_headers = server
         .ignore_invalid_headers
-        .unwrap_or(http_ignore_invalid_headers);
+        .unwrap_or(http.ignore_invalid_headers);
     let server_underscores_in_headers = server
         .underscores_in_headers
-        .unwrap_or(http_underscores_in_headers);
+        .unwrap_or(http.underscores_in_headers);
     let server_gzip = std::mem::take(&mut server.gzip);
     let server_proxy_defaults = ServerProxyDefaults::build(
         std::mem::take(&mut server.proxy),
@@ -2057,7 +2063,7 @@ pub(crate) fn prepare_server(
     );
     let server_error_logs: &'static [PreparedErrorLog] = match server.error_logs {
         Some(list) => prepare_error_logs(list)?,
-        None => http_error_logs,
+        None => http.error_logs,
     };
     let server_log_not_found = server.log_not_found.unwrap_or(true);
     let server_recursive_error_pages = server.recursive_error_pages.unwrap_or(false);
@@ -2066,49 +2072,52 @@ pub(crate) fn prepare_server(
         server.auth_basic.take(),
         server.auth_basic_user_file.take(),
         server.auth_delay_ms,
-        http_access,
+        http.access,
     );
-    let server_client_max_body_size = server.client_max_body_size.or(http_client_max_body_size);
-    let server_max_ranges = server.max_ranges.or(http_max_ranges);
+    let server_client_max_body_size = server.client_max_body_size.or(http.client_max_body_size);
+    let server_max_ranges = server.max_ranges.or(http.max_ranges);
     let server_client_body_buffer_size = server
         .client_body_buffer_size
-        .or(http_client_body_buffer_size);
-    let server_sendfile = server.sendfile.or(http_sendfile).unwrap_or(false);
+        .or(http.client_body_buffer_size);
+    let server_sendfile = server.sendfile.or(http.sendfile).unwrap_or(false);
     // A server's own `client_body_temp_path`; without one its locations
     // use the http-level directory (`PreparedHttp::body_temp`).
     let server_body_temp = server.client_body_temp_path.clone().map(BodyTempDir::leak);
-    let server_disable_symlinks = server.disable_symlinks.clone().or(http_disable_symlinks);
+    let server_disable_symlinks = server
+        .disable_symlinks
+        .clone()
+        .or_else(|| http.disable_symlinks.clone());
     let server_limit_rate = PreparedLimitRate::inherit(
         server.limit_rate.take(),
         server.limit_rate_after.take(),
-        http_limit_rate,
+        http.limit_rate,
     );
     let server_post_action = server
         .post_action
         .as_ref()
         .map(|target| leak_bytes(target.as_bytes()))
-        .or(http_post_action);
+        .or(http.post_action);
     let server_expires = server
         .expires
         .clone()
         .map(prepare_expires)
-        .unwrap_or(http_expires);
+        .unwrap_or(http.expires);
     // chunked_transfer_encoding has no http-scope inheritance pathway in
     // ruxen yet; default to nginx's `on` when unset at server scope.
     let server_chunked_transfer_encoding = server.chunked_transfer_encoding.unwrap_or(true);
     let server_redirect = server.redirect.policy();
-    let server_autoindex = server.autoindex.unwrap_or(http_autoindex);
+    let server_autoindex = server.autoindex.unwrap_or(http.autoindex);
     let server_autoindex_exact_size = server
         .autoindex_exact_size
-        .unwrap_or(http_autoindex_exact_size);
+        .unwrap_or(http.autoindex_exact_size);
     let server_autoindex_localtime = server
         .autoindex_localtime
-        .unwrap_or(http_autoindex_localtime);
-    let server_autoindex_format = server.autoindex_format.unwrap_or(http_autoindex_format);
+        .unwrap_or(http.autoindex_localtime);
+    let server_autoindex_format = server.autoindex_format.unwrap_or(http.autoindex_format);
     // server_tokens inheritance: server scope wins over http scope; both
     // default to `On`. Resolved once here; prepare_handler downstream
     // bakes the right `Server:` bytes into static prebuilts.
-    let server_tokens_value = server.server_tokens.unwrap_or(http_tokens);
+    let server_tokens_value = server.server_tokens.unwrap_or(http.tokens);
     let server_rewrite_program =
         prepare_rewrite_ops(std::mem::take(&mut server.rewrite_ops), server_tokens_value);
     let server_header_bytes = http::server_header_value(server_tokens_value);
@@ -2117,7 +2126,7 @@ pub(crate) fn prepare_server(
     // user wrote `access_log off;` at server scope — explicit silence.
     let server_access_logs: &'static [PreparedAccessLog] = match server.access_logs {
         Some(ref list) => alp.prepare_list(list)?,
-        None => http_access_logs,
+        None => http.access_logs,
     };
     // The cache of the scope a line is written in (#371); the locations
     // fall back to this one.
@@ -2137,184 +2146,51 @@ pub(crate) fn prepare_server(
     for l in &mut locations {
         take_if_locations(&mut l.rewrite_ops, &mut if_parsed, None);
     }
+    let scope = ServerScope {
+        index: server_index,
+        add_headers: server_add_headers,
+        add_trailers: server_add_trailers,
+        error_pages: server_error_pages,
+        keepalive: server_keepalive,
+        error_logs: server_error_logs,
+        log_not_found: server_log_not_found,
+        recursive_error_pages: server_recursive_error_pages,
+        tokens: server_tokens_value,
+        autoindex: server_autoindex,
+        autoindex_exact_size: server_autoindex_exact_size,
+        autoindex_localtime: server_autoindex_localtime,
+        autoindex_format: server_autoindex_format,
+        access_logs: server_access_logs,
+        access: server_access,
+        client_max_body_size: server_client_max_body_size,
+        max_ranges: server_max_ranges,
+        client_body_buffer_size: server_client_body_buffer_size,
+        sendfile: server_sendfile,
+        body_temp: server_body_temp,
+        disable_symlinks: server_disable_symlinks.clone(),
+        limit_rate: server_limit_rate,
+        post_action: server_post_action,
+        expires: server_expires,
+        chunked_transfer_encoding: server_chunked_transfer_encoding,
+        limit_req: &server.limit_req,
+        limit_conn: &server.limit_conn,
+        client_timeouts: server.client_timeouts,
+        proxy_defaults: server_proxy_defaults,
+        gzip: &server_gzip,
+    };
     let mut if_locations: Vec<PreparedLocation> = Vec::with_capacity(if_parsed.len());
     for l in if_parsed {
-        if_locations.push(build_prefix_or_exact(
-            l,
-            server_index,
-            server_add_headers,
-            server_add_trailers,
-            server_error_pages,
-            server_keepalive,
-            server_error_logs,
-            server_log_not_found,
-            server_recursive_error_pages,
-            server_tokens_value,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            server_access_logs,
-            server_access,
-            server_client_max_body_size,
-            server_max_ranges,
-            server_client_body_buffer_size,
-            server_sendfile,
-            server_body_temp,
-            server_disable_symlinks.clone(),
-            server_limit_rate,
-            server_post_action,
-            server_expires,
-            server_chunked_transfer_encoding,
-            &server.limit_req,
-            &server.limit_conn,
-            server.client_timeouts,
-            server_proxy_defaults,
-            &server_gzip,
-            upstreams,
-            alp,
-        )?);
+        if_locations.push(build_prefix_or_exact(l, &scope, upstreams, alp)?);
     }
     for l in locations {
         match l.mode {
-            MatchMode::Exact => exact.push(build_prefix_or_exact(
-                l,
-                server_index,
-                server_add_headers,
-                server_add_trailers,
-                server_error_pages,
-                server_keepalive,
-                server_error_logs,
-                server_log_not_found,
-                server_recursive_error_pages,
-                server_tokens_value,
-                server_autoindex,
-                server_autoindex_exact_size,
-                server_autoindex_localtime,
-                server_autoindex_format,
-                server_access_logs,
-                server_access,
-                server_client_max_body_size,
-                server_max_ranges,
-                server_client_body_buffer_size,
-                server_sendfile,
-                server_body_temp,
-                server_disable_symlinks.clone(),
-                server_limit_rate,
-                server_post_action,
-                server_expires,
-                server_chunked_transfer_encoding,
-                &server.limit_req,
-                &server.limit_conn,
-                server.client_timeouts,
-                server_proxy_defaults,
-                &server_gzip,
-                upstreams,
-                alp,
-            )?),
-            MatchMode::Prefix => prefix.push(build_prefix_or_exact(
-                l,
-                server_index,
-                server_add_headers,
-                server_add_trailers,
-                server_error_pages,
-                server_keepalive,
-                server_error_logs,
-                server_log_not_found,
-                server_recursive_error_pages,
-                server_tokens_value,
-                server_autoindex,
-                server_autoindex_exact_size,
-                server_autoindex_localtime,
-                server_autoindex_format,
-                server_access_logs,
-                server_access,
-                server_client_max_body_size,
-                server_max_ranges,
-                server_client_body_buffer_size,
-                server_sendfile,
-                server_body_temp,
-                server_disable_symlinks.clone(),
-                server_limit_rate,
-                server_post_action,
-                server_expires,
-                server_chunked_transfer_encoding,
-                &server.limit_req,
-                &server.limit_conn,
-                server.client_timeouts,
-                server_proxy_defaults,
-                &server_gzip,
-                upstreams,
-                alp,
-            )?),
-            MatchMode::Named => named.push(build_prefix_or_exact(
-                l,
-                server_index,
-                server_add_headers,
-                server_add_trailers,
-                server_error_pages,
-                server_keepalive,
-                server_error_logs,
-                server_log_not_found,
-                server_recursive_error_pages,
-                server_tokens_value,
-                server_autoindex,
-                server_autoindex_exact_size,
-                server_autoindex_localtime,
-                server_autoindex_format,
-                server_access_logs,
-                server_access,
-                server_client_max_body_size,
-                server_max_ranges,
-                server_client_body_buffer_size,
-                server_sendfile,
-                server_body_temp,
-                server_disable_symlinks.clone(),
-                server_limit_rate,
-                server_post_action,
-                server_expires,
-                server_chunked_transfer_encoding,
-                &server.limit_req,
-                &server.limit_conn,
-                server.client_timeouts,
-                server_proxy_defaults,
-                &server_gzip,
-                upstreams,
-                alp,
-            )?),
+            MatchMode::Exact => exact.push(build_prefix_or_exact(l, &scope, upstreams, alp)?),
+            MatchMode::Prefix => prefix.push(build_prefix_or_exact(l, &scope, upstreams, alp)?),
+            MatchMode::Named => named.push(build_prefix_or_exact(l, &scope, upstreams, alp)?),
             MatchMode::Regex { case_insensitive } => regex.push(build_regex_location(
                 l,
                 case_insensitive,
-                server_index,
-                server_add_headers,
-                server_add_trailers,
-                server_error_pages,
-                server_keepalive,
-                server_error_logs,
-                server_log_not_found,
-                server_recursive_error_pages,
-                server_tokens_value,
-                server_autoindex,
-                server_autoindex_exact_size,
-                server_autoindex_localtime,
-                server_autoindex_format,
-                server_access_logs,
-                server_access,
-                server_client_max_body_size,
-                server_max_ranges,
-                server_client_body_buffer_size,
-                server_sendfile,
-                server_body_temp,
-                server_disable_symlinks.clone(),
-                server_limit_rate,
-                server_post_action,
-                server_expires,
-                server_chunked_transfer_encoding,
-                &server.limit_req,
-                &server.limit_conn,
-                server.client_timeouts,
-                server_proxy_defaults,
-                &server_gzip,
+                &scope,
                 upstreams,
                 alp,
             )?),
@@ -2350,30 +2226,29 @@ pub(crate) fn prepare_server(
     let server_default = if !have_root_catchall {
         let root_path = server.root.clone().unwrap_or_else(|| "html".into());
         let pattern: &'static [u8] = b"/";
+        let site = HandlerSite {
+            pattern,
+            is_regex: false,
+            alias_prefix_override: None,
+            server_index,
+            autoindex: server_autoindex,
+            autoindex_exact_size: server_autoindex_exact_size,
+            autoindex_localtime: server_autoindex_localtime,
+            autoindex_format: server_autoindex_format,
+            disable_symlinks: server_disable_symlinks.clone(),
+            mime: &server.mime,
+            tokens: server_tokens_value,
+            upstreams,
+        };
         let handler = build_handler(
             Handler::Root {
                 path: root_path,
                 mapping: PathMapping::Root,
             },
-            pattern,
-            false,
             None,
             None,
-            None,
-            server_index,
-            None,
-            None,
-            None,
-            None,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            server_disable_symlinks.clone(),
-            &server.mime,
-            server_tokens_value,
-            upstreams,
             ProxyEffective::defaults(),
+            &site,
         )?;
         Some(PreparedLocation {
             pattern,
@@ -3369,40 +3244,42 @@ fn prepare_types(mime: &crate::config::MimeConf) -> &'static PreparedTypes {
     types
 }
 
+/// The location a handler is built for, with the settings it inherits
+/// resolved: what every `build_handler` call for one location shares.
+pub(crate) struct HandlerSite<'a> {
+    pub(crate) pattern: &'static [u8],
+    pub(crate) is_regex: bool,
+    pub(crate) alias_prefix_override: Option<&'static [u8]>,
+    pub(crate) server_index: Option<&'static [PreparedIndexEntry]>,
+    pub(crate) autoindex: bool,
+    pub(crate) autoindex_exact_size: bool,
+    pub(crate) autoindex_localtime: bool,
+    pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) disable_symlinks: Option<crate::config::DisableSymlinks>,
+    pub(crate) mime: &'a crate::config::MimeConf,
+    pub(crate) tokens: crate::config::ServerTokens,
+    pub(crate) upstreams: &'a UpstreamMap,
+}
+
 pub(crate) fn build_handler(
     handler: Handler,
-    location_pattern: &'static [u8],
-    is_regex_location: bool,
-    alias_prefix_override: Option<&'static [u8]>,
     location_index: Option<Vec<IndexEntry>>,
     location_try_files: Option<TryFiles>,
-    server_index: Option<&'static [PreparedIndexEntry]>,
-    location_autoindex: Option<bool>,
-    location_autoindex_exact_size: Option<bool>,
-    location_autoindex_localtime: Option<bool>,
-    location_autoindex_format: Option<AutoindexFormat>,
-    server_autoindex: bool,
-    server_autoindex_exact_size: bool,
-    server_autoindex_localtime: bool,
-    server_autoindex_format: AutoindexFormat,
-    disable_symlinks: Option<crate::config::DisableSymlinks>,
-    mime: &crate::config::MimeConf,
-    tokens: crate::config::ServerTokens,
-    upstreams: &UpstreamMap,
     proxy_effective: ProxyEffective,
+    site: &HandlerSite<'_>,
 ) -> Result<PreparedHandler, String> {
     Ok(match handler {
         Handler::Return { status, body } => {
             let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
-            PreparedHandler::Return(prepare_return(status, body, tokens), finalized)
+            PreparedHandler::Return(prepare_return(status, body, site.tokens), finalized)
         }
         Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
             pp,
-            upstreams,
+            site.upstreams,
             proxy_effective,
-            location_pattern,
-            is_regex_location,
+            site.pattern,
+            site.is_regex,
         )?),
         Handler::Root { path, mapping } => {
             // nginx resolves `root` per request and starts without it: a
@@ -3416,9 +3293,9 @@ pub(crate) fn build_handler(
             }
             let path_mapping = prepare_path_mapping(
                 mapping,
-                location_pattern,
-                is_regex_location,
-                alias_prefix_override,
+                site.pattern,
+                site.is_regex,
+                site.alias_prefix_override,
             );
 
             // Index inheritance: location list wins; else server list; else
@@ -3426,7 +3303,7 @@ pub(crate) fn build_handler(
             // (NGX_HTTP_DEFAULT_INDEX).
             let index: &'static [PreparedIndexEntry] = match location_index {
                 Some(names) => prepare_index_entries(names),
-                None => match server_index {
+                None => match site.server_index {
                     Some(v) => v,
                     None => prepare_index_entries(vec![IndexEntry {
                         parts: vec![ValuePart::Literal("index.html".into())],
@@ -3434,25 +3311,19 @@ pub(crate) fn build_handler(
                 },
             };
 
-            let try_files = location_try_files.map(|tf| prepare_try_files(tf, tokens));
-            let autoindex = location_autoindex.unwrap_or(server_autoindex);
-            let autoindex_exact_size =
-                location_autoindex_exact_size.unwrap_or(server_autoindex_exact_size);
-            let autoindex_localtime =
-                location_autoindex_localtime.unwrap_or(server_autoindex_localtime);
-            let autoindex_format = location_autoindex_format.unwrap_or(server_autoindex_format);
+            let try_files = location_try_files.map(|tf| prepare_try_files(tf, site.tokens));
 
             PreparedHandler::Root(PreparedRoot {
                 root,
-                types: prepare_types(mime),
+                types: prepare_types(site.mime),
                 root_fd,
-                symlinks: PreparedSymlinks::new(disable_symlinks),
+                symlinks: PreparedSymlinks::new(site.disable_symlinks.clone()),
                 path_mapping,
                 index,
-                autoindex,
-                autoindex_exact_size,
-                autoindex_localtime,
-                autoindex_format,
+                autoindex: site.autoindex,
+                autoindex_exact_size: site.autoindex_exact_size,
+                autoindex_localtime: site.autoindex_localtime,
+                autoindex_format: site.autoindex_format,
                 try_files,
             })
         }
@@ -3531,38 +3402,44 @@ pub(crate) fn resolve_error_logs(
     }
 }
 
+/// What a server's locations inherit from it, resolved once in
+/// `prepare_server` and shared by every location it builds.
+pub(crate) struct ServerScope<'a> {
+    pub(crate) index: Option<&'static [PreparedIndexEntry]>,
+    pub(crate) add_headers: &'static [PreparedAddHeader],
+    pub(crate) add_trailers: &'static [PreparedAddHeader],
+    pub(crate) error_pages: &'static [PreparedErrorPage],
+    pub(crate) keepalive: PreparedKeepalive,
+    pub(crate) error_logs: &'static [PreparedErrorLog],
+    pub(crate) log_not_found: bool,
+    pub(crate) recursive_error_pages: bool,
+    pub(crate) tokens: crate::config::ServerTokens,
+    pub(crate) autoindex: bool,
+    pub(crate) autoindex_exact_size: bool,
+    pub(crate) autoindex_localtime: bool,
+    pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) access_logs: &'static [PreparedAccessLog],
+    pub(crate) access: PreparedAccess,
+    pub(crate) client_max_body_size: Option<u64>,
+    pub(crate) max_ranges: Option<u32>,
+    pub(crate) client_body_buffer_size: Option<u64>,
+    pub(crate) sendfile: bool,
+    pub(crate) body_temp: Option<&'static BodyTempDir>,
+    pub(crate) disable_symlinks: Option<crate::config::DisableSymlinks>,
+    pub(crate) limit_rate: PreparedLimitRate,
+    pub(crate) post_action: Option<&'static [u8]>,
+    pub(crate) expires: PreparedExpires,
+    pub(crate) chunked_transfer_encoding: bool,
+    pub(crate) limit_req: &'a crate::config::LimitReqConf,
+    pub(crate) limit_conn: &'a crate::config::LimitConnConf,
+    pub(crate) client_timeouts: crate::config::ClientTimeouts,
+    pub(crate) proxy_defaults: ServerProxyDefaults,
+    pub(crate) gzip: &'a crate::config::GzipConf,
+}
+
 pub(crate) fn build_prefix_or_exact(
     l: Location,
-    server_index: Option<&'static [PreparedIndexEntry]>,
-    server_add_headers: &'static [PreparedAddHeader],
-    server_add_trailers: &'static [PreparedAddHeader],
-    server_error_pages: &'static [PreparedErrorPage],
-    server_keepalive: PreparedKeepalive,
-    server_error_logs: &'static [PreparedErrorLog],
-    server_log_not_found: bool,
-    server_recursive_error_pages: bool,
-    server_tokens_value: crate::config::ServerTokens,
-    server_autoindex: bool,
-    server_autoindex_exact_size: bool,
-    server_autoindex_localtime: bool,
-    server_autoindex_format: AutoindexFormat,
-    server_access_logs: &'static [PreparedAccessLog],
-    server_access: PreparedAccess,
-    server_client_max_body_size: Option<u64>,
-    server_max_ranges: Option<u32>,
-    server_client_body_buffer_size: Option<u64>,
-    server_sendfile: bool,
-    server_body_temp: Option<&'static BodyTempDir>,
-    server_disable_symlinks: Option<crate::config::DisableSymlinks>,
-    server_limit_rate: PreparedLimitRate,
-    server_post_action: Option<&'static [u8]>,
-    server_expires: PreparedExpires,
-    server_chunked_transfer_encoding: bool,
-    server_limit_req: &crate::config::LimitReqConf,
-    server_limit_conn: &crate::config::LimitConnConf,
-    server_client_timeouts: crate::config::ClientTimeouts,
-    server_proxy_defaults: ServerProxyDefaults,
-    server_gzip: &crate::config::GzipConf,
+    server: &ServerScope<'_>,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedLocation, String> {
@@ -3621,8 +3498,8 @@ pub(crate) fn build_prefix_or_exact(
         inherits_root: _,
         explicit_return: _,
     } = l;
-    let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
-    let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
+    let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
+    let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
     // Only an `if` block's anonymous location in a regex location is
     // built here with a regex mode (#137): its alias takes the captures.
     let is_regex = matches!(mode, MatchMode::Regex { .. });
@@ -3634,71 +3511,51 @@ pub(crate) fn build_prefix_or_exact(
         keepalive_requests,
         keepalive_time_ms,
         keepalive_disable,
-        server_keepalive,
+        server.keepalive,
     );
-    let tokens = location_server_tokens.unwrap_or(server_tokens_value);
+    let tokens = location_server_tokens.unwrap_or(server.tokens);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
-    let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
+    let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
-        location_recursive_error_pages.unwrap_or(server_recursive_error_pages);
+        location_recursive_error_pages.unwrap_or(server.recursive_error_pages);
     let proxy_effective = ProxyEffective {
         error_pages,
         recursive_error_pages,
         ..proxy_effective
+    };
+    let site = HandlerSite {
+        pattern,
+        is_regex,
+        alias_prefix_override,
+        server_index: server.index,
+        autoindex: location_autoindex.unwrap_or(server.autoindex),
+        autoindex_exact_size: location_autoindex_exact_size.unwrap_or(server.autoindex_exact_size),
+        autoindex_localtime: location_autoindex_localtime.unwrap_or(server.autoindex_localtime),
+        autoindex_format: location_autoindex_format.unwrap_or(server.autoindex_format),
+        disable_symlinks: location_disable_symlinks.or_else(|| server.disable_symlinks.clone()),
+        mime: &mime,
+        tokens,
+        upstreams,
     };
     let limited_handler = match &limit_except {
         // `proxy_pass` in the block: the other methods are proxied there,
         // with the location's proxy_* settings (proxy_if.t).
         Some(le) if le.proxy_pass.is_some() => Some(build_handler(
             Handler::Proxy(le.proxy_pass.clone().expect("checked")),
-            pattern,
-            is_regex,
-            alias_prefix_override,
             None,
             None,
-            server_index,
-            location_autoindex,
-            location_autoindex_exact_size,
-            location_autoindex_localtime,
-            location_autoindex_format,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            location_disable_symlinks
-                .clone()
-                .or_else(|| server_disable_symlinks.clone()),
-            &mime,
-            tokens,
-            upstreams,
             proxy_effective,
+            &site,
         )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),
                 mapping: document_root.1,
             },
-            pattern,
-            is_regex,
-            alias_prefix_override,
             index.clone(),
             None,
-            server_index,
-            location_autoindex,
-            location_autoindex_exact_size,
-            location_autoindex_localtime,
-            location_autoindex_format,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            location_disable_symlinks
-                .clone()
-                .or_else(|| server_disable_symlinks.clone()),
-            &mime,
-            tokens,
-            upstreams,
             ProxyEffective::defaults(),
+            &site,
         )?),
         _ => None,
     };
@@ -3707,40 +3564,17 @@ pub(crate) fn build_prefix_or_exact(
         pattern,
         is_regex,
         alias_prefix_override,
-        location_disable_symlinks
-            .clone()
-            .or_else(|| server_disable_symlinks.clone()),
+        site.disable_symlinks.clone(),
     );
-    let handler = build_handler(
-        handler,
-        pattern,
-        is_regex,
-        alias_prefix_override,
-        index,
-        try_files,
-        server_index,
-        location_autoindex,
-        location_autoindex_exact_size,
-        location_autoindex_localtime,
-        location_autoindex_format,
-        server_autoindex,
-        server_autoindex_exact_size,
-        server_autoindex_localtime,
-        server_autoindex_format,
-        location_disable_symlinks.or(server_disable_symlinks),
-        &mime,
-        tokens,
-        upstreams,
-        proxy_effective,
-    )?;
+    let handler = build_handler(handler, index, try_files, proxy_effective, &site)?;
     let auto_redirect = matches!(&handler, PreparedHandler::Proxy(_)) && pattern.ends_with(b"/");
-    let add_headers = resolve_add_headers(location_add_headers, server_add_headers);
-    let add_trailers = resolve_add_headers(location_add_trailers, server_add_trailers);
-    let error_logs = resolve_error_logs(location_error_logs, server_error_logs)?;
-    let log_not_found = location_log_not_found.unwrap_or(server_log_not_found);
+    let add_headers = resolve_add_headers(location_add_headers, server.add_headers);
+    let add_trailers = resolve_add_headers(location_add_trailers, server.add_trailers);
+    let error_logs = resolve_error_logs(location_error_logs, server.error_logs)?;
+    let log_not_found = location_log_not_found.unwrap_or(server.log_not_found);
     let access_logs = match location_access_logs {
         Some(ref list) => alp.prepare_list(list)?,
-        None => server_access_logs,
+        None => server.access_logs,
     };
     let access_logs = alp.with_cache(
         access_logs,
@@ -3751,30 +3585,30 @@ pub(crate) fn build_prefix_or_exact(
         location_auth_basic,
         location_auth_basic_user_file,
         location_auth_delay_ms,
-        server_access,
+        server.access,
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
-    let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
-    let max_ranges = location_max_ranges.or(server_max_ranges);
+    let client_max_body_size = location_client_max_body_size.or(server.client_max_body_size);
+    let max_ranges = location_max_ranges.or(server.max_ranges);
     let client_body_buffer_size =
-        location_client_body_buffer_size.or(server_client_body_buffer_size);
-    let sendfile = location_sendfile.unwrap_or(server_sendfile);
+        location_client_body_buffer_size.or(server.client_body_buffer_size);
+    let sendfile = location_sendfile.unwrap_or(server.sendfile);
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
-        .or(server_body_temp);
+        .or(server.body_temp);
     let limit_rate = PreparedLimitRate::inherit(
         location_limit_rate,
         location_limit_rate_after,
-        server_limit_rate,
+        server.limit_rate,
     );
     let post_action = location_post_action
         .map(|target| leak_bytes(target.as_bytes()))
-        .or(server_post_action);
+        .or(server.post_action);
     let expires = location_expires
         .map(prepare_expires)
-        .unwrap_or(server_expires);
+        .unwrap_or(server.expires);
     let chunked_transfer_encoding =
-        location_chunked_transfer_encoding.unwrap_or(server_chunked_transfer_encoding);
+        location_chunked_transfer_encoding.unwrap_or(server.chunked_transfer_encoding);
     Ok(PreparedLocation {
         pattern,
         handler,
@@ -3807,10 +3641,10 @@ pub(crate) fn build_prefix_or_exact(
         expires,
         chunked_transfer_encoding,
         redirect: redirect.policy(),
-        limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
-        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
+        limit_req: prepare_limit_req(location_limit_req.inherit(server.limit_req))?,
+        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server.limit_conn))?,
         timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
-            location_client_timeouts.inherit(server_client_timeouts),
+            location_client_timeouts.inherit(server.client_timeouts),
         ))),
     })
 }
@@ -3818,36 +3652,7 @@ pub(crate) fn build_prefix_or_exact(
 pub(crate) fn build_regex_location(
     l: Location,
     case_insensitive: bool,
-    server_index: Option<&'static [PreparedIndexEntry]>,
-    server_add_headers: &'static [PreparedAddHeader],
-    server_add_trailers: &'static [PreparedAddHeader],
-    server_error_pages: &'static [PreparedErrorPage],
-    server_keepalive: PreparedKeepalive,
-    server_error_logs: &'static [PreparedErrorLog],
-    server_log_not_found: bool,
-    server_recursive_error_pages: bool,
-    server_tokens_value: crate::config::ServerTokens,
-    server_autoindex: bool,
-    server_autoindex_exact_size: bool,
-    server_autoindex_localtime: bool,
-    server_autoindex_format: AutoindexFormat,
-    server_access_logs: &'static [PreparedAccessLog],
-    server_access: PreparedAccess,
-    server_client_max_body_size: Option<u64>,
-    server_max_ranges: Option<u32>,
-    server_client_body_buffer_size: Option<u64>,
-    server_sendfile: bool,
-    server_body_temp: Option<&'static BodyTempDir>,
-    server_disable_symlinks: Option<crate::config::DisableSymlinks>,
-    server_limit_rate: PreparedLimitRate,
-    server_post_action: Option<&'static [u8]>,
-    server_expires: PreparedExpires,
-    server_chunked_transfer_encoding: bool,
-    server_limit_req: &crate::config::LimitReqConf,
-    server_limit_conn: &crate::config::LimitConnConf,
-    server_client_timeouts: crate::config::ClientTimeouts,
-    server_proxy_defaults: ServerProxyDefaults,
-    server_gzip: &crate::config::GzipConf,
+    server: &ServerScope<'_>,
     upstreams: &UpstreamMap,
     alp: &mut AccessLogPrep<'_>,
 ) -> Result<PreparedRegexLocation, String> {
@@ -3906,8 +3711,8 @@ pub(crate) fn build_regex_location(
         inherits_root: _,
         explicit_return: _,
     } = l;
-    let proxy_effective = resolve_proxy_effective(location_proxy, server_proxy_defaults);
-    let gzip = prepare_gzip(location_gzip.inherit(server_gzip))?;
+    let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
+    let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
     // The parser already validated this with the same flags + the same
     // `regex::bytes` builder; rebuild here because the compiled `Regex`
     // doesn't survive the AST.
@@ -3928,71 +3733,51 @@ pub(crate) fn build_regex_location(
         keepalive_requests,
         keepalive_time_ms,
         keepalive_disable,
-        server_keepalive,
+        server.keepalive,
     );
-    let tokens = location_server_tokens.unwrap_or(server_tokens_value);
+    let tokens = location_server_tokens.unwrap_or(server.tokens);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
-    let error_pages = resolve_error_pages(location_error_pages, server_error_pages);
+    let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
-        location_recursive_error_pages.unwrap_or(server_recursive_error_pages);
+        location_recursive_error_pages.unwrap_or(server.recursive_error_pages);
     let proxy_effective = ProxyEffective {
         error_pages,
         recursive_error_pages,
         ..proxy_effective
+    };
+    let site = HandlerSite {
+        pattern: location_pattern,
+        is_regex: true,
+        alias_prefix_override,
+        server_index: server.index,
+        autoindex: location_autoindex.unwrap_or(server.autoindex),
+        autoindex_exact_size: location_autoindex_exact_size.unwrap_or(server.autoindex_exact_size),
+        autoindex_localtime: location_autoindex_localtime.unwrap_or(server.autoindex_localtime),
+        autoindex_format: location_autoindex_format.unwrap_or(server.autoindex_format),
+        disable_symlinks: location_disable_symlinks.or_else(|| server.disable_symlinks.clone()),
+        mime: &mime,
+        tokens,
+        upstreams,
     };
     let limited_handler = match &limit_except {
         // `proxy_pass` in the block: the other methods are proxied there,
         // with the location's proxy_* settings (proxy_if.t).
         Some(le) if le.proxy_pass.is_some() => Some(build_handler(
             Handler::Proxy(le.proxy_pass.clone().expect("checked")),
-            location_pattern,
-            true,
-            alias_prefix_override,
             None,
             None,
-            server_index,
-            location_autoindex,
-            location_autoindex_exact_size,
-            location_autoindex_localtime,
-            location_autoindex_format,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            location_disable_symlinks
-                .clone()
-                .or_else(|| server_disable_symlinks.clone()),
-            &mime,
-            tokens,
-            upstreams,
             proxy_effective,
+            &site,
         )?),
         Some(_) if limit_except_rebuilds_handler(&handler, &try_files) => Some(build_handler(
             Handler::Root {
                 path: document_root.0.clone(),
                 mapping: document_root.1,
             },
-            location_pattern,
-            true,
-            alias_prefix_override,
             index.clone(),
             None,
-            server_index,
-            location_autoindex,
-            location_autoindex_exact_size,
-            location_autoindex_localtime,
-            location_autoindex_format,
-            server_autoindex,
-            server_autoindex_exact_size,
-            server_autoindex_localtime,
-            server_autoindex_format,
-            location_disable_symlinks
-                .clone()
-                .or_else(|| server_disable_symlinks.clone()),
-            &mime,
-            tokens,
-            upstreams,
             ProxyEffective::defaults(),
+            &site,
         )?),
         _ => None,
     };
@@ -4001,39 +3786,16 @@ pub(crate) fn build_regex_location(
         location_pattern,
         true,
         alias_prefix_override,
-        location_disable_symlinks
-            .clone()
-            .or_else(|| server_disable_symlinks.clone()),
+        site.disable_symlinks.clone(),
     );
-    let handler = build_handler(
-        handler,
-        location_pattern,
-        true,
-        alias_prefix_override,
-        index,
-        try_files,
-        server_index,
-        location_autoindex,
-        location_autoindex_exact_size,
-        location_autoindex_localtime,
-        location_autoindex_format,
-        server_autoindex,
-        server_autoindex_exact_size,
-        server_autoindex_localtime,
-        server_autoindex_format,
-        location_disable_symlinks.or(server_disable_symlinks),
-        &mime,
-        tokens,
-        upstreams,
-        proxy_effective,
-    )?;
-    let add_headers = resolve_add_headers(location_add_headers, server_add_headers);
-    let add_trailers = resolve_add_headers(location_add_trailers, server_add_trailers);
-    let error_logs = resolve_error_logs(location_error_logs, server_error_logs)?;
-    let log_not_found = location_log_not_found.unwrap_or(server_log_not_found);
+    let handler = build_handler(handler, index, try_files, proxy_effective, &site)?;
+    let add_headers = resolve_add_headers(location_add_headers, server.add_headers);
+    let add_trailers = resolve_add_headers(location_add_trailers, server.add_trailers);
+    let error_logs = resolve_error_logs(location_error_logs, server.error_logs)?;
+    let log_not_found = location_log_not_found.unwrap_or(server.log_not_found);
     let access_logs = match location_access_logs {
         Some(ref list) => alp.prepare_list(list)?,
-        None => server_access_logs,
+        None => server.access_logs,
     };
     let access_logs = alp.with_cache(
         access_logs,
@@ -4044,30 +3806,30 @@ pub(crate) fn build_regex_location(
         location_auth_basic,
         location_auth_basic_user_file,
         location_auth_delay_ms,
-        server_access,
+        server.access,
     );
     let limit_except = limit_except.map(|le| build_limit_except(le, limited_handler, access));
-    let client_max_body_size = location_client_max_body_size.or(server_client_max_body_size);
-    let max_ranges = location_max_ranges.or(server_max_ranges);
+    let client_max_body_size = location_client_max_body_size.or(server.client_max_body_size);
+    let max_ranges = location_max_ranges.or(server.max_ranges);
     let client_body_buffer_size =
-        location_client_body_buffer_size.or(server_client_body_buffer_size);
-    let sendfile = location_sendfile.unwrap_or(server_sendfile);
+        location_client_body_buffer_size.or(server.client_body_buffer_size);
+    let sendfile = location_sendfile.unwrap_or(server.sendfile);
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
-        .or(server_body_temp);
+        .or(server.body_temp);
     let limit_rate = PreparedLimitRate::inherit(
         location_limit_rate,
         location_limit_rate_after,
-        server_limit_rate,
+        server.limit_rate,
     );
     let post_action = location_post_action
         .map(|target| leak_bytes(target.as_bytes()))
-        .or(server_post_action);
+        .or(server.post_action);
     let expires = location_expires
         .map(prepare_expires)
-        .unwrap_or(server_expires);
+        .unwrap_or(server.expires);
     let chunked_transfer_encoding =
-        location_chunked_transfer_encoding.unwrap_or(server_chunked_transfer_encoding);
+        location_chunked_transfer_encoding.unwrap_or(server.chunked_transfer_encoding);
     Ok(PreparedRegexLocation {
         regex,
         set_pattern: set_pattern(&pattern, case_insensitive),
@@ -4099,10 +3861,10 @@ pub(crate) fn build_regex_location(
         expires,
         chunked_transfer_encoding,
         redirect: redirect.policy(),
-        limit_req: prepare_limit_req(location_limit_req.inherit(server_limit_req))?,
-        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server_limit_conn))?,
+        limit_req: prepare_limit_req(location_limit_req.inherit(server.limit_req))?,
+        limit_conn: prepare_limit_conn(location_limit_conn.inherit(server.limit_conn))?,
         timeouts: crate::arena::leak(Box::new(PreparedClientTimeouts::resolve(
-            location_client_timeouts.inherit(server_client_timeouts),
+            location_client_timeouts.inherit(server.client_timeouts),
         ))),
     })
 }

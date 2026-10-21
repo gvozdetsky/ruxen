@@ -33,6 +33,7 @@ use crate::{autoindex, file, fs_resolve, uri};
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) fn finalize_location_response(
     response: Response,
     add_headers: &'static [PreparedAddHeader],
@@ -620,6 +621,7 @@ pub(crate) fn forward_client_headers<'a>(
 /// The variable-render context of a request in a location: the `return`
 /// body, `add_header` values and error pages share it.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 fn location_render_ctx<'a>(
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
@@ -696,6 +698,7 @@ fn location_render_ctx<'a>(
 /// phase runs before the access phase.
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) fn finish_access_denial(
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
@@ -790,6 +793,7 @@ fn range_too_far(range: &[u8], max: u64) -> bool {
         .is_some_and(|offset| offset >= max)
 }
 
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) fn run_location_handler(
     http: &'static PreparedHttp,
     server: &'static PreparedServer,
@@ -1573,13 +1577,15 @@ fn entity_too_large(
     )
 }
 
+/// `(prebuilt ptr, add_headers ptr)` → the prebuilt with those headers
+/// applied, or `None` when some value has variables.
+type PrebuiltAddHeaders = std::collections::HashMap<(usize, usize), Option<&'static [u8]>>;
+
 thread_local! {
-    /// `(prebuilt ptr, add_headers ptr)` → the prebuilt with those headers
-    /// applied, or `None` when some value has variables. Both keys are
-    /// `'static` config data, so the map is bounded by the config.
-    static PREBUILT_ADD_HEADERS: std::cell::RefCell<
-        std::collections::HashMap<(usize, usize), Option<&'static [u8]>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Both keys are `'static` config data, so the map is bounded by the
+    /// config.
+    static PREBUILT_ADD_HEADERS: std::cell::RefCell<PrebuiltAddHeaders> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// A static `return` with `add_header`s whose values are all literals

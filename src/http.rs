@@ -163,6 +163,7 @@ impl ParseState {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // per request: boxing waits for #467's measurements
 pub enum Parse {
     Complete(Request),
     Incomplete,

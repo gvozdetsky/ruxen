@@ -102,8 +102,11 @@ struct Backend {
     addr: SocketAddr,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Captured first-line + Host header of the most recent request seen.
-    seen: std::sync::Arc<Mutex<Option<(String, Option<String>)>>>,
+    seen: std::sync::Arc<Mutex<Option<SeenRequest>>>,
 }
+
+/// A request's first line, and its Host header if it had one.
+type SeenRequest = (String, Option<String>);
 
 impl Backend {
     fn spawn(response: Vec<u8>) -> Self {
@@ -169,7 +172,7 @@ impl Backend {
         Backend { addr, stop, seen }
     }
 
-    fn last_request(&self) -> Option<(String, Option<String>)> {
+    fn last_request(&self) -> Option<SeenRequest> {
         self.seen.lock().unwrap().clone()
     }
 }
