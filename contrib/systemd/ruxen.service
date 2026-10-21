@@ -47,6 +47,10 @@ CacheDirectory=ruxen
 RuntimeDirectory=ruxen
 # Raise it for many connections; worker_rlimit_nofile can't go above it.
 LimitNOFILE=65536
+# Each worker's io_uring ring, about 0.5 MiB, counts against it on
+# Linux 7.0, and a reload holds the old workers' rings for a while: the
+# default 8 MiB fits about 16 workers.
+LimitMEMLOCK=128M
 
 # Hardening. ruxen runs on io_uring: the system-call filter has to let
 # io_uring_setup, io_uring_enter and io_uring_register through. Recent

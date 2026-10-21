@@ -496,6 +496,7 @@ impl Generation {
             arena: Some(arena),
         };
         let mut error = None;
+        let ring_entries = worker::ring_entries(http, settings.workers);
         for (i, own) in listeners.into_iter().enumerate() {
             let cpu = if settings.pin { Some(i) } else { None };
             let ready = ready_tx.clone();
@@ -504,7 +505,7 @@ impl Generation {
                 .name(format!("ruxen-worker-{i}"))
                 .spawn(move || {
                     let _exited = exited;
-                    worker::run(http, cpu, state, ready, own)
+                    worker::run(http, cpu, state, ready, own, ring_entries)
                 });
             match spawned {
                 Ok(handle) => generation.handles.push(handle),
