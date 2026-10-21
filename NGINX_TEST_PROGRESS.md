@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-19 against `nginx-tests` 0b70854 (2026-09-30).
+Last run: 2026-10-21 against `nginx-tests` ec44bc8 (2026-10-16).
 
 ## Summary
 
-- **Total tests tracked:** 505
-- **Passing in ruxen:** 170
-- **Intentionally skipped (`-V` banner excludes the module):** 314
-- **Failing — work in progress:** 21
+- **Total tests tracked:** 511
+- **Passing in ruxen:** 172
+- **Intentionally skipped (`-V` banner excludes the module):** 319
+- **Failing — work in progress:** 20
 
-The three groups below are mutually exclusive and sum to 505.
+The three groups below are mutually exclusive and sum to 511.
 
-## Passing in ruxen (170)
+## Passing in ruxen (172)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -169,7 +169,9 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `ssl_sni.t`
 - `ssl_sni_reneg.t`
 - `ssl_sni_sessions.t`
+- `ssl_stapling.t`
 - `ssl_verify_client.t`
+- `ssl_verify_client_trusted.t`
 - `ssl_verify_depth.t`
 - `stub_status.t`
 - `syslog.t`
@@ -188,12 +190,12 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout_h2.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (21)
+## Failing — actively being worked on (20)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
 - `h2_error_page.t` — 1/4
-- `h2_headers.t` — 41/112
+- `h2_headers.t` — 0/0
 - `h2_host.t` — 4/62
 - `h2_keepalive.t` — 3/21
 - `h2_priority.t` — 11/24
@@ -212,13 +214,12 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `proxy_request_buffering_chunked.t` — 3/24
 - `proxy_request_buffering_ssl.t` — 3/20
 - `ssl_ocsp.t` — 0/0
-- `ssl_stapling.t` — 5/12
 
-## Intentionally skipped (314)
+## Intentionally skipped (319)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
-### no stream available (84)
+### no stream available (87)
 
 - `proxy_protocol_ipv6.t`
 - `proxy_protocol_unix.t`
@@ -228,9 +229,12 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `stream_access_log_none.t`
 - `stream_error_log.t`
 - `stream_geo.t`
+- `stream_geo_binary.t`
+- `stream_geo_include.t`
 - `stream_geo_ipv6.t`
 - `stream_geo_unix.t`
 - `stream_geoip.t`
+- `stream_geoip2.t`
 - `stream_limit_conn.t`
 - `stream_limit_conn_complex.t`
 - `stream_limit_conn_dry_run.t`
@@ -419,6 +423,17 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `sub_filter_perl.t`
 - `sub_filter_ssi.t`
 
+### no geo available (8)
+
+- `geo.t`
+- `geo_binary.t`
+- `geo_include.t`
+- `geo_ipv6.t`
+- `geo_unix.t`
+- `geo_volatile.t`
+- `ssl_certificate.t`
+- `ssl_store_keys.t`
+
 ### no upstream_sticky available (8)
 
 - `upstream_max_conns_sticky.t`
@@ -458,15 +473,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `h2.t`
 - `range.t`
 - `range_charset.t`
-
-### no geo available (6)
-
-- `geo.t`
-- `geo_ipv6.t`
-- `geo_unix.t`
-- `geo_volatile.t`
-- `ssl_certificate.t`
-- `ssl_store_keys.t`
 
 ### no perl available (6)
 
@@ -515,6 +521,13 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `mp4_start_key_frame.t`
 - `range_mp4.t`
 
+### no openssl:1.0.2 available (4)
+
+- `proxy_ssl_certificate_cache.t`
+- `ssl_certificate_cache.t`
+- `ssl_conf_command.t`
+- `ssl_sigalgs.t`
+
 ### can leave orphaned process group (3)
 
 - `binary_upgrade.t`
@@ -545,12 +558,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `mirror.t`
 - `mirror_proxy.t`
 
-### no openssl:1.0.2 available (3)
-
-- `proxy_ssl_certificate_cache.t`
-- `ssl_certificate_cache.t`
-- `ssl_conf_command.t`
-
 ### no resolve in upstream server (3)
 
 - `upstream_resolve.t`
@@ -580,11 +587,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `http_listen_wildcard.t`
 - `stream_udp_wildcard.t`
 
-### long configuration parsing (2)
-
-- `geo_binary.t`
-- `stream_geo_binary.t`
-
 ### no addition available (2)
 
 - `addition.t`
@@ -594,6 +596,11 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `control_api.t`
 - `control_api_unix.t`
+
+### no http_geoip available (2)
+
+- `geoip.t`
+- `geoip2.t`
 
 ### no image_filter available (2)
 
@@ -635,6 +642,10 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `ssl_engine_keys.t`
 
+### no Linux KTLS (1)
+
+- `ssl_ktls.t`
+
 ### no disable_symlinks (1)
 
 - `http_disable_symlinks.t`
@@ -646,10 +657,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 ### no flv available (1)
 
 - `range_flv.t`
-
-### no http_geoip available (1)
-
-- `geoip.t`
 
 ### no json available (1)
 
@@ -710,8 +717,4 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 ### not win32 (1)
 
 - `http_location_win32.t`
-
-### wants ssl_client_certificate (1)
-
-- `ssl_verify_client_trusted.t`
 

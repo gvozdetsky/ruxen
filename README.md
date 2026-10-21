@@ -22,7 +22,7 @@ See [`DESIGN.md`](DESIGN.md) for the architecture notes and the reasoning behind
 
 ## Current status
 
-Version 0.2.0. In short:
+Version 0.2.1. In short:
 
 - Linux only, x86_64 and aarch64
 - HTTP/1.1, and HTTP/2 for clients (`http2 on`; over TLS through ALPN, and cleartext with prior knowledge)
@@ -34,7 +34,7 @@ Version 0.2.0. In short:
 - configuration reload without dropping connections (`SIGHUP`, `-s reload`)
 - no dynamic modules
 
-The upstream `nginx-tests` suite is used as a compatibility test. **165 of the 191 test files that ruxen currently opts into pass end-to-end** (v0.2.0; v0.1.3: 105 of 159).
+The upstream `nginx-tests` suite is used as a compatibility test. **172 of the 192 test files that ruxen currently opts into pass end-to-end** (v0.2.1; v0.2.0: 165 of 191).
 
 See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, and [`ROADMAP.md`](ROADMAP.md) for where ruxen is going: first a memory-safe edge server (TLS termination, reverse proxy, static files) that takes your nginx configuration.
 
@@ -150,7 +150,7 @@ ruxen --compat -c /etc/nginx/nginx.conf
 ```
 
 ```text
-ruxen 0.2.0: checking /etc/nginx/nginx.conf
+ruxen 0.2.1: checking /etc/nginx/nginx.conf
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
 /etc/nginx/nginx.conf:41: differs: ssl_early_data on — TLS 1.3 early data is not accepted
 -: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
