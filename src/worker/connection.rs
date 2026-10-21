@@ -152,6 +152,10 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
         None
     }
 
+    /// For an HTTP/2 stream, the largest DATA frame of the response: the
+    /// `http2_chunk_size` of the request's location (#594).
+    fn set_h2_chunk(&mut self, _chunk: usize) {}
+
     /// For an HTTP/2 stream, whether its `:authority` and `Host` differ,
     /// which nginx refuses with 400 (#592).
     fn h2_authority_mismatch(&self) -> bool {

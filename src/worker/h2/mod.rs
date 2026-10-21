@@ -391,11 +391,9 @@ async fn serve_stream(
         return misdirected(respond);
     }
     let listen = &ctx.http.listens[ctx.listen_index];
-    // nginx's default http2_chunk_size: DATA frames of at most 8 KiB.
-    let chunk = listen.servers[listen.default_server]
-        .h2
-        .chunk_size
-        .unwrap_or(8 * 1024) as usize;
+    // The default server's http2_chunk_size, until the request has a
+    // location: `handle` then sets the location's (#594).
+    let chunk = listen.servers[listen.default_server].timeouts.h2_chunk;
     let mut io = stream::StreamIo::new(&parts, body, respond, counters, chunk, header_block);
     super::handle(
         &mut io,

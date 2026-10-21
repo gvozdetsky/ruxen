@@ -3341,9 +3341,11 @@ pub(crate) async fn handle<S: ConnIo>(
     // The default server's client timeouts: the header is read before a
     // virtual server is chosen (as in nginx). A request's body and response
     // use its location's client_body_timeout and send_timeout (#147).
-    let timeouts = {
+    // Borrowed, not copied: the connection's future holds a pointer, not
+    // the struct, which grew with `h2_chunk` (#594).
+    let timeouts: &'static PreparedClientTimeouts = {
         let listen = &http.listens[listen_index];
-        listen.servers[listen.default_server].timeouts
+        &listen.servers[listen.default_server].timeouts
     };
     // A new connection gets client_header_timeout to send its first request
     // (nginx's post-accept timeout); later waits use keepalive_timeout.
@@ -4051,6 +4053,10 @@ pub(crate) async fn handle<S: ConnIo>(
                         // the next request's header waits use the default
                         // server's values again, as in nginx.
                         let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
+                        // And on an HTTP/2 stream, its http2_chunk_size (#594).
+                        if let Some(t) = process_meta.timeouts {
+                            stream.set_h2_chunk(t.h2_chunk);
+                        }
 
                         // An upstream 101 to a client that asked to upgrade:
                         // the head goes out, then the connection is a tunnel

@@ -721,6 +721,10 @@ impl super::super::ConnIo for StreamIo {
         Some(self.header_block)
     }
 
+    fn set_h2_chunk(&mut self, chunk: usize) {
+        self.chunk = chunk.max(1);
+    }
+
     fn h2_authority_mismatch(&self) -> bool {
         self.authority_mismatch
     }

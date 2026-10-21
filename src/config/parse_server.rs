@@ -416,7 +416,8 @@ pub(crate) fn parse_server_block(
                 name @ ("client_header_timeout"
                 | "client_body_timeout"
                 | "send_timeout"
-                | "large_client_header_buffers"),
+                | "large_client_header_buffers"
+                | "http2_chunk_size"),
                 Terminator::Semi,
             ) => {
                 client_timeouts.parse(name, &args)?;

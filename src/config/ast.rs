@@ -10,7 +10,10 @@ use std::path::PathBuf;
 /// `client_header_timeout`, `client_body_timeout` and `send_timeout`
 /// (milliseconds); `None` means nginx's default, 60 s. Also
 /// `large_client_header_buffers` (#482): like `client_header_timeout`, the
-/// default server's applies while a request head is read.
+/// default server's applies while a request head is read. And
+/// `http2_chunk_size` (#594), the other location setting of the response
+/// writer: it goes through the same levels (http, server, location) and
+/// reaches the writer the same way, with the request's location.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClientTimeouts {
     pub header_ms: Option<u64>,
@@ -18,11 +21,13 @@ pub struct ClientTimeouts {
     pub send_ms: Option<u64>,
     /// `large_client_header_buffers number size`.
     pub large_header_buffers: Option<(u64, u64)>,
+    /// `http2_chunk_size`: the largest DATA frame of a response.
+    pub h2_chunk_size: Option<u32>,
 }
 
 impl ClientTimeouts {
-    /// Parse one of the three directives into `self`; `false` when `name`
-    /// is none of them.
+    /// Parse one of these directives into `self`; `false` when `name` is
+    /// none of them.
     pub(crate) fn parse(
         &mut self,
         name: &str,
@@ -35,6 +40,13 @@ impl ClientTimeouts {
             "send_timeout" => (&mut self.send_ms, "send_timeout"),
             "large_client_header_buffers" => {
                 return self.parse_large_header_buffers(args).map(|()| true);
+            }
+            "http2_chunk_size" => {
+                if self.h2_chunk_size.is_some() {
+                    return Err(Error::Duplicate("http2_chunk_size"));
+                }
+                self.h2_chunk_size = Some(super::parse_http2::parse_chunk_size(args)?);
+                return Ok(true);
             }
             _ => return Ok(false),
         };
@@ -88,6 +100,7 @@ impl ClientTimeouts {
             body_ms: self.body_ms.or(parent.body_ms),
             send_ms: self.send_ms.or(parent.send_ms),
             large_header_buffers: self.large_header_buffers.or(parent.large_header_buffers),
+            h2_chunk_size: self.h2_chunk_size.or(parent.h2_chunk_size),
         }
     }
 }

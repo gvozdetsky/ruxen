@@ -749,6 +749,6 @@ Not supported: `xml_entities`, `xslt_stylesheet`, `xslt_param`, `xslt_string_par
 | `http2_streams_index_size` | yes | http, server |  |
 | `http2_recv_timeout` | accepted, differs | http, server | the "http2_recv_timeout" directive is obsolete, use the "client_header_timeout" directive instead |
 | `http2_idle_timeout` | accepted, differs | http, server | the "http2_idle_timeout" directive is obsolete, use the "keepalive_timeout" directive instead |
-| `http2_chunk_size` | yes | http, server |  |
-| `http2_push_preload` | accepted, differs | http, server | the "http2_push_preload" directive is obsolete, ignored |
-| `http2_push` | accepted, differs | http, server | the "http2_push" directive is obsolete, ignored |
+| `http2_chunk_size` | yes | http, server, location |  |
+| `http2_push_preload` | accepted, differs | http, server, location | the "http2_push_preload" directive is obsolete, ignored |
+| `http2_push` | accepted, differs | http, server, location | the "http2_push" directive is obsolete, ignored |

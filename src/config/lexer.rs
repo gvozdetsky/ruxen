@@ -112,6 +112,11 @@ impl Lexer {
         self.warnings.push(warning);
     }
 
+    /// The `[warn]` lines so far, for a parser that adds each line once.
+    pub(crate) fn warnings_mut(&mut self) -> &mut Vec<String> {
+        &mut self.warnings
+    }
+
     pub(crate) fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.warnings)
     }

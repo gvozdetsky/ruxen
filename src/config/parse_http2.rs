@@ -3,7 +3,10 @@
 //! (on/off) is parsed with the other server settings. The obsolete
 //! directives are accepted with nginx's warning and change nothing, as in
 //! nginx ≥ 1.25.1 (server push is gone, the timeouts and limits moved to
-//! the core module's directives).
+//! the core module's directives). `http2_chunk_size`, `http2_push` and
+//! `http2_push_preload` are location settings too (#594); the chunk size
+//! lives in `ClientTimeouts`, which carries the location's response
+//! settings to the writer.
 
 use super::*;
 
@@ -13,8 +16,6 @@ pub struct Http2Conf {
     pub max_concurrent_streams: Option<u32>,
     /// `http2_body_preread_size` (default 64k): the stream window.
     pub body_preread_size: Option<u32>,
-    /// `http2_chunk_size` (default 8k): the largest DATA frame sent.
-    pub chunk_size: Option<u32>,
 }
 
 /// The obsolete ones, with what replaces each (`None`: nothing).
@@ -41,7 +42,7 @@ impl Http2Conf {
     pub(crate) fn takes(name: &str) -> bool {
         matches!(
             name,
-            "http2_max_concurrent_streams" | "http2_body_preread_size" | "http2_chunk_size"
+            "http2_max_concurrent_streams" | "http2_body_preread_size"
         ) || OBSOLETE.iter().any(|(n, _)| *n == name)
             || NO_OP.contains(&name)
     }
@@ -52,7 +53,6 @@ impl Http2Conf {
                 .max_concurrent_streams
                 .or(parent.max_concurrent_streams),
             body_preread_size: self.body_preread_size.or(parent.body_preread_size),
-            chunk_size: self.chunk_size.or(parent.chunk_size),
         }
     }
 
@@ -65,7 +65,6 @@ impl Http2Conf {
         let what: &'static str = match name {
             "http2_max_concurrent_streams" => "http2_max_concurrent_streams",
             "http2_body_preread_size" => "http2_body_preread_size",
-            "http2_chunk_size" => "http2_chunk_size",
             _ => {
                 if args.len() != 2 {
                     return Err(Error::BadValue {
@@ -99,8 +98,7 @@ impl Http2Conf {
         };
         let slot = match name {
             "http2_max_concurrent_streams" => &mut self.max_concurrent_streams,
-            "http2_body_preread_size" => &mut self.body_preread_size,
-            _ => &mut self.chunk_size,
+            _ => &mut self.body_preread_size,
         };
         if slot.is_some() {
             return Err(Error::Duplicate(what));
@@ -110,8 +108,7 @@ impl Http2Conf {
         } else {
             parse_location::parse_size(value.as_bytes()).ok_or_else(bad)?
         };
-        // nginx: the preread size is at most the largest window, and a
-        // chunk of 0 is "invalid".
+        // nginx: the preread size is at most the largest window.
         let n = match name {
             "http2_body_preread_size" if n > (1 << 31) - 1 => {
                 return Err(Error::BadValue {
@@ -119,16 +116,33 @@ impl Http2Conf {
                     got: format!("{value}: the maximum body preread buffer size is 2147483647"),
                 });
             }
-            "http2_chunk_size" if n == 0 => {
-                return Err(Error::BadValue {
-                    what,
-                    got: format!("{value}: the http2 chunk size cannot be zero"),
-                });
-            }
             _ => u32::try_from(n).map_err(|_| bad())?,
         };
         *slot = Some(n);
         Ok(())
+    }
+}
+
+/// `http2_chunk_size size;`, at every level (`ClientTimeouts`). nginx: a
+/// chunk of 0 is invalid (ngx_http_v2_chunk_size).
+pub(crate) fn parse_chunk_size(args: &[String]) -> Result<u32, Error> {
+    const WHAT: &str = "http2_chunk_size";
+    let [_, value] = args else {
+        return Err(Error::BadValue {
+            what: WHAT,
+            got: args.join(" "),
+        });
+    };
+    let bad = || Error::BadValue {
+        what: WHAT,
+        got: value.clone(),
+    };
+    match parse_location::parse_size(value.as_bytes()).ok_or_else(bad)? {
+        0 => Err(Error::BadValue {
+            what: WHAT,
+            got: format!("{value}: the http2 chunk size cannot be zero"),
+        }),
+        n => u32::try_from(n).map_err(|_| bad()),
     }
 }
 
@@ -146,18 +160,24 @@ mod tests {
         let mut w = Vec::new();
         http.parse(&args("http2_max_concurrent_streams 64"), &mut w)
             .unwrap();
-        http.parse(&args("http2_chunk_size 16k"), &mut w).unwrap();
         let mut server = Http2Conf::default();
         server
             .parse(&args("http2_body_preread_size 0"), &mut w)
             .unwrap();
         let merged = server.inherit(&http);
         assert_eq!(merged.max_concurrent_streams, Some(64));
-        assert_eq!(merged.chunk_size, Some(16384));
         assert_eq!(merged.body_preread_size, Some(0));
         assert!(w.is_empty());
-        assert!(http.parse(&args("http2_chunk_size 4k"), &mut w).is_err());
-        assert!(server.parse(&args("http2_chunk_size 0"), &mut w).is_err());
+        assert!(
+            http.parse(&args("http2_max_concurrent_streams 8"), &mut w)
+                .is_err()
+        );
+        assert_eq!(
+            parse_chunk_size(&args("http2_chunk_size 16k")).ok(),
+            Some(16384)
+        );
+        assert!(parse_chunk_size(&args("http2_chunk_size 0")).is_err());
+        assert!(parse_chunk_size(&args("http2_chunk_size")).is_err());
         assert!(
             server
                 .parse(&args("http2_max_concurrent_streams x"), &mut w)
