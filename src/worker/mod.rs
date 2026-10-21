@@ -141,41 +141,86 @@ pub(crate) enum AccessLogSink {
     PerLine,
 }
 
+impl AccessLogSink {
+    /// Another handle on the same file or socket: what an access_log keeps
+    /// when its reopen fails (#522).
+    fn try_clone(&self) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        Ok(match self {
+            AccessLogSink::File(file) => {
+                // SAFETY: `dup` of a descriptor `file` owns; the new one is
+                // owned by the `File` made from it.
+                let fd = unsafe { libc::dup(file.as_raw_fd()) };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: `fd` is a fresh descriptor nothing else owns.
+                AccessLogSink::File(AsyncFile::from_std(unsafe {
+                    std::fs::File::from_raw_fd(fd)
+                })?)
+            }
+            AccessLogSink::Syslog(sock) => AccessLogSink::Syslog(sock.try_clone()?),
+            AccessLogSink::PerLine => AccessLogSink::PerLine,
+        })
+    }
+}
+
 fn open_access_logs(logs: &[PreparedAccessLog]) -> Result<std::rc::Rc<[AccessLogSink]>, String> {
-    let mut opened: Vec<AccessLogSink> = Vec::with_capacity(logs.len());
-    for log in logs {
-        if log.path_vars.is_some() {
-            opened.push(AccessLogSink::PerLine);
-            continue;
-        }
-        if let Some(peer) = log.syslog {
-            let sock = crate::syslog::SyslogSocket::open(peer).map_err(|e| {
-                format!(
-                    "syslog \"{}\" failed ({})",
-                    log.path.display(),
-                    errno_text(&e)
-                )
-            })?;
-            opened.push(AccessLogSink::Syslog(sock));
-            continue;
-        }
-        let open_failed = |e: std::io::Error| {
+    logs.iter().map(open_access_log).collect()
+}
+
+fn open_access_log(log: &PreparedAccessLog) -> Result<AccessLogSink, String> {
+    if log.path_vars.is_some() {
+        return Ok(AccessLogSink::PerLine);
+    }
+    if let Some(peer) = log.syslog {
+        let sock = crate::syslog::SyslogSocket::open(peer).map_err(|e| {
             format!(
-                "open() \"{}\" failed ({})",
+                "syslog \"{}\" failed ({})",
                 log.path.display(),
                 errno_text(&e)
             )
-        };
-        let std_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log.path)
-            .map_err(open_failed)?;
-        opened.push(AccessLogSink::File(
-            AsyncFile::from_std(std_file).map_err(open_failed)?,
-        ));
+        })?;
+        return Ok(AccessLogSink::Syslog(sock));
     }
-    Ok(opened.into())
+    let open_failed = |e: std::io::Error| {
+        format!(
+            "open() \"{}\" failed ({})",
+            log.path.display(),
+            errno_text(&e)
+        )
+    };
+    let std_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log.path)
+        .map_err(open_failed)?;
+    Ok(AccessLogSink::File(
+        AsyncFile::from_std(std_file).map_err(open_failed)?,
+    ))
+}
+
+/// SIGUSR1: each access_log on its own, as ngx_reopen_files does: one that
+/// can't be opened is logged at `emerg` and keeps its old file or socket,
+/// and the others move to the new files (#522).
+fn reopen_access_logs(
+    logs: &[PreparedAccessLog],
+    old: &std::rc::Rc<[AccessLogSink]>,
+    error_logs: &[PreparedErrorLog],
+) -> std::rc::Rc<[AccessLogSink]> {
+    let reopened: std::io::Result<std::rc::Rc<[AccessLogSink]>> = logs
+        .iter()
+        .zip(old.iter())
+        .map(|(log, old)| match open_access_log(log) {
+            Ok(sink) => Ok(sink),
+            Err(e) => {
+                write_worker_log(error_logs, ErrorLogLevel::Emerg, &e);
+                old.try_clone()
+            }
+        })
+        .collect();
+    // Out of descriptors for the copy: all of them stay on the old files.
+    reopened.unwrap_or_else(|_| old.clone())
 }
 
 /// `prepare` already opened every access_log once, so a failure here
@@ -192,8 +237,12 @@ pub(crate) fn init_access_logs_for_worker(logs: &[PreparedAccessLog]) -> Result<
 }
 
 /// This worker's access_log files, reopened first if SIGUSR1 arrived
-/// since they were opened. `None` before `init_access_logs_for_worker`.
-pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc<[AccessLogSink]>> {
+/// since they were opened (a failure goes to `error_logs`). `None` before
+/// `init_access_logs_for_worker`.
+pub(crate) fn access_log_files(
+    logs: &[PreparedAccessLog],
+    error_logs: &[PreparedErrorLog],
+) -> Option<std::rc::Rc<[AccessLogSink]>> {
     let generation = LOG_REOPEN_GEN.load(std::sync::atomic::Ordering::Relaxed);
     ACCESS_LOG_FILES.with(|cell| {
         let mut cell = cell.borrow_mut();
@@ -203,10 +252,8 @@ pub(crate) fn access_log_files(logs: &[PreparedAccessLog]) -> Option<std::rc::Rc
             if let Some(old) = &cell.1 {
                 logbuf::flush_all(old);
             }
-            match open_access_logs(logs) {
-                Ok(files) => cell.1 = Some(files),
-                // nginx keeps writing to the old file when a reopen fails.
-                Err(e) => eprintln!("ruxen: [alert] reopening access_log: {e}"),
+            if let Some(old) = &cell.1 {
+                cell.1 = Some(reopen_access_logs(logs, old, error_logs));
             }
         }
         cell.1.clone()
