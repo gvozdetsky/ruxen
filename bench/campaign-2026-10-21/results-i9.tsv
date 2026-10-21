@@ -1,0 +1,64 @@
+r021-aa	rc-cb24d29-i9	rc-cb24d29-i9-copy	m1_hello	2026-10-20T23:28:01+02:00	0.06	error: ruxen did not become ready: http://127.0.0.1:8080/
+r021	rc3-fc9ba99-i9	rc-cb24d29-i9	m1_hello	2026-10-20T23:28:01+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8080/
+r021	rc3-fc9ba99-i9	rc-cb24d29-i9	proxy_hello	2026-10-20T23:28:01+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8095/
+r021	rc3-fc9ba99-i9	rc-cb24d29-i9	tls_hello	2026-10-20T23:28:01+02:00	0.13	error: ruxen did not become ready: https://127.0.0.1:8443/
+r021	rc3-fc9ba99-i9	rc-cb24d29-i9	m3_static_1k	2026-10-20T23:28:01+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8090/hello.txt
+r021	rc3-fc9ba99-i9	rc-cb24d29-i9	proxy_64k	2026-10-20T23:28:01+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8144/64k.bin
+r021	rc3-fc9ba99-i9	rc-cb24d29-i9	h2c_hello	2026-10-20T23:28:02+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8180/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	m1_hello	2026-10-20T23:28:02+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8080/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	m1_no_keepalive	2026-10-20T23:28:02+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8081/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	m1_keepalive_requests_1	2026-10-20T23:28:02+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8082/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	m3_static_1k	2026-10-20T23:28:02+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8090/hello.txt
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	m5_range_206	2026-10-20T23:28:03+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8090/hello.txt
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	m19_stream_1m	2026-10-20T23:28:03+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8090/1M.bin
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	static_8k	2026-10-20T23:28:03+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8102/hello.txt
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	static_64k	2026-10-20T23:28:04+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8133/64k.bin
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	static_1m_sendfile_off	2026-10-20T23:28:04+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8133/nosf/1M.bin
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	static_index	2026-10-20T23:28:05+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8133/dir/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	try_files_hit	2026-10-20T23:28:06+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8133/spa/app.js
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	rewrite_hello	2026-10-20T23:28:06+02:00	0.13	error: ruxen did not become ready: http://127.0.0.1:8097/foo
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	vars_map	2026-10-20T23:28:06+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8100/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	regex_locations_50	2026-10-20T23:28:07+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8130/re49/item
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	vhost_regex_20	2026-10-20T23:28:07+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8132/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	access_log_hello	2026-10-20T23:28:07+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8134/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	autoindex_100	2026-10-20T23:28:08+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8133/list/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	gzip_html_8k	2026-10-20T23:28:08+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8105/index.html
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	limit_req_static_1k	2026-10-20T23:28:08+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8106/hello.txt
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	proxy_hello	2026-10-20T23:28:08+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8095/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	proxy_64k	2026-10-20T23:28:09+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8144/64k.bin
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	proxy_1m	2026-10-20T23:28:09+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8144/1M.bin
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	proxy_post_64k	2026-10-20T23:28:09+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8135/proxy
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	proxy_no_upstream_keepalive	2026-10-20T23:28:09+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8140/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	proxy_cache_hit	2026-10-20T23:28:10+02:00	0.20	error: ruxen did not become ready: http://127.0.0.1:8170/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	tls_hello	2026-10-20T23:28:10+02:00	0.20	error: ruxen did not become ready: https://127.0.0.1:8443/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	tls13_handshake	2026-10-20T23:28:10+02:00	0.20	error: ruxen did not become ready: https://127.0.0.1:8451/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	tls_static_1m	2026-10-20T23:28:11+02:00	0.20	error: ruxen did not become ready: https://127.0.0.1:8454/1M.bin
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	tls_proxy_hello	2026-10-20T23:28:11+02:00	0.18	error: ruxen did not become ready: https://127.0.0.1:8455/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	h2c_hello	2026-10-20T23:28:12+02:00	0.18	error: ruxen did not become ready: http://127.0.0.1:8180/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	h2_tls_hello	2026-10-20T23:28:12+02:00	0.18	error: ruxen did not become ready: https://127.0.0.1:8181/
+c021-i9	nginx-1.30.6	rc-cb24d29-i9	h2c_static_8k	2026-10-20T23:28:13+02:00	0.18	error: ruxen did not become ready: http://127.0.0.1:8180/hello.txt
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	m1_hello	2026-10-20T23:32:23+02:00	36.89	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 100.5% (geometric mean; median 100.7%, min 99.7%, max 101.0%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	m1_no_keepalive	2026-10-20T23:36:33+02:00	25.96	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 100.2% (geometric mean; median 100.1%, min 99.3%, max 101.8%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	m3_static_1k	2026-10-20T23:40:43+02:00	37.54	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 100.2% (geometric mean; median 100.0%, min 99.3%, max 101.3%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	static_8k	2026-10-20T23:44:53+02:00	37.88	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 99.6% (geometric mean; median 99.6%, min 99.3%, max 100.0%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	m19_stream_1m	2026-10-20T23:49:03+02:00	26.32	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 99.9% (geometric mean; median 99.9%, min 99.4%, max 100.4%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	regex_locations_50	2026-10-20T23:53:15+02:00	38.86	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 100.2% (geometric mean; median 100.2%, min 99.2%, max 101.2%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	gzip_html_8k	2026-10-20T23:57:26+02:00	34.24	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 99.7% (geometric mean; median 99.6%, min 99.3%, max 100.5%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	proxy_hello	2026-10-21T00:01:35+02:00	38.50	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 99.5% (geometric mean; median 99.4%, min 98.2%, max 100.7%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	proxy_64k	2026-10-21T00:05:46+02:00	37.99	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 100.0% (geometric mean; median 99.9%, min 99.6%, max 100.4%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	proxy_post_64k	2026-10-21T00:09:57+02:00	34.28	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 99.7% (geometric mean; median 99.7%, min 99.3%, max 100.2%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	tls_hello	2026-10-21T00:14:08+02:00	37.26	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 99.3% (geometric mean; median 98.9%, min 98.6%, max 100.8%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	tls13_handshake	2026-10-21T00:18:20+02:00	25.93	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 100.1% (geometric mean; median 100.1%, min 99.9%, max 100.3%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	h2c_hello	2026-10-21T00:22:29+02:00	32.41	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 99.5% (geometric mean; median 98.8%, min 96.2%, max 104.1%, 6 pairs)
+c021-nginx-i9	nginx-1.24.0	nginx-1.30.6	h2_tls_hello	2026-10-21T00:26:39+02:00	29.72	ruxen:nginx-1.30.6 / ruxen:nginx-1.24.0: 100.5% (geometric mean; median 100.5%, min 98.0%, max 102.8%, 6 pairs)
+r021-aa-end	rc-cb24d29-i9	rc-cb24d29-i9-copy	m1_hello	2026-10-21T00:26:39+02:00	29.72	error: ruxen did not become ready: http://127.0.0.1:8080/
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	m1_hello	2026-10-21T05:39:11+02:00	35.36	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 102.2% (geometric mean; median 102.5%, min 101.1%, max 103.3%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	m1_no_keepalive	2026-10-21T05:43:22+02:00	25.80	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 95.7% (geometric mean; median 96.2%, min 93.2%, max 97.3%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	m3_static_1k	2026-10-21T05:47:32+02:00	36.70	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 105.0% (geometric mean; median 104.7%, min 103.8%, max 107.1%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	static_8k	2026-10-21T05:51:42+02:00	36.69	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 100.9% (geometric mean; median 100.7%, min 100.5%, max 101.7%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	proxy_hello	2026-10-21T05:55:52+02:00	36.25	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 97.2% (geometric mean; median 96.8%, min 95.8%, max 99.4%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	proxy_64k	2026-10-21T06:00:03+02:00	37.39	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 110.5% (geometric mean; median 110.4%, min 110.2%, max 110.8%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	tls_hello	2026-10-21T06:04:14+02:00	36.20	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 108.8% (geometric mean; median 108.6%, min 106.5%, max 112.0%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	h2c_hello	2026-10-21T06:08:23+02:00	29.44	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 118.2% (geometric mean; median 119.4%, min 113.7%, max 121.2%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	regex_locations_50	2026-10-21T06:12:35+02:00	38.66	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 125.5% (geometric mean; median 125.5%, min 124.7%, max 126.6%, 6 pairs)
+c021-i9b	nginx-1.30.6	pr613-2f4950eb	m19_stream_1m	2026-10-21T06:16:45+02:00	31.09	ruxen:pr613-2f4950eb / ruxen:nginx-1.30.6: 112.2% (geometric mean; median 112.1%, min 111.6%, max 113.1%, 6 pairs)
