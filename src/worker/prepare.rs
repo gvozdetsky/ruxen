@@ -3404,18 +3404,6 @@ fn open_access_log_file(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-fn open_log_file(path: &Path) -> Result<(), String> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(drop)
-        .map_err(|e| format!("open() \"{}\" failed ({})", path.display(), errno_text(&e)))?;
-    // Reopened after logrotate by the `user` ruxen switches to.
-    crate::privileges::note_file(path);
-    Ok(())
-}
-
 pub(crate) fn prepare_error_log_target(
     target: ErrorLogTarget,
 ) -> Result<PreparedErrorLogTarget, String> {
