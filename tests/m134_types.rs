@@ -131,7 +131,7 @@ fn charset_labels_content_type_like_nginx() {
     let dir = std::env::temp_dir().join(format!("ruxen-m134-charset-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("www")).unwrap();
-    for f in ["a.html", "a.css", "a.js"] {
+    for f in ["a.html", "a.css", "a.js", "x.noext"] {
         std::fs::write(dir.join("www").join(f), "x").unwrap();
     }
     let setup = common::ports::setup_lock();
@@ -145,6 +145,8 @@ fn charset_labels_content_type_like_nginx() {
              charset utf-8;\n\
              server {{ listen 127.0.0.1:{port}; root {www};\n\
                location /r {{ return 200 x; }}\n\
+               location /m {{ return 301 /r; }}\n\
+               location /pp/ {{ alias {www}/; default_type \"text/html; foo=bar\"; }}\n\
                location /p {{ proxy_pass http://127.0.0.1:{port}/a.html; }}\n\
                location /pc {{ proxy_pass http://127.0.0.1:{port}/up/a.html; }}\n\
                location /up/ {{ alias {www}/; charset koi8-r; }}\n\
@@ -187,6 +189,9 @@ fn charset_labels_content_type_like_nginx() {
         ("/a.js", "application/javascript; charset=utf-8"),
         ("/a.css", "text/css"),
         ("/r", "text/plain; charset=utf-8"),
+        // Not on a 301 or 302; a type with parameters isn't the bare type.
+        ("/m", "text/html"),
+        ("/pp/x.noext", "text/html; foo=bar"),
         ("/none", "text/html; charset=utf-8"),
         ("/p", "text/html; charset=utf-8"),
         ("/pc", "text/html; charset=koi8-r"),

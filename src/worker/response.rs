@@ -1586,6 +1586,10 @@ pub(crate) fn add_charset(charset: &PreparedCharset, response: Response) -> Resp
 /// value, when that has the right type and no charset.
 fn charset_label_at(charset: &PreparedCharset, head: &[u8]) -> Option<usize> {
     const NAME: &[u8] = b"content-type:";
+    // Not on a 301 or 302 (ngx_http_set_charset).
+    if matches!(response_status(head), 301 | 302) {
+        return None;
+    }
     let end = head.windows(4).position(|w| w == b"\r\n\r\n")?;
     let mut start = head.iter().position(|&b| b == b'\n')? + 1;
     while start < end {
@@ -1596,14 +1600,11 @@ fn charset_label_at(charset: &PreparedCharset, head: &[u8]) -> Option<usize> {
             let has_charset = value
                 .windows(8)
                 .any(|w| w.eq_ignore_ascii_case(b"charset="));
-            let media = value
-                .split(|&b| b == b';')
-                .next()
-                .unwrap_or(value)
-                .trim_ascii();
+            // The whole value, parameters included, as nginx looks a type
+            // without a charset up: `text/html; foo=bar` isn't text/html.
             let listed = charset
                 .types
-                .is_none_or(|types| types.iter().any(|t| t.eq_ignore_ascii_case(media)));
+                .is_none_or(|types| types.iter().any(|t| t.eq_ignore_ascii_case(value)));
             return (!has_charset && listed).then_some(line_end);
         }
         start = line_end + 2;

@@ -457,6 +457,7 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
+        charset: server.charset,
         ..ProcessMeta::default()
     }
 }
@@ -961,6 +962,7 @@ fn process_with_meta_inner(
                         // access_log list so the request still gets logged.
                         meta.access_logs = server.access_logs;
                         meta.post_action = server.post_action;
+                        meta.charset = server.charset;
                         meta.remote_user = None;
                         let auth_resume = take_auth_resume(&server.access, &mut rewrite_state);
                         match run_access_control(

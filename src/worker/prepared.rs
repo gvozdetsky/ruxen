@@ -1822,6 +1822,9 @@ pub struct PreparedServer {
     /// The server's `root` (else `html`), for `$request_filename` in its
     /// rewrite phase.
     pub doc_root: &'static DocRoot,
+    /// The server's charset, for what it answers before a location
+    /// (#464).
+    pub charset: Option<&'static PreparedCharset>,
     /// Client-side timeouts. The worker uses the listen's default server's
     /// values for the whole connection (see `handle`).
     /// HTTP/2 for this server: `http2 on` (server, else http) or
