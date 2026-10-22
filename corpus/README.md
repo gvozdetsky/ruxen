@@ -32,5 +32,6 @@ Only URLs are committed. The configurations themselves are fetched at run time i
 3. **Counted** only if nginx accepts it.
    - A case nginx rejects (templates with `${VAR}`, broken samples, non-nginx blocks picked from a page) is listed but doesn't count.
    - For the rest, ruxen's first error is the "blocker" the report groups by.
+4. **Compared**: each configuration ruxen loads also goes through `ruxen --compat` (#478). The report's second number counts the ones with no "differs" finding (directives ruxen accepts but handles differently); "ignored" tuning directives don't count. "What differs most" groups them by directive, which ranks what to implement next by how many configurations would then behave as nginx. `resolver` and upstream names are not measured: they point at 127.0.0.1.
 
 Loading is the first step. Comparing behaviour (the same requests, the same answers as nginx) can follow for a subset.
