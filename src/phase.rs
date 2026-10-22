@@ -910,6 +910,9 @@ fn process_with_meta_inner(
                 }
                 return (response, refused);
             }
+            // The location is found with whatever URI the server's rewrite
+            // left (ngx_http_core_find_config_phase clears `uri_changed`).
+            rewrite_state.uri_changed = false;
             match match_location(server, url_scratch, &mut rewrite_state) {
                 Some(loc) => loc,
                 None => match server.server_default.as_ref() {
@@ -1014,6 +1017,17 @@ fn process_with_meta_inner(
             &mut rewrite_state,
             regex_captures.as_ref(),
         ) {
+            // A `rewrite` without a flag changed the URI: the locations
+            // are searched again (ngx_http_core_post_rewrite_phase, #682),
+            // as after `last`. Not past a top-level `return`, a rewrite
+            // directive in nginx that answers before that.
+            RewriteOutcome::Continue
+                if rewrite_state.uri_changed
+                    && !matches!(loc.handler, crate::worker::PreparedHandler::Return(..)) =>
+            {
+                rewrite_state.uri_changed = false;
+                continue;
+            }
             RewriteOutcome::Continue => false,
             RewriteOutcome::Break => true,
             RewriteOutcome::Reroute => continue,
@@ -1285,6 +1299,14 @@ fn process_with_meta_inner(
         }
     }
     // Budget exhausted: nginx returns 500; we match.
+    crate::fs_resolve::note_failed_lookup_at(
+        format!(
+            "rewrite or internal redirection cycle while processing \"{}\"",
+            String::from_utf8_lossy(url_scratch)
+        ),
+        false,
+        crate::config::ErrorLogLevel::Error,
+    );
     (
         Response::Owned(crate::http::error_response_for_method(
             500,

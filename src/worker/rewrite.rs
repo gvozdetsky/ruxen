@@ -502,18 +502,21 @@ pub(crate) fn execute_rewrite_ops(
                 } else if *drop_args {
                     *current_args = Some(Vec::new());
                 }
-                // nginx: a successful in-place rewrite (no `last`/external
-                // redirect) clears `r->valid_location`, which `proxy_pass`
-                // checks to decide whether to apply its configured URI
-                // prefix substitution. Without this, a `rewrite ...; break;
-                // proxy_pass http://up/PATH;` would still send `PATH` to
-                // upstream — see nginx-tests/rewrite.t valid_location reset.
-                rewrite_state.valid_location = false;
+                // nginx's ngx_http_script_regex_end_code: `break` keeps the
+                // request in the location with the new URI and clears
+                // `r->valid_location`, which `proxy_pass` checks to decide
+                // whether to apply its configured URI prefix substitution;
+                // otherwise the URI changed, and the locations are searched
+                // again (#682).
                 rewrite_state.unparsed_uri = false;
                 match flag {
                     PreparedRewriteFlag::Last => return RewriteControl::Reroute,
-                    PreparedRewriteFlag::Break => return RewriteControl::Stop,
-                    PreparedRewriteFlag::None => {}
+                    PreparedRewriteFlag::Break => {
+                        rewrite_state.valid_location = false;
+                        rewrite_state.uri_changed = false;
+                        return RewriteControl::Stop;
+                    }
+                    PreparedRewriteFlag::None => rewrite_state.uri_changed = true,
                     PreparedRewriteFlag::Redirect | PreparedRewriteFlag::Permanent => {}
                 }
             }
@@ -547,7 +550,15 @@ pub(crate) fn execute_rewrite_ops(
                 };
                 return RewriteControl::Respond(response, *finalized);
             }
-            PreparedRewriteOp::Break => return RewriteControl::Stop,
+            // ngx_http_script_break_code: after a changed URI, the request
+            // stays here with it (`rewrite …; break;`, rewrite.t's
+            // "valid_location reset").
+            PreparedRewriteOp::Break => {
+                if std::mem::take(&mut rewrite_state.uri_changed) {
+                    rewrite_state.valid_location = false;
+                }
+                return RewriteControl::Stop;
+            }
         }
     }
     RewriteControl::Continue

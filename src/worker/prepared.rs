@@ -235,11 +235,17 @@ pub struct PreparedMap {
 pub struct RewriteState {
     user_vars: Vec<(&'static [u8], Vec<u8>)>,
     numbered_captures: Vec<Vec<u8>>,
-    /// nginx's `r->valid_location`: starts true, cleared whenever a
-    /// `rewrite` directive replaces the URI in-place. Read by `proxy_pass`
-    /// to decide whether to apply its configured URI prefix substitution
-    /// (when false, the rewritten URI is forwarded as-is to upstream).
+    /// nginx's `r->valid_location`: starts true, cleared when a `break`
+    /// (the `rewrite` flag, or the directive after a changed URI) keeps
+    /// the request in a location whose URI it changed. Read by
+    /// `proxy_pass` to decide whether to apply its configured URI prefix
+    /// substitution (when false, the rewritten URI is forwarded as-is to
+    /// upstream).
     pub(crate) valid_location: bool,
+    /// nginx's `r->uri_changed`: a `rewrite` without a flag changed the
+    /// URI, so the locations are searched again once the rewrite
+    /// directives are done (ngx_http_core_post_rewrite_phase, #682).
+    pub(crate) uri_changed: bool,
     /// nginx's `r->valid_unparsed_uri`: the URI is still the one the client
     /// sent, so `proxy_pass` without a URI part forwards the client's own
     /// request target (#541). Cleared by a `rewrite` of the URI and by an
@@ -271,6 +277,7 @@ impl Default for RewriteState {
             user_vars: Vec::new(),
             numbered_captures: Vec::new(),
             valid_location: true,
+            uri_changed: false,
             unparsed_uri: true,
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
