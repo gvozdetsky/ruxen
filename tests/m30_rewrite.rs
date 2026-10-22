@@ -383,3 +383,44 @@ fn a_rewrite_without_a_flag_searches_the_locations_again() {
     let looped = http_get(port, "/loop/1");
     assert_eq!(status_line(&looped), "HTTP/1.1 500 Internal Server Error");
 }
+
+/// An `alias` location maps nothing once a `rewrite` changed the URI in
+/// it, as nginx 1.30's ngx_http_map_uri_to_path refuses (#589):
+/// `$request_filename` is empty after a flagless rewrite (a `return`
+/// answering before the locations are searched again), and a file is a
+/// 500 after `rewrite … break`, both with an `[alert]`. Without a rewrite
+/// the alias maps as usual.
+#[test]
+fn an_alias_maps_nothing_after_a_rewrite() {
+    let (g, port) = spawn_server(
+        "error_log %%DIR%%/error.log info;\nevents {}\nhttp {\n\
+         server { listen 127.0.0.1:%%PORT%%;\n\
+           location /foo/ { alias %%DIR%%/bar/; rewrite ^/foo/.*$ /x; return 200 \"rf=[$request_filename]\"; }\n\
+           location /brk/ { alias %%DIR%%/bar/; rewrite ^/brk/(.*)$ /brk/x break; }\n\
+           location /set/ { alias %%DIR%%/bar/; return 200 \"rf=[$request_filename]\"; }\n\
+         } }\n",
+    );
+    std::fs::create_dir_all(g.tempdir.join("bar")).unwrap();
+    std::fs::write(g.tempdir.join("bar/x"), "x").unwrap();
+    let dir = g.tempdir.display().to_string();
+
+    let foo = http_get(port, "/foo/1");
+    assert_eq!(body(&foo), b"rf=[]", "{}", String::from_utf8_lossy(&foo));
+    let brk = http_get(port, "/brk/1");
+    assert_eq!(status_line(&brk), "HTTP/1.1 500 Internal Server Error");
+    let plain = http_get(port, "/set/1");
+    assert_eq!(
+        String::from_utf8_lossy(body(&plain)),
+        format!("rf=[{dir}/bar/1]")
+    );
+    let log = std::fs::read_to_string(g.tempdir.join("error.log")).unwrap_or_default();
+    for name in ["/foo/", "/brk/"] {
+        let alert =
+            format!("\"alias\" cannot be used in location \"{name}\" where URI was rewritten");
+        assert!(
+            log.lines()
+                .any(|l| l.contains("[alert]") && l.contains(&alert)),
+            "{alert}\n{log}"
+        );
+    }
+}

@@ -1267,6 +1267,9 @@ pub struct PreparedRoot {
 pub struct DocRoot {
     pub path: &'static Path,
     pub mapping: PreparedPathMapping,
+    /// The location's name, for nginx's `"alias" cannot be used in
+    /// location …` (#589).
+    pub location: &'static [u8],
     /// The location's `disable_symlinks`, for `if -f` and the like.
     pub symlinks: PreparedSymlinks,
 }
@@ -1284,6 +1287,31 @@ pub enum PreparedSymlinkFrom {
     /// `from=$document_root`: the location's root (or alias) path.
     DocumentRoot,
     Path(&'static [u8]),
+}
+
+impl DocRoot {
+    /// nginx's ngx_http_map_uri_to_path refuses an `alias` once a
+    /// `rewrite` changed the URI in the location (`uri_changed`, before
+    /// the locations are searched again) or kept it there with `break`
+    /// (`!valid_location`): there is no part of the new URI to replace
+    /// (#589). The `[alert]` is noted for the request's error log.
+    #[cold]
+    pub(crate) fn alias_refused(&self, state: &RewriteState) -> bool {
+        if matches!(self.mapping, PreparedPathMapping::Root)
+            || (state.valid_location && !state.uri_changed)
+        {
+            return false;
+        }
+        crate::fs_resolve::note_failed_lookup_at(
+            format!(
+                "\"alias\" cannot be used in location \"{}\" where URI was rewritten",
+                String::from_utf8_lossy(self.location)
+            ),
+            false,
+            crate::config::ErrorLogLevel::Alert,
+        );
+        true
+    }
 }
 
 impl PreparedSymlinks {
