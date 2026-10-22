@@ -3394,14 +3394,17 @@ pub fn default_hidden_bit(name: &[u8]) -> Option<u16> {
 }
 
 /// `Content-Length` value as nginx's `ngx_atoof` accepts it: decimal
-/// digits only, no sign, no overflow.
+/// digits only, no sign, at most `NGX_MAX_OFF_T_VALUE` (2^63 - 1).
 pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    value.iter().try_fold(0u64, |n, &d| {
-        n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
-    })
+    value
+        .iter()
+        .try_fold(0u64, |n, &d| {
+            n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+        })
+        .filter(|&n| n <= i64::MAX as u64)
 }
 
 pub(crate) fn parse_status_code(status_line: &[u8]) -> u16 {
@@ -3780,9 +3783,12 @@ mod tests {
         assert_eq!(parse_content_length(b"0"), Some(0));
         assert_eq!(parse_content_length(b"1234"), Some(1234));
         assert_eq!(
-            parse_content_length(b"18446744073709551615"),
-            Some(u64::MAX)
+            parse_content_length(b"9223372036854775807"),
+            Some(i64::MAX as u64)
         );
+        // Past NGX_MAX_OFF_T_VALUE: nginx's ngx_atoof refuses it.
+        assert_eq!(parse_content_length(b"9223372036854775808"), None);
+        assert_eq!(parse_content_length(b"18446744073709551615"), None);
         for bad in [
             &b""[..],
             b"foo",

@@ -139,6 +139,9 @@ fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
                 if start < end {
                     push((start, end));
                     size += u128::from(end - start);
+                    if size > i64::MAX as u128 {
+                        return Parsed::NotSatisfiable;
+                    }
                     if left == 0 {
                         return Parsed::Declined;
                     }
@@ -182,7 +185,11 @@ fn parse(value: &[u8], len: u64, limit: u64) -> Parsed {
         }
         if start < end {
             push((start, end));
+            // nginx: past NGX_MAX_OFF_T_VALUE in total is a 416.
             size += u128::from(end - start);
+            if size > i64::MAX as u128 {
+                return Parsed::NotSatisfiable;
+            }
             if left == 0 {
                 return Parsed::Declined;
             }
@@ -304,8 +311,7 @@ fn decide(
         return Cut::Pass;
     }
     let Some(len) = header(head, b"content-length")
-        .and_then(|v| std::str::from_utf8(v).ok())
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(crate::proxy::parse_content_length)
         .filter(|&l| req.head_only || l == body_len)
     else {
         return Cut::Pass;
@@ -601,13 +607,21 @@ mod tests {
         assert_eq!(parse(b"x", 8, 9), Parsed::NotSatisfiable);
         // More than the whole body in total: the whole body instead.
         assert_eq!(parse(b"0-7,0-7", 8, 9), Parsed::Declined);
-        // Also where the total doesn't fit 64 bits (#477, found by the
-        // `range` fuzz target): an upstream's Content-Length near 2^64.
+        // Past 2^63 - 1 in total, nginx's 416, before the range limit
+        // (#477: the `range` fuzz target found the old u64 sum wrapping).
         assert_eq!(
             parse(b"0-,0-,0-", u64::MAX, DEFAULT_LIMIT),
-            Parsed::Declined
+            Parsed::NotSatisfiable
         );
-        assert_eq!(parse(b"5-,5-,5-", u64::MAX - 65406, 9), Parsed::Declined);
+        assert_eq!(
+            parse(b"5-,5-,5-", u64::MAX - 65406, 9),
+            Parsed::NotSatisfiable
+        );
+        assert_eq!(
+            parse(b"0-,0-", 1 << 62, DEFAULT_LIMIT),
+            Parsed::NotSatisfiable
+        );
+        assert_eq!(parse(b"0-,0-", 1 << 62, 1), Parsed::NotSatisfiable);
     }
 
     /// nginx 1.29.5: without `max_ranges`, several ranges are declined
