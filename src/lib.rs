@@ -82,6 +82,70 @@ pub mod fuzzing {
             .map_err(drop)
     }
 
+    /// `range::parse_header` for a body of `len` bytes and at most `limit`
+    /// ranges: `None` when the header isn't a `bytes=` range, else the
+    /// ranges, `Err(true)` for not satisfiable, `Err(false)` for declined
+    /// (the whole body).
+    pub fn range_parse(
+        value: &[u8],
+        len: u64,
+        limit: u64,
+    ) -> Option<Result<Vec<(u64, u64)>, bool>> {
+        use crate::worker::range::Parsed;
+        crate::worker::range::parse_header(value, len, limit).map(|parsed| match parsed {
+            Parsed::Ranges(ranges) => Ok(ranges.iter().collect()),
+            Parsed::NotSatisfiable => Err(true),
+            Parsed::Declined => Err(false),
+        })
+    }
+
+    /// The range limit without `max_ranges`.
+    pub const RANGE_DEFAULT_LIMIT: u64 = crate::worker::range::DEFAULT_LIMIT;
+
+    /// `range::filter` over a `200` with `body` and its `Content-Length`,
+    /// for a request with `Range: <range>`: the response, head and body.
+    /// `multi`: several ranges allowed (a cached response), else one.
+    pub fn range_filter(
+        body: &[u8],
+        range: &[u8],
+        head_only: bool,
+        multi: bool,
+        max_ranges: Option<u32>,
+    ) -> Vec<u8> {
+        use crate::worker::range::{RangeAllow, RangeRequest};
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        if !head_only {
+            response.extend_from_slice(body);
+        }
+        let allow = if multi {
+            RangeAllow::Multi
+        } else {
+            RangeAllow::Single
+        };
+        let req = RangeRequest {
+            range: Some(range),
+            if_range: None,
+            head_only,
+        };
+        crate::worker::range::filter(response, allow, max_ranges, req, |len, server| {
+            crate::worker::range::not_satisfiable(len, head_only, server)
+        })
+    }
+
+    /// `gzip::accepts_gzip`: whether `Accept-Encoding` takes gzip.
+    pub fn accepts_gzip(accept_encoding: &[u8]) -> bool {
+        crate::worker::gzip::accepts_gzip(accept_encoding)
+    }
+
+    /// `gzip::is_msie6`: `gzip_disable msie6`'s test of a `User-Agent`.
+    pub fn is_msie6(user_agent: &[u8]) -> bool {
+        crate::worker::gzip::is_msie6(user_agent)
+    }
+
     /// `proxy_protocol::parse`.
     pub fn proxy_protocol(data: &[u8]) {
         let _ = crate::proxy_protocol::parse(data);
