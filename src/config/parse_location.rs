@@ -335,6 +335,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     let mut chain = header_chain(parent);
     chain.append(&mut child.header_ancestors);
     child.header_ancestors = chain;
+    child.charset.inherit(&parent.charset);
     or(&mut child.error_pages, &parent.error_pages);
     or(&mut child.keepalive_timeout, &parent.keepalive_timeout);
     or(&mut child.keepalive_requests, &parent.keepalive_requests);
@@ -604,6 +605,7 @@ pub(crate) fn parse_location_block(
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut redirect = RedirectConf::default();
     let mut mime = MimeConf::default();
+    let mut charset = CharsetConf::default();
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
@@ -628,6 +630,8 @@ pub(crate) fn parse_location_block(
                 | "add_header_inherit"
                 | "add_trailer_inherit"
                 | "error_page"
+                | "charset"
+                | "source_charset"
                 | "access_log"
                 | "expires"
                 | "gzip"
@@ -768,6 +772,7 @@ pub(crate) fn parse_location_block(
                         chunked_transfer_encoding,
                         redirect,
                         mime,
+                        charset,
                         client_timeouts,
                         alias_prefix_override,
                         inherits_root,
@@ -801,6 +806,9 @@ pub(crate) fn parse_location_block(
         match (args[0].as_str(), &term) {
             ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
                 parse_mime(lx, &args, &term, &mut mime)?;
+            }
+            ("charset" | "charset_types" | "source_charset", Terminator::Semi) => {
+                parse_charset(lx, &args, &term, &mut charset)?;
             }
             ("set", Terminator::Semi) => {
                 rewrite_ops.push(parse_set_op(&args[1..])?);

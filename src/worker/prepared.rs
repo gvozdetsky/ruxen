@@ -1515,6 +1515,8 @@ pub struct PreparedLocation {
     pub sendfile: bool,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
+    /// The charset added to `Content-Type` (#464); `None` without one.
+    pub charset: Option<&'static PreparedCharset>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     /// Effective `post_action` target, if any. A leading `/` is an
     /// internal URI redirect; a leading `@` is a named-location jump.
@@ -1575,6 +1577,8 @@ pub struct PreparedRegexLocation {
     pub sendfile: bool,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
+    /// The charset added to `Content-Type` (#464); `None` without one.
+    pub charset: Option<&'static PreparedCharset>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
@@ -1622,6 +1626,8 @@ pub struct MatchedLocation<'a> {
     pub sendfile: bool,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
+    /// The charset added to `Content-Type` (#464); `None` without one.
+    pub charset: Option<&'static PreparedCharset>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
@@ -1663,6 +1669,7 @@ impl<'a> MatchedLocation<'a> {
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
             gzip: loc.gzip,
+            charset: loc.charset,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,
@@ -1717,6 +1724,7 @@ impl<'a> MatchedLocation<'a> {
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
             gzip: loc.gzip,
+            charset: loc.charset,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,
@@ -2235,6 +2243,14 @@ impl RuntimeState {
 }
 
 /// A location's effective gzip settings (`gzip on`), see `worker::gzip`.
+/// `charset` where a response gets it (#464): the name, and the
+/// `charset_types` it applies to (`None`: any, `charset_types *`).
+#[derive(Debug)]
+pub struct PreparedCharset {
+    pub name: &'static [u8],
+    pub types: Option<&'static [&'static [u8]]>,
+}
+
 #[derive(Debug)]
 pub struct PreparedGzip {
     /// `gzip_types *`.

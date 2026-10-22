@@ -2327,6 +2327,7 @@ pub(crate) fn prepare_server(
             client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
             gzip: prepare_gzip(server_gzip.clone())?,
+            charset: prepare_charset(&server.charset),
             limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             body_temp: server_body_temp,
@@ -3588,9 +3589,11 @@ pub(crate) fn build_prefix_or_exact(
         add_header_inherit: _,
         add_trailer_inherit: _,
         header_ancestors: _,
+        charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let charset = prepare_charset(&location_charset);
     // Only an `if` block's anonymous location in a regex location is
     // built here with a regex mode (#137): its alias takes the captures.
     let is_regex = matches!(mode, MatchMode::Regex { .. });
@@ -3723,6 +3726,7 @@ pub(crate) fn build_prefix_or_exact(
         client_body_buffer_size,
         sendfile,
         gzip,
+        charset,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
@@ -3804,9 +3808,11 @@ pub(crate) fn build_regex_location(
         add_header_inherit: _,
         add_trailer_inherit: _,
         header_ancestors: _,
+        charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let charset = prepare_charset(&location_charset);
     // The parser already validated this with the same flags + the same
     // `regex::bytes` builder; rebuild here because the compiled `Regex`
     // doesn't survive the AST.
@@ -3946,6 +3952,7 @@ pub(crate) fn build_regex_location(
         client_body_buffer_size,
         sendfile,
         gzip,
+        charset,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
@@ -3999,6 +4006,58 @@ pub(crate) fn prepare_try_files(
 
 /// The effective `gzip*` settings of a location, or `None` when gzip is
 /// off there: the filter then costs one check per response.
+/// A level's charset settings as responses get them (#464), `None` where
+/// nothing is added: no `charset`, `charset off`, a charset from a
+/// variable (not supported yet), or a `source_charset` other than it, as
+/// that would need a conversion ruxen doesn't do.
+pub(crate) fn prepare_charset(
+    conf: &crate::config::CharsetConf,
+) -> Option<&'static PreparedCharset> {
+    // ngx_http_charset_default_types.
+    const DEFAULT_TYPES: &[&str] = &[
+        "text/html",
+        "text/xml",
+        "text/plain",
+        "text/vnd.wap.wml",
+        "application/javascript",
+        "application/rss+xml",
+    ];
+    let name = conf.charset.as_ref()?.as_ref()?;
+    if name.starts_with('$')
+        || conf
+            .source
+            .as_ref()
+            .is_some_and(|s| !s.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    let leak =
+        |s: &str| -> &'static [u8] { crate::arena::leak(s.as_bytes().to_vec().into_boxed_slice()) };
+    let types: Option<&'static [&'static [u8]]> = match &conf.types {
+        Some(list) if list.iter().any(|t| t == "*") => None,
+        // Always with text/html, "in addition to" the list, as nginx's
+        // charset_types takes it.
+        Some(list) => Some(crate::arena::leak(
+            std::iter::once("text/html")
+                .chain(list.iter().map(String::as_str))
+                .map(leak)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )),
+        None => Some(crate::arena::leak(
+            DEFAULT_TYPES
+                .iter()
+                .map(|t| leak(t))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )),
+    };
+    Some(crate::arena::leak(Box::new(PreparedCharset {
+        name: leak(name),
+        types,
+    })))
+}
+
 pub(crate) fn prepare_gzip(
     conf: crate::config::GzipConf,
 ) -> Result<Option<&'static PreparedGzip>, String> {
