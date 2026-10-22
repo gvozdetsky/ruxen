@@ -447,4 +447,4 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup (tests, nginx-tests, benchmar
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) lists the material that comes from nginx (`mime.types`, among others) and its 2-clause BSD licence; the release tarballs and images carry both files.
