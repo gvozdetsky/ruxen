@@ -424,3 +424,48 @@ fn an_alias_maps_nothing_after_a_rewrite() {
         );
     }
 }
+
+/// What clears the rewrite flags (#682), as nginx: `last` and every new
+/// location search clear `uri_changed`, and an internal redirect
+/// (`error_page`, `try_files`) sets `valid_location` again, so an alias
+/// location found after them maps as usual; ten flagless rewrites in a
+/// row are within nginx's budget of URI changes.
+#[test]
+fn rewrites_before_a_redirect_leave_no_trace() {
+    let mut chain = String::new();
+    for i in 1..10 {
+        chain.push_str(&format!(
+            "location /l{i}/ {{ rewrite ^/l{i}/(.*) /l{}/$1; }}\n",
+            i + 1
+        ));
+    }
+    let (g, port) = spawn_server(&format!(
+        "events {{}}\nhttp {{\n\
+         server {{ listen 127.0.0.1:%%PORT%%; root %%DIR%%;\n\
+           location /a/ {{ rewrite ^/a/(.*) /b/$1; rewrite ^/b/(.*) /c/$1 last; }}\n\
+           location /c/ {{ alias %%DIR%%/c/; }}\n\
+           location /d/ {{ rewrite ^/d/(.*) /e/$1; error_page 404 /err/404.html; return 404; }}\n\
+           location /err/ {{ alias %%DIR%%/err/; }}\n\
+           location /g/ {{ rewrite ^/g/(.*) /h/$1 break; error_page 404 /err/404.html; }}\n\
+           location /t/ {{ rewrite ^/t/(.*) /u/$1 break; try_files $uri /c/f.txt; }}\n\
+           {chain}\
+           location /l10/ {{ return 200 \"end $uri\"; }}\n\
+         }} }}\n"
+    ));
+    std::fs::create_dir_all(g.tempdir.join("c")).unwrap();
+    std::fs::create_dir_all(g.tempdir.join("err")).unwrap();
+    std::fs::write(g.tempdir.join("c/f.txt"), "file").unwrap();
+    std::fs::write(g.tempdir.join("err/404.html"), "err").unwrap();
+
+    for (path, status, wanted) in [
+        ("/a/f.txt", "HTTP/1.1 200 OK", &b"file"[..]),
+        ("/d/x", "HTTP/1.1 404 Not Found", b"err"),
+        ("/g/x", "HTTP/1.1 404 Not Found", b"err"),
+        ("/t/x", "HTTP/1.1 200 OK", b"file"),
+        ("/l1/x", "HTTP/1.1 200 OK", b"end /l10/x"),
+    ] {
+        let resp = http_get(port, path);
+        assert_eq!(status_line(&resp), status, "{path}");
+        assert_eq!(body(&resp), wanted, "{path}");
+    }
+}
