@@ -2344,6 +2344,7 @@ pub(crate) fn prepare_server(
 
     Ok(PreparedServer {
         doc_root: server_doc_root,
+        charset: prepare_charset(&server.charset),
         // Set by the caller, which knows the http scope.
         http2: false,
         tls_context: None,
