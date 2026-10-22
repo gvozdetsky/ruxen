@@ -827,7 +827,7 @@ async fn settle_proxy_response(
     // The first pass is inline (an `async fn` layer here costs on the
     // proxy hot path); later passes, after an internal redirect, are in
     // `settle_redirected`.
-    let redirects = plan.response.redirects;
+    let response_rules = plan.response;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
     let error_pages: &'static [PreparedErrorPage] = if plan.in_error_page {
@@ -917,7 +917,7 @@ async fn settle_proxy_response(
             return finish_proxy_response(
                 upstream_resp,
                 report,
-                redirects,
+                response_rules,
                 error_page_status,
                 http,
                 ctx,
@@ -997,7 +997,7 @@ fn intercept_with_report(
 fn finish_proxy_response(
     upstream_resp: Response,
     mut report: crate::proxy::ProxyReport,
-    redirects: &'static [PreparedRedirect],
+    response_rules: &'static ProxyResponseRules,
     error_page_status: Option<phase::ErrorPageStatus>,
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
@@ -1048,7 +1048,7 @@ fn finish_proxy_response(
     let upstream_resp = if report.redirect_header {
         rewrite_proxy_redirects(
             upstream_resp,
-            redirects,
+            response_rules.redirects,
             http,
             ctx,
             &process_meta,
@@ -1057,6 +1057,18 @@ fn finish_proxy_response(
         )
     } else {
         upstream_resp
+    };
+    let upstream_resp = match response_rules.cookies {
+        Some(rules) => super::rewrite_proxy_cookies(
+            upstream_resp,
+            rules,
+            http,
+            ctx,
+            &process_meta,
+            &report.upstream_headers,
+            uri,
+        ),
+        None => upstream_resp,
     };
     // The range filter (#370). nginx runs it after gzip, which then
     // leaves the response alone, and before the chunked filter writes
@@ -1247,7 +1259,7 @@ async fn run_proxy_pass(
     // After an internal redirect the answer's head is rewritten further
     // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
     plan.stream = false;
-    let redirects = plan.response.redirects;
+    let response_rules = plan.response;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
     let error_pages: &'static [PreparedErrorPage] = if plan.in_error_page {
@@ -1341,7 +1353,7 @@ async fn run_proxy_pass(
             let (response, process_meta) = finish_proxy_response(
                 upstream_resp,
                 report,
-                redirects,
+                response_rules,
                 error_page_status,
                 http,
                 ctx,

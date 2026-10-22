@@ -657,6 +657,18 @@ pub struct ProxyResponseRules {
     pub ignore_accel_redirect: bool,
     /// `proxy_ignore_headers X-Accel-Limit-Rate`.
     pub ignore_accel_limit_rate: bool,
+    /// `proxy_cookie_domain` / `proxy_cookie_path`; `None` when neither
+    /// has a rule.
+    pub cookies: Option<&'static PreparedCookieRules>,
+}
+
+/// A location's `proxy_cookie_domain` and `proxy_cookie_path` rules, for
+/// the `Domain` and `Path` of the upstream's `Set-Cookie`. A `Prefix` rule
+/// in `domains` matches the whole domain, caseless, after a leading dot.
+#[derive(Debug)]
+pub struct PreparedCookieRules {
+    pub domains: &'static [PreparedRedirect],
+    pub paths: &'static [PreparedRedirect],
 }
 
 /// One prepared `proxy_redirect` rule.
@@ -876,6 +888,9 @@ pub(crate) struct ProxyEffective {
     /// The nearest scope's `proxy_redirect` lines; `None` = nginx's
     /// implicit `proxy_redirect default`.
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
+    /// The nearest scope's `proxy_cookie_domain` / `proxy_cookie_path`.
+    pub cookie_domain: Option<&'static crate::config::ProxyRedirect>,
+    pub cookie_path: Option<&'static crate::config::ProxyRedirect>,
     /// The nearest scope's `proxy_hide_header` / `proxy_pass_header` names
     /// (each list inherits on its own, as in nginx).
     pub hide_headers: Option<&'static [String]>,
@@ -1054,6 +1069,8 @@ impl ProxyEffective {
             ignore_invalid_headers: true,
             underscores_in_headers: false,
             redirect: None,
+            cookie_domain: None,
+            cookie_path: None,
             hide_headers: None,
             pass_headers: None,
             bind: None,

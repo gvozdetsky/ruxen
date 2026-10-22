@@ -1143,6 +1143,179 @@ pub(crate) fn rewrite_proxy_redirects(
     Response::Owned(out)
 }
 
+/// `proxy_cookie_domain` / `proxy_cookie_path`: rewrite the `Domain` and
+/// `Path` of the proxied response's `Set-Cookie` headers with the first
+/// matching rule each, as ngx_http_proxy_rewrite_cookie does. A header
+/// with a rewritten attribute is written again from its parts, `; `
+/// between them.
+#[cold]
+#[inline(never)]
+pub(crate) fn rewrite_proxy_cookies(
+    response: Response,
+    rules: &crate::worker::PreparedCookieRules,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    upstream_headers: &[u8],
+    uri: Option<&[u8]>,
+) -> Response {
+    let Response::Owned(bytes) = response else {
+        return response;
+    };
+    let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Response::Owned(bytes);
+    };
+    let is_cookie = |line: &[u8]| {
+        line.iter().position(|&b| b == b':').is_some_and(|colon| {
+            line[..colon]
+                .trim_ascii()
+                .eq_ignore_ascii_case(b"set-cookie")
+        })
+    };
+    if !bytes[..head_end].split(|&b| b == b'\n').any(is_cookie) {
+        return Response::Owned(bytes);
+    }
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_headers,
+        &root_only,
+        uri,
+    );
+    let mut out = Vec::with_capacity(bytes.len() + 64);
+    let mut changed = false;
+    for (i, line) in bytes[..head_end]
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .enumerate()
+    {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        let rewritten = if i > 0 && is_cookie(line) {
+            let colon = line.iter().position(|&b| b == b':').unwrap_or(0);
+            rewrite_cookie(line[colon + 1..].trim_ascii(), rules, &render_ctx).map(|value| {
+                let mut new = line[..colon + 1].to_vec();
+                new.push(b' ');
+                new.extend_from_slice(&value);
+                new
+            })
+        } else {
+            None
+        };
+        match rewritten {
+            Some(new_line) => {
+                out.extend_from_slice(&new_line);
+                changed = true;
+            }
+            None => out.extend_from_slice(line),
+        }
+    }
+    if !changed {
+        return Response::Owned(bytes);
+    }
+    out.extend_from_slice(&bytes[head_end..]);
+    Response::Owned(out)
+}
+
+/// A cookie attribute: its name, and its value if it has `=`.
+type CookieAttr<'a> = (&'a [u8], Option<std::borrow::Cow<'a, [u8]>>);
+
+/// One `Set-Cookie` value with its `Domain` and `Path` rewritten; `None`
+/// when no rule applied (ngx_http_proxy_parse_cookie splits it: at each
+/// `;`, a name up to `=` and a value, both trimmed of spaces).
+fn rewrite_cookie(
+    value: &[u8],
+    rules: &crate::worker::PreparedCookieRules,
+    render_ctx: &RenderCtx<'_>,
+) -> Option<Vec<u8>> {
+    let mut attrs: Vec<CookieAttr<'_>> = value
+        .split(|&b| b == b';')
+        .map(|attr| {
+            let attr = attr.trim_ascii_start();
+            match attr.iter().position(|&b| b == b'=') {
+                Some(eq) => (
+                    attr[..eq].trim_ascii_end(),
+                    Some(attr[eq + 1..].trim_ascii().into()),
+                ),
+                None => (attr.trim_ascii_end(), None),
+            }
+        })
+        .collect();
+    // Not `name=value` first: not a cookie nginx rewrites.
+    attrs.first()?.1.as_ref()?;
+    let mut changed = false;
+    for (key, value) in attrs.iter_mut().skip(1) {
+        let Some(v) = value.as_ref() else {
+            continue;
+        };
+        let new = if key.eq_ignore_ascii_case(b"domain") {
+            apply_cookie_domain_rules(rules.domains, v, render_ctx)
+        } else if key.eq_ignore_ascii_case(b"path") {
+            apply_redirect_rules(rules.paths, v, 0, render_ctx)
+        } else {
+            None
+        };
+        if let Some(new) = new {
+            *value = Some(new.into());
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = Vec::with_capacity(value.len() + 16);
+    for (i, (key, value)) in attrs.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"; ");
+        }
+        out.extend_from_slice(key);
+        if let Some(value) = value {
+            out.push(b'=');
+            out.extend_from_slice(value);
+        }
+    }
+    Some(out)
+}
+
+/// `proxy_cookie_domain`'s first matching rule, applied to a `Domain`. A
+/// literal rule matches the whole domain after a leading dot, caseless,
+/// and keeps the dot (ngx_http_proxy_rewrite_domain_handler); a regex one
+/// replaces the whole value, as in `proxy_redirect`.
+fn apply_cookie_domain_rules(
+    rules: &[PreparedRedirect],
+    value: &[u8],
+    render_ctx: &RenderCtx<'_>,
+) -> Option<Vec<u8>> {
+    for (i, rule) in rules.iter().enumerate() {
+        match rule {
+            PreparedRedirect::Prefix {
+                pattern,
+                replacement,
+            } => {
+                let dot = usize::from(value.first() == Some(&b'.'));
+                let mut pat = Vec::new();
+                render_parts(pattern, render_ctx, &mut pat);
+                if !value[dot..].eq_ignore_ascii_case(&pat) {
+                    continue;
+                }
+                let mut new = value[..dot].to_vec();
+                render_parts(replacement, render_ctx, &mut new);
+                return Some(new);
+            }
+            PreparedRedirect::Regex { .. } => {
+                if let Some(new) = apply_redirect_rules(&rules[i..=i], value, 0, render_ctx) {
+                    return Some(new);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The first rule that matches `value[prefix..]`, applied; `None` if none
 /// does (the header is left as the upstream sent it).
 fn apply_redirect_rules(

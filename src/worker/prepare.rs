@@ -1294,15 +1294,7 @@ pub(crate) fn build_proxy(
         },
     };
     let cache = prepare_proxy_cache(eff.cache, eff.cache_ignore)?;
-    let response = prepare_response_rules(
-        redirects,
-        eff.hide_headers,
-        eff.pass_headers,
-        eff.error_pages,
-        eff.recursive_error_pages,
-        eff.ignore_accel_redirect,
-        eff.ignore_accel_limit_rate,
-    );
+    let response = prepare_response_rules(redirects, &eff)?;
     Ok(match pp {
         ProxyPass::Direct {
             addrs,
@@ -1618,36 +1610,78 @@ fn without_default_port(authority: &'static [u8], tls: bool) -> &'static [u8] {
 /// `proxy_pass_header` (ngx_http_upstream_hide_headers_hash).
 fn prepare_response_rules(
     redirects: &'static [PreparedRedirect],
-    hide: Option<&'static [String]>,
-    pass: Option<&'static [String]>,
-    error_pages: &'static [PreparedErrorPage],
-    recursive_error_pages: bool,
-    ignore_accel_redirect: bool,
-    ignore_accel_limit_rate: bool,
-) -> &'static ProxyResponseRules {
-    let pass = pass.unwrap_or(&[]);
+    eff: &ProxyEffective,
+) -> Result<&'static ProxyResponseRules, String> {
+    let pass = eff.pass_headers.unwrap_or(&[]);
     let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
     let pass_mask = pass
         .iter()
         .filter_map(|p| crate::proxy::default_hidden_bit(p.as_bytes()))
         .fold(0, |mask, bit| mask | bit);
-    let hide: Vec<&'static [u8]> = hide
+    let hide: Vec<&'static [u8]> = eff
+        .hide_headers
         .unwrap_or(&[])
         .iter()
         .filter(|h| !passed(h) && crate::proxy::default_hidden_bit(h.as_bytes()).is_none())
         .map(|h| leak_bytes(h.to_ascii_lowercase().as_bytes()))
         .collect();
-    crate::arena::leak(Box::new(ProxyResponseRules {
+    let domains = prepare_cookie_rules(eff.cookie_domain, "proxy_cookie_domain")?;
+    let paths = prepare_cookie_rules(eff.cookie_path, "proxy_cookie_path")?;
+    let cookies = (!domains.is_empty() || !paths.is_empty())
+        .then(|| &*crate::arena::leak(Box::new(PreparedCookieRules { domains, paths })));
+    Ok(crate::arena::leak(Box::new(ProxyResponseRules {
         redirects,
-        error_pages,
-        recursive_error_pages,
-        ignore_accel_redirect,
-        ignore_accel_limit_rate,
+        error_pages: eff.error_pages,
+        recursive_error_pages: eff.recursive_error_pages,
+        ignore_accel_redirect: eff.ignore_accel_redirect,
+        ignore_accel_limit_rate: eff.ignore_accel_limit_rate,
+        cookies,
         hide: crate::arena::leak(hide.into_boxed_slice()),
         passes_date: crate::proxy::default_hidden_bit(b"date")
             .is_some_and(|bit| pass_mask & bit != 0),
         pass_mask,
-    }))
+    })))
+}
+
+/// The rules of `proxy_cookie_domain` or `proxy_cookie_path`: none when
+/// unset or `off`.
+fn prepare_cookie_rules(
+    config: Option<&'static crate::config::ProxyRedirect>,
+    what: &str,
+) -> Result<&'static [PreparedRedirect], String> {
+    use crate::config::{ProxyRedirect, ProxyRedirectRule};
+    let Some(ProxyRedirect::Rules(rules)) = config else {
+        return Ok(&[]);
+    };
+    let rules = rules
+        .iter()
+        .filter_map(|rule| match rule {
+            // Only `proxy_redirect` has a `default`.
+            ProxyRedirectRule::Default => None,
+            ProxyRedirectRule::Prefix {
+                pattern,
+                replacement,
+            } => Some(Ok(PreparedRedirect::Prefix {
+                pattern: prepare_value_parts(pattern.clone()),
+                replacement: prepare_value_parts(replacement.clone()),
+            })),
+            ProxyRedirectRule::Regex {
+                pattern,
+                case_insensitive,
+                replacement,
+            } => Some(
+                regex::bytes::RegexBuilder::new(pattern)
+                    .case_insensitive(*case_insensitive)
+                    .build()
+                    .map_err(|e| format!("invalid {what} regex \"{pattern}\": {e}"))
+                    .map(|regex| PreparedRedirect::Regex {
+                        regex: leak_regex(regex),
+                        replacement: prepare_value_parts(replacement.clone()),
+                    }),
+            ),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::arena::leak(rules.into_boxed_slice()))
 }
 
 /// The `proxy_redirect` rules for one `proxy_pass`. Without any
@@ -1732,6 +1766,8 @@ pub(crate) struct ServerProxyDefaults {
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
+    pub cookie_domain: Option<&'static crate::config::ProxyRedirect>,
+    pub cookie_path: Option<&'static crate::config::ProxyRedirect>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
     pub proxy_method: Option<&'static [PreparedValuePart]>,
@@ -1818,6 +1854,10 @@ impl ServerProxyDefaults {
             ignore_invalid_headers,
             underscores_in_headers,
             redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
+            cookie_domain: conf
+                .cookie_domain
+                .map(|r| &*crate::arena::leak(Box::new(r))),
+            cookie_path: conf.cookie_path.map(|r| &*crate::arena::leak(Box::new(r))),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
             proxy_method: conf.proxy_method.map(prepare_value_parts),
@@ -1943,6 +1983,14 @@ pub(crate) fn resolve_proxy_effective(
         redirect: match location.redirect {
             Some(r) => Some(&*crate::arena::leak(Box::new(r))),
             None => server_defaults.redirect,
+        },
+        cookie_domain: match location.cookie_domain {
+            Some(r) => Some(&*crate::arena::leak(Box::new(r))),
+            None => server_defaults.cookie_domain,
+        },
+        cookie_path: match location.cookie_path {
+            Some(r) => Some(&*crate::arena::leak(Box::new(r))),
+            None => server_defaults.cookie_path,
         },
         cache_ignore: cache_ignore(
             location.ignore_headers.as_deref(),
