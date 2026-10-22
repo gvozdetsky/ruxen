@@ -1464,7 +1464,8 @@ pub(crate) fn parse_proxy_cookie_flags(
             *slot = Some(Vec::new());
             return Ok(());
         }
-        [cookie, flags @ ..] if !flags.is_empty() => {
+        // At most three flags: nginx declares it NGX_CONF_TAKE1234.
+        [cookie, flags @ ..] if (1..=3).contains(&flags.len()) => {
             let cookie = match cookie.strip_prefix('~') {
                 Some(regex) => {
                     regex::bytes::RegexBuilder::new(regex)

@@ -889,6 +889,17 @@ async fn settle_proxy_response(
         // and the request redirected internally, as a GET.
         _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => {
             accel_carried_headers(&report.upstream_headers, &mut carried);
+            if let Some(rules) = response_rules.cookies {
+                carried = super::rewrite_carried_cookies(
+                    carried,
+                    rules,
+                    http,
+                    ctx,
+                    &process_meta,
+                    &report.upstream_headers,
+                    uri,
+                );
+            }
             match accel_redirect(&mut report) {
                 Ok(reroute) => (reroute, !matches!(ctx.method, Method::Head)),
                 Err(target) => match refuse_unsafe_accel(
@@ -1313,6 +1324,17 @@ async fn run_proxy_pass(
         _ if report.accel.as_ref().is_some_and(|a| a.redirect.is_some()) => {
             let mut carried = Vec::new();
             accel_carried_headers(&report.upstream_headers, &mut carried);
+            if let Some(rules) = response_rules.cookies {
+                carried = super::rewrite_carried_cookies(
+                    carried,
+                    rules,
+                    http,
+                    ctx,
+                    &process_meta,
+                    &report.upstream_headers,
+                    uri,
+                );
+            }
             let (reroute, as_get) = match accel_redirect(&mut report) {
                 Ok(reroute) => (reroute, !matches!(ctx.method, Method::Head)),
                 Err(target) => match refuse_unsafe_accel(
