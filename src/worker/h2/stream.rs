@@ -461,32 +461,6 @@ impl Drop for StreamIo {
     }
 }
 
-/// A `host` field next to the `:authority`: `true` if it isn't the same
-/// bytes. The first stands with the `:authority`; the others go into the
-/// head `out`, where the parser refuses a duplicate Host as nginx does,
-/// `:authority` being its Host (#609). Out of line: the usual request has
-/// no `host` field, and the field loop stays as small as without it.
-#[cold]
-#[inline(never)]
-fn host_beside_authority(
-    parts: &http::request::Parts,
-    authority: &http::uri::Authority,
-    value: &http::HeaderValue,
-    out: &mut Vec<u8>,
-) -> bool {
-    let first = parts
-        .headers
-        .get(http::header::HOST)
-        .is_some_and(|h| std::ptr::eq(h, value));
-    if first {
-        return value.as_bytes() != authority.as_str().as_bytes();
-    }
-    out.extend_from_slice(b"host: ");
-    out.extend_from_slice(value.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    false
-}
-
 /// The request head: the request line with `HTTP/2.0`, `Host` from
 /// `:authority`, the fields with every `cookie` joined into one (RFC 9113,
 /// 8.2.3, as nginx does for `$http_cookie`), and `Transfer-Encoding:
@@ -532,14 +506,19 @@ fn request_head(parts: &http::request::Parts, chunked: bool, out: &mut Vec<u8>) 
         out.extend_from_slice(b"\r\n");
     }
     let mut authority_mismatch = false;
+    let mut host_seen = false;
     for (name, value) in &parts.headers {
         if name == http::header::COOKIE {
             continue;
         }
+        // The first `host` stands with the `:authority`; a second one goes
+        // into the head, where the parser refuses a duplicate Host as
+        // nginx does, `:authority` being its Host (#609).
         if name == http::header::HOST
             && let Some(authority) = authority
+            && !std::mem::replace(&mut host_seen, true)
         {
-            authority_mismatch |= host_beside_authority(parts, authority, value, out);
+            authority_mismatch |= value.as_bytes() != authority.as_str().as_bytes();
             continue;
         }
         out.extend_from_slice(name.as_str().as_bytes());
