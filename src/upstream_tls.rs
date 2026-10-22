@@ -364,6 +364,9 @@ pub fn client_config(
         None => builder.with_no_client_auth(),
     };
     config.enable_sni = sni;
+    // No certificate compression either way, as nginx's contexts (#601).
+    config.cert_compressors = Vec::new();
+    config.cert_decompressors = Vec::new();
     if !reuse {
         config.resumption = rustls::client::Resumption::disabled();
     }

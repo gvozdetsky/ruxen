@@ -1110,3 +1110,85 @@ fn ssl_protocols_of_the_server_chosen_by_sni() {
     );
     assert_eq!(handshake_version(port, "b.test", &ca_b, &TLS12), None);
 }
+
+/// `ssl_certificate_compression` (#601), per server as nginx copies the
+/// SNI server's context options: `b.test` sends its certificate
+/// compressed (zlib) to a client that offers it, the default server
+/// `a.test` doesn't (nginx's default, off).
+const CERT_COMPRESSION_CONF: &str = r#"
+daemon off;
+events { }
+
+http {
+    ssl_certificate_cache max=10;
+    server {
+        listen 127.0.0.1:%%PORT%% ssl default_server;
+        server_name a.test;
+        ssl_certificate     %%CERT_0%%;
+        ssl_certificate_key %%KEY_0%%;
+        location / { return 200 "server-A\n"; }
+    }
+
+    server {
+        listen 127.0.0.1:%%PORT%%;
+        server_name b.test;
+        ssl_certificate_compression on;
+        ssl_certificate     %%CERT_1%%;
+        ssl_certificate_key %%KEY_1%%;
+        location / { return 200 "server-B\n"; }
+    }
+}
+"#;
+
+/// rustls's zlib decompressor, noting that it was used.
+#[derive(Debug)]
+struct NotedZlib(std::sync::atomic::AtomicBool);
+
+impl rustls::compress::CertDecompressor for NotedZlib {
+    fn decompress(
+        &self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), rustls::compress::DecompressionFailed> {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        rustls::compress::ZLIB_DECOMPRESSOR.decompress(input, output)
+    }
+
+    fn algorithm(&self) -> rustls::CertificateCompressionAlgorithm {
+        rustls::CertificateCompressionAlgorithm::Zlib
+    }
+}
+
+/// Whether the certificate for `name` came compressed.
+fn certificate_came_compressed(port: u16, name: &str, ca_pem: &Path) -> bool {
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read(ca_pem).unwrap();
+    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let noted: &'static NotedZlib = Box::leak(Box::new(NotedZlib(Default::default())));
+    let mut config =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    config.cert_decompressors = vec![noted];
+    let name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock).unwrap();
+    }
+    noted.0.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[test]
+fn ssl_certificate_compression_of_the_server_chosen_by_sni() {
+    let cert_a = make_ca_and_leaf("a.test");
+    let cert_b = make_ca_and_leaf("b.test");
+    let ca_a = cert_a.ca_path().unwrap().to_path_buf();
+    let ca_b = cert_b.ca_path().unwrap().to_path_buf();
+    let server = spawn_https_server_multi(CERT_COMPRESSION_CONF, vec![cert_a, cert_b]);
+    assert!(!certificate_came_compressed(server.port, "a.test", &ca_a));
+    assert!(certificate_came_compressed(server.port, "b.test", &ca_b));
+}

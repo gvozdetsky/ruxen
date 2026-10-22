@@ -395,6 +395,9 @@ pub struct UserDirective {
 #[derive(Debug, Default)]
 pub struct RuntimeOpts {
     pub pid: Option<PathBuf>,
+    /// `ssl_object_cache_inheritable` (nginx 1.27.4, #601): `None` is
+    /// nginx's default, on.
+    pub ssl_object_cache_inheritable: Option<bool>,
     /// `worker_processes <N|auto>;`. `None` means "not set" (default 1,
     /// matching nginx). `Some(0)` represents `auto` — resolved at runtime
     /// via `available_parallelism()`.
@@ -766,6 +769,9 @@ pub struct ServerSsl {
     pub resumption: SessionResumption,
     /// `ssl_reject_handshake on|off` (#112), merged with http scope.
     pub reject_handshake: Option<bool>,
+    /// `ssl_certificate_compression on|off` (nginx 1.29.1, #601), merged
+    /// with http scope; off by default.
+    pub certificate_compression: Option<bool>,
     /// `ssl_verify_client` and what it checks with (#113), merged with
     /// http scope.
     pub client_verify: ClientVerifyConf,
