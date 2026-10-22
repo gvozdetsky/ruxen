@@ -892,6 +892,7 @@ fn client_auth(key: &ClientAuthKey) -> Result<crate::client_verify::ClientAuth, 
             .add_trusted(pem)
             .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_client_certificate)", e))?;
         hints = crate::x509_verify::subjects(pem)
+            .map_err(|e| fail("SSL_load_client_CA_file(ssl_client_certificate)", e))?
             .into_iter()
             .map(rustls::DistinguishedName::from)
             .collect();
