@@ -50,7 +50,6 @@ aws-lc-rs = { version = "1.18", default-features = false }
 # pregenerated bindings with the X509 API (the C library is the same).
 aws-lc-sys = { version = "0.46", default-features = false, features = ["all-bindings"] }
 rustls-webpki = { version = "0.103", default-features = false }
-rustls-pemfile = "2"
 h2 = "0.4"
 http = "1"
 tokio = { version = "1", default-features = false }

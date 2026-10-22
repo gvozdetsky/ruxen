@@ -492,7 +492,11 @@ fn client_certificates_to_upstreams() {
     let client = common::tls::make_ca_and_leaf("client.test");
     let ca_pem = std::fs::read(client.ca_path().unwrap()).unwrap();
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut &ca_pem[..]) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &ca_pem,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());

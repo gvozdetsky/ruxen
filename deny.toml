@@ -1,0 +1,15 @@
+# cargo-deny (#476): the RustSec advisories for Cargo.lock and
+# fuzz/Cargo.lock, on every change and daily (.github/workflows/deny.yml).
+# An ignored advisory says why, and what removes it.
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2025-0057", reason = "fxhash (unmaintained) comes in through monoio 0.2.4 only and goes with a monoio release that drops it; ruxen's own FxHash maps are local code" },
+]

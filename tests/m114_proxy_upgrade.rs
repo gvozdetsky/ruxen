@@ -219,7 +219,11 @@ fn m114_websocket_tunnel_over_tls() {
 
     let mut roots = rustls::RootCertStore::empty();
     let ca = std::fs::read(certs.ca_path().unwrap()).unwrap();
-    for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &ca,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     let config = rustls::ClientConfig::builder()
