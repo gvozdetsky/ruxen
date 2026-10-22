@@ -547,7 +547,7 @@ impl Generation {
         arena: arena::Arena,
         settings: &Settings,
         listeners: Vec<worker::listeners::WorkerListeners>,
-        exited_tx: &std::sync::mpsc::Sender<(u64, usize, bool)>,
+        exited_tx: &std::sync::mpsc::Sender<Exited>,
         on_wait: &mut dyn FnMut(&str),
     ) -> Result<Generation, (String, Option<arena::Arena>)> {
         let state: &'static worker::RuntimeState = Box::leak(Box::default());
@@ -564,15 +564,26 @@ impl Generation {
             arena: Some(arena),
         };
         let mut error = None;
+        // Each worker's thread id, for nginx's `start worker process`.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let ring_entries = worker::ring_entries(http, settings.workers);
         for (i, own) in listeners.into_iter().enumerate() {
             let cpu = if settings.pin { Some(i) } else { None };
             let ready = ready_tx.clone();
-            let exited = WorkerExit(id, i, exited_tx.clone());
+            let tx = exited_tx.clone();
+            let started = started_tx.clone();
             let spawned = thread::Builder::new()
                 .name(format!("ruxen-worker-{i}"))
                 .spawn(move || {
-                    let _exited = exited;
+                    // SAFETY: gettid has no preconditions.
+                    let tid = unsafe { libc::gettid() };
+                    let _exited = WorkerExit {
+                        generation: id,
+                        index: i,
+                        tid,
+                        tx,
+                    };
+                    let _ = started.send(tid);
                     worker::run(http, cpu, state, ready, own, ring_entries)
                 });
             match spawned {
@@ -584,6 +595,7 @@ impl Generation {
             }
         }
         drop(ready_tx);
+        drop(started_tx);
         generation.alive = generation.handles.len();
         let mut pending = generation.handles.len();
         while pending > 0 {
@@ -601,7 +613,22 @@ impl Generation {
             }
         }
         match error {
-            None => Ok(generation),
+            None => {
+                // nginx's master, as it spawns them (#669); a worker's
+                // first step is to send its id, so they are all in.
+                let notice = |message: &str| {
+                    worker::write_worker_log(
+                        http.error_logs,
+                        config::ErrorLogLevel::Notice,
+                        message,
+                    )
+                };
+                notice("start worker processes");
+                for tid in started_rx.try_iter() {
+                    notice(&format!("start worker process {tid}"));
+                }
+                Ok(generation)
+            }
             Some(e) => {
                 // Freed by the caller once nothing reads the configuration.
                 let arena = generation.arena.take();
@@ -630,7 +657,7 @@ struct Master {
     /// Generations a reload retired whose workers haven't all finished.
     retiring: Vec<Generation>,
     listeners: worker::listeners::ListenerSet,
-    exited_tx: std::sync::mpsc::Sender<(u64, usize, bool)>,
+    exited_tx: std::sync::mpsc::Sender<Exited>,
     next_id: u64,
     /// systemd's watchdog (`WatchdogSec=`), when it watches ruxen (#502).
     watchdog: Option<Watchdog>,
@@ -651,7 +678,7 @@ struct Watchdog {
 impl Master {
     fn run(
         &mut self,
-        exited_rx: std::sync::mpsc::Receiver<(u64, usize, bool)>,
+        exited_rx: std::sync::mpsc::Receiver<Exited>,
         reopen_stderr: Option<PathBuf>,
     ) -> Result<(), Failure> {
         let mut quit_at = None;
@@ -677,13 +704,27 @@ impl Master {
             // closer than a reload left retired generations unfreed until
             // they stopped (#503), as nginx's ngx_reap_children reaps all.
             let pending = std::iter::from_fn(|| exited_rx.try_recv().ok());
-            for (id, i, panicked) in first.into_iter().chain(pending) {
+            for Exited {
+                generation: id,
+                index: i,
+                tid,
+                panicked,
+            } in first.into_iter().chain(pending)
+            {
                 // A generation that failed to start was joined already.
                 let Some(generation) = self.generation(id) else {
                     continue;
                 };
                 generation.alive -= 1;
                 let http = generation.http;
+                if !panicked {
+                    // nginx's ngx_process_get_status, as it reaps one (#669).
+                    worker::write_worker_log(
+                        self.current.http.error_logs,
+                        config::ErrorLogLevel::Notice,
+                        &format!("worker process {tid} exited with code 0"),
+                    );
+                }
                 if panicked && !worker_panicked {
                     worker_panicked = true;
                     worker::write_worker_log(
@@ -981,6 +1022,7 @@ impl Master {
             config::ErrorLogLevel::Notice,
             &signal_line(SIGHUP, "reconfiguring"),
         );
+        log(old_http, config::ErrorLogLevel::Notice, "reconfiguring");
         let cli = self.cli.clone();
         // Its own thread: parsing and preparing keep state in thread
         // locals, which then start empty, as at startup.
@@ -1140,11 +1182,30 @@ fn parse_config(cli: &Cli) -> Result<config::HttpConfig, String> {
 /// Held by a worker thread: tells `main` the worker (generation, index) is
 /// gone, and whether it unwound from a panic, when the thread ends either
 /// way.
-struct WorkerExit(u64, usize, std::sync::mpsc::Sender<(u64, usize, bool)>);
+struct WorkerExit {
+    generation: u64,
+    index: usize,
+    /// The worker thread's id, for nginx's `worker process <pid> exited`.
+    tid: i32,
+    tx: std::sync::mpsc::Sender<Exited>,
+}
+
+/// A worker that is gone, as `WorkerExit` reports it.
+struct Exited {
+    generation: u64,
+    index: usize,
+    tid: i32,
+    panicked: bool,
+}
 
 impl Drop for WorkerExit {
     fn drop(&mut self) {
-        let _ = self.2.send((self.0, self.1, thread::panicking()));
+        let _ = self.tx.send(Exited {
+            generation: self.generation,
+            index: self.index,
+            tid: self.tid,
+            panicked: thread::panicking(),
+        });
     }
 }
 
