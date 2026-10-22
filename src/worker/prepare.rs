@@ -2172,8 +2172,11 @@ pub(crate) fn prepare_server(
     // default to `On`. Resolved once here; prepare_handler downstream
     // bakes the right `Server:` bytes into static prebuilts.
     let server_tokens_value = server.server_tokens.unwrap_or(http.tokens);
-    let server_rewrite_program =
-        prepare_rewrite_ops(std::mem::take(&mut server.rewrite_ops), server_tokens_value);
+    let server_rewrite_program = prepare_rewrite_ops(
+        std::mem::take(&mut server.rewrite_ops),
+        server_tokens_value,
+        prepare_types(&server.mime),
+    );
     let server_header_bytes = http::server_header_value(server_tokens_value);
     // access_log inheritance: server-scope list (if set) replaces http;
     // None inherits the http-scope list. Empty `Some(vec![])` means the
@@ -2520,6 +2523,7 @@ fn take_if_locations(ops: &mut [RewriteOp], out: &mut Vec<Location>, enclosing: 
 pub(crate) fn prepare_rewrite_ops(
     ops: Vec<RewriteOp>,
     tokens: crate::config::ServerTokens,
+    types: &'static PreparedTypes,
 ) -> &'static [PreparedRewriteOp] {
     if ops.is_empty() {
         return &[];
@@ -2540,7 +2544,7 @@ pub(crate) fn prepare_rewrite_ops(
                 location,
             } => PreparedRewriteOp::If {
                 guard: prepare_guard(guard),
-                body: prepare_rewrite_ops(body, tokens),
+                body: prepare_rewrite_ops(body, tokens, types),
                 // `prepare_server` moved every parsed one into the server's
                 // list first.
                 location: match location {
@@ -2574,7 +2578,7 @@ pub(crate) fn prepare_rewrite_ops(
             }
             RewriteOp::Return { status, body } => {
                 let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
-                PreparedRewriteOp::Return(prepare_return(status, body, tokens), finalized)
+                PreparedRewriteOp::Return(prepare_return(status, body, tokens, types), finalized)
             }
             RewriteOp::Break => PreparedRewriteOp::Break,
         };
@@ -3075,7 +3079,9 @@ pub(crate) fn prepare_return(
     status: u16,
     body: Vec<ValuePart>,
     tokens: crate::config::ServerTokens,
+    types: &'static PreparedTypes,
 ) -> PreparedReturn {
+    let types = (!is_redirect_status(status)).then_some(types);
     let server_bytes = http::server_header_value(tokens);
     // A redirect to a path goes out as `absolute_redirect` makes it, with
     // the request's host (#15): rendered per request.
@@ -3086,7 +3092,7 @@ pub(crate) fn prepare_return(
         // A redirect status is a redirect whatever its URL, an empty one
         // included: nginx's `ngx_http_send_response` sends an empty
         // `Location` then (#374).
-        PreparedReturn::Static(if is_redirect_status(status) {
+        let prebuilt = if is_redirect_status(status) {
             Prebuilt::leak_redirect(status, concatenated.as_bytes(), server_bytes)
         } else if body.is_empty() {
             // `return STATUS;` with no body: when the status has a canned
@@ -3102,11 +3108,13 @@ pub(crate) fn prepare_return(
             }
         } else {
             Prebuilt::leak(status, &concatenated, server_bytes)
-        })
+        };
+        PreparedReturn::Static(prebuilt, types)
     } else {
         PreparedReturn::Template {
             status,
             parts: prepare_value_parts(body),
+            types,
         }
     }
 }
@@ -3341,7 +3349,10 @@ pub(crate) fn build_handler(
     Ok(match handler {
         Handler::Return { status, body } => {
             let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
-            PreparedHandler::Return(prepare_return(status, body, site.tokens), finalized)
+            PreparedHandler::Return(
+                prepare_return(status, body, site.tokens, prepare_types(site.mime)),
+                finalized,
+            )
         }
         Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
@@ -3608,7 +3619,7 @@ pub(crate) fn build_prefix_or_exact(
         server.keepalive,
     );
     let tokens = location_server_tokens.unwrap_or(server.tokens);
-    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
+    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens, prepare_types(&mime));
     let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
         location_recursive_error_pages.unwrap_or(server.recursive_error_pages);
@@ -3836,7 +3847,7 @@ pub(crate) fn build_regex_location(
         server.keepalive,
     );
     let tokens = location_server_tokens.unwrap_or(server.tokens);
-    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
+    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens, prepare_types(&mime));
     let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
         location_recursive_error_pages.unwrap_or(server.recursive_error_pages);

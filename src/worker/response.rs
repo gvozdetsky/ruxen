@@ -1611,6 +1611,43 @@ fn charset_label_at(charset: &PreparedCharset, head: &[u8]) -> Option<usize> {
     None
 }
 
+/// A `return`'s response with the type nginx gives it (#691): by the URI's
+/// extension, else `default_type` (ngx_http_set_content_type), where it was
+/// built as `text/plain`. A canned error page or a 204 keeps its own.
+#[inline]
+pub(crate) fn typed_return(response: Response, types: ReturnTypes, uri: &[u8]) -> Response {
+    match types.map(|types| types.for_url(uri)) {
+        Some(ty) if ty != b"text/plain" => retype_return(response, ty),
+        _ => response,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn retype_return(response: Response, ty: &[u8]) -> Response {
+    const PLAIN: &[u8] = b"\r\nContent-Type: text/plain\r\n";
+    let bytes: &[u8] = match &response {
+        Response::Prebuilt(b) => b,
+        Response::Owned(b) => b,
+        _ => return response,
+    };
+    let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return response;
+    };
+    let Some(at) = bytes[..head_end + 2]
+        .windows(PLAIN.len())
+        .position(|w| w == PLAIN)
+    else {
+        return response;
+    };
+    let mut out = Vec::with_capacity(bytes.len() + ty.len());
+    out.extend_from_slice(&bytes[..at]);
+    out.extend_from_slice(b"\r\nContent-Type: ");
+    out.extend_from_slice(ty);
+    out.extend_from_slice(&bytes[at + PLAIN.len() - 2..]);
+    Response::Owned(out)
+}
+
 pub(crate) fn response_has_header(bytes: &[u8], name: &[u8]) -> bool {
     let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
