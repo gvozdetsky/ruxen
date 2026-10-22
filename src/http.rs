@@ -622,11 +622,12 @@ fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
     let n = buf.len();
     let mut i = start;
 
-    // Method: RFC 7230 token chars are a looser set, but we only need to
-    // detect the SP delimiter and reject obviously-bogus control bytes.
+    // Method: nginx's rule (ngx_http_parse_request_line, `sw_start` and
+    // `sw_method`), stricter than RFC 9110's token: `A`-`Z`, `_` and `-`,
+    // any length (#485).
     let method_start = i;
     while i < n && buf[i] != b' ' {
-        if buf[i] < b'!' {
+        if !(buf[i].is_ascii_uppercase() || buf[i] == b'_' || buf[i] == b'-') {
             return LineParse::Invalid;
         }
         i += 1;
@@ -2038,6 +2039,35 @@ mod tests {
             }
             other => panic!("want Complete, got {other:?}"),
         }
+    }
+
+    /// nginx's method rule (#485): `A`-`Z`, `_` and `-`, any length;
+    /// anything else is a bad request.
+    #[test]
+    fn method_takes_uppercase_underscore_and_dash() {
+        for good in [
+            &b"FOO_BAR-X"[..],
+            b"VERSION-CONTROL",
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        ] {
+            let mut raw = good.to_vec();
+            raw.extend_from_slice(b" / HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert!(matches!(parse_fresh(&raw), Parse::Complete(_)), "{good:?}");
+        }
+        for bad in [
+            &b"get"[..],
+            b"G3T",
+            b"G\x7fT",
+            b"G\xc3\xa9T",
+            b"GE.T",
+            b"G!",
+        ] {
+            let mut raw = bad.to_vec();
+            raw.extend_from_slice(b" / HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert!(matches!(parse_fresh(&raw), Parse::Invalid), "{bad:?}");
+        }
+        // Refused at the first bad byte, before the line is complete.
+        assert!(matches!(parse_fresh(b"Ge"), Parse::Invalid));
     }
 
     #[test]
