@@ -164,6 +164,8 @@ struct Cli {
     quiet: bool,
     dump: bool,
     show_version: bool,
+    /// `-v`: the first line of `-V` only, as nginx's `-v` (#475).
+    short_version: bool,
     signal: Option<String>,
     /// `--compat`: report everything in the configuration ruxen doesn't
     /// do as nginx (#278).
@@ -181,6 +183,7 @@ impl Default for Cli {
             quiet: false,
             dump: false,
             show_version: false,
+            short_version: false,
             compat: false,
             signal: None,
         }
@@ -239,8 +242,12 @@ fn report_emerg(msg: &str, cli: &Cli, main_path: &Path) -> Failure {
 fn real_main() -> Result<(), Failure> {
     let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
 
-    if cli.show_version {
-        print!("{}", version_output(http::nginx_identity()));
+    if cli.show_version || cli.short_version {
+        let out = version_output(http::nginx_identity());
+        match out.lines().next().filter(|_| !cli.show_version) {
+            Some(first) => println!("{first}"),
+            None => print!("{out}"),
+        }
         return Ok(());
     }
     let signal = match cli.signal.as_deref() {
@@ -1292,6 +1299,7 @@ where
                 cli.dump = true;
             }
             "-V" => cli.show_version = true,
+            "-v" => cli.short_version = true,
             "--compat" => {
                 cli.compat = true;
                 cli.test_only = true;

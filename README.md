@@ -316,7 +316,7 @@ The currently implemented nginx-style command-line surface includes:
 
 and one option nginx doesn't have: `--compat`, the configuration check described in [Check your nginx configuration](#check-your-nginx-configuration).
 
-`-V` starts with `ruxen version: ruxen/<version>`, followed by a `configure arguments` list in nginx's format that names only the modules ruxen actually implements: the nginx-tests harness reads it to decide which tests apply.
+`-V` starts with `ruxen version: ruxen/<version>`, followed by a `configure arguments` list in nginx's format that names only the modules ruxen actually implements: the nginx-tests harness reads it to decide which tests apply. `-v` prints the first line only, as nginx's `-v` does.
 
 Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.30.6` instead, because the upstream tests assert nginx's header, and puts `nginx version: nginx/1.30.6` at the top of `-V`, which the harness needs too.
 
