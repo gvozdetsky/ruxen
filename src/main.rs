@@ -1438,12 +1438,39 @@ fn choose_driver(http: &worker::PreparedHttp) -> Result<worker::Driver, Failure>
         eprintln!("ruxen: [emerg] io_uring is not available: {WHY}");
         return Err(Failure::Reported);
     }
+    // ENOMEM is no policy: the user's RLIMIT_MEMLOCK, which every
+    // io_uring ring counts against (#612), is used up, by this process's
+    // limit or by other io_uring processes of the user.
+    let why = match io_uring_setup_error() {
+        Some(e) if e.raw_os_error() == Some(libc::ENOMEM) => format!(
+            "io_uring_setup() failed ({}): the rings count against RLIMIT_MEMLOCK, \
+             and the user's other io_uring processes may hold it (LimitMEMLOCK=, ulimit -l)",
+            worker::errno_text(&e)
+        ),
+        _ => WHY.to_string(),
+    };
     worker::write_worker_log(
         http.error_logs,
         config::ErrorLogLevel::Notice,
-        &format!("io_uring is not available, using epoll: {WHY}"),
+        &format!("io_uring is not available, using epoll: {why}"),
     );
     Ok(worker::Driver::Epoll)
+}
+
+/// Why a one-entry ring can't be set up, for the epoll notice; `None` when
+/// it can now.
+fn io_uring_setup_error() -> Option<std::io::Error> {
+    // SAFETY: io_uring_setup with a zeroed params struct it fills in; the
+    // ring's descriptor, if any, is closed at once.
+    unsafe {
+        let mut params: [u8; 120] = [0; 120];
+        let fd = libc::syscall(libc::SYS_io_uring_setup, 1u32, params.as_mut_ptr());
+        if fd >= 0 {
+            libc::close(fd as i32);
+            return None;
+        }
+    }
+    Some(std::io::Error::last_os_error())
 }
 
 /// `worker_rlimit_nofile` / `worker_rlimit_core`: both soft and hard limits
