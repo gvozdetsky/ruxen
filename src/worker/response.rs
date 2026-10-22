@@ -4,6 +4,7 @@
 
 #![allow(unused_imports)]
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
@@ -1163,6 +1164,306 @@ pub(crate) fn rewrite_proxy_redirects(
     }
     out.extend_from_slice(&bytes[head_end..]);
     Response::Owned(out)
+}
+
+/// `proxy_cookie_domain` / `proxy_cookie_path`: rewrite the `Domain` and
+/// `Path` of the proxied response's `Set-Cookie` headers with the first
+/// matching rule each, as ngx_http_proxy_rewrite_cookie does. A header
+/// with a rewritten attribute is written again from its parts, `; `
+/// between them.
+#[cold]
+#[inline(never)]
+pub(crate) fn rewrite_proxy_cookies(
+    response: Response,
+    rules: &crate::worker::PreparedCookieRules,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    upstream_headers: &[u8],
+    uri: Option<&[u8]>,
+) -> Response {
+    let Response::Owned(bytes) = response else {
+        return response;
+    };
+    let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Response::Owned(bytes);
+    };
+    let is_cookie = |line: &[u8]| {
+        line.iter().position(|&b| b == b':').is_some_and(|colon| {
+            line[..colon]
+                .trim_ascii()
+                .eq_ignore_ascii_case(b"set-cookie")
+        })
+    };
+    if !bytes[..head_end].split(|&b| b == b'\n').any(is_cookie) {
+        return Response::Owned(bytes);
+    }
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(
+        http,
+        ctx,
+        meta,
+        response_status(&bytes),
+        upstream_headers,
+        &root_only,
+        uri,
+    );
+    let mut out = Vec::with_capacity(bytes.len() + 64);
+    let mut changed = false;
+    for (i, line) in bytes[..head_end]
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .enumerate()
+    {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        let rewritten = if i > 0 && is_cookie(line) {
+            let colon = line.iter().position(|&b| b == b':').unwrap_or(0);
+            rewrite_cookie(line[colon + 1..].trim_ascii(), rules, &render_ctx).map(|value| {
+                let mut new = line[..colon + 1].to_vec();
+                new.push(b' ');
+                new.extend_from_slice(&value);
+                new
+            })
+        } else {
+            None
+        };
+        match rewritten {
+            Some(new_line) => {
+                out.extend_from_slice(&new_line);
+                changed = true;
+            }
+            None => out.extend_from_slice(line),
+        }
+    }
+    if !changed {
+        return Response::Owned(bytes);
+    }
+    out.extend_from_slice(&bytes[head_end..]);
+    Response::Owned(out)
+}
+
+/// A cookie attribute: its name, and its value if it has `=`; `None` once
+/// `proxy_cookie_flags` removed it.
+type CookieAttr<'a> = Option<(Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>;
+
+/// One `Set-Cookie` value with its `Domain`, `Path` and flags rewritten;
+/// `None` when no rule applied (ngx_http_proxy_parse_cookie splits it: at
+/// each `;`, a name up to `=` and a value, both trimmed of spaces).
+fn rewrite_cookie(
+    value: &[u8],
+    rules: &crate::worker::PreparedCookieRules,
+    render_ctx: &RenderCtx<'_>,
+) -> Option<Vec<u8>> {
+    let mut attrs: Vec<CookieAttr<'_>> = value
+        .split(|&b| b == b';')
+        .map(|attr| {
+            let attr = attr.trim_ascii_start();
+            Some(match attr.iter().position(|&b| b == b'=') {
+                Some(eq) => (
+                    attr[..eq].trim_ascii_end().into(),
+                    Some(attr[eq + 1..].trim_ascii().into()),
+                ),
+                None => (attr.trim_ascii_end().into(), None),
+            })
+        })
+        .collect();
+    // Not `name=value` first: not a cookie nginx rewrites.
+    attrs.first()?.as_ref()?.1.as_ref()?;
+    let mut changed = false;
+    for (key, value) in attrs.iter_mut().skip(1).flatten() {
+        let Some(v) = value.as_ref() else {
+            continue;
+        };
+        let new = if key.eq_ignore_ascii_case(b"domain") {
+            apply_cookie_domain_rules(rules.domains, v, render_ctx)
+        } else if key.eq_ignore_ascii_case(b"path") {
+            apply_redirect_rules(rules.paths, v, 0, render_ctx)
+        } else {
+            None
+        };
+        if let Some(new) = new {
+            *value = Some(new.into());
+            changed = true;
+        }
+    }
+    if !rules.flags.is_empty() {
+        let name = attrs[0].as_ref().map_or(&b""[..], |(k, _)| &k[..]);
+        let flags = cookie_flags(rules.flags, name, render_ctx);
+        if flags != 0 {
+            edit_cookie_flags(&mut attrs, flags);
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = Vec::with_capacity(value.len() + 32);
+    for (i, (key, value)) in attrs.iter().flatten().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"; ");
+        }
+        out.extend_from_slice(key);
+        if let Some(value) = value {
+            out.push(b'=');
+            out.extend_from_slice(value);
+        }
+    }
+    Some(out)
+}
+
+// `proxy_cookie_flags`' flags, as nginx's NGX_HTTP_PROXY_COOKIE_* bits.
+const SECURE_ON: u16 = 1 << 0;
+const SECURE_OFF: u16 = 1 << 1;
+const HTTPONLY_ON: u16 = 1 << 2;
+const HTTPONLY_OFF: u16 = 1 << 3;
+const SAMESITE_STRICT: u16 = 1 << 4;
+const SAMESITE_LAX: u16 = 1 << 5;
+const SAMESITE_NONE: u16 = 1 << 6;
+const SAMESITE_OFF: u16 = 1 << 7;
+
+/// The flags of the first `proxy_cookie_flags` line whose cookie is `name`
+/// (ngx_http_proxy_rewrite_cookie_flags); 0 when none is, or it sets none.
+/// A flag nginx doesn't know is skipped.
+fn cookie_flags(
+    rules: &[crate::worker::PreparedCookieFlags],
+    name: &[u8],
+    render_ctx: &RenderCtx<'_>,
+) -> u16 {
+    let mut rendered = Vec::new();
+    let rule = rules.iter().find(|rule| match rule.cookie {
+        crate::worker::PreparedCookieName::Regex(regex) => regex.is_match(name),
+        crate::worker::PreparedCookieName::Name(parts) => {
+            rendered.clear();
+            render_parts(parts, render_ctx, &mut rendered);
+            rendered.eq_ignore_ascii_case(name)
+        }
+    });
+    let Some(rule) = rule else {
+        return 0;
+    };
+    let mut flags = 0;
+    for parts in rule.flags {
+        rendered.clear();
+        render_parts(parts, render_ctx, &mut rendered);
+        flags |= match rendered.to_ascii_lowercase().as_slice() {
+            b"secure" => SECURE_ON,
+            b"nosecure" => SECURE_OFF,
+            b"httponly" => HTTPONLY_ON,
+            b"nohttponly" => HTTPONLY_OFF,
+            b"samesite=strict" => SAMESITE_STRICT,
+            b"samesite=lax" => SAMESITE_LAX,
+            b"samesite=none" => SAMESITE_NONE,
+            b"nosamesite" => SAMESITE_OFF,
+            _ => 0,
+        };
+    }
+    flags
+}
+
+/// Set and remove `Secure`, `HttpOnly` and `SameSite` as
+/// ngx_http_proxy_edit_cookie_flags does: an attribute the cookie has is
+/// kept (its `SameSite` value set), one it lacks is added at the end, and
+/// a `no…` flag removes it. Setting a flag wins over removing it.
+fn edit_cookie_flags(attrs: &mut Vec<CookieAttr<'_>>, mut flags: u16) {
+    for attr in attrs.iter_mut().skip(1) {
+        let Some((key, value)) = attr.as_mut() else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case(b"secure") {
+            if flags & SECURE_ON != 0 {
+                flags &= !SECURE_ON;
+            } else if flags & SECURE_OFF != 0 {
+                *attr = None;
+            }
+        } else if key.eq_ignore_ascii_case(b"httponly") {
+            if flags & HTTPONLY_ON != 0 {
+                flags &= !HTTPONLY_ON;
+            } else if flags & HTTPONLY_OFF != 0 {
+                *attr = None;
+            }
+        } else if key.eq_ignore_ascii_case(b"samesite") {
+            let wanted: &'static [u8] = if flags & SAMESITE_STRICT != 0 {
+                flags &= !SAMESITE_STRICT;
+                b"Strict"
+            } else if flags & SAMESITE_LAX != 0 {
+                flags &= !SAMESITE_LAX;
+                b"Lax"
+            } else if flags & SAMESITE_NONE != 0 {
+                flags &= !SAMESITE_NONE;
+                b"None"
+            } else {
+                if flags & SAMESITE_OFF != 0 {
+                    *attr = None;
+                }
+                continue;
+            };
+            if !value
+                .as_ref()
+                .is_some_and(|v| v.eq_ignore_ascii_case(wanted))
+            {
+                *key = Cow::Borrowed(b"SameSite");
+                *value = Some(Cow::Borrowed(wanted));
+            }
+        }
+    }
+    if flags & SECURE_ON != 0 {
+        attrs.push(Some((Cow::Borrowed(b"Secure"), None)));
+    }
+    if flags & HTTPONLY_ON != 0 {
+        attrs.push(Some((Cow::Borrowed(b"HttpOnly"), None)));
+    }
+    let same_site: Option<&'static [u8]> = if flags & SAMESITE_STRICT != 0 {
+        Some(b"Strict")
+    } else if flags & SAMESITE_LAX != 0 {
+        Some(b"Lax")
+    } else if flags & SAMESITE_NONE != 0 {
+        Some(b"None")
+    } else {
+        None
+    };
+    if let Some(same_site) = same_site {
+        attrs.push(Some((
+            Cow::Borrowed(b"SameSite"),
+            Some(Cow::Borrowed(same_site)),
+        )));
+    }
+}
+
+/// `proxy_cookie_domain`'s first matching rule, applied to a `Domain`. A
+/// literal rule matches the whole domain after a leading dot, caseless,
+/// and keeps the dot (ngx_http_proxy_rewrite_domain_handler); a regex one
+/// replaces the whole value, as in `proxy_redirect`.
+fn apply_cookie_domain_rules(
+    rules: &[PreparedRedirect],
+    value: &[u8],
+    render_ctx: &RenderCtx<'_>,
+) -> Option<Vec<u8>> {
+    for (i, rule) in rules.iter().enumerate() {
+        match rule {
+            PreparedRedirect::Prefix {
+                pattern,
+                replacement,
+            } => {
+                let dot = usize::from(value.first() == Some(&b'.'));
+                let mut pat = Vec::new();
+                render_parts(pattern, render_ctx, &mut pat);
+                if !value[dot..].eq_ignore_ascii_case(&pat) {
+                    continue;
+                }
+                let mut new = value[..dot].to_vec();
+                render_parts(replacement, render_ctx, &mut new);
+                return Some(new);
+            }
+            PreparedRedirect::Regex { .. } => {
+                if let Some(new) = apply_redirect_rules(&rules[i..=i], value, 0, render_ctx) {
+                    return Some(new);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The first rule that matches `value[prefix..]`, applied; `None` if none

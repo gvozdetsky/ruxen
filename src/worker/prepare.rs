@@ -1298,7 +1298,7 @@ pub(crate) fn build_proxy(
         },
     };
     let cache = prepare_proxy_cache(eff.cache, eff.cache_ignore)?;
-    let response = prepare_response_rules(redirects, &eff);
+    let response = prepare_response_rules(redirects, &eff)?;
     Ok(match pp {
         ProxyPass::Direct {
             addrs,
@@ -1629,7 +1629,7 @@ fn literal_limit_rate(parts: Option<&[PreparedValuePart]>) -> Option<u64> {
 fn prepare_response_rules(
     redirects: &'static [PreparedRedirect],
     eff: &ProxyEffective,
-) -> &'static ProxyResponseRules {
+) -> Result<&'static ProxyResponseRules, String> {
     let pass = eff.pass_headers.unwrap_or(&[]);
     let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
     let pass_mask = pass
@@ -1643,7 +1643,17 @@ fn prepare_response_rules(
         .filter(|h| !passed(h) && crate::proxy::default_hidden_bit(h.as_bytes()).is_none())
         .map(|h| leak_bytes(h.to_ascii_lowercase().as_bytes()))
         .collect();
-    crate::arena::leak(Box::new(ProxyResponseRules {
+    let domains = prepare_cookie_rules(eff.cookie_domain, "proxy_cookie_domain")?;
+    let paths = prepare_cookie_rules(eff.cookie_path, "proxy_cookie_path")?;
+    let flags = prepare_cookie_flags(eff.cookie_flags)?;
+    let cookies = (!domains.is_empty() || !paths.is_empty() || !flags.is_empty()).then(|| {
+        &*crate::arena::leak(Box::new(PreparedCookieRules {
+            domains,
+            paths,
+            flags,
+        }))
+    });
+    Ok(crate::arena::leak(Box::new(ProxyResponseRules {
         redirects,
         error_pages: eff.error_pages,
         recursive_error_pages: eff.recursive_error_pages,
@@ -1652,11 +1662,89 @@ fn prepare_response_rules(
         limit_rate: eff
             .limit_rate
             .filter(|parts| literal_limit_rate(Some(parts)).is_none()),
+        cookies,
         hide: crate::arena::leak(hide.into_boxed_slice()),
         passes_date: crate::proxy::default_hidden_bit(b"date")
             .is_some_and(|bit| pass_mask & bit != 0),
         pass_mask,
-    }))
+    })))
+}
+
+/// The `proxy_cookie_flags` lines in scope: none when unset or `off`.
+fn prepare_cookie_flags(
+    config: Option<&'static [crate::config::CookieFlagsRule]>,
+) -> Result<&'static [PreparedCookieFlags], String> {
+    use crate::config::CookieName;
+    let rules = config
+        .unwrap_or(&[])
+        .iter()
+        .map(|rule| {
+            let cookie = match &rule.cookie {
+                CookieName::Name(parts) => {
+                    PreparedCookieName::Name(prepare_value_parts(parts.clone()))
+                }
+                CookieName::Regex(pattern) => PreparedCookieName::Regex(leak_regex(
+                    regex::bytes::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(|e| {
+                            format!("invalid proxy_cookie_flags regex \"{pattern}\": {e}")
+                        })?,
+                )),
+            };
+            let flags: Vec<&'static [PreparedValuePart]> = rule
+                .flags
+                .iter()
+                .map(|f| prepare_value_parts(f.clone()))
+                .collect();
+            Ok(PreparedCookieFlags {
+                cookie,
+                flags: crate::arena::leak(flags.into_boxed_slice()),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::arena::leak(rules.into_boxed_slice()))
+}
+
+/// The rules of `proxy_cookie_domain` or `proxy_cookie_path`: none when
+/// unset or `off`.
+fn prepare_cookie_rules(
+    config: Option<&'static crate::config::ProxyRedirect>,
+    what: &str,
+) -> Result<&'static [PreparedRedirect], String> {
+    use crate::config::{ProxyRedirect, ProxyRedirectRule};
+    let Some(ProxyRedirect::Rules(rules)) = config else {
+        return Ok(&[]);
+    };
+    let rules = rules
+        .iter()
+        .filter_map(|rule| match rule {
+            // Only `proxy_redirect` has a `default`.
+            ProxyRedirectRule::Default => None,
+            ProxyRedirectRule::Prefix {
+                pattern,
+                replacement,
+            } => Some(Ok(PreparedRedirect::Prefix {
+                pattern: prepare_value_parts(pattern.clone()),
+                replacement: prepare_value_parts(replacement.clone()),
+            })),
+            ProxyRedirectRule::Regex {
+                pattern,
+                case_insensitive,
+                replacement,
+            } => Some(
+                regex::bytes::RegexBuilder::new(pattern)
+                    .case_insensitive(*case_insensitive)
+                    .build()
+                    .map_err(|e| format!("invalid {what} regex \"{pattern}\": {e}"))
+                    .map(|regex| PreparedRedirect::Regex {
+                        regex: leak_regex(regex),
+                        replacement: prepare_value_parts(replacement.clone()),
+                    }),
+            ),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::arena::leak(rules.into_boxed_slice()))
 }
 
 /// The `proxy_redirect` rules for one `proxy_pass`. Without any
@@ -1741,6 +1829,9 @@ pub(crate) struct ServerProxyDefaults {
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
+    pub cookie_domain: Option<&'static crate::config::ProxyRedirect>,
+    pub cookie_path: Option<&'static crate::config::ProxyRedirect>,
+    pub cookie_flags: Option<&'static [crate::config::CookieFlagsRule]>,
     pub hide_headers: Option<&'static [String]>,
     pub pass_headers: Option<&'static [String]>,
     pub proxy_method: Option<&'static [PreparedValuePart]>,
@@ -1830,6 +1921,13 @@ impl ServerProxyDefaults {
             ignore_invalid_headers,
             underscores_in_headers,
             redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
+            cookie_domain: conf
+                .cookie_domain
+                .map(|r| &*crate::arena::leak(Box::new(r))),
+            cookie_path: conf.cookie_path.map(|r| &*crate::arena::leak(Box::new(r))),
+            cookie_flags: conf
+                .cookie_flags
+                .map(|r| &*crate::arena::leak(r.into_boxed_slice())),
             hide_headers: leak_list(conf.hide_headers),
             pass_headers: leak_list(conf.pass_headers),
             proxy_method: conf.proxy_method.map(prepare_value_parts),
@@ -1958,6 +2056,18 @@ pub(crate) fn resolve_proxy_effective(
         redirect: match location.redirect {
             Some(r) => Some(&*crate::arena::leak(Box::new(r))),
             None => server_defaults.redirect,
+        },
+        cookie_domain: match location.cookie_domain {
+            Some(r) => Some(&*crate::arena::leak(Box::new(r))),
+            None => server_defaults.cookie_domain,
+        },
+        cookie_path: match location.cookie_path {
+            Some(r) => Some(&*crate::arena::leak(Box::new(r))),
+            None => server_defaults.cookie_path,
+        },
+        cookie_flags: match location.cookie_flags {
+            Some(r) => Some(&*crate::arena::leak(r.into_boxed_slice())),
+            None => server_defaults.cookie_flags,
         },
         cache_ignore: cache_ignore(
             location.ignore_headers.as_deref(),
