@@ -94,3 +94,57 @@ fn absolute_and_empty_intercept_targets() {
     assert!(empty.ends_with("upstream404"), "{empty}");
     assert!(again.starts_with("HTTP/1.1 302"), "{again}");
 }
+
+/// An `error_page` that leads to `proxy_pass` keeps the error's status
+/// (404 here, the upstream answering 200), as nginx's `r->err_status`
+/// replaces the upstream's; `=` takes the upstream's and `=202` its own
+/// (#675).
+#[test]
+fn a_proxied_error_page_keeps_the_error_status() {
+    let setup = common::ports::setup_lock();
+    let [front, back] = common::ports::free_ports();
+    let dir = std::env::temp_dir().join(format!("ruxen-m71-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("html")).unwrap();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{\n\
+             server {{ listen 127.0.0.1:{front}; root {d}/html;\n\
+               location /plain/ {{ error_page 404 /up/plain; }}\n\
+               location /same/ {{ error_page 404 = /up/same; }}\n\
+               location /code/ {{ error_page 404 =202 /up/code; }}\n\
+               location /up/ {{ proxy_pass http://127.0.0.1:{back}; }}\n\
+             }}\n\
+             server {{ listen 127.0.0.1:{back}; location / {{ return 200 \"from $uri\"; }} }}\n\
+             }}\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .env("RUXEN_WORKERS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(3));
+    drop(setup);
+
+    let plain = get(front, "/plain/none");
+    let same = get(front, "/same/none");
+    let code = get(front, "/code/none");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(plain.starts_with("HTTP/1.1 404 Not Found\r\n"), "{plain}");
+    assert!(plain.ends_with("from /up/plain"), "{plain}");
+    assert!(same.starts_with("HTTP/1.1 200 OK\r\n"), "{same}");
+    assert!(same.ends_with("from /up/same"), "{same}");
+    assert!(code.starts_with("HTTP/1.1 202 Accepted\r\n"), "{code}");
+    assert!(code.ends_with("from /up/code"), "{code}");
+}
