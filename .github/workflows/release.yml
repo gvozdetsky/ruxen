@@ -7,6 +7,12 @@ name: Release
 # image ghcr.io/gvozdetsky/ruxen (amd64 and arm64) from the same binaries.
 # Publishing to crates.io is a separate, manual `cargo publish` (see
 # CONTRIBUTING.md, "Releasing").
+#
+# Supply chain (#480): each binary carries its crate list (`cargo
+# auditable`), each target gets a CycloneDX SBOM as a release asset, and on
+# a tag the tarballs get build-provenance and SBOM attestations signed with
+# the workflow's identity (`gh attestation verify <tarball> -R
+# gvozdetsky/ruxen`). The image carries buildx's provenance and an SBOM.
 
 on:
   push:
@@ -37,6 +43,11 @@ jobs:
             name: x86_64-linux-musl
             musl: true
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # The attestations, signed through Sigstore with the run's OIDC token.
+      id-token: write
+      attestations: write
     env:
       # monoio uses statx, which the libc crate declares for musl only when
       # told the musl is 1.2.3+. The binary links the musl that ships with
@@ -53,6 +64,10 @@ jobs:
       - name: musl toolchain
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable,cargo-cyclonedx
 
       - name: Version
         id: version
@@ -81,14 +96,17 @@ jobs:
       - name: Test
         run: cargo test --release --locked --target ${{ matrix.target }}
 
+      # The crate list goes into a `.dep-v0` section, for `cargo audit bin`,
+      # Trivy and Syft; the code is the same as a plain build's.
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo auditable build --release --locked --target ${{ matrix.target }}
 
       - name: Smoke test
         run: |
           bin=target/${{ matrix.target }}/release/ruxen
           file "$bin"
           "$bin" -V 2>&1 | grep -Fx "ruxen version: ruxen/${{ steps.version.outputs.version }}"
+          readelf -S "$bin" | grep -q '\.dep-v0'
           for conf in examples/*.conf; do
             "$bin" -t -c "$PWD/$conf"
           done
@@ -105,12 +123,37 @@ jobs:
           # install links) always points at the newest release.
           cp "$dist.tar.gz" "ruxen-${{ matrix.name }}.tar.gz"
 
+      # The dependencies this target links, normal ones only (no dev or
+      # build dependencies), as CycloneDX JSON.
+      - name: SBOM
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --target ${{ matrix.target }} --no-build-deps \
+            --override-filename ruxen.cdx
+          mv ruxen.cdx.json "${{ steps.version.outputs.dist }}.cdx.json"
+          jq -e '.components | length > 0' "${{ steps.version.outputs.dist }}.cdx.json" > /dev/null
+
+      - uses: actions/attest-build-provenance@v2
+        if: github.ref_type == 'tag'
+        with:
+          subject-path: |
+            ${{ steps.version.outputs.dist }}.tar.gz
+            ruxen-${{ matrix.name }}.tar.gz
+
+      - uses: actions/attest-sbom@v2
+        if: github.ref_type == 'tag'
+        with:
+          subject-path: |
+            ${{ steps.version.outputs.dist }}.tar.gz
+            ruxen-${{ matrix.name }}.tar.gz
+          sbom-path: ${{ steps.version.outputs.dist }}.cdx.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.version.outputs.dist }}
           path: |
             ${{ steps.version.outputs.dist }}.tar.gz
             ruxen-${{ matrix.name }}.tar.gz
+            ${{ steps.version.outputs.dist }}.cdx.json
 
   release:
     needs: build
@@ -128,7 +171,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.cdx.json > SHA256SUMS
           cat SHA256SUMS
 
       - uses: actions/upload-artifact@v4
@@ -149,7 +192,7 @@ jobs:
           gh release create "$tag" --draft "${prerelease[@]}" \
             --title "ruxen $tag" \
             --notes-file ".github/release-notes/$tag.md" \
-            dist/*.tar.gz dist/SHA256SUMS
+            dist/*.tar.gz dist/*.cdx.json dist/SHA256SUMS
           gh release edit "$tag" --draft=false
 
   image:
@@ -213,4 +256,5 @@ jobs:
             --platform linux/amd64,linux/arm64 \
             --label org.opencontainers.image.source=https://github.com/gvozdetsky/ruxen \
             --label org.opencontainers.image.version=${{ steps.bins.outputs.version }} \
+            --provenance=mode=max --sbom=true \
             "${tags[@]}" --push .
