@@ -843,11 +843,12 @@ async fn settle_proxy_response(
     let client = client.filter(|_| !plan.ignore_client_abort);
     let upstream_resp = {
         let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report));
-        if process_meta.limit_conn_held.is_some() {
-            super::client_watch::Watched::at_once(proxy, client).await
+        let watched = if process_meta.limit_conn_held.is_some() {
+            super::client_watch::Watched::at_once(proxy, client)
         } else {
-            super::client_watch::Watched::new(proxy, client).await
-        }
+            super::client_watch::Watched::new(proxy, client)
+        };
+        watched.await
     };
     let Some(upstream_resp) = upstream_resp else {
         client_closed_log(&process_meta, ctx);
