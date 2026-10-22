@@ -148,6 +148,9 @@ pub struct ProxyPlan {
     /// The proxied location was reached as an error page, so its own
     /// `error_page` doesn't apply again (no `recursive_error_pages`).
     pub in_error_page: bool,
+    /// Reached through an `error_page`: the status its response goes out
+    /// with, as nginx's `r->err_status` replaces the upstream's (#675).
+    pub error_page_status: Option<crate::phase::ErrorPageStatus>,
     /// `proxy_intercept_errors on;` (M43): when `Some`, an upstream
     /// status that matches one of these rules is reflected back as a
     /// `Response::Reroute` instead of being forwarded to the client. The

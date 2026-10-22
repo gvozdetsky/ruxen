@@ -835,6 +835,7 @@ async fn settle_proxy_response(
     } else {
         plan.response.error_pages
     };
+    let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
     // nginx's ngx_http_upstream_check_broken_connection: a client that
     // closes ends the exchange, and with it the upstream connection (the
@@ -917,6 +918,7 @@ async fn settle_proxy_response(
                 upstream_resp,
                 report,
                 redirects,
+                error_page_status,
                 http,
                 ctx,
                 process_meta,
@@ -991,10 +993,12 @@ fn intercept_with_report(
 /// The upstream response goes to the client: apply `proxy_redirect` and
 /// the location's `add_header` / `add_trailer` / `expires`, with the
 /// upstream headers visible to `$upstream_http_*` / `$upstream_cookie_*`.
+#[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 fn finish_proxy_response(
     upstream_resp: Response,
     mut report: crate::proxy::ProxyReport,
     redirects: &'static [PreparedRedirect],
+    error_page_status: Option<phase::ErrorPageStatus>,
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     mut process_meta: phase::ProcessMeta,
@@ -1024,6 +1028,15 @@ fn finish_proxy_response(
         // Trailers go after a chunked body built in memory.
         Response::File { headers, body } => (read_file_body(headers, body, ctx), None, None),
         other => (other, None, None),
+    };
+    // Reached through an `error_page` without `=`: the error's status
+    // (#675). Not the proxy's own 502/504, which stand as nginx's special
+    // response sets them.
+    let upstream_resp = match (error_page_status, upstream_resp) {
+        (Some(forced), Response::Owned(head)) => {
+            Response::Owned(error_page_status_on_proxied(head, forced))
+        }
+        (_, upstream_resp) => upstream_resp,
     };
     // `X-Accel-Limit-Rate` is the response's `limit_rate`.
     if let Some(rate) = report.accel.as_ref().and_then(|a| a.limit_rate) {
@@ -1090,6 +1103,19 @@ fn finish_proxy_response(
     }
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
+}
+
+/// A proxied response's head with the status of the `error_page` that led
+/// to it, as nginx's ngx_http_send_header puts `r->err_status` over the
+/// upstream's (#675).
+#[cold]
+#[inline(never)]
+fn error_page_status_on_proxied(head: Vec<u8>, forced: phase::ErrorPageStatus) -> Vec<u8> {
+    let status = response_status(&head);
+    match effective_error_page_status(status, Some(forced)) {
+        same if same == status => head,
+        other => rewrite_response_status(head, other),
+    }
 }
 
 /// The range filter may see `response` (#370): gzip won't compress it.
@@ -1229,6 +1255,7 @@ async fn run_proxy_pass(
     } else {
         plan.response.error_pages
     };
+    let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
     let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
     if !report.failures.is_empty() {
@@ -1315,6 +1342,7 @@ async fn run_proxy_pass(
                 upstream_resp,
                 report,
                 redirects,
+                error_page_status,
                 http,
                 ctx,
                 process_meta,
