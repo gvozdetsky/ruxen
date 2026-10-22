@@ -148,6 +148,15 @@ fn if_locations_follow_nginx() {
                  proxy_set_header X-Root $document_root;\n\
                  if ($arg_h) {{ add_header X-H 1; }}\n\
                }}\n\
+               location /carried {{\n\
+                 if ($arg_p) {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+                 if ($arg_q) {{ }}\n\
+               }}\n\
+               location /inherited {{\n\
+                 proxy_pass http://127.0.0.1:{up};\n\
+                 if ($arg_p) {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+                 if ($arg_q) {{ }}\n\
+               }}\n\
                root {d}/html;\n\
              }}\n\
              server {{ listen 127.0.0.1:{up}; return 200 \"uri:$uri$http_x_root\\n\"; }}\n\
@@ -178,6 +187,9 @@ fn if_locations_follow_nginx() {
     let two_a = get(port, "/two?a=1");
     let two_ab = get(port, "/two?a=1&b=1");
     let late = get(port, "/late/?h=1");
+    let carried = get(port, "/carried?p=1");
+    let carried_on = get(port, "/carried?p=1&q=1");
+    let inherited = get(port, "/inherited?p=1&q=1");
     // The line of `/h` is written after its response: wait for it rather
     // than a fixed time, which the full test run's load can outlast.
     let mut log = String::new();
@@ -214,4 +226,10 @@ fn if_locations_follow_nginx() {
         late.contains("X-H: 1") && late.ends_with(&format!("uri:/late/{}/html\n", dir.display())),
         "{late}"
     );
+    // The proxy handler of the first `if` stays with the second's
+    // configuration, which has no upstream: nginx answers 500 (it used to
+    // crash; proxy_if.t). With one inherited from the location, it proxies.
+    assert!(carried.ends_with("uri:/carried\n"), "{carried}");
+    assert!(carried_on.starts_with("HTTP/1.1 500"), "{carried_on}");
+    assert!(inherited.ends_with("uri:/inherited\n"), "{inherited}");
 }

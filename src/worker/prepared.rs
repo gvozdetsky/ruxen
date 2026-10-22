@@ -263,6 +263,10 @@ pub struct RewriteState {
     /// location's rewrite program (#137): the request goes on with its
     /// configuration, as nginx's `r->loc_conf = code->loc_conf`.
     pub(crate) if_location: Option<u32>,
+    /// An `if` whose condition held had a `proxy_pass`: nginx keeps that
+    /// content handler (`r->content_handler`) when a later `if` sets none,
+    /// with the later configuration, which may have no upstream.
+    pub(crate) if_proxy: bool,
 }
 
 impl Default for RewriteState {
@@ -277,6 +281,7 @@ impl Default for RewriteState {
             limit_req_status: 0,
             limit_conn_status: 0,
             if_location: None,
+            if_proxy: false,
         }
     }
 }
