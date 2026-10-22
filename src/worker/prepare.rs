@@ -554,6 +554,9 @@ pub(crate) fn build_listen_tls(
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
             keys.push(server_key(input, cert, key, &passwords)?);
         }
+        // Each is loaded and checked, as nginx loads it; the last of each
+        // key type is the one served (#670).
+        let keys = crate::tls_certs::last_per_key_type(keys);
 
         // Register each registered server_name against every key so an RSA
         // + ECDSA pair can both serve under the same hostname.
