@@ -277,7 +277,7 @@ A growing nginx-compatible configuration surface is implemented. [`docs/directiv
 
 - `include`, with patterns (`include conf.d/*.conf;`: the matches sorted, none is fine, as nginx's glob)
 - `return`, including `return URL;` (a 302)
-- `add_header` and `add_trailer`, at http, server and location level
+- `add_header` and `add_trailer`, at http, server and location level, with `add_header_inherit` / `add_trailer_inherit` (`merge` keeps the inherited headers under a level's own)
 - `types {}` (`include mime.types`) and `default_type`, as nginx sets Content-Type: no charset is added, and without `types` only .html, .gif and .jpg have a type
 - `expires`
 - `error_page` and `recursive_error_pages`
