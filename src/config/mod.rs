@@ -3527,6 +3527,10 @@ mod tests {
                         add_header_inherit merge;
                         location /nest/in { add_header X-N in; }
                         location /nest/on { add_header_inherit on; add_header X-N on; }
+                        location /nest/deep {
+                            add_header X-C c;
+                            if ($arg_b) { add_header X-J j; }
+                        }
                         add_header X-L nest;
                         if ($arg_a) { add_header X-I a; }
                     }
@@ -3572,6 +3576,15 @@ mod tests {
             panic!("{:?}", loc("/nest").rewrite_ops)
         };
         assert_eq!(names(&inside.add_headers), ["X-I", "X-L", "X-S"]);
+        // An `if` in a nested location: each level once.
+        let RewriteOp::If {
+            location: Some(IfLocation::Parsed { location: deep, .. }),
+            ..
+        } = &loc("/nest/deep").rewrite_ops[0]
+        else {
+            panic!("{:?}", loc("/nest/deep").rewrite_ops)
+        };
+        assert_eq!(names(&deep.add_headers), ["X-J", "X-C", "X-L", "X-S"]);
         let two = &cfg.servers[1];
         assert_eq!(names(&two.add_headers), ["X-S", "X-H"]);
         assert_eq!(names(&two.add_trailers), ["X-T", "X-T"]);

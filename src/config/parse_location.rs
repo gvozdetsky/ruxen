@@ -299,21 +299,6 @@ fn header_chain(parent: &Location) -> Vec<HeaderLevel> {
     chain
 }
 
-/// The `if` locations of a location an enclosing one closes over take its
-/// levels in front of theirs too, as the location itself does (#598).
-fn prepend_header_chain_in_ifs(ops: &mut [RewriteOp], chain: &[HeaderLevel]) {
-    for op in ops {
-        if let RewriteOp::If { body, location, .. } = op {
-            if let Some(IfLocation::Parsed { location, .. }) = location {
-                let mut levels = chain.to_vec();
-                levels.append(&mut location.header_ancestors);
-                location.header_ancestors = levels;
-            }
-            prepend_header_chain_in_ifs(body, chain);
-        }
-    }
-}
-
 /// What a nested location takes from its parent where it sets nothing
 /// itself (#106), as nginx's `merge_loc_conf` of each module: a list
 /// directive (`add_header`, `error_page`, `proxy_set_header`, …) comes as a
@@ -482,6 +467,10 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
                 own_root,
             }) => {
                 inherit_from_parent(location, parent);
+                // Set, not prepended: this runs again each time an
+                // enclosing location closes, from the parent's chain as
+                // it then is (#598).
+                location.header_ancestors = header_chain(parent);
                 location.mode = parent.mode;
                 if !*own_root {
                     location.document_root = parent.document_root.clone();
@@ -790,10 +779,6 @@ pub(crate) fn parse_location_block(
                     // children already hold their own descendants' merge.
                     for child in &mut children {
                         inherit_from_parent(child, &location);
-                        prepend_header_chain_in_ifs(
-                            &mut child.rewrite_ops,
-                            &header_chain(&location),
-                        );
                     }
                     sink.push(location);
                     sink.extend(children);
