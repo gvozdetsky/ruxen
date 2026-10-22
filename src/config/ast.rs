@@ -1196,7 +1196,35 @@ pub struct Server {
     pub redirect: RedirectConf,
     /// `types {}` / `default_type` (#38), http's merged in.
     pub mime: MimeConf,
+    /// `charset`, `charset_types`, `source_charset` (#464).
+    pub charset: CharsetConf,
     pub locations: Vec<Location>,
+}
+
+/// `charset`, `charset_types` and `source_charset` of one level (#464),
+/// each `None` until set, as nginx's charset filter merges them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CharsetConf {
+    /// `charset NAME`, `Some(None)` for `charset off`.
+    pub charset: Option<Option<String>>,
+    /// `charset_types`, lowercased; `*` is any type.
+    pub types: Option<Vec<String>>,
+    /// `source_charset NAME`.
+    pub source: Option<String>,
+}
+
+impl CharsetConf {
+    pub(crate) fn inherit(&mut self, parent: &CharsetConf) {
+        if self.charset.is_none() {
+            self.charset.clone_from(&parent.charset);
+        }
+        if self.types.is_none() {
+            self.types.clone_from(&parent.types);
+        }
+        if self.source.is_none() {
+            self.source.clone_from(&parent.source);
+        }
+    }
 }
 
 /// `types {}` and `default_type` of one level (#38), `None` until set.
@@ -1450,6 +1478,8 @@ pub struct Location {
     pub redirect: RedirectConf,
     /// `types {}` / `default_type` (#38), likewise.
     pub mime: MimeConf,
+    /// `charset`, `charset_types`, `source_charset` (#464).
+    pub charset: CharsetConf,
     /// The location's own `client_body_timeout` / `send_timeout` (#147);
     /// `client_header_timeout` stays a server setting.
     pub client_timeouts: ClientTimeouts,

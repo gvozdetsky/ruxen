@@ -325,6 +325,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut add_headers: Option<Vec<AddHeader>> = None;
     let mut redirect = RedirectConf::default();
     let mut mime = MimeConf::default();
+    let mut charset = CharsetConf::default();
     let mut add_trailers: Option<Vec<AddHeader>> = None;
     let mut recursive_error_pages: Option<bool> = None;
     let mut merge_slashes: Option<bool> = None;
@@ -394,10 +395,15 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         // types {} / default_type (#38) the same way.
                         server.mime.inherit(&mime);
                         let server_mime = server.mime.clone();
+                        // charset (#464) likewise, into the `if` blocks too.
+                        server.charset.inherit(&charset);
                         for loc in &mut server.locations {
                             loc.inherit_redirect(&server_redirect);
                             loc.mime.inherit(&server_mime);
+                            loc.charset.inherit(&server.charset);
+                            inherit_charset_in_ifs(&mut loc.rewrite_ops, &loc.charset);
                         }
+                        inherit_charset_in_ifs(&mut server.rewrite_ops, &server.charset);
                         server.recursive_error_pages =
                             server.recursive_error_pages.or(recursive_error_pages);
                         server.merge_slashes = server.merge_slashes.or(merge_slashes);
@@ -494,6 +500,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
         match (args[0].as_str(), &term) {
             ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
                 parse_mime(lx, &args, &term, &mut mime)?;
+            }
+            ("charset" | "charset_types" | "source_charset", Terminator::Semi) => {
+                parse_charset(lx, &args, &term, &mut charset)?;
             }
             ("server", Terminator::BlockOpen) => {
                 servers.extend(parse_server_block(lx, &mut warnings)?)
@@ -1130,8 +1139,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "ssi",
     "ssi_silent_errors",
     "ssi_types",
-    "charset",
-    "source_charset",
     "override_charset",
 ];
 
@@ -1170,6 +1177,82 @@ pub(crate) fn parse_types_block(lx: &mut Lexer) -> Result<Vec<(String, String)>,
 
 /// `types {` or `default_type …;` into `mime` (#38); `false` if `args`
 /// is neither.
+/// A location's (or server's) charset settings into its `if` blocks, which
+/// took only the location's own at parse time (#464).
+fn inherit_charset_in_ifs(ops: &mut [RewriteOp], parent: &CharsetConf) {
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            match location {
+                Some(IfLocation::Parsed { location, .. }) => {
+                    location.charset.inherit(parent);
+                    let own = location.charset.clone();
+                    inherit_charset_in_ifs(body, &own);
+                }
+                _ => inherit_charset_in_ifs(body, parent),
+            }
+        }
+    }
+}
+
+/// `charset`, `charset_types` and `source_charset` (#464), at the levels
+/// the caller allows; `false` for any other directive. `if_block`: inside
+/// a location's `if`, where `charset_types` isn't allowed.
+pub(crate) fn parse_charset(
+    lx: &Lexer,
+    args: &[String],
+    term: &Terminator,
+    conf: &mut CharsetConf,
+) -> Result<bool, Error> {
+    if *term != Terminator::Semi {
+        return Ok(false);
+    }
+    match args[0].as_str() {
+        "charset" => {
+            if conf.charset.is_some() {
+                return Err(Error::Duplicate("charset"));
+            }
+            let [_, name] = args else {
+                return Err(Error::BadValue {
+                    what: "charset",
+                    got: args[1..].join(" "),
+                });
+            };
+            // A charset from a variable is not supported yet: none is
+            // added, which `--compat` reports.
+            if name.starts_with('$') {
+                compat::ignored(lx, args);
+            }
+            conf.charset = Some((name != "off").then(|| name.clone()));
+        }
+        "charset_types" => {
+            if conf.types.is_some() {
+                return Err(Error::Duplicate("charset_types"));
+            }
+            if args.len() < 2 {
+                return Err(Error::MissingArg("charset_types"));
+            }
+            conf.types = Some(args[1..].iter().map(|t| t.to_ascii_lowercase()).collect());
+        }
+        "source_charset" => {
+            if conf.source.is_some() {
+                return Err(Error::Duplicate("source_charset"));
+            }
+            let [_, name] = args else {
+                return Err(Error::BadValue {
+                    what: "source_charset",
+                    got: args[1..].join(" "),
+                });
+            };
+            // Nothing is converted: a different charset leaves the
+            // response unlabelled (`worker::prepare_charset`).
+            compat::ignored(lx, args);
+            conf.source = Some(name.clone());
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 pub(crate) fn parse_mime(
     lx: &mut Lexer,
     args: &[String],

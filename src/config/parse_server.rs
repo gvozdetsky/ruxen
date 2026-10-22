@@ -86,6 +86,7 @@ pub(crate) fn parse_server_block(
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut redirect = RedirectConf::default();
     let mut mime = MimeConf::default();
+    let mut charset = CharsetConf::default();
 
     loop {
         let (args, term) = lx.read_directive()?;
@@ -192,6 +193,7 @@ pub(crate) fn parse_server_block(
                         chunked_transfer_encoding,
                         redirect,
                         mime,
+                        charset,
                         ssl,
                         locations,
                     });
@@ -217,6 +219,9 @@ pub(crate) fn parse_server_block(
         match (args[0].as_str(), &term) {
             ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
                 parse_mime(lx, &args, &term, &mut mime)?;
+            }
+            ("charset" | "charset_types" | "source_charset", Terminator::Semi) => {
+                parse_charset(lx, &args, &term, &mut charset)?;
             }
             ("listen", Terminator::Semi) => {
                 saw_listen = true;

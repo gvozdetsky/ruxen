@@ -1544,6 +1544,73 @@ pub(crate) fn leak_bytes(b: &[u8]) -> &'static [u8] {
     crate::arena::leak(b.to_vec().into_boxed_slice())
 }
 
+/// nginx's charset filter (`ngx_http_charset_header_filter`, #464):
+/// `; charset=<name>` after a `Content-Type` whose type is in
+/// `charset_types` and that carries no charset yet (an upstream's stays,
+/// as without `override_charset`). Cold: only where `charset` is set.
+#[cold]
+#[inline(never)]
+pub(crate) fn add_charset(charset: &PreparedCharset, response: Response) -> Response {
+    let label = |head: &mut Vec<u8>| {
+        if let Some(at) = charset_label_at(charset, head) {
+            let label = [b"; charset=", charset.name].concat();
+            head.splice(at..at, label);
+        }
+    };
+    match response {
+        Response::Prebuilt(bytes) => match charset_label_at(charset, bytes) {
+            Some(_) => {
+                let mut owned = bytes.to_vec();
+                label(&mut owned);
+                Response::Owned(owned)
+            }
+            None => Response::Prebuilt(bytes),
+        },
+        Response::Owned(mut bytes) => {
+            label(&mut bytes);
+            Response::Owned(bytes)
+        }
+        Response::File { mut headers, body } => {
+            label(&mut headers);
+            Response::File { headers, body }
+        }
+        Response::ProxyStream(mut relayed) => {
+            label(&mut relayed.head);
+            Response::ProxyStream(relayed)
+        }
+        other => other,
+    }
+}
+
+/// Where `charset`'s label goes in `head`: the end of its `Content-Type`
+/// value, when that has the right type and no charset.
+fn charset_label_at(charset: &PreparedCharset, head: &[u8]) -> Option<usize> {
+    const NAME: &[u8] = b"content-type:";
+    let end = head.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let mut start = head.iter().position(|&b| b == b'\n')? + 1;
+    while start < end {
+        let line_end = start + head[start..].iter().position(|&b| b == b'\r')?;
+        let line = &head[start..line_end];
+        if line.len() > NAME.len() && line[..NAME.len()].eq_ignore_ascii_case(NAME) {
+            let value = line[NAME.len()..].trim_ascii();
+            let has_charset = value
+                .windows(8)
+                .any(|w| w.eq_ignore_ascii_case(b"charset="));
+            let media = value
+                .split(|&b| b == b';')
+                .next()
+                .unwrap_or(value)
+                .trim_ascii();
+            let listed = charset
+                .types
+                .is_none_or(|types| types.iter().any(|t| t.eq_ignore_ascii_case(media)));
+            return (!has_charset && listed).then_some(line_end);
+        }
+        start = line_end + 2;
+    }
+    None
+}
+
 pub(crate) fn response_has_header(bytes: &[u8], name: &[u8]) -> bool {
     let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;

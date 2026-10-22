@@ -4709,6 +4709,11 @@ pub(crate) async fn handle<S: ConnIo>(
                             ),
                             None => (response, None),
                         };
+                        // `charset` (#464): the label on Content-Type.
+                        let response = match process_meta.charset {
+                            Some(charset) => super::add_charset(charset, response),
+                            None => response,
+                        };
 
                         // `return 444;` (no text) is nginx's NGX_HTTP_CLOSE: no
                         // response at all; the connection closes after the

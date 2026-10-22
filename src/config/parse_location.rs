@@ -300,6 +300,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     or(&mut child.index, &parent.index);
     child.redirect = child.redirect.inherit(&parent.redirect);
     child.mime.inherit(&parent.mime);
+    child.charset.inherit(&parent.charset);
     or(&mut child.add_headers, &parent.add_headers);
     or(&mut child.add_trailers, &parent.add_trailers);
     or(&mut child.error_pages, &parent.error_pages);
@@ -569,6 +570,7 @@ pub(crate) fn parse_location_block(
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut redirect = RedirectConf::default();
     let mut mime = MimeConf::default();
+    let mut charset = CharsetConf::default();
     let mut sendfile: Option<bool> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
@@ -586,9 +588,9 @@ pub(crate) fn parse_location_block(
                 "set" | "rewrite" | "break" | "return" | "if" => {}
                 // What nginx allows in an `if` in a location
                 // (`NGX_HTTP_LIF_CONF`) and ruxen implements.
-                "proxy_pass" | "root" | "add_header" | "add_trailer" | "error_page"
-                | "access_log" | "expires" | "gzip" | "limit_rate" | "limit_rate_after"
-                | "post_action" | "sendfile" => info.settings = true,
+                "proxy_pass" | "root" | "add_header" | "add_trailer" | "error_page" | "charset"
+                | "source_charset" | "access_log" | "expires" | "gzip" | "limit_rate"
+                | "limit_rate_after" | "post_action" | "sendfile" => info.settings = true,
                 // Accepted and ignored anywhere, as they were in `if`.
                 n if term == Terminator::Semi && is_ignored_stmt(n) => {
                     check_ignored_args(lx, &args)?;
@@ -719,6 +721,7 @@ pub(crate) fn parse_location_block(
                         chunked_transfer_encoding,
                         redirect,
                         mime,
+                        charset,
                         client_timeouts,
                         alias_prefix_override,
                         inherits_root,
@@ -748,6 +751,9 @@ pub(crate) fn parse_location_block(
         match (args[0].as_str(), &term) {
             ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
                 parse_mime(lx, &args, &term, &mut mime)?;
+            }
+            ("charset" | "charset_types" | "source_charset", Terminator::Semi) => {
+                parse_charset(lx, &args, &term, &mut charset)?;
             }
             ("set", Terminator::Semi) => {
                 rewrite_ops.push(parse_set_op(&args[1..])?);
