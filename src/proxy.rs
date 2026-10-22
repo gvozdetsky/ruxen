@@ -1843,6 +1843,9 @@ async fn attempt(
     // safe — the kernel writes before we read.
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
+    if plan.limit_rate != 0 || late_limit_rate.is_some() {
+        read_buf = paced_head_buf(read_buf);
+    }
     let mut head_end_terminator: (usize, usize); // (head_end, terminator_len)
     let mut scanned = 0;
     // Bytes of 103 heads dropped from the front of `accum` (#581): not
@@ -3257,6 +3260,17 @@ fn late_limit_rate_of(
         lines.extend_from_slice(b"\r\n");
     }
     late(status, &lines)
+}
+
+/// Under `proxy_limit_rate`, the head is read as nginx reads it, into a
+/// `proxy_buffer_size` buffer (4k by default): a pooled buffer may hold
+/// 128 KiB, and the body bytes that come with the head go out unpaced
+/// (#700).
+#[cold]
+#[inline(never)]
+fn paced_head_buf(buf: Vec<u8>) -> Vec<u8> {
+    return_proxy_buf(buf);
+    Vec::with_capacity(PROXY_SCRATCH_CAP)
 }
 
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body

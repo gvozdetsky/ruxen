@@ -205,8 +205,6 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         crate::proxy::return_proxy_buf(std::mem::replace(&mut s.read_buf, take_relay_buf()));
     }
     loop {
-        // proxy_limit_rate: wait until the body read so far is due.
-        crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
         let mut buf = std::mem::take(&mut s.read_buf);
         buf.clear();
         let (res, returned) = match timeout(s.read_timeout, s.upstream.read(buf)).await {
@@ -269,6 +267,10 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         };
         end.upstream_read += n as u64;
         s.paced += n as u64;
+        // proxy_limit_rate: what was read goes out once it is due, the
+        // last read too (#700), as the whole-body path waits after each
+        // read.
+        crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
         // A length-framed body to a client that takes it as it is goes
         // out of the read buffer itself.
         if !chunked_out
