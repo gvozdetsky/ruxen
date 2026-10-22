@@ -1188,11 +1188,6 @@ fn process_with_meta_inner(
             meta.proxy_tls = proxy.tls.is_some() && proxy.url.is_none();
         }
         let response = match denied {
-            None if rewrite_state.if_proxy
-                && !matches!(loc.handler, crate::worker::PreparedHandler::Proxy(_)) =>
-            {
-                no_upstream_configuration(req.method)
-            }
             None => run_location_handler(
                 http,
                 server,
@@ -2153,20 +2148,6 @@ fn find_config<'h, 'r>(
     }
 
     (&listen.servers[listen.default_server], None)
-}
-
-/// The proxy handler of an earlier `if` with the configuration of a later
-/// one that has no `proxy_pass`: nginx 1.3.10+ answers 500 with an alert
-/// (ngx_http_upstream_init_request), where it used to crash.
-#[cold]
-#[inline(never)]
-fn no_upstream_configuration(method: crate::http::Method) -> Response {
-    crate::fs_resolve::note_failed_lookup_at(
-        "no upstream configuration".to_string(),
-        false,
-        crate::config::ErrorLogLevel::Alert,
-    );
-    crate::worker::internal_error_response(method)
 }
 
 /// The anonymous location of an `if` block (#137) as the request's
