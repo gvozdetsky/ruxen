@@ -37,7 +37,9 @@ regex = "1"
 # (not through flate2) to size memLevel with the window, as nginx does.
 zlib-rs = { version = "0.6", default-features = false, features = ["std", "rust-allocator"] }
 socket2 = "0.5"
-rustls = "0.23.46"
+# `zlib`: certificate compression (RFC 8879) for `ssl_certificate_compression`
+# (#601), off unless a server turns it on.
+rustls = { version = "0.23.46", features = ["zlib"] }
 # Session tickets in nginx's layout (#140) and the proxy cache's file names
 # (#233); already in the tree through
 # rustls, with the features rustls turns on.

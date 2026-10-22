@@ -127,6 +127,15 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
+            ("ssl_object_cache_inheritable", Terminator::Semi) => {
+                if runtime.ssl_object_cache_inheritable.is_some() {
+                    return Err(Error::Duplicate("ssl_object_cache_inheritable"));
+                }
+                runtime.ssl_object_cache_inheritable = Some(parse_on_off_args(
+                    &args[1..],
+                    "ssl_object_cache_inheritable",
+                )?);
+            }
             ("pid", Terminator::Semi) => {
                 if runtime.pid.is_some() {
                     return Err(Error::Duplicate("pid"));
@@ -328,6 +337,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
     let mut ssl_reject_handshake: Option<bool> = None;
+    let mut ssl_certificate_compression: Option<bool> = None;
+    let mut ssl_certificate_cache_seen = false;
     let mut resumption = SessionResumption::default();
     let mut client_verify = ClientVerifyConf::default();
     let mut stapling = StaplingConf::default();
@@ -420,6 +431,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         ssl.session_timeout_ms = ssl.session_timeout_ms.or(ssl_session_timeout_ms);
                         ssl.resumption = std::mem::take(&mut ssl.resumption).inherit(&resumption);
                         ssl.reject_handshake = ssl.reject_handshake.or(ssl_reject_handshake);
+                        ssl.certificate_compression =
+                            ssl.certificate_compression.or(ssl_certificate_compression);
                         ssl.client_verify =
                             std::mem::take(&mut ssl.client_verify).inherit(&client_verify);
                         if ssl.password_file.is_none() {
@@ -668,6 +681,21 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 ssl_reject_handshake = Some(parse_on_off_args(&args[1..], "ssl_reject_handshake")?);
             }
+            ("ssl_certificate_compression", Terminator::Semi) => {
+                if ssl_certificate_compression.is_some() {
+                    return Err(Error::Duplicate("ssl_certificate_compression"));
+                }
+                ssl_certificate_compression = Some(parse_on_off_args(
+                    &args[1..],
+                    "ssl_certificate_compression",
+                )?);
+            }
+            ("ssl_certificate_cache", Terminator::Semi) => {
+                if std::mem::replace(&mut ssl_certificate_cache_seen, true) {
+                    return Err(Error::Duplicate("ssl_certificate_cache"));
+                }
+                parse_server::check_ssl_certificate_cache(&args[1..])?;
+            }
             (name @ ("ssl_session_cache" | "ssl_session_tickets"), Terminator::Semi) => {
                 resumption.parse(name, &args)?;
             }
@@ -736,6 +764,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_reject_handshake"
+                | "ssl_certificate_compression"
+                | "ssl_certificate_cache"
                 | "ssl_conf_command",
                 _,
             ) => {
@@ -2195,6 +2225,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// nginx 1.27–1.29's `ssl_object_cache_inheritable`,
+    /// `ssl_certificate_cache` and `ssl_certificate_compression` (#601):
+    /// taken where nginx takes them, refused as nginx refuses them, and the
+    /// compression flag inherited from http scope.
+    #[test]
+    fn ssl_cache_and_compression_directives() {
+        let cfg = parse(
+            "ssl_object_cache_inheritable off;\n\
+             http { ssl_certificate_cache max=10 inactive=20s valid=1m;\n\
+             ssl_certificate_compression on;\n\
+             server { listen 80; ssl_certificate_cache off; }\n\
+             server { listen 81; ssl_certificate_compression off; } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers[0].ssl.certificate_compression, Some(true));
+        assert_eq!(cfg.servers[1].ssl.certificate_compression, Some(false));
+        for bad in [
+            "ssl_object_cache_inheritable on; ssl_object_cache_inheritable on; http { }",
+            "ssl_object_cache_inheritable yes; http { }",
+            "http { ssl_object_cache_inheritable on; }",
+            "http { ssl_certificate_cache inactive=20s; }",
+            "http { ssl_certificate_cache max=0; }",
+            "http { ssl_certificate_cache max=1 valid=x; }",
+            "http { ssl_certificate_cache foo; }",
+            "http { ssl_certificate_cache off; ssl_certificate_cache off; }",
+            "http { server { listen 80; location / { ssl_certificate_cache off; } } }",
+            "http { ssl_certificate_compression yes; }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

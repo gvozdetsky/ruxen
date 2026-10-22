@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 178 implemented, 25 accepted with a difference, 72 accepted with no effect, 1 refused, 288 unknown.
+Of 564 directives: 182 implemented, 25 accepted with a difference, 72 accepted with no effect, 1 refused, 284 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -78,7 +78,9 @@ Not supported: `ssl_engine`.
 
 ## event_openssl_cache
 
-Not supported: `ssl_object_cache_inheritable`.
+| directive | ruxen | contexts | notes |
+| --- | --- | --- | --- |
+| `ssl_object_cache_inheritable` | yes | main |  |
 
 ## http
 
@@ -594,10 +596,10 @@ Not supported: `slice`.
 | --- | --- | --- | --- |
 | `ssl_certificate` | yes | http, server |  |
 | `ssl_certificate_key` | yes | http, server |  |
-| `ssl_certificate_cache` | no |  |  |
+| `ssl_certificate_cache` | yes | http, server |  |
 | `ssl_ech_file` | no |  |  |
 | `ssl_password_file` | yes | http, server |  |
-| `ssl_certificate_compression` | no |  |  |
+| `ssl_certificate_compression` | yes | http, server |  |
 | `ssl_dhparam` | accepted, no effect | http, server |  |
 | `ssl_ecdh_curve` | accepted, differs | http, server | "ssl_ecdh_curve" is not supported yet and is ignored: rustls's default key exchange groups are used |
 | `ssl_protocols` | yes | http, server |  |

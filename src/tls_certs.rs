@@ -550,6 +550,11 @@ pub fn build_server_config(
     let mut cfg = ServerConfig::builder_with_protocol_versions(&versions)
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
+    // Neither sent nor taken compressed unless `ssl_certificate_compression`
+    // says so, as nginx sets SSL_OP_NO_TX_CERTIFICATE_COMPRESSION and
+    // SSL_OP_NO_RX_CERTIFICATE_COMPRESSION on every context.
+    compress_certificates(&mut cfg, false);
+    cfg.cert_decompressors = Vec::new();
     // nginx's default ssl_session_timeout.
     let timeout_secs = session_timeout_secs.unwrap_or(300);
     let cache = resumption.cache.unwrap_or(false);
@@ -632,18 +637,59 @@ static PASSWORD_FILES: std::sync::Mutex<PasswordFiles> = std::sync::Mutex::new(V
 
 /// A certificate, key, CA or CRL file, read once per configuration load
 /// however many directives name it, as nginx's SSL object cache does
-/// (1.27.2+, ssl_cache.t): one may be a FIFO.
+/// (1.27.2+, ssl_cache.t): one may be a FIFO. On a reload it is what the
+/// last configuration read, if that one had `ssl_object_cache_inheritable`
+/// on (the default) and the file has the same inode and modification time
+/// (seconds) still, as ngx_ssl_cache_fetch takes the old cycle's object
+/// (#601).
 pub fn pem_file(path: &Path) -> std::io::Result<Arc<[u8]>> {
+    use std::os::unix::fs::MetadataExt;
     let mut files = PEM_FILES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, bytes)) = files.iter().find(|(p, _)| p == path) {
+    if let Some((_, _, bytes)) = files.iter().find(|(p, _, _)| p == path) {
         return Ok(bytes.clone());
     }
-    let bytes: Arc<[u8]> = std::fs::read(path)?.into();
-    files.push((path.to_path_buf(), bytes.clone()));
+    let id = std::fs::metadata(path)
+        .ok()
+        .map(|m| FileId(m.ino(), m.mtime()));
+    let kept = {
+        let kept = KEPT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        kept.0
+            .then(|| {
+                kept.1
+                    .iter()
+                    .find(|(p, kept_id, _)| p == path && id.is_some() && *kept_id == id)
+                    .map(|(_, _, bytes)| bytes.clone())
+            })
+            .flatten()
+    };
+    let bytes: Arc<[u8]> = match kept {
+        Some(bytes) => bytes,
+        None => std::fs::read(path)?.into(),
+    };
+    files.push((path.to_path_buf(), id, bytes.clone()));
     Ok(bytes)
 }
 
-static PEM_FILES: std::sync::Mutex<Vec<(PathBuf, Arc<[u8]>)>> = std::sync::Mutex::new(Vec::new());
+/// A file's inode and modification time in seconds (nginx's
+/// `ngx_file_uniq`, `ngx_file_mtime`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId(u64, i64);
+
+/// `(path, its identity when read, contents)`.
+type PemFiles = Vec<(PathBuf, Option<FileId>, Arc<[u8]>)>;
+
+static PEM_FILES: std::sync::Mutex<PemFiles> = std::sync::Mutex::new(Vec::new());
+
+/// The files the running configuration read, and whether it lets the next
+/// one take them over (`ssl_object_cache_inheritable`).
+static KEPT_FILES: std::sync::Mutex<(bool, PemFiles)> = std::sync::Mutex::new((false, Vec::new()));
+
+/// A configuration was loaded: what it read is kept for the next load,
+/// which takes the files that haven't changed if `inheritable`.
+pub fn keep_files(inheritable: bool) {
+    let files = std::mem::take(&mut *PEM_FILES.lock().unwrap_or_else(|e| e.into_inner()));
+    *KEPT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = (inheritable, files);
+}
 
 /// A configuration load starts or ends: password and PEM files are read
 /// again by the next one, and what they held isn't kept.
@@ -653,6 +699,17 @@ pub fn forget_files() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+}
+
+/// `ssl_certificate_compression` (#601): whether the server's certificate
+/// goes compressed (zlib, RFC 8879) to a client that offers it, as nginx's
+/// ngx_ssl_certificate_compression with zlib.
+pub fn compress_certificates(cfg: &mut ServerConfig, on: bool) {
+    cfg.cert_compressors = if on {
+        vec![rustls::compress::ZLIB_COMPRESSOR]
+    } else {
+        Vec::new()
+    };
 }
 
 /// A server's own context: `base` with its protocol versions (#586) and

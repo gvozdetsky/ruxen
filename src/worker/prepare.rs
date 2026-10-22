@@ -62,7 +62,11 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     crate::tls_certs::forget_files();
     STAPLED_KEYS.with(|k| k.borrow_mut().clear());
     ERROR_LOG_FILES.with(|f| f.borrow_mut().clear());
+    let inheritable = cfg.runtime.ssl_object_cache_inheritable.unwrap_or(true);
     let prepared = prepare_http(cfg);
+    if prepared.is_ok() {
+        crate::tls_certs::keep_files(inheritable);
+    }
     crate::tls_certs::forget_files();
     STAPLED_KEYS.with(|k| k.borrow_mut().clear());
     ERROR_LOG_FILES.with(|f| f.borrow_mut().clear());
@@ -617,6 +621,14 @@ pub(crate) fn build_listen_tls(
     if http2 && let Some(cfg) = Arc::get_mut(&mut cfg) {
         cfg.alpn_protocols.insert(0, b"h2".to_vec());
     }
+    // `ssl_certificate_compression` (#601), the default server's for the
+    // address's config.
+    let compress = |input: &TlsServerInput| input.ssl.certificate_compression.unwrap_or(false);
+    if compress(default)
+        && let Some(cfg) = Arc::get_mut(&mut cfg)
+    {
+        crate::tls_certs::compress_certificates(cfg, true);
+    }
     // Client certificates (#113) and protocols (#586): each server with
     // certificates of its own has its context; one without takes the
     // default server's, whose SSL_CTX its SNI name keeps in nginx. Equal
@@ -633,29 +645,39 @@ pub(crate) fn build_listen_tls(
         auths.push((key, Arc::new(auth)));
         Ok(Some(auths.len() - 1))
     };
-    type ContextKey = (Option<usize>, crate::config::TlsVersionSet);
-    let default_key: ContextKey = (auth_of(default)?, protocols);
+    // And certificate compression (#601), an SSL_CTX option nginx copies
+    // from the server chosen by SNI too.
+    type ContextKey = (Option<usize>, crate::config::TlsVersionSet, bool);
+    let default_key: ContextKey = (auth_of(default)?, protocols, compress(default));
     let mut server_keys: Vec<ContextKey> = Vec::with_capacity(inputs.len());
     for input in inputs {
         server_keys.push(if input.ssl.certs.is_empty() {
             default_key
         } else {
-            (auth_of(input)?, input.ssl.protocols.unwrap_or_default())
+            (
+                auth_of(input)?,
+                input.ssl.protocols.unwrap_or_default(),
+                compress(input),
+            )
         });
     }
     // The address's config is the default server's context; the others
     // are configs of their own, indexed in `contexts`.
     let context_config =
-        |(auth, versions): ContextKey| -> Result<Arc<rustls::ServerConfig>, String> {
-            if (auth, versions) == (None, protocols) {
+        |(auth, versions, compressed): ContextKey| -> Result<Arc<rustls::ServerConfig>, String> {
+            if (auth, versions, compressed) == (None, protocols, compress(default)) {
                 return Ok(cfg.clone());
             }
-            crate::tls_certs::with_context(
+            let mut config = crate::tls_certs::with_context(
                 &cfg,
                 versions,
                 auth.map(|i| auths[i].1.verifier(crate::tls_certs::active_provider())),
             )
-            .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))
+            .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
+            if let Some(config) = Arc::get_mut(&mut config) {
+                crate::tls_certs::compress_certificates(config, compressed);
+            }
+            Ok(config)
         };
     let mut others: Vec<ContextKey> = Vec::new();
     let contexts: Vec<Option<u16>> = server_keys

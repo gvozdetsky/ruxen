@@ -31,6 +31,8 @@ pub(crate) fn parse_server_block(
     let mut ssl_prefer_server_ciphers: Option<bool> = None;
     let mut ssl_session_timeout_ms: Option<u64> = None;
     let mut ssl_reject_handshake: Option<bool> = None;
+    let mut ssl_certificate_compression: Option<bool> = None;
+    let mut ssl_certificate_cache_seen = false;
     let mut resumption = SessionResumption::default();
     let mut client_verify = ClientVerifyConf::default();
     let mut stapling = StaplingConf::default();
@@ -122,6 +124,7 @@ pub(crate) fn parse_server_block(
                         prefer_server_ciphers: ssl_prefer_server_ciphers,
                         session_timeout_ms: ssl_session_timeout_ms,
                         reject_handshake: ssl_reject_handshake,
+                        certificate_compression: ssl_certificate_compression,
                         resumption,
                         client_verify,
                         password_file: ssl_password_file,
@@ -308,6 +311,22 @@ pub(crate) fn parse_server_block(
                     return Err(Error::Duplicate("ssl_reject_handshake"));
                 }
                 ssl_reject_handshake = Some(parse_on_off_args(&args[1..], "ssl_reject_handshake")?);
+            }
+            ("ssl_certificate_compression", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                if ssl_certificate_compression.is_some() {
+                    return Err(Error::Duplicate("ssl_certificate_compression"));
+                }
+                ssl_certificate_compression = Some(parse_on_off_args(
+                    &args[1..],
+                    "ssl_certificate_compression",
+                )?);
+            }
+            ("ssl_certificate_cache", Terminator::Semi) => {
+                if std::mem::replace(&mut ssl_certificate_cache_seen, true) {
+                    return Err(Error::Duplicate("ssl_certificate_cache"));
+                }
+                check_ssl_certificate_cache(&args[1..])?;
             }
             // SSL directives we accept-and-ignore at server scope. Matched
             // here (rather than via the global IGNORED_STMT allowlist) so
@@ -745,6 +764,8 @@ pub(crate) fn parse_server_block(
                 | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_reject_handshake"
+                | "ssl_certificate_compression"
+                | "ssl_certificate_cache"
                 | "ssl_conf_command",
                 _,
             ) => {
@@ -903,6 +924,46 @@ pub(crate) fn resolve_ssl_file_arg(conf_prefix: Option<&Path>, raw: &str) -> Pat
         return path;
     }
     resolve_conf_path(conf_prefix, path)
+}
+
+/// `ssl_certificate_cache off | max=N [inactive=time] [valid=time]`
+/// (nginx 1.27.4, #601), checked as nginx's ngx_http_ssl_certificate_cache
+/// does. The cache holds certificates whose names have variables, which
+/// ruxen doesn't load, so it has nothing to keep: the directive does
+/// nothing else, as in nginx with fixed certificate names.
+pub(crate) fn check_ssl_certificate_cache(args: &[String]) -> Result<(), Error> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(Error::MissingArg("ssl_certificate_cache"));
+    }
+    let invalid = |arg: &String| Error::Directive {
+        name: "ssl_certificate_cache",
+        msg: format!("has an invalid parameter \"{arg}\""),
+    };
+    let (mut max, mut off) = (false, false);
+    for arg in args {
+        if let Some(n) = arg.strip_prefix("max=") {
+            if n.parse::<u64>().map_or(true, |n| n == 0) {
+                return Err(invalid(arg));
+            }
+            max = true;
+        } else if let Some(t) = arg
+            .strip_prefix("inactive=")
+            .or_else(|| arg.strip_prefix("valid="))
+        {
+            parse_duration_ms(t, "ssl_certificate_cache").map_err(|_| invalid(arg))?;
+        } else if arg == "off" {
+            off = true;
+        } else {
+            return Err(invalid(arg));
+        }
+    }
+    if !off && !max {
+        return Err(Error::Directive {
+            name: "ssl_certificate_cache",
+            msg: "must have the \"max\" parameter".into(),
+        });
+    }
+    Ok(())
 }
 
 /// `ssl_protocols` values: TLS 1.2 and 1.3, which rustls speaks. The old
