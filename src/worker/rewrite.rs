@@ -591,7 +591,12 @@ pub(crate) fn run_server_rewrite(
         server_name_captures,
     ) {
         RewriteControl::Respond(response, _) => Some(response),
-        RewriteControl::Continue | RewriteControl::Stop | RewriteControl::Reroute => None,
+        RewriteControl::Continue | RewriteControl::Stop | RewriteControl::Reroute => {
+            // The location is found with the URI this left
+            // (ngx_http_core_find_config_phase clears `uri_changed`, #682).
+            rewrite_state.uri_changed = false;
+            None
+        }
     }
 }
 
@@ -621,6 +626,17 @@ pub(crate) fn run_rewrite_program(
         rewrite_state,
         server_name_captures,
     ) {
+        // A `rewrite` without a flag changed the URI: the locations are
+        // searched again (ngx_http_core_post_rewrite_phase, #682), as
+        // after `last`. Not past a top-level `return`, a rewrite directive
+        // in nginx that answers before that. Here, not in `process`:
+        // a location without rewrites doesn't pay for the check.
+        RewriteControl::Continue
+            if rewrite_state.uri_changed && !matches!(loc.handler, PreparedHandler::Return(..)) =>
+        {
+            rewrite_state.uri_changed = false;
+            RewriteOutcome::Reroute
+        }
         RewriteControl::Continue => RewriteOutcome::Continue,
         RewriteControl::Stop => RewriteOutcome::Break,
         RewriteControl::Reroute => RewriteOutcome::Reroute,
