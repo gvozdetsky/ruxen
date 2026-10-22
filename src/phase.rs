@@ -358,8 +358,6 @@ pub struct ProcessMeta {
     pub keep_upstream_date: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
-    /// The matched location's charset for `Content-Type` (#464).
-    pub charset: Option<&'static crate::worker::PreparedCharset>,
     /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
     /// for the range filter on a proxied or cached response (#370).
     pub max_ranges: Option<u32>,
@@ -422,7 +420,6 @@ impl Default for ProcessMeta {
             sendfile: false,
             keep_upstream_date: false,
             gzip: None,
-            charset: None,
             max_ranges: None,
             range_allow: crate::worker::range::RangeAllow::No,
             limit_rate: None,
@@ -457,7 +454,6 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
-        charset: server.charset,
         ..ProcessMeta::default()
     }
 }
@@ -490,12 +486,25 @@ fn refuse(
         Response::Reroute(reroute) => {
             process_with_meta_inner(http, req, url_scratch, Some(reroute))
         }
-        response => (response, refused_meta(server, false)),
+        mut response => {
+            server_charset(server, &mut response);
+            (response, refused_meta(server, false))
+        }
     };
     if close {
         meta.keepalive.allow = false;
     }
     (response, meta)
+}
+
+/// The server's charset on what it answers before a location (#464);
+/// a location's answers get theirs from its DocRoot in the worker.
+#[cold]
+#[inline(never)]
+fn server_charset(server: &PreparedServer, response: &mut Response) {
+    if let Some(charset) = server.charset {
+        crate::worker::add_charset(charset, response);
+    }
 }
 
 /// A response's `limit_rate` (bytes per second, 0 = unlimited) and
@@ -930,7 +939,6 @@ fn process_with_meta_inner(
                         // access_log list so the request still gets logged.
                         meta.access_logs = server.access_logs;
                         meta.post_action = server.post_action;
-                        meta.charset = server.charset;
                         meta.remote_user = None;
                         let auth_resume = take_auth_resume(&server.access, &mut rewrite_state);
                         match run_access_control(
@@ -965,11 +973,16 @@ fn process_with_meta_inner(
                                         url_scratch,
                                         Some(reroute),
                                     ),
-                                    response => (response, meta),
+                                    mut response => {
+                                        server_charset(server, &mut response);
+                                        (response, meta)
+                                    }
                                 };
                             }
                         }
-                        return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+                        let mut response = Response::Prebuilt(http.not_found.pick(req.method));
+                        server_charset(server, &mut response);
+                        return (response, meta);
                     }
                 },
             }
@@ -1165,7 +1178,6 @@ fn process_with_meta_inner(
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
         meta.gzip = loc.gzip;
-        meta.charset = loc.charset;
         meta.max_ranges = loc.max_ranges;
         // `set $limit_rate` wins over the directive, as nginx's
         // r->limit_rate_set. Rendered only when something is set.

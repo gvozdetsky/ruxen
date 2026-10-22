@@ -1260,6 +1260,11 @@ pub struct PreparedRoot {
 pub struct DocRoot {
     pub path: &'static Path,
     pub mapping: PreparedPathMapping,
+    /// The location's charset for `Content-Type` (#464), here because the
+    /// request's meta already points at its DocRoot: a field of its own in
+    /// `MatchedLocation` and `ProcessMeta` cost h2c_hello about 1% (ABBA
+    /// and callgrind, 2026-10-22).
+    pub charset: Option<&'static PreparedCharset>,
     /// The location's `disable_symlinks`, for `if -f` and the like.
     pub symlinks: PreparedSymlinks,
 }
@@ -1480,8 +1485,6 @@ pub struct PreparedLocation {
     pub sendfile: bool,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
-    /// The charset added to `Content-Type` (#464); `None` without one.
-    pub charset: Option<&'static PreparedCharset>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     /// Effective `post_action` target, if any. A leading `/` is an
     /// internal URI redirect; a leading `@` is a named-location jump.
@@ -1542,8 +1545,6 @@ pub struct PreparedRegexLocation {
     pub sendfile: bool,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
-    /// The charset added to `Content-Type` (#464); `None` without one.
-    pub charset: Option<&'static PreparedCharset>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
@@ -1591,8 +1592,6 @@ pub struct MatchedLocation<'a> {
     pub sendfile: bool,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
-    /// The charset added to `Content-Type` (#464); `None` without one.
-    pub charset: Option<&'static PreparedCharset>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
     pub post_action: Option<&'static [u8]>,
     pub expires: PreparedExpires,
@@ -1634,7 +1633,6 @@ impl<'a> MatchedLocation<'a> {
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
             gzip: loc.gzip,
-            charset: loc.charset,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,
@@ -1689,7 +1687,6 @@ impl<'a> MatchedLocation<'a> {
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
             gzip: loc.gzip,
-            charset: loc.charset,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
             expires: loc.expires,

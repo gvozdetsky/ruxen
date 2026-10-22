@@ -1550,7 +1550,7 @@ pub(crate) fn leak_bytes(b: &[u8]) -> &'static [u8] {
 /// as without `override_charset`). Cold: only where `charset` is set.
 #[cold]
 #[inline(never)]
-pub(crate) fn add_charset(charset: &PreparedCharset, response: Response) -> Response {
+pub(crate) fn add_charset(charset: &PreparedCharset, response: &mut Response) {
     let label = |head: &mut Vec<u8>| {
         if let Some(at) = charset_label_at(charset, head) {
             let label = [b"; charset=", charset.name].concat();
@@ -1558,27 +1558,17 @@ pub(crate) fn add_charset(charset: &PreparedCharset, response: Response) -> Resp
         }
     };
     match response {
-        Response::Prebuilt(bytes) => match charset_label_at(charset, bytes) {
-            Some(_) => {
+        Response::Prebuilt(bytes) => {
+            if charset_label_at(charset, bytes).is_some() {
                 let mut owned = bytes.to_vec();
                 label(&mut owned);
-                Response::Owned(owned)
+                *response = Response::Owned(owned);
             }
-            None => Response::Prebuilt(bytes),
-        },
-        Response::Owned(mut bytes) => {
-            label(&mut bytes);
-            Response::Owned(bytes)
         }
-        Response::File { mut headers, body } => {
-            label(&mut headers);
-            Response::File { headers, body }
-        }
-        Response::ProxyStream(mut relayed) => {
-            label(&mut relayed.head);
-            Response::ProxyStream(relayed)
-        }
-        other => other,
+        Response::Owned(bytes) => label(bytes),
+        Response::File { headers, .. } => label(headers),
+        Response::ProxyStream(relayed) => label(&mut relayed.head),
+        _ => {}
     }
 }
 
