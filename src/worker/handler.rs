@@ -1267,6 +1267,7 @@ pub(crate) fn run_location_handler(
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
+            error_page_status,
             intercept,
             upgrade: client_upgrade,
             // A response the range filter may cut is read whole (#370).
