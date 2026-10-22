@@ -396,6 +396,14 @@ pub(crate) fn execute_rewrite_ops(
                     // own in nginx: one with rewrite directives only goes
                     // back to the enclosing one's.
                     rewrite_state.if_location = *location;
+                    if let Some(n) = *location
+                        && matches!(
+                            server.if_locations[n as usize].handler,
+                            crate::worker::PreparedHandler::Proxy(_)
+                        )
+                    {
+                        rewrite_state.if_proxy = true;
+                    }
                     match execute_rewrite_ops(
                         body,
                         http,
