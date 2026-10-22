@@ -1897,11 +1897,9 @@ pub(crate) struct FirstBodyLimit {
     /// The location's `client_body_temp_path` directory, if it (or its
     /// server) has its own.
     pub body_temp: Option<&'static crate::worker::BodyTempDir>,
-    /// Nothing can read the body: the location answers with `return`, has
-    /// no rewrite, `if`, `error_page`, `post_action` or `limit_except` that
-    /// could take the request elsewhere, and neither `$request_body` nor
-    /// `$request_body_file` appears anywhere. The body is then read into a small buffer and dropped, as
-    /// nginx's ngx_http_discard_request_body does, instead of being kept.
+    /// Nothing can read the body (`discards_body`): the response goes
+    /// first and the body is dropped, as nginx's
+    /// ngx_http_discard_request_body does, instead of being kept.
     pub discard: bool,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
@@ -1974,15 +1972,127 @@ pub(crate) fn first_body_limit(
             crate::config::ClientBodyInFileOnly::On
         ),
         body_temp: loc.body_temp,
-        discard: !http.uses_request_body
-            && !http.uses_request_body_file
-            && matches!(loc.handler, crate::worker::PreparedHandler::Return(..))
-            && loc.rewrite_program.is_empty()
-            && loc.error_pages.is_empty()
-            && loc.post_action.is_none()
-            && loc.limit_except.is_none(),
+        discard: discards_body(http, server, &loc, url_scratch, true, 0),
         body_timeout: loc.timeouts.body,
     })
+}
+
+/// Whether nothing a request in `loc` (at `uri`) can get to reads its
+/// body, so it is discarded and the response goes first (#627). A
+/// `return` with no rewrite, `if`, `error_page`, `post_action` or
+/// `limit_except` that could take the request elsewhere, while neither
+/// `$request_body` nor `$request_body_file` appears anywhere (#289). A
+/// static file, as nginx's static module discards the body
+/// (ngx_http_static_module.c:221), so `$request_body` is empty there as in
+/// nginx; but `index` and `error_page` redirect before that discard
+/// (ngx_http_special_response.c:470-481), so where they lead must discard
+/// too. `try_files`, rewrites, `auth_request` and the rest aren't
+/// followed: the body is read. `errors_redirect`: the location's
+/// `error_page` applies (not past an error page without
+/// `recursive_error_pages`). Cold: only for requests with a body.
+#[cold]
+#[inline(never)]
+fn discards_body(
+    http: &PreparedHttp,
+    server: &PreparedServer,
+    loc: &MatchedLocation<'_>,
+    uri: &[u8],
+    errors_redirect: bool,
+    hops: u8,
+) -> bool {
+    use crate::worker::PreparedHandler;
+    if hops > 2
+        || !loc.rewrite_program.is_empty()
+        || loc.post_action.is_some()
+        || loc.limit_except.is_some()
+    {
+        return false;
+    }
+    let root = match loc.handler {
+        PreparedHandler::Return(..) => {
+            return !http.uses_request_body
+                && !http.uses_request_body_file
+                && (loc.error_pages.is_empty() || !errors_redirect);
+        }
+        PreparedHandler::Root(root) => root,
+        _ => return false,
+    };
+    if root.try_files.is_some()
+        || loc.access.auth_request.is_some()
+        || loc.auto_redirect_to.is_some()
+    {
+        return false;
+    }
+    // Where an internal redirect goes, as `process` routes it.
+    let follow = |target: &[u8], errors_redirect: bool| {
+        let mut state = RewriteState::default();
+        let next = if target.first() == Some(&b'@') {
+            match_named_location(server, target)
+        } else {
+            match_location(server, target, &mut state).or_else(|| {
+                server
+                    .server_default
+                    .as_ref()
+                    .map(MatchedLocation::from_prefix)
+            })
+        };
+        next.is_some_and(|next| {
+            discards_body(http, server, &next, target, errors_redirect, hops + 1)
+        })
+    };
+    if uri.ends_with(b"/") {
+        for entry in root.index {
+            let Some(name) = literal_value(entry.parts) else {
+                return false;
+            };
+            let target = if name.first() == Some(&b'/') {
+                name
+            } else {
+                [uri, &name[..]].concat()
+            };
+            if !follow(&target, errors_redirect) {
+                return false;
+            }
+        }
+    }
+    if !errors_redirect {
+        return true;
+    }
+    loc.error_pages.iter().all(|page| {
+        // What a static location answers before its handler drops the
+        // body: the access phase, the file lookup, the method check, and
+        // the conditional and range checks.
+        let arises = matches!(page.status, 301 | 401 | 403 | 404 | 405 | 412 | 416 | 500)
+            || loc.limit_req.is_some_and(|l| l.status == page.status)
+            || loc.limit_conn.is_some_and(|l| l.status == page.status);
+        if !arises {
+            return true;
+        }
+        let Some(target) = literal_value(page.target) else {
+            return false;
+        };
+        match target.first() {
+            Some(b'/') => {
+                let path = target.split(|&b| b == b'?').next().unwrap_or_default();
+                follow(path, loc.recursive_error_pages)
+            }
+            Some(b'@') => follow(&target, loc.recursive_error_pages),
+            // An external redirect, or nothing.
+            _ => true,
+        }
+    })
+}
+
+/// A value with no variables, as its bytes.
+fn literal_value(parts: &[crate::worker::PreparedValuePart]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            crate::worker::PreparedValuePart::Literal(bytes) => out.extend_from_slice(bytes),
+            crate::worker::PreparedValuePart::Var(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 fn select_listen(http: &PreparedHttp, listen_index: usize) -> Option<&PreparedListen> {

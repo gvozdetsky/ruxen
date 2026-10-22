@@ -5,7 +5,9 @@
 //! buffer and drops it, as nginx's ngx_http_discard_request_body does. The
 //! response goes out first, before the body has come (#627). The
 //! connection stays usable: keep-alive and a pipelined request after the
-//! body work, and `$request_length` still counts the whole body.
+//! body work, and `$request_length` still counts the whole body. A static
+//! file discards it too, as nginx's static module does, unless an `index`
+//! or `error_page` can take the request to something that reads it.
 
 mod common;
 
@@ -26,6 +28,14 @@ impl Drop for Server {
 }
 
 fn start(name: &str) -> (Server, u16) {
+    start_with(name, |_, _| {
+        "location / { return 200 \"ok $content_length\\n\"; }".to_string()
+    })
+}
+
+/// A server whose locations `locations` gives, from the temp dir and the
+/// port.
+fn start_with(name: &str, locations: impl FnOnce(&Path, u16) -> String) -> (Server, u16) {
     let dir = std::env::temp_dir().join(format!("ruxen-m100-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -46,8 +56,9 @@ fn start(name: &str) -> (Server, u16) {
              server {{ listen 127.0.0.1:{port};\n\
              access_log {d}/access.log len;\n\
              client_max_body_size 10m;\n\
-             location / {{ return 200 \"ok $content_length\\n\"; }}\n\
-             }} }}\n"
+             {locations}\n\
+             }} }}\n",
+            locations = locations(&dir, port)
         ),
     )
     .unwrap();
@@ -195,4 +206,127 @@ fn m100_the_response_comes_before_the_body() {
     let _ = c.read_to_end(&mut out);
     let out = String::from_utf8_lossy(&out);
     assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+}
+
+/// An upstream that answers each request with how many body bytes it got
+/// and the Content-Length it was told: `got N of CL`.
+fn counting_upstream() -> u16 {
+    // Bound under the lock: it could take the port another test has just
+    // picked for its ruxen.
+    let setup = common::ports::setup_lock();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    drop(setup);
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut c) = conn else { return };
+            c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let end = loop {
+                if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                match c.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break raw.len(),
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+            let cl: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .map_or(0, |v| v.trim().parse().unwrap());
+            while raw.len() < end + cl {
+                match c.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let body = format!("got {} of {cl}", raw.len() - end);
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+fn static_locations(dir: &Path, upstream: u16) -> String {
+    let html = dir.join("html");
+    std::fs::create_dir_all(&html).unwrap();
+    std::fs::write(html.join("index.html"), "index").unwrap();
+    std::fs::write(html.join("f.txt"), "file").unwrap();
+    format!(
+        "root {html};\n\
+         add_header X-Body \"[$request_body]\";\n\
+         location / {{ error_page 400 /up/; }}\n\
+         location /e404/ {{ error_page 404 /up/; }}\n\
+         location /small {{ client_max_body_size 4; error_page 413 /up/; }}\n\
+         location /up/ {{ proxy_pass http://127.0.0.1:{upstream}; }}",
+        html = html.display()
+    )
+}
+
+/// A static file answers before its body has come, as nginx's static
+/// module discards it (#627), though the config reads `$request_body`
+/// (empty here, as in nginx) and an `error_page` the static path can't
+/// reach proxies. The rest is dropped and the connection goes on. A POST,
+/// which the static module refuses, gets its 405 at once too.
+#[test]
+fn m100_a_static_file_answers_before_the_body() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with("static", |dir, _| static_locations(dir, upstream));
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(b"GET /f.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+        .unwrap();
+    assert_eq!(responses(&mut s, 1), ["HTTP/1.1 200 OK | file".to_string()]);
+    s.write_all(b"defghijGET / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nxy")
+        .unwrap();
+    assert_eq!(
+        responses(&mut s, 1),
+        ["HTTP/1.1 200 OK | index".to_string()]
+    );
+
+    let mut p = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    p.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    p.write_all(b"POST /f.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    let n = p.read(&mut buf).unwrap();
+    let out = String::from_utf8_lossy(&buf[..n]);
+    assert!(out.starts_with("HTTP/1.1 405 Not Allowed"), "{out}");
+}
+
+/// Where an `error_page` the static path can reach proxies, the body is
+/// read and goes upstream, as nginx redirects to the error page before
+/// the static module would discard it.
+#[test]
+fn m100_an_error_page_that_proxies_gets_the_body() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with("static-404", |dir, _| static_locations(dir, upstream));
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"POST /e404/none HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+        .unwrap();
+    let out = responses(&mut s, 1);
+    assert!(out[0].ends_with("| got 5 of 5"), "{out:?}");
+}
+
+/// A body refused as too large isn't read, and an `error_page` that
+/// proxies sends none upstream: nginx's `Content-Length: 0`, where the
+/// client's length with no bytes behind it left the upstream waiting.
+#[test]
+fn m100_a_refused_body_goes_upstream_empty() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with("static-413", |dir, _| static_locations(dir, upstream));
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"POST /small HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789")
+        .unwrap();
+    let out = responses(&mut s, 1);
+    assert!(out[0].ends_with("| got 0 of 0"), "{out:?}");
 }
