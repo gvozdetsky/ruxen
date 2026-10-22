@@ -1,7 +1,7 @@
 //! M111 — `limit_conn_zone` / `limit_conn` (#95): requests in progress per
 //! key, on a zone shared by all workers. While a slow request holds the
 //! only slot, another one from the same address gets `limit_conn_status`;
-//! once it is answered, the slot is free again. `$limit_conn_status` says
+//! once it is answered, or its client closes, the slot is free again. `$limit_conn_status` says
 //! which, and an undeclared zone fails at startup.
 
 mod common;
@@ -119,6 +119,12 @@ fn m111_one_request_at_a_time_per_address() {
     assert_eq!(answer(send(port, "/")), (429, "REJECTED".into()));
     assert_eq!(answer(slow), (200, "PASSED".into()));
     // Answered: the slot is free again.
+    assert_eq!(answer(send(port, "/")), (200, "PASSED".into()));
+    // A client that closes gives its slot back at once, as nginx's
+    // limit_conn.t expects: the next request a moment later passes, while
+    // the upstream still works on the first.
+    drop(send(port, "/slow"));
+    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(answer(send(port, "/")), (200, "PASSED".into()));
     let log = std::fs::read_to_string(server.1.join("error.log")).unwrap();
     assert!(

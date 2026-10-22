@@ -913,7 +913,12 @@ async fn settle_proxy_response(
             .as_ref()
             .map(|late| late as crate::proxy::LateLimitRate<'_>);
         let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
-        super::client_watch::Watched::new(proxy, client).await
+        let watched = if process_meta.limit_conn_held.is_some() {
+            super::client_watch::Watched::at_once(proxy, client)
+        } else {
+            super::client_watch::Watched::new(proxy, client)
+        };
+        watched.await
     };
     let Some(upstream_resp) = upstream_resp else {
         client_closed_log(&process_meta, ctx);
@@ -926,6 +931,9 @@ async fn settle_proxy_response(
         }
         let mut process_meta = process_meta;
         process_meta.upstream_states = report.states;
+        // The limit_conn counts go back now, as nginx frees them when it
+        // finalizes the request, not once the connection is torn down.
+        process_meta.limit_conn_held = None;
         return (Response::Prebuilt(super::CLIENT_CLOSED), process_meta);
     };
     if !report.failures.is_empty() {
