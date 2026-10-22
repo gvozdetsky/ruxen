@@ -2157,7 +2157,14 @@ async fn attempt(
     // far; we sleep when bytes/elapsed would exceed `plan.limit_rate`. Bytes
     // already pulled in with the header read are counted as received.
     let body_pacer_start = Instant::now();
+    let intercepted = plan
+        .intercept
+        .as_ref()
+        .is_some_and(|rules| rules.iter().any(|r| r.status == status_code));
     let limit_rate = match late_limit_rate {
+        // An answer `proxy_intercept_errors` sends to an error_page isn't
+        // the client's: nginx doesn't read its body at all.
+        _ if intercepted => 0,
         Some(late) => late_limit_rate_of(late, status_code, &accum[..head_end], first_line_end),
         None => plan.limit_rate,
     };
@@ -2238,8 +2245,14 @@ async fn attempt(
         // bytes after `body_start` are not what we'll forward.
         accum.truncate(body_start);
         body_len_in_accum = 0;
-        match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout)
-            .await
+        match read_chunked_body_with_buf(
+            &mut stream,
+            &mut body,
+            &mut read_buf,
+            plan.read_timeout,
+            (limit_rate, body_pacer_start),
+        )
+        .await
         {
             Ok((read, extra)) => {
                 state.bytes_received += read;
@@ -3314,7 +3327,10 @@ async fn read_chunked_body_with_buf(
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
+    // `proxy_limit_rate`: the rate, and when the body started.
+    (limit_rate, pacer_start): (u64, Instant),
 ) -> Result<(u64, bool), (bool, UpstreamError)> {
+    let mut paced = body.len() as u64;
     let leftover = std::mem::take(body);
     let mut nothing_read = leftover.is_empty();
     let mut decoder = crate::proxy_stream::ChunkedDecoder::default();
@@ -3343,6 +3359,8 @@ async fn read_chunked_body_with_buf(
                 nothing_read = false;
                 received += n as u64;
                 (done, extra) = decode_chunked(&mut decoder, &read_buf[..n], &mut decoded)?;
+                paced += n as u64;
+                pace_body_read(limit_rate, paced, pacer_start).await;
             }
             Err(e) => {
                 return Err((
