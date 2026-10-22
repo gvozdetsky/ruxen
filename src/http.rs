@@ -2118,6 +2118,48 @@ mod tests {
 
     use super::*;
 
+    /// `refusal_reason` takes whatever the parser refused without panicking
+    /// (#663): it runs on a client's bytes, and a panic would stop the
+    /// worker. Valid requests with bytes changed, cut or repeated.
+    #[test]
+    fn refusal_reason_survives_mangled_requests() {
+        let seeds: [&[u8]; 3] = [
+            b"GET /a?b HTTP/1.1\r\nHost: x\r\nIf-Match: a\r\nContent-Length: 3\r\n\r\n",
+            b"POST http://h:1/p HTTP/1.0\nHost: h\nTransfer-Encoding: chunked\n\n",
+            b"CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\nX_Y:\t\r\n\r\n",
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut refused = 0;
+        for round in 0..200_000 {
+            let mut data = seeds[round % seeds.len()].to_vec();
+            for _ in 0..1 + next() % 4 {
+                let at = (next() as usize) % data.len().max(1);
+                match next() % 4 {
+                    0 if !data.is_empty() => data[at] = next() as u8,
+                    1 => data.insert(at.min(data.len()), next() as u8),
+                    2 if !data.is_empty() => {
+                        data.remove(at);
+                    }
+                    _ => data.truncate(at),
+                }
+            }
+            if matches!(parse_fresh(&data), Parse::Invalid) {
+                refused += 1;
+                let refusal = refusal_reason(&data, false);
+                assert!(data.starts_with(refusal.request_line), "{data:?}");
+                assert!(refusal.message.starts_with("client sent "), "{data:?}");
+                let _ = refusal_reason(&data, true);
+            }
+        }
+        assert!(refused > 10_000, "{refused}");
+    }
+
     /// The reason nginx logs for each refusal (#663), found again from the
     /// bytes the parser refused.
     #[test]
