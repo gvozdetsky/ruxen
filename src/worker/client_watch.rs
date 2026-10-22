@@ -50,6 +50,23 @@ impl<'a, F: Future> Watched<'a, F> {
     }
 }
 
+impl<'a, F: Future> Watched<'a, F> {
+    /// Watched from the start, without waiting for the ticker: for a
+    /// request that holds a `limit_conn` count, which nginx gives back as
+    /// soon as the client closes (its check runs on the client's read
+    /// event), so a client that comes back at once isn't refused.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn at_once(proxy: Pin<&'a mut F>, client: Option<&'a dyn WatchClient>) -> Self {
+        Watched {
+            proxy,
+            client,
+            ticket: None,
+            watch: client.map(|c| c.closed()),
+        }
+    }
+}
+
 impl<F: Future> Future for Watched<'_, F> {
     type Output = Option<F::Output>;
 
