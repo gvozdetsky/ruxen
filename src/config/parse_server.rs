@@ -1446,6 +1446,62 @@ pub(crate) fn parse_proxy_cookie(
     Ok(())
 }
 
+/// One `proxy_cookie_flags off | <cookie> <flag>…;` line into the scope's
+/// `slot` (ngx_http_proxy_cookie_flags): `off` stands alone in a scope. The
+/// flags may hold variables, so they are read per response; one nginx
+/// doesn't know is skipped then, as nginx does.
+pub(crate) fn parse_proxy_cookie_flags(
+    args: &[String],
+    slot: &mut Option<Vec<crate::config::CookieFlagsRule>>,
+) -> Result<(), Error> {
+    use crate::config::{CookieFlagsRule, CookieName};
+    const WHAT: &str = "proxy_cookie_flags";
+    let rule = match &args[1..] {
+        [one] if one == "off" => {
+            if slot.is_some() {
+                return Err(Error::Duplicate(WHAT));
+            }
+            *slot = Some(Vec::new());
+            return Ok(());
+        }
+        [cookie, flags @ ..] if !flags.is_empty() => {
+            let cookie = match cookie.strip_prefix('~') {
+                Some(regex) => {
+                    regex::bytes::RegexBuilder::new(regex)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(|e| Error::InvalidRegex {
+                            pattern: regex.to_string(),
+                            msg: e.to_string(),
+                        })?;
+                    CookieName::Regex(regex.to_string())
+                }
+                None => CookieName::Name(crate::config::parse_value_with_vars(cookie)?),
+            };
+            CookieFlagsRule {
+                cookie,
+                flags: flags
+                    .iter()
+                    .map(|f| crate::config::parse_value_with_vars(f))
+                    .collect::<Result<_, _>>()?,
+            }
+        }
+        _ => {
+            return Err(Error::BadValue {
+                what: WHAT,
+                got: args[1..].join(" "),
+            });
+        }
+    };
+    match slot {
+        None => *slot = Some(vec![rule]),
+        // `off` is the empty list.
+        Some(rules) if rules.is_empty() => return Err(Error::Duplicate(WHAT)),
+        Some(rules) => rules.push(rule),
+    }
+    Ok(())
+}
+
 /// Where a `server` without `listen` listens: `*:80`, or `*:8000` when not
 /// run by root (`ngx_http_core_server`, which checks the real uid).
 fn default_listen_addr() -> SocketAddr {

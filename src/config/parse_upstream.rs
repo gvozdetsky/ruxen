@@ -741,6 +741,7 @@ impl ProxyConf {
         "proxy_redirect",
         "proxy_cookie_domain",
         "proxy_cookie_path",
+        "proxy_cookie_flags",
         "proxy_hide_header",
         "proxy_pass_header",
         "proxy_method",
@@ -1048,6 +1049,9 @@ impl ProxyConf {
             )?,
             "proxy_cookie_path" => {
                 crate::config::parse_server::parse_proxy_cookie(args, &mut self.cookie_path, false)?
+            }
+            "proxy_cookie_flags" => {
+                crate::config::parse_server::parse_proxy_cookie_flags(args, &mut self.cookie_flags)?
             }
             "proxy_hide_header" => {
                 let name = args.get(1).ok_or(Error::MissingArg("proxy_hide_header"))?;

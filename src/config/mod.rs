@@ -1100,7 +1100,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "fastcgi_temp_path",
     "uwsgi_temp_path",
     "scgi_temp_path",
-    "proxy_cookie_flags",
     "proxy_socket_keepalive",
     "proxy_store",
     "proxy_store_access",
@@ -1220,11 +1219,6 @@ pub(crate) fn parse_mime(
 pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
-        // The flags harden cookies (`secure`, `httponly`, `samesite=`), so
-        // dropping them weakens what the config protects. Only `off` loads.
-        Some("proxy_cookie_flags") if value != Some("off") || args.len() != 2 => {
-            "upstream cookies would reach clients without the flags it sets"
-        }
         // Taken literally, `root /var/www/$host` or `alias /srv/$1` looks
         // for a directory named `$host` (#232). Until the path is rendered
         // per request, such a configuration is refused rather than served
@@ -2470,8 +2464,7 @@ mod tests {
         assert!(parse(&tls("ssl_verify_client maybe;")).is_err());
         parse(&tls("ssl_reject_handshake off;")).unwrap();
         parse(&tls("ssl_client_certificate ca.pem;")).unwrap();
-        // proxy_cookie_flags isn't implemented: refused at every level,
-        // except `off`, which sets no flags.
+        // proxy_cookie_flags (#40): at every level; `off` stands alone.
         let cookie_flags = |directive: &str| {
             [
                 format!("http {{ {directive} server {{ listen 80; }} }}"),
@@ -2483,17 +2476,19 @@ mod tests {
             ]
         };
         for src in cookie_flags("proxy_cookie_flags ~ secure httponly samesite=strict;") {
-            assert_eq!(
-                unenforced_err(&src),
-                "\"proxy_cookie_flags\" is not supported yet, and ignoring it is unsafe: \
-                 upstream cookies would reach clients without the flags it sets"
-            );
+            parse(&src).unwrap();
         }
-        unenforced_err("http { server { listen 80; proxy_cookie_flags sid secure; } }");
-        unenforced_err("http { server { listen 80; proxy_cookie_flags off secure; } }");
         for src in cookie_flags("proxy_cookie_flags off;") {
             parse(&src).unwrap();
         }
+        parse("http { server { listen 80; proxy_cookie_flags sid secure; } }").unwrap();
+        // A cookie named `off`, as nginx reads it.
+        parse("http { server { listen 80; proxy_cookie_flags off secure; } }").unwrap();
+        assert!(parse("http { server { listen 80; proxy_cookie_flags; } }").is_err());
+        assert!(
+            parse("http { server { listen 80; proxy_cookie_flags off; proxy_cookie_flags a secure; } }")
+                .is_err()
+        );
     }
 
     #[test]
