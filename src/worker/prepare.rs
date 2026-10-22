@@ -1298,15 +1298,7 @@ pub(crate) fn build_proxy(
         },
     };
     let cache = prepare_proxy_cache(eff.cache, eff.cache_ignore)?;
-    let response = prepare_response_rules(
-        redirects,
-        eff.hide_headers,
-        eff.pass_headers,
-        eff.error_pages,
-        eff.recursive_error_pages,
-        eff.ignore_accel_redirect,
-        eff.ignore_accel_limit_rate,
-    );
+    let response = prepare_response_rules(redirects, &eff);
     Ok(match pp {
         ProxyPass::Direct {
             addrs,
@@ -1361,7 +1353,7 @@ pub(crate) fn build_proxy(
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
                 send_timeout_ms: eff.send_timeout_ms,
-                limit_rate: eff.limit_rate,
+                limit_rate: literal_limit_rate(eff.limit_rate).unwrap_or(0),
                 http_version: eff.http_version,
                 next_upstream: eff.next_upstream,
                 next_upstream_tries: eff.next_upstream_tries,
@@ -1409,7 +1401,7 @@ pub(crate) fn build_proxy(
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
                 send_timeout_ms: eff.send_timeout_ms,
-                limit_rate: eff.limit_rate,
+                limit_rate: literal_limit_rate(eff.limit_rate).unwrap_or(0),
                 http_version: eff.http_version,
                 next_upstream: eff.next_upstream,
                 next_upstream_tries: eff.next_upstream_tries,
@@ -1470,7 +1462,7 @@ pub(crate) fn build_proxy(
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
                 send_timeout_ms: eff.send_timeout_ms,
-                limit_rate: eff.limit_rate,
+                limit_rate: literal_limit_rate(eff.limit_rate).unwrap_or(0),
                 http_version: eff.http_version,
                 next_upstream: eff.next_upstream,
                 next_upstream_tries: eff.next_upstream_tries,
@@ -1618,24 +1610,34 @@ fn without_default_port(authority: &'static [u8], tls: bool) -> &'static [u8] {
     }
 }
 
+/// A `proxy_limit_rate` without variables, in bytes/sec; `Some(0)` when
+/// unset. `None` when it has variables.
+fn literal_limit_rate(parts: Option<&[PreparedValuePart]>) -> Option<u64> {
+    let mut value = Vec::new();
+    for part in parts.unwrap_or(&[]) {
+        match part {
+            PreparedValuePart::Literal(bytes) => value.extend_from_slice(bytes),
+            PreparedValuePart::Var(_) => return None,
+        }
+    }
+    // Checked as a size when parsed.
+    Some(crate::config::parse_size(&value).unwrap_or(0))
+}
+
 /// nginx's hidden set: its defaults, plus `proxy_hide_header`, minus
 /// `proxy_pass_header` (ngx_http_upstream_hide_headers_hash).
 fn prepare_response_rules(
     redirects: &'static [PreparedRedirect],
-    hide: Option<&'static [String]>,
-    pass: Option<&'static [String]>,
-    error_pages: &'static [PreparedErrorPage],
-    recursive_error_pages: bool,
-    ignore_accel_redirect: bool,
-    ignore_accel_limit_rate: bool,
+    eff: &ProxyEffective,
 ) -> &'static ProxyResponseRules {
-    let pass = pass.unwrap_or(&[]);
+    let pass = eff.pass_headers.unwrap_or(&[]);
     let passed = |name: &str| pass.iter().any(|p| p.eq_ignore_ascii_case(name));
     let pass_mask = pass
         .iter()
         .filter_map(|p| crate::proxy::default_hidden_bit(p.as_bytes()))
         .fold(0, |mask, bit| mask | bit);
-    let hide: Vec<&'static [u8]> = hide
+    let hide: Vec<&'static [u8]> = eff
+        .hide_headers
         .unwrap_or(&[])
         .iter()
         .filter(|h| !passed(h) && crate::proxy::default_hidden_bit(h.as_bytes()).is_none())
@@ -1643,10 +1645,13 @@ fn prepare_response_rules(
         .collect();
     crate::arena::leak(Box::new(ProxyResponseRules {
         redirects,
-        error_pages,
-        recursive_error_pages,
-        ignore_accel_redirect,
-        ignore_accel_limit_rate,
+        error_pages: eff.error_pages,
+        recursive_error_pages: eff.recursive_error_pages,
+        ignore_accel_redirect: eff.ignore_accel_redirect,
+        ignore_accel_limit_rate: eff.ignore_accel_limit_rate,
+        limit_rate: eff
+            .limit_rate
+            .filter(|parts| literal_limit_rate(Some(parts)).is_none()),
         hide: crate::arena::leak(hide.into_boxed_slice()),
         passes_date: crate::proxy::default_hidden_bit(b"date")
             .is_some_and(|bit| pass_mask & bit != 0),
@@ -1725,7 +1730,7 @@ pub(crate) struct ServerProxyDefaults {
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
-    pub limit_rate: u64,
+    pub limit_rate: Option<&'static [PreparedValuePart]>,
     pub http_version: u8,
     pub next_upstream: crate::config::ProxyNextUpstream,
     pub next_upstream_tries: u32,
@@ -1805,7 +1810,10 @@ impl ServerProxyDefaults {
                 .unwrap_or(defaults.connect_timeout_ms),
             read_timeout_ms: conf.read_timeout_ms.unwrap_or(defaults.read_timeout_ms),
             send_timeout_ms: conf.send_timeout_ms.unwrap_or(defaults.send_timeout_ms),
-            limit_rate: conf.limit_rate.unwrap_or(defaults.limit_rate),
+            limit_rate: conf
+                .limit_rate
+                .map(prepare_value_parts)
+                .or(defaults.limit_rate),
             http_version: conf.http_version.unwrap_or(defaults.http_version),
             next_upstream: conf.next_upstream.unwrap_or(defaults.next_upstream),
             next_upstream_tries: conf
@@ -1923,7 +1931,10 @@ pub(crate) fn resolve_proxy_effective(
         send_timeout_ms: location
             .send_timeout_ms
             .unwrap_or(server_defaults.send_timeout_ms),
-        limit_rate: location.limit_rate.unwrap_or(server_defaults.limit_rate),
+        limit_rate: location
+            .limit_rate
+            .map(prepare_value_parts)
+            .or(server_defaults.limit_rate),
         next_upstream: location
             .next_upstream
             .unwrap_or(server_defaults.next_upstream),

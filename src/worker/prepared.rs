@@ -671,6 +671,11 @@ pub struct ProxyResponseRules {
     pub ignore_accel_redirect: bool,
     /// `proxy_ignore_headers X-Accel-Limit-Rate`.
     pub ignore_accel_limit_rate: bool,
+    /// A `proxy_limit_rate` with variables, rendered once the upstream's
+    /// header is in, as nginx's ngx_http_upstream_send_response does
+    /// (`$upstream_http_*` included). `None` when it has none: the plan's
+    /// `limit_rate` holds its value then.
+    pub limit_rate: Option<&'static [PreparedValuePart]>,
 }
 
 /// One prepared `proxy_redirect` rule.
@@ -719,7 +724,9 @@ pub struct PreparedProxy {
     pub read_timeout_ms: u64,
     /// Inheritance-resolved `proxy_send_timeout` (default 60s).
     pub send_timeout_ms: u64,
-    /// Inheritance-resolved `proxy_limit_rate` in bytes/sec; `0` is unlimited.
+    /// Inheritance-resolved `proxy_limit_rate` in bytes/sec; `0` is
+    /// unlimited, and so is one with variables here: it is read when the
+    /// upstream's header is in (`ProxyResponseRules::limit_rate`).
     pub limit_rate: u64,
     /// 0 = HTTP/1.0, 1 = HTTP/1.1 (the default since nginx 1.29.7).
     /// Drives the upstream request-line version and gates pool
@@ -874,8 +881,9 @@ pub(crate) struct ProxyEffective {
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
-    /// `proxy_limit_rate` in bytes/sec; `0` means unlimited.
-    pub limit_rate: u64,
+    /// `proxy_limit_rate`, a size that may hold variables; `None`
+    /// means unlimited.
+    pub limit_rate: Option<&'static [PreparedValuePart]>,
     /// 0 = HTTP/1.0, 1 = HTTP/1.1. Matches nginx's default of 1.1 (1.29.7).
     pub http_version: u8,
     pub next_upstream: crate::config::ProxyNextUpstream,
@@ -1056,7 +1064,7 @@ impl ProxyEffective {
             connect_timeout_ms: 60_000,
             read_timeout_ms: 60_000,
             send_timeout_ms: 60_000,
-            limit_rate: 0,
+            limit_rate: None,
             // ngx_http_proxy_merge_loc_conf: NGX_HTTP_VERSION_11 (1.29.7).
             http_version: 1,
             next_upstream: crate::config::ProxyNextUpstream::DEFAULT,

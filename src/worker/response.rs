@@ -817,6 +817,28 @@ pub(crate) fn root_only_state(meta: &phase::ProcessMeta) -> Option<RewriteState>
     Some(state)
 }
 
+/// A `proxy_limit_rate` with variables, rendered once the upstream's
+/// header is in, as ngx_http_upstream_send_response does; a value that
+/// isn't a size is 0 (unlimited), as ngx_http_complex_value_size has it.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+pub(crate) fn render_proxy_limit_rate(
+    parts: &[PreparedValuePart],
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    status: u16,
+    upstream_headers: &[u8],
+    uri: Option<&[u8]>,
+) -> u64 {
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(http, ctx, meta, status, upstream_headers, &root_only, uri);
+    let mut value = Vec::with_capacity(16);
+    render_parts(parts, &render_ctx, &mut value);
+    crate::config::parse_size(&value).unwrap_or(0)
+}
+
 /// The variable context for rendering against a proxied response
 /// (`add_header`, `proxy_redirect`).
 fn proxy_render_ctx<'a>(

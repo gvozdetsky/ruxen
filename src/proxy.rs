@@ -612,6 +612,11 @@ async fn resolve_peers(
     }
 }
 
+/// A `proxy_limit_rate` with variables (`ProxyResponseRules::limit_rate`),
+/// rendered by the caller, who has the request: from the upstream's status
+/// and header lines (`Name: value` CRLF each) to bytes/sec.
+pub type LateLimitRate<'a> = &'a dyn Fn(u16, &[u8]) -> u64;
+
 /// Run the upstream exchange, with `proxy_next_upstream` failover. Each
 /// failed attempt is appended to `failures` so the worker can log it with
 /// the request's context; on the happy path nothing is pushed and the
@@ -630,7 +635,11 @@ async fn resolve_peers(
 ///     and retry.
 ///   - Pool the upstream socket on success when the upstream and request
 ///     framing both permit it.
-pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Response {
+pub async fn run_proxy(
+    mut plan: Box<ProxyPlan>,
+    report: &mut ProxyReport,
+    late_limit_rate: Option<LateLimitRate<'_>>,
+) -> Response {
     report.passes_date = plan.response.passes_date;
     if let Some(cache) = plan.cache.as_deref_mut() {
         if cache.wait_until.is_some() {
@@ -738,6 +747,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 started,
                 &mut storable,
                 failures,
+                late_limit_rate,
             )
             .await
             {
@@ -759,6 +769,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                             started,
                             &mut storable,
                             failures,
+                            late_limit_rate,
                         )
                         .await
                     } else {
@@ -784,6 +795,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 started,
                 &mut storable,
                 failures,
+                late_limit_rate,
             )
             .await
         };
@@ -1670,6 +1682,7 @@ async fn attempt(
     started: Instant,
     storable: &mut Option<Storable>,
     failures: &mut Vec<AttemptFailure>,
+    late_limit_rate: Option<LateLimitRate<'_>>,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     // Only the answering attempt's X-Accel headers count.
@@ -1863,6 +1876,9 @@ async fn attempt(
     // safe — the kernel writes before we read.
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
+    if plan.limit_rate != 0 || late_limit_rate.is_some() {
+        read_buf = paced_head_buf(read_buf);
+    }
     let mut head_end_terminator: (usize, usize); // (head_end, terminator_len)
     let mut scanned = 0;
     // Bytes of 103 heads dropped from the front of `accum` (#581): not
@@ -2174,6 +2190,10 @@ async fn attempt(
     // far; we sleep when bytes/elapsed would exceed `plan.limit_rate`. Bytes
     // already pulled in with the header read are counted as received.
     let body_pacer_start = Instant::now();
+    let limit_rate = match late_limit_rate {
+        Some(late) => late_limit_rate_of(late, status_code, &accum[..head_end], first_line_end),
+        None => plan.limit_rate,
+    };
     let mut paced_body_bytes: u64 = body_len_in_accum as u64;
     // A body that hasn't all arrived goes to the client as it comes (#88),
     // unless something needs it whole: a status that may fail over or be
@@ -2224,7 +2244,7 @@ async fn attempt(
                 upstream: stream,
                 read_buf,
                 read_timeout: plan.read_timeout,
-                limit_rate: plan.limit_rate,
+                limit_rate,
                 pacer_start: body_pacer_start,
                 paced: paced_body_bytes,
                 started,
@@ -2321,7 +2341,7 @@ async fn attempt(
                     accum.extend_from_slice(&read_buf[..take]);
                     body_len_in_accum += take;
                     paced_body_bytes += take as u64;
-                    pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
+                    pace_body_read(limit_rate, paced_body_bytes, body_pacer_start).await;
                 }
                 Err(e) => {
                     return AttemptOutcome::Failed(
@@ -2354,7 +2374,7 @@ async fn attempt(
                     accum.extend_from_slice(&read_buf[..n]);
                     body_len_in_accum += n;
                     paced_body_bytes += n as u64;
-                    pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
+                    pace_body_read(limit_rate, paced_body_bytes, body_pacer_start).await;
                 }
                 Err(e) => {
                     return AttemptOutcome::Failed(
@@ -2872,7 +2892,7 @@ fn background_update(
     }
     Box::pin(async move {
         let mut report = ProxyReport::default();
-        let _ = run_proxy(plan, &mut report).await;
+        let _ = run_proxy(plan, &mut report, None).await;
     })
 }
 
@@ -3248,6 +3268,42 @@ async fn send_body_file(
         offset += n as u64;
     }
     Ok(())
+}
+
+/// A `proxy_limit_rate` with variables, from the upstream's head: its
+/// header lines as `$upstream_http_*` reads them.
+#[cold]
+#[inline(never)]
+fn late_limit_rate_of(
+    late: LateLimitRate<'_>,
+    status: u16,
+    head: &[u8],
+    first_line_end: usize,
+) -> u64 {
+    let mut lines = Vec::with_capacity(head.len());
+    let mut cursor = headers_start(head, first_line_end, head.len());
+    while cursor < head.len() {
+        let (line_len, t) = find_line_end(&head[cursor..]).unwrap_or((head.len() - cursor, 0));
+        let line = &head[cursor..cursor + line_len];
+        cursor += line_len + t;
+        if line.is_empty() {
+            break;
+        }
+        lines.extend_from_slice(line);
+        lines.extend_from_slice(b"\r\n");
+    }
+    late(status, &lines)
+}
+
+/// Under `proxy_limit_rate`, the head is read as nginx reads it, into a
+/// `proxy_buffer_size` buffer (4k by default): a pooled buffer may hold
+/// 128 KiB, and the body bytes that come with the head go out unpaced
+/// (#700).
+#[cold]
+#[inline(never)]
+fn paced_head_buf(buf: Vec<u8>) -> Vec<u8> {
+    return_proxy_buf(buf);
+    Vec::with_capacity(PROXY_SCRATCH_CAP)
 }
 
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body
