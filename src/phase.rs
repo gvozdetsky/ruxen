@@ -637,6 +637,21 @@ pub fn process_with_meta_from_reroute(
     out
 }
 
+/// nginx's `rewrite or internal redirection cycle` line, noted for the
+/// request's error log (#682).
+#[cold]
+#[inline(never)]
+fn rewrite_cycle_log(uri: &[u8]) {
+    crate::fs_resolve::note_failed_lookup_at(
+        format!(
+            "rewrite or internal redirection cycle while processing \"{}\"",
+            String::from_utf8_lossy(uri)
+        ),
+        false,
+        crate::config::ErrorLogLevel::Error,
+    );
+}
+
 /// A file lookup that failed while processing (`open() "…" failed`) is
 /// logged now, with this request's context, as nginx logs it where the
 /// open fails. The note is per worker thread, so it has to be taken
@@ -1285,6 +1300,7 @@ fn process_with_meta_inner(
         }
     }
     // Budget exhausted: nginx returns 500; we match.
+    rewrite_cycle_log(url_scratch);
     (
         Response::Owned(crate::http::error_response_for_method(
             500,
