@@ -138,8 +138,9 @@ pub struct ProxyConf {
     pub connect_timeout_ms: Option<u64>,
     pub read_timeout_ms: Option<u64>,
     pub send_timeout_ms: Option<u64>,
-    /// `proxy_limit_rate` in bytes/sec; `0` means unlimited.
-    pub limit_rate: Option<u64>,
+    /// `proxy_limit_rate` in bytes/sec (a size, variables allowed); `0`
+    /// means unlimited.
+    pub limit_rate: Option<Vec<ValuePart>>,
     /// `proxy_http_version 1.0|1.1`, stored as the minor digit.
     pub http_version: Option<u8>,
     /// `proxy_next_upstream`; unset means nginx's `error timeout`.
@@ -329,7 +330,7 @@ impl ProxyConf {
             connect_timeout_ms: self.connect_timeout_ms.or(parent.connect_timeout_ms),
             read_timeout_ms: self.read_timeout_ms.or(parent.read_timeout_ms),
             send_timeout_ms: self.send_timeout_ms.or(parent.send_timeout_ms),
-            limit_rate: self.limit_rate.or(parent.limit_rate),
+            limit_rate: self.limit_rate.or_else(|| parent.limit_rate.clone()),
             http_version: self.http_version.or(parent.http_version),
             next_upstream: self.next_upstream.or(parent.next_upstream),
             next_upstream_tries: self.next_upstream_tries.or(parent.next_upstream_tries),

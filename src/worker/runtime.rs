@@ -841,8 +841,17 @@ async fn settle_proxy_response(
     // closes ends the exchange, and with it the upstream connection (the
     // proxy future is dropped).
     let client = client.filter(|_| !plan.ignore_client_abort);
+    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+        let meta = &process_meta;
+        move |status: u16, headers: &[u8]| {
+            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        }
+    });
     let upstream_resp = {
-        let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report));
+        let late = late_limit_rate
+            .as_ref()
+            .map(|late| late as crate::proxy::LateLimitRate<'_>);
+        let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
         super::client_watch::Watched::new(proxy, client).await
     };
     let Some(upstream_resp) = upstream_resp else {
@@ -1257,7 +1266,16 @@ async fn run_proxy_pass(
     };
     let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
-    let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
+    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+        let meta = &process_meta;
+        move |status: u16, headers: &[u8]| {
+            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        }
+    });
+    let late = late_limit_rate
+        .as_ref()
+        .map(|late| late as crate::proxy::LateLimitRate<'_>);
+    let upstream_resp = crate::proxy::run_proxy(plan, &mut report, late).await;
     if !report.failures.is_empty() {
         write_upstream_error_log(
             &process_meta.log,
