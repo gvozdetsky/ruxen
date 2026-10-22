@@ -431,12 +431,48 @@ fn large_client_header_buffers_bound_fields_and_the_list() {
 /// ngx_http_v2_close_stream (#627): the body is never waited for.
 #[test]
 fn a_body_nothing_reads_is_reset_with_no_error_after_the_response() {
-    use std::io::{Read, Write};
     let setup = common::ports::setup_lock();
     let [port] = common::ports::free_ports();
     let _s = start("discard", setup, |_| {
         format!("server {{ listen 127.0.0.1:{port}; http2 on; location / {{ return 200 ok; }} }}")
     });
+    // POST / with :authority a, END_HEADERS only: a body is to follow.
+    let (status, reset) = response_then_reset(port, &[0x83, 0x86, 0x84, 0x01, 1, b'a']);
+    // `:status` 200 is static-table entry 8.
+    assert_eq!(status, Some(0x88));
+    assert_eq!(reset, Some(0), "RST_STREAM NO_ERROR");
+}
+
+/// A static file discards the body too, as nginx's static module does,
+/// even where the config reads `$request_body` elsewhere and an
+/// `error_page` the static path can't reach proxies (as in
+/// h2_request_body.t): the file, then RST_STREAM NO_ERROR (#627).
+#[test]
+fn a_static_file_is_reset_with_no_error_after_the_response() {
+    let setup = common::ports::setup_lock();
+    let [port, dead] = common::ports::free_ports();
+    let s = start("discard-static", setup, |dir| {
+        format!(
+            "server {{ listen 127.0.0.1:{port}; http2 on; root {d}/html;\n\
+             error_page 400 /proxy/;\n\
+             location / {{ }}\n\
+             location /proxy/ {{ add_header X-Body $request_body; \
+             proxy_pass http://127.0.0.1:{dead}/; }} }}",
+            d = dir.display()
+        )
+    });
+    std::fs::write(s.dir.join("html/index.html"), "index").unwrap();
+    // GET / (an index redirect to the same location), a body to follow.
+    let (status, reset) = response_then_reset(port, &[0x82, 0x86, 0x84, 0x01, 1, b'a']);
+    assert_eq!(status, Some(0x88));
+    assert_eq!(reset, Some(0), "RST_STREAM NO_ERROR");
+}
+
+/// Send a HEADERS frame without END_STREAM and read up to the stream's
+/// RST_STREAM: the first byte of its response's header block, and the
+/// reset's error code.
+fn response_then_reset(port: u16, block: &[u8]) -> (Option<u8>, Option<u32>) {
+    use std::io::{Read, Write};
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
         let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
         f.extend_from_slice(&[kind, flags]);
@@ -448,9 +484,7 @@ fn a_body_nothing_reads_is_reset_with_no_error_after_the_response() {
     c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
     c.write_all(&frame(0x4, 0, 0, &[])).unwrap();
-    // POST / with :authority a, END_HEADERS only: a body is to follow.
-    c.write_all(&frame(0x1, 0x4, 1, &[0x83, 0x86, 0x84, 0x01, 1, b'a']))
-        .unwrap();
+    c.write_all(&frame(0x1, 0x4, 1, block)).unwrap();
     let (mut status, mut reset) = (None, None);
     while reset.is_none() {
         let mut head = [0u8; 9];
@@ -465,7 +499,5 @@ fn a_body_nothing_reads_is_reset_with_no_error_after_the_response() {
             _ => {}
         }
     }
-    // `:status` 200 is static-table entry 8.
-    assert_eq!(status, Some(0x88));
-    assert_eq!(reset, Some(0), "RST_STREAM NO_ERROR");
+    (status, reset)
 }

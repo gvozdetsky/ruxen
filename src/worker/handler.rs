@@ -1099,7 +1099,11 @@ pub(crate) fn run_location_handler(
         };
         let forward_len = match &set_body {
             Some(body) => body.len() as u64,
-            None if proxy.pass_request_body => req.body_len,
+            None if proxy.pass_request_body && req.body_file.is_some() => req.body_len,
+            // A body dropped unread (discarded, or over the limit, on the
+            // way to an error page) has a length and no bytes: none go
+            // upstream, as in nginx.
+            None if proxy.pass_request_body => req.body.len() as u64,
             None => 0,
         };
         // A body too large to keep in memory is only in the temp file;
