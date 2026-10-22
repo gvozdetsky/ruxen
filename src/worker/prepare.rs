@@ -3580,6 +3580,9 @@ pub(crate) fn build_prefix_or_exact(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        add_header_inherit: _,
+        add_trailer_inherit: _,
+        header_ancestors: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
@@ -3793,6 +3796,9 @@ pub(crate) fn build_regex_location(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        add_header_inherit: _,
+        add_trailer_inherit: _,
+        header_ancestors: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;

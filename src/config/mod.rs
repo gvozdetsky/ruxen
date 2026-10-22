@@ -326,6 +326,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut redirect = RedirectConf::default();
     let mut mime = MimeConf::default();
     let mut add_trailers: Option<Vec<AddHeader>> = None;
+    let mut add_header_inherit: Option<HeaderInherit> = None;
+    let mut add_trailer_inherit: Option<HeaderInherit> = None;
     let mut recursive_error_pages: Option<bool> = None;
     let mut merge_slashes: Option<bool> = None;
     // http-scope SSL defaults inherited by `server {}` blocks unless
@@ -378,14 +380,14 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                             server.error_pages.clone_from(&error_pages);
                         }
                         // add_header / add_trailer likewise
-                        // (ngx_http_headers_merge_conf, #17); a location
-                        // without its own takes the server's.
-                        if server.add_headers.is_none() {
-                            server.add_headers.clone_from(&add_headers);
-                        }
-                        if server.add_trailers.is_none() {
-                            server.add_trailers.clone_from(&add_trailers);
-                        }
+                        // (ngx_http_headers_merge_conf, #17), with
+                        // add_header_inherit (#598); then each location's
+                        // chain over the server's.
+                        merge_add_headers(
+                            server,
+                            (&add_headers, add_header_inherit),
+                            (&add_trailers, add_trailer_inherit),
+                        );
                         // absolute_redirect and friends (#15): http into the
                         // server, the server into each location and its
                         // `if` blocks.
@@ -547,6 +549,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             ("add_trailer", Terminator::Semi) => {
                 let entry = parse_add_header_args(&args[1..])?;
                 add_trailers.get_or_insert_with(Vec::new).push(entry);
+            }
+            ("add_header_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_header_inherit, &args)?;
+            }
+            ("add_trailer_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_trailer_inherit, &args)?;
             }
             ("recursive_error_pages", Terminator::Semi) => {
                 if recursive_error_pages.is_some() {
@@ -1141,6 +1149,104 @@ pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "charset_map"];
 /// The body of `types { TYPE EXT…; … }` (#38): extensions lowercased, a
 /// repeated one taking the later type, as ngx_http_core_type does (it
 /// warns too).
+/// nginx's ngx_http_headers_merge_conf over a chain of levels (#598):
+/// `parent` is the effective list above the first level and `mode` its
+/// inherit mode; each level's own list and mode merge over what is above.
+/// `None`: the parent's list as it is, no level changed it.
+fn merge_header_levels<'a>(
+    parent: Option<&Vec<AddHeader>>,
+    mut mode: HeaderInherit,
+    levels: impl IntoIterator<Item = (Option<&'a Vec<AddHeader>>, Option<HeaderInherit>)>,
+) -> Option<Vec<AddHeader>> {
+    let mut merged: Option<Vec<AddHeader>> = None;
+    for (own, own_mode) in levels {
+        mode = own_mode.unwrap_or(mode);
+        merged = match (mode, own) {
+            (HeaderInherit::Off, own) => Some(own.cloned().unwrap_or_default()),
+            (_, None) => merged,
+            (HeaderInherit::On, Some(own)) => Some(own.clone()),
+            (HeaderInherit::Merge, Some(own)) => {
+                let above = merged.as_ref().or(parent);
+                Some(
+                    own.iter()
+                        .chain(above.into_iter().flatten())
+                        .cloned()
+                        .collect(),
+                )
+            }
+        };
+    }
+    merged
+}
+
+/// A server's `add_header` / `add_trailer` over the http level's, and then
+/// each location's (and `if` block's) chain over the server's (#598). A
+/// location's lists become its effective ones; `None` where they are the
+/// server's as they are, which `prepare` takes.
+fn merge_add_headers(
+    server: &mut Server,
+    http_headers: (&Option<Vec<AddHeader>>, Option<HeaderInherit>),
+    http_trailers: (&Option<Vec<AddHeader>>, Option<HeaderInherit>),
+) {
+    fn level(
+        headers: &Option<Vec<AddHeader>>,
+        mode: Option<HeaderInherit>,
+    ) -> (Option<&Vec<AddHeader>>, Option<HeaderInherit>) {
+        (headers.as_ref(), mode)
+    }
+    let on = HeaderInherit::On;
+    let headers_mode = server.add_header_inherit.or(http_headers.1);
+    let trailers_mode = server.add_trailer_inherit.or(http_trailers.1);
+    let headers = merge_header_levels(
+        http_headers.0.as_ref(),
+        http_headers.1.unwrap_or(on),
+        [level(&server.add_headers, server.add_header_inherit)],
+    );
+    let trailers = merge_header_levels(
+        http_trailers.0.as_ref(),
+        http_trailers.1.unwrap_or(on),
+        [level(&server.add_trailers, server.add_trailer_inherit)],
+    );
+    server.add_headers = headers.or_else(|| http_headers.0.clone());
+    server.add_trailers = trailers.or_else(|| http_trailers.0.clone());
+    server.add_header_inherit = headers_mode;
+    server.add_trailer_inherit = trailers_mode;
+    let (server_headers, server_trailers) = (&server.add_headers, &server.add_trailers);
+    let merge = |loc: &mut Location| {
+        loc.add_headers = merge_header_levels(
+            server_headers.as_ref(),
+            headers_mode.unwrap_or(on),
+            loc.header_ancestors
+                .iter()
+                .map(|l| level(&l.headers, l.headers_inherit))
+                .chain([level(&loc.add_headers, loc.add_header_inherit)]),
+        );
+        loc.add_trailers = merge_header_levels(
+            server_trailers.as_ref(),
+            trailers_mode.unwrap_or(on),
+            loc.header_ancestors
+                .iter()
+                .map(|l| level(&l.trailers, l.trailers_inherit))
+                .chain([level(&loc.add_trailers, loc.add_trailer_inherit)]),
+        );
+    };
+    fn in_ifs(ops: &mut [RewriteOp], merge: &dyn Fn(&mut Location)) {
+        for op in ops {
+            if let RewriteOp::If { body, location, .. } = op {
+                if let Some(IfLocation::Parsed { location, .. }) = location {
+                    merge(location);
+                }
+                in_ifs(body, merge);
+            }
+        }
+    }
+    for loc in &mut server.locations {
+        in_ifs(&mut loc.rewrite_ops, &merge);
+        merge(loc);
+    }
+    in_ifs(&mut server.rewrite_ops, &merge);
+}
+
 pub(crate) fn parse_types_block(lx: &mut Lexer) -> Result<Vec<(String, String)>, Error> {
     let mut out: Vec<(String, String)> = Vec::new();
     loop {
@@ -3314,6 +3420,83 @@ mod tests {
         assert_eq!(
             loc.auth_basic_user_file.as_deref(),
             Some(std::path::Path::new("/tmp/location.htpasswd"))
+        );
+    }
+
+    /// `add_header_inherit` / `add_trailer_inherit` (#598), as nginx's
+    /// ngx_http_headers_merge_conf: `merge` puts the level's own list
+    /// before the inherited one, `off` inherits nothing, and the mode is
+    /// inherited itself, through nested locations (a directive after the
+    /// nested block counts), `if` blocks and the http level.
+    #[test]
+    fn add_header_inherit_merges_as_nginx() {
+        let src = r#"
+            http {
+                add_header X-H http;
+                add_trailer X-T http;
+                server {
+                    listen 80;
+                    add_header X-S server;
+                    location /def { }
+                    location /merge { add_header_inherit merge; add_header X-L merge; }
+                    location /off { add_header_inherit off; add_trailer_inherit off; }
+                    location /nest {
+                        add_header_inherit merge;
+                        location /nest/in { add_header X-N in; }
+                        location /nest/on { add_header_inherit on; add_header X-N on; }
+                        add_header X-L nest;
+                        if ($arg_a) { add_header X-I a; }
+                    }
+                }
+                server {
+                    listen 81;
+                    add_header_inherit merge;
+                    add_trailer_inherit merge;
+                    add_header X-S two;
+                    add_trailer X-T two;
+                    location / { add_header X-L one; }
+                }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let names = |list: &Option<Vec<AddHeader>>| -> Vec<String> {
+            list.iter().flatten().map(|h| h.name.clone()).collect()
+        };
+        let one = &cfg.servers[0];
+        let loc = |pattern: &str| {
+            one.locations
+                .iter()
+                .find(|l| l.pattern == pattern)
+                .unwrap_or_else(|| panic!("{pattern}"))
+        };
+        assert_eq!(names(&one.add_headers), ["X-S"]);
+        assert_eq!(names(&one.add_trailers), ["X-T"]);
+        // Nothing of its own: the server's, as `prepare` takes it.
+        assert!(loc("/def").add_headers.is_none());
+        assert_eq!(names(&loc("/merge").add_headers), ["X-L", "X-S"]);
+        assert_eq!(loc("/off").add_headers, Some(Vec::new()));
+        assert_eq!(loc("/off").add_trailers, Some(Vec::new()));
+        assert_eq!(names(&loc("/nest").add_headers), ["X-L", "X-S"]);
+        assert_eq!(names(&loc("/nest/in").add_headers), ["X-N", "X-L", "X-S"]);
+        assert_eq!(names(&loc("/nest/on").add_headers), ["X-N"]);
+        let RewriteOp::If {
+            location: Some(IfLocation::Parsed {
+                location: inside, ..
+            }),
+            ..
+        } = &loc("/nest").rewrite_ops[0]
+        else {
+            panic!("{:?}", loc("/nest").rewrite_ops)
+        };
+        assert_eq!(names(&inside.add_headers), ["X-I", "X-L", "X-S"]);
+        let two = &cfg.servers[1];
+        assert_eq!(names(&two.add_headers), ["X-S", "X-H"]);
+        assert_eq!(names(&two.add_trailers), ["X-T", "X-T"]);
+        assert_eq!(names(&two.locations[0].add_headers), ["X-L", "X-S", "X-H"]);
+        assert!(parse("http { add_header_inherit maybe; }").is_err());
+        assert!(
+            parse("http { server { listen 80; add_header_inherit on; add_header_inherit off; } }")
+                .is_err()
         );
     }
 

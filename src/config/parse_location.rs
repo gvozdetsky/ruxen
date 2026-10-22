@@ -286,6 +286,34 @@ pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<()
         })
 }
 
+/// `parent`'s place in a descendant's `header_ancestors`: its own chain,
+/// then its own lists (#598).
+fn header_chain(parent: &Location) -> Vec<HeaderLevel> {
+    let mut chain = parent.header_ancestors.clone();
+    chain.push(HeaderLevel {
+        headers: parent.add_headers.clone(),
+        trailers: parent.add_trailers.clone(),
+        headers_inherit: parent.add_header_inherit,
+        trailers_inherit: parent.add_trailer_inherit,
+    });
+    chain
+}
+
+/// The `if` locations of a location an enclosing one closes over take its
+/// levels in front of theirs too, as the location itself does (#598).
+fn prepend_header_chain_in_ifs(ops: &mut [RewriteOp], chain: &[HeaderLevel]) {
+    for op in ops {
+        if let RewriteOp::If { body, location, .. } = op {
+            if let Some(IfLocation::Parsed { location, .. }) = location {
+                let mut levels = chain.to_vec();
+                levels.append(&mut location.header_ancestors);
+                location.header_ancestors = levels;
+            }
+            prepend_header_chain_in_ifs(body, chain);
+        }
+    }
+}
+
 /// What a nested location takes from its parent where it sets nothing
 /// itself (#106), as nginx's `merge_loc_conf` of each module: a list
 /// directive (`add_header`, `error_page`, `proxy_set_header`, …) comes as a
@@ -300,8 +328,13 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     or(&mut child.index, &parent.index);
     child.redirect = child.redirect.inherit(&parent.redirect);
     child.mime.inherit(&parent.mime);
-    or(&mut child.add_headers, &parent.add_headers);
-    or(&mut child.add_trailers, &parent.add_trailers);
+    // add_header / add_trailer: the parent's own lists and modes go in
+    // front of the chain the server's are merged over (#598,
+    // `merge_add_headers`). In front: a nested location's own children
+    // closed first, and joined the chain then.
+    let mut chain = header_chain(parent);
+    chain.append(&mut child.header_ancestors);
+    child.header_ancestors = chain;
     or(&mut child.error_pages, &parent.error_pages);
     or(&mut child.keepalive_timeout, &parent.keepalive_timeout);
     or(&mut child.keepalive_requests, &parent.keepalive_requests);
@@ -533,6 +566,8 @@ pub(crate) fn parse_location_block(
     let mut try_files: Option<TryFiles> = None;
     let mut add_headers: Option<Vec<AddHeader>> = None;
     let mut add_trailers: Option<Vec<AddHeader>> = None;
+    let mut add_header_inherit: Option<HeaderInherit> = None;
+    let mut add_trailer_inherit: Option<HeaderInherit> = None;
     let mut error_pages: Option<Vec<ErrorPage>> = None;
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
@@ -586,9 +621,20 @@ pub(crate) fn parse_location_block(
                 "set" | "rewrite" | "break" | "return" | "if" => {}
                 // What nginx allows in an `if` in a location
                 // (`NGX_HTTP_LIF_CONF`) and ruxen implements.
-                "proxy_pass" | "root" | "add_header" | "add_trailer" | "error_page"
-                | "access_log" | "expires" | "gzip" | "limit_rate" | "limit_rate_after"
-                | "post_action" | "sendfile" => info.settings = true,
+                "proxy_pass"
+                | "root"
+                | "add_header"
+                | "add_trailer"
+                | "add_header_inherit"
+                | "add_trailer_inherit"
+                | "error_page"
+                | "access_log"
+                | "expires"
+                | "gzip"
+                | "limit_rate"
+                | "limit_rate_after"
+                | "post_action"
+                | "sendfile" => info.settings = true,
                 // Accepted and ignored anywhere, as they were in `if`.
                 n if term == Terminator::Semi && is_ignored_stmt(n) => {
                     check_ignored_args(lx, &args)?;
@@ -679,6 +725,9 @@ pub(crate) fn parse_location_block(
                         try_files,
                         add_headers,
                         add_trailers,
+                        add_header_inherit,
+                        add_trailer_inherit,
+                        header_ancestors: Vec::new(),
                         error_pages,
                         keepalive_timeout,
                         keepalive_requests,
@@ -736,6 +785,10 @@ pub(crate) fn parse_location_block(
                     // children already hold their own descendants' merge.
                     for child in &mut children {
                         inherit_from_parent(child, &location);
+                        prepend_header_chain_in_ifs(
+                            &mut child.rewrite_ops,
+                            &header_chain(&location),
+                        );
                     }
                     sink.push(location);
                     sink.extend(children);
@@ -785,6 +838,12 @@ pub(crate) fn parse_location_block(
             ("add_trailer", Terminator::Semi) => {
                 let entry = parse_add_header_args(&args[1..])?;
                 add_trailers.get_or_insert_with(Vec::new).push(entry);
+            }
+            ("add_header_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_header_inherit, &args)?;
+            }
+            ("add_trailer_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_trailer_inherit, &args)?;
             }
             ("error_page", Terminator::Semi) => {
                 let entries = parse_error_page_args(&args[1..])?;
@@ -1168,6 +1227,8 @@ pub(crate) fn parse_location_block(
                 | "index"
                 | "try_files"
                 | "add_header"
+                | "add_header_inherit"
+                | "add_trailer_inherit"
                 | "error_page"
                 | "keepalive_timeout"
                 | "keepalive_requests"
@@ -1481,6 +1542,40 @@ pub(crate) fn parse_index_entries(args: &[String]) -> Result<Vec<IndexEntry>, Er
         out.push(IndexEntry { parts });
     }
     Ok(out)
+}
+
+/// `add_header_inherit` / `add_trailer_inherit` (nginx 1.29.3, #598):
+/// `on`, `off` or `merge`, once per level, as nginx's enum slot.
+pub(crate) fn parse_header_inherit(
+    slot: &mut Option<HeaderInherit>,
+    args: &[String],
+) -> Result<(), Error> {
+    let what = if args[0] == "add_header_inherit" {
+        "add_header_inherit"
+    } else {
+        "add_trailer_inherit"
+    };
+    if slot.is_some() {
+        return Err(Error::Duplicate(what));
+    }
+    let [_, value] = args else {
+        return Err(Error::BadValue {
+            what,
+            got: args[1..].join(" "),
+        });
+    };
+    *slot = Some(match value.as_str() {
+        "on" => HeaderInherit::On,
+        "off" => HeaderInherit::Off,
+        "merge" => HeaderInherit::Merge,
+        _ => {
+            return Err(Error::BadValue {
+                what,
+                got: value.clone(),
+            });
+        }
+    });
+    Ok(())
 }
 
 /// Parse the arguments after the `add_header` keyword. Accepts:
