@@ -3076,6 +3076,38 @@ pub(crate) fn concat_literals(parts: &[ValuePart]) -> String {
     out
 }
 
+/// A top-level `return` is a rewrite directive in nginx: a `break` (the
+/// directive, or `rewrite … break`) stops the location's rewrite program
+/// before it, and the static module answers (#697). ruxen makes such a
+/// `return` the location's handler; where the program can break, the
+/// `return` goes to its end instead and the location serves files from
+/// its root, as nginx's location would.
+fn return_after_break(
+    handler: Handler,
+    mut ops: Vec<RewriteOp>,
+    root: &(std::path::PathBuf, PathMapping),
+) -> (Handler, Vec<RewriteOp>) {
+    fn breaks(ops: &[RewriteOp]) -> bool {
+        ops.iter().any(|op| match op {
+            RewriteOp::Break => true,
+            RewriteOp::Rewrite(rule) => rule.flag == crate::config::RewriteFlag::Break,
+            RewriteOp::If { body, .. } => breaks(body),
+            _ => false,
+        })
+    }
+    match handler {
+        Handler::Return { status, body } if breaks(&ops) => {
+            ops.push(RewriteOp::Return { status, body });
+            let handler = Handler::Root {
+                path: root.0.clone(),
+                mapping: root.1,
+            };
+            (handler, ops)
+        }
+        handler => (handler, ops),
+    }
+}
+
 pub(crate) fn prepare_return(
     status: u16,
     body: Vec<ValuePart>,
@@ -3620,6 +3652,7 @@ pub(crate) fn build_prefix_or_exact(
         server.keepalive,
     );
     let tokens = location_server_tokens.unwrap_or(server.tokens);
+    let (handler, rewrite_ops) = return_after_break(handler, rewrite_ops, &document_root);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens, prepare_types(&mime));
     let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
@@ -3848,6 +3881,7 @@ pub(crate) fn build_regex_location(
         server.keepalive,
     );
     let tokens = location_server_tokens.unwrap_or(server.tokens);
+    let (handler, rewrite_ops) = return_after_break(handler, rewrite_ops, &document_root);
     let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens, prepare_types(&mime));
     let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
