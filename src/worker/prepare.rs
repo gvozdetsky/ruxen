@@ -2279,6 +2279,7 @@ pub(crate) fn prepare_server(
         false,
         None,
         server_disable_symlinks.clone(),
+        prepare_charset(&server.charset),
     );
     let server_default = if !have_root_catchall {
         let root_path = server.root.clone().unwrap_or_else(|| "html".into());
@@ -2330,7 +2331,6 @@ pub(crate) fn prepare_server(
             client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
             gzip: prepare_gzip(server_gzip.clone())?,
-            charset: prepare_charset(&server.charset),
             limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             body_temp: server_body_temp,
@@ -3186,6 +3186,7 @@ pub(crate) fn leak_doc_root(
     is_regex_location: bool,
     alias_prefix_override: Option<&'static [u8]>,
     disable_symlinks: Option<crate::config::DisableSymlinks>,
+    charset: Option<&'static PreparedCharset>,
 ) -> &'static DocRoot {
     // nginx resolves a relative root under the prefix (ruxen's working
     // directory by now) and prints it absolute.
@@ -3204,6 +3205,7 @@ pub(crate) fn leak_doc_root(
             alias_prefix_override,
         ),
         symlinks: PreparedSymlinks::new(disable_symlinks),
+        charset,
     }))
 }
 
@@ -3704,6 +3706,7 @@ pub(crate) fn build_prefix_or_exact(
         is_regex,
         alias_prefix_override,
         site.disable_symlinks.clone(),
+        charset,
     );
     let handler = build_handler(handler, index, try_files, proxy_effective, &site)?;
     let auto_redirect = matches!(&handler, PreparedHandler::Proxy(_)) && pattern.ends_with(b"/");
@@ -3771,7 +3774,6 @@ pub(crate) fn build_prefix_or_exact(
         client_body_buffer_size,
         sendfile,
         gzip,
-        charset,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
@@ -3933,6 +3935,7 @@ pub(crate) fn build_regex_location(
         true,
         alias_prefix_override,
         site.disable_symlinks.clone(),
+        charset,
     );
     let handler = build_handler(handler, index, try_files, proxy_effective, &site)?;
     let add_headers = resolve_add_headers(location_add_headers, server.add_headers);
@@ -3998,7 +4001,6 @@ pub(crate) fn build_regex_location(
         client_body_buffer_size,
         sendfile,
         gzip,
-        charset,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
             .unwrap_or(crate::config::ClientBodyInFileOnly::Off),
