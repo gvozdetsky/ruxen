@@ -362,24 +362,34 @@ unsafe impl monoio::buf::IoVecBuf for RequestParts {
     }
 }
 
-/// Write the header block and the body with writev until both are sent.
+/// Write the header block and the body with writev until both are sent,
+/// each write within `send_timeout`: nginx sets its write timer again
+/// whenever a send makes progress (ngx_http_upstream_send_request), so
+/// `proxy_send_timeout` is the time between two writes, not for the whole
+/// request (#490). `None`: a write waited longer.
 async fn write_request_parts(
     stream: &mut UpstreamIo,
     head: bytes::Bytes,
     body: bytes::Bytes,
-) -> std::io::Result<()> {
+    send_timeout: Duration,
+) -> Option<std::io::Result<()>> {
     let mut parts = RequestParts::new(head, body);
     while parts.len() > 0 {
-        let (res, returned) = monoio::io::AsyncWriteRent::writev(stream, parts).await;
+        let (res, returned) = timeout(
+            send_timeout,
+            monoio::io::AsyncWriteRent::writev(stream, parts),
+        )
+        .await
+        .ok()?;
         parts = returned;
         match res {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(0) => return Some(Err(std::io::ErrorKind::WriteZero.into())),
             Ok(n) => parts.advance(n),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(e) => return Some(Err(e)),
         }
     }
-    Ok(())
+    Some(Ok(()))
 }
 
 /// The temp file holding a large request body (an open descriptor: the
@@ -1760,22 +1770,45 @@ async fn attempt(
 
     // 2. Send the request. Cloning here keeps the original bytes available
     // for `proxy_next_upstream` retries when this attempt fails — monoio's
-    // write_all consumes the buffer, and on `timeout()` cancellation the
+    // writes consume the buffer, and on `timeout()` cancellation the
     // future drops the buffer with the kernel-completion still pending, so
     // the original on `plan.request` is the only way to recover. With
     // `Bytes` the clone is just an Arc bump; the underlying request bytes
-    // are never copied per attempt.
+    // are never copied per attempt. `proxy_send_timeout` bounds each write
+    // (#490): a request without a body usually goes in one, and the rest
+    // of a head the socket didn't take goes as a body does.
     let res = if plan.body.is_empty() {
-        timeout(plan.send_timeout, stream.write_all(plan.request.clone()))
-            .await
-            .map(|(res, _)| res.map(drop))
+        let len = plan.request.len();
+        match timeout(
+            plan.send_timeout,
+            monoio::io::AsyncWriteRent::write(&mut stream, plan.request.clone()),
+        )
+        .await
+        {
+            Ok((Ok(n), _)) if n == len => Some(Ok(())),
+            Ok((Ok(0), _)) => Some(Err(std::io::ErrorKind::WriteZero.into())),
+            Ok((Err(e), _)) if e.kind() != std::io::ErrorKind::Interrupted => Some(Err(e)),
+            Ok((res, _)) => {
+                let sent = res.unwrap_or(0);
+                let rest = plan.request.slice(sent..);
+                let parts =
+                    write_request_parts(&mut stream, rest, bytes::Bytes::new(), plan.send_timeout);
+                Box::pin(parts).await
+            }
+            Err(_) => None,
+        }
     } else {
-        let parts = write_request_parts(&mut stream, plan.request.clone(), plan.body.clone());
-        timeout(plan.send_timeout, Box::pin(parts)).await
+        let parts = write_request_parts(
+            &mut stream,
+            plan.request.clone(),
+            plan.body.clone(),
+            plan.send_timeout,
+        );
+        Box::pin(parts).await
     };
     let res = match res {
-        Ok(res) => res,
-        Err(_) => {
+        Some(res) => res,
+        None => {
             return AttemptOutcome::Failed(
                 Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
                 FailKind::Timeout,
