@@ -514,6 +514,173 @@ pub fn parse_request(buf: &[u8], st: &mut ParseState) -> Parse {
     }
 }
 
+/// Why `parse_request` refused a request, for nginx's `[info]` line
+/// (#663): its message, the request line nginx shows (up to the first CR
+/// or LF), and the `Host` read before the failure. Found again from the
+/// bytes, off the hot path: `Parse::Invalid` carries nothing.
+pub struct Refusal<'a> {
+    pub message: String,
+    pub request_line: &'a [u8],
+    pub host: Option<&'a [u8]>,
+}
+
+#[cold]
+#[inline(never)]
+pub fn refusal_reason(buf: &[u8], h2: bool) -> Refusal<'_> {
+    let line_end = buf
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(buf.len());
+    let request_line = &buf[..line_end];
+    let refusal = |message: String, host| Refusal {
+        message,
+        request_line,
+        host,
+    };
+    let LineParse::Ok { next, .. } = parse_request_line(buf, 0, h2) else {
+        // ngx_http_client_errors: a method outside nginx's rule (`A`-`Z`,
+        // `_`, `-`), else the rest of the line.
+        let method = request_line
+            .split(|&b| b == b' ')
+            .next()
+            .unwrap_or_default();
+        let valid = |b: &u8| b.is_ascii_uppercase() || *b == b'_' || *b == b'-';
+        let what = if !method.is_empty() && method.iter().all(valid) {
+            "request"
+        } else {
+            "method"
+        };
+        return refusal(
+            format!("client sent invalid {what} while reading client request line"),
+            None,
+        );
+    };
+    const HEADERS: &str = " while reading client request headers";
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    // nginx's `"Name: value"`: the name as sent, the value trimmed.
+    let field = |start: usize, colon: usize, value: (usize, usize)| {
+        format!(
+            "{}: {}",
+            text(&buf[start..colon]),
+            text(&buf[value.0..value.1])
+        )
+    };
+    // The first line of each unique header: start, colon, value.
+    let mut seen: Vec<(KnownHeader, usize, usize, (usize, usize))> = Vec::new();
+    let mut host = None;
+    let mut i = next;
+    while i < buf.len() && buf[i] != b'\n' && buf[i..].first_chunk() != Some(b"\r\n") {
+        match parse_header_line(buf, i) {
+            HeaderParse::Ok {
+                next,
+                known,
+                val_start,
+                val_end,
+            } => {
+                let colon = i + buf[i..].iter().position(|&b| b == b':').unwrap_or(0);
+                let value = (val_start, val_end);
+                if known == Some(KnownHeader::ContentLength)
+                    && content_length(&buf[val_start..val_end]).is_none()
+                {
+                    return refusal(
+                        format!("client sent invalid \"Content-Length\" header{HEADERS}"),
+                        host,
+                    );
+                }
+                let unique =
+                    known.filter(|k| !matches!(k, KnownHeader::Connection | KnownHeader::Range));
+                if let Some(kind) = unique {
+                    if let Some(&(_, start, colon_was, value_was)) =
+                        seen.iter().find(|(k, ..)| *k == kind)
+                    {
+                        let what = if kind == KnownHeader::Host {
+                            "duplicate host header"
+                        } else {
+                            "duplicate header line"
+                        };
+                        return refusal(
+                            format!(
+                                "client sent {what}: \"{}\", previous value: \"{}\"{HEADERS}",
+                                field(i, colon, value),
+                                field(start, colon_was, value_was),
+                            ),
+                            host,
+                        );
+                    }
+                    seen.push((kind, i, colon, value));
+                    if kind == KnownHeader::Host {
+                        host = Some(&buf[val_start..val_end]);
+                    }
+                }
+                i = next;
+            }
+            HeaderParse::Incomplete => break,
+            HeaderParse::Invalid => {
+                // nginx shows the line up to the byte it refused, then that
+                // byte: `"Bad\x01..."`.
+                let line = &buf[i..];
+                let bad = invalid_header_byte(line);
+                return refusal(
+                    format!(
+                        "client sent invalid header line: \"{}\\x{:02x}...\"{HEADERS}",
+                        text(&line[..bad]),
+                        line.get(bad).copied().unwrap_or(0)
+                    ),
+                    host,
+                );
+            }
+        }
+    }
+    // A CR not followed by LF where the header block should end.
+    match buf.get(i..i + 2) {
+        Some(&[b'\r', after]) if after != b'\n' => refusal(
+            format!("client sent invalid header line: \"\\x{after:02x}...\"{HEADERS}"),
+            host,
+        ),
+        _ => refusal(format!("client sent invalid request{HEADERS}"), host),
+    }
+}
+
+/// A `Content-Length` value as the parser takes it: digits only, within
+/// u64.
+fn content_length(v: &[u8]) -> Option<u64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.iter().try_fold(0u64, |n, &b| {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n.checked_mul(10)?.checked_add((b - b'0') as u64)
+    })
+}
+
+/// Where `parse_header_line` refused `line`: a byte a name can't hold (a
+/// CR or LF before any `:`, or an empty name: that byte), a NUL in the
+/// value, or what follows a CR that isn't LF.
+fn invalid_header_byte(line: &[u8]) -> usize {
+    let last = line.len().saturating_sub(1);
+    let mut i = 0;
+    while i < line.len() && line[i] != b':' {
+        if line[i] <= 0x20 || line[i] == 0x7f {
+            return i;
+        }
+        i += 1;
+    }
+    if i == 0 || i >= line.len() {
+        return i.min(last);
+    }
+    for (at, &b) in line.iter().enumerate().skip(i + 1) {
+        match b {
+            0 => return at,
+            b'\r' if line.get(at + 1) != Some(&b'\n') => return (at + 1).min(last),
+            b'\n' => break,
+            _ => {}
+        }
+    }
+    last
+}
+
 /// Which known header a just-parsed name matched, for dispatch. Unknown
 /// headers get no classification and are silently ignored.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1950,6 +2117,74 @@ mod tests {
     }
 
     use super::*;
+
+    /// The reason nginx logs for each refusal (#663), found again from the
+    /// bytes the parser refused.
+    #[test]
+    fn refusal_reasons_are_nginx_s() {
+        const LINE: &str = " while reading client request line";
+        const HEADERS: &str = " while reading client request headers";
+        type Case = (&'static [u8], String, Option<&'static [u8]>);
+        let cases: &[Case] = &[
+            (
+                b"G3T / HTTP/1.1\r\nHost: x\r\n\r\n",
+                format!("client sent invalid method{LINE}"),
+                None,
+            ),
+            (
+                b"GET /\x01 HTTP/1.1\r\n\r\n",
+                format!("client sent invalid request{LINE}"),
+                None,
+            ),
+            (
+                b"GET / HTTP/x.1\r\n\r\n",
+                format!("client sent invalid request{LINE}"),
+                None,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: x\r\nBad\x01Header: v\r\n\r\n",
+                format!("client sent invalid header line: \"Bad\\x01...\"{HEADERS}"),
+                Some(b"x"),
+            ),
+            (
+                b"GET / HTTP/1.1\r\nX: a\x00b\r\n\r\n",
+                format!("client sent invalid header line: \"X: a\\x00...\"{HEADERS}"),
+                None,
+            ),
+            (
+                b"GET / HTTP/1.1\r\n: v\r\n\r\n",
+                format!("client sent invalid header line: \"\\x3a...\"{HEADERS}"),
+                None,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1x\r\n\r\n",
+                format!("client sent invalid \"Content-Length\" header{HEADERS}"),
+                Some(b"x"),
+            ),
+            (
+                b"GET / HTTP/1.1\r\nIf-Match: a\r\nif-match:  b \r\n\r\n",
+                format!(
+                    "client sent duplicate header line: \"if-match: b\", previous value: \"If-Match: a\"{HEADERS}"
+                ),
+                None,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
+                format!(
+                    "client sent duplicate host header: \"Host: y\", previous value: \"Host: x\"{HEADERS}"
+                ),
+                Some(b"x"),
+            ),
+        ];
+        for (raw, message, host) in cases {
+            assert!(matches!(parse_fresh(raw), Parse::Invalid), "{raw:?}");
+            let refusal = refusal_reason(raw, false);
+            assert_eq!(&refusal.message, message, "{raw:?}");
+            assert_eq!(refusal.host, *host, "{raw:?}");
+            let line_end = raw.iter().position(|&b| b == b'\r').unwrap();
+            assert_eq!(refusal.request_line, &raw[..line_end]);
+        }
+    }
 
     fn parse_fresh(buf: &[u8]) -> Parse {
         let mut st = ParseState::default();

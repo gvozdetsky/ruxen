@@ -637,6 +637,19 @@ pub fn process_with_meta_from_reroute(
     out
 }
 
+/// nginx's `[info]` line for an HTTP/1.1 request without `Host` (#663).
+#[cold]
+#[inline(never)]
+fn missing_host_log(server: &PreparedServer, req: &RequestCtx<'_>) {
+    crate::worker::write_error_log(
+        server.error_logs,
+        crate::config::ErrorLogLevel::Info,
+        &crate::worker::ErrorLogRequest::new(req, server.primary_server_name),
+        b"client sent HTTP/1.1 request without \"Host\" header while reading client request headers",
+        None,
+    );
+}
+
 /// A file lookup that failed while processing (`open() "…" failed`) is
 /// logged now, with this request's context, as nginx logs it where the
 /// open fails. The note is per worker thread, so it has to be taken
@@ -687,6 +700,10 @@ fn process_with_meta_inner(
     // — empty Host is treated as "default server".
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
         let server = &listen.servers[listen.default_server];
+        // Not past an invalid one, logged already.
+        if req.refuse.is_none() {
+            missing_host_log(server, req);
+        }
         let response = Response::Prebuilt(http.bad_request.pick(req.method));
         return refuse(http, req, url_scratch, server, response, true, false, None);
     }

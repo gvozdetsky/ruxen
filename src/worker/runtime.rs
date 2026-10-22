@@ -707,6 +707,67 @@ async fn many_header_lines<S: ConnIo>(
     reject_request(stream, scratch, http, response, head, conn).await;
 }
 
+/// nginx's `[info]` line for a request refused while its head is read
+/// (#663): `client sent invalid method while reading client request
+/// line`, `client sent invalid header line: "…"`, …, with the default
+/// server's error log, as nginx logs them before a server is chosen.
+#[cold]
+#[inline(never)]
+fn refused_head_log(
+    http: &'static PreparedHttp,
+    conn: &ConnLogCtx<'_>,
+    request_line: &[u8],
+    host: Option<&[u8]>,
+    message: &str,
+) {
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
+    write_error_log(
+        server.error_logs,
+        ErrorLogLevel::Info,
+        &ErrorLogRequest {
+            connection_id: conn.connection_id,
+            client: conn.remote_addr,
+            server: server.primary_server_name,
+            request_line,
+            host,
+        },
+        message.as_bytes(),
+        None,
+    );
+}
+
+/// Why the parser refused `head` (`http::refusal_reason`), logged.
+#[cold]
+#[inline(never)]
+fn invalid_head_log(http: &'static PreparedHttp, conn: &ConnLogCtx<'_>, head: &[u8], h2: bool) {
+    let refusal = http::refusal_reason(head, h2);
+    refused_head_log(
+        http,
+        conn,
+        refusal.request_line,
+        refusal.host,
+        &refusal.message,
+    );
+}
+
+/// A parsed head refused for its `Host` or `Transfer-Encoding`, logged.
+#[cold]
+#[inline(never)]
+fn refused_parsed_head_log(
+    http: &'static PreparedHttp,
+    conn: &ConnLogCtx<'_>,
+    head: &[u8],
+    message: &str,
+) {
+    let request_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    let host = lookup_request_header(&head[request_end..], b"host");
+    refused_head_log(http, conn, &head[..request_end], host, message);
+}
+
 /// A request head over `large_client_header_buffers` (#482), answered and
 /// logged as nginx does (`src/http/ngx_http_request.c:1189`, `:1370`): a
 /// request line that doesn't fit gets 414 and `client sent too long URI`;
@@ -4017,6 +4078,27 @@ pub(crate) async fn handle<S: ConnIo>(
                                     RequestTransferEncoding::Invalid => Some(400),
                                 }
                             };
+                            if refuse.is_some() {
+                                let message = if !req.http_11 {
+                                    "client sent HTTP/1.0 request with \"Transfer-Encoding\" header"
+                                        .to_string()
+                                } else if req.content_length.is_some() {
+                                    "client sent \"Content-Length\" and \"Transfer-Encoding\" \
+                                     headers at the same time"
+                                        .to_string()
+                                } else {
+                                    format!(
+                                        "client sent unknown \"Transfer-Encoding\": \"{}\"",
+                                        String::from_utf8_lossy(te)
+                                    )
+                                };
+                                refused_parsed_head_log(
+                                    http,
+                                    conn_log!(),
+                                    &buf[base..base + req.headers_end],
+                                    &format!("{message} while reading client request headers"),
+                                );
+                            }
                         }
                         let mut bad_host = false;
                         let request_line_host =
@@ -4032,6 +4114,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
+                                    refused_parsed_head_log(
+                                        http,
+                                        conn_log!(),
+                                        &buf[base..base + req.headers_end],
+                                        "client sent invalid host in request line while reading client request line",
+                                    );
                                     None
                                 }
                             },
@@ -4047,6 +4135,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
+                                    refused_parsed_head_log(
+                                        http,
+                                        conn_log!(),
+                                        &buf[base..base + req.headers_end],
+                                        "client sent invalid host header while reading client request headers",
+                                    );
                                     None
                                 }
                             },
@@ -5203,6 +5297,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     Parse::Incomplete => break,
                     Parse::Invalid => {
                         request_count = request_count.saturating_add(1);
+                        invalid_head_log(http, conn_log!(), &buf[read_start..filled], stream.h2());
                         // Honor HEAD if the request line parsed before the
                         // header block went sideways; otherwise default to
                         // full — we don't know the method and a body on a

@@ -150,7 +150,10 @@ fn https_upstreams_like_nginx() {
     // A plain HTTP server where TLS is expected: 502, and nginx's line.
     let (status, _) = get(front, "/handshake/");
     assert_eq!(status, 502);
-    let log = std::fs::read_to_string(s.dir.join("error.log")).unwrap_or_default();
+    // Lossy: the plain server logs the ClientHello it refused as its
+    // request line, binary as nginx writes it (#663).
+    let log = String::from_utf8_lossy(&std::fs::read(s.dir.join("error.log")).unwrap_or_default())
+        .into_owned();
     assert!(
         log.contains("SSL_do_handshake() failed")
             && log.contains("while SSL handshaking to upstream")
