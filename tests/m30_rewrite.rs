@@ -341,3 +341,31 @@ http {
         Some(format!("http://localhost:{port}/a%20dir/?x=1").as_str())
     );
 }
+
+/// A top-level `return` is a rewrite directive in nginx: after `break`
+/// (the directive or the flag, in an `if` too) the static module answers
+/// instead (#697); without a break the `return` answers as before.
+#[test]
+fn a_break_stops_before_the_return() {
+    let (g, port) = spawn_server(
+        "events {}\nhttp {\n\
+         server { listen 127.0.0.1:%%PORT%%; root %%DIR%%;\n\
+           location /k { rewrite ^ /k.txt break; return 200 ret; }\n\
+           location /j { set $a 1; break; return 200 ret; }\n\
+           location /i { if ($arg_b) { break; } return 200 ret; }\n\
+         } }\n",
+    );
+    std::fs::write(g.tempdir.join("k.txt"), "file").unwrap();
+    for (path, status, wanted) in [
+        ("/k", "HTTP/1.1 200 OK", Some(&b"file"[..])),
+        ("/j", "HTTP/1.1 404 Not Found", None),
+        ("/i?b=1", "HTTP/1.1 404 Not Found", None),
+        ("/i", "HTTP/1.1 200 OK", Some(b"ret")),
+    ] {
+        let resp = http_get(port, path);
+        assert_eq!(status_line(&resp), status, "{path}");
+        if let Some(wanted) = wanted {
+            assert_eq!(body(&resp), wanted, "{path}");
+        }
+    }
+}
