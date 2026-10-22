@@ -510,7 +510,12 @@ pub(crate) fn execute_rewrite_ops(
                 // again (#682).
                 rewrite_state.unparsed_uri = false;
                 match flag {
-                    PreparedRewriteFlag::Last => return RewriteControl::Reroute,
+                    // The location is searched again: find_config clears
+                    // `uri_changed` (#682).
+                    PreparedRewriteFlag::Last => {
+                        rewrite_state.uri_changed = false;
+                        return RewriteControl::Reroute;
+                    }
                     PreparedRewriteFlag::Break => {
                         rewrite_state.valid_location = false;
                         rewrite_state.uri_changed = false;
