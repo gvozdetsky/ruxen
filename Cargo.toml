@@ -34,6 +34,9 @@ bytes = "1"
 libc = "0.2"
 monoio = "0.2.4"
 regex = "1"
+# Line scans of a request's head (the proxied body framing); already in
+# the tree through regex.
+memchr = "2"
 # gzip filter (#93): pure Rust, no C dependency, like rustls. Used directly
 # (not through flate2) to size memLevel with the window, as nginx does.
 zlib-rs = { version = "0.6", default-features = false, features = ["std", "rust-allocator"] }
