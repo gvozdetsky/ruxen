@@ -415,7 +415,7 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
-- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
+- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
 - a proxied response is still read whole before it is sent in a few cases: a cache store, `add_trailer`, failover and interception (#463)

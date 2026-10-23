@@ -1145,6 +1145,19 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "ssi_silent_errors",
     "ssi_types",
     "override_charset",
+    // HTTP/3 (nginx ≥ 1.25): ruxen has none, and its `listen … quic` is
+    // ignored with a warning already, so these settings have nothing to
+    // apply to. Accepted so a config written for nginx with HTTP/3 starts
+    // and serves HTTP/1.1 and HTTP/2 on its TCP listeners.
+    "http3",
+    "http3_hq",
+    "http3_max_concurrent_streams",
+    "http3_stream_buffer_size",
+    "quic_active_connection_id_limit",
+    "quic_bpf",
+    "quic_gso",
+    "quic_host_key",
+    "quic_retry",
 ];
 
 /// Block directives whose body we swallow wholesale (no inner parsing).
@@ -2375,6 +2388,22 @@ mod tests {
                 QUIC_LISTEN_IGNORED.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn http3_directives_are_accepted_without_effect() {
+        // A config written for nginx with HTTP/3 starts; its TCP listen
+        // serves as before, and only the `quic` listen warns.
+        let cfg = parse(
+            "http { quic_retry on; quic_gso on; http3_stream_buffer_size 64k;
+                    server { listen 127.0.0.1:443 ssl; listen 127.0.0.1:443 quic reuseport;
+                             http3 on; http3_hq off; http3_max_concurrent_streams 128;
+                             quic_active_connection_id_limit 2; quic_host_key k.key;
+                             ssl_certificate a.pem; ssl_certificate_key a.key; } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.warnings, [QUIC_LISTEN_IGNORED.to_string()]);
     }
 
     #[test]
