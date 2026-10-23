@@ -6,12 +6,11 @@
 
 mod common;
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::sync::MutexGuard;
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -28,10 +27,8 @@ impl Drop for ServerGuard {
     }
 }
 
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let guard = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = common::ports::setup_lock();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -48,19 +45,6 @@ fn unique_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir(&dir).unwrap();
     dir
-}
-
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
 }
 
 fn write(path: &Path, contents: &str) {
@@ -119,11 +103,16 @@ fn include_and_ssl_paths_resolve_against_config_dir() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-    let _guard = ServerGuard {
+    let mut _guard = ServerGuard {
         child,
         dirs: vec![conf_dir.clone(), prefix.clone()],
     };
-    wait_for_listen(port);
+    // The configuration sets `pid <conf_dir>/ruxen.pid`.
+    common::ports::wait_for_pid_file(
+        &mut _guard.child,
+        &conf_dir.join("ruxen.pid"),
+        Duration::from_secs(5),
+    );
     drop(_lock);
 
     let out = Command::new("curl")

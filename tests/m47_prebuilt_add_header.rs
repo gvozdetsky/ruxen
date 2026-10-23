@@ -3,13 +3,14 @@
 //! keep getting the same headers; variable values must still render per
 //! request; an `error_page` status override must not reuse the prebuilt.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::sync::MutexGuard;
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -24,10 +25,8 @@ impl Drop for ServerGuard {
     }
 }
 
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let guard = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = common::ports::setup_lock();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -86,12 +85,12 @@ http {{
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
-    (ServerGuard { child, dir }, port)
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard { child, dir };
+    // The configuration sets `pid <dir>/ruxen.pid`.
+    let pid_file = guard.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 /// Send one request on `stream` and read back exactly one response
