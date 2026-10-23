@@ -765,9 +765,11 @@ pub(crate) fn normalize_request_uri_into(
     merge_slashes: bool,
     out: &mut Vec<u8>,
 ) -> Result<(), Response> {
+    // A client URI that climbs above the root is an invalid request, as
+    // in ngx_http_parse_complex_uri (400 and the connection closes), not
+    // a forbidden one.
     match uri::normalize_with(req.path, merge_slashes, out) {
         Ok(_) => Ok(()),
-        Err(uri::UriError::EscapesRoot) => Err(Response::Prebuilt(http.forbidden.pick(req.method))),
         Err(_) => Err(Response::Prebuilt(http.bad_request.pick(req.method))),
     }
 }

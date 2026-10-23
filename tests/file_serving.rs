@@ -282,7 +282,9 @@ fn m3_end_to_end() {
     );
     assert_eq!(status_line(&r), "HTTP/1.1 404 Not Found");
 
-    // 5. Traversal attempts all blocked (403 from URI normalizer)
+    // 5. Traversal attempts all refused: a URI above the root is an
+    // invalid request (400, as ngx_http_parse_complex_uri), and the
+    // connection closes.
     for raw in [
         &b"GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"[..],
         &b"GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"[..],
@@ -290,10 +292,11 @@ fn m3_end_to_end() {
         let r = request(port, raw);
         assert_eq!(
             status_line(&r),
-            "HTTP/1.1 403 Forbidden",
+            "HTTP/1.1 400 Bad Request",
             "request: {:?}",
             std::str::from_utf8(raw).unwrap()
         );
+        assert_eq!(header(&r, "Connection").as_deref(), Some("close"));
     }
 
     // 6. Nested path works
@@ -530,14 +533,14 @@ fn head_worker_404_has_no_body() {
 }
 
 #[test]
-fn head_worker_403_has_no_body() {
+fn head_worker_400_has_no_body() {
     let (_guard, port) = setup_server();
 
     let r = request(
         port,
         b"HEAD /../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden");
+    assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request");
     // nginx's HTML page (#34): its length, no body.
     assert_eq!(header(&r, "Content-Type").as_deref(), Some("text/html"));
     assert!(
@@ -1081,5 +1084,5 @@ fn m6_traversal_via_normalized_uri_still_blocked() {
         port,
         b"GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden");
+    assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request");
 }
