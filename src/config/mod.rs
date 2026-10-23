@@ -2675,6 +2675,10 @@ mod tests {
         parse("http { server { listen 80; proxy_cookie_flags off secure; } }").unwrap();
         assert!(parse("http { server { listen 80; proxy_cookie_flags; } }").is_err());
         assert!(
+            parse("http { server { listen 80; proxy_cookie_flags a secure httponly samesite=lax nosamesite; } }")
+                .is_err()
+        );
+        assert!(
             parse("http { server { listen 80; proxy_cookie_flags off; proxy_cookie_flags a secure; } }")
                 .is_err()
         );

@@ -31,7 +31,8 @@ fn cookies(port: u16, path: &str) -> Vec<String> {
 fn set_cookie_domain_and_path_are_rewritten() {
     let dir = std::env::temp_dir().join(format!("ruxen-m162-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("static")).unwrap();
+    std::fs::write(dir.join("static/f.txt"), "f").unwrap();
     // Held from the port pick until ruxen listens.
     let setup = common::ports::setup_lock();
     let [port, up] = common::ports::free_ports();
@@ -54,8 +55,14 @@ fn set_cookie_domain_and_path_are_rewritten() {
                    proxy_cookie_flags ~^B nosecure nosamesite;\n\
                    proxy_cookie_flags $arg_c httponly; }}\n\
                }}\n\
+               location /xar {{ proxy_pass http://127.0.0.1:{up};\n\
+                 proxy_cookie_domain ~^(?<dd>.+)\\.example\\.com$ $dd.test; }}\n\
+               location /static/ {{ root {d}; \n\
+               }}\n\
              }}\n\
              server {{ listen 127.0.0.1:{up};\n\
+               location /xar {{ add_header X-Accel-Redirect /static/f.txt;\n\
+                 add_header Set-Cookie \"x=1; Domain=sub.example.com\"; return 200; }}\n\
                location / {{\n\
                  add_header Set-Cookie \"a=1; Domain=www.Example.org; Path=/path/x; Secure\";\n\
                  add_header Set-Cookie \"b=2;Domain=.LocalHost.com;path=/CASEless/y;secure;SameSite=Lax\";\n\
@@ -86,6 +93,7 @@ fn set_cookie_domain_and_path_are_rewritten() {
     let rewritten = cookies(port, "/");
     let off = cookies(port, "/off/");
     let flags = cookies(port, "/flags/?c=D");
+    let xar = cookies(port, "/xar");
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -123,4 +131,8 @@ fn set_cookie_domain_and_path_are_rewritten() {
             "flag; Domain=www.example.org",
         ]
     );
+    // X-Accel-Redirect: the Set-Cookie it carries to the target is the
+    // proxied location's to rewrite, as nginx does before it redirects;
+    // `(?<dd>…)` is `$dd` in the replacement.
+    assert_eq!(xar, ["x=1; Domain=sub.test"]);
 }
