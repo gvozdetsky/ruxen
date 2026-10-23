@@ -136,6 +136,32 @@ pub mod fuzzing {
         })
     }
 
+    /// `file::parse_http_date`: an `If-Modified-Since` / `If-Range` date
+    /// in any of the three formats, as seconds since the epoch.
+    pub fn parse_http_date(value: &[u8]) -> Option<u64> {
+        crate::file::parse_http_date(value)
+    }
+
+    /// `file::format_http_date`: the IMF-fixdate of `secs`, saturating at
+    /// the end of year 9999.
+    pub fn format_http_date(secs: u64) -> [u8; 29] {
+        crate::file::format_http_date(secs)
+    }
+
+    /// The end of year 9999, where `format_http_date` saturates.
+    pub const MAX_HTTP_DATE_SECS: u64 = 253_402_300_799;
+
+    /// `auth::decode_basic_authorization` over a request's header lines:
+    /// the user and password, or `Err(true)` without the header,
+    /// `Err(false)` for a malformed one.
+    pub fn basic_authorization(headers_raw: &[u8]) -> Result<(Vec<u8>, Vec<u8>), bool> {
+        match crate::auth::decode_basic_authorization(headers_raw) {
+            Ok(creds) => Ok((creds.username, creds.password)),
+            Err(crate::auth::BasicHeaderError::Missing) => Err(true),
+            Err(crate::auth::BasicHeaderError::Malformed) => Err(false),
+        }
+    }
+
     /// `gzip::accepts_gzip`: whether `Accept-Encoding` takes gzip.
     pub fn accepts_gzip(accept_encoding: &[u8]) -> bool {
         crate::worker::gzip::accepts_gzip(accept_encoding)
