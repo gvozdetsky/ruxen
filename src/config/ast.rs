@@ -1528,6 +1528,10 @@ pub struct Location {
     /// after the `if` blocks, so it answers even when one of them holds
     /// and has a `proxy_pass` of its own (#137).
     pub explicit_return: bool,
+    /// How many locations nested in this one, at any depth, follow it in
+    /// the server's list: the parser flattens them, and `prepare` builds
+    /// the tree nginx's ngx_http_core_find_location walks from it.
+    pub descendants: usize,
 }
 
 impl Location {

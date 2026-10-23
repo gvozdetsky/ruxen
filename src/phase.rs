@@ -2530,6 +2530,11 @@ pub(crate) fn match_location<'a>(
         return Some(loc);
     }
 
+    // Locations nested in others: nginx's search, level by level.
+    if let Some(tree) = &server.location_tree {
+        return match_nested(server, tree, path, rewrite_state);
+    }
+
     let best = server
         .prefix_locations
         .iter()
@@ -2567,6 +2572,94 @@ pub(crate) fn match_location<'a>(
     }
 
     best.map(MatchedLocation::from_prefix)
+}
+
+/// `match_location` for a server with nested locations, as nginx's
+/// ngx_http_core_find_location: on each level, an exact match ends the
+/// search; else the longest prefix, and the locations nested in it are
+/// searched before this level's regex locations (unless the prefix has
+/// `^~`); a regex match ends it, after a search of its own nested ones.
+/// A regex location nested in a prefix one is tried only for URIs that
+/// prefix matches, and before the server's own (#730).
+#[cold]
+#[inline(never)]
+fn match_nested<'a>(
+    server: &'a PreparedServer,
+    tree: &crate::worker::LocationTree,
+    path: &[u8],
+    rewrite_state: &mut RewriteState,
+) -> Option<MatchedLocation<'a>> {
+    // Which regex locations match at all, in one pass (#248).
+    let hits = server
+        .regex_location_set
+        .as_ref()
+        .map(|set| set.matches(path));
+    let hit = |r: usize| hits.as_ref().is_none_or(|h| h.matched(r));
+    #[derive(PartialEq)]
+    enum Found {
+        /// An exact or a regex location: the search is over.
+        Final,
+        /// A prefix location: a regex one further up may still win.
+        Prefix,
+        Nothing,
+    }
+    fn level<'a>(
+        server: &'a PreparedServer,
+        tree: &crate::worker::LocationTree,
+        at: usize,
+        path: &[u8],
+        rewrite_state: &mut RewriteState,
+        hit: &dyn Fn(usize) -> bool,
+    ) -> (Found, Option<MatchedLocation<'a>>) {
+        let lvl = &tree.levels[at];
+        for &e in &lvl.exact {
+            let loc = &server.exact_locations[e as usize];
+            if loc.pattern == path {
+                return (Found::Final, Some(MatchedLocation::from_prefix(loc)));
+            }
+        }
+        let mut found = (Found::Nothing, None);
+        let mut noregex = false;
+        if let Some(&p) = lvl
+            .prefix
+            .iter()
+            .find(|&&p| path.starts_with(server.prefix_locations[p as usize].pattern))
+        {
+            let loc = &server.prefix_locations[p as usize];
+            found = (Found::Prefix, Some(MatchedLocation::from_prefix(loc)));
+            noregex = loc.noregex;
+            if let Some(child) = tree.prefix_children[p as usize] {
+                let (deeper, m) = level(server, tree, child as usize, path, rewrite_state, hit);
+                if m.is_some() {
+                    found.1 = m;
+                }
+                if deeper == Found::Final {
+                    return (Found::Final, found.1);
+                }
+            }
+        }
+        if !noregex {
+            for &r in &lvl.regex {
+                let rloc = &server.regex_locations[r as usize];
+                if !hit(r as usize) {
+                    continue;
+                }
+                if let Some(captures) = rloc.regex.captures(path) {
+                    rewrite_state.set_numbered_from_regex_captures(&captures, path);
+                    let mut m = MatchedLocation::from_regex(rloc);
+                    if let Some(child) = tree.regex_children[r as usize]
+                        && let (_, Some(deeper)) =
+                            level(server, tree, child as usize, path, rewrite_state, hit)
+                    {
+                        m = deeper;
+                    }
+                    return (Found::Final, Some(m));
+                }
+            }
+        }
+        found
+    }
+    level(server, tree, 0, path, rewrite_state, &hit).1
 }
 
 /// What a `Location` that starts with `/` becomes (#15), as nginx's header

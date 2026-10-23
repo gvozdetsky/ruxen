@@ -766,6 +766,7 @@ pub(crate) fn parse_location_block(
                         alias_prefix_override,
                         inherits_root,
                         explicit_return,
+                        descendants: 0,
                     };
                     // The anonymous locations of its `if` blocks (#137).
                     let mut location = location;
@@ -780,6 +781,7 @@ pub(crate) fn parse_location_block(
                     for child in &mut children {
                         inherit_from_parent(child, &location);
                     }
+                    location.descendants = children.len();
                     sink.push(location);
                     sink.extend(children);
                     Ok(())
