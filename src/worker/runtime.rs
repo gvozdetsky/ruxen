@@ -1861,12 +1861,15 @@ pub fn run(
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(state);
                 if state.is_shutting_down() {
+                    worker_notice(http, "gracefully shutting down");
                     // Stop accepting at once: after a reload, the socket
                     // goes on with the next generation's worker, or is
                     // closed if the address went away.
                     drop(listener);
                     drain(state, inherited.as_deref()).await;
+                    worker_notice(http, "exiting");
                     flush_access_log_buffers();
+                    worker_notice(http, "exit");
                     return;
                 }
                 match accept_or_tick(&listener, &mut tick, state).await {
@@ -1918,6 +1921,7 @@ pub fn run(
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(state);
                 if state.is_shutting_down() {
+                    worker_notice(http, "gracefully shutting down");
                     // The accept loops cancel their accepts and close their
                     // sockets. Dropped with the runtime instead, an accept
                     // left in the ring kept the socket listening after a
@@ -1926,7 +1930,9 @@ pub fn run(
                         task.await;
                     }
                     drain(state, inherited.as_deref()).await;
+                    worker_notice(http, "exiting");
                     flush_access_log_buffers();
+                    worker_notice(http, "exit");
                     return;
                 }
                 monoio::time::sleep(Duration::from_millis(10)).await;
@@ -1973,6 +1979,13 @@ pub fn run(
         },
         Driver::Epoll => run_epoll(body),
     }
+}
+
+/// nginx's notice lines for a worker's end, from its own thread
+/// (ngx_worker_process_cycle, ngx_worker_process_exit; #669).
+#[cold]
+fn worker_notice(http: &PreparedHttp, message: &str) {
+    write_worker_log(http.error_logs, ErrorLogLevel::Notice, message);
 }
 
 /// Ring sizes, largest first: the size of a generation's rings, and the

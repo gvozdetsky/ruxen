@@ -546,7 +546,12 @@ impl ChunkedDecoder {
                     self.line.extend_from_slice(&input[pos..pos + nl]);
                     pos += nl + 1;
                     let line = std::mem::take(&mut self.line);
-                    let line = line.strip_suffix(b"\r").unwrap_or(&line);
+                    // CRLF only, as nginx since 1.29.4: a bare LF is where
+                    // parsers behind other intermediaries disagree on the
+                    // body's end (ngx_http_parse_chunked, #585).
+                    let Some(line) = line.strip_suffix(b"\r") else {
+                        return Err(());
+                    };
                     self.state = match self.state {
                         ChunkState::DataEnd => {
                             if !line.is_empty() {
@@ -618,6 +623,27 @@ mod tests {
             dec.feed(&[b'1'; MAX_CHUNK_LINE + 2], &mut Vec::new())
                 .is_err()
         );
+    }
+
+    /// A bare LF anywhere in the framing is refused, as nginx 1.29.4+
+    /// does (#585): after a size, after data, after the last chunk, in a
+    /// trailer.
+    #[test]
+    fn chunked_decoder_refuses_a_bare_lf() {
+        for wire in [
+            &b"3\nok!\r\n0\r\n\r\n"[..],
+            b"3\r\nok!\n0\r\n\r\n",
+            b"3\r\nok!\r\n0\n\r\n",
+            b"3\r\nok!\r\n0\r\nX: 1\n\r\n",
+            b"3\r\nok!\r\n0\r\n\n",
+        ] {
+            let mut dec = ChunkedDecoder::default();
+            assert!(
+                dec.feed(wire, &mut Vec::new()).is_err(),
+                "{}",
+                String::from_utf8_lossy(wire)
+            );
+        }
     }
 
     #[test]

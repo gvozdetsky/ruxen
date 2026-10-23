@@ -26,11 +26,11 @@ use std::net::IpAddr;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-/// Maximum internal reroute hops before we declare a loop. nginx uses
-/// `NGX_HTTP_MAX_URI_CHANGES` (default 10) for the same purpose; we pick
-/// 8 as a slightly tighter budget since our reroute surface is narrower
-/// (no rewrite engine, only try_files fallback).
-pub(crate) const MAX_REROUTES: u32 = 8;
+/// Maximum location searches for a request before we declare a loop: the
+/// first and nginx's `NGX_HTTP_MAX_URI_CHANGES` (10) more, as its
+/// `r->uri_changes` starts at 11. A flagless `rewrite` spends one too
+/// (#682), so a chain of them reaches the limit as in nginx.
+pub(crate) const MAX_REROUTES: u32 = 11;
 
 /// Planned nginx-compatible phase list.
 ///
@@ -637,6 +637,21 @@ pub fn process_with_meta_from_reroute(
     out
 }
 
+/// nginx's `rewrite or internal redirection cycle` line, noted for the
+/// request's error log (#682).
+#[cold]
+#[inline(never)]
+fn rewrite_cycle_log(uri: &[u8]) {
+    crate::fs_resolve::note_failed_lookup_at(
+        format!(
+            "rewrite or internal redirection cycle while processing \"{}\"",
+            String::from_utf8_lossy(uri)
+        ),
+        false,
+        crate::config::ErrorLogLevel::Error,
+    );
+}
+
 /// A file lookup that failed while processing (`open() "…" failed`) is
 /// logged now, with this request's context, as nginx logs it where the
 /// open fails. The note is per worker thread, so it has to be taken
@@ -1222,6 +1237,15 @@ fn process_with_meta_inner(
         match response {
             Response::Reroute(next) => {
                 run_server_rewrite = true;
+                // An internal redirect (error_page, try_files, index): the
+                // location is found anew, so no rewrite of the old one
+                // counts (ngx_http_handler sets `valid_location` again,
+                // find_config clears `uri_changed`, #682). A named location
+                // keeps `valid_location`, as ngx_http_named_location does.
+                rewrite_state.uri_changed = false;
+                if matches!(next.target, RerouteTarget::Uri(_)) {
+                    rewrite_state.valid_location = true;
+                }
                 let to_get = turns_into_get(req, &next);
                 if let Some(args) = next.args {
                     current_args = Some(args);
@@ -1285,6 +1309,7 @@ fn process_with_meta_inner(
         }
     }
     // Budget exhausted: nginx returns 500; we match.
+    rewrite_cycle_log(url_scratch);
     (
         Response::Owned(crate::http::error_response_for_method(
             500,

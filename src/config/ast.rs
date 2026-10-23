@@ -1081,6 +1081,10 @@ pub struct Server {
     /// `add_headers`. Trailers force chunked transfer-encoding on the
     /// response when the list is non-empty.
     pub add_trailers: Option<Vec<AddHeader>>,
+    /// `add_header_inherit` / `add_trailer_inherit` (#598), with the http
+    /// level's when the server sets none.
+    pub add_header_inherit: Option<HeaderInherit>,
+    pub add_trailer_inherit: Option<HeaderInherit>,
     /// Server-scope `error_page` stack. Multiple directives accumulate in
     /// declaration order; a location with its own list replaces the
     /// inherited server list entirely, mirroring nginx's merge behavior.
@@ -1339,14 +1343,22 @@ pub struct Location {
     /// Location-scope `try_files`. Not inherited. A location without it
     /// goes straight to the static/index resolver for its `root`.
     pub try_files: Option<TryFiles>,
-    /// Location-scope `add_header` stack. Inheritance: child list (if
-    /// `Some`) replaces parent's entirely — nginx's
-    /// `ngx_http_headers_filter_module.c::ngx_http_headers_merge_conf`
-    /// semantics. `None` here means "inherit from server".
+    /// Location-scope `add_header` stack: the location's own list while
+    /// parsing, its effective one once `config::merge_add_headers` has
+    /// put it over the enclosing locations' and the server's (nginx's
+    /// `ngx_http_headers_merge_conf`, with `add_header_inherit`, #598).
+    /// `None` then means "the server's, as it is".
     pub add_headers: Option<Vec<AddHeader>>,
     /// Location-scope `add_trailer` stack. Same shape and merge rules as
     /// `add_headers`.
     pub add_trailers: Option<Vec<AddHeader>>,
+    /// Location-scope `add_header_inherit` / `add_trailer_inherit` (#598).
+    pub add_header_inherit: Option<HeaderInherit>,
+    pub add_trailer_inherit: Option<HeaderInherit>,
+    /// The enclosing locations' own lists and modes, outermost first, for
+    /// the merge with the server's once it is known (#598). Empty for a
+    /// top-level location.
+    pub header_ancestors: Vec<HeaderLevel>,
     /// Location-scope `error_page` stack. Inheritance mirrors nginx core:
     /// if the child has any entries it replaces the parent's list outright;
     /// otherwise it inherits the server-level list.
@@ -1676,6 +1688,31 @@ pub struct KeepaliveTimeout {
 pub struct KeepaliveDisable {
     pub msie6: bool,
     pub safari: bool,
+}
+
+/// `add_header_inherit` / `add_trailer_inherit` (nginx 1.29.3, #598): how
+/// a level's `add_header` (or `add_trailer`) list relates to the one it
+/// would inherit (ngx_http_headers_merge_conf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderInherit {
+    /// Nothing inherited, even with no list of its own.
+    Off,
+    /// The default: inherited unless the level has its own list.
+    On,
+    /// The level's own list, then the inherited one.
+    Merge,
+}
+
+/// A location's own `add_header` / `add_trailer` lists and inherit modes,
+/// as an enclosing location passes them on (#598): the server's lists
+/// apply on top of the chain once the server is known
+/// (`config::merge_add_headers`).
+#[derive(Debug, Clone, Default)]
+pub struct HeaderLevel {
+    pub headers: Option<Vec<AddHeader>>,
+    pub trailers: Option<Vec<AddHeader>>,
+    pub headers_inherit: Option<HeaderInherit>,
+    pub trailers_inherit: Option<HeaderInherit>,
 }
 
 /// One `add_header NAME VALUE [always];` entry. `always` toggles whether

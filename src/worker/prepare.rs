@@ -554,6 +554,9 @@ pub(crate) fn build_listen_tls(
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
             keys.push(server_key(input, cert, key, &passwords)?);
         }
+        // Each is loaded and checked, as nginx loads it; the last of each
+        // key type is the one served (#670).
+        let keys = crate::tls_certs::last_per_key_type(keys);
 
         // Register each registered server_name against every key so an RSA
         // + ECDSA pair can both serve under the same hostname.
@@ -892,6 +895,7 @@ fn client_auth(key: &ClientAuthKey) -> Result<crate::client_verify::ClientAuth, 
             .add_trusted(pem)
             .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_client_certificate)", e))?;
         hints = crate::x509_verify::subjects(pem)
+            .map_err(|e| fail("SSL_load_client_CA_file(ssl_client_certificate)", e))?
             .into_iter()
             .map(rustls::DistinguishedName::from)
             .collect();
@@ -3150,6 +3154,7 @@ pub(crate) fn leak_doc_root(
     };
     crate::arena::leak(Box::new(DocRoot {
         path: leak_path_buf(path),
+        location: location_pattern,
         mapping: prepare_path_mapping(
             mapping,
             location_pattern,
@@ -3580,6 +3585,9 @@ pub(crate) fn build_prefix_or_exact(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        add_header_inherit: _,
+        add_trailer_inherit: _,
+        header_ancestors: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
@@ -3793,6 +3801,9 @@ pub(crate) fn build_regex_location(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        add_header_inherit: _,
+        add_trailer_inherit: _,
+        header_ancestors: _,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;

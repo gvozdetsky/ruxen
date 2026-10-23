@@ -130,8 +130,12 @@ fn nginx_identity_for_the_test_harness() {
 }
 
 fn version(nginx_identity: bool) -> String {
+    version_with("-V", nginx_identity)
+}
+
+fn version_with(flag: &str, nginx_identity: bool) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ruxen"));
-    cmd.arg("-V").env_remove("RUXEN_NGINX_IDENTITY");
+    cmd.arg(flag).env_remove("RUXEN_NGINX_IDENTITY");
     if nginx_identity {
         cmd.env("RUXEN_NGINX_IDENTITY", "1");
     }
@@ -149,4 +153,15 @@ fn version_names_nginx_only_for_the_test_harness() {
 
     let nginx = version(true);
     assert_eq!(nginx, format!("nginx version: nginx/1.30.6\n{ruxen}"));
+}
+
+/// `-v` prints the first line of `-V` only, as nginx's `-v` (#475): the
+/// ruxen line, or the nginx one for the test harness.
+#[test]
+fn short_version_is_the_first_line() {
+    assert_eq!(
+        version_with("-v", false),
+        format!("ruxen version: ruxen/{}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(version_with("-v", true), "nginx version: nginx/1.30.6\n");
 }
