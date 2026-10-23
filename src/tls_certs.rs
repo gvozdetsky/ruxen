@@ -324,6 +324,26 @@ impl ServerKey {
             None => self.key.clone(),
         }
     }
+
+    /// Its key's type, the slot OpenSSL keeps one certificate in.
+    pub fn key_type(&self) -> rustls::SignatureAlgorithm {
+        self.key.key.algorithm()
+    }
+}
+
+/// A server's keys as nginx serves them: OpenSSL keeps one certificate
+/// per key type in an SSL_CTX, and a later `SSL_CTX_use_certificate`
+/// replaces an earlier one of the same type (`ssl_set_cert`), so the last
+/// listed of each type (RSA, ECDSA, ...) stays (#670). In their order.
+pub fn last_per_key_type(keys: Vec<ServerKey>) -> Vec<ServerKey> {
+    let mut kept: Vec<ServerKey> = Vec::with_capacity(keys.len());
+    for key in keys.into_iter().rev() {
+        if !kept.iter().any(|k| k.key_type() == key.key_type()) {
+            kept.push(key);
+        }
+    }
+    kept.reverse();
+    kept
 }
 
 impl From<Arc<CertifiedKey>> for ServerKey {
@@ -796,6 +816,21 @@ mod tests {
         SignatureScheme::RSA_PSS_SHA256,
         SignatureScheme::RSA_PKCS1_SHA256,
     ];
+
+    /// Two RSA pairs and an ECDSA one: the later RSA replaces the earlier,
+    /// as in OpenSSL's per-type slot (#670); the order stays.
+    #[test]
+    fn the_last_certificate_of_each_key_type_stays() {
+        let (rsa, ec, alt) = (
+            ck(RSA_CRT, RSA_KEY_PKCS8),
+            ck(EC_CRT, EC_KEY_PKCS8),
+            ck(ALT_CRT, ALT_KEY),
+        );
+        let kept = last_per_key_type(vec![rsa.into(), ec.clone().into(), alt.clone().into()]);
+        assert_eq!(kept.len(), 2);
+        assert!(Arc::ptr_eq(&kept[0].key, &ec));
+        assert!(Arc::ptr_eq(&kept[1].key, &alt));
+    }
 
     #[test]
     fn loads_pkcs8_rsa_key() {
