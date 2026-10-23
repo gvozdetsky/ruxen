@@ -23,6 +23,8 @@ COPY --from=build /usr/local/bin/ruxen /usr/local/bin/ruxen
 COPY examples/minimal.conf /etc/ruxen/ruxen.conf
 # nginx's mime.types, for a configuration that does `include mime.types` (#38).
 COPY examples/mime.types /etc/ruxen/mime.types
+# Its licence, nginx's, comes with it (#479).
+COPY LICENSE NOTICE /usr/share/doc/ruxen/
 # Run as a user of its own from the start, so nothing in the container
 # runs as root (`user` only applies when ruxen starts as root).
 RUN useradd --system --no-create-home --uid 10001 ruxen

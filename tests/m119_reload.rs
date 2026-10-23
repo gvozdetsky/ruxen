@@ -734,6 +734,59 @@ fn signals_are_logged_with_their_sender() {
     );
 }
 
+/// A worker's life is in the log as nginx writes it (#669): the master's
+/// `start worker process <id>` for each, `reconfiguring`, and `worker
+/// process <id> exited with code 0` once a retired one is gone, which
+/// nginx-tests waits for after a reload; each worker's own `gracefully
+/// shutting down`, `exiting` and `exit`.
+#[test]
+fn worker_lifecycle_is_logged_as_nginx_does() {
+    let setup = common::ports::setup_lock();
+    let port = free_port();
+    let mut s = spawn("lifecycle", "worker_processes 2;", &returning(port, "ok"));
+    drop(setup);
+    let started = |log: &str| -> Vec<String> {
+        log.lines()
+            .filter_map(|l| l.split("start worker process ").nth(1))
+            .map(str::to_string)
+            .collect()
+    };
+    let first = started(&s.error_log());
+    assert_eq!(first.len(), 2, "{}", s.error_log());
+    s.hup();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while s.error_log().matches("exited with code 0").count() < 2 {
+        assert!(std::time::Instant::now() < deadline, "{}", s.error_log());
+        sleep(Duration::from_millis(20));
+    }
+    let log = s.error_log();
+    assert!(log.contains("[notice] "), "{log}");
+    assert!(log.contains(": reconfiguring\n"), "{log}");
+    assert_eq!(
+        log.matches(": start worker processes\n").count(),
+        2,
+        "{log}"
+    );
+    assert_eq!(started(&log).len(), 4, "{log}");
+    for tid in &first {
+        for line in [
+            format!("#{tid}: gracefully shutting down\n"),
+            format!("#{tid}: exiting\n"),
+            format!("#{tid}: exit\n"),
+            format!(": worker process {tid} exited with code 0\n"),
+        ] {
+            assert!(log.contains(&line), "{line}:\n{log}");
+        }
+    }
+    // SAFETY: a signal to the child we started.
+    unsafe {
+        assert_eq!(kill(s.child.id() as i32, SIGQUIT), 0);
+    }
+    assert!(s.child.wait().unwrap().success());
+    let log = s.error_log();
+    assert_eq!(log.matches("exited with code 0").count(), 4, "{log}");
+}
+
 /// A reload blocked in `prepare` (an access_log FIFO without a reader:
 /// `open` waits for one) doesn't keep `main` from SIGTERM (#497): it
 /// exits as usual, the pid file removed, instead of until SIGKILL.

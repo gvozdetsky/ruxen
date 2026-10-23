@@ -4,7 +4,7 @@
 //
 // - `load_certified_key`: parse a PEM cert chain + matching private key into
 //   a `rustls::sign::CertifiedKey`. Accepts PKCS#8, PKCS#1 (RSA), and SEC1
-//   (EC) private keys via `rustls_pemfile::private_key`. Cert/key mismatch
+//   (EC) private keys via rustls-pki-types' PEM reader (`PemObject`). Cert/key mismatch
 //   is caught by comparing SubjectPublicKeyInfo bytes, like rustls's
 //   `keys_match`, but without webpki so X.509 v1 leaves load too.
 //
@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -44,7 +45,7 @@ pub enum LoadCertError {
     },
     Pem {
         path: PathBuf,
-        err: std::io::Error,
+        err: rustls::pki_types::pem::Error,
     },
     NoCerts(PathBuf),
     NoKey(PathBuf),
@@ -105,8 +106,7 @@ pub(crate) fn parse_certified_key(
     passwords: &[Vec<u8>],
 ) -> Result<CertifiedKey, LoadCertError> {
     let cert_pem = with_trusted_certificates_relabeled(cert_pem);
-    let mut cert_reader = std::io::BufReader::new(&cert_pem[..]);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .map(|cert| cert.map(only_the_certificate))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| LoadCertError::Pem {
@@ -117,7 +117,7 @@ pub(crate) fn parse_certified_key(
         return Err(LoadCertError::NoCerts(cert_path.to_path_buf()));
     }
 
-    // rustls-pemfile skips encrypted blocks: those go through OpenSSL's
+    // The PEM reader skips encrypted blocks: those go through OpenSSL's
     // PEM_read_bio_PrivateKey with each password in turn, as nginx reads
     // them (ngx_ssl_load_certificate_key).
     if crate::x509_verify::is_encrypted_key(key_pem) {
@@ -136,13 +136,19 @@ pub(crate) fn parse_certified_key(
         keys_match(&certified).map_err(LoadCertError::Rustls)?;
         return Ok(certified);
     }
-    let mut key_reader = std::io::BufReader::new(key_pem);
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|err| LoadCertError::Pem {
-            path: key_path.to_path_buf(),
-            err,
-        })?
-        .ok_or_else(|| LoadCertError::NoKey(key_path.to_path_buf()))?;
+    // The first private key, PKCS#1, PKCS#8 or SEC1.
+    let key: PrivateKeyDer<'static> = match PrivateKeyDer::from_pem_slice(key_pem) {
+        Ok(key) => key,
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => {
+            return Err(LoadCertError::NoKey(key_path.to_path_buf()));
+        }
+        Err(err) => {
+            return Err(LoadCertError::Pem {
+                path: key_path.to_path_buf(),
+                err,
+            });
+        }
+    };
 
     let provider = active_provider();
     let signing_key = provider
@@ -156,7 +162,7 @@ pub(crate) fn parse_certified_key(
 
 /// OpenSSL's `-trustout` form, `-----BEGIN TRUSTED CERTIFICATE-----`, is a
 /// certificate followed by its `X509_CERT_AUX` trust settings. nginx reads
-/// it (`PEM_read_bio_X509_AUX`); rustls-pemfile skips the label. Relabel
+/// it (`PEM_read_bio_X509_AUX`); the PEM reader skips the label. Relabel
 /// it as a plain certificate, and `only_the_certificate` drops the trust
 /// settings, which ruxen has no use for.
 fn with_trusted_certificates_relabeled(pem: &[u8]) -> std::borrow::Cow<'_, [u8]> {
@@ -324,6 +330,26 @@ impl ServerKey {
             None => self.key.clone(),
         }
     }
+
+    /// Its key's type, the slot OpenSSL keeps one certificate in.
+    pub fn key_type(&self) -> rustls::SignatureAlgorithm {
+        self.key.key.algorithm()
+    }
+}
+
+/// A server's keys as nginx serves them: OpenSSL keeps one certificate
+/// per key type in an SSL_CTX, and a later `SSL_CTX_use_certificate`
+/// replaces an earlier one of the same type (`ssl_set_cert`), so the last
+/// listed of each type (RSA, ECDSA, ...) stays (#670). In their order.
+pub fn last_per_key_type(keys: Vec<ServerKey>) -> Vec<ServerKey> {
+    let mut kept: Vec<ServerKey> = Vec::with_capacity(keys.len());
+    for key in keys.into_iter().rev() {
+        if !kept.iter().any(|k| k.key_type() == key.key_type()) {
+            kept.push(key);
+        }
+    }
+    kept.reverse();
+    kept
 }
 
 impl From<Arc<CertifiedKey>> for ServerKey {
@@ -796,6 +822,21 @@ mod tests {
         SignatureScheme::RSA_PSS_SHA256,
         SignatureScheme::RSA_PKCS1_SHA256,
     ];
+
+    /// Two RSA pairs and an ECDSA one: the later RSA replaces the earlier,
+    /// as in OpenSSL's per-type slot (#670); the order stays.
+    #[test]
+    fn the_last_certificate_of_each_key_type_stays() {
+        let (rsa, ec, alt) = (
+            ck(RSA_CRT, RSA_KEY_PKCS8),
+            ck(EC_CRT, EC_KEY_PKCS8),
+            ck(ALT_CRT, ALT_KEY),
+        );
+        let kept = last_per_key_type(vec![rsa.into(), ec.clone().into(), alt.clone().into()]);
+        assert_eq!(kept.len(), 2);
+        assert!(Arc::ptr_eq(&kept[0].key, &ec));
+        assert!(Arc::ptr_eq(&kept[1].key, &alt));
+    }
 
     #[test]
     fn loads_pkcs8_rsa_key() {

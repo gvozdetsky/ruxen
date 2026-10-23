@@ -420,6 +420,48 @@ def check(binary, conf, prefix, extra):
     return ok, (lines[0] if lines else "").strip().replace(prefix, "<sandbox>")
 
 
+def differences(binary, conf, prefix):
+    """What `ruxen --compat` reports as behaving differently from nginx in a
+    configuration ruxen loads (#478): one key per finding, to count
+    configurations per directive. "ignored" (tuning with no effect) doesn't
+    count."""
+    try:
+        r = subprocess.run(
+            [binary, "--compat", "-p", prefix + "/", "-c", conf],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return ["--compat timed out"]
+    keys = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"^(.+:\d+|-): differs: (.*)$", line)
+        if m:
+            keys.append(difference(m.group(2), m.group(1) != "-"))
+    return sorted(set(keys))
+
+
+def difference(finding, at_directive):
+    """A short key for a `--compat` "differs" finding: the directive, with
+    its arguments when they are on/off (`proxy_buffering off`), else its
+    name alone (`charset`). A finding not tied to a line (`-:`, from a
+    warning) is its directive when it names one, else its text."""
+    variable = re.match(r'variable "(\$[^"]+)"', finding)
+    if variable:
+        return variable.group(1)
+    named = re.match(r'^"?([a-z0-9_]+)"?( on| off)?(?::| is | —)', finding)
+    if named:
+        return named.group(1) + (named.group(2) or "")
+    head = finding.split(" — ")[0].strip()
+    words = head.split()
+    if at_directive and words and re.fullmatch(r"[a-z0-9_]+", words[0]):
+        if len(words) > 1 and all(w in ("on", "off") for w in words[1:]):
+            return head
+        return words[0]
+    return head[:80]
+
+
 def blocker(message):
     """A short key for a ruxen error, to count configurations per cause."""
     m = re.search(r"unknown directive [`\"]([^`\"]+)[`\"]", message)
@@ -459,8 +501,9 @@ def run(args):
                     f.write(text2)
                 n_ok, n_err = check(args.nginx, conf, tmp, ["-e", os.path.join(tmp, "logs", "error.log")])
                 r_ok, r_err = check(ruxen, conf, tmp, [])
+                differs = differences(ruxen, conf, tmp) if n_ok and r_ok else []
             results.append({"id": case_id, "use": use, "nginx": n_ok, "nginx_error": n_err,
-                            "ruxen": r_ok, "ruxen_error": r_err})
+                            "ruxen": r_ok, "ruxen_error": r_err, "differs": differs})
             if args.verbose:
                 print(f"{case_id}: nginx={'ok' if n_ok else 'FAIL'} ruxen={'ok' if r_ok else 'FAIL'} {r_err if n_ok and not r_ok else ''}")
     version = subprocess.run([args.nginx, "-v"], capture_output=True, text=True).stderr.strip()
@@ -478,6 +521,11 @@ def write_report(results, output, nginx_version):
     for r in valid:
         if not r["ruxen"]:
             blockers[blocker(r["ruxen_error"])].append(r["id"])
+    same = [r for r in loaded if not r.get("differs")]
+    differing = collections.defaultdict(list)
+    for r in loaded:
+        for key in r.get("differs", []):
+            differing[key].append(r["id"])
     pct = lambda a, b: f"{100 * a / b:.0f}%" if b else "—"
     lines = [
         "# Config corpus results",
@@ -491,6 +539,11 @@ def write_report(results, output, nginx_version):
         f"**ruxen loads {len(loaded)} of {len(valid)} configurations nginx accepts ({pct(len(loaded), len(valid))}).**"
         f" {len(results) - len(valid)} more cases were not valid for nginx either and don't count.",
         "",
+        f"**{len(same)} of them ({pct(len(same), len(valid))} of {len(valid)}) load with nothing that"
+        " behaves differently from nginx**, by `ruxen --compat` (#278): no \"differs\" finding."
+        " Upstream names point at 127.0.0.1 here, so `resolver` and DNS-dependent behaviour"
+        " are not measured.",
+        "",
         "| use | nginx accepts | ruxen loads | share |",
         "|---|---:|---:|---:|",
     ]
@@ -500,16 +553,24 @@ def write_report(results, output, nginx_version):
     lines += ["", "## What blocks the rest", "", "| configurations | first error in ruxen | examples |", "|---:|---|---|"]
     for key, ids in sorted(blockers.items(), key=lambda kv: (-len(kv[1]), kv[0])):
         lines.append(f"| {len(ids)} | {key} | {', '.join(ids[:4])}{' …' if len(ids) > 4 else ''} |")
-    lines += ["", "## Every case", "", "| case | use | nginx | ruxen | ruxen's error |", "|---|---|---|---|---|"]
+    lines += ["", "## What differs most", "",
+              "Among the configurations ruxen loads, how many have each `--compat` \"differs\" finding.",
+              "", "| configurations | differs | examples |", "|---:|---|---|"]
+    for key, ids in sorted(differing.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        key = key.replace("|", "\\|")
+        lines.append(f"| {len(ids)} | {key} | {', '.join(ids[:4])}{' …' if len(ids) > 4 else ''} |")
+    lines += ["", "## Every case", "", "| case | use | nginx | ruxen | differs | ruxen's error |", "|---|---|---|---|---:|---|"]
     for r in results:
         err = r["ruxen_error"] if r["nginx"] and not r["ruxen"] else ("" if r["nginx"] else "(" + (r["nginx_error"] or "nginx rejects it")[:80] + ")")
         err = err.replace("|", "\\|")
+        differs = len(r.get("differs", [])) if r["nginx"] and r["ruxen"] else ""
         lines.append(
-            f"| {r['id']} | {r['use']} | {'ok' if r['nginx'] else '—'} | {'ok' if r['ruxen'] else ('FAIL' if r['nginx'] else '—')} | {err} |"
+            f"| {r['id']} | {r['use']} | {'ok' if r['nginx'] else '—'} | {'ok' if r['ruxen'] else ('FAIL' if r['nginx'] else '—')} | {differs or ''} | {err} |"
         )
     with open(output, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"ruxen loads {len(loaded)} of {len(valid)} ({pct(len(loaded), len(valid))}); {output}")
+    print(f"ruxen loads {len(loaded)} of {len(valid)} ({pct(len(loaded), len(valid))}), "
+          f"{len(same)} with nothing that differs; {output}")
 
 
 # --------------------------------------------------------- github sample

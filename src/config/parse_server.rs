@@ -44,6 +44,8 @@ pub(crate) fn parse_server_block(
     let mut locations: Vec<Location> = Vec::new();
     let mut add_headers: Option<Vec<AddHeader>> = None;
     let mut add_trailers: Option<Vec<AddHeader>> = None;
+    let mut add_header_inherit: Option<HeaderInherit> = None;
+    let mut add_trailer_inherit: Option<HeaderInherit> = None;
     let mut error_pages: Option<Vec<ErrorPage>> = None;
     let mut rewrite_ops: Vec<RewriteOp> = Vec::new();
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
@@ -86,6 +88,7 @@ pub(crate) fn parse_server_block(
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut redirect = RedirectConf::default();
     let mut mime = MimeConf::default();
+    let mut charset = CharsetConf::default();
 
     loop {
         let (args, term) = lx.read_directive()?;
@@ -148,6 +151,8 @@ pub(crate) fn parse_server_block(
                         root,
                         add_headers,
                         add_trailers,
+                        add_header_inherit,
+                        add_trailer_inherit,
                         error_pages,
                         rewrite_ops,
                         keepalive_timeout,
@@ -192,6 +197,7 @@ pub(crate) fn parse_server_block(
                         chunked_transfer_encoding,
                         redirect,
                         mime,
+                        charset,
                         ssl,
                         locations,
                     });
@@ -217,6 +223,9 @@ pub(crate) fn parse_server_block(
         match (args[0].as_str(), &term) {
             ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
                 parse_mime(lx, &args, &term, &mut mime)?;
+            }
+            ("charset" | "charset_types" | "source_charset", Terminator::Semi) => {
+                parse_charset(lx, &args, &term, &mut charset)?;
             }
             ("listen", Terminator::Semi) => {
                 saw_listen = true;
@@ -658,6 +667,12 @@ pub(crate) fn parse_server_block(
                 let entry = parse_add_header_args(&args[1..])?;
                 add_trailers.get_or_insert_with(Vec::new).push(entry);
             }
+            ("add_header_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_header_inherit, &args)?;
+            }
+            ("add_trailer_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_trailer_inherit, &args)?;
+            }
             ("error_page", Terminator::Semi) => {
                 let entries = parse_error_page_args(&args[1..])?;
                 error_pages.get_or_insert_with(Vec::new).extend(entries);
@@ -683,6 +698,8 @@ pub(crate) fn parse_server_block(
                 | "root"
                 | "location"
                 | "add_header"
+                | "add_header_inherit"
+                | "add_trailer_inherit"
                 | "error_page"
                 | "return"
                 | "set"
