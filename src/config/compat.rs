@@ -78,16 +78,52 @@ pub(crate) fn unknown(
             ctx,
         });
     }
-    record(
-        lx,
-        Severity::Unsupported,
-        args,
-        format!("unknown directive {}", super::error::in_block(ctx)),
-    );
+    let mut note = format!("unknown directive {}", super::error::in_block(ctx));
+    if let Some(module) = missing_module(&args[0]) {
+        note.push_str(&format!(" ({module} isn't in ruxen: README, Limitations)"));
+    }
+    record(lx, Severity::Unsupported, args, note);
     if matches!(term, Terminator::BlockOpen) {
         skip_block(lx)?;
     }
     Ok(())
+}
+
+/// The nginx module a directive ruxen doesn't know belongs to, for the
+/// ones a configuration commonly has and ruxen doesn't implement.
+fn missing_module(name: &str) -> Option<&'static str> {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("fastcgi_", "FastCGI"),
+        ("uwsgi_", "uwsgi"),
+        ("scgi_", "SCGI"),
+        ("memcached_", "memcached"),
+        ("grpc_", "gRPC proxying"),
+        ("ssi_", "SSI"),
+        ("sub_filter", "sub_filter"),
+        ("geoip", "GeoIP"),
+        ("perl", "embedded Perl"),
+        ("js_", "njs"),
+        ("image_filter", "image_filter"),
+        ("xslt", "XSLT"),
+        ("mp4", "MP4 streaming"),
+        ("flv", "FLV streaming"),
+        ("dav_", "WebDAV"),
+        ("slice", "slice"),
+        ("mirror", "mirror"),
+        ("userid", "userid"),
+        ("secure_link", "secure_link"),
+    ];
+    match name {
+        "geo" => Some("geo"),
+        "stream" => Some("the stream module"),
+        "mail" => Some("the mail module"),
+        "ssi" => Some("SSI"),
+        _ if name.contains("_by_lua") || name.starts_with("lua_") => Some("Lua (OpenResty)"),
+        _ => PREFIXES
+            .iter()
+            .find(|(p, _)| name.starts_with(p))
+            .map(|(_, m)| *m),
+    }
 }
 
 /// `reject_unenforced`'s error: while collecting, a finding, and the
@@ -306,6 +342,13 @@ fn classify(args: &[String]) -> (Severity, String) {
     }
 }
 
+/// A warning's trailing ` in <file>:<line>`, split off: (text, place).
+fn split_position(w: &str) -> Option<(&str, &str)> {
+    let (text, at) = w.rsplit_once(" in ")?;
+    let (_, line) = at.rsplit_once(':')?;
+    (!line.is_empty() && line.bytes().all(|b| b.is_ascii_digit())).then_some((text, at))
+}
+
 /// The report for `ruxen --compat`: one line per finding that matters,
 /// the tuning knobs summed up, and a verdict.
 pub fn report(
@@ -325,14 +368,44 @@ pub fn report(
         format!("{at}: {label}: {} — {}\n", f.directive, f.note)
     };
     for severity in [Severity::Unsupported, Severity::Differs] {
-        for f in findings.iter().filter(|f| f.severity == severity) {
-            out.push_str(&line(f));
+        // A directive that comes back with the same note (`fastcgi_param`
+        // from fastcgi_params, 20 lines and more) is one line, its first,
+        // and how many more there are.
+        let of_severity: Vec<&Finding> =
+            findings.iter().filter(|f| f.severity == severity).collect();
+        let name = |f: &Finding| f.directive.split(' ').next().unwrap_or("").to_string();
+        let mut done = vec![false; of_severity.len()];
+        for (i, f) in of_severity.iter().enumerate() {
+            if done[i] {
+                continue;
+            }
+            let mut more = 0;
+            for (j, g) in of_severity.iter().enumerate().skip(i + 1) {
+                if !done[j] && g.note == f.note && name(g) == name(f) {
+                    done[j] = true;
+                    more += 1;
+                }
+            }
+            let mut text = line(f);
+            if more > 0 {
+                text.pop();
+                text.push_str(&format!(
+                    " (and {more} more `{}` line{})\n",
+                    name(f),
+                    if more == 1 { "" } else { "s" }
+                ));
+            }
+            out.push_str(&text);
         }
         if severity == Severity::Differs {
-            // `[warn]` lines from parsing (`ssl_ciphers`, …): accepted with
-            // a difference ruxen already explains.
+            // `[warn]` lines from parsing (a `quic` listen, …): accepted
+            // with a difference ruxen already explains; where the warning
+            // ends with its place, the place goes first, as for findings.
             for w in warnings {
-                out.push_str(&format!("-: differs: {w}\n"));
+                out.push_str(&match split_position(w) {
+                    Some((text, at)) => format!("{at}: differs: {text}\n"),
+                    None => format!("-: differs: {w}\n"),
+                });
             }
         }
     }
@@ -460,6 +533,45 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].severity, Severity::Unsupported);
         assert_eq!(found[0].directive, "root /srv/$host");
+    }
+
+    #[test]
+    fn repeated_findings_are_one_line_and_modules_are_named() {
+        let (found, _) = findings(
+            "http { server { location ~ \\.php$ { fastcgi_param A a; fastcgi_param B b; \
+             fastcgi_param C c; fastcgi_pass x; } } }",
+        );
+        let out = report(&found, &[], None, None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(
+            lines[0].contains("unsupported: fastcgi_param A a — unknown directive")
+                && lines[0].ends_with("(FastCGI isn't in ruxen: README, Limitations) (and 2 more `fastcgi_param` lines)"),
+            "{out}"
+        );
+        assert!(lines[1].contains("unsupported: fastcgi_pass x"), "{out}");
+        assert!(
+            lines[2].starts_with("ruxen does not start with this configuration: 4 unsupported"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_warning_with_its_place_starts_with_it() {
+        let out = report(
+            &[],
+            &[
+                "the listen is ignored in /etc/nginx/x.conf:12".to_string(),
+                "no place here".to_string(),
+            ],
+            None,
+            None,
+        );
+        assert!(
+            out.starts_with("/etc/nginx/x.conf:12: differs: the listen is ignored\n"),
+            "{out}"
+        );
+        assert!(out.contains("-: differs: no place here\n"), "{out}");
     }
 
     #[test]
