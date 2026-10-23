@@ -3465,14 +3465,11 @@ fn prepare_types(mime: &crate::config::MimeConf) -> &'static PreparedTypes {
             leak_bytes(ty.as_bytes()),
         );
     }
+    let default = mime.default_type.as_deref().unwrap_or("text/plain");
     let types: &'static PreparedTypes = crate::arena::leak(Box::new(PreparedTypes {
         map,
-        default: leak_bytes(
-            mime.default_type
-                .as_deref()
-                .unwrap_or("text/plain")
-                .as_bytes(),
-        ),
+        default: leak_bytes(default.as_bytes()),
+        default_is_plain: default == "text/plain",
     }));
     BUILT.with(|b| b.borrow_mut().push((key, types)));
     types

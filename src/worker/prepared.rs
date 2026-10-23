@@ -1258,6 +1258,9 @@ pub struct PreparedTypes {
         std::hash::BuildHasherDefault<super::NameHasher>,
     >,
     pub default: &'static [u8],
+    /// `default` is `text/plain`: a `return` to a URI without an extension
+    /// keeps the type it was built with (#691), without a compare.
+    pub default_is_plain: bool,
 }
 
 impl PreparedTypes {
