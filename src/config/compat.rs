@@ -243,16 +243,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         "request bodies are still read whole before they are proxied (#134)",
     ),
     (
-        "proxy_cookie_domain",
-        Some("off"),
-        "Set-Cookie domains are not rewritten (#40)",
-    ),
-    (
-        "proxy_cookie_path",
-        Some("off"),
-        "Set-Cookie paths are not rewritten (#40)",
-    ),
-    (
         "proxy_store",
         Some("off"),
         "proxied responses are not stored",

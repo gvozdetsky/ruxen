@@ -157,6 +157,12 @@ pub struct ProxyConf {
     pub ignore_client_abort: Option<bool>,
     /// `proxy_redirect`; unset means nginx's implicit `default`.
     pub redirect: Option<ProxyRedirect>,
+    /// `proxy_cookie_domain` and `proxy_cookie_path`: the `Domain` and
+    /// `Path` of the upstream's `Set-Cookie` rewritten as `proxy_redirect`
+    /// rewrites `Location`. A `Prefix` rule of `cookie_domain` matches the
+    /// whole domain, without a leading dot and caseless.
+    pub cookie_domain: Option<ProxyRedirect>,
+    pub cookie_path: Option<ProxyRedirect>,
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
@@ -341,6 +347,8 @@ impl ProxyConf {
             force_ranges: self.force_ranges.or(parent.force_ranges),
             ignore_client_abort: self.ignore_client_abort.or(parent.ignore_client_abort),
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
+            cookie_domain: self.cookie_domain.or_else(|| parent.cookie_domain.clone()),
+            cookie_path: self.cookie_path.or_else(|| parent.cookie_path.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
             proxy_method: self.proxy_method.or_else(|| parent.proxy_method.clone()),

@@ -1117,8 +1117,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "fastcgi_temp_path",
     "uwsgi_temp_path",
     "scgi_temp_path",
-    "proxy_cookie_domain",
-    "proxy_cookie_path",
     "proxy_cookie_flags",
     "proxy_socket_keepalive",
     "proxy_store",

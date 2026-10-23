@@ -422,7 +422,7 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 - OCSP checks of client certificates (#142), 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
 - nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
-- variables in `root` and `alias` (#232), `proxy_cookie_domain` / `_path` / `_flags` (#40)
+- variables in `root` and `alias` (#232), `proxy_cookie_flags` (#40)
 
 Access restrictions that ruxen can't enforce yet — `proxy_cookie_flags` (other than `off`), and `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used).
 
