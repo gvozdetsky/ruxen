@@ -165,7 +165,11 @@ fn a_tls_client_gone_while_the_upstream_is_awaited_is_499() {
 
     let mut roots = rustls::RootCertStore::empty();
     let ca = std::fs::read(certs.ca_path().unwrap()).unwrap();
-    for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &ca,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     let config = Arc::new(

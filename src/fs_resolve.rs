@@ -961,6 +961,7 @@ mod tests {
             types: crate::arena::leak(Box::new(crate::worker::PreparedTypes {
                 map: Default::default(),
                 default: b"text/plain",
+                default_is_plain: true,
             })),
             // `AT_FDCWD` is fine for tests that only exercise the path
             // utilities below — none of them hit `openat2`.

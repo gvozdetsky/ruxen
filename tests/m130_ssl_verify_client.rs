@@ -124,12 +124,11 @@ fn client_config(cert: Option<(&Path, &Path)>) -> Arc<rustls::ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(AnyServer(provider)));
     Arc::new(match cert {
         Some((cert, key)) => {
-            let chain = rustls_pemfile::certs(&mut &std::fs::read(cert).unwrap()[..])
+            let chain = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(&std::fs::read(cert).unwrap())
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             let key: PrivateKeyDer<'static> =
-                rustls_pemfile::private_key(&mut &std::fs::read(key).unwrap()[..])
-                    .unwrap()
+                rustls::pki_types::pem::PemObject::from_pem_slice(&std::fs::read(key).unwrap())
                     .unwrap();
             builder.with_client_auth_cert(chain, key).unwrap()
         }
