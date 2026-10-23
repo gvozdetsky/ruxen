@@ -63,7 +63,7 @@ cd ruxen-v*-x86_64-linux-gnu
 ./ruxen -V
 ```
 
-On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`) and a `SHA256SUMS` file.
+On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`), a CycloneDX SBOM per target (`ruxen-v<version>-<target>.cdx.json`) and a `SHA256SUMS` file. The tarballs carry build-provenance and SBOM attestations, signed with the release workflow's identity: `gh attestation verify ruxen-x86_64-linux-gnu.tar.gz -R gvozdetsky/ruxen`. The binaries embed their crate list (`cargo audit bin ruxen`, Trivy and Syft read it).
 
 **Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), published with every release after 0.1.2:
 
