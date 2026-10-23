@@ -2769,6 +2769,27 @@ mod tests {
     }
 
     #[test]
+    fn alias_with_one_trailing_slash_warns() {
+        let cfg = parse(
+            "http { server { listen 80;
+                location /a { alias /srv/a/; }
+                location /b/ { alias /srv/b; }
+                location /c/ { alias /srv/c/; }
+                location /d { alias /srv/d; }
+            } }",
+        )
+        .unwrap();
+        let warned: Vec<&String> = cfg
+            .warnings
+            .iter()
+            .filter(|w| w.contains("only one of them ends with"))
+            .collect();
+        assert_eq!(warned.len(), 2, "{:?}", cfg.warnings);
+        assert!(warned[0].contains("nginx would map \"/a../x\" to \"/srv/a/../x\""));
+        assert!(warned[1].contains("nginx would map \"/b/x\" to \"/srv/bx\""));
+    }
+
+    #[test]
     fn client_timeouts_parse_and_inherit() {
         let cfg = parse(
             r#"
