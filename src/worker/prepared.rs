@@ -235,11 +235,17 @@ pub struct PreparedMap {
 pub struct RewriteState {
     user_vars: Vec<(&'static [u8], Vec<u8>)>,
     numbered_captures: Vec<Vec<u8>>,
-    /// nginx's `r->valid_location`: starts true, cleared whenever a
-    /// `rewrite` directive replaces the URI in-place. Read by `proxy_pass`
-    /// to decide whether to apply its configured URI prefix substitution
-    /// (when false, the rewritten URI is forwarded as-is to upstream).
+    /// nginx's `r->valid_location`: starts true, cleared when a `break`
+    /// (the `rewrite` flag, or the directive after a changed URI) keeps
+    /// the request in a location whose URI it changed. Read by
+    /// `proxy_pass` to decide whether to apply its configured URI prefix
+    /// substitution (when false, the rewritten URI is forwarded as-is to
+    /// upstream).
     pub(crate) valid_location: bool,
+    /// nginx's `r->uri_changed`: a `rewrite` without a flag changed the
+    /// URI, so the locations are searched again once the rewrite
+    /// directives are done (ngx_http_core_post_rewrite_phase, #682).
+    pub(crate) uri_changed: bool,
     /// nginx's `r->valid_unparsed_uri`: the URI is still the one the client
     /// sent, so `proxy_pass` without a URI part forwards the client's own
     /// request target (#541). Cleared by a `rewrite` of the URI and by an
@@ -271,6 +277,7 @@ impl Default for RewriteState {
             user_vars: Vec::new(),
             numbered_captures: Vec::new(),
             valid_location: true,
+            uri_changed: false,
             unparsed_uri: true,
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
@@ -1260,6 +1267,9 @@ pub struct PreparedRoot {
 pub struct DocRoot {
     pub path: &'static Path,
     pub mapping: PreparedPathMapping,
+    /// The location's name, for nginx's `"alias" cannot be used in
+    /// location …` (#589).
+    pub location: &'static [u8],
     /// The location's `disable_symlinks`, for `if -f` and the like.
     pub symlinks: PreparedSymlinks,
 }
@@ -1277,6 +1287,31 @@ pub enum PreparedSymlinkFrom {
     /// `from=$document_root`: the location's root (or alias) path.
     DocumentRoot,
     Path(&'static [u8]),
+}
+
+impl DocRoot {
+    /// nginx's ngx_http_map_uri_to_path refuses an `alias` once a
+    /// `rewrite` changed the URI in the location (`uri_changed`, before
+    /// the locations are searched again) or kept it there with `break`
+    /// (`!valid_location`): there is no part of the new URI to replace
+    /// (#589). The `[alert]` is noted for the request's error log.
+    #[cold]
+    pub(crate) fn alias_refused(&self, state: &RewriteState) -> bool {
+        if matches!(self.mapping, PreparedPathMapping::Root)
+            || (state.valid_location && !state.uri_changed)
+        {
+            return false;
+        }
+        crate::fs_resolve::note_failed_lookup_at(
+            format!(
+                "\"alias\" cannot be used in location \"{}\" where URI was rewritten",
+                String::from_utf8_lossy(self.location)
+            ),
+            false,
+            crate::config::ErrorLogLevel::Alert,
+        );
+        true
+    }
 }
 
 impl PreparedSymlinks {

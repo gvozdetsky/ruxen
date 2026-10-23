@@ -3153,6 +3153,7 @@ pub(crate) fn leak_doc_root(
     };
     crate::arena::leak(Box::new(DocRoot {
         path: leak_path_buf(path),
+        location: location_pattern,
         mapping: prepare_path_mapping(
             mapping,
             location_pattern,
