@@ -278,8 +278,13 @@ jobs:
     # After the GitHub release, so a failed build never reaches crates.io:
     # a published version can't be replaced, only yanked.
     needs: release
-    if: github.ref_type == 'tag'
+    # A pushed tag only: a manual run on a tag ref doesn't publish.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-22.04
+    # The environment narrows who can get a crates.io token: its
+    # deployment rule allows `v*` tags only, and crates.io's trusted
+    # publisher names it, so no other job or ref of this workflow can.
+    environment: crates-io
     permissions:
       contents: read
       id-token: write
