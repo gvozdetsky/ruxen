@@ -47,7 +47,13 @@ pub mod fuzzing {
         match crate::http::parse_request(data, &mut st) {
             crate::http::Parse::Complete(req) => Some(Ok(req.consumed)),
             crate::http::Parse::Incomplete => None,
-            _ => Some(Err(())),
+            _ => {
+                // The log line for a refused request is found again from
+                // the bytes (#663): it must not panic on any of them.
+                let refusal = crate::http::refusal_reason(data, false);
+                assert!(data.starts_with(refusal.request_line));
+                Some(Err(()))
+            }
         }
     }
 

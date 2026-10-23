@@ -1116,6 +1116,7 @@ mod tests {
         let types = crate::worker::PreparedTypes {
             map,
             default: b"text/plain",
+            default_is_plain: true,
         };
         assert_eq!(types.for_url(b"/a/index.html"), b"text/html");
         assert_eq!(types.for_url(b"/a/INDEX.HTML"), b"text/html");

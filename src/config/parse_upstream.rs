@@ -739,6 +739,9 @@ impl ProxyConf {
         "proxy_ignore_client_abort",
         "proxy_bind",
         "proxy_redirect",
+        "proxy_cookie_domain",
+        "proxy_cookie_path",
+        "proxy_cookie_flags",
         "proxy_hide_header",
         "proxy_pass_header",
         "proxy_method",
@@ -860,11 +863,15 @@ impl ProxyConf {
                 if self.limit_rate.is_some() {
                     return Err(Error::Duplicate("proxy_limit_rate"));
                 }
-                let v = args.get(1).ok_or(Error::MissingArg("proxy_limit_rate"))?;
-                self.limit_rate = Some(parse_size_bytes(v).ok_or(Error::BadValue {
-                    what: "proxy_limit_rate",
-                    got: v.clone(),
-                })?);
+                if args.len() < 2 {
+                    return Err(Error::MissingArg("proxy_limit_rate"));
+                }
+                // Variables since nginx 1.27.0, read once the upstream's
+                // header is in (ngx_http_upstream_send_response).
+                self.limit_rate = Some(crate::config::parse_location::parse_size_value(
+                    &args[1..],
+                    "proxy_limit_rate",
+                )?);
             }
             "proxy_ssl_server_name" => {
                 if self.ssl_server_name.is_some() {
@@ -1039,6 +1046,17 @@ impl ProxyConf {
                     Some(parse_duration_ms(v, "proxy_next_upstream_timeout")?);
             }
             "proxy_redirect" => parse_proxy_redirect(args, &mut self.redirect)?,
+            "proxy_cookie_domain" => crate::config::parse_server::parse_proxy_cookie(
+                args,
+                &mut self.cookie_domain,
+                true,
+            )?,
+            "proxy_cookie_path" => {
+                crate::config::parse_server::parse_proxy_cookie(args, &mut self.cookie_path, false)?
+            }
+            "proxy_cookie_flags" => {
+                crate::config::parse_server::parse_proxy_cookie_flags(args, &mut self.cookie_flags)?
+            }
             "proxy_hide_header" => {
                 let name = args.get(1).ok_or(Error::MissingArg("proxy_hide_header"))?;
                 self.hide_headers
