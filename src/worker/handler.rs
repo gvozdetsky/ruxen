@@ -287,15 +287,33 @@ fn dynamic_client_config(
 }
 
 /// The client framed a body (even an empty one): it sent Content-Length
-/// or Transfer-Encoding. nginx's `content_length_n` is -1 otherwise. One
-/// pass over the header lines: a proxied GET without a body asks.
+/// or Transfer-Encoding. nginx's `content_length_n` is -1 otherwise. A
+/// proxied GET without a body asks, so the scan is cheap: line starts by
+/// memchr, a line ruled out by its first byte (it was ~1% of a proxied
+/// GET's instructions, byte by byte).
 #[inline(never)]
 fn body_framed(headers: &[u8]) -> bool {
-    headers.split(|&b| b == b'\n').any(|line| {
-        let name = line.split(|&b| b == b':').next().unwrap_or(line);
-        crate::worker::header_name_eq_ci(name, b"content-length")
-            || crate::worker::header_name_eq_ci(name, b"transfer-encoding")
-    })
+    let named = |line: &[u8], name: &[u8]| {
+        line.len() > name.len()
+            && line[name.len()] == b':'
+            && line[..name.len()].eq_ignore_ascii_case(name)
+    };
+    let mut start = 0;
+    while let Some(line) = headers.get(start..) {
+        let framed = match line.first() {
+            Some(b'c' | b'C') => named(line, b"content-length"),
+            Some(b't' | b'T') => named(line, b"transfer-encoding"),
+            _ => false,
+        };
+        if framed {
+            return true;
+        }
+        match memchr::memchr(b'\n', line) {
+            Some(end) => start += end + 1,
+            None => return false,
+        }
+    }
+    false
 }
 
 /// nginx's `r->quoted_uri`: a `%` in the path of the client's request
@@ -1271,6 +1289,7 @@ pub(crate) fn run_location_handler(
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
+            error_page_status,
             intercept,
             upgrade: client_upgrade,
             // A response the range filter may cut is read whole (#370).
@@ -1285,18 +1304,28 @@ pub(crate) fn run_location_handler(
         }));
     }
     let inner = match loc.handler {
-        PreparedHandler::Return(PreparedReturn::Static(response), _) => {
-            Response::Prebuilt(response.pick(req.method))
-        }
-        PreparedHandler::Return(PreparedReturn::Template { status, parts }, _) => {
-            Response::Owned(build_templated_return(
+        PreparedHandler::Return(PreparedReturn::Static(response, types), _) => typed_return(
+            Response::Prebuilt(response.pick(req.method)),
+            *types,
+            url_path,
+        ),
+        PreparedHandler::Return(
+            PreparedReturn::Template {
+                status,
+                parts,
+                types,
+            },
+            _,
+        ) => {
+            let response = Response::Owned(build_templated_return(
                 *status,
                 parts,
                 &render_ctx_base,
                 req.method,
                 server_bytes,
                 phase::RedirectCtx::new(loc.redirect, req, server),
-            ))
+            ));
+            typed_return(response, *types, url_path)
         }
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
         // ngx_http_stub_status_handler: GET and HEAD only, text/plain.
@@ -1322,6 +1351,12 @@ pub(crate) fn run_location_handler(
             let get_or_head = matches!(req.method, Method::Get | Method::Head);
             if !get_or_head && req.method_bytes != b"POST" {
                 break 'root Response::Owned(file::method_not_allowed(req.method, server_bytes));
+            }
+            // An `alias` after a rewrite: nothing to map (#589).
+            if !matches!(root.path_mapping, PreparedPathMapping::Root)
+                && loc.doc_root.alias_refused(rewrite_state)
+            {
+                break 'root crate::worker::internal_error_response(req.method);
             }
             let last_modified_override =
                 last_modified_override_for_conditionals(loc.add_headers, &render_ctx_base);
@@ -1981,7 +2016,27 @@ fn resolve_bind(
 }
 
 #[cfg(test)]
+mod body_framed_tests {
+    use super::body_framed;
+
+    #[test]
+    fn body_framing_is_found_by_its_header_names() {
+        assert!(!body_framed(b""));
+        assert!(!body_framed(b"Host: x\r\nX-A: 1\r\n"));
+        assert!(body_framed(b"Host: x\r\nContent-Length: 0\r\n"));
+        assert!(body_framed(b"content-length: 0\r\n"));
+        assert!(body_framed(b"Host: x\r\nTRANSFER-ENCODING: chunked"));
+        // Only the whole name before the colon counts.
+        assert!(!body_framed(b"Content-Lengths: 0\r\nTransfer: x\r\n"));
+        assert!(!body_framed(
+            b"Content-Type: text/plain\r\nCookie: content-length:1\r\n"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod range_offset_tests {
+
     use super::range_too_far;
 
     /// ngx_http_upstream_cache_check_range's cases.

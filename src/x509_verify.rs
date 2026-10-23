@@ -19,13 +19,15 @@ use aws_lc_sys as ffi;
 #[derive(Debug)]
 pub struct Store(*mut ffi::X509_STORE);
 
-// X509_STORE is reference-counted and locks its own tables; once loaded it
-// is only read.
+// SAFETY: X509_STORE is reference-counted and locks its own tables; once
+// loaded it is only read, from any thread.
 unsafe impl Send for Store {}
+// SAFETY: as for Send: lookups during verification take the store's lock.
 unsafe impl Sync for Store {}
 
 impl Drop for Store {
     fn drop(&mut self) {
+        // SAFETY: the store is ours (X509_STORE_new), freed once, here.
         unsafe { ffi::X509_STORE_free(self.0) }
     }
 }
@@ -62,6 +64,7 @@ pub(crate) struct Cert(pub(crate) *mut ffi::X509);
 
 impl Drop for Cert {
     fn drop(&mut self) {
+        // SAFETY: a Cert owns its X509 (from d2i_X509), freed once, here.
         unsafe { ffi::X509_free(self.0) }
     }
 }
@@ -69,6 +72,8 @@ impl Drop for Cert {
 impl Cert {
     pub(crate) fn from_der(der: &[u8]) -> Option<Self> {
         let mut p = der.as_ptr();
+        // SAFETY: d2i_X509 reads at most `der.len()` bytes from `p` and
+        // returns a new X509 (or NULL) that the Cert then owns.
         let x = unsafe { ffi::d2i_X509(ptr::null_mut(), &mut p, der.len() as c_long) };
         (!x.is_null()).then_some(Cert(x))
     }
@@ -77,12 +82,16 @@ impl Cert {
 /// The most recent error of this thread's queue, as OpenSSL prints it;
 /// the queue is cleared.
 pub(crate) fn ssl_error() -> String {
+    // SAFETY: the error queue is per thread; these take no pointers.
     let code = unsafe { ffi::ERR_get_error() };
+    // SAFETY: as above.
     unsafe { ffi::ERR_clear_error() };
     if code == 0 {
         return "no certificate or crl found".to_string();
     }
     let mut buf = [0 as c_char; 256];
+    // SAFETY: ERR_error_string_n writes at most `buf.len()` bytes into
+    // `buf`, NUL included, so it holds a C string afterwards.
     unsafe {
         ffi::ERR_error_string_n(code, buf.as_mut_ptr(), buf.len());
         CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
@@ -103,18 +112,25 @@ impl Store {
     /// A store that trusts nothing yet (`ssl_verify_client optional_no_ca`
     /// without certificates).
     pub fn empty(depth: u32) -> Result<Store, String> {
+        // SAFETY: a new store, owned by the Store from here.
         let store = unsafe { ffi::X509_STORE_new() };
         if store.is_null() {
             return Err(ssl_error());
         }
-        unsafe { ffi::X509_STORE_set_depth(store, depth.min(c_int::MAX as u32) as c_int) };
-        Ok(Store(store))
+        let store = Store(store);
+        // SAFETY: `store.0` is a live store; the depth is in range.
+        if unsafe { ffi::X509_STORE_set_depth(store.0, depth.min(c_int::MAX as u32) as c_int) } != 1
+        {
+            return Err(ssl_error());
+        }
+        Ok(store)
     }
 
     /// A store with no depth of its own: a server's SSL_CTX store as
     /// OCSP_basic_verify uses it (`ssl_stapling_verify`, #141), since
     /// `ssl_verify_depth` limits the SSL_CTX, not its store.
     pub fn without_depth() -> Result<Store, String> {
+        // SAFETY: a new store, owned by the Store from here.
         let store = unsafe { ffi::X509_STORE_new() };
         if store.is_null() {
             return Err(ssl_error());
@@ -137,11 +153,15 @@ impl Store {
     /// (X509_V_FLAG_CRL_CHECK_ALL, as ngx_ssl_crl sets).
     pub fn add_crl(&mut self, pem: &[u8]) -> Result<(), String> {
         self.load(pem)?;
-        unsafe {
+        // SAFETY: `self.0` is a live store, not yet shared.
+        let set = unsafe {
             ffi::X509_STORE_set_flags(
                 self.0,
                 (ffi::X509_V_FLAG_CRL_CHECK | ffi::X509_V_FLAG_CRL_CHECK_ALL) as _,
-            );
+            )
+        };
+        if set != 1 {
+            return Err(ssl_error());
         }
         Ok(())
     }
@@ -153,9 +173,17 @@ impl Store {
         // type finds them all. The _AUX reader takes OpenSSL's `TRUSTED
         // CERTIFICATE` form too (`openssl x509 -trustout`), as
         // X509_load_cert_crl_file does (ssl_certificate_aux.t).
-        let bio = || unsafe { ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _) };
+        let bio = || {
+            // SAFETY: a read-only BIO over `pem`, which outlives it: each
+            // is freed below before `load` returns.
+            let b = unsafe { ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _) };
+            if b.is_null() { Err(ssl_error()) } else { Ok(b) }
+        };
+        // SAFETY: `b` is a live BIO until its BIO_free; each X509 and CRL
+        // read is ours until freed, X509_STORE_add_* taking references of
+        // their own; `self.0` is a live store.
         unsafe {
-            let b = bio();
+            let b = bio()?;
             loop {
                 let x = ffi::PEM_read_bio_X509_AUX(b, ptr::null_mut(), None, ptr::null_mut());
                 if x.is_null() {
@@ -171,7 +199,7 @@ impl Store {
             }
             ffi::BIO_free(b);
             ffi::ERR_clear_error();
-            let b = bio();
+            let b = bio()?;
             loop {
                 let crl = ffi::PEM_read_bio_X509_CRL(b, ptr::null_mut(), None, ptr::null_mut());
                 if crl.is_null() {
@@ -231,18 +259,27 @@ impl Store {
             .iter()
             .map(|der| Cert::from_der(der).ok_or(Failure::BadDer))
             .collect::<Result<_, _>>()?;
+        // SAFETY: the stack borrows `chain`'s certificates (OPENSSL_sk_free
+        // leaves them to `chain`); the context points into `self.0`,
+        // `leaf` and the stack, all alive until X509_STORE_CTX_free, which
+        // comes first. X509_STORE_CTX_free takes NULL.
         let code = unsafe {
             let stack = ffi::OPENSSL_sk_new_null();
             if stack.is_null() {
                 return Err(Failure::BadDer);
             }
-            for c in &chain {
-                ffi::OPENSSL_sk_push(stack, c.0 as *mut c_void);
-            }
+            // A certificate left out could only make the chain fail, or
+            // find another; count it as a failure anyway (#517).
+            let pushed = chain
+                .iter()
+                .all(|c| ffi::OPENSSL_sk_push(stack, c.0 as *mut c_void) != 0);
             let ctx = ffi::X509_STORE_CTX_new();
-            let code = if ctx.is_null()
+            let code = if !pushed
+                || ctx.is_null()
                 || ffi::X509_STORE_CTX_init(ctx, self.0, leaf.0, stack as *mut ffi::stack_st_X509)
                     != 1
+                // Without it the purpose and trust checks are skipped.
+                || ffi::X509_STORE_CTX_set_default(ctx, purpose.as_ptr()) != 1
             {
                 ffi::X509_V_ERR_UNSPECIFIED as c_long
             } else {
@@ -250,21 +287,35 @@ impl Store {
                 // callback, which lets the chain be checked to the end
                 // (ngx_ssl_verify_callback): the result is the last error,
                 // as SSL_get_verify_result has it.
-                ffi::X509_STORE_CTX_set_default(ctx, purpose.as_ptr());
                 ffi::X509_STORE_CTX_set_verify_cb(ctx, Some(keep_going));
-                ffi::X509_verify_cert(ctx);
-                ffi::X509_STORE_CTX_get_error(ctx) as c_long
+                let ret = ffi::X509_verify_cert(ctx);
+                verdict(ret, ffi::X509_STORE_CTX_get_error(ctx) as c_long)
             };
             ffi::X509_STORE_CTX_free(ctx);
-            // The certificates are `chain`'s, freed with it.
             ffi::OPENSSL_sk_free(stack);
             code
         };
         if code != ffi::X509_V_OK as c_long {
+            // SAFETY: X509_verify_cert_error_string returns a static C
+            // string for any code.
             let text = unsafe { CStr::from_ptr(ffi::X509_verify_cert_error_string(code)) };
             return Err(Failure::Verify(code, text.to_string_lossy().into_owned()));
         }
         Ok(())
+    }
+}
+
+/// The outcome of X509_verify_cert, from its return value and the
+/// context's error. With `keep_going` a refused chain returns 1 with its
+/// error set, which is the code; but a failure is never taken for success
+/// because the error stayed `X509_V_OK` (#517): AWS-LC sets one on every
+/// failure today, and verification shouldn't depend on that.
+fn verdict(ret: c_int, error: c_long) -> c_long {
+    let ok = ffi::X509_V_OK as c_long;
+    match (ret, error) {
+        (1, e) if e == ok => ok,
+        (_, e) if e == ok => ffi::X509_V_ERR_UNSPECIFIED as c_long,
+        (_, e) => e,
     }
 }
 
@@ -285,10 +336,16 @@ pub fn error_is_optional(code: c_long) -> bool {
 /// The DER subject names of the certificates in a PEM text, each once:
 /// the CA list a server sends with its CertificateRequest, as
 /// SSL_load_client_CA_file reads it from `ssl_client_certificate`.
-pub fn subjects(pem: &[u8]) -> Vec<Vec<u8>> {
+pub fn subjects(pem: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let mut out: Vec<Vec<u8>> = Vec::new();
+    // SAFETY: a read-only BIO over `pem`, freed before it returns; each
+    // X509 read is ours until X509_free, and its subject name is borrowed
+    // from it while it lives; `der` holds `len` bytes for i2d to write.
     unsafe {
         let b = ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _);
+        if b.is_null() {
+            return Err(ssl_error());
+        }
         loop {
             let x = ffi::PEM_read_bio_X509_AUX(b, ptr::null_mut(), None, ptr::null_mut());
             if x.is_null() {
@@ -308,10 +365,10 @@ pub fn subjects(pem: &[u8]) -> Vec<Vec<u8>> {
         ffi::BIO_free(b);
         ffi::ERR_clear_error();
     }
-    out
+    Ok(out)
 }
 
-unsafe extern "C" fn keep_going(_ok: c_int, _ctx: *mut ffi::X509_STORE_CTX) -> c_int {
+extern "C" fn keep_going(_ok: c_int, _ctx: *mut ffi::X509_STORE_CTX) -> c_int {
     1
 }
 
@@ -337,9 +394,13 @@ impl NameToCheck<'_> {
                 IpAddr::V4(v4) => v4.octets().to_vec(),
                 IpAddr::V6(v6) => v6.octets().to_vec(),
             };
+            // SAFETY: `leaf` is a live X509; the address is `bytes.len()`
+            // bytes.
             unsafe { ffi::X509_check_ip(leaf.0, bytes.as_ptr(), bytes.len(), 0) == 1 }
         });
         ip_match
+            // SAFETY: `leaf` is a live X509; the name is `text.len()`
+            // bytes, and no peer name is asked for.
             || unsafe {
                 ffi::X509_check_host(
                     leaf.0,
@@ -356,6 +417,8 @@ impl NameToCheck<'_> {
 /// signature with: OpenSSL takes certificates webpki won't parse.
 pub fn spki(cert: &[u8]) -> Option<Vec<u8>> {
     let cert = Cert::from_der(cert)?;
+    // SAFETY: the key is borrowed from `cert`, which lives to the end;
+    // `out` holds the `len` bytes i2d_X509_PUBKEY writes.
     unsafe {
         let key = ffi::X509_get_X509_PUBKEY(cert.0);
         if key.is_null() {
@@ -434,6 +497,9 @@ pub fn print_field(der: &[u8], field: crate::config::SslClientField, out: &mut V
         return;
     };
     let x = cert.0;
+    // SAFETY: `x` is `cert`'s, alive to the end; names, times and the
+    // serial are borrowed from it; X509_NAME_oneline's string is ours until
+    // OPENSSL_free; `digest` has room for any digest (EVP_MAX_MD_SIZE).
     unsafe {
         match field {
             F::RawCert => print_to(out, |b| ffi::PEM_write_bio_X509(b, x)),
@@ -515,7 +581,13 @@ pub fn print_field(der: &[u8], field: crate::config::SslClientField, out: &mut V
 }
 
 /// What `print` writes into a memory BIO, appended to `out`.
+///
+/// # Safety
+///
+/// `print` must only write into the BIO it is given.
 unsafe fn print_to(out: &mut Vec<u8>, print: impl FnOnce(*mut ffi::BIO) -> c_int) {
+    // SAFETY: a new memory BIO, freed before it returns; its contents are
+    // borrowed only while it lives.
     unsafe {
         let bio = ffi::BIO_new(ffi::BIO_s_mem());
         if bio.is_null() {
@@ -561,8 +633,14 @@ pub fn decrypt_private_key(pem: &[u8], passwords: &[Vec<u8>]) -> Result<Vec<u8>,
     for password in passwords {
         let mut c_password: Vec<u8> = password.iter().copied().filter(|&b| b != 0).collect();
         c_password.push(0);
+        // SAFETY: a read-only BIO over `pem`, freed here; the password is
+        // a NUL-terminated buffer, wiped after use; the key is ours until
+        // EVP_PKEY_free below.
         let key = unsafe {
             let bio = ffi::BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as _);
+            if bio.is_null() {
+                return Err(ssl_error());
+            }
             let key = ffi::PEM_read_bio_PrivateKey(
                 bio,
                 ptr::null_mut(),
@@ -577,6 +655,9 @@ pub fn decrypt_private_key(pem: &[u8], passwords: &[Vec<u8>]) -> Result<Vec<u8>,
             reason = ssl_error();
             continue;
         }
+        // SAFETY: a zeroed CBB is the state CBB_init expects; `out` is
+        // ours after CBB_finish, `len` bytes, until OPENSSL_free; `key` is
+        // freed once, here.
         let der = unsafe {
             let mut cbb: ffi::CBB = std::mem::zeroed();
             let mut out: *mut u8 = ptr::null_mut();
@@ -594,6 +675,7 @@ pub fn decrypt_private_key(pem: &[u8], passwords: &[Vec<u8>]) -> Result<Vec<u8>,
             ffi::OPENSSL_free(out as *mut c_void);
             der
         };
+        // SAFETY: the thread's error queue; no pointers.
         unsafe { ffi::ERR_clear_error() };
         return Ok(der);
     }
@@ -612,9 +694,8 @@ mod tests {
     use crate::config::SslClientField as F;
 
     fn der(pem: &[u8]) -> Vec<u8> {
-        rustls_pemfile::certs(&mut &pem[..])
-            .next()
-            .unwrap()
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(pem)
             .unwrap()
             .to_vec()
     }
@@ -657,6 +738,20 @@ mod tests {
             "{escaped}"
         );
         assert!(!escaped.contains('\n') && !escaped.contains('+') && !escaped.contains('/'));
+    }
+
+    /// X509_verify_cert's verdict (#517): a refusal is its error; a failure
+    /// with no error set is still a failure.
+    #[test]
+    fn a_failure_without_an_error_is_still_a_failure() {
+        let ok = ffi::X509_V_OK as c_long;
+        let expired = ffi::X509_V_ERR_CERT_HAS_EXPIRED as c_long;
+        let unspecified = ffi::X509_V_ERR_UNSPECIFIED as c_long;
+        assert_eq!(verdict(1, ok), ok);
+        assert_eq!(verdict(1, expired), expired);
+        assert_eq!(verdict(0, expired), expired);
+        assert_eq!(verdict(0, ok), unspecified);
+        assert_eq!(verdict(-1, ok), unspecified);
     }
 
     /// RFC 2253: the RDNs last first, `,` escaped; the legacy form in

@@ -206,3 +206,72 @@ fn charset_labels_content_type_like_nginx() {
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `return` types its response as nginx types any (#691): by the URI's
+/// extension, else `default_type`, with text or without; a 204 has no
+/// type, and a redirect keeps its page's.
+#[test]
+fn return_takes_the_type_of_the_uri() {
+    let dir = std::env::temp_dir().join(format!("ruxen-m134-return-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let setup = common::ports::setup_lock();
+    let [port] = common::ports::free_ports();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{\naccess_log off;\n\
+             types {{ text/html html; }}\ndefault_type application/octet-stream;\n\
+             server {{ listen 127.0.0.1:{port};\n\
+               location /a {{ return 200; }}\n\
+               location /b {{ return 200 x; }}\n\
+               location /c {{ return 404 nf; }}\n\
+               location /d {{ if ($arg_x) {{ return 200 $arg_x; }} return 204; }}\n\
+               location /e {{ default_type application/json; return 200 '{{}}'; }}\n\
+               location /m {{ return 301 /b; }}\n\
+             }} }}\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    let mut child = common::KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::ports::wait_for_pid_file(&mut child, &dir.join("ruxen.pid"), Duration::from_secs(5));
+    drop(setup);
+    let get = |path: &str| -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        raw.lines()
+            .find_map(|l| l.strip_prefix("Content-Type: "))
+            .unwrap_or("")
+            .to_string()
+    };
+    for (path, wanted) in [
+        ("/a", "application/octet-stream"),
+        ("/b", "application/octet-stream"),
+        ("/b.html", "text/html"),
+        ("/c", "application/octet-stream"),
+        ("/d?x=1", "application/octet-stream"),
+        ("/d", ""),
+        ("/e", "application/json"),
+        ("/m", "text/html"),
+    ] {
+        assert_eq!(get(path), wanted, "{path}");
+    }
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

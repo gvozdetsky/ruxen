@@ -150,7 +150,10 @@ fn https_upstreams_like_nginx() {
     // A plain HTTP server where TLS is expected: 502, and nginx's line.
     let (status, _) = get(front, "/handshake/");
     assert_eq!(status, 502);
-    let log = std::fs::read_to_string(s.dir.join("error.log")).unwrap_or_default();
+    // Lossy: the plain server logs the ClientHello it refused as its
+    // request line, binary as nginx writes it (#663).
+    let log = String::from_utf8_lossy(&std::fs::read(s.dir.join("error.log")).unwrap_or_default())
+        .into_owned();
     assert!(
         log.contains("SSL_do_handshake() failed")
             && log.contains("while SSL handshaking to upstream")
@@ -489,7 +492,11 @@ fn client_certificates_to_upstreams() {
     let client = common::tls::make_ca_and_leaf("client.test");
     let ca_pem = std::fs::read(client.ca_path().unwrap()).unwrap();
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut &ca_pem[..]) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &ca_pem,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());

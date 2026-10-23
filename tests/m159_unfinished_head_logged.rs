@@ -158,3 +158,42 @@ fn m159_the_first_head_is_timed_from_the_accept() {
         "{took:?}"
     );
 }
+
+/// A head the parser refuses gets its 400 and nginx's `[info]` reason
+/// (#663): an invalid method, a bad header line, an invalid Host.
+#[test]
+fn m159_a_refused_head_logs_its_reason() {
+    let (server, port) = start("refused");
+    for raw in [
+        &b"G3T / HTTP/1.1\r\nHost: x\r\n\r\n"[..],
+        b"GET / HTTP/1.1\r\nHost: x\r\nBad\x01Header: v\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: a/b\r\n\r\n",
+    ] {
+        let out = send(port, raw, false);
+        assert!(
+            out.starts_with(b"HTTP/1.1 400 "),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    let wanted = [
+        "client sent invalid method while reading client request line, client: 127.0.0.1, \
+         server: , request: \"G3T / HTTP/1.1\"",
+        "client sent invalid header line: \"Bad\\x01...\" while reading client request headers, \
+         client: 127.0.0.1, server: , request: \"GET / HTTP/1.1\", host: \"x\"",
+        "client sent invalid host header while reading client request headers, \
+         client: 127.0.0.1, server: , request: \"GET / HTTP/1.1\", host: \"a/b\"",
+    ];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(server.1.join("error.log")).unwrap_or_default();
+        if wanted
+            .iter()
+            .all(|w| log.lines().any(|l| l.contains("[info]") && l.ends_with(w)))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{log}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
