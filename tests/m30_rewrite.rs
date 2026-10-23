@@ -341,3 +341,131 @@ http {
         Some(format!("http://localhost:{port}/a%20dir/?x=1").as_str())
     );
 }
+
+/// A `rewrite` without a flag changes the URI, and once the location's
+/// rewrite directives are done the locations are searched again, as
+/// nginx's post-rewrite phase does (#682): a `proxy_pass` with a URI part
+/// there substitutes it, an `alias` maps the new URI. A top-level `return`
+/// answers first; `break` keeps the request where it is, `proxy_pass` then
+/// sending the new URI as it is; a rewrite back into the same location
+/// ends in a 500.
+#[test]
+fn a_rewrite_without_a_flag_searches_the_locations_again() {
+    let (g, port) = spawn_server(
+        "events {}\nhttp {\n\
+         server { listen 127.0.0.1:%%PORT%%;\n\
+           location /a/ { rewrite ^/a/(.*)$ /b/$1; }\n\
+           location /b/ { proxy_pass http://127.0.0.1:%%PORT%%/x/; }\n\
+           location /k/ { rewrite ^/k/(.*)$ /x/$1; break; proxy_pass http://127.0.0.1:%%PORT%%/x/z/; }\n\
+           location /x/ { return 200 \"x:$uri\"; }\n\
+           location /al/ { rewrite ^/al/(.*)$ /bar/$1; }\n\
+           location /bar/ { alias %%DIR%%/bar/; }\n\
+           location /once/ { rewrite ^/once/(.*)$ /once/x$1; return 200 \"uri:$uri\"; }\n\
+           location /loop/ { rewrite ^/loop/(.*)$ /loop/$1; }\n\
+         } }\n",
+    );
+    std::fs::create_dir_all(g.tempdir.join("bar")).unwrap();
+    std::fs::write(g.tempdir.join("bar/1"), "one").unwrap();
+
+    let a = http_get(port, "/a/1");
+    assert_eq!(body(&a), b"x:/x/1", "{}", String::from_utf8_lossy(&a));
+    let k = http_get(port, "/k/1");
+    assert_eq!(body(&k), b"x:/x/1", "{}", String::from_utf8_lossy(&k));
+    let al = http_get(port, "/al/1");
+    assert_eq!(body(&al), b"one", "{}", String::from_utf8_lossy(&al));
+    let once = http_get(port, "/once/1");
+    assert_eq!(
+        body(&once),
+        b"uri:/once/x1",
+        "{}",
+        String::from_utf8_lossy(&once)
+    );
+    let looped = http_get(port, "/loop/1");
+    assert_eq!(status_line(&looped), "HTTP/1.1 500 Internal Server Error");
+}
+
+/// An `alias` location maps nothing once a `rewrite` changed the URI in
+/// it, as nginx 1.30's ngx_http_map_uri_to_path refuses (#589):
+/// `$request_filename` is empty after a flagless rewrite (a `return`
+/// answering before the locations are searched again), and a file is a
+/// 500 after `rewrite … break`, both with an `[alert]`. Without a rewrite
+/// the alias maps as usual.
+#[test]
+fn an_alias_maps_nothing_after_a_rewrite() {
+    let (g, port) = spawn_server(
+        "error_log %%DIR%%/error.log info;\nevents {}\nhttp {\n\
+         server { listen 127.0.0.1:%%PORT%%;\n\
+           location /foo/ { alias %%DIR%%/bar/; rewrite ^/foo/.*$ /x; return 200 \"rf=[$request_filename]\"; }\n\
+           location /brk/ { alias %%DIR%%/bar/; rewrite ^/brk/(.*)$ /brk/x break; }\n\
+           location /set/ { alias %%DIR%%/bar/; return 200 \"rf=[$request_filename]\"; }\n\
+         } }\n",
+    );
+    std::fs::create_dir_all(g.tempdir.join("bar")).unwrap();
+    std::fs::write(g.tempdir.join("bar/x"), "x").unwrap();
+    let dir = g.tempdir.display().to_string();
+
+    let foo = http_get(port, "/foo/1");
+    assert_eq!(body(&foo), b"rf=[]", "{}", String::from_utf8_lossy(&foo));
+    let brk = http_get(port, "/brk/1");
+    assert_eq!(status_line(&brk), "HTTP/1.1 500 Internal Server Error");
+    let plain = http_get(port, "/set/1");
+    assert_eq!(
+        String::from_utf8_lossy(body(&plain)),
+        format!("rf=[{dir}/bar/1]")
+    );
+    let log = std::fs::read_to_string(g.tempdir.join("error.log")).unwrap_or_default();
+    for name in ["/foo/", "/brk/"] {
+        let alert =
+            format!("\"alias\" cannot be used in location \"{name}\" where URI was rewritten");
+        assert!(
+            log.lines()
+                .any(|l| l.contains("[alert]") && l.contains(&alert)),
+            "{alert}\n{log}"
+        );
+    }
+}
+
+/// What clears the rewrite flags (#682), as nginx: `last` and every new
+/// location search clear `uri_changed`, and an internal redirect
+/// (`error_page`, `try_files`) sets `valid_location` again, so an alias
+/// location found after them maps as usual; ten flagless rewrites in a
+/// row are within nginx's budget of URI changes.
+#[test]
+fn rewrites_before_a_redirect_leave_no_trace() {
+    let mut chain = String::new();
+    for i in 1..10 {
+        chain.push_str(&format!(
+            "location /l{i}/ {{ rewrite ^/l{i}/(.*) /l{}/$1; }}\n",
+            i + 1
+        ));
+    }
+    let (g, port) = spawn_server(&format!(
+        "events {{}}\nhttp {{\n\
+         server {{ listen 127.0.0.1:%%PORT%%; root %%DIR%%;\n\
+           location /a/ {{ rewrite ^/a/(.*) /b/$1; rewrite ^/b/(.*) /c/$1 last; }}\n\
+           location /c/ {{ alias %%DIR%%/c/; }}\n\
+           location /d/ {{ rewrite ^/d/(.*) /e/$1; error_page 404 /err/404.html; return 404; }}\n\
+           location /err/ {{ alias %%DIR%%/err/; }}\n\
+           location /g/ {{ rewrite ^/g/(.*) /h/$1 break; error_page 404 /err/404.html; }}\n\
+           location /t/ {{ rewrite ^/t/(.*) /u/$1 break; try_files $uri /c/f.txt; }}\n\
+           {chain}\
+           location /l10/ {{ return 200 \"end $uri\"; }}\n\
+         }} }}\n"
+    ));
+    std::fs::create_dir_all(g.tempdir.join("c")).unwrap();
+    std::fs::create_dir_all(g.tempdir.join("err")).unwrap();
+    std::fs::write(g.tempdir.join("c/f.txt"), "file").unwrap();
+    std::fs::write(g.tempdir.join("err/404.html"), "err").unwrap();
+
+    for (path, status, wanted) in [
+        ("/a/f.txt", "HTTP/1.1 200 OK", &b"file"[..]),
+        ("/d/x", "HTTP/1.1 404 Not Found", b"err"),
+        ("/g/x", "HTTP/1.1 404 Not Found", b"err"),
+        ("/t/x", "HTTP/1.1 200 OK", b"file"),
+        ("/l1/x", "HTTP/1.1 200 OK", b"end /l10/x"),
+    ] {
+        let resp = http_get(port, path);
+        assert_eq!(status_line(&resp), status, "{path}");
+        assert_eq!(body(&resp), wanted, "{path}");
+    }
+}

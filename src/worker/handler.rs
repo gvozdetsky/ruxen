@@ -1271,6 +1271,7 @@ pub(crate) fn run_location_handler(
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
+            error_page_status,
             intercept,
             upgrade: client_upgrade,
             // A response the range filter may cut is read whole (#370).
@@ -1322,6 +1323,12 @@ pub(crate) fn run_location_handler(
             let get_or_head = matches!(req.method, Method::Get | Method::Head);
             if !get_or_head && req.method_bytes != b"POST" {
                 break 'root Response::Owned(file::method_not_allowed(req.method, server_bytes));
+            }
+            // An `alias` after a rewrite: nothing to map (#589).
+            if !matches!(root.path_mapping, PreparedPathMapping::Root)
+                && loc.doc_root.alias_refused(rewrite_state)
+            {
+                break 'root crate::worker::internal_error_response(req.method);
             }
             let last_modified_override =
                 last_modified_override_for_conditionals(loc.add_headers, &render_ctx_base);

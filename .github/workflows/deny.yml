@@ -1,0 +1,22 @@
+name: Advisories
+
+# RustSec advisories for both lock files (#476). Daily too: an advisory is
+# published without any change here, so a check on pull requests alone
+# would miss it until the next one.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *"
+
+jobs:
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - name: Cargo.lock
+        run: cargo deny --locked check advisories
+      - name: fuzz/Cargo.lock
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked check advisories
