@@ -212,11 +212,15 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
     ("ssi", Some("off"), "server-side includes are not processed"),
     (
         "charset",
-        Some("off"),
-        "no charset is added to Content-Type, and nothing is converted",
+        None,
+        "a charset from a variable is not supported yet: none is added to Content-Type",
     ),
     ("override_charset", Some("off"), "nothing is converted"),
-    ("source_charset", None, "nothing is converted"),
+    (
+        "source_charset",
+        None,
+        "nothing is converted: a response is labelled only when it is already in `charset`",
+    ),
     ("etag", Some("on"), "static responses still carry an ETag"),
     (
         "if_modified_since",

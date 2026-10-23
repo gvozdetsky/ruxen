@@ -138,8 +138,9 @@ pub struct ProxyConf {
     pub connect_timeout_ms: Option<u64>,
     pub read_timeout_ms: Option<u64>,
     pub send_timeout_ms: Option<u64>,
-    /// `proxy_limit_rate` in bytes/sec; `0` means unlimited.
-    pub limit_rate: Option<u64>,
+    /// `proxy_limit_rate` in bytes/sec (a size, variables allowed); `0`
+    /// means unlimited.
+    pub limit_rate: Option<Vec<ValuePart>>,
     /// `proxy_http_version 1.0|1.1`, stored as the minor digit.
     pub http_version: Option<u8>,
     /// `proxy_next_upstream`; unset means nginx's `error timeout`.
@@ -337,7 +338,7 @@ impl ProxyConf {
             connect_timeout_ms: self.connect_timeout_ms.or(parent.connect_timeout_ms),
             read_timeout_ms: self.read_timeout_ms.or(parent.read_timeout_ms),
             send_timeout_ms: self.send_timeout_ms.or(parent.send_timeout_ms),
-            limit_rate: self.limit_rate.or(parent.limit_rate),
+            limit_rate: self.limit_rate.or_else(|| parent.limit_rate.clone()),
             http_version: self.http_version.or(parent.http_version),
             next_upstream: self.next_upstream.or(parent.next_upstream),
             next_upstream_tries: self.next_upstream_tries.or(parent.next_upstream_tries),
@@ -1092,6 +1093,10 @@ pub struct Server {
     /// `add_headers`. Trailers force chunked transfer-encoding on the
     /// response when the list is non-empty.
     pub add_trailers: Option<Vec<AddHeader>>,
+    /// `add_header_inherit` / `add_trailer_inherit` (#598), with the http
+    /// level's when the server sets none.
+    pub add_header_inherit: Option<HeaderInherit>,
+    pub add_trailer_inherit: Option<HeaderInherit>,
     /// Server-scope `error_page` stack. Multiple directives accumulate in
     /// declaration order; a location with its own list replaces the
     /// inherited server list entirely, mirroring nginx's merge behavior.
@@ -1207,7 +1212,35 @@ pub struct Server {
     pub redirect: RedirectConf,
     /// `types {}` / `default_type` (#38), http's merged in.
     pub mime: MimeConf,
+    /// `charset`, `charset_types`, `source_charset` (#464).
+    pub charset: CharsetConf,
     pub locations: Vec<Location>,
+}
+
+/// `charset`, `charset_types` and `source_charset` of one level (#464),
+/// each `None` until set, as nginx's charset filter merges them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CharsetConf {
+    /// `charset NAME`, `Some(None)` for `charset off`.
+    pub charset: Option<Option<String>>,
+    /// `charset_types`, lowercased; `*` is any type.
+    pub types: Option<Vec<String>>,
+    /// `source_charset NAME`.
+    pub source: Option<String>,
+}
+
+impl CharsetConf {
+    pub(crate) fn inherit(&mut self, parent: &CharsetConf) {
+        if self.charset.is_none() {
+            self.charset.clone_from(&parent.charset);
+        }
+        if self.types.is_none() {
+            self.types.clone_from(&parent.types);
+        }
+        if self.source.is_none() {
+            self.source.clone_from(&parent.source);
+        }
+    }
 }
 
 /// `types {}` and `default_type` of one level (#38), `None` until set.
@@ -1350,14 +1383,22 @@ pub struct Location {
     /// Location-scope `try_files`. Not inherited. A location without it
     /// goes straight to the static/index resolver for its `root`.
     pub try_files: Option<TryFiles>,
-    /// Location-scope `add_header` stack. Inheritance: child list (if
-    /// `Some`) replaces parent's entirely — nginx's
-    /// `ngx_http_headers_filter_module.c::ngx_http_headers_merge_conf`
-    /// semantics. `None` here means "inherit from server".
+    /// Location-scope `add_header` stack: the location's own list while
+    /// parsing, its effective one once `config::merge_add_headers` has
+    /// put it over the enclosing locations' and the server's (nginx's
+    /// `ngx_http_headers_merge_conf`, with `add_header_inherit`, #598).
+    /// `None` then means "the server's, as it is".
     pub add_headers: Option<Vec<AddHeader>>,
     /// Location-scope `add_trailer` stack. Same shape and merge rules as
     /// `add_headers`.
     pub add_trailers: Option<Vec<AddHeader>>,
+    /// Location-scope `add_header_inherit` / `add_trailer_inherit` (#598).
+    pub add_header_inherit: Option<HeaderInherit>,
+    pub add_trailer_inherit: Option<HeaderInherit>,
+    /// The enclosing locations' own lists and modes, outermost first, for
+    /// the merge with the server's once it is known (#598). Empty for a
+    /// top-level location.
+    pub header_ancestors: Vec<HeaderLevel>,
     /// Location-scope `error_page` stack. Inheritance mirrors nginx core:
     /// if the child has any entries it replaces the parent's list outright;
     /// otherwise it inherits the server-level list.
@@ -1461,6 +1502,8 @@ pub struct Location {
     pub redirect: RedirectConf,
     /// `types {}` / `default_type` (#38), likewise.
     pub mime: MimeConf,
+    /// `charset`, `charset_types`, `source_charset` (#464).
+    pub charset: CharsetConf,
     /// The location's own `client_body_timeout` / `send_timeout` (#147);
     /// `client_header_timeout` stays a server setting.
     pub client_timeouts: ClientTimeouts,
@@ -1687,6 +1730,31 @@ pub struct KeepaliveTimeout {
 pub struct KeepaliveDisable {
     pub msie6: bool,
     pub safari: bool,
+}
+
+/// `add_header_inherit` / `add_trailer_inherit` (nginx 1.29.3, #598): how
+/// a level's `add_header` (or `add_trailer`) list relates to the one it
+/// would inherit (ngx_http_headers_merge_conf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderInherit {
+    /// Nothing inherited, even with no list of its own.
+    Off,
+    /// The default: inherited unless the level has its own list.
+    On,
+    /// The level's own list, then the inherited one.
+    Merge,
+}
+
+/// A location's own `add_header` / `add_trailer` lists and inherit modes,
+/// as an enclosing location passes them on (#598): the server's lists
+/// apply on top of the chain once the server is known
+/// (`config::merge_add_headers`).
+#[derive(Debug, Clone, Default)]
+pub struct HeaderLevel {
+    pub headers: Option<Vec<AddHeader>>,
+    pub trailers: Option<Vec<AddHeader>>,
+    pub headers_inherit: Option<HeaderInherit>,
+    pub trailers_inherit: Option<HeaderInherit>,
 }
 
 /// One `add_header NAME VALUE [always];` entry. `always` toggles whether

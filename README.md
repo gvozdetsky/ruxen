@@ -63,7 +63,7 @@ cd ruxen-v*-x86_64-linux-gnu
 ./ruxen -V
 ```
 
-On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`) and a `SHA256SUMS` file.
+On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`), a CycloneDX SBOM per target (`ruxen-v<version>-<target>.cdx.json`) and a `SHA256SUMS` file. The tarballs carry build-provenance and SBOM attestations, signed with the release workflow's identity: `gh attestation verify ruxen-x86_64-linux-gnu.tar.gz -R gvozdetsky/ruxen`. The binaries embed their crate list (`cargo audit bin ruxen`, Trivy and Syft read it).
 
 **Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), published with every release after 0.1.2:
 
@@ -277,7 +277,7 @@ A growing nginx-compatible configuration surface is implemented. [`docs/directiv
 
 - `include`, with patterns (`include conf.d/*.conf;`: the matches sorted, none is fine, as nginx's glob)
 - `return`, including `return URL;` (a 302)
-- `add_header` and `add_trailer`, at http, server and location level
+- `add_header` and `add_trailer`, at http, server and location level, with `add_header_inherit` / `add_trailer_inherit` (`merge` keeps the inherited headers under a level's own)
 - `types {}` (`include mime.types`) and `default_type`, as nginx sets Content-Type: no charset is added, and without `types` only .html, .gif and .jpg have a type
 - `expires`
 - `error_page` and `recursive_error_pages`
@@ -316,7 +316,7 @@ The currently implemented nginx-style command-line surface includes:
 
 and one option nginx doesn't have: `--compat`, the configuration check described in [Check your nginx configuration](#check-your-nginx-configuration).
 
-`-V` starts with `ruxen version: ruxen/<version>`, followed by a `configure arguments` list in nginx's format that names only the modules ruxen actually implements: the nginx-tests harness reads it to decide which tests apply.
+`-V` starts with `ruxen version: ruxen/<version>`, followed by a `configure arguments` list in nginx's format that names only the modules ruxen actually implements: the nginx-tests harness reads it to decide which tests apply. `-v` prints the first line only, as nginx's `-v` does.
 
 Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.30.6` instead, because the upstream tests assert nginx's header, and puts `nginx version: nginx/1.30.6` at the top of `-V`, which the harness needs too.
 
@@ -447,4 +447,4 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup (tests, nginx-tests, benchmar
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) lists the material that comes from nginx (`mime.types`, among others) and its 2-clause BSD licence; the release tarballs and images carry both files.

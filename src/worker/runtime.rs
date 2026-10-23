@@ -707,6 +707,67 @@ async fn many_header_lines<S: ConnIo>(
     reject_request(stream, scratch, http, response, head, conn).await;
 }
 
+/// nginx's `[info]` line for a request refused while its head is read
+/// (#663): `client sent invalid method while reading client request
+/// line`, `client sent invalid header line: "…"`, …, with the default
+/// server's error log, as nginx logs them before a server is chosen.
+#[cold]
+#[inline(never)]
+fn refused_head_log(
+    http: &'static PreparedHttp,
+    conn: &ConnLogCtx<'_>,
+    request_line: &[u8],
+    host: Option<&[u8]>,
+    message: &str,
+) {
+    let listen = &http.listens[conn.listen_index];
+    let server = &listen.servers[listen.default_server];
+    write_error_log(
+        server.error_logs,
+        ErrorLogLevel::Info,
+        &ErrorLogRequest {
+            connection_id: conn.connection_id,
+            client: conn.remote_addr,
+            server: server.primary_server_name,
+            request_line,
+            host,
+        },
+        message.as_bytes(),
+        None,
+    );
+}
+
+/// Why the parser refused `head` (`http::refusal_reason`), logged.
+#[cold]
+#[inline(never)]
+fn invalid_head_log(http: &'static PreparedHttp, conn: &ConnLogCtx<'_>, head: &[u8], h2: bool) {
+    let refusal = http::refusal_reason(head, h2);
+    refused_head_log(
+        http,
+        conn,
+        refusal.request_line,
+        refusal.host,
+        &refusal.message,
+    );
+}
+
+/// A parsed head refused for its `Host` or `Transfer-Encoding`, logged.
+#[cold]
+#[inline(never)]
+fn refused_parsed_head_log(
+    http: &'static PreparedHttp,
+    conn: &ConnLogCtx<'_>,
+    head: &[u8],
+    message: &str,
+) {
+    let request_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    let host = lookup_request_header(&head[request_end..], b"host");
+    refused_head_log(http, conn, &head[..request_end], host, message);
+}
+
 /// A request head over `large_client_header_buffers` (#482), answered and
 /// logged as nginx does (`src/http/ngx_http_request.c:1189`, `:1370`): a
 /// request line that doesn't fit gets 414 and `client sent too long URI`;
@@ -841,9 +902,23 @@ async fn settle_proxy_response(
     // closes ends the exchange, and with it the upstream connection (the
     // proxy future is dropped).
     let client = client.filter(|_| !plan.ignore_client_abort);
+    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+        let meta = &process_meta;
+        move |status: u16, headers: &[u8]| {
+            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        }
+    });
     let upstream_resp = {
-        let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report));
-        super::client_watch::Watched::new(proxy, client).await
+        let late = late_limit_rate
+            .as_ref()
+            .map(|late| late as crate::proxy::LateLimitRate<'_>);
+        let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
+        let watched = if process_meta.limit_conn_held.is_some() {
+            super::client_watch::Watched::at_once(proxy, client)
+        } else {
+            super::client_watch::Watched::new(proxy, client)
+        };
+        watched.await
     };
     let Some(upstream_resp) = upstream_resp else {
         client_closed_log(&process_meta, ctx);
@@ -856,6 +931,9 @@ async fn settle_proxy_response(
         }
         let mut process_meta = process_meta;
         process_meta.upstream_states = report.states;
+        // The limit_conn counts go back now, as nginx frees them when it
+        // finalizes the request, not once the connection is torn down.
+        process_meta.limit_conn_held = None;
         return (Response::Prebuilt(super::CLIENT_CLOSED), process_meta);
     };
     if !report.failures.is_empty() {
@@ -1280,7 +1358,16 @@ async fn run_proxy_pass(
     };
     let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
-    let upstream_resp = crate::proxy::run_proxy(plan, &mut report).await;
+    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+        let meta = &process_meta;
+        move |status: u16, headers: &[u8]| {
+            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        }
+    });
+    let late = late_limit_rate
+        .as_ref()
+        .map(|late| late as crate::proxy::LateLimitRate<'_>);
+    let upstream_resp = crate::proxy::run_proxy(plan, &mut report, late).await;
     if !report.failures.is_empty() {
         write_upstream_error_log(
             &process_meta.log,
@@ -1895,12 +1982,15 @@ pub fn run(
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(state);
                 if state.is_shutting_down() {
+                    worker_notice(http, "gracefully shutting down");
                     // Stop accepting at once: after a reload, the socket
                     // goes on with the next generation's worker, or is
                     // closed if the address went away.
                     drop(listener);
                     drain(state, inherited.as_deref()).await;
+                    worker_notice(http, "exiting");
                     flush_access_log_buffers();
+                    worker_notice(http, "exit");
                     return;
                 }
                 match accept_or_tick(&listener, &mut tick, state).await {
@@ -1952,6 +2042,7 @@ pub fn run(
                 // Shutdown or a reload wakes the idle connections.
                 notice_runtime_events(state);
                 if state.is_shutting_down() {
+                    worker_notice(http, "gracefully shutting down");
                     // The accept loops cancel their accepts and close their
                     // sockets. Dropped with the runtime instead, an accept
                     // left in the ring kept the socket listening after a
@@ -1960,7 +2051,9 @@ pub fn run(
                         task.await;
                     }
                     drain(state, inherited.as_deref()).await;
+                    worker_notice(http, "exiting");
                     flush_access_log_buffers();
+                    worker_notice(http, "exit");
                     return;
                 }
                 monoio::time::sleep(Duration::from_millis(10)).await;
@@ -2007,6 +2100,13 @@ pub fn run(
         },
         Driver::Epoll => run_epoll(body),
     }
+}
+
+/// nginx's notice lines for a worker's end, from its own thread
+/// (ngx_worker_process_cycle, ngx_worker_process_exit; #669).
+#[cold]
+fn worker_notice(http: &PreparedHttp, message: &str) {
+    write_worker_log(http.error_logs, ErrorLogLevel::Notice, message);
 }
 
 /// Ring sizes, largest first: the size of a generation's rings, and the
@@ -4079,6 +4179,27 @@ pub(crate) async fn handle<S: ConnIo>(
                                     RequestTransferEncoding::Invalid => Some(400),
                                 }
                             };
+                            if refuse.is_some() {
+                                let message = if !req.http_11 {
+                                    "client sent HTTP/1.0 request with \"Transfer-Encoding\" header"
+                                        .to_string()
+                                } else if req.content_length.is_some() {
+                                    "client sent \"Content-Length\" and \"Transfer-Encoding\" \
+                                     headers at the same time"
+                                        .to_string()
+                                } else {
+                                    format!(
+                                        "client sent unknown \"Transfer-Encoding\": \"{}\"",
+                                        String::from_utf8_lossy(te)
+                                    )
+                                };
+                                refused_parsed_head_log(
+                                    http,
+                                    conn_log!(),
+                                    &buf[base..base + req.headers_end],
+                                    &format!("{message} while reading client request headers"),
+                                );
+                            }
                         }
                         let mut bad_host = false;
                         let request_line_host =
@@ -4094,6 +4215,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
+                                    refused_parsed_head_log(
+                                        http,
+                                        conn_log!(),
+                                        &buf[base..base + req.headers_end],
+                                        "client sent invalid host in request line while reading client request line",
+                                    );
                                     None
                                 }
                             },
@@ -4109,6 +4236,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
+                                    refused_parsed_head_log(
+                                        http,
+                                        conn_log!(),
+                                        &buf[base..base + req.headers_end],
+                                        "client sent invalid host header while reading client request headers",
+                                    );
                                     None
                                 }
                             },
@@ -4757,7 +4890,7 @@ pub(crate) async fn handle<S: ConnIo>(
 
                         // gzip (`gzip on` in the location): a body in memory
                         // is compressed here, a file on its way out below.
-                        let (response, gzip_stream) = match process_meta.gzip {
+                        let (mut response, gzip_stream) = match process_meta.gzip {
                             Some(gz) => super::gzip::filter(
                                 gz,
                                 &super::gzip::GzipRequest {
@@ -4771,6 +4904,11 @@ pub(crate) async fn handle<S: ConnIo>(
                             ),
                             None => (response, None),
                         };
+                        // `charset` (#464): the label on Content-Type, from
+                        // the location's DocRoot, in place.
+                        if let Some(charset) = process_meta.doc_root.and_then(|d| d.charset) {
+                            super::add_charset(charset, &mut response);
+                        }
 
                         // `return 444;` (no text) is nginx's NGX_HTTP_CLOSE: no
                         // response at all; the connection closes after the
@@ -5265,6 +5403,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     Parse::Incomplete => break,
                     Parse::Invalid => {
                         request_count = request_count.saturating_add(1);
+                        invalid_head_log(http, conn_log!(), &buf[read_start..filled], stream.h2());
                         // Honor HEAD if the request line parsed before the
                         // header block went sideways; otherwise default to
                         // full — we don't know the method and a body on a

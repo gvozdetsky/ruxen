@@ -143,7 +143,10 @@ for f in "${TEST_FILES[@]}"; do
         continue
     fi
 
-    skip_line=$(grep -m1 -E '\.\. skipped:' "${logfile}" || true)
+    # `-a` everywhere below: a failing test may print raw bytes (h2_headers.t
+    # dumps HTTP/2 frames, a Date among them); with a NUL in them grep says
+    # "binary file matches" instead of the line, and the file counted 0/0.
+    skip_line=$(grep -a -m1 -E '\.\. skipped:' "${logfile}" || true)
     if [[ -n "$skip_line" ]]; then
         reason=$(sed -E 's/.*\.\. skipped: //' <<<"$skip_line" | tr '\t' ' ')
         printf 'SKIP\t%s\t0\t0\t%s\n' "$name" "$reason" >> "${RESULTS_TSV}"
@@ -155,20 +158,20 @@ for f in "${TEST_FILES[@]}"; do
     # Prefer the "Failed N/M subtests" line — M is the planned count, even if
     # the plan wasn't reached, so this is more informative than Files=1,Tests=N
     # for setup-error cases (where Tests reports 0).
-    fail_line=$(grep -oE 'Failed [0-9]+/[0-9]+ subtests' "${logfile}" | head -1 || true)
+    fail_line=$(grep -a -oE 'Failed [0-9]+/[0-9]+ subtests' "${logfile}" | head -1 || true)
     if [[ -n "$fail_line" ]]; then
         failed=$(awk '{print $2}' <<<"$fail_line" | cut -d/ -f1)
         total=$(awk '{print $2}' <<<"$fail_line" | cut -d/ -f2)
     else
         failed=0
-        total=$(grep -oE 'Files=1, Tests=[0-9]+' "${logfile}" | head -1 | grep -oE '[0-9]+$' || echo 0)
+        total=$(grep -a -oE 'Files=1, Tests=[0-9]+' "${logfile}" | head -1 | grep -oE '[0-9]+$' || echo 0)
     fi
 
-    if grep -q '^Result: PASS' "${logfile}"; then
+    if grep -a -q '^Result: PASS' "${logfile}"; then
         printf 'PASS\t%s\t0\t%s\t\n' "$name" "$total" >> "${RESULTS_TSV}"
         n_pass=$((n_pass+1))
         printf '[%d/%d] PASS %s (%s)\n' "$i" "$TOTAL" "$name" "$total"
-    elif grep -q '^Result: NOTESTS' "${logfile}"; then
+    elif grep -a -q '^Result: NOTESTS' "${logfile}"; then
         printf 'FAIL\t%s\t0\t0\tno tests reached (setup error)\n' "$name" >> "${RESULTS_TSV}"
         n_fail=$((n_fail+1))
         printf '[%d/%d] FAIL %s (NOTESTS)\n' "$i" "$TOTAL" "$name"

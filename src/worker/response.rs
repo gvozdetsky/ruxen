@@ -818,6 +818,28 @@ pub(crate) fn root_only_state(meta: &phase::ProcessMeta) -> Option<RewriteState>
     Some(state)
 }
 
+/// A `proxy_limit_rate` with variables, rendered once the upstream's
+/// header is in, as ngx_http_upstream_send_response does; a value that
+/// isn't a size is 0 (unlimited), as ngx_http_complex_value_size has it.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
+pub(crate) fn render_proxy_limit_rate(
+    parts: &[PreparedValuePart],
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    status: u16,
+    upstream_headers: &[u8],
+    uri: Option<&[u8]>,
+) -> u64 {
+    let root_only = root_only_state(meta);
+    let render_ctx = proxy_render_ctx(http, ctx, meta, status, upstream_headers, &root_only, uri);
+    let mut value = Vec::with_capacity(16);
+    render_parts(parts, &render_ctx, &mut value);
+    crate::config::parse_size(&value).unwrap_or(0)
+}
+
 /// The variable context for rendering against a proxied response
 /// (`add_header`, `proxy_redirect`).
 fn proxy_render_ctx<'a>(
@@ -1915,6 +1937,124 @@ pub(crate) fn fallback_body(code: u16) -> &'static str {
 
 pub(crate) fn leak_bytes(b: &[u8]) -> &'static [u8] {
     crate::arena::leak(b.to_vec().into_boxed_slice())
+}
+
+/// nginx's charset filter (`ngx_http_charset_header_filter`, #464):
+/// `; charset=<name>` after a `Content-Type` whose type is in
+/// `charset_types` and that carries no charset yet (an upstream's stays,
+/// as without `override_charset`). Cold: only where `charset` is set.
+#[cold]
+#[inline(never)]
+pub(crate) fn add_charset(charset: &PreparedCharset, response: &mut Response) {
+    let label = |head: &mut Vec<u8>| {
+        if let Some(at) = charset_label_at(charset, head) {
+            let label = [b"; charset=", charset.name].concat();
+            head.splice(at..at, label);
+        }
+    };
+    match response {
+        Response::Prebuilt(bytes) => {
+            if charset_label_at(charset, bytes).is_some() {
+                let mut owned = bytes.to_vec();
+                label(&mut owned);
+                *response = Response::Owned(owned);
+            }
+        }
+        Response::Owned(bytes) => label(bytes),
+        Response::File { headers, .. } => label(headers),
+        Response::ProxyStream(relayed) => label(&mut relayed.head),
+        _ => {}
+    }
+}
+
+/// Where `charset`'s label goes in `head`: the end of its `Content-Type`
+/// value, when that has the right type and no charset.
+fn charset_label_at(charset: &PreparedCharset, head: &[u8]) -> Option<usize> {
+    const NAME: &[u8] = b"content-type:";
+    // Not on a 301 or 302 (ngx_http_set_charset).
+    if matches!(response_status(head), 301 | 302) {
+        return None;
+    }
+    let end = head.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let mut start = head.iter().position(|&b| b == b'\n')? + 1;
+    while start < end {
+        let line_end = start + head[start..].iter().position(|&b| b == b'\r')?;
+        let line = &head[start..line_end];
+        if line.len() > NAME.len() && line[..NAME.len()].eq_ignore_ascii_case(NAME) {
+            let value = line[NAME.len()..].trim_ascii();
+            let has_charset = value
+                .windows(8)
+                .any(|w| w.eq_ignore_ascii_case(b"charset="));
+            // The whole value, parameters included, as nginx looks a type
+            // without a charset up: `text/html; foo=bar` isn't text/html.
+            let listed = charset
+                .types
+                .is_none_or(|types| types.iter().any(|t| t.eq_ignore_ascii_case(value)));
+            return (!has_charset && listed).then_some(line_end);
+        }
+        start = line_end + 2;
+    }
+    None
+}
+
+/// A `return`'s response with the type nginx gives it (#691): by the URI's
+/// extension, else `default_type` (ngx_http_set_content_type), where it was
+/// built as `text/plain`. A canned error page or a 204 keeps its own.
+#[inline]
+pub(crate) fn typed_return(response: Response, types: ReturnTypes, uri: &[u8]) -> Response {
+    let Some(types) = types else {
+        return response;
+    };
+    // The usual case, a URI without an extension and `default_type
+    // text/plain`: nothing to look up or compare.
+    let has_extension = uri
+        .iter()
+        .rev()
+        .take_while(|&&b| b != b'/')
+        .any(|&b| b == b'.');
+    if !has_extension && types.default_is_plain {
+        return response;
+    }
+    typed_return_by_types(response, types, uri)
+}
+
+#[cold]
+#[inline(never)]
+fn typed_return_by_types(
+    response: Response,
+    types: &'static crate::worker::PreparedTypes,
+    uri: &[u8],
+) -> Response {
+    match types.for_url(uri) {
+        b"text/plain" => response,
+        ty => retype_return(response, ty),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn retype_return(response: Response, ty: &[u8]) -> Response {
+    const PLAIN: &[u8] = b"\r\nContent-Type: text/plain\r\n";
+    let bytes: &[u8] = match &response {
+        Response::Prebuilt(b) => b,
+        Response::Owned(b) => b,
+        _ => return response,
+    };
+    let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return response;
+    };
+    let Some(at) = bytes[..head_end + 2]
+        .windows(PLAIN.len())
+        .position(|w| w == PLAIN)
+    else {
+        return response;
+    };
+    let mut out = Vec::with_capacity(bytes.len() + ty.len());
+    out.extend_from_slice(&bytes[..at]);
+    out.extend_from_slice(b"\r\nContent-Type: ");
+    out.extend_from_slice(ty);
+    out.extend_from_slice(&bytes[at + PLAIN.len() - 2..]);
+    Response::Owned(out)
 }
 
 pub(crate) fn response_has_header(bytes: &[u8], name: &[u8]) -> bool {
