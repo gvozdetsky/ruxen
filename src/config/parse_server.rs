@@ -456,6 +456,7 @@ pub(crate) fn parse_server_block(
                 | "client_body_timeout"
                 | "send_timeout"
                 | "large_client_header_buffers"
+                | "client_header_buffer_size"
                 | "max_headers"
                 | "http2_chunk_size"),
                 Terminator::Semi,
