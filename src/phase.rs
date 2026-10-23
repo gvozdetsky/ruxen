@@ -26,11 +26,11 @@ use std::net::IpAddr;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-/// Maximum internal reroute hops before we declare a loop. nginx uses
-/// `NGX_HTTP_MAX_URI_CHANGES` (default 10) for the same purpose; we pick
-/// 8 as a slightly tighter budget since our reroute surface is narrower
-/// (no rewrite engine, only try_files fallback).
-pub(crate) const MAX_REROUTES: u32 = 8;
+/// Maximum location searches for a request before we declare a loop: the
+/// first and nginx's `NGX_HTTP_MAX_URI_CHANGES` (10) more, as its
+/// `r->uri_changes` starts at 11. A flagless `rewrite` spends one too
+/// (#682), so a chain of them reaches the limit as in nginx.
+pub(crate) const MAX_REROUTES: u32 = 11;
 
 /// Planned nginx-compatible phase list.
 ///
@@ -486,12 +486,25 @@ fn refuse(
         Response::Reroute(reroute) => {
             process_with_meta_inner(http, req, url_scratch, Some(reroute))
         }
-        response => (response, refused_meta(server, false)),
+        mut response => {
+            server_charset(server, &mut response);
+            (response, refused_meta(server, false))
+        }
     };
     if close {
         meta.keepalive.allow = false;
     }
     (response, meta)
+}
+
+/// The server's charset on what it answers before a location (#464);
+/// a location's answers get theirs from its DocRoot in the worker.
+#[cold]
+#[inline(never)]
+fn server_charset(server: &PreparedServer, response: &mut Response) {
+    if let Some(charset) = server.charset {
+        crate::worker::add_charset(charset, response);
+    }
 }
 
 /// A response's `limit_rate` (bytes per second, 0 = unlimited) and
@@ -637,6 +650,34 @@ pub fn process_with_meta_from_reroute(
     out
 }
 
+/// nginx's `rewrite or internal redirection cycle` line, noted for the
+/// request's error log (#682).
+#[cold]
+#[inline(never)]
+fn rewrite_cycle_log(uri: &[u8]) {
+    crate::fs_resolve::note_failed_lookup_at(
+        format!(
+            "rewrite or internal redirection cycle while processing \"{}\"",
+            String::from_utf8_lossy(uri)
+        ),
+        false,
+        crate::config::ErrorLogLevel::Error,
+    );
+}
+
+/// nginx's `[info]` line for an HTTP/1.1 request without `Host` (#663).
+#[cold]
+#[inline(never)]
+fn missing_host_log(server: &PreparedServer, req: &RequestCtx<'_>) {
+    crate::worker::write_error_log(
+        server.error_logs,
+        crate::config::ErrorLogLevel::Info,
+        &crate::worker::ErrorLogRequest::new(req, server.primary_server_name),
+        b"client sent HTTP/1.1 request without \"Host\" header while reading client request headers",
+        None,
+    );
+}
+
 /// A file lookup that failed while processing (`open() "…" failed`) is
 /// logged now, with this request's context, as nginx logs it where the
 /// open fails. The note is per worker thread, so it has to be taken
@@ -687,6 +728,10 @@ fn process_with_meta_inner(
     // — empty Host is treated as "default server".
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
         let server = &listen.servers[listen.default_server];
+        // Not past an invalid one, logged already.
+        if req.refuse.is_none() {
+            missing_host_log(server, req);
+        }
         let response = Response::Prebuilt(http.bad_request.pick(req.method));
         return refuse(http, req, url_scratch, server, response, true, false, None);
     }
@@ -960,11 +1005,16 @@ fn process_with_meta_inner(
                                         url_scratch,
                                         Some(reroute),
                                     ),
-                                    response => (response, meta),
+                                    mut response => {
+                                        server_charset(server, &mut response);
+                                        (response, meta)
+                                    }
                                 };
                             }
                         }
-                        return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+                        let mut response = Response::Prebuilt(http.not_found.pick(req.method));
+                        server_charset(server, &mut response);
+                        return (response, meta);
                     }
                 },
             }
@@ -997,6 +1047,7 @@ fn process_with_meta_inner(
             loc = loc.limited(le);
         }
         rewrite_state.if_location = None;
+        rewrite_state.if_proxy = false;
         // A response from the rewrite program (`return` in an `if`, a
         // `rewrite … redirect`) goes on to the location's response
         // filters, `error_page` and `add_header`, as nginx finalizes it
@@ -1222,6 +1273,15 @@ fn process_with_meta_inner(
         match response {
             Response::Reroute(next) => {
                 run_server_rewrite = true;
+                // An internal redirect (error_page, try_files, index): the
+                // location is found anew, so no rewrite of the old one
+                // counts (ngx_http_handler sets `valid_location` again,
+                // find_config clears `uri_changed`, #682). A named location
+                // keeps `valid_location`, as ngx_http_named_location does.
+                rewrite_state.uri_changed = false;
+                if matches!(next.target, RerouteTarget::Uri(_)) {
+                    rewrite_state.valid_location = true;
+                }
                 let to_get = turns_into_get(req, &next);
                 if let Some(args) = next.args {
                     current_args = Some(args);
@@ -1285,6 +1345,7 @@ fn process_with_meta_inner(
         }
     }
     // Budget exhausted: nginx returns 500; we match.
+    rewrite_cycle_log(url_scratch);
     (
         Response::Owned(crate::http::error_response_for_method(
             500,

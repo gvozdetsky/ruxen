@@ -554,6 +554,9 @@ pub(crate) fn build_listen_tls(
         for (cert, key) in input.ssl.certs.iter().zip(input.ssl.keys.iter()) {
             keys.push(server_key(input, cert, key, &passwords)?);
         }
+        // Each is loaded and checked, as nginx loads it; the last of each
+        // key type is the one served (#670).
+        let keys = crate::tls_certs::last_per_key_type(keys);
 
         // Register each registered server_name against every key so an RSA
         // + ECDSA pair can both serve under the same hostname.
@@ -892,6 +895,7 @@ fn client_auth(key: &ClientAuthKey) -> Result<crate::client_verify::ClientAuth, 
             .add_trusted(pem)
             .map_err(|e| fail("SSL_CTX_load_verify_locations(ssl_client_certificate)", e))?;
         hints = crate::x509_verify::subjects(pem)
+            .map_err(|e| fail("SSL_load_client_CA_file(ssl_client_certificate)", e))?
             .into_iter()
             .map(rustls::DistinguishedName::from)
             .collect();
@@ -1349,7 +1353,7 @@ pub(crate) fn build_proxy(
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
                 send_timeout_ms: eff.send_timeout_ms,
-                limit_rate: eff.limit_rate,
+                limit_rate: literal_limit_rate(eff.limit_rate).unwrap_or(0),
                 http_version: eff.http_version,
                 next_upstream: eff.next_upstream,
                 next_upstream_tries: eff.next_upstream_tries,
@@ -1397,7 +1401,7 @@ pub(crate) fn build_proxy(
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
                 send_timeout_ms: eff.send_timeout_ms,
-                limit_rate: eff.limit_rate,
+                limit_rate: literal_limit_rate(eff.limit_rate).unwrap_or(0),
                 http_version: eff.http_version,
                 next_upstream: eff.next_upstream,
                 next_upstream_tries: eff.next_upstream_tries,
@@ -1458,7 +1462,7 @@ pub(crate) fn build_proxy(
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
                 send_timeout_ms: eff.send_timeout_ms,
-                limit_rate: eff.limit_rate,
+                limit_rate: literal_limit_rate(eff.limit_rate).unwrap_or(0),
                 http_version: eff.http_version,
                 next_upstream: eff.next_upstream,
                 next_upstream_tries: eff.next_upstream_tries,
@@ -1606,6 +1610,20 @@ fn without_default_port(authority: &'static [u8], tls: bool) -> &'static [u8] {
     }
 }
 
+/// A `proxy_limit_rate` without variables, in bytes/sec; `Some(0)` when
+/// unset. `None` when it has variables.
+fn literal_limit_rate(parts: Option<&[PreparedValuePart]>) -> Option<u64> {
+    let mut value = Vec::new();
+    for part in parts.unwrap_or(&[]) {
+        match part {
+            PreparedValuePart::Literal(bytes) => value.extend_from_slice(bytes),
+            PreparedValuePart::Var(_) => return None,
+        }
+    }
+    // Checked as a size when parsed.
+    Some(crate::config::parse_size(&value).unwrap_or(0))
+}
+
 /// nginx's hidden set: its defaults, plus `proxy_hide_header`, minus
 /// `proxy_pass_header` (ngx_http_upstream_hide_headers_hash).
 fn prepare_response_rules(
@@ -1635,6 +1653,9 @@ fn prepare_response_rules(
         recursive_error_pages: eff.recursive_error_pages,
         ignore_accel_redirect: eff.ignore_accel_redirect,
         ignore_accel_limit_rate: eff.ignore_accel_limit_rate,
+        limit_rate: eff
+            .limit_rate
+            .filter(|parts| literal_limit_rate(Some(parts)).is_none()),
         cookies,
         hide: crate::arena::leak(hide.into_boxed_slice()),
         passes_date: crate::proxy::default_hidden_bit(b"date")
@@ -1755,7 +1776,7 @@ pub(crate) struct ServerProxyDefaults {
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
-    pub limit_rate: u64,
+    pub limit_rate: Option<&'static [PreparedValuePart]>,
     pub http_version: u8,
     pub next_upstream: crate::config::ProxyNextUpstream,
     pub next_upstream_tries: u32,
@@ -1837,7 +1858,10 @@ impl ServerProxyDefaults {
                 .unwrap_or(defaults.connect_timeout_ms),
             read_timeout_ms: conf.read_timeout_ms.unwrap_or(defaults.read_timeout_ms),
             send_timeout_ms: conf.send_timeout_ms.unwrap_or(defaults.send_timeout_ms),
-            limit_rate: conf.limit_rate.unwrap_or(defaults.limit_rate),
+            limit_rate: conf
+                .limit_rate
+                .map(prepare_value_parts)
+                .or(defaults.limit_rate),
             http_version: conf.http_version.unwrap_or(defaults.http_version),
             next_upstream: conf.next_upstream.unwrap_or(defaults.next_upstream),
             next_upstream_tries: conf
@@ -1959,7 +1983,10 @@ pub(crate) fn resolve_proxy_effective(
         send_timeout_ms: location
             .send_timeout_ms
             .unwrap_or(server_defaults.send_timeout_ms),
-        limit_rate: location.limit_rate.unwrap_or(server_defaults.limit_rate),
+        limit_rate: location
+            .limit_rate
+            .map(prepare_value_parts)
+            .or(server_defaults.limit_rate),
         next_upstream: location
             .next_upstream
             .unwrap_or(server_defaults.next_upstream),
@@ -2216,8 +2243,11 @@ pub(crate) fn prepare_server(
     // default to `On`. Resolved once here; prepare_handler downstream
     // bakes the right `Server:` bytes into static prebuilts.
     let server_tokens_value = server.server_tokens.unwrap_or(http.tokens);
-    let server_rewrite_program =
-        prepare_rewrite_ops(std::mem::take(&mut server.rewrite_ops), server_tokens_value);
+    let server_rewrite_program = prepare_rewrite_ops(
+        std::mem::take(&mut server.rewrite_ops),
+        server_tokens_value,
+        prepare_types(&server.mime),
+    );
     let server_header_bytes = http::server_header_value(server_tokens_value);
     // access_log inheritance: server-scope list (if set) replaces http;
     // None inherits the http-scope list. Empty `Some(vec![])` means the
@@ -2320,6 +2350,7 @@ pub(crate) fn prepare_server(
         false,
         None,
         server_disable_symlinks.clone(),
+        prepare_charset(&server.charset),
     );
     let server_default = if !have_root_catchall {
         let root_path = server.root.clone().unwrap_or_else(|| "html".into());
@@ -2391,6 +2422,7 @@ pub(crate) fn prepare_server(
 
     Ok(PreparedServer {
         doc_root: server_doc_root,
+        charset: prepare_charset(&server.charset),
         // Set by the caller, which knows the http scope.
         http2: false,
         tls_context: None,
@@ -2563,6 +2595,7 @@ fn take_if_locations(ops: &mut [RewriteOp], out: &mut Vec<Location>, enclosing: 
 pub(crate) fn prepare_rewrite_ops(
     ops: Vec<RewriteOp>,
     tokens: crate::config::ServerTokens,
+    types: &'static PreparedTypes,
 ) -> &'static [PreparedRewriteOp] {
     if ops.is_empty() {
         return &[];
@@ -2583,7 +2616,7 @@ pub(crate) fn prepare_rewrite_ops(
                 location,
             } => PreparedRewriteOp::If {
                 guard: prepare_guard(guard),
-                body: prepare_rewrite_ops(body, tokens),
+                body: prepare_rewrite_ops(body, tokens, types),
                 // `prepare_server` moved every parsed one into the server's
                 // list first.
                 location: match location {
@@ -2617,7 +2650,7 @@ pub(crate) fn prepare_rewrite_ops(
             }
             RewriteOp::Return { status, body } => {
                 let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
-                PreparedRewriteOp::Return(prepare_return(status, body, tokens), finalized)
+                PreparedRewriteOp::Return(prepare_return(status, body, tokens, types), finalized)
             }
             RewriteOp::Break => PreparedRewriteOp::Break,
         };
@@ -3114,11 +3147,45 @@ pub(crate) fn concat_literals(parts: &[ValuePart]) -> String {
     out
 }
 
+/// A top-level `return` is a rewrite directive in nginx: a `break` (the
+/// directive, or `rewrite … break`) stops the location's rewrite program
+/// before it, and the static module answers (#697). ruxen makes such a
+/// `return` the location's handler; where the program can break, the
+/// `return` goes to its end instead and the location serves files from
+/// its root, as nginx's location would.
+fn return_after_break(
+    handler: Handler,
+    mut ops: Vec<RewriteOp>,
+    root: &(std::path::PathBuf, PathMapping),
+) -> (Handler, Vec<RewriteOp>) {
+    fn breaks(ops: &[RewriteOp]) -> bool {
+        ops.iter().any(|op| match op {
+            RewriteOp::Break => true,
+            RewriteOp::Rewrite(rule) => rule.flag == crate::config::RewriteFlag::Break,
+            RewriteOp::If { body, .. } => breaks(body),
+            _ => false,
+        })
+    }
+    match handler {
+        Handler::Return { status, body } if breaks(&ops) => {
+            ops.push(RewriteOp::Return { status, body });
+            let handler = Handler::Root {
+                path: root.0.clone(),
+                mapping: root.1,
+            };
+            (handler, ops)
+        }
+        handler => (handler, ops),
+    }
+}
+
 pub(crate) fn prepare_return(
     status: u16,
     body: Vec<ValuePart>,
     tokens: crate::config::ServerTokens,
+    types: &'static PreparedTypes,
 ) -> PreparedReturn {
+    let types = (!is_redirect_status(status)).then_some(types);
     let server_bytes = http::server_header_value(tokens);
     // A redirect to a path goes out as `absolute_redirect` makes it, with
     // the request's host (#15): rendered per request.
@@ -3129,7 +3196,7 @@ pub(crate) fn prepare_return(
         // A redirect status is a redirect whatever its URL, an empty one
         // included: nginx's `ngx_http_send_response` sends an empty
         // `Location` then (#374).
-        PreparedReturn::Static(if is_redirect_status(status) {
+        let prebuilt = if is_redirect_status(status) {
             Prebuilt::leak_redirect(status, concatenated.as_bytes(), server_bytes)
         } else if body.is_empty() {
             // `return STATUS;` with no body: when the status has a canned
@@ -3145,11 +3212,13 @@ pub(crate) fn prepare_return(
             }
         } else {
             Prebuilt::leak(status, &concatenated, server_bytes)
-        })
+        };
+        PreparedReturn::Static(prebuilt, types)
     } else {
         PreparedReturn::Template {
             status,
             parts: prepare_value_parts(body),
+            types,
         }
     }
 }
@@ -3188,6 +3257,7 @@ pub(crate) fn leak_doc_root(
     is_regex_location: bool,
     alias_prefix_override: Option<&'static [u8]>,
     disable_symlinks: Option<crate::config::DisableSymlinks>,
+    charset: Option<&'static PreparedCharset>,
 ) -> &'static DocRoot {
     // nginx resolves a relative root under the prefix (ruxen's working
     // directory by now) and prints it absolute.
@@ -3198,6 +3268,7 @@ pub(crate) fn leak_doc_root(
     };
     crate::arena::leak(Box::new(DocRoot {
         path: leak_path_buf(path),
+        location: location_pattern,
         mapping: prepare_path_mapping(
             mapping,
             location_pattern,
@@ -3205,6 +3276,7 @@ pub(crate) fn leak_doc_root(
             alias_prefix_override,
         ),
         symlinks: PreparedSymlinks::new(disable_symlinks),
+        charset,
     }))
 }
 
@@ -3343,14 +3415,11 @@ fn prepare_types(mime: &crate::config::MimeConf) -> &'static PreparedTypes {
             leak_bytes(ty.as_bytes()),
         );
     }
+    let default = mime.default_type.as_deref().unwrap_or("text/plain");
     let types: &'static PreparedTypes = crate::arena::leak(Box::new(PreparedTypes {
         map,
-        default: leak_bytes(
-            mime.default_type
-                .as_deref()
-                .unwrap_or("text/plain")
-                .as_bytes(),
-        ),
+        default: leak_bytes(default.as_bytes()),
+        default_is_plain: default == "text/plain",
     }));
     BUILT.with(|b| b.borrow_mut().push((key, types)));
     types
@@ -3383,7 +3452,10 @@ pub(crate) fn build_handler(
     Ok(match handler {
         Handler::Return { status, body } => {
             let finalized = body.is_empty() || matches!(status, 301 | 302 | 303 | 307 | 308);
-            PreparedHandler::Return(prepare_return(status, body, site.tokens), finalized)
+            PreparedHandler::Return(
+                prepare_return(status, body, site.tokens, prepare_types(site.mime)),
+                finalized,
+            )
         }
         Handler::StubStatus => PreparedHandler::StubStatus,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
@@ -3628,9 +3700,14 @@ pub(crate) fn build_prefix_or_exact(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        add_header_inherit: _,
+        add_trailer_inherit: _,
+        header_ancestors: _,
+        charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let charset = prepare_charset(&location_charset);
     // Only an `if` block's anonymous location in a regex location is
     // built here with a regex mode (#137): its alias takes the captures.
     let is_regex = matches!(mode, MatchMode::Regex { .. });
@@ -3645,7 +3722,8 @@ pub(crate) fn build_prefix_or_exact(
         server.keepalive,
     );
     let tokens = location_server_tokens.unwrap_or(server.tokens);
-    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
+    let (handler, rewrite_ops) = return_after_break(handler, rewrite_ops, &document_root);
+    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens, prepare_types(&mime));
     let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
         location_recursive_error_pages.unwrap_or(server.recursive_error_pages);
@@ -3696,6 +3774,7 @@ pub(crate) fn build_prefix_or_exact(
         is_regex,
         alias_prefix_override,
         site.disable_symlinks.clone(),
+        charset,
     );
     let handler = build_handler(handler, index, try_files, proxy_effective, &site)?;
     let auto_redirect = matches!(&handler, PreparedHandler::Proxy(_)) && pattern.ends_with(b"/");
@@ -3841,9 +3920,14 @@ pub(crate) fn build_regex_location(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        add_header_inherit: _,
+        add_trailer_inherit: _,
+        header_ancestors: _,
+        charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
     let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let charset = prepare_charset(&location_charset);
     // The parser already validated this with the same flags + the same
     // `regex::bytes` builder; rebuild here because the compiled `Regex`
     // doesn't survive the AST.
@@ -3867,7 +3951,8 @@ pub(crate) fn build_regex_location(
         server.keepalive,
     );
     let tokens = location_server_tokens.unwrap_or(server.tokens);
-    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens);
+    let (handler, rewrite_ops) = return_after_break(handler, rewrite_ops, &document_root);
+    let rewrite_program = prepare_rewrite_ops(rewrite_ops, tokens, prepare_types(&mime));
     let error_pages = resolve_error_pages(location_error_pages, server.error_pages);
     let recursive_error_pages =
         location_recursive_error_pages.unwrap_or(server.recursive_error_pages);
@@ -3918,6 +4003,7 @@ pub(crate) fn build_regex_location(
         true,
         alias_prefix_override,
         site.disable_symlinks.clone(),
+        charset,
     );
     let handler = build_handler(handler, index, try_files, proxy_effective, &site)?;
     let add_headers = resolve_add_headers(location_add_headers, server.add_headers);
@@ -4036,6 +4122,58 @@ pub(crate) fn prepare_try_files(
 
 /// The effective `gzip*` settings of a location, or `None` when gzip is
 /// off there: the filter then costs one check per response.
+/// A level's charset settings as responses get them (#464), `None` where
+/// nothing is added: no `charset`, `charset off`, a charset from a
+/// variable (not supported yet), or a `source_charset` other than it, as
+/// that would need a conversion ruxen doesn't do.
+pub(crate) fn prepare_charset(
+    conf: &crate::config::CharsetConf,
+) -> Option<&'static PreparedCharset> {
+    // ngx_http_charset_default_types.
+    const DEFAULT_TYPES: &[&str] = &[
+        "text/html",
+        "text/xml",
+        "text/plain",
+        "text/vnd.wap.wml",
+        "application/javascript",
+        "application/rss+xml",
+    ];
+    let name = conf.charset.as_ref()?.as_ref()?;
+    if name.starts_with('$')
+        || conf
+            .source
+            .as_ref()
+            .is_some_and(|s| !s.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    let leak =
+        |s: &str| -> &'static [u8] { crate::arena::leak(s.as_bytes().to_vec().into_boxed_slice()) };
+    let types: Option<&'static [&'static [u8]]> = match &conf.types {
+        Some(list) if list.iter().any(|t| t == "*") => None,
+        // Always with text/html, "in addition to" the list, as nginx's
+        // charset_types takes it.
+        Some(list) => Some(crate::arena::leak(
+            std::iter::once("text/html")
+                .chain(list.iter().map(String::as_str))
+                .map(leak)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )),
+        None => Some(crate::arena::leak(
+            DEFAULT_TYPES
+                .iter()
+                .map(|t| leak(t))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )),
+    };
+    Some(crate::arena::leak(Box::new(PreparedCharset {
+        name: leak(name),
+        types,
+    })))
+}
+
 pub(crate) fn prepare_gzip(
     conf: crate::config::GzipConf,
 ) -> Result<Option<&'static PreparedGzip>, String> {

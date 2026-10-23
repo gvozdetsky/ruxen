@@ -88,15 +88,22 @@ impl Prebuilt {
 
 pub enum PreparedReturn {
     /// Body has no variables — baked once at startup into a Prebuilt.
-    Static(Prebuilt),
+    Static(Prebuilt, ReturnTypes),
     /// Body contains at least one `$variable` reference. Rendered per
     /// request by walking `parts` and writing each literal chunk / variable
     /// value into a fresh `Vec<u8>`.
     Template {
         status: u16,
         parts: &'static [PreparedValuePart],
+        types: ReturnTypes,
     },
 }
+
+/// The level's `types` / `default_type` for a `return` whose response is
+/// built as `text/plain` (#691): nginx types it as any response, by the
+/// URI's extension, else `default_type` (ngx_http_set_content_type).
+/// `None` for a redirect, which keeps nginx's `text/html` page.
+pub type ReturnTypes = Option<&'static PreparedTypes>;
 
 /// Runtime-ready form of a `ValuePart`. Literals are promoted to `&'static
 /// [u8]` so rendering is a straight byte-copy; variables carry the enum
@@ -235,11 +242,17 @@ pub struct PreparedMap {
 pub struct RewriteState {
     user_vars: Vec<(&'static [u8], Vec<u8>)>,
     numbered_captures: Vec<Vec<u8>>,
-    /// nginx's `r->valid_location`: starts true, cleared whenever a
-    /// `rewrite` directive replaces the URI in-place. Read by `proxy_pass`
-    /// to decide whether to apply its configured URI prefix substitution
-    /// (when false, the rewritten URI is forwarded as-is to upstream).
+    /// nginx's `r->valid_location`: starts true, cleared when a `break`
+    /// (the `rewrite` flag, or the directive after a changed URI) keeps
+    /// the request in a location whose URI it changed. Read by
+    /// `proxy_pass` to decide whether to apply its configured URI prefix
+    /// substitution (when false, the rewritten URI is forwarded as-is to
+    /// upstream).
     pub(crate) valid_location: bool,
+    /// nginx's `r->uri_changed`: a `rewrite` without a flag changed the
+    /// URI, so the locations are searched again once the rewrite
+    /// directives are done (ngx_http_core_post_rewrite_phase, #682).
+    pub(crate) uri_changed: bool,
     /// nginx's `r->valid_unparsed_uri`: the URI is still the one the client
     /// sent, so `proxy_pass` without a URI part forwards the client's own
     /// request target (#541). Cleared by a `rewrite` of the URI and by an
@@ -263,6 +276,10 @@ pub struct RewriteState {
     /// location's rewrite program (#137): the request goes on with its
     /// configuration, as nginx's `r->loc_conf = code->loc_conf`.
     pub(crate) if_location: Option<u32>,
+    /// An `if` whose condition held had a `proxy_pass`: nginx keeps that
+    /// content handler (`r->content_handler`) when a later `if` sets none,
+    /// with the later configuration, which may have no upstream.
+    pub(crate) if_proxy: bool,
 }
 
 impl Default for RewriteState {
@@ -271,12 +288,14 @@ impl Default for RewriteState {
             user_vars: Vec::new(),
             numbered_captures: Vec::new(),
             valid_location: true,
+            uri_changed: false,
             unparsed_uri: true,
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
             limit_req_status: 0,
             limit_conn_status: 0,
             if_location: None,
+            if_proxy: false,
         }
     }
 }
@@ -657,6 +676,11 @@ pub struct ProxyResponseRules {
     pub ignore_accel_redirect: bool,
     /// `proxy_ignore_headers X-Accel-Limit-Rate`.
     pub ignore_accel_limit_rate: bool,
+    /// A `proxy_limit_rate` with variables, rendered once the upstream's
+    /// header is in, as nginx's ngx_http_upstream_send_response does
+    /// (`$upstream_http_*` included). `None` when it has none: the plan's
+    /// `limit_rate` holds its value then.
+    pub limit_rate: Option<&'static [PreparedValuePart]>,
     /// `proxy_cookie_domain` / `proxy_cookie_path`; `None` when neither
     /// has a rule.
     pub cookies: Option<&'static PreparedCookieRules>,
@@ -717,7 +741,9 @@ pub struct PreparedProxy {
     pub read_timeout_ms: u64,
     /// Inheritance-resolved `proxy_send_timeout` (default 60s).
     pub send_timeout_ms: u64,
-    /// Inheritance-resolved `proxy_limit_rate` in bytes/sec; `0` is unlimited.
+    /// Inheritance-resolved `proxy_limit_rate` in bytes/sec; `0` is
+    /// unlimited, and so is one with variables here: it is read when the
+    /// upstream's header is in (`ProxyResponseRules::limit_rate`).
     pub limit_rate: u64,
     /// 0 = HTTP/1.0, 1 = HTTP/1.1 (the default since nginx 1.29.7).
     /// Drives the upstream request-line version and gates pool
@@ -872,8 +898,9 @@ pub(crate) struct ProxyEffective {
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub send_timeout_ms: u64,
-    /// `proxy_limit_rate` in bytes/sec; `0` means unlimited.
-    pub limit_rate: u64,
+    /// `proxy_limit_rate`, a size that may hold variables; `None`
+    /// means unlimited.
+    pub limit_rate: Option<&'static [PreparedValuePart]>,
     /// 0 = HTTP/1.0, 1 = HTTP/1.1. Matches nginx's default of 1.1 (1.29.7).
     pub http_version: u8,
     pub next_upstream: crate::config::ProxyNextUpstream,
@@ -1057,7 +1084,7 @@ impl ProxyEffective {
             connect_timeout_ms: 60_000,
             read_timeout_ms: 60_000,
             send_timeout_ms: 60_000,
-            limit_rate: 0,
+            limit_rate: None,
             // ngx_http_proxy_merge_loc_conf: NGX_HTTP_VERSION_11 (1.29.7).
             http_version: 1,
             next_upstream: crate::config::ProxyNextUpstream::DEFAULT,
@@ -1211,6 +1238,9 @@ pub struct PreparedTypes {
         std::hash::BuildHasherDefault<super::NameHasher>,
     >,
     pub default: &'static [u8],
+    /// `default` is `text/plain`: a `return` to a URI without an extension
+    /// keeps the type it was built with (#691), without a compare.
+    pub default_is_plain: bool,
 }
 
 impl PreparedTypes {
@@ -1277,6 +1307,14 @@ pub struct PreparedRoot {
 pub struct DocRoot {
     pub path: &'static Path,
     pub mapping: PreparedPathMapping,
+    /// The location's name, for nginx's `"alias" cannot be used in
+    /// location …` (#589).
+    pub location: &'static [u8],
+    /// The location's charset for `Content-Type` (#464), here because the
+    /// request's meta already points at its DocRoot: a field of its own in
+    /// `MatchedLocation` and `ProcessMeta` cost h2c_hello about 1% (ABBA
+    /// and callgrind, 2026-10-22).
+    pub charset: Option<&'static PreparedCharset>,
     /// The location's `disable_symlinks`, for `if -f` and the like.
     pub symlinks: PreparedSymlinks,
 }
@@ -1294,6 +1332,31 @@ pub enum PreparedSymlinkFrom {
     /// `from=$document_root`: the location's root (or alias) path.
     DocumentRoot,
     Path(&'static [u8]),
+}
+
+impl DocRoot {
+    /// nginx's ngx_http_map_uri_to_path refuses an `alias` once a
+    /// `rewrite` changed the URI in the location (`uri_changed`, before
+    /// the locations are searched again) or kept it there with `break`
+    /// (`!valid_location`): there is no part of the new URI to replace
+    /// (#589). The `[alert]` is noted for the request's error log.
+    #[cold]
+    pub(crate) fn alias_refused(&self, state: &RewriteState) -> bool {
+        if matches!(self.mapping, PreparedPathMapping::Root)
+            || (state.valid_location && !state.uri_changed)
+        {
+            return false;
+        }
+        crate::fs_resolve::note_failed_lookup_at(
+            format!(
+                "\"alias\" cannot be used in location \"{}\" where URI was rewritten",
+                String::from_utf8_lossy(self.location)
+            ),
+            false,
+            crate::config::ErrorLogLevel::Alert,
+        );
+        true
+    }
 }
 
 impl PreparedSymlinks {
@@ -1789,6 +1852,9 @@ pub struct PreparedServer {
     /// The server's `root` (else `html`), for `$request_filename` in its
     /// rewrite phase.
     pub doc_root: &'static DocRoot,
+    /// The server's charset, for what it answers before a location
+    /// (#464).
+    pub charset: Option<&'static PreparedCharset>,
     /// Client-side timeouts. The worker uses the listen's default server's
     /// values for the whole connection (see `handle`).
     /// HTTP/2 for this server: `http2 on` (server, else http) or
@@ -2217,6 +2283,14 @@ impl RuntimeState {
 }
 
 /// A location's effective gzip settings (`gzip on`), see `worker::gzip`.
+/// `charset` where a response gets it (#464): the name, and the
+/// `charset_types` it applies to (`None`: any, `charset_types *`).
+#[derive(Debug)]
+pub struct PreparedCharset {
+    pub name: &'static [u8],
+    pub types: Option<&'static [&'static [u8]]>,
+}
+
 #[derive(Debug)]
 pub struct PreparedGzip {
     /// `gzip_types *`.

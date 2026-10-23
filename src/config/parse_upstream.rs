@@ -862,11 +862,15 @@ impl ProxyConf {
                 if self.limit_rate.is_some() {
                     return Err(Error::Duplicate("proxy_limit_rate"));
                 }
-                let v = args.get(1).ok_or(Error::MissingArg("proxy_limit_rate"))?;
-                self.limit_rate = Some(parse_size_bytes(v).ok_or(Error::BadValue {
-                    what: "proxy_limit_rate",
-                    got: v.clone(),
-                })?);
+                if args.len() < 2 {
+                    return Err(Error::MissingArg("proxy_limit_rate"));
+                }
+                // Variables since nginx 1.27.0, read once the upstream's
+                // header is in (ngx_http_upstream_send_response).
+                self.limit_rate = Some(crate::config::parse_location::parse_size_value(
+                    &args[1..],
+                    "proxy_limit_rate",
+                )?);
             }
             "proxy_ssl_server_name" => {
                 if self.ssl_server_name.is_some() {
