@@ -266,11 +266,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
             got: host_port.clone(),
         })?],
         // ngx_http_upstream_server: the port defaults to 80.
-        None => resolve_host_port(&with_default_port(host_port, 80))
-            .map_err(|msg| Error::BadValue {
-                what: "upstream server host:port",
-                got: format!("{host_port}: {msg}"),
-            })?
+        None => resolve_upstream_host(&with_default_port(host_port, 80), host_port)?
             .into_iter()
             .map(UpstreamAddr::Inet)
             .collect(),
@@ -375,17 +371,35 @@ fn with_default_port(host_port: &str, port: u16) -> String {
 }
 
 pub(crate) fn resolve_host_port(s: &str) -> Result<Vec<SocketAddr>, String> {
+    resolve_host_port_io(s).map_err(|e| e.to_string())
+}
+
+/// `resolve_host_port`, an `upstream` address's, refused in nginx's words:
+/// `invalid port in upstream "…"` (std's `InvalidInput`), else `host not
+/// found in upstream "…"`.
+fn resolve_upstream_host(host_port: &str, as_written: &str) -> Result<Vec<SocketAddr>, Error> {
+    resolve_host_port_io(host_port).map_err(|e| Error::UpstreamUrl {
+        problem: if e.kind() == std::io::ErrorKind::InvalidInput {
+            "invalid port"
+        } else {
+            "host not found"
+        },
+        url: as_written.to_string(),
+    })
+}
+
+fn resolve_host_port_io(s: &str) -> std::io::Result<Vec<SocketAddr>> {
     use std::net::ToSocketAddrs;
     // Every address, in getaddrinfo's order: each is a peer, as
     // ngx_inet_resolve_host makes it (#330).
     let mut addrs: Vec<SocketAddr> = Vec::new();
-    for addr in s.to_socket_addrs().map_err(|e| e.to_string())? {
+    for addr in s.to_socket_addrs()? {
         if !addrs.contains(&addr) {
             addrs.push(addr);
         }
     }
     if addrs.is_empty() {
-        return Err("no addresses resolved".into());
+        return Err(std::io::Error::other("no addresses resolved"));
     }
     Ok(addrs)
 }
@@ -549,10 +563,7 @@ pub(crate) fn parse_proxy_pass_arg(args: &[String]) -> Result<ProxyPass, Error> 
         });
     }
     let host_port = with_default_port(authority, if tls { 443 } else { 80 });
-    let addrs = resolve_host_port(&host_port).map_err(|msg| Error::BadValue {
-        what: "proxy_pass host:port",
-        got: format!("{raw}: {msg}"),
-    })?;
+    let addrs = resolve_upstream_host(&host_port, authority)?;
     Ok(ProxyPass::Direct {
         addrs: addrs.into_iter().map(UpstreamAddr::Inet).collect(),
         host_header: authority.to_string(),
