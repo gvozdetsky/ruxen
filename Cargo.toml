@@ -21,6 +21,7 @@ include = [
     "/README.md",
     "/DESIGN.md",
     "/LICENSE",
+    "/NOTICE",
 ]
 
 [features]
