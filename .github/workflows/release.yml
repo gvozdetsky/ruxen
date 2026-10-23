@@ -43,11 +43,10 @@ jobs:
             name: x86_64-linux-musl
             musl: true
     runs-on: ${{ matrix.os }}
+    # No OIDC token here: this job runs every dependency's build script and
+    # tests, and the tools it installs. The `release` job attests.
     permissions:
       contents: read
-      # The attestations, signed through Sigstore with the run's OIDC token.
-      id-token: write
-      attestations: write
     env:
       # monoio uses statx, which the libc crate declares for musl only when
       # told the musl is 1.2.3+. The binary links the musl that ships with
@@ -132,21 +131,6 @@ jobs:
           mv ruxen.cdx.json "${{ steps.version.outputs.dist }}.cdx.json"
           jq -e '.components | length > 0' "${{ steps.version.outputs.dist }}.cdx.json" > /dev/null
 
-      - uses: actions/attest-build-provenance@v2
-        if: github.ref_type == 'tag'
-        with:
-          subject-path: |
-            ${{ steps.version.outputs.dist }}.tar.gz
-            ruxen-${{ matrix.name }}.tar.gz
-
-      - uses: actions/attest-sbom@v2
-        if: github.ref_type == 'tag'
-        with:
-          subject-path: |
-            ${{ steps.version.outputs.dist }}.tar.gz
-            ruxen-${{ matrix.name }}.tar.gz
-          sbom-path: ${{ steps.version.outputs.dist }}.cdx.json
-
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.version.outputs.dist }}
@@ -160,6 +144,10 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      # The attestations, signed through Sigstore with the run's OIDC
+      # identity; on a pushed tag only, never on a manual run.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -178,6 +166,31 @@ jobs:
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v2
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        with:
+          subject-path: dist/*.tar.gz
+
+      # One SBOM per target, for both of its tarballs (the glob takes the
+      # versioned and the version-less name).
+      - uses: actions/attest-sbom@v2
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        with:
+          subject-path: dist/*-x86_64-linux-gnu.tar.gz
+          sbom-path: dist/ruxen-${{ github.ref_name }}-x86_64-linux-gnu.cdx.json
+
+      - uses: actions/attest-sbom@v2
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        with:
+          subject-path: dist/*-aarch64-linux-gnu.tar.gz
+          sbom-path: dist/ruxen-${{ github.ref_name }}-aarch64-linux-gnu.cdx.json
+
+      - uses: actions/attest-sbom@v2
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        with:
+          subject-path: dist/*-x86_64-linux-musl.tar.gz
+          sbom-path: dist/ruxen-${{ github.ref_name }}-x86_64-linux-musl.cdx.json
 
       - name: GitHub release
         if: github.ref_type == 'tag'
