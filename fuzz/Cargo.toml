@@ -96,3 +96,17 @@ path = "fuzz_targets/gzip_negotiation.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http_date"
+path = "fuzz_targets/http_date.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "basic_auth"
+path = "fuzz_targets/basic_auth.rs"
+test = false
+doc = false
+bench = false
