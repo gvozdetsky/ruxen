@@ -694,6 +694,7 @@ dependencies = [
  "h2",
  "http",
  "libc",
+ "memchr",
  "mimalloc",
  "monoio",
  "rcgen",
