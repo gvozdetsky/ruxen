@@ -205,10 +205,11 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         crate::proxy::return_proxy_buf(std::mem::replace(&mut s.read_buf, take_relay_buf()));
     }
     loop {
-        // proxy_limit_rate: wait until the body read so far is due.
-        crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
         let mut buf = std::mem::take(&mut s.read_buf);
         buf.clear();
+        if s.limit_rate != 0 {
+            buf = paced_read_buf(buf, s.limit_rate, s.paced, s.pacer_start);
+        }
         let (res, returned) = match timeout(s.read_timeout, s.upstream.read(buf)).await {
             Ok(pair) => pair,
             Err(_) => {
@@ -269,6 +270,10 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         };
         end.upstream_read += n as u64;
         s.paced += n as u64;
+        // proxy_limit_rate: what was read goes out once it is due, the
+        // last read too (#700), as the whole-body path waits after each
+        // read.
+        crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
         // A length-framed body to a client that takes it as it is goes
         // out of the read buffer itself.
         if !chunked_out
@@ -471,6 +476,23 @@ fn push_body(out: &mut Vec<u8>, data: &[u8], chunked_out: bool) {
     } else {
         out.extend_from_slice(data);
     }
+}
+
+/// Under `proxy_limit_rate`, a read buffer no larger than what the rate
+/// allows so far, as ngx_event_pipe_read_upstream caps each read at
+/// `limit_rate * (seconds since the start + 1) - read`: the body then goes
+/// out about a second's worth at a time, not a long wait and 64 KiB.
+#[cold]
+#[inline(never)]
+fn paced_read_buf(buf: Vec<u8>, limit_rate: u64, paced: u64, start: std::time::Instant) -> Vec<u8> {
+    let allowed = limit_rate
+        .saturating_mul(start.elapsed().as_secs() + 1)
+        .saturating_sub(paced);
+    let cap = (allowed as usize).clamp(1, RELAY_BUF);
+    if buf.capacity() > cap || buf.capacity() < cap / 2 {
+        return Vec::with_capacity(cap);
+    }
+    buf
 }
 
 /// Write `buf[..len]` with `send_timeout`, under `limit_rate` if any.

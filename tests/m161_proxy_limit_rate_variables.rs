@@ -1,7 +1,8 @@
 //! M161 — `proxy_limit_rate` with variables (nginx 1.27.0, #601), read
 //! once the upstream's header is in: `$upstream_http_*` sets the rate of
 //! the response it came with, on the relayed path and on the one that
-//! reads the body whole (`add_trailer`).
+//! reads the body whole (`add_trailer`); and a body that comes at once
+//! is paced too (#700).
 
 mod common;
 
@@ -11,8 +12,6 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Large enough that the pacing shows: the last read of a relayed body
-/// goes out unpaced (#700).
 const BODY: usize = 400_000;
 
 struct Server(Child, PathBuf);
@@ -25,11 +24,12 @@ impl Drop for Server {
     }
 }
 
-fn start() -> (Server, u16) {
-    let dir = std::env::temp_dir().join(format!("ruxen-m161-{}", std::process::id()));
+fn start(name: &str) -> (Server, u16) {
+    let dir = std::env::temp_dir().join(format!("ruxen-m161-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("data"), "X".repeat(BODY)).unwrap();
+    std::fs::write(dir.join("small"), "X".repeat(40000)).unwrap();
     // Held until ruxen listens: released earlier, another test could take
     // the same free port, and ruxen would fail to bind it.
     let setup = common::ports::setup_lock();
@@ -51,6 +51,9 @@ fn start() -> (Server, u16) {
                location /whole/ {{ proxy_pass http://127.0.0.1:{port}/data;\n\
                  add_trailer X-T t; }}\n\
                location /data {{ root {d}; add_header X-Rate $arg_e; }}\n\
+               location /fixed/ {{ proxy_pass http://127.0.0.1:{port}/small;\n\
+                 proxy_limit_rate 20000; }}\n\
+               location /small {{ root {d}; }}\n\
              }}\n}}\n"
         ),
     )
@@ -97,7 +100,7 @@ fn get(port: u16, path: &str) -> (usize, Duration) {
 
 #[test]
 fn the_upstreams_header_sets_the_rate() {
-    let (_server, port) = start();
+    let (_server, port) = start("vars");
     for prefix in ["/", "/whole/"] {
         // 400 KB at 200 KB/s.
         let (len, took) = get(port, &format!("{prefix}?e=200000"));
@@ -132,4 +135,16 @@ fn a_literal_rate_is_still_checked_as_a_size() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("proxy_limit_rate"), "{stderr}");
+}
+
+/// A body that comes in one read with the head is paced too (#700): the
+/// head is read into a small buffer, and each relayed read waits until
+/// it's due before it goes out.
+#[test]
+fn a_body_that_comes_at_once_is_paced() {
+    let (_server, port) = start("once");
+    // 40000 bytes at 20000 bytes/s; nginx 1.30.6 takes 1.8 s.
+    let (len, took) = get(port, "/fixed/");
+    assert_eq!(len, 40000);
+    assert!(took >= Duration::from_millis(900), "{took:?}");
 }

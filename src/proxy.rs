@@ -1876,6 +1876,9 @@ async fn attempt(
     // safe — the kernel writes before we read.
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
+    if plan.limit_rate != 0 || late_limit_rate.is_some() {
+        read_buf = paced_head_buf(read_buf);
+    }
     let mut head_end_terminator: (usize, usize); // (head_end, terminator_len)
     let mut scanned = 0;
     // Bytes of 103 heads dropped from the front of `accum` (#581): not
@@ -2187,7 +2190,14 @@ async fn attempt(
     // far; we sleep when bytes/elapsed would exceed `plan.limit_rate`. Bytes
     // already pulled in with the header read are counted as received.
     let body_pacer_start = Instant::now();
+    let intercepted = plan
+        .intercept
+        .as_ref()
+        .is_some_and(|rules| rules.iter().any(|r| r.status == status_code));
     let limit_rate = match late_limit_rate {
+        // An answer `proxy_intercept_errors` sends to an error_page isn't
+        // the client's: nginx doesn't read its body at all.
+        _ if intercepted => 0,
         Some(late) => late_limit_rate_of(late, status_code, &accum[..head_end], first_line_end),
         None => plan.limit_rate,
     };
@@ -2268,8 +2278,14 @@ async fn attempt(
         // bytes after `body_start` are not what we'll forward.
         accum.truncate(body_start);
         body_len_in_accum = 0;
-        match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout)
-            .await
+        match read_chunked_body_with_buf(
+            &mut stream,
+            &mut body,
+            &mut read_buf,
+            plan.read_timeout,
+            (limit_rate, body_pacer_start),
+        )
+        .await
         {
             Ok((read, extra)) => {
                 state.bytes_received += read;
@@ -3292,6 +3308,17 @@ fn late_limit_rate_of(
     late(status, &lines)
 }
 
+/// Under `proxy_limit_rate`, the head is read as nginx reads it, into a
+/// `proxy_buffer_size` buffer (4k by default): a pooled buffer may hold
+/// 128 KiB, and the body bytes that come with the head go out unpaced
+/// (#700).
+#[cold]
+#[inline(never)]
+fn paced_head_buf(buf: Vec<u8>) -> Vec<u8> {
+    return_proxy_buf(buf);
+    Vec::with_capacity(PROXY_SCRATCH_CAP)
+}
+
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body
 /// bytes received so far don't exceed `limit_rate` bytes/second since
 /// `started`. `limit_rate == 0` is a no-op (unlimited). Mirrors nginx's
@@ -3333,7 +3360,10 @@ async fn read_chunked_body_with_buf(
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
+    // `proxy_limit_rate`: the rate, and when the body started.
+    (limit_rate, pacer_start): (u64, Instant),
 ) -> Result<(u64, bool), (bool, UpstreamError)> {
+    let mut paced = body.len() as u64;
     let leftover = std::mem::take(body);
     let mut nothing_read = leftover.is_empty();
     let mut decoder = crate::proxy_stream::ChunkedDecoder::default();
@@ -3362,6 +3392,8 @@ async fn read_chunked_body_with_buf(
                 nothing_read = false;
                 received += n as u64;
                 (done, extra) = decode_chunked(&mut decoder, &read_buf[..n], &mut decoded)?;
+                paced += n as u64;
+                pace_body_read(limit_rate, paced, pacer_start).await;
             }
             Err(e) => {
                 return Err((
