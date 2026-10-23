@@ -785,6 +785,10 @@ enum LineParse {
     Invalid,
 }
 
+// Inlined into `parse_request`, its hot caller: `refusal_reason` (#663)
+// calls it too, and with two callers LLVM kept it out of line, ~3% of a
+// `return 200`'s instructions with `parse_header_line`.
+#[inline(always)]
 fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
     let n = buf.len();
     let mut i = start;
@@ -1102,6 +1106,7 @@ fn parse_authority(buf: &[u8], start: usize, require_port_digits: bool) -> Optio
     Some(i)
 }
 
+#[inline(always)]
 fn looks_like_absolute_form(buf: &[u8], start: usize, end: usize) -> bool {
     if start >= end || !buf[start].is_ascii_alphabetic() {
         return false;
@@ -1140,6 +1145,8 @@ enum HeaderParse {
 /// suppresses the classification — which is the correct outcome anyway.
 const LC_NAME_MAX: usize = 64;
 
+// As `parse_request_line`.
+#[inline(always)]
 fn parse_header_line(buf: &[u8], start: usize) -> HeaderParse {
     let n = buf.len();
     let mut i = start;
@@ -1228,7 +1235,9 @@ fn parse_header_line(buf: &[u8], start: usize) -> HeaderParse {
     }
 }
 
-#[inline]
+// As `parse_request_line`: kept out of line once `refusal_reason` called
+// `parse_header_line` too.
+#[inline(always)]
 fn classify_header(hash: u32, lc: &[u8]) -> Option<KnownHeader> {
     // Tiny linear scan; the hash compare is the fast discriminator. The full
     // memcmp only runs on hash collisions, which don't exist within our
