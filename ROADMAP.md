@@ -67,6 +67,7 @@ Each release reports four numbers, and the release pull request adds its row to 
 | 0.1.3 | 105 / 159 | 193 / 238 (81%) | 75 of 87, 118.8% ([report](https://github.com/gvozdetsky/ruxen/blob/v0.1.3/bench/campaign-2026-10-14/REPORT.md)) | ~10.5 billion runs, 6 targets | — |
 | 0.2.0 | 165 / 191 | 217 / 238 (91%) | 85 of 94, 120.2% ([report](https://github.com/gvozdetsky/ruxen/blob/v0.2.0/bench/campaign-2026-10-17/REPORT.md)) | ~37 billion runs, 8 targets | 13 issues from the audit (#529) |
 | 0.2.1 | 172 / 192 | 217 / 238 (91%) | 91 of 94, 121.5% ([report](https://github.com/gvozdetsky/ruxen/blob/v0.2.1/bench/campaign-2026-10-21/REPORT.md)) | ASan nginx-tests sweep, no reports | 5 issues |
+| 0.2.2 | 182 / 197 | 218 / 238 (92%) | no campaign; ABBA against 0.2.1 (i7, 6 pairs each): h2c_hello 106.2%, h2_tls_hello 104.7%, proxy_64k 100.3%, m1_hello 99.6%, tls_hello 99.5%, proxy_hello 99.2%, m3_static_1k 99.1%, gzip_html_8k 97.3% | ASan nginx-tests sweep, no reports; ~2.7 billion runs, 5 targets | 1 issue (#586), 1 dependency advisory |
 
 Performance up to 0.2.0 is against nginx 1.24.0, from 0.2.1 against 1.30.6; on the bench configurations the two run at the same speed (±1.3%).
 
