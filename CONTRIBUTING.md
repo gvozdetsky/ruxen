@@ -136,7 +136,9 @@ separate step, so do them in this order:
    tag against `Cargo.toml` and the notes file, runs `cargo fmt --check`
    and `cargo test`, builds, smoke-tests (`-V`, `-t` on `examples/`), and
    publishes the release with the versioned tarball, a version-less copy
-   for the README's `releases/latest` link, and `SHA256SUMS`.
+   for the README's `releases/latest` link, an SBOM per target and
+   `SHA256SUMS`. The binaries are built with `cargo auditable`, and the
+   tarballs get build-provenance and SBOM attestations (#480).
 4. When the release is up, `cargo publish --locked`. A crates.io version
    can't be replaced, only yanked, so this goes last.
 5. Security fixes in the release: publish their advisories (see

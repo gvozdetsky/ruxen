@@ -156,6 +156,12 @@ impl RenderCtx<'_> {
         };
         match v {
             Variable::RequestFilename => {
+                if self
+                    .rewrite_state
+                    .is_some_and(|s| doc_root.alias_refused(s))
+                {
+                    return;
+                }
                 let path = crate::fs_resolve::request_filename(doc_root, self.uri);
                 out.extend_from_slice(path.as_os_str().as_bytes());
             }

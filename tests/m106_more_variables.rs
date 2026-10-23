@@ -38,7 +38,7 @@ fn m106_binary_remote_addr_document_uri_https() {
         dir.join("nginx.conf"),
         format!(
             "events {{}}\nhttp {{ server {{ listen 127.0.0.1:{port};\n\
-             location / {{ rewrite ^/old(.*)$ /new$1 break;\n\
+             location / {{ rewrite ^/old(.*)$ /new$1;\n\
              return 200 \"[$binary_remote_addr][$document_uri][$https][$pid]\"; }}\n\
              }} }}\n"
         ),

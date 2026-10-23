@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 182 implemented, 25 accepted with a difference, 72 accepted with no effect, 1 refused, 284 unknown.
+Of 564 directives: 185 implemented, 23 accepted with a difference, 72 accepted with no effect, 0 refused, 284 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -418,9 +418,9 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | --- | --- | --- | --- |
 | `proxy_pass` | yes | location |  |
 | `proxy_redirect` | yes | http, server, location |  |
-| `proxy_cookie_domain` | accepted, differs | any | Set-Cookie domains are not rewritten (#40) |
-| `proxy_cookie_path` | accepted, differs | any | Set-Cookie paths are not rewritten (#40) |
-| `proxy_cookie_flags` | refused | any | not enforced yet, so ruxen refuses it: upstream cookies would reach clients without the flags it sets |
+| `proxy_cookie_domain` | yes | http, server, location |  |
+| `proxy_cookie_path` | yes | http, server, location |  |
+| `proxy_cookie_flags` | yes | http, server, location |  |
 | `proxy_store` | accepted, differs | any | proxied responses are not stored |
 | `proxy_store_access` | accepted, no effect | any |  |
 | `proxy_buffering` | accepted, differs | any | ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #88) |
