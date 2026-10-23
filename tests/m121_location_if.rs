@@ -148,7 +148,7 @@ fn if_locations_follow_nginx() {
                  proxy_set_header X-Root $document_root;\n\
                  if ($arg_h) {{ add_header X-H 1; }}\n\
                }}\n\
-               location /carried {{\n\
+               location /carried {{ add_header X-Carried 1 always;\n\
                  if ($arg_p) {{ proxy_pass http://127.0.0.1:{up}; }}\n\
                  if ($arg_q) {{ }}\n\
                }}\n\
@@ -230,6 +230,9 @@ fn if_locations_follow_nginx() {
     // configuration, which has no upstream: nginx answers 500 (it used to
     // crash; proxy_if.t). With one inherited from the location, it proxies.
     assert!(carried.ends_with("uri:/carried\n"), "{carried}");
-    assert!(carried_on.starts_with("HTTP/1.1 500"), "{carried_on}");
+    assert!(
+        carried_on.starts_with("HTTP/1.1 500") && carried_on.contains("X-Carried: 1"),
+        "{carried_on}"
+    );
     assert!(inherited.ends_with("uri:/inherited\n"), "{inherited}");
 }

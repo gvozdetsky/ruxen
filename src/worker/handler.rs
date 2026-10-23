@@ -875,6 +875,19 @@ pub(crate) fn run_location_handler(
             preserved_www_authenticate,
         );
     }
+    // The proxy handler of an earlier `if` with the configuration of a
+    // later one that has no `proxy_pass` (#703): nginx 1.3.10+ answers 500
+    // with an alert (ngx_http_upstream_init_request), through error_page.
+    if rewrite_state.if_proxy && !matches!(loc.handler, PreparedHandler::Proxy(_)) {
+        return no_upstream_configuration(
+            http,
+            &loc,
+            req,
+            &render_ctx_base,
+            in_error_page,
+            preserved_www_authenticate,
+        );
+    }
     // The plan carries everything `proxy::run_proxy` needs for async work.
     // The worker awaits it after `process_with_meta`, then applies the
     // location's proxy add_header/add_trailer state with `$upstream_*`
@@ -1916,6 +1929,33 @@ fn intern_unix_path(path: &[u8]) -> Option<&'static std::path::Path> {
         paths.push(leaked);
         Some(leaked)
     })
+}
+
+/// The 500 of a proxy handler with no upstream (#703), with nginx's alert.
+#[cold]
+#[inline(never)]
+fn no_upstream_configuration(
+    http: &'static PreparedHttp,
+    loc: &MatchedLocation<'static>,
+    req: &phase::RequestCtx<'_>,
+    render_ctx_base: &RenderCtx<'_>,
+    in_error_page: bool,
+    preserved_www_authenticate: &[Vec<u8>],
+) -> Response {
+    crate::fs_resolve::note_failed_lookup_at(
+        "no upstream configuration".to_string(),
+        false,
+        crate::config::ErrorLogLevel::Alert,
+    );
+    variable_url_failed(
+        http,
+        500,
+        loc,
+        req,
+        render_ctx_base,
+        in_error_page,
+        preserved_www_authenticate,
+    )
 }
 
 /// The 500 or 502 for a `proxy_pass` URL that can't be used, through the
