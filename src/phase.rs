@@ -486,12 +486,25 @@ fn refuse(
         Response::Reroute(reroute) => {
             process_with_meta_inner(http, req, url_scratch, Some(reroute))
         }
-        response => (response, refused_meta(server, false)),
+        mut response => {
+            server_charset(server, &mut response);
+            (response, refused_meta(server, false))
+        }
     };
     if close {
         meta.keepalive.allow = false;
     }
     (response, meta)
+}
+
+/// The server's charset on what it answers before a location (#464);
+/// a location's answers get theirs from its DocRoot in the worker.
+#[cold]
+#[inline(never)]
+fn server_charset(server: &PreparedServer, response: &mut Response) {
+    if let Some(charset) = server.charset {
+        crate::worker::add_charset(charset, response);
+    }
 }
 
 /// A response's `limit_rate` (bytes per second, 0 = unlimited) and
@@ -992,11 +1005,16 @@ fn process_with_meta_inner(
                                         url_scratch,
                                         Some(reroute),
                                     ),
-                                    response => (response, meta),
+                                    mut response => {
+                                        server_charset(server, &mut response);
+                                        (response, meta)
+                                    }
                                 };
                             }
                         }
-                        return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+                        let mut response = Response::Prebuilt(http.not_found.pick(req.method));
+                        server_charset(server, &mut response);
+                        return (response, meta);
                     }
                 },
             }

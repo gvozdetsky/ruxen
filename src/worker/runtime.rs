@@ -4830,7 +4830,7 @@ pub(crate) async fn handle<S: ConnIo>(
 
                         // gzip (`gzip on` in the location): a body in memory
                         // is compressed here, a file on its way out below.
-                        let (response, gzip_stream) = match process_meta.gzip {
+                        let (mut response, gzip_stream) = match process_meta.gzip {
                             Some(gz) => super::gzip::filter(
                                 gz,
                                 &super::gzip::GzipRequest {
@@ -4844,6 +4844,11 @@ pub(crate) async fn handle<S: ConnIo>(
                             ),
                             None => (response, None),
                         };
+                        // `charset` (#464): the label on Content-Type, from
+                        // the location's DocRoot, in place.
+                        if let Some(charset) = process_meta.doc_root.and_then(|d| d.charset) {
+                            super::add_charset(charset, &mut response);
+                        }
 
                         // `return 444;` (no text) is nginx's NGX_HTTP_CLOSE: no
                         // response at all; the connection closes after the

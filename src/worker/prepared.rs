@@ -1280,6 +1280,11 @@ pub struct DocRoot {
     /// The location's name, for nginx's `"alias" cannot be used in
     /// location …` (#589).
     pub location: &'static [u8],
+    /// The location's charset for `Content-Type` (#464), here because the
+    /// request's meta already points at its DocRoot: a field of its own in
+    /// `MatchedLocation` and `ProcessMeta` cost h2c_hello about 1% (ABBA
+    /// and callgrind, 2026-10-22).
+    pub charset: Option<&'static PreparedCharset>,
     /// The location's `disable_symlinks`, for `if -f` and the like.
     pub symlinks: PreparedSymlinks,
 }
@@ -1817,6 +1822,9 @@ pub struct PreparedServer {
     /// The server's `root` (else `html`), for `$request_filename` in its
     /// rewrite phase.
     pub doc_root: &'static DocRoot,
+    /// The server's charset, for what it answers before a location
+    /// (#464).
+    pub charset: Option<&'static PreparedCharset>,
     /// Client-side timeouts. The worker uses the listen's default server's
     /// values for the whole connection (see `handle`).
     /// HTTP/2 for this server: `http2 on` (server, else http) or
@@ -2245,6 +2253,14 @@ impl RuntimeState {
 }
 
 /// A location's effective gzip settings (`gzip on`), see `worker::gzip`.
+/// `charset` where a response gets it (#464): the name, and the
+/// `charset_types` it applies to (`None`: any, `charset_types *`).
+#[derive(Debug)]
+pub struct PreparedCharset {
+    pub name: &'static [u8],
+    pub types: Option<&'static [&'static [u8]]>,
+}
+
 #[derive(Debug)]
 pub struct PreparedGzip {
     /// `gzip_types *`.
