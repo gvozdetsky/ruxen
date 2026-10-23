@@ -771,7 +771,11 @@ type TlsClient = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 fn tls_connect(port: u16, ca_pem: &Path) -> TlsClient {
     let mut roots = rustls::RootCertStore::empty();
     let pem = std::fs::read(ca_pem).unwrap();
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &pem,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     let config = rustls::ClientConfig::builder()
@@ -900,7 +904,11 @@ fn session_client(
 ) -> std::sync::Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     let pem = std::fs::read(ca_pem).unwrap();
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &pem,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     std::sync::Arc::new(
@@ -1073,7 +1081,11 @@ fn handshake_version(
 ) -> Option<rustls::ProtocolVersion> {
     let mut roots = rustls::RootCertStore::empty();
     let pem = std::fs::read(ca_pem).unwrap();
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &pem,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     let config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
@@ -1163,7 +1175,11 @@ impl rustls::compress::CertDecompressor for NotedZlib {
 fn certificate_came_compressed(port: u16, name: &str, ca_pem: &Path) -> bool {
     let mut roots = rustls::RootCertStore::empty();
     let pem = std::fs::read(ca_pem).unwrap();
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &pem,
+        )
+    {
         roots.add(cert.unwrap()).unwrap();
     }
     let noted: &'static NotedZlib = Box::leak(Box::new(NotedZlib(Default::default())));

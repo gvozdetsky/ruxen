@@ -362,24 +362,34 @@ unsafe impl monoio::buf::IoVecBuf for RequestParts {
     }
 }
 
-/// Write the header block and the body with writev until both are sent.
+/// Write the header block and the body with writev until both are sent,
+/// each write within `send_timeout`: nginx sets its write timer again
+/// whenever a send makes progress (ngx_http_upstream_send_request), so
+/// `proxy_send_timeout` is the time between two writes, not for the whole
+/// request (#490). `None`: a write waited longer.
 async fn write_request_parts(
     stream: &mut UpstreamIo,
     head: bytes::Bytes,
     body: bytes::Bytes,
-) -> std::io::Result<()> {
+    send_timeout: Duration,
+) -> Option<std::io::Result<()>> {
     let mut parts = RequestParts::new(head, body);
     while parts.len() > 0 {
-        let (res, returned) = monoio::io::AsyncWriteRent::writev(stream, parts).await;
+        let (res, returned) = timeout(
+            send_timeout,
+            monoio::io::AsyncWriteRent::writev(stream, parts),
+        )
+        .await
+        .ok()?;
         parts = returned;
         match res {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(0) => return Some(Err(std::io::ErrorKind::WriteZero.into())),
             Ok(n) => parts.advance(n),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(e) => return Some(Err(e)),
         }
     }
-    Ok(())
+    Some(Ok(()))
 }
 
 /// The temp file holding a large request body (an open descriptor: the
@@ -602,6 +612,11 @@ async fn resolve_peers(
     }
 }
 
+/// A `proxy_limit_rate` with variables (`ProxyResponseRules::limit_rate`),
+/// rendered by the caller, who has the request: from the upstream's status
+/// and header lines (`Name: value` CRLF each) to bytes/sec.
+pub type LateLimitRate<'a> = &'a dyn Fn(u16, &[u8]) -> u64;
+
 /// Run the upstream exchange, with `proxy_next_upstream` failover. Each
 /// failed attempt is appended to `failures` so the worker can log it with
 /// the request's context; on the happy path nothing is pushed and the
@@ -620,7 +635,11 @@ async fn resolve_peers(
 ///     and retry.
 ///   - Pool the upstream socket on success when the upstream and request
 ///     framing both permit it.
-pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Response {
+pub async fn run_proxy(
+    mut plan: Box<ProxyPlan>,
+    report: &mut ProxyReport,
+    late_limit_rate: Option<LateLimitRate<'_>>,
+) -> Response {
     report.passes_date = plan.response.passes_date;
     if let Some(cache) = plan.cache.as_deref_mut() {
         if cache.wait_until.is_some() {
@@ -728,6 +747,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 started,
                 &mut storable,
                 failures,
+                late_limit_rate,
             )
             .await
             {
@@ -749,6 +769,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                             started,
                             &mut storable,
                             failures,
+                            late_limit_rate,
                         )
                         .await
                     } else {
@@ -774,6 +795,7 @@ pub async fn run_proxy(mut plan: Box<ProxyPlan>, report: &mut ProxyReport) -> Re
                 started,
                 &mut storable,
                 failures,
+                late_limit_rate,
             )
             .await
         };
@@ -1660,6 +1682,7 @@ async fn attempt(
     started: Instant,
     storable: &mut Option<Storable>,
     failures: &mut Vec<AttemptFailure>,
+    late_limit_rate: Option<LateLimitRate<'_>>,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     // Only the answering attempt's X-Accel headers count.
@@ -1760,22 +1783,45 @@ async fn attempt(
 
     // 2. Send the request. Cloning here keeps the original bytes available
     // for `proxy_next_upstream` retries when this attempt fails — monoio's
-    // write_all consumes the buffer, and on `timeout()` cancellation the
+    // writes consume the buffer, and on `timeout()` cancellation the
     // future drops the buffer with the kernel-completion still pending, so
     // the original on `plan.request` is the only way to recover. With
     // `Bytes` the clone is just an Arc bump; the underlying request bytes
-    // are never copied per attempt.
+    // are never copied per attempt. `proxy_send_timeout` bounds each write
+    // (#490): a request without a body usually goes in one, and the rest
+    // of a head the socket didn't take goes as a body does.
     let res = if plan.body.is_empty() {
-        timeout(plan.send_timeout, stream.write_all(plan.request.clone()))
-            .await
-            .map(|(res, _)| res.map(drop))
+        let len = plan.request.len();
+        match timeout(
+            plan.send_timeout,
+            monoio::io::AsyncWriteRent::write(&mut stream, plan.request.clone()),
+        )
+        .await
+        {
+            Ok((Ok(n), _)) if n == len => Some(Ok(())),
+            Ok((Ok(0), _)) => Some(Err(std::io::ErrorKind::WriteZero.into())),
+            Ok((Err(e), _)) if e.kind() != std::io::ErrorKind::Interrupted => Some(Err(e)),
+            Ok((res, _)) => {
+                let sent = res.unwrap_or(0);
+                let rest = plan.request.slice(sent..);
+                let parts =
+                    write_request_parts(&mut stream, rest, bytes::Bytes::new(), plan.send_timeout);
+                Box::pin(parts).await
+            }
+            Err(_) => None,
+        }
     } else {
-        let parts = write_request_parts(&mut stream, plan.request.clone(), plan.body.clone());
-        timeout(plan.send_timeout, Box::pin(parts)).await
+        let parts = write_request_parts(
+            &mut stream,
+            plan.request.clone(),
+            plan.body.clone(),
+            plan.send_timeout,
+        );
+        Box::pin(parts).await
     };
     let res = match res {
-        Ok(res) => res,
-        Err(_) => {
+        Some(res) => res,
+        None => {
             return AttemptOutcome::Failed(
                 Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
                 FailKind::Timeout,
@@ -1830,6 +1876,9 @@ async fn attempt(
     // safe — the kernel writes before we read.
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
+    if plan.limit_rate != 0 || late_limit_rate.is_some() {
+        read_buf = paced_head_buf(read_buf);
+    }
     let mut head_end_terminator: (usize, usize); // (head_end, terminator_len)
     let mut scanned = 0;
     // Bytes of 103 heads dropped from the front of `accum` (#581): not
@@ -2141,6 +2190,17 @@ async fn attempt(
     // far; we sleep when bytes/elapsed would exceed `plan.limit_rate`. Bytes
     // already pulled in with the header read are counted as received.
     let body_pacer_start = Instant::now();
+    let intercepted = plan
+        .intercept
+        .as_ref()
+        .is_some_and(|rules| rules.iter().any(|r| r.status == status_code));
+    let limit_rate = match late_limit_rate {
+        // An answer `proxy_intercept_errors` sends to an error_page isn't
+        // the client's: nginx doesn't read its body at all.
+        _ if intercepted => 0,
+        Some(late) => late_limit_rate_of(late, status_code, &accum[..head_end], first_line_end),
+        None => plan.limit_rate,
+    };
     let mut paced_body_bytes: u64 = body_len_in_accum as u64;
     // A body that hasn't all arrived goes to the client as it comes (#88),
     // unless something needs it whole: a status that may fail over or be
@@ -2191,7 +2251,7 @@ async fn attempt(
                 upstream: stream,
                 read_buf,
                 read_timeout: plan.read_timeout,
-                limit_rate: plan.limit_rate,
+                limit_rate,
                 pacer_start: body_pacer_start,
                 paced: paced_body_bytes,
                 started,
@@ -2218,8 +2278,14 @@ async fn attempt(
         // bytes after `body_start` are not what we'll forward.
         accum.truncate(body_start);
         body_len_in_accum = 0;
-        match read_chunked_body_with_buf(&mut stream, &mut body, &mut read_buf, plan.read_timeout)
-            .await
+        match read_chunked_body_with_buf(
+            &mut stream,
+            &mut body,
+            &mut read_buf,
+            plan.read_timeout,
+            (limit_rate, body_pacer_start),
+        )
+        .await
         {
             Ok((read, extra)) => {
                 state.bytes_received += read;
@@ -2288,7 +2354,7 @@ async fn attempt(
                     accum.extend_from_slice(&read_buf[..take]);
                     body_len_in_accum += take;
                     paced_body_bytes += take as u64;
-                    pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
+                    pace_body_read(limit_rate, paced_body_bytes, body_pacer_start).await;
                 }
                 Err(e) => {
                     return AttemptOutcome::Failed(
@@ -2321,7 +2387,7 @@ async fn attempt(
                     accum.extend_from_slice(&read_buf[..n]);
                     body_len_in_accum += n;
                     paced_body_bytes += n as u64;
-                    pace_body_read(plan.limit_rate, paced_body_bytes, body_pacer_start).await;
+                    pace_body_read(limit_rate, paced_body_bytes, body_pacer_start).await;
                 }
                 Err(e) => {
                     return AttemptOutcome::Failed(
@@ -2839,7 +2905,7 @@ fn background_update(
     }
     Box::pin(async move {
         let mut report = ProxyReport::default();
-        let _ = run_proxy(plan, &mut report).await;
+        let _ = run_proxy(plan, &mut report, None).await;
     })
 }
 
@@ -3217,6 +3283,42 @@ async fn send_body_file(
     Ok(())
 }
 
+/// A `proxy_limit_rate` with variables, from the upstream's head: its
+/// header lines as `$upstream_http_*` reads them.
+#[cold]
+#[inline(never)]
+fn late_limit_rate_of(
+    late: LateLimitRate<'_>,
+    status: u16,
+    head: &[u8],
+    first_line_end: usize,
+) -> u64 {
+    let mut lines = Vec::with_capacity(head.len());
+    let mut cursor = headers_start(head, first_line_end, head.len());
+    while cursor < head.len() {
+        let (line_len, t) = find_line_end(&head[cursor..]).unwrap_or((head.len() - cursor, 0));
+        let line = &head[cursor..cursor + line_len];
+        cursor += line_len + t;
+        if line.is_empty() {
+            break;
+        }
+        lines.extend_from_slice(line);
+        lines.extend_from_slice(b"\r\n");
+    }
+    late(status, &lines)
+}
+
+/// Under `proxy_limit_rate`, the head is read as nginx reads it, into a
+/// `proxy_buffer_size` buffer (4k by default): a pooled buffer may hold
+/// 128 KiB, and the body bytes that come with the head go out unpaced
+/// (#700).
+#[cold]
+#[inline(never)]
+fn paced_head_buf(buf: Vec<u8>) -> Vec<u8> {
+    return_proxy_buf(buf);
+    Vec::with_capacity(PROXY_SCRATCH_CAP)
+}
+
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body
 /// bytes received so far don't exceed `limit_rate` bytes/second since
 /// `started`. `limit_rate == 0` is a no-op (unlimited). Mirrors nginx's
@@ -3258,7 +3360,10 @@ async fn read_chunked_body_with_buf(
     body: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     read_timeout: Duration,
+    // `proxy_limit_rate`: the rate, and when the body started.
+    (limit_rate, pacer_start): (u64, Instant),
 ) -> Result<(u64, bool), (bool, UpstreamError)> {
+    let mut paced = body.len() as u64;
     let leftover = std::mem::take(body);
     let mut nothing_read = leftover.is_empty();
     let mut decoder = crate::proxy_stream::ChunkedDecoder::default();
@@ -3287,6 +3392,8 @@ async fn read_chunked_body_with_buf(
                 nothing_read = false;
                 received += n as u64;
                 (done, extra) = decode_chunked(&mut decoder, &read_buf[..n], &mut decoded)?;
+                paced += n as u64;
+                pace_body_read(limit_rate, paced, pacer_start).await;
             }
             Err(e) => {
                 return Err((
@@ -3394,14 +3501,17 @@ pub fn default_hidden_bit(name: &[u8]) -> Option<u16> {
 }
 
 /// `Content-Length` value as nginx's `ngx_atoof` accepts it: decimal
-/// digits only, no sign, no overflow.
+/// digits only, no sign, at most `NGX_MAX_OFF_T_VALUE` (2^63 - 1).
 pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    value.iter().try_fold(0u64, |n, &d| {
-        n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
-    })
+    value
+        .iter()
+        .try_fold(0u64, |n, &d| {
+            n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+        })
+        .filter(|&n| n <= i64::MAX as u64)
 }
 
 pub(crate) fn parse_status_code(status_line: &[u8]) -> u16 {
@@ -3780,9 +3890,12 @@ mod tests {
         assert_eq!(parse_content_length(b"0"), Some(0));
         assert_eq!(parse_content_length(b"1234"), Some(1234));
         assert_eq!(
-            parse_content_length(b"18446744073709551615"),
-            Some(u64::MAX)
+            parse_content_length(b"9223372036854775807"),
+            Some(i64::MAX as u64)
         );
+        // Past NGX_MAX_OFF_T_VALUE: nginx's ngx_atoof refuses it.
+        assert_eq!(parse_content_length(b"9223372036854775808"), None);
+        assert_eq!(parse_content_length(b"18446744073709551615"), None);
         for bad in [
             &b""[..],
             b"foo",

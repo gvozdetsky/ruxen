@@ -52,7 +52,7 @@ jobs:
           workspaces: fuzz
       - name: Fuzz each target
         run: |
-          for t in request host uri proxy_protocol config chunked upstream_head upstream_chunked dns_response; do
+          for t in request host uri proxy_protocol config chunked upstream_head upstream_chunked dns_response range gzip_negotiation http_date basic_auth h2_frames; do
             mkdir -p "fuzz/corpus/$t"
             # The prebuilt cargo-fuzz is a musl binary and defaults to its
             # own target, where the sanitizer can't run: say gnu.

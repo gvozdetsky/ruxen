@@ -278,7 +278,11 @@ fn decode_chunked(
 }
 
 impl StreamIo {
-    /// The response head `handle` wrote, as a HEADERS frame.
+    /// The response head `handle` wrote, as a HEADERS frame. Out of line:
+    /// whether LLVM inlined it into `write` flipped with unrelated changes
+    /// elsewhere, and inlined it cost h2c_hello ~1% (callgrind and ABBA,
+    /// 2026-10-22).
+    #[inline(never)]
     fn send_head(&mut self, head: &[u8]) -> io::Result<()> {
         let (status, fields) = parse_head(head)?;
         // An interim response (100 Continue): HTTP/2 has its own; the

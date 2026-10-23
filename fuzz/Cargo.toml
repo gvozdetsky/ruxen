@@ -82,3 +82,38 @@ path = "fuzz_targets/dns_response.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "range"
+path = "fuzz_targets/range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gzip_negotiation"
+path = "fuzz_targets/gzip_negotiation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_date"
+path = "fuzz_targets/http_date.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "basic_auth"
+path = "fuzz_targets/basic_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_frames"
+path = "fuzz_targets/h2_frames.rs"
+test = false
+doc = false
+bench = false

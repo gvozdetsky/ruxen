@@ -126,6 +126,32 @@ impl FrameScan {
     }
 }
 
+/// For the `h2_frames` fuzz target (#477): the header-block sizes
+/// `FrameScan` finds in `data` (the client preface first), read in pieces
+/// cut at `cuts`, per stream id in the order they were first seen.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn scan_header_blocks(data: &[u8], cuts: &[usize]) -> Vec<(u32, u64)> {
+    let blocks: Rc<HeaderBlocks> = Rc::default();
+    let mut scan = FrameScan {
+        skip: super::PREFACE.len(),
+        head: [0; 9],
+        head_len: 0,
+        padded: None,
+        blocks: blocks.clone(),
+    };
+    let mut at = 0;
+    for &cut in cuts {
+        let cut = cut.clamp(at, data.len());
+        scan.scan(&data[at..cut]);
+        at = cut;
+    }
+    scan.scan(&data[at..]);
+    drop(scan);
+    Rc::try_unwrap(blocks)
+        .map(|b| b.sizes.into_inner())
+        .unwrap_or_default()
+}
+
 pub(crate) struct PollIo<S: 'static> {
     // The operations borrow `*stream`; declared first, so they are dropped
     // before it.

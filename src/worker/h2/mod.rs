@@ -7,7 +7,7 @@
 //! with the client preface (cleartext, "prior knowledge"), or when TLS
 //! negotiated `h2` through ALPN.
 
-mod compat;
+pub(crate) mod compat;
 mod stream;
 
 use std::cell::Cell;
@@ -273,11 +273,15 @@ async fn drive<IO>(
                 let (http, connection_id, peer_addr) = (ctx.http, ctx.connection_id, ctx.peer_addr);
                 let ctx = ctx.clone();
                 let streams = streams.clone();
+                // Boxed: the stream's future is about 11 KB, and moved by
+                // value it was copied four more times per request on its
+                // way into the task (callgrind: 99k -> 52k instructions
+                // per h2c request).
                 monoio::spawn(Contained::new(
-                    async move {
+                    Box::pin(async move {
                         serve_stream(request, respond, &ctx, counters, header_block).await;
                         streams.end();
-                    },
+                    }),
                     http,
                     connection_id,
                     peer_addr,

@@ -44,6 +44,8 @@ pub(crate) fn parse_server_block(
     let mut locations: Vec<Location> = Vec::new();
     let mut add_headers: Option<Vec<AddHeader>> = None;
     let mut add_trailers: Option<Vec<AddHeader>> = None;
+    let mut add_header_inherit: Option<HeaderInherit> = None;
+    let mut add_trailer_inherit: Option<HeaderInherit> = None;
     let mut error_pages: Option<Vec<ErrorPage>> = None;
     let mut rewrite_ops: Vec<RewriteOp> = Vec::new();
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
@@ -86,6 +88,7 @@ pub(crate) fn parse_server_block(
     let mut chunked_transfer_encoding: Option<bool> = None;
     let mut redirect = RedirectConf::default();
     let mut mime = MimeConf::default();
+    let mut charset = CharsetConf::default();
 
     loop {
         let (args, term) = lx.read_directive()?;
@@ -148,6 +151,8 @@ pub(crate) fn parse_server_block(
                         root,
                         add_headers,
                         add_trailers,
+                        add_header_inherit,
+                        add_trailer_inherit,
                         error_pages,
                         rewrite_ops,
                         keepalive_timeout,
@@ -192,6 +197,7 @@ pub(crate) fn parse_server_block(
                         chunked_transfer_encoding,
                         redirect,
                         mime,
+                        charset,
                         ssl,
                         locations,
                     });
@@ -217,6 +223,9 @@ pub(crate) fn parse_server_block(
         match (args[0].as_str(), &term) {
             ("types", Terminator::BlockOpen) | ("default_type", Terminator::Semi) => {
                 parse_mime(lx, &args, &term, &mut mime)?;
+            }
+            ("charset" | "charset_types" | "source_charset", Terminator::Semi) => {
+                parse_charset(lx, &args, &term, &mut charset)?;
             }
             ("listen", Terminator::Semi) => {
                 saw_listen = true;
@@ -658,6 +667,12 @@ pub(crate) fn parse_server_block(
                 let entry = parse_add_header_args(&args[1..])?;
                 add_trailers.get_or_insert_with(Vec::new).push(entry);
             }
+            ("add_header_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_header_inherit, &args)?;
+            }
+            ("add_trailer_inherit", Terminator::Semi) => {
+                parse_header_inherit(&mut add_trailer_inherit, &args)?;
+            }
             ("error_page", Terminator::Semi) => {
                 let entries = parse_error_page_args(&args[1..])?;
                 error_pages.get_or_insert_with(Vec::new).extend(entries);
@@ -683,6 +698,8 @@ pub(crate) fn parse_server_block(
                 | "root"
                 | "location"
                 | "add_header"
+                | "add_header_inherit"
+                | "add_trailer_inherit"
                 | "error_page"
                 | "return"
                 | "set"
@@ -1372,6 +1389,133 @@ pub(crate) fn parse_proxy_redirect(
         None => *slot = Some(ProxyRedirect::Rules(vec![rule])),
         Some(ProxyRedirect::Rules(rules)) => rules.push(rule),
         Some(ProxyRedirect::Off) => return Err(Error::Duplicate("proxy_redirect")),
+    }
+    Ok(())
+}
+
+/// One `proxy_cookie_domain` / `proxy_cookie_path` line (`domain`: the
+/// first) into the scope's `slot`: `off`, or a pattern and a replacement
+/// (ngx_http_proxy_cookie_domain / _path). A domain's `~` regex is always
+/// caseless, and a literal domain loses a leading dot on both sides; a
+/// path's `~*` is caseless. `off` can't be mixed with rules in one scope.
+pub(crate) fn parse_proxy_cookie(
+    args: &[String],
+    slot: &mut Option<ProxyRedirect>,
+    domain: bool,
+) -> Result<(), Error> {
+    let what = if domain {
+        "proxy_cookie_domain"
+    } else {
+        "proxy_cookie_path"
+    };
+    let rule = match &args[1..] {
+        [one] if one == "off" => {
+            if slot.is_some() {
+                return Err(Error::Duplicate(what));
+            }
+            *slot = Some(ProxyRedirect::Off);
+            return Ok(());
+        }
+        [pattern, replacement] => {
+            if let Some(regex) = pattern.strip_prefix('~') {
+                let (regex, case_insensitive) = match regex.strip_prefix('*') {
+                    Some(r) if !domain => (r, true),
+                    _ => (regex, domain),
+                };
+                regex::bytes::RegexBuilder::new(regex)
+                    .case_insensitive(case_insensitive)
+                    .build()
+                    .map_err(|e| Error::InvalidRegex {
+                        pattern: regex.to_string(),
+                        msg: e.to_string(),
+                    })?;
+                ProxyRedirectRule::Regex {
+                    pattern: regex.to_string(),
+                    case_insensitive,
+                    // Its captures, $1…$9.
+                    replacement: super::values::parse_value_with_vars_rewrite(replacement)?,
+                }
+            } else {
+                let undotted = |s: &'_ str| -> String {
+                    match s.strip_prefix('.') {
+                        Some(rest) if domain => rest.to_string(),
+                        _ => s.to_string(),
+                    }
+                };
+                ProxyRedirectRule::Prefix {
+                    pattern: crate::config::parse_value_with_vars(&undotted(pattern))?,
+                    replacement: crate::config::parse_value_with_vars(&undotted(replacement))?,
+                }
+            }
+        }
+        _ => {
+            return Err(Error::BadValue {
+                what,
+                got: args[1..].join(" "),
+            });
+        }
+    };
+    match slot {
+        None => *slot = Some(ProxyRedirect::Rules(vec![rule])),
+        Some(ProxyRedirect::Rules(rules)) => rules.push(rule),
+        Some(ProxyRedirect::Off) => return Err(Error::Duplicate(what)),
+    }
+    Ok(())
+}
+
+/// One `proxy_cookie_flags off | <cookie> <flag>…;` line into the scope's
+/// `slot` (ngx_http_proxy_cookie_flags): `off` stands alone in a scope. The
+/// flags may hold variables, so they are read per response; one nginx
+/// doesn't know is skipped then, as nginx does.
+pub(crate) fn parse_proxy_cookie_flags(
+    args: &[String],
+    slot: &mut Option<Vec<crate::config::CookieFlagsRule>>,
+) -> Result<(), Error> {
+    use crate::config::{CookieFlagsRule, CookieName};
+    const WHAT: &str = "proxy_cookie_flags";
+    let rule = match &args[1..] {
+        [one] if one == "off" => {
+            if slot.is_some() {
+                return Err(Error::Duplicate(WHAT));
+            }
+            *slot = Some(Vec::new());
+            return Ok(());
+        }
+        // At most three flags: nginx declares it NGX_CONF_TAKE1234.
+        [cookie, flags @ ..] if (1..=3).contains(&flags.len()) => {
+            let cookie = match cookie.strip_prefix('~') {
+                Some(regex) => {
+                    regex::bytes::RegexBuilder::new(regex)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(|e| Error::InvalidRegex {
+                            pattern: regex.to_string(),
+                            msg: e.to_string(),
+                        })?;
+                    CookieName::Regex(regex.to_string())
+                }
+                None => CookieName::Name(crate::config::parse_value_with_vars(cookie)?),
+            };
+            CookieFlagsRule {
+                cookie,
+                flags: flags
+                    .iter()
+                    .map(|f| crate::config::parse_value_with_vars(f))
+                    .collect::<Result<_, _>>()?,
+            }
+        }
+        _ => {
+            return Err(Error::BadValue {
+                what: WHAT,
+                got: args[1..].join(" "),
+            });
+        }
+    };
+    match slot {
+        None => *slot = Some(vec![rule]),
+        // `off` is the empty list.
+        Some(rules) if rules.is_empty() => return Err(Error::Duplicate(WHAT)),
+        Some(rules) => rules.push(rule),
     }
     Ok(())
 }

@@ -47,7 +47,13 @@ pub mod fuzzing {
         match crate::http::parse_request(data, &mut st) {
             crate::http::Parse::Complete(req) => Some(Ok(req.consumed)),
             crate::http::Parse::Incomplete => None,
-            _ => Some(Err(())),
+            _ => {
+                // The log line for a refused request is found again from
+                // the bytes (#663): it must not panic on any of them.
+                let refusal = crate::http::refusal_reason(data, false);
+                assert!(data.starts_with(refusal.request_line));
+                Some(Err(()))
+            }
         }
     }
 
@@ -80,6 +86,103 @@ pub mod fuzzing {
         crate::uri::normalize_with(data, merge_slashes, &mut out)
             .map(|_| out)
             .map_err(drop)
+    }
+
+    /// `range::parse_header` for a body of `len` bytes and at most `limit`
+    /// ranges: `None` when the header isn't a `bytes=` range, else the
+    /// ranges, `Err(true)` for not satisfiable, `Err(false)` for declined
+    /// (the whole body).
+    pub fn range_parse(
+        value: &[u8],
+        len: u64,
+        limit: u64,
+    ) -> Option<Result<Vec<(u64, u64)>, bool>> {
+        use crate::worker::range::Parsed;
+        crate::worker::range::parse_header(value, len, limit).map(|parsed| match parsed {
+            Parsed::Ranges(ranges) => Ok(ranges.iter().collect()),
+            Parsed::NotSatisfiable => Err(true),
+            Parsed::Declined => Err(false),
+        })
+    }
+
+    /// The range limit without `max_ranges`.
+    pub const RANGE_DEFAULT_LIMIT: u64 = crate::worker::range::DEFAULT_LIMIT;
+
+    /// `range::filter` over a `200` with `body` and its `Content-Length`,
+    /// for a request with `Range: <range>`: the response, head and body.
+    /// `multi`: several ranges allowed (a cached response), else one.
+    pub fn range_filter(
+        body: &[u8],
+        range: &[u8],
+        head_only: bool,
+        multi: bool,
+        max_ranges: Option<u32>,
+    ) -> Vec<u8> {
+        use crate::worker::range::{RangeAllow, RangeRequest};
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        if !head_only {
+            response.extend_from_slice(body);
+        }
+        let allow = if multi {
+            RangeAllow::Multi
+        } else {
+            RangeAllow::Single
+        };
+        let req = RangeRequest {
+            range: Some(range),
+            if_range: None,
+            head_only,
+        };
+        crate::worker::range::filter(response, allow, max_ranges, req, |len, server| {
+            crate::worker::range::not_satisfiable(len, head_only, server)
+        })
+    }
+
+    /// `file::parse_http_date`: an `If-Modified-Since` / `If-Range` date
+    /// in any of the three formats, as seconds since the epoch.
+    pub fn parse_http_date(value: &[u8]) -> Option<u64> {
+        crate::file::parse_http_date(value)
+    }
+
+    /// `file::format_http_date`: the IMF-fixdate of `secs`, saturating at
+    /// the end of year 9999.
+    pub fn format_http_date(secs: u64) -> [u8; 29] {
+        crate::file::format_http_date(secs)
+    }
+
+    /// The end of year 9999, where `format_http_date` saturates.
+    pub const MAX_HTTP_DATE_SECS: u64 = 253_402_300_799;
+
+    /// `auth::decode_basic_authorization` over a request's header lines:
+    /// the user and password, or `Err(true)` without the header,
+    /// `Err(false)` for a malformed one.
+    pub fn basic_authorization(headers_raw: &[u8]) -> Result<(Vec<u8>, Vec<u8>), bool> {
+        match crate::auth::decode_basic_authorization(headers_raw) {
+            Ok(creds) => Ok((creds.username, creds.password)),
+            Err(crate::auth::BasicHeaderError::Missing) => Err(true),
+            Err(crate::auth::BasicHeaderError::Malformed) => Err(false),
+        }
+    }
+
+    /// The HTTP/2 header-block sizes `$request_length` starts from (#409):
+    /// `data` (client preface, then frames) read in pieces cut at `cuts`,
+    /// per stream id.
+    pub fn h2_header_blocks(data: &[u8], cuts: &[usize]) -> Vec<(u32, u64)> {
+        crate::worker::h2::compat::scan_header_blocks(data, cuts)
+    }
+
+    /// `gzip::accepts_gzip`: whether `Accept-Encoding` takes gzip.
+    pub fn accepts_gzip(accept_encoding: &[u8]) -> bool {
+        crate::worker::gzip::accepts_gzip(accept_encoding)
+    }
+
+    /// `gzip::is_msie6`: `gzip_disable msie6`'s test of a `User-Agent`.
+    pub fn is_msie6(user_agent: &[u8]) -> bool {
+        crate::worker::gzip::is_msie6(user_agent)
     }
 
     /// `proxy_protocol::parse`.

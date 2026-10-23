@@ -156,6 +156,12 @@ impl RenderCtx<'_> {
         };
         match v {
             Variable::RequestFilename => {
+                if self
+                    .rewrite_state
+                    .is_some_and(|s| doc_root.alias_refused(s))
+                {
+                    return;
+                }
                 let path = crate::fs_resolve::request_filename(doc_root, self.uri);
                 out.extend_from_slice(path.as_os_str().as_bytes());
             }
@@ -886,37 +892,27 @@ fn header_name_eq_var(name: &[u8], target: &[u8]) -> bool {
         })
 }
 
-pub(crate) fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    haystack.windows(needle.len()).any(|w| {
-        w.iter()
-            .zip(needle.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    })
-}
-
+/// nginx's `r->headers_in.msie6`, the same flag `gzip_disable msie6`
+/// reads (ngx_http_user_agent).
 pub(crate) fn user_agent_is_msie6(ua: &[u8]) -> bool {
-    let Some(pos) = ua.windows(5).position(|w| w.eq_ignore_ascii_case(b"MSIE ")) else {
-        return false;
-    };
-    let mut major: u32 = 0;
-    let mut any = false;
-    for &b in &ua[pos + 5..] {
-        if b.is_ascii_digit() {
-            any = true;
-            major = major.saturating_mul(10).saturating_add((b - b'0') as u32);
-        } else {
-            break;
-        }
-    }
-    any && major <= 6
+    super::gzip::is_msie6(ua)
 }
 
+/// nginx's `r->headers_in.safari` (ngx_http_user_agent): `Safari/` and
+/// `Mac OS X`, case-sensitive, unless the agent is MSIE (`MSIE ` with three
+/// bytes after it), Opera, Gecko (`Gecko/`) or Chrome (`Chrome/`).
 pub(crate) fn user_agent_is_safari(ua: &[u8]) -> bool {
-    contains_ascii_case_insensitive(ua, b"Safari/")
-        && contains_ascii_case_insensitive(ua, b"Mac OS X")
+    let has = |needle: &[u8]| ua.windows(needle.len()).any(|w| w == needle);
+    let msie = ua
+        .windows(5)
+        .position(|w| w == b"MSIE ")
+        .is_some_and(|at| at + 7 < ua.len());
+    !msie
+        && !has(b"Opera")
+        && !has(b"Gecko/")
+        && !has(b"Chrome/")
+        && has(b"Safari/")
+        && has(b"Mac OS X")
 }
 
 pub(crate) fn should_disable_keepalive_for_user_agent(
@@ -1605,5 +1601,31 @@ mod time_format_tests {
             format_time_iso8601(&mut out, civil, offset);
             assert_eq!(String::from_utf8(out).unwrap(), iso);
         }
+    }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::{user_agent_is_msie6, user_agent_is_safari};
+
+    /// `keepalive_disable msie6 | safari` read nginx's ngx_http_user_agent
+    /// flags, the same msie6 as `gzip_disable` (#477).
+    #[test]
+    fn keepalive_user_agents_as_nginx() {
+        assert!(user_agent_is_msie6(b"MSIE 5.0"));
+        assert!(!user_agent_is_msie6(
+            b"Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1)"
+        ));
+        assert!(!user_agent_is_msie6(b"msie 5.0"));
+        assert!(user_agent_is_safari(b"Mac OS X Safari/7534.48.3"));
+        // Chrome and Firefox on a Mac aren't Safari to nginx.
+        assert!(!user_agent_is_safari(
+            b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+              (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ));
+        assert!(!user_agent_is_safari(
+            b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0 Safari/1"
+        ));
+        assert!(!user_agent_is_safari(b"mac os x safari/1"));
     }
 }
