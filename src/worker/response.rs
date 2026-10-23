@@ -1549,9 +1549,32 @@ pub(crate) fn leak_bytes(b: &[u8]) -> &'static [u8] {
 /// built as `text/plain`. A canned error page or a 204 keeps its own.
 #[inline]
 pub(crate) fn typed_return(response: Response, types: ReturnTypes, uri: &[u8]) -> Response {
-    match types.map(|types| types.for_url(uri)) {
-        Some(ty) if ty != b"text/plain" => retype_return(response, ty),
-        _ => response,
+    let Some(types) = types else {
+        return response;
+    };
+    // The usual case, a URI without an extension and `default_type
+    // text/plain`: nothing to look up or compare.
+    let has_extension = uri
+        .iter()
+        .rev()
+        .take_while(|&&b| b != b'/')
+        .any(|&b| b == b'.');
+    if !has_extension && types.default_is_plain {
+        return response;
+    }
+    typed_return_by_types(response, types, uri)
+}
+
+#[cold]
+#[inline(never)]
+fn typed_return_by_types(
+    response: Response,
+    types: &'static crate::worker::PreparedTypes,
+    uri: &[u8],
+) -> Response {
+    match types.for_url(uri) {
+        b"text/plain" => response,
+        ty => retype_return(response, ty),
     }
 }
 
