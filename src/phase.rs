@@ -1047,6 +1047,7 @@ fn process_with_meta_inner(
             loc = loc.limited(le);
         }
         rewrite_state.if_location = None;
+        rewrite_state.if_proxy = false;
         // A response from the rewrite program (`return` in an `if`, a
         // `rewrite … redirect`) goes on to the location's response
         // filters, `error_page` and `add_header`, as nginx finalizes it
