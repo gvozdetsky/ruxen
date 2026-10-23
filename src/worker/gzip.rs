@@ -232,30 +232,34 @@ fn quantity(v: &[u8]) -> u32 {
         if matches!(c, b',' | b' ') {
             break;
         }
-        if !c.is_ascii_digit() {
+        // More than three digits is invalid, and would overflow `frac`.
+        if !c.is_ascii_digit() || n == 3 {
             return 0;
         }
         frac = frac * 10 + u32::from(c - b'0');
         n += 1;
     }
-    if n > 3 {
-        return 0;
-    }
     let total = q + frac * 10u32.pow(3 - n);
     if total > 1000 { 0 } else { total }
 }
 
-/// nginx's `r->headers_in.msie6`: MSIE 4, 5 or 6, except 6 with SV1.
-fn is_msie6(ua: &[u8]) -> bool {
+/// nginx's `r->headers_in.msie6` (ngx_http_user_agent): the first `MSIE `
+/// followed by at least three bytes, version 4, 5 or 6 (6 without `SV1`
+/// after it), and no `Opera` anywhere.
+pub(crate) fn is_msie6(ua: &[u8]) -> bool {
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
     let Some(at) = ua.windows(5).position(|w| w == b"MSIE ") else {
         return false;
     };
-    let rest = &ua[at + 5..];
-    match rest {
-        [b'4' | b'5', b'.', ..] => true,
-        [b'6', b'.', ..] => !rest.windows(3).any(|w| w == b"SV1"),
-        _ => false,
+    if at + 7 >= ua.len() || ua[at + 6] != b'.' {
+        return false;
     }
+    let msie6 = match ua[at + 5] {
+        b'4' | b'5' => true,
+        b'6' => !find(&ua[at + 8..], b"SV1"),
+        _ => false,
+    };
+    msie6 && !find(ua, b"Opera")
 }
 
 /// `ngx_http_gzip_ok`: may this client get a compressed response?
@@ -832,8 +836,35 @@ mod tests {
             b"gzipx",
             b"gzip;q=1.5",
             b"gzip;q=0.0001",
+            // Overflowed the fraction before the length check (#477).
+            b"gzip;q=0.99999999999999999999",
         ] {
             assert!(!accepts_gzip(no), "{}", String::from_utf8_lossy(no));
+        }
+    }
+
+    #[test]
+    fn msie6_as_nginx_user_agent() {
+        for yes in [
+            &b"Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0)"[..],
+            b"Mozilla/4.0 (compatible; MSIE 5.5; Windows 98)",
+            b"MSIE 4.01",
+            b"MSIE 6.0",
+            // `SV1` counts after the version only (msie + 8).
+            b"MSIE 6.SV1",
+        ] {
+            assert!(is_msie6(yes), "{}", String::from_utf8_lossy(yes));
+        }
+        for no in [
+            &b"Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1)"[..],
+            b"Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)",
+            // Too short: nginx wants three bytes after `MSIE `.
+            b"MSIE 6.",
+            // Opera said it was MSIE; nginx clears msie then.
+            b"Opera/9.80 (compatible; MSIE 6.0; Windows NT 5.1)",
+            b"Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1) Opera 7.54",
+        ] {
+            assert!(!is_msie6(no), "{}", String::from_utf8_lossy(no));
         }
     }
 
