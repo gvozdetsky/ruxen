@@ -1208,3 +1208,136 @@ fn ssl_certificate_compression_of_the_server_chosen_by_sni() {
     assert!(!certificate_came_compressed(server.port, "a.test", &ca_a));
     assert!(certificate_came_compressed(server.port, "b.test", &ca_b));
 }
+
+/// `ssl_ciphers` and `ssl_prefer_server_ciphers` of the server chosen by
+/// SNI: `a.test` (the default server) only ChaCha20 for TLS 1.2, `b.test`
+/// AES-128 then AES-256 in its own order, `c.test` the same list in the
+/// client's order (nginx's default). TLS 1.3 isn't restricted.
+const SNI_CIPHERS_CONF: &str = r#"
+daemon off;
+events { }
+
+http {
+    server {
+        listen 127.0.0.1:%%PORT%% ssl default_server;
+        server_name a.test;
+        ssl_ciphers CHACHA20;
+        ssl_certificate     %%CERT_0%%;
+        ssl_certificate_key %%KEY_0%%;
+        location / { return 200 "a\n"; }
+    }
+
+    server {
+        listen 127.0.0.1:%%PORT%%;
+        server_name b.test;
+        ssl_ciphers "ECDHE+AES128:ECDHE+AES256:!CHACHA20";
+        ssl_prefer_server_ciphers on;
+        ssl_certificate     %%CERT_1%%;
+        ssl_certificate_key %%KEY_1%%;
+        location / { return 200 "b\n"; }
+    }
+
+    server {
+        listen 127.0.0.1:%%PORT%%;
+        server_name c.test;
+        ssl_ciphers "ECDHE+AES128:ECDHE+AES256:!CHACHA20";
+        ssl_certificate     %%CERT_2%%;
+        ssl_certificate_key %%KEY_2%%;
+        location / { return 200 "c\n"; }
+    }
+}
+"#;
+
+/// The suite a TLS 1.2 handshake for `name` agrees on when the client
+/// offers `suites` in that order, or `None` when the server refuses.
+fn handshake_suite(
+    port: u16,
+    name: &str,
+    ca_pem: &Path,
+    suites: &[rustls::CipherSuite],
+) -> Option<rustls::CipherSuite> {
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read(ca_pem).unwrap();
+    for cert in
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(
+            &pem,
+        )
+    {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    let all = provider.cipher_suites.clone();
+    provider.cipher_suites = suites
+        .iter()
+        .filter_map(|id| all.iter().copied().find(|s| s.suite() == *id))
+        .collect();
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock).ok()?;
+    }
+    conn.negotiated_cipher_suite().map(|s| s.suite())
+}
+
+#[test]
+fn ssl_ciphers_of_the_server_chosen_by_sni() {
+    use rustls::CipherSuite as C;
+    let certs: Vec<_> = ["a.test", "b.test", "c.test"]
+        .iter()
+        .map(|n| make_ca_and_leaf(n))
+        .collect();
+    let cas: Vec<PathBuf> = certs
+        .iter()
+        .map(|c| c.ca_path().unwrap().to_path_buf())
+        .collect();
+    let server = spawn_https_server_multi(SNI_CIPHERS_CONF, certs);
+    let port = server.port;
+    // Whichever key the test certificates have: both auth types offered.
+    let (aes128, aes256, chacha) = (
+        [
+            C::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            C::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        ],
+        [
+            C::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            C::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        ],
+        [
+            C::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            C::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ],
+    );
+    let offer =
+        |parts: &[&[C; 2]]| -> Vec<C> { parts.iter().flat_map(|p| p.iter().copied()).collect() };
+    let is = |got: Option<C>, want: &[C; 2]| got.is_some_and(|g| want.contains(&g));
+    // a.test: ChaCha20 only.
+    assert!(is(
+        handshake_suite(port, "a.test", &cas[0], &offer(&[&aes128, &chacha])),
+        &chacha
+    ));
+    assert_eq!(
+        handshake_suite(port, "a.test", &cas[0], &offer(&[&aes128])),
+        None
+    );
+    // b.test: its own order, AES-128 first; ChaCha20 refused.
+    assert!(is(
+        handshake_suite(port, "b.test", &cas[1], &offer(&[&aes256, &aes128])),
+        &aes128
+    ));
+    assert_eq!(
+        handshake_suite(port, "b.test", &cas[1], &offer(&[&chacha])),
+        None
+    );
+    // c.test: the same list, the client's order.
+    assert!(is(
+        handshake_suite(port, "c.test", &cas[2], &offer(&[&aes256, &aes128])),
+        &aes256
+    ));
+}

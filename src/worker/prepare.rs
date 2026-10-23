@@ -100,6 +100,16 @@ fn prepare_warning(line: String) {
     PREPARE_WARNINGS.with(|w| w.borrow_mut().push(line));
 }
 
+/// A warning about a server, which the server's every address would repeat.
+fn prepare_warning_once(line: String) {
+    PREPARE_WARNINGS.with(|w| {
+        let mut w = w.borrow_mut();
+        if !w.contains(&line) {
+            w.push(line);
+        }
+    });
+}
+
 fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         limit_req_zones,
@@ -533,7 +543,23 @@ pub(crate) fn build_listen_tls(
     // keeps the default server's session context. A server chosen by SNI
     // has its own protocols (#586), as nginx 1.29.2+ selects the server
     // before the version is negotiated.
-    let protocols = default.ssl.protocols.unwrap_or_default();
+    // `ssl_ciphers` / `ssl_prefer_server_ciphers`: each server's, in its
+    // context as its protocols are (an SNI-chosen server's own SSL_CTX in
+    // nginx). A list that leaves no TLS 1.2 suite leaves TLS 1.3 alone.
+    let cipher_policy = |input: &TlsServerInput| {
+        crate::tls_ciphers::Policy::of(
+            input.ssl.ciphers.as_deref(),
+            input.ssl.prefer_server_ciphers,
+        )
+    };
+    let versions_of = |input: &TlsServerInput| {
+        cipher_policy(input).versions(
+            input.ssl.protocols.unwrap_or_default(),
+            input.ssl.ciphers.as_deref(),
+            &mut |w| prepare_warning_once(w),
+        )
+    };
+    let protocols = versions_of(default)?;
     let session_timeout_secs = default
         .ssl
         .session_timeout_ms
@@ -650,8 +676,25 @@ pub(crate) fn build_listen_tls(
     };
     // And certificate compression (#601), an SSL_CTX option nginx copies
     // from the server chosen by SNI too.
-    type ContextKey = (Option<usize>, crate::config::TlsVersionSet, bool);
-    let default_key: ContextKey = (auth_of(default)?, protocols, compress(default));
+    // And the cipher policy, an index into `policies`.
+    let mut policies: Vec<crate::tls_ciphers::Policy> = vec![Default::default()];
+    let mut policy_of = |input: &TlsServerInput| -> usize {
+        let policy = cipher_policy(input);
+        policies
+            .iter()
+            .position(|p| *p == policy)
+            .unwrap_or_else(|| {
+                policies.push(policy);
+                policies.len() - 1
+            })
+    };
+    type ContextKey = (Option<usize>, crate::config::TlsVersionSet, bool, usize);
+    let default_key: ContextKey = (
+        auth_of(default)?,
+        protocols,
+        compress(default),
+        policy_of(default),
+    );
     let mut server_keys: Vec<ContextKey> = Vec::with_capacity(inputs.len());
     for input in inputs {
         server_keys.push(if input.ssl.certs.is_empty() {
@@ -659,22 +702,24 @@ pub(crate) fn build_listen_tls(
         } else {
             (
                 auth_of(input)?,
-                input.ssl.protocols.unwrap_or_default(),
+                versions_of(input)?,
                 compress(input),
+                policy_of(input),
             )
         });
     }
     // The address's config is the default server's context; the others
     // are configs of their own, indexed in `contexts`.
-    let context_config =
-        |(auth, versions, compressed): ContextKey| -> Result<Arc<rustls::ServerConfig>, String> {
-            if (auth, versions, compressed) == (None, protocols, compress(default)) {
+    let context_config = |(auth, versions, compressed, policy): ContextKey|
+     -> Result<Arc<rustls::ServerConfig>, String> {
+            if (auth, versions, compressed, policy) == (None, protocols, compress(default), 0) {
                 return Ok(cfg.clone());
             }
             let mut config = crate::tls_certs::with_context(
                 &cfg,
                 versions,
                 auth.map(|i| auths[i].1.verifier(crate::tls_certs::active_provider())),
+                &policies[policy],
             )
             .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
             if let Some(config) = Arc::get_mut(&mut config) {

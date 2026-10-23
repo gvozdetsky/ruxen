@@ -738,8 +738,9 @@ pub fn compress_certificates(cfg: &mut ServerConfig, on: bool) {
     };
 }
 
-/// A server's own context: `base` with its protocol versions (#586) and
-/// client-certificate verifier (#113), if any. A config of its own, since
+/// A server's own context: `base` with its protocol versions (#586),
+/// client-certificate verifier (#113), if any, and cipher suites and
+/// order (`ssl_ciphers`, `ssl_prefer_server_ciphers`). A config of its own, since
 /// rustls keeps both private, with everything else `base`'s, its session
 /// cache and ticket keys included (nginx keeps the default server's too).
 /// A session can't cross contexts anyway: resumption needs the same SNI
@@ -749,6 +750,7 @@ pub fn with_context(
     base: &ServerConfig,
     protocols: TlsVersionSet,
     verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    ciphers: &crate::tls_ciphers::Policy,
 ) -> Result<Arc<ServerConfig>, rustls::Error> {
     let versions: Vec<&'static SupportedProtocolVersion> = [
         (protocols.tlsv1_3, &rustls::version::TLS13),
@@ -762,15 +764,23 @@ pub fn with_context(
             "no TLS protocol versions enabled".into(),
         ));
     }
-    let builder = ServerConfig::builder_with_provider(base.crypto_provider().clone())
-        .with_protocol_versions(&versions)?;
+    // `ssl_ciphers` (the TLS 1.2 suites) is the provider's list.
+    let provider = match &ciphers.tls12 {
+        Some(tls12) => Arc::new(crate::tls_ciphers::provider_with_tls12(
+            base.crypto_provider(),
+            tls12,
+        )),
+        None => base.crypto_provider().clone(),
+    };
+    let builder =
+        ServerConfig::builder_with_provider(provider).with_protocol_versions(&versions)?;
     let builder = match verifier {
         Some(verifier) => builder.with_client_cert_verifier(verifier),
         None => builder.with_no_client_auth(),
     };
     let mut cfg = builder.with_cert_resolver(base.cert_resolver.clone());
     // Every public field, as rustls 0.23 has them.
-    cfg.ignore_client_order = base.ignore_client_order;
+    cfg.ignore_client_order = ciphers.server_order;
     cfg.max_fragment_size = base.max_fragment_size;
     cfg.session_storage = base.session_storage.clone();
     cfg.ticketer = base.ticketer.clone();

@@ -113,12 +113,6 @@ pub(crate) fn parse_server_block(
                             got: format!("{} cert(s), {} key(s)", ssl_certs.len(), ssl_keys.len()),
                         });
                     }
-                    if matches!(ssl_prefer_server_ciphers, Some(false)) {
-                        warnings.push(
-                            "ssl_prefer_server_ciphers off: rustls always uses server preference for TLS 1.2; ignored"
-                                .into(),
-                        );
-                    }
                     let ssl = ServerSsl {
                         certs: ssl_certs,
                         keys: ssl_keys,
