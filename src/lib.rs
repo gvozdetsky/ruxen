@@ -168,6 +168,13 @@ pub mod fuzzing {
         }
     }
 
+    /// The HTTP/2 header-block sizes `$request_length` starts from (#409):
+    /// `data` (client preface, then frames) read in pieces cut at `cuts`,
+    /// per stream id.
+    pub fn h2_header_blocks(data: &[u8], cuts: &[usize]) -> Vec<(u32, u64)> {
+        crate::worker::h2::compat::scan_header_blocks(data, cuts)
+    }
+
     /// `gzip::accepts_gzip`: whether `Accept-Encoding` takes gzip.
     pub fn accepts_gzip(accept_encoding: &[u8]) -> bool {
         crate::worker::gzip::accepts_gzip(accept_encoding)
