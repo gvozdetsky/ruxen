@@ -88,15 +88,22 @@ impl Prebuilt {
 
 pub enum PreparedReturn {
     /// Body has no variables — baked once at startup into a Prebuilt.
-    Static(Prebuilt),
+    Static(Prebuilt, ReturnTypes),
     /// Body contains at least one `$variable` reference. Rendered per
     /// request by walking `parts` and writing each literal chunk / variable
     /// value into a fresh `Vec<u8>`.
     Template {
         status: u16,
         parts: &'static [PreparedValuePart],
+        types: ReturnTypes,
     },
 }
+
+/// The level's `types` / `default_type` for a `return` whose response is
+/// built as `text/plain` (#691): nginx types it as any response, by the
+/// URI's extension, else `default_type` (ngx_http_set_content_type).
+/// `None` for a redirect, which keeps nginx's `text/html` page.
+pub type ReturnTypes = Option<&'static PreparedTypes>;
 
 /// Runtime-ready form of a `ValuePart`. Literals are promoted to `&'static
 /// [u8]` so rendering is a straight byte-copy; variables carry the enum
@@ -1201,6 +1208,9 @@ pub struct PreparedTypes {
         std::hash::BuildHasherDefault<super::NameHasher>,
     >,
     pub default: &'static [u8],
+    /// `default` is `text/plain`: a `return` to a URI without an extension
+    /// keeps the type it was built with (#691), without a compare.
+    pub default_is_plain: bool,
 }
 
 impl PreparedTypes {

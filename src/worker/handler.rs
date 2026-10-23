@@ -1304,18 +1304,28 @@ pub(crate) fn run_location_handler(
         }));
     }
     let inner = match loc.handler {
-        PreparedHandler::Return(PreparedReturn::Static(response), _) => {
-            Response::Prebuilt(response.pick(req.method))
-        }
-        PreparedHandler::Return(PreparedReturn::Template { status, parts }, _) => {
-            Response::Owned(build_templated_return(
+        PreparedHandler::Return(PreparedReturn::Static(response, types), _) => typed_return(
+            Response::Prebuilt(response.pick(req.method)),
+            *types,
+            url_path,
+        ),
+        PreparedHandler::Return(
+            PreparedReturn::Template {
+                status,
+                parts,
+                types,
+            },
+            _,
+        ) => {
+            let response = Response::Owned(build_templated_return(
                 *status,
                 parts,
                 &render_ctx_base,
                 req.method,
                 server_bytes,
                 phase::RedirectCtx::new(loc.redirect, req, server),
-            ))
+            ));
+            typed_return(response, *types, url_path)
         }
         PreparedHandler::Proxy(_) => unreachable!("handled above"),
         // ngx_http_stub_status_handler: GET and HEAD only, text/plain.

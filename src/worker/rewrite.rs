@@ -539,18 +539,25 @@ pub(crate) fn execute_rewrite_ops(
                     rewrite_state,
                 );
                 let response = match prepared {
-                    PreparedReturn::Static(prebuilt) => {
-                        Response::Prebuilt(prebuilt.pick(req.method))
-                    }
-                    PreparedReturn::Template { status, parts } => {
-                        Response::Owned(build_templated_return(
+                    PreparedReturn::Static(prebuilt, types) => typed_return(
+                        Response::Prebuilt(prebuilt.pick(req.method)),
+                        *types,
+                        uri_path,
+                    ),
+                    PreparedReturn::Template {
+                        status,
+                        parts,
+                        types,
+                    } => {
+                        let response = Response::Owned(build_templated_return(
                             *status,
                             parts,
                             &ctx,
                             req.method,
                             server_header,
                             phase::RedirectCtx::new(redirect, req, server),
-                        ))
+                        ));
+                        typed_return(response, *types, uri_path)
                     }
                 };
                 return RewriteControl::Respond(response, *finalized);
