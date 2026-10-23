@@ -119,6 +119,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         autoindex_exact_size,
         autoindex_localtime,
         autoindex_format,
+        if_modified_since,
         split_clients,
         maps,
         auth_basic,
@@ -171,6 +172,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_autoindex_exact_size = autoindex_exact_size.unwrap_or(true);
     let http_autoindex_localtime = autoindex_localtime.unwrap_or(false);
     let http_autoindex_format = autoindex_format.unwrap_or(AutoindexFormat::Html);
+    let http_if_modified_since = if_modified_since.unwrap_or(crate::config::IfModifiedSince::Exact);
     let http_access = resolve_access(
         access,
         auth_basic,
@@ -229,6 +231,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         autoindex_exact_size: http_autoindex_exact_size,
         autoindex_localtime: http_autoindex_localtime,
         autoindex_format: http_autoindex_format,
+        if_modified_since: http_if_modified_since,
         access: http_access,
         client_max_body_size: http_client_max_body_size,
         max_ranges: http_max_ranges,
@@ -2107,6 +2110,7 @@ pub(crate) struct HttpScope {
     pub(crate) autoindex_exact_size: bool,
     pub(crate) autoindex_localtime: bool,
     pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) if_modified_since: crate::config::IfModifiedSince,
     pub(crate) access: PreparedAccess,
     pub(crate) client_max_body_size: Option<u64>,
     pub(crate) max_ranges: Option<u32>,
@@ -2289,6 +2293,7 @@ pub(crate) fn prepare_server(
         .autoindex_localtime
         .unwrap_or(http.autoindex_localtime);
     let server_autoindex_format = server.autoindex_format.unwrap_or(http.autoindex_format);
+    let server_if_modified_since = server.if_modified_since.unwrap_or(http.if_modified_since);
     // server_tokens inheritance: server scope wins over http scope; both
     // default to `On`. Resolved once here; prepare_handler downstream
     // bakes the right `Server:` bytes into static prebuilts.
@@ -2338,6 +2343,7 @@ pub(crate) fn prepare_server(
         autoindex_exact_size: server_autoindex_exact_size,
         autoindex_localtime: server_autoindex_localtime,
         autoindex_format: server_autoindex_format,
+        if_modified_since: server_if_modified_since,
         access_logs: server_access_logs,
         access: server_access,
         client_max_body_size: server_client_max_body_size,
@@ -2414,6 +2420,7 @@ pub(crate) fn prepare_server(
             autoindex_exact_size: server_autoindex_exact_size,
             autoindex_localtime: server_autoindex_localtime,
             autoindex_format: server_autoindex_format,
+            if_modified_since: server_if_modified_since,
             disable_symlinks: server_disable_symlinks.clone(),
             mime: &server.mime,
             tokens: server_tokens_value,
@@ -3486,6 +3493,7 @@ pub(crate) struct HandlerSite<'a> {
     pub(crate) autoindex_exact_size: bool,
     pub(crate) autoindex_localtime: bool,
     pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) if_modified_since: crate::config::IfModifiedSince,
     pub(crate) disable_symlinks: Option<crate::config::DisableSymlinks>,
     pub(crate) mime: &'a crate::config::MimeConf,
     pub(crate) tokens: crate::config::ServerTokens,
@@ -3558,6 +3566,7 @@ pub(crate) fn build_handler(
                 autoindex_exact_size: site.autoindex_exact_size,
                 autoindex_localtime: site.autoindex_localtime,
                 autoindex_format: site.autoindex_format,
+                if_modified_since: site.if_modified_since,
                 try_files,
             })
         }
@@ -3671,6 +3680,7 @@ pub(crate) struct ServerScope<'a> {
     pub(crate) autoindex_exact_size: bool,
     pub(crate) autoindex_localtime: bool,
     pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) if_modified_since: crate::config::IfModifiedSince,
     pub(crate) access_logs: &'static [PreparedAccessLog],
     pub(crate) access: PreparedAccess,
     pub(crate) client_max_body_size: Option<u64>,
@@ -3721,6 +3731,7 @@ pub(crate) fn build_prefix_or_exact(
         autoindex_exact_size: location_autoindex_exact_size,
         autoindex_localtime: location_autoindex_localtime,
         autoindex_format: location_autoindex_format,
+        if_modified_since: location_if_modified_since,
         access_logs: location_access_logs,
         open_log_file_cache: location_open_log_file_cache,
         auth_basic: location_auth_basic,
@@ -3791,6 +3802,7 @@ pub(crate) fn build_prefix_or_exact(
         autoindex_exact_size: location_autoindex_exact_size.unwrap_or(server.autoindex_exact_size),
         autoindex_localtime: location_autoindex_localtime.unwrap_or(server.autoindex_localtime),
         autoindex_format: location_autoindex_format.unwrap_or(server.autoindex_format),
+        if_modified_since: location_if_modified_since.unwrap_or(server.if_modified_since),
         disable_symlinks: location_disable_symlinks.or_else(|| server.disable_symlinks.clone()),
         mime: &mime,
         tokens,
@@ -3941,6 +3953,7 @@ pub(crate) fn build_regex_location(
         autoindex_exact_size: location_autoindex_exact_size,
         autoindex_localtime: location_autoindex_localtime,
         autoindex_format: location_autoindex_format,
+        if_modified_since: location_if_modified_since,
         access_logs: location_access_logs,
         open_log_file_cache: location_open_log_file_cache,
         auth_basic: location_auth_basic,
@@ -4020,6 +4033,7 @@ pub(crate) fn build_regex_location(
         autoindex_exact_size: location_autoindex_exact_size.unwrap_or(server.autoindex_exact_size),
         autoindex_localtime: location_autoindex_localtime.unwrap_or(server.autoindex_localtime),
         autoindex_format: location_autoindex_format.unwrap_or(server.autoindex_format),
+        if_modified_since: location_if_modified_since.unwrap_or(server.if_modified_since),
         disable_symlinks: location_disable_symlinks.or_else(|| server.disable_symlinks.clone()),
         mime: &mime,
         tokens,

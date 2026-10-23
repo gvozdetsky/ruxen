@@ -341,6 +341,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     );
     or(&mut child.autoindex_localtime, &parent.autoindex_localtime);
     or(&mut child.autoindex_format, &parent.autoindex_format);
+    or(&mut child.if_modified_since, &parent.if_modified_since);
     or(&mut child.access_logs, &parent.access_logs);
     or(&mut child.auth_basic, &parent.auth_basic);
     or(
@@ -509,6 +510,7 @@ pub(crate) struct Inherited {
     pub(crate) autoindex_exact_size: Option<bool>,
     pub(crate) autoindex_localtime: Option<bool>,
     pub(crate) autoindex_format: Option<AutoindexFormat>,
+    pub(crate) if_modified_since: Option<IfModifiedSince>,
     pub(crate) auth_basic: Option<AuthBasic>,
     pub(crate) auth_basic_user_file: Option<PathBuf>,
     pub(crate) auth_delay_ms: Option<u64>,
@@ -572,6 +574,7 @@ pub(crate) fn parse_location_block(
     let mut autoindex_exact_size: Option<bool> = None;
     let mut autoindex_localtime: Option<bool> = None;
     let mut autoindex_format: Option<AutoindexFormat> = None;
+    let mut if_modified_since: Option<IfModifiedSince> = None;
     let mut access_logs: Option<Vec<AccessLog>> = None;
     let mut open_log_file_cache: Option<Option<OpenLogFileCache>> = None;
     let mut auth_basic: Option<AuthBasic> = None;
@@ -690,6 +693,8 @@ pub(crate) fn parse_location_block(
                         autoindex_localtime.or(inherited.autoindex_localtime);
                     let effective_autoindex_format =
                         autoindex_format.or(inherited.autoindex_format);
+                    let effective_if_modified_since =
+                        if_modified_since.or(inherited.if_modified_since);
                     let effective_auth_basic = auth_basic.or(inherited.auth_basic);
                     let effective_auth_basic_user_file =
                         auth_basic_user_file.or(inherited.auth_basic_user_file);
@@ -736,6 +741,7 @@ pub(crate) fn parse_location_block(
                         autoindex_exact_size: effective_autoindex_exact_size,
                         autoindex_localtime: effective_autoindex_localtime,
                         autoindex_format: effective_autoindex_format,
+                        if_modified_since: effective_if_modified_since,
                         access_logs,
                         auth_basic: effective_auth_basic,
                         auth_basic_user_file: effective_auth_basic_user_file,
@@ -922,6 +928,12 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("autoindex_format"));
                 }
                 autoindex_format = Some(parse_autoindex_format_args(&args[1..])?);
+            }
+            ("if_modified_since", Terminator::Semi) => {
+                if if_modified_since.is_some() {
+                    return Err(Error::Duplicate("if_modified_since"));
+                }
+                if_modified_since = Some(parse_if_modified_since_args(&args[1..])?);
             }
             ("access_log", Terminator::Semi) => {
                 let list = access_logs.get_or_insert_with(Vec::new);
@@ -1146,6 +1158,7 @@ pub(crate) fn parse_location_block(
                 let pass_autoindex_localtime =
                     autoindex_localtime.or(inherited.autoindex_localtime);
                 let pass_autoindex_format = autoindex_format.or(inherited.autoindex_format);
+                let pass_if_modified_since = if_modified_since.or(inherited.if_modified_since);
                 let pass_auth_basic = auth_basic.clone().or(inherited.auth_basic.clone());
                 let pass_auth_file = auth_basic_user_file
                     .clone()
@@ -1193,6 +1206,7 @@ pub(crate) fn parse_location_block(
                         autoindex_exact_size: pass_autoindex_exact_size,
                         autoindex_localtime: pass_autoindex_localtime,
                         autoindex_format: pass_autoindex_format,
+                        if_modified_since: pass_if_modified_since,
                         auth_basic: pass_auth_basic,
                         auth_basic_user_file: pass_auth_file,
                         auth_delay_ms: pass_auth_delay_ms,
@@ -1236,6 +1250,7 @@ pub(crate) fn parse_location_block(
                 | "autoindex_exact_size"
                 | "autoindex_localtime"
                 | "autoindex_format"
+                | "if_modified_since"
                 | "access_log"
                 | "auth_basic"
                 | "auth_basic_user_file"
@@ -1381,6 +1396,21 @@ pub(crate) fn parse_on_off_args(args: &[String], what: &'static str) -> Result<b
             what,
             got: args[0].clone(),
         }),
+    }
+}
+
+pub(crate) fn parse_if_modified_since_args(args: &[String]) -> Result<IfModifiedSince, Error> {
+    match args {
+        [v] => match v.as_str() {
+            "off" => Ok(IfModifiedSince::Off),
+            "exact" => Ok(IfModifiedSince::Exact),
+            "before" => Ok(IfModifiedSince::Before),
+            _ => Err(Error::BadValue {
+                what: "if_modified_since",
+                got: v.clone(),
+            }),
+        },
+        _ => Err(Error::MissingArg("if_modified_since")),
     }
 }
 

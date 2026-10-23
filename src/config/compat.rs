@@ -223,11 +223,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
     ),
     ("etag", Some("on"), "static responses still carry an ETag"),
     (
-        "if_modified_since",
-        Some("exact"),
-        "If-Modified-Since is still compared exactly",
-    ),
-    (
         "chunked_transfer_encoding",
         Some("on"),
         "not applied at this level (ruxen reads it in location only)",

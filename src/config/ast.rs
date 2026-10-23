@@ -471,6 +471,7 @@ pub struct HttpConfig {
     /// http-scope `autoindex_format ...;`. `None` means "not set";
     /// inheritance chain defaults to `html`.
     pub autoindex_format: Option<AutoindexFormat>,
+    pub if_modified_since: Option<IfModifiedSince>,
     /// http-scope `split_clients` programs keyed by output variable name
     /// (without the leading `$`).
     pub split_clients: Vec<SplitClients>,
@@ -1151,6 +1152,7 @@ pub struct Server {
     pub autoindex_localtime: Option<bool>,
     /// Server-scope `autoindex_format ...;`. `None` inherits from http.
     pub autoindex_format: Option<AutoindexFormat>,
+    pub if_modified_since: Option<IfModifiedSince>,
     /// Server-scope `access_log` directives. `None` inherits the http-scope
     /// list. `Some(empty)` means `access_log off;` was used to disable
     /// logging at this scope (parser collapses `off` to an empty vec).
@@ -1434,6 +1436,7 @@ pub struct Location {
     pub autoindex_localtime: Option<bool>,
     /// Location-scope `autoindex_format ...;`. `None` inherits from server.
     pub autoindex_format: Option<AutoindexFormat>,
+    pub if_modified_since: Option<IfModifiedSince>,
     /// Location-scope `access_log` directives. `None` inherits from server.
     /// `Some(empty)` is `access_log off;` — explicit suppression.
     pub access_logs: Option<Vec<AccessLog>>,
@@ -2734,6 +2737,16 @@ pub enum ServerTokens {
     /// tag so this is identical to `On` today, but we preserve the
     /// distinction so the directive parses and round-trips faithfully).
     Build,
+}
+
+/// `if_modified_since off|exact|before;` (ngx_http_test_if_modified):
+/// `exact`, nginx's default, takes a date equal to the Last-Modified as
+/// unmodified; `before` also one after it; `off` never.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum IfModifiedSince {
+    Off,
+    Exact,
+    Before,
 }
 
 /// `autoindex_format html|xml|json|jsonp;`
