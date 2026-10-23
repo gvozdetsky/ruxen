@@ -2,18 +2,18 @@
 
 Reproduce: `scripts/run_nginx_tests.sh` (or `--update-progress` to regenerate this file). The script runs every `.t` file sequentially against `target/release/ruxen` and writes per-file logs under `.nginx-tests-out/logs/`. Run files sequentially — running the suite in parallel introduces flakes from shared TLS-session-cache / port races and gives false negatives.
 
-Last run: 2026-10-21 against `nginx-tests` ec44bc8 (2026-10-16).
+Last run: 2026-10-23 against `nginx-tests` ec44bc8 (2026-10-16).
 
 ## Summary
 
 - **Total tests tracked:** 511
-- **Passing in ruxen:** 172
-- **Intentionally skipped (`-V` banner excludes the module):** 319
-- **Failing — work in progress:** 20
+- **Passing in ruxen:** 182
+- **Intentionally skipped (`-V` banner excludes the module):** 314
+- **Failing — work in progress:** 15
 
 The three groups below are mutually exclusive and sum to 511.
 
-## Passing in ruxen (172)
+## Passing in ruxen (182)
 
 Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential `prove`, `TEST_NGINX_BINARY=$PWD/target/release/ruxen`, `RUXEN_NGINX_IDENTITY=1`).
 
@@ -35,6 +35,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `h2_http2.t`
 - `h2_limit_conn.t`
 - `h2_limit_req.t`
+- `h2_max_headers.t`
 - `h2_proxy_cache.t`
 - `h2_proxy_max_temp_file_size.t`
 - `h2_proxy_protocol.t`
@@ -61,10 +62,12 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `http_listen.t`
 - `http_location.t`
 - `http_location_auto.t`
+- `http_max_headers.t`
 - `http_method.t`
 - `http_request_port.t`
 - `http_resolver.t`
 - `http_resolver_aaaa.t`
+- `http_resolver_cleanup.t`
 - `http_resolver_cname.t`
 - `http_resolver_ipv4.t`
 - `http_server_name.t`
@@ -73,6 +76,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `http_variables.t`
 - `ignore_invalid_headers.t`
 - `index.t`
+- `limit_conn.t`
 - `limit_conn_complex.t`
 - `limit_conn_dry_run.t`
 - `limit_rate.t`
@@ -108,11 +112,15 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `proxy_cache_vary.t`
 - `proxy_chunked_extra.t`
 - `proxy_connection_headers.t`
+- `proxy_cookie.t`
+- `proxy_cookie_flags.t`
 - `proxy_duplicate_headers.t`
 - `proxy_force_ranges.t`
+- `proxy_if.t`
 - `proxy_implicit.t`
 - `proxy_intercept_errors.t`
 - `proxy_limit_rate.t`
+- `proxy_limit_rate2.t`
 - `proxy_max_temp_file_size.t`
 - `proxy_merge_headers.t`
 - `proxy_method.t`
@@ -154,8 +162,10 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `split_clients.t`
 - `ssl.t`
 - `ssl_cache.t`
+- `ssl_cache_reload.t`
 - `ssl_certificate_aux.t`
 - `ssl_certificate_chain.t`
+- `ssl_certificate_compression.t`
 - `ssl_certificates.t`
 - `ssl_client_escaped_cert.t`
 - `ssl_crl.t`
@@ -190,7 +200,7 @@ Tests where ruxen passes the upstream `Test::Nginx` suite end-to-end (sequential
 - `worker_shutdown_timeout_h2.t`
 - `worker_shutdown_timeout_proxy_upgrade.t`
 
-## Failing — actively being worked on (20)
+## Failing — actively being worked on (15)
 
 Tests that ran (not skipped by `has_module`) but produced at least one failed assertion or non-zero exit. The fraction is **failed subtests / total subtests** (`0/0` means harness died during setup before reaching the plan; `0/N` means subtests passed but the file exited non-zero — typically `-t` config check).
 
@@ -203,21 +213,16 @@ Tests that ran (not skipped by `has_module`) but produced at least one failed as
 - `h2_priority.t` — 11/24; by design: priorities ignored, as RFC 9113 deprecates them, #347
 - `h2_proxy_request_buffering.t` — 49/51
 - `h2_proxy_request_buffering_ssl.t` — 40/42
-- `h2_request_body.t` — 8/51; partly by design: Content-Length mismatches, the WINDOW_UPDATE size and a malformed request's 400, #347; the rest #493, #627, #628
-- `h2_request_body_extra.t` — 2/52
+- `h2_request_body.t` — 4/51; by design: Content-Length mismatches, the WINDOW_UPDATE size and a malformed request's 400, #347
+- `h2_request_body_extra.t` — 1/52
 - `h2_request_body_preread.t` — 1/11; by design: #347
-- `http_resolver_cleanup.t` — 0/3
-- `limit_conn.t` — 1/10
 - `proxy_cache_convert_head.t` — 2/10
-- `proxy_cookie.t` — 8/11
-- `proxy_cookie_flags.t` — 0/0
-- `proxy_if.t` — 1/17
 - `proxy_request_buffering.t` — 2/20
 - `proxy_request_buffering_chunked.t` — 3/24
 - `proxy_request_buffering_ssl.t` — 3/20
 - `ssl_ocsp.t` — 0/0
 
-## Intentionally skipped (319)
+## Intentionally skipped (314)
 
 These test files call `has_module(...)` (or similar guards) that fail against ruxen's pinned `-V` banner — so the entire file is skipped before any subtest runs. They are out of scope for the current compat profile and intentional, not regressions. Grouped below by skip reason; the leading count is the number of test files in that group.
 
@@ -609,11 +614,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 - `image_filter_finalize.t`
 - `image_filter_webp.t`
 
-### no max_headers (2)
-
-- `h2_max_headers.t`
-- `http_max_headers.t`
-
 ### no memcached available (2)
 
 - `memcached_fake.t`
@@ -676,10 +676,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 
 - `ssl_sigalg.t`
 
-### no proxy_limit_rate variables (1)
-
-- `proxy_limit_rate2.t`
-
 ### no random_index available (1)
 
 - `random_index.t`
@@ -703,14 +699,6 @@ These test files call `has_module(...)` (or similar guards) that fail against ru
 ### no slice available (1)
 
 - `sub_filter_slice.t`
-
-### no ssl_certificate_compression (1)
-
-- `ssl_certificate_compression.t`
-
-### no ssl_object_cache_inheritable (1)
-
-- `ssl_cache_reload.t`
 
 ### no upstream_random available (1)
 
