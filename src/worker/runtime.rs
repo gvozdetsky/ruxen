@@ -3998,7 +3998,14 @@ pub(crate) async fn handle<S: ConnIo>(
     // Taken from this worker's pool and given back when the connection
     // ends: a connection per request doesn't allocate (and zero) them each
     // time (#128).
-    let mut bufs = ConnBufs::take(timeouts.header_buffer);
+    // An HTTP/2 stream's head is rebuilt here, with its body's start: not
+    // nginx's client_header_buffer_size, whose body goes into
+    // http2_body_preread_size.
+    let mut bufs = ConnBufs::take(if stream.h2() {
+        READ_BUF
+    } else {
+        timeouts.header_buffer
+    });
     // Set once the zero-copy `sendfile` path has put the socket in
     // O_NONBLOCK mode; see `send_head_and_file`.
     let mut sock_nonblocking = false;
