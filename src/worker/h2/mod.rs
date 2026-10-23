@@ -7,7 +7,7 @@
 //! with the client preface (cleartext, "prior knowledge"), or when TLS
 //! negotiated `h2` through ALPN.
 
-mod compat;
+pub(crate) mod compat;
 mod stream;
 
 use std::cell::Cell;
