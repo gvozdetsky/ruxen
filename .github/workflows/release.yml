@@ -4,9 +4,8 @@ name: Release
 # release with the notes from `.github/release-notes/<tag>.md`. Run it by
 # hand (workflow_dispatch) to build and upload the tarballs as workflow
 # artifacts without creating a release. A tag also publishes the container
-# image ghcr.io/gvozdetsky/ruxen (amd64 and arm64) from the same binaries.
-# Publishing to crates.io is a separate, manual `cargo publish` (see
-# CONTRIBUTING.md, "Releasing").
+# image ghcr.io/gvozdetsky/ruxen (amd64 and arm64) from the same binaries,
+# and, once the GitHub release is out, the crate on crates.io (#672).
 #
 # Supply chain (#480): each binary carries its crate list (`cargo
 # auditable`), each target gets a CycloneDX SBOM as a release asset, and on
@@ -271,3 +270,32 @@ jobs:
             --label org.opencontainers.image.version=${{ steps.bins.outputs.version }} \
             --provenance=mode=max --sbom=true \
             "${tags[@]}" --push .
+
+  crates-io:
+    # crates.io's trusted publishing (#672): a token for this run only,
+    # from the workflow's OIDC identity, instead of a stored API token. The
+    # crate's settings on crates.io name this repository and `release.yml`.
+    # After the GitHub release, so a failed build never reaches crates.io:
+    # a published version can't be replaced, only yanked.
+    needs: release
+    # A pushed tag only: a manual run on a tag ref doesn't publish.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    # The environment narrows who can get a crates.io token: its
+    # deployment rule allows `v*` tags only, and crates.io's trusted
+    # publisher names it, so no other job or ref of this workflow can.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
