@@ -694,9 +694,8 @@ mod tests {
     use crate::config::SslClientField as F;
 
     fn der(pem: &[u8]) -> Vec<u8> {
-        rustls_pemfile::certs(&mut &pem[..])
-            .next()
-            .unwrap()
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(pem)
             .unwrap()
             .to_vec()
     }
