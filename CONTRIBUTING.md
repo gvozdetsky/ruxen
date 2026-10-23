@@ -139,8 +139,11 @@ separate step, so do them in this order:
    for the README's `releases/latest` link, an SBOM per target and
    `SHA256SUMS`. The binaries are built with `cargo auditable`, and the
    tarballs get build-provenance and SBOM attestations (#480).
-4. When the release is up, `cargo publish --locked`. A crates.io version
-   can't be replaced, only yanked, so this goes last.
+4. When the release is up, the workflow's `crates-io` job runs `cargo
+   publish --locked` with a token from crates.io's trusted publishing
+   (#672): no API token is stored anywhere. A crates.io version can't be
+   replaced, only yanked, so this goes last. If the job fails, rerun it
+   from the run's page once the cause is fixed.
 5. Security fixes in the release: publish their advisories (see
    `SECURITY.md`) and file any follow-up issues they mention.
 
