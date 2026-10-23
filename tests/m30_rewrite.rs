@@ -497,3 +497,33 @@ fn a_break_stops_before_the_return() {
         }
     }
 }
+
+/// A redirect's captures come from the decoded URI: nginx escapes them
+/// (when the URI had escapes or a `+`) before it unescapes the target,
+/// so a `%` or `#` the client sent encoded stays encoded in `Location`,
+/// and what's printable above `%` comes back decoded.
+#[test]
+fn rewrite_redirect_keeps_encoded_captures() {
+    let (_guard, port) = spawn_server(
+        r#"
+events {}
+http { server { listen 127.0.0.1:%%PORT%%;
+    location /p/ { rewrite ^(.*)$ https://example.com$1 permanent; }
+    location /r/ { rewrite ^/r/(.*)$ https://example.com/target/$1 redirect; }
+} }
+"#,
+    );
+    for (path, want) in [
+        ("/p/docs/50%25-off", "https://example.com/p/docs/50%25-off"),
+        ("/p/a%23b?x=1", "https://example.com/p/a%23b?x=1"),
+        ("/p/a%20b", "https://example.com/p/a%20b"),
+        ("/p/a+b", "https://example.com/p/a+b"),
+        ("/p/%E2%82%AC", "https://example.com/p/%E2%82%AC"),
+        ("/p/a%2Fb", "https://example.com/p/a/b"),
+        ("/r/a%3Fb", "https://example.com/target/a?b"),
+        ("/r/plain", "https://example.com/target/plain"),
+    ] {
+        let r = http_get(port, path);
+        assert_eq!(header_value(&r, "Location"), Some(want), "{path}");
+    }
+}
