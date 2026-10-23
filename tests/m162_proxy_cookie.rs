@@ -4,7 +4,8 @@
 //! domain matches the whole domain after a leading dot, caseless; a literal
 //! path is a prefix; `~` (caseless for domains) and `~*` are regexes whose
 //! captures the replacement may use. `off` in a nested location undoes the
-//! rules it would inherit.
+//! rules it would inherit. `proxy_cookie_flags` sets and removes `Secure`,
+//! `HttpOnly` and `SameSite`.
 
 mod common;
 
@@ -49,6 +50,10 @@ fn set_cookie_domain_and_path_are_rewritten() {
                  proxy_cookie_path ~*^/caseless/(.+)$ /$1;\n\
                  location /off/ {{ proxy_pass http://127.0.0.1:{up};\n\
                    proxy_cookie_domain off; proxy_cookie_path off; }}\n\
+                 location /flags/ {{ proxy_pass http://127.0.0.1:{up};\n\
+                   proxy_cookie_flags a secure httponly samesite=strict;\n\
+                   proxy_cookie_flags ~^B nosecure nosamesite;\n\
+                   proxy_cookie_flags $arg_c httponly; }}\n\
                }}\n\
                location /xar {{ proxy_pass http://127.0.0.1:{up};\n\
                  proxy_cookie_domain ~^(?<dd>.+)\\.example\\.com$ $dd.test; }}\n\
@@ -60,7 +65,7 @@ fn set_cookie_domain_and_path_are_rewritten() {
                  add_header Set-Cookie \"x=1; Domain=sub.example.com\"; return 200; }}\n\
                location / {{\n\
                  add_header Set-Cookie \"a=1; Domain=www.Example.org; Path=/path/x; Secure\";\n\
-                 add_header Set-Cookie \"b=2;Domain=.LocalHost.com;path=/CASEless/y\";\n\
+                 add_header Set-Cookie \"b=2;Domain=.LocalHost.com;path=/CASEless/y;secure;SameSite=Lax\";\n\
                  add_header Set-Cookie \"c=3; Domain=www.example.COM\";\n\
                  add_header Set-Cookie \"d=4; Domain=other.net; Path=/kept/\";\n\
                  add_header Set-Cookie \"flag; Domain=www.example.org\";\n\
@@ -87,6 +92,7 @@ fn set_cookie_domain_and_path_are_rewritten() {
 
     let rewritten = cookies(port, "/");
     let off = cookies(port, "/off/");
+    let flags = cookies(port, "/flags/?c=D");
     let xar = cookies(port, "/xar");
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
@@ -95,7 +101,7 @@ fn set_cookie_domain_and_path_are_rewritten() {
         rewritten,
         [
             "a=1; Domain=example.com; Path=/new/x; Secure",
-            "b=2; Domain=.en.localhost.org; path=/y",
+            "b=2; Domain=.en.localhost.org; path=/y; secure; SameSite=Lax",
             "c=3; Domain=www.example.org",
             "d=4; Domain=other.net; Path=/kept/",
             // Not `name=value` first: left alone, as nginx does.
@@ -106,9 +112,22 @@ fn set_cookie_domain_and_path_are_rewritten() {
         off,
         [
             "a=1; Domain=www.Example.org; Path=/path/x; Secure",
-            "b=2;Domain=.LocalHost.com;path=/CASEless/y",
+            "b=2;Domain=.LocalHost.com;path=/CASEless/y;secure;SameSite=Lax",
             "c=3; Domain=www.example.COM",
             "d=4; Domain=other.net; Path=/kept/",
+            "flag; Domain=www.example.org",
+        ]
+    );
+    // proxy_cookie_flags: the first line whose cookie matches. A flag the
+    // cookie has stays where it is, `SameSite` takes the value asked for,
+    // a missing one is added; `no…` removes it.
+    assert_eq!(
+        flags,
+        [
+            "a=1; Domain=example.com; Path=/new/x; Secure; HttpOnly; SameSite=Strict",
+            "b=2; Domain=.en.localhost.org; path=/y",
+            "c=3; Domain=www.example.org",
+            "d=4; Domain=other.net; Path=/kept/; HttpOnly",
             "flag; Domain=www.example.org",
         ]
     );

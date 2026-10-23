@@ -693,6 +693,24 @@ pub struct ProxyResponseRules {
 pub struct PreparedCookieRules {
     pub domains: &'static [PreparedRedirect],
     pub paths: &'static [PreparedRedirect],
+    /// `proxy_cookie_flags`, the first whose cookie matches applies.
+    pub flags: &'static [PreparedCookieFlags],
+}
+
+/// One `proxy_cookie_flags` line: which cookie, and its flags, rendered
+/// per response.
+#[derive(Debug)]
+pub struct PreparedCookieFlags {
+    pub cookie: PreparedCookieName,
+    pub flags: &'static [&'static [PreparedValuePart]],
+}
+
+#[derive(Debug)]
+pub enum PreparedCookieName {
+    /// Compared with the cookie's name, caseless.
+    Name(&'static [PreparedValuePart]),
+    /// Caseless.
+    Regex(&'static regex::bytes::Regex),
 }
 
 /// One prepared `proxy_redirect` rule.
@@ -918,6 +936,7 @@ pub(crate) struct ProxyEffective {
     /// The nearest scope's `proxy_cookie_domain` / `proxy_cookie_path`.
     pub cookie_domain: Option<&'static crate::config::ProxyRedirect>,
     pub cookie_path: Option<&'static crate::config::ProxyRedirect>,
+    pub cookie_flags: Option<&'static [crate::config::CookieFlagsRule]>,
     /// The nearest scope's `proxy_hide_header` / `proxy_pass_header` names
     /// (each list inherits on its own, as in nginx).
     pub hide_headers: Option<&'static [String]>,
@@ -1098,6 +1117,7 @@ impl ProxyEffective {
             redirect: None,
             cookie_domain: None,
             cookie_path: None,
+            cookie_flags: None,
             hide_headers: None,
             pass_headers: None,
             bind: None,

@@ -163,6 +163,8 @@ pub struct ProxyConf {
     /// whole domain, without a leading dot and caseless.
     pub cookie_domain: Option<ProxyRedirect>,
     pub cookie_path: Option<ProxyRedirect>,
+    /// `proxy_cookie_flags`: `None` inherits, an empty list is `off`.
+    pub cookie_flags: Option<Vec<CookieFlagsRule>>,
     /// `proxy_hide_header` / `proxy_pass_header` names.
     pub hide_headers: Option<Vec<String>>,
     pub pass_headers: Option<Vec<String>>,
@@ -349,6 +351,7 @@ impl ProxyConf {
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             cookie_domain: self.cookie_domain.or_else(|| parent.cookie_domain.clone()),
             cookie_path: self.cookie_path.or_else(|| parent.cookie_path.clone()),
+            cookie_flags: self.cookie_flags.or_else(|| parent.cookie_flags.clone()),
             hide_headers: self.hide_headers.or_else(|| parent.hide_headers.clone()),
             pass_headers: self.pass_headers.or_else(|| parent.pass_headers.clone()),
             proxy_method: self.proxy_method.or_else(|| parent.proxy_method.clone()),
@@ -2831,6 +2834,22 @@ pub enum Handler {
 /// prepend `request_path`.
 /// The `proxy_redirect` directives of one scope: `off`, or rules tried in
 /// order on upstream `Location` / `Refresh` headers.
+/// One `proxy_cookie_flags <cookie> <flag>…` line: the cookie by name
+/// (with variables, caseless) or by `~` regex (caseless), and its flags,
+/// rendered per response (`secure`, `nosecure`, `httponly`, `nohttponly`,
+/// `samesite=strict|lax|none`, `nosamesite`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CookieFlagsRule {
+    pub cookie: CookieName,
+    pub flags: Vec<Vec<ValuePart>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CookieName {
+    Name(Vec<ValuePart>),
+    Regex(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProxyRedirect {
     Off,
