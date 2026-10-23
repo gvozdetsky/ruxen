@@ -166,16 +166,23 @@ struct Cli {
     show_version: bool,
     /// `-v`: the first line of `-V` only, as nginx's `-v` (#475).
     short_version: bool,
+    /// `-h`, `-?`, `--help`: the usage, as nginx prints it.
+    help: bool,
     signal: Option<String>,
     /// `--compat`: report everything in the configuration ruxen doesn't
     /// do as nginx (#278).
     compat: bool,
 }
 
+/// Where the configuration is without `-c`: the path the systemd unit and
+/// the container image use, as a distribution's nginx reads
+/// /etc/nginx/nginx.conf.
+const DEFAULT_CONFIG: &str = "/etc/ruxen/ruxen.conf";
+
 impl Default for Cli {
     fn default() -> Self {
         Self {
-            config_path: PathBuf::from("ruxen.conf"),
+            config_path: PathBuf::from(DEFAULT_CONFIG),
             prefix: None,
             errlog: None,
             globals: Vec::new(),
@@ -184,6 +191,7 @@ impl Default for Cli {
             dump: false,
             show_version: false,
             short_version: false,
+            help: false,
             compat: false,
             signal: None,
         }
@@ -242,6 +250,10 @@ fn report_emerg(msg: &str, cli: &Cli, main_path: &Path) -> Failure {
 fn real_main() -> Result<(), Failure> {
     let cli = parse_cli(std::env::args().skip(1)).map_err(io::Error::other)?;
 
+    if cli.help {
+        print!("{}", usage());
+        return Ok(());
+    }
     if cli.show_version || cli.short_version {
         let out = version_output(http::nginx_identity());
         match out.lines().next().filter(|_| !cli.show_version) {
@@ -265,7 +277,8 @@ fn real_main() -> Result<(), Failure> {
     // failures still surface on the controlling terminal (and match the
     // upstream `nginx -T` behavior the Test::Nginx helpers rely on).
 
-    let (main_path, file_src) = read_main_config(&cli)?;
+    let (main_path, file_src) =
+        read_main_config(&cli).map_err(|e| report_emerg(&e.to_string(), &cli, &cli.config_path))?;
     let globals_src = if cli.globals.is_empty() {
         None
     } else {
@@ -1299,7 +1312,8 @@ where
                 cli.dump = true;
             }
             "-V" => cli.show_version = true,
-            "-v" => cli.short_version = true,
+            "-v" | "--version" => cli.short_version = true,
+            "-h" | "-?" | "--help" => cli.help = true,
             "--compat" => {
                 cli.compat = true;
                 cli.test_only = true;
@@ -1323,14 +1337,22 @@ where
 }
 
 fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
-    let abs = cli.config_path.canonicalize().map_err(|e| {
+    // In nginx's words (ngx_conf_parse): `open() "…" failed (2: No such
+    // file or directory)`.
+    let failed = |path: &Path, e: io::Error| {
+        let errno = e.raw_os_error().unwrap_or(0);
+        let text = io::Error::from_raw_os_error(errno).to_string();
+        let text = text.split(" (os error").next().unwrap_or(&text).to_string();
         io::Error::new(
             e.kind(),
-            format!("opening {}: {e}", cli.config_path.display()),
+            format!("open() \"{}\" failed ({errno}: {text})", path.display()),
         )
-    })?;
-    let src = std::fs::read_to_string(&abs)
-        .map_err(|e| io::Error::new(e.kind(), format!("reading {}: {e}", abs.display())))?;
+    };
+    let abs = cli
+        .config_path
+        .canonicalize()
+        .map_err(|e| failed(&cli.config_path, e))?;
+    let src = std::fs::read_to_string(&abs).map_err(|e| failed(&abs, e))?;
     Ok((abs, src))
 }
 
@@ -1338,6 +1360,32 @@ fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
 /// (RUXEN_NGINX_IDENTITY, as for `Server:`): Test::Nginx reads it to decide
 /// which tests apply, and outside the harness ruxen doesn't claim to be an
 /// nginx release. The `configure arguments` are the same in both modes.
+/// `-h`: nginx's usage (ngx_show_version_info), with ruxen's options.
+fn usage() -> String {
+    format!(
+        "ruxen version: ruxen/{version}
+Usage: ruxen [-?hvVtTq] [-s signal] [-p prefix]
+             [-e filename] [-c filename] [-g directives] [--compat]
+
+Options:
+  -?,-h,--help  : this help
+  -v,--version  : show version and exit
+  -V            : show version and configure options then exit
+  -t            : test configuration and exit
+  -T            : test configuration, dump it and exit
+  -q            : suppress non-error messages during configuration testing
+  --compat      : list what ruxen doesn't support or does differently in the
+                  configuration, then test it
+  -s signal     : send signal to a master process: stop, quit, reopen, reload
+  -p prefix     : set prefix path (the working directory; default: none)
+  -e filename   : set error log file (default: stderr)
+  -c filename   : set configuration file (default: {DEFAULT_CONFIG})
+  -g directives : set global directives out of configuration file
+",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 fn version_output(nginx_identity: bool) -> String {
     let mut out = String::new();
     if nginx_identity {
@@ -1674,6 +1722,30 @@ mod tests {
         assert_eq!(
             version_output(true),
             format!("nginx version: nginx/1.30.6\n{}", version_output(false))
+        );
+    }
+
+    #[test]
+    fn parse_cli_help_version_and_default_config() {
+        for flag in ["-h", "-?", "--help"] {
+            assert!(parse_cli([flag.to_string()]).unwrap().help, "{flag}");
+        }
+        assert!(parse_cli(["--version".to_string()]).unwrap().short_version);
+        let cli = parse_cli(Vec::<String>::new()).unwrap();
+        assert_eq!(cli.config_path, PathBuf::from("/etc/ruxen/ruxen.conf"));
+        assert!(usage().contains("(default: /etc/ruxen/ruxen.conf)"));
+    }
+
+    #[test]
+    fn missing_config_reads_as_nginx_says_it() {
+        let cli = Cli {
+            config_path: PathBuf::from("/nonexistent/ruxen.conf"),
+            ..Cli::default()
+        };
+        let err = read_main_config(&cli).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "open() \"/nonexistent/ruxen.conf\" failed (2: No such file or directory)"
         );
     }
 
