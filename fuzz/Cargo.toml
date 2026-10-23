@@ -82,3 +82,17 @@ path = "fuzz_targets/dns_response.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "range"
+path = "fuzz_targets/range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gzip_negotiation"
+path = "fuzz_targets/gzip_negotiation.rs"
+test = false
+doc = false
+bench = false
