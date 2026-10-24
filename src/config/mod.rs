@@ -291,6 +291,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut autoindex_exact_size: Option<bool> = None;
     let mut autoindex_localtime: Option<bool> = None;
     let mut autoindex_format: Option<AutoindexFormat> = None;
+    let mut if_modified_since: Option<IfModifiedSince> = None;
     let mut split_clients: Vec<SplitClients> = Vec::new();
     let mut maps: Vec<MapBlock> = Vec::new();
     let mut auth_basic: Option<AuthBasic> = None;
@@ -459,6 +460,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         autoindex_exact_size,
                         autoindex_localtime,
                         autoindex_format,
+                        if_modified_since,
                         split_clients,
                         maps,
                         auth_basic,
@@ -615,6 +617,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 autoindex_format = Some(parse_autoindex_format_args(&args[1..])?);
             }
+            ("if_modified_since", Terminator::Semi) => {
+                if if_modified_since.is_some() {
+                    return Err(Error::Duplicate("if_modified_since"));
+                }
+                if_modified_since = Some(parse_if_modified_since_args(&args[1..])?);
+            }
             ("split_clients", Terminator::BlockOpen) => {
                 split_clients.push(parse_split_clients_block(&args[1..], lx)?);
             }
@@ -756,6 +764,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "autoindex_exact_size"
                 | "autoindex_localtime"
                 | "autoindex_format"
+                | "if_modified_since"
                 | "split_clients"
                 | "ssl_certificate"
                 | "ssl_certificate_key"
@@ -1092,7 +1101,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Misc request handling we treat as no-op for now
     "ignore_invalid_headers",
     "underscores_in_headers",
-    "if_modified_since",
     "etag",
     "msie_padding",
     "msie_refresh",
@@ -2766,6 +2774,28 @@ mod tests {
         assert_eq!(tls_warnings.len(), 2, "{:?}", cfg.warnings);
         assert!(tls_warnings[0].starts_with("\"ssl_ciphers\" is not supported yet"));
         assert!(tls_warnings[1].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
+    }
+
+    #[test]
+    fn if_modified_since_parses_and_inherits() {
+        let cfg = parse(
+            "http { if_modified_since before;
+                    server { listen 80; location / { } location /x { if_modified_since off; } }
+                    server { listen 81; if_modified_since exact; location / { } } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.if_modified_since, Some(IfModifiedSince::Before));
+        assert_eq!(cfg.servers[0].if_modified_since, None);
+        assert_eq!(
+            cfg.servers[0].locations[1].if_modified_since,
+            Some(IfModifiedSince::Off)
+        );
+        assert_eq!(
+            cfg.servers[1].if_modified_since,
+            Some(IfModifiedSince::Exact)
+        );
+        assert!(parse("http { if_modified_since sometimes; }").is_err());
+        assert!(parse("http { if_modified_since exact; if_modified_since off; }").is_err());
     }
 
     #[test]
