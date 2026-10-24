@@ -1362,7 +1362,12 @@ pub(crate) fn run_location_handler(
             // The static module takes GET, HEAD and POST; it refuses a POST
             // only once the file is found (ngx_http_static_handler).
             let get_or_head = matches!(req.method, Method::Get | Method::Head);
-            if !get_or_head && req.method_bytes != b"POST" {
+            // Another method gets the static module's 405, unless a
+            // `try_files` fallback takes the request first: nginx's
+            // try_files phase runs for every method, so a PUT goes on to
+            // `@app` (ngx_http_core_try_files_phase checks no method).
+            let not_static = !get_or_head && req.method_bytes != b"POST";
+            if not_static && root.try_files.is_none() {
                 break 'root Response::Owned(file::method_not_allowed(req.method, server_bytes));
             }
             // An `alias` after a rewrite: nothing to map (#589).
@@ -1453,6 +1458,13 @@ pub(crate) fn run_location_handler(
                         }
                         None => response,
                     }
+                }
+                // What try_files found (a directory, a listing) is the
+                // static module's, and so its 405.
+                fs_resolve::Outcome::Redirect(_) | fs_resolve::Outcome::Autoindex { .. }
+                    if not_static =>
+                {
+                    Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
                 fs_resolve::Outcome::Redirect(location) => {
                     // ngx_http_static_handler: the URI escaped
