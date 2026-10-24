@@ -8,6 +8,7 @@
 # uses -c64: at -c512 each 128 MiB response takes longer than wrk's 2s
 # timeout on loopback.
 m1_hello|return 200 "hello", keep-alive|8080|/|16|512|30s|5s|20|bench/m1/nginx.conf||none||http
+m1_varied_heads|return 200 "hello", keep-alive requests of 40 B to 2.7 KiB in turn|8080|/|16|512|30s|5s|20|bench/m1/nginx.conf||lua|bench/m1/varied_heads.lua|http
 m1_no_keepalive|return 200 "hello", keepalive_timeout 0|8081|/|16|512|30s|5s|20|bench/m1_no_keepalive/nginx.conf||none||http
 m1_keepalive_requests_1|return 200 "hello", keepalive_requests 1|8082|/|16|512|30s|5s|20|bench/m1_keepalive_requests_1/nginx.conf||none||http
 m3_static_1k|static 1 KiB file, keep-alive|8090|/hello.txt|16|512|30s|5s|20|bench/m3/nginx.conf||none||http
