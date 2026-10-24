@@ -125,6 +125,8 @@ ruxen -c examples/minimal.conf
 
 As with nginx, a valid configuration prints `… syntax is ok` and `… test is successful` (on stderr; `-q` silences them) and exits with status 0.
 
+Without `-c`, ruxen reads `/etc/ruxen/ruxen.conf`, the path the systemd unit and the container image use. `ruxen -h` lists the options, which are nginx's plus `--compat`.
+
 Then, from another terminal:
 
 ```bash
