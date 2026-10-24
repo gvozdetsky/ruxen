@@ -767,12 +767,10 @@ pub struct ServerSsl {
     pub keys: Vec<PathBuf>,
     /// `None`: not set here or at http level; TLSv1.2 and TLSv1.3.
     pub protocols: Option<TlsVersionSet>,
-    /// `ssl_ciphers` — verbatim, not applied: rustls's default suites are
-    /// used and the parser warns (`warn_ignored_tls_policy`).
+    /// `ssl_ciphers`, verbatim: `tls_ciphers` evaluates it over rustls's
+    /// TLS 1.2 suites when the TLS contexts are prepared.
     pub ciphers: Option<String>,
-    /// `ssl_prefer_server_ciphers on|off;`. rustls always uses server
-    /// preference for TLS 1.2, so explicit `off` is treated as a parse
-    /// warning (see `HttpConfig.warnings`) but kept here for diagnostics.
+    /// `ssl_prefer_server_ciphers on|off;`: rustls's `ignore_client_order`.
     pub prefer_server_ciphers: Option<bool>,
     /// Parsed `ssl_session_timeout` for this server/listen context.
     /// `None` means directive absent. The prepared TLS config wraps

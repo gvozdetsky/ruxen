@@ -1463,16 +1463,12 @@ pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<()
     Err(Error::Unenforced { name, consequence })
 }
 
-/// Accepted with a warning: `ssl_ciphers` / `ssl_ecdh_curve`, because
-/// rustls offers only AEAD suites and modern groups, so ignoring a
-/// restriction can't enable a weak cipher, and nearly every real TLS
-/// config sets them; `ssl_verify_client optional*` (see above).
+/// Accepted with a warning: `ssl_ecdh_curve`, because rustls offers only
+/// modern groups, so ignoring a restriction can't enable a weak one, and
+/// many real TLS configs set it. (`ssl_ciphers` is applied: `tls_ciphers`.)
 pub(crate) fn warn_ignored_tls_policy(args: &[String], warnings: &mut Vec<String>) {
     let name = args[0].as_str();
     let w = match (name, args.get(1).map(String::as_str)) {
-        ("ssl_ciphers", _) => format!(
-            "\"{name}\" is not supported yet and is ignored: rustls's default cipher suites are used"
-        ),
         ("ssl_ecdh_curve", _) => format!(
             "\"{name}\" is not supported yet and is ignored: rustls's default key exchange groups \
              are used"
@@ -2800,9 +2796,9 @@ mod tests {
             .iter()
             .filter(|w| w.contains("rustls's default"))
             .collect();
-        assert_eq!(tls_warnings.len(), 2, "{:?}", cfg.warnings);
-        assert!(tls_warnings[0].starts_with("\"ssl_ciphers\" is not supported yet"));
-        assert!(tls_warnings[1].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
+        // `ssl_ciphers` is applied (tls_ciphers): no warning.
+        assert_eq!(tls_warnings.len(), 1, "{:?}", cfg.warnings);
+        assert!(tls_warnings[0].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
     }
 
     #[test]
@@ -3178,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn ssl_prefer_server_ciphers_off_emits_warning() {
+    fn ssl_prefer_server_ciphers_off_is_kept_without_warning() {
         let src = r#"
             http {
                 server {
@@ -3192,11 +3188,12 @@ mod tests {
         "#;
         let cfg = parse(src).unwrap();
         assert_eq!(cfg.servers[0].ssl.prefer_server_ciphers, Some(false));
+        // rustls's `ignore_client_order` is off by default, as nginx's.
         assert!(
-            cfg.warnings
+            !cfg.warnings
                 .iter()
                 .any(|w| w.contains("prefer_server_ciphers")),
-            "expected prefer-server-ciphers warning, got {:?}",
+            "{:?}",
             cfg.warnings
         );
     }
