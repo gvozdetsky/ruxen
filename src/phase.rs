@@ -2470,9 +2470,8 @@ fn match_server_name<'h>(
 /// or the wildcard would also match `xexample.com` against
 /// `*.example.com`.
 fn host_matches_leading_wildcard(host: &[u8], suffix: &[u8]) -> bool {
-    if host == suffix {
-        return true;
-    }
+    // `*.example.com` doesn't take `example.com` (ngx_hash_find_wc_head);
+    // `.example.com` does, as an exact name the parser adds beside it.
     if host.len() <= suffix.len() {
         return false;
     }
@@ -2480,12 +2479,9 @@ fn host_matches_leading_wildcard(host: &[u8], suffix: &[u8]) -> bool {
     host[split - 1] == b'.' && &host[split..] == suffix
 }
 
-/// Match `host` against a `head.*` wildcard. Matches when the host
-/// equals the head or starts with `head.`.
+/// Match `host` against a `head.*` wildcard: it starts with `head.`
+/// (`www.example.*` doesn't take `www.example`, ngx_hash_find_wc_tail).
 fn host_matches_trailing_wildcard(host: &[u8], head: &[u8]) -> bool {
-    if host == head {
-        return true;
-    }
     if host.len() <= head.len() {
         return false;
     }
@@ -2719,6 +2715,41 @@ fn match_named_location<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildcards_take_only_names_below_them() {
+        // ngx_hash_find_wc_head / _tail: `*.example.com` and `www.example.*`
+        // need a label more; `.example.com` covers the bare name as an exact
+        // one.
+        assert!(host_matches_leading_wildcard(
+            b"x.example.com",
+            b"example.com"
+        ));
+        assert!(host_matches_leading_wildcard(
+            b"a.b.example.com",
+            b"example.com"
+        ));
+        assert!(!host_matches_leading_wildcard(
+            b"example.com",
+            b"example.com"
+        ));
+        assert!(!host_matches_leading_wildcard(
+            b"xexample.com",
+            b"example.com"
+        ));
+        assert!(host_matches_trailing_wildcard(
+            b"www.example.org",
+            b"www.example"
+        ));
+        assert!(!host_matches_trailing_wildcard(
+            b"www.example",
+            b"www.example"
+        ));
+        assert!(!host_matches_trailing_wildcard(
+            b"www.exampleorg",
+            b"www.example"
+        ));
+    }
     use crate::config;
     use crate::worker::prepare;
     use std::path::Path;
