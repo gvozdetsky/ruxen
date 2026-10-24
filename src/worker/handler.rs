@@ -1427,7 +1427,11 @@ pub(crate) fn run_location_handler(
                         }
                         (range, _) => range,
                     };
-                    file::serve_path(
+                    let vary_cut = match (range, loc.gzip) {
+                        (Some(_), Some(gz)) if gz.vary => Some((gz, opened.mime, opened.size)),
+                        _ => None,
+                    };
+                    let response = file::serve_path(
                         opened,
                         req.method,
                         file::Conditionals {
@@ -1442,7 +1446,13 @@ pub(crate) fn run_location_handler(
                         },
                         server_bytes,
                         loc.sendfile,
-                    )
+                    );
+                    match vary_cut {
+                        Some((gz, mime, size)) => {
+                            super::gzip::vary_cut_file(gz, mime, size, response)
+                        }
+                        None => response,
+                    }
                 }
                 fs_resolve::Outcome::Redirect(location) => {
                     // ngx_http_static_handler: the URI escaped
