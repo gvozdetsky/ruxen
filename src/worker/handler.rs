@@ -1406,6 +1406,7 @@ pub(crate) fn run_location_handler(
                                 if_range: None,
                                 last_modified_override: last_modified_override.as_deref(),
                                 max_ranges: Some(0),
+                                ims_mode: root.if_modified_since,
                             },
                             server_bytes,
                             loc.sendfile,
