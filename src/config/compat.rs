@@ -283,6 +283,51 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         None,
         "client certificates are not requested yet (#113)",
     ),
+    (
+        "http3",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "http3_hq",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "http3_max_concurrent_streams",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "http3_stream_buffer_size",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "quic_active_connection_id_limit",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "quic_bpf",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "quic_gso",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "quic_host_key",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
+    (
+        "quic_retry",
+        None,
+        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+    ),
 ];
 
 fn classify(args: &[String]) -> (Severity, String) {
