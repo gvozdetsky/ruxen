@@ -652,8 +652,22 @@ fn restore_read_len(buf: &mut Vec<u8>, ptr: *const u8, len: usize) {
 #[cold]
 #[inline(never)]
 fn grow_head_buffer(buf: &mut Vec<u8>, limit: usize) {
-    let len = (buf.len() + buf.len() / 2).clamp(buf.len() + 1, limit);
-    buf.resize(len, 0);
+    // From `client_header_buffer_size` straight to `READ_BUF`, as nginx
+    // moves a head that doesn't fit into a large buffer, then by half.
+    let len = if buf.len() < READ_BUF {
+        READ_BUF
+    } else {
+        buf.len() + buf.len() / 2
+    };
+    buf.resize(len.clamp(buf.len() + 1, limit), 0);
+}
+
+/// To `READ_BUF` for a client whose requests don't fit
+/// `client_header_buffer_size` (#467).
+#[cold]
+#[inline(never)]
+fn grow_read_buffer(buf: &mut Vec<u8>) {
+    buf.resize(READ_BUF, 0);
 }
 
 /// Back to `READ_BUF` after a large head, once nothing of it is left.
@@ -3150,14 +3164,20 @@ const CONN_BUFS_KEPT: usize = 64;
 const CONN_SCRATCH_KEEP: usize = 64 * 1024;
 
 impl ConnBufs {
-    fn take() -> ConnBufs {
-        CONN_BUFS
+    /// `size`: `client_header_buffer_size` (#467). An idle keep-alive
+    /// connection holds its read buffer in the kernel's read, so it starts
+    /// as small as nginx's; `scratch` is allocated when a response first
+    /// needs it.
+    fn take(size: usize) -> ConnBufs {
+        let mut bufs = CONN_BUFS
             .with(|pool| pool.borrow_mut().pop())
             .unwrap_or_else(|| ConnBufs {
-                buf: vec![0u8; READ_BUF],
-                scratch: Vec::with_capacity(READ_BUF),
+                buf: Vec::new(),
+                scratch: Vec::new(),
                 url_scratch: Vec::with_capacity(256),
-            })
+            });
+        bufs.buf.resize(size, 0);
+        bufs
     }
 }
 
@@ -3165,8 +3185,9 @@ impl Drop for ConnBufs {
     fn drop(&mut self) {
         // A buffer still lent to an I/O operation (empty here) or grown
         // large isn't kept.
-        if self.buf.len() != READ_BUF
-            || !(READ_BUF..=CONN_SCRATCH_KEEP).contains(&self.scratch.capacity())
+        if self.buf.is_empty()
+            || self.buf.capacity() > READ_BUF
+            || self.scratch.capacity() > CONN_SCRATCH_KEEP
             || self.url_scratch.capacity() > CONN_SCRATCH_KEEP
         {
             return;
@@ -3977,7 +3998,14 @@ pub(crate) async fn handle<S: ConnIo>(
     // Taken from this worker's pool and given back when the connection
     // ends: a connection per request doesn't allocate (and zero) them each
     // time (#128).
-    let mut bufs = ConnBufs::take();
+    // An HTTP/2 stream's head is rebuilt here, with its body's start: not
+    // nginx's client_header_buffer_size, whose body goes into
+    // http2_body_preread_size.
+    let mut bufs = ConnBufs::take(if stream.h2() {
+        READ_BUF
+    } else {
+        timeouts.header_buffer
+    });
     // Set once the zero-copy `sendfile` path has put the socket in
     // O_NONBLOCK mode; see `send_head_and_file`.
     let mut sock_nonblocking = false;
@@ -5397,8 +5425,11 @@ pub(crate) async fn handle<S: ConnIo>(
                         // offset 0 so the next parse iteration sees it.
                         if !pipelined_tail.is_empty() {
                             if pipelined_tail.len() > buf.len() {
-                                // Larger than READ_BUF: can't resume keep-alive.
-                                return;
+                                if pipelined_tail.len() > READ_BUF {
+                                    // Larger than READ_BUF: can't resume keep-alive.
+                                    return;
+                                }
+                                grow_read_buffer(buf);
                             }
                             buf[..pipelined_tail.len()].copy_from_slice(&pipelined_tail);
                             read_start = 0;
@@ -5457,6 +5488,11 @@ pub(crate) async fn handle<S: ConnIo>(
                     // A large head grew it (#482): back to the usual size,
                     // as nginx frees its large buffers for keep-alive.
                     shrink_head_buffer(buf);
+                } else if filled == buf.len() && filled < READ_BUF {
+                    // The request filled `client_header_buffer_size` (a
+                    // body after the head): this client's next ones get
+                    // `READ_BUF` and come in one read (#467).
+                    grow_read_buffer(buf);
                 }
                 continue 'idle;
             }

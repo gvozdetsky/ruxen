@@ -21,6 +21,9 @@ pub struct ClientTimeouts {
     pub send_ms: Option<u64>,
     /// `large_client_header_buffers number size`.
     pub large_header_buffers: Option<(u64, u64)>,
+    /// `client_header_buffer_size`: the buffer a request head is first
+    /// read into (#467).
+    pub header_buffer: Option<u64>,
     /// `http2_chunk_size`: the largest DATA frame of a response.
     pub h2_chunk_size: Option<u32>,
     /// `max_headers` (nginx 1.29.8, #584): the most header lines a request
@@ -43,6 +46,28 @@ impl ClientTimeouts {
             "send_timeout" => (&mut self.send_ms, "send_timeout"),
             "large_client_header_buffers" => {
                 return self.parse_large_header_buffers(args).map(|()| true);
+            }
+            "client_header_buffer_size" => {
+                const WHAT: &str = "client_header_buffer_size";
+                if self.header_buffer.is_some() {
+                    return Err(Error::Duplicate(WHAT));
+                }
+                // ngx_conf_set_size_slot.
+                let raw = args.get(1).ok_or(Error::MissingArg(WHAT))?;
+                if args.len() > 2 {
+                    return Err(Error::BadValue {
+                        what: WHAT,
+                        got: args[1..].join(" "),
+                    });
+                }
+                self.header_buffer =
+                    Some(super::parse_server::parse_size_bytes(raw).ok_or_else(|| {
+                        Error::BadValue {
+                            what: WHAT,
+                            got: raw.clone(),
+                        }
+                    })?);
+                return Ok(true);
             }
             "max_headers" => {
                 if self.max_headers.is_some() {
@@ -115,6 +140,7 @@ impl ClientTimeouts {
             body_ms: self.body_ms.or(parent.body_ms),
             send_ms: self.send_ms.or(parent.send_ms),
             large_header_buffers: self.large_header_buffers.or(parent.large_header_buffers),
+            header_buffer: self.header_buffer.or(parent.header_buffer),
             h2_chunk_size: self.h2_chunk_size.or(parent.h2_chunk_size),
             max_headers: self.max_headers.or(parent.max_headers),
         }
