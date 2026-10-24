@@ -14,6 +14,9 @@ pub enum Error {
     },
     WrongTerminator {
         name: String,
+        /// The block it was in: nginx's message doesn't name it, `Debug`
+        /// shows it.
+        #[allow(dead_code)]
         ctx: &'static str,
     },
     MissingArg(&'static str),
@@ -56,6 +59,14 @@ pub enum Error {
         url: String,
         directive: &'static str,
     },
+    /// A `proxy_pass` or upstream `server` address nginx refuses, in its
+    /// words: `host not found in upstream "name"`, `invalid port in
+    /// upstream "name:99999"` (ngx_parse_url's error, ngx_http_upstream_add,
+    /// ngx_http_upstream_server).
+    UpstreamUrl {
+        problem: &'static str,
+        url: String,
+    },
     /// `$name` that is neither a variable nginx knows nor one the config
     /// defines (`set`, `map`, `split_clients`, a named regex capture).
     UnknownVariable(String),
@@ -78,8 +89,13 @@ impl std::fmt::Display for Error {
             Error::UnknownDirective { name, ctx } => {
                 write!(f, "unknown directive `{name}` {}", in_block(ctx))
             }
-            Error::WrongTerminator { name, ctx } => {
-                write!(f, "directive `{name}` in {ctx} has wrong terminator")
+            // nginx's words (ngx_conf_handler): a block directive without
+            // its `{`, any other without its `;`.
+            Error::WrongTerminator { name, .. } if is_block_directive(name) => {
+                write!(f, "directive \"{name}\" has no opening \"{{\"")
+            }
+            Error::WrongTerminator { name, .. } => {
+                write!(f, "directive \"{name}\" is not terminated by \";\"")
             }
             Error::MissingArg(w) => write!(f, "missing argument for `{w}`"),
             Error::BadValue { what, got } => write!(f, "bad value for {what}: {got}"),
@@ -99,6 +115,9 @@ impl std::fmt::Display for Error {
             ),
             Error::Directive { name, msg } => write!(f, "\"{name}\" directive {msg}"),
             Error::DuplicateListen(addr) => write!(f, "a duplicate listen {addr}"),
+            Error::UpstreamUrl { problem, url } => {
+                write!(f, "{problem} in upstream \"{url}\"")
+            }
             Error::HostNotFound { url, directive } => {
                 write!(
                     f,
@@ -128,5 +147,55 @@ pub(crate) fn in_block(ctx: &str) -> String {
     match ctx {
         "top-level" => "at the top level".to_string(),
         ctx => format!("in a {ctx} block"),
+    }
+}
+
+/// The directives nginx declares `NGX_CONF_BLOCK` that ruxen parses.
+fn is_block_directive(name: &str) -> bool {
+    matches!(
+        name,
+        "http"
+            | "events"
+            | "server"
+            | "location"
+            | "upstream"
+            | "types"
+            | "map"
+            | "if"
+            | "limit_except"
+            | "split_clients"
+            | "geo"
+            | "charset_map"
+            | "match"
+            | "stream"
+            | "mail"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn in_nginx_words() {
+        let parse = |src: &str| crate::config::parse(src).unwrap_err().to_string();
+        assert_eq!(
+            parse("http { server { listen 80 { } } }"),
+            "directive \"listen\" is not terminated by \";\""
+        );
+        assert_eq!(
+            parse("http { server { location / ; } }"),
+            "directive \"location\" has no opening \"{\""
+        );
+        assert_eq!(
+            parse("http { server { location / { proxy_pass http://nosuch.invalid; } } }"),
+            "host not found in upstream \"nosuch.invalid\""
+        );
+        assert_eq!(
+            parse("http { upstream u { server nosuch.invalid:8080; } }"),
+            "host not found in upstream \"nosuch.invalid:8080\""
+        );
+        assert_eq!(
+            parse("http { server { location / { proxy_pass http://127.0.0.1:99999; } } }"),
+            "invalid port in upstream \"127.0.0.1:99999\""
+        );
     }
 }
