@@ -274,7 +274,9 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             .iter()
             .map(|s| s.http2_conf.inherit(&http2_conf))
             .collect();
-        let tls_default_server = servers_for_addr
+        // The address's default server: `listen … default_server`, else
+        // the first (ngx_http_add_addresses), for plain and TLS alike.
+        let default_server = servers_for_addr
             .iter()
             .position(|s| s.listen.default_server)
             .unwrap_or(0);
@@ -368,17 +370,16 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 crate::arena::leak(addr.ip().to_string().into_bytes().into_boxed_slice())
             },
             servers,
-            default_server: 0,
+            default_server,
             tls,
             reject_handshake,
             proxy_protocol,
             http2_listen,
-            // The default server is the first (`default_server: 0`).
-            h2_plain: server_http2.first().copied().unwrap_or(false),
+            h2_plain: server_http2.get(default_server).copied().unwrap_or(false),
             h2_by_sni,
             tls_contexts_by_sni,
             client_verify,
-            tls_default_server,
+            tls_default_server: default_server,
             socket,
         });
     }

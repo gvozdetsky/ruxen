@@ -851,6 +851,27 @@ mod tests {
     }
 
     #[test]
+    fn default_server_of_a_plain_address_is_the_flagged_one() {
+        // nginx's ngx_http_add_addresses: `default_server`, else the first;
+        // plain HTTP as TLS (the plain one was always the first).
+        let http = prepare(parse_cfg(
+            r#"
+                http {
+                    server { listen 8080; server_name a.test; return 200 "a"; }
+                    server { listen 8080 default_server; server_name b.test; return 200 "b"; }
+                    server { listen 8081; server_name c.test; return 200 "c"; }
+                    server { listen 8081; server_name d.test; return 200 "d"; }
+                }
+            "#,
+        ))
+        .expect("prepare");
+        let by_port = |port: u16| http.listens.iter().find(|l| l.addr.port() == port).unwrap();
+        assert_eq!(by_port(8080).default_server, 1);
+        assert_eq!(by_port(8080).tls_default_server, 1);
+        assert_eq!(by_port(8081).default_server, 0);
+    }
+
+    #[test]
     pub(crate) fn prepare_accepts_multiple_servers_on_same_listen() {
         let cfg = parse_cfg(
             r#"
