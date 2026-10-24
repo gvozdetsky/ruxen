@@ -1054,6 +1054,33 @@ pub(crate) fn parse_location_block(
                     });
                 }
                 let path = args.get(1).ok_or(Error::MissingArg("alias path"))?;
+                // The classic misconfiguration: nginx joins location and
+                // alias as written. `location /img { alias /data/img/; }`
+                // maps `/img../x` to `/data/img/../x`, outside the
+                // directory; `location /img/ { alias /data/img; }` maps
+                // `/img/x` to `/data/imgx`. ruxen joins them with one `/`
+                // and stays in the directory, but the configuration likely
+                // doesn't say what was meant (gixy's "alias traversal").
+                if matches!(spec.mode, MatchMode::Prefix)
+                    && !path.contains('$')
+                    && spec.pattern.len() > 1
+                    && spec.pattern.ends_with('/') != path.ends_with('/')
+                {
+                    let (loc, dir) = (
+                        spec.pattern.trim_end_matches('/'),
+                        path.trim_end_matches('/'),
+                    );
+                    let example = if path.ends_with('/') {
+                        format!("\"{loc}../x\" to \"{dir}/../x\", outside the directory")
+                    } else {
+                        format!("\"{loc}/x\" to \"{dir}x\"")
+                    };
+                    lx.warnings_mut().push(format!(
+                        "\"alias {path}\" in location \"{}\": only one of them ends with \"/\"; \
+                         nginx would map {example}, ruxen joins them with one \"/\"",
+                        spec.pattern,
+                    ));
+                }
                 root = Some((PathBuf::from(path), PathMapping::Alias));
                 local_path_mapping = Some(PathMapping::Alias);
                 alias_prefix_override = None;
