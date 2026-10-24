@@ -2360,7 +2360,40 @@ pub(crate) fn prepare_server(
     for l in if_parsed {
         if_locations.push(build_prefix_or_exact(l, &scope, upstreams, alp)?);
     }
+    // Nesting: what each location, by its place in `locations`, is nested
+    // in. The parser lists a location's nested ones (`descendants`) right
+    // after it.
+    let nesting: Option<Vec<Option<usize>>> =
+        locations.iter().any(|l| l.descendants > 0).then(|| {
+            let mut stack: Vec<(usize, usize)> = Vec::new();
+            locations
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    while stack.last().is_some_and(|&(_, end)| i >= end) {
+                        stack.pop();
+                    }
+                    let parent = stack.last().map(|&(p, _)| p);
+                    if l.descendants > 0 {
+                        stack.push((i, i + 1 + l.descendants));
+                    }
+                    parent
+                })
+                .collect()
+        });
+    // Where each one went: its kind and index in that list (before the
+    // exact and prefix lists are sorted).
+    let mut placed: Vec<(MatchMode, usize)> = Vec::with_capacity(locations.len());
     for l in locations {
+        placed.push((
+            l.mode,
+            match l.mode {
+                MatchMode::Exact => exact.len(),
+                MatchMode::Prefix => prefix.len(),
+                MatchMode::Named => named.len(),
+                MatchMode::Regex { .. } => regex.len(),
+            },
+        ));
         match l.mode {
             MatchMode::Exact => exact.push(build_prefix_or_exact(l, &scope, upstreams, alp)?),
             MatchMode::Prefix => prefix.push(build_prefix_or_exact(l, &scope, upstreams, alp)?),
@@ -2374,8 +2407,32 @@ pub(crate) fn prepare_server(
             )?),
         }
     }
-    exact.sort_by(|a, b| a.pattern.cmp(b.pattern));
-    prefix.sort_by_key(|a| std::cmp::Reverse(a.pattern.len()));
+    // Sorted through a permutation, so `placed` can follow.
+    let sorted = |len: usize, key: &dyn Fn(usize, usize) -> std::cmp::Ordering| {
+        let mut order: Vec<usize> = (0..len).collect();
+        order.sort_by(|&a, &b| key(a, b));
+        let mut at = vec![0; len];
+        for (new, &old) in order.iter().enumerate() {
+            at[old] = new;
+        }
+        (order, at)
+    };
+    let (exact_order, exact_at) =
+        sorted(exact.len(), &|a, b| exact[a].pattern.cmp(exact[b].pattern));
+    let (prefix_order, prefix_at) = sorted(prefix.len(), &|a, b| {
+        prefix[b].pattern.len().cmp(&prefix[a].pattern.len())
+    });
+    let exact = permute(exact, &exact_order);
+    let prefix = permute(prefix, &prefix_order);
+    for (mode, index) in &mut placed {
+        match mode {
+            MatchMode::Exact => *index = exact_at[*index],
+            MatchMode::Prefix => *index = prefix_at[*index],
+            _ => {}
+        }
+    }
+    let location_tree = nesting
+        .map(|parents| Box::new(location_tree(&placed, &parents, prefix.len(), regex.len())));
     // regex_locations stay in declaration order — first match wins.
 
     // Synthesize a nameless catch-all PreparedLocation for requests the
@@ -2493,6 +2550,7 @@ pub(crate) fn prepare_server(
         regex_location_set: first_match_set(regex.iter().map(|r| r.set_pattern.as_str())),
         regex_locations: regex,
         named_locations: named,
+        location_tree,
         if_locations,
         server_default,
         error_logs: server_error_logs,
@@ -2508,6 +2566,67 @@ pub(crate) fn prepare_server(
         add_headers: server_add_headers,
         error_pages: server_error_pages,
     })
+}
+
+/// `list` in the order of `order`'s indices.
+fn permute<T>(list: Vec<T>, order: &[usize]) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = list.into_iter().map(Some).collect();
+    order.iter().map(|&i| slots[i].take().unwrap()).collect()
+}
+
+/// The nesting nginx searches (ngx_http_core_find_location): each location
+/// in its parent's level, the server's being level 0. `placed[i]` is where
+/// the server's `i`th location went, `parents[i]` what it is nested in.
+/// A level's prefix locations are kept longest first, as the sorted list
+/// is, and its regex ones in declaration order.
+fn location_tree(
+    placed: &[(MatchMode, usize)],
+    parents: &[Option<usize>],
+    prefixes: usize,
+    regexes: usize,
+) -> LocationTree {
+    let mut tree = LocationTree {
+        levels: vec![LocationLevel::default()],
+        prefix_children: vec![None; prefixes],
+        regex_children: vec![None; regexes],
+    };
+    // The level of the locations nested in location `i`, made on first use.
+    let level_of = |tree: &mut LocationTree, i: usize| -> usize {
+        let slot = match placed[i] {
+            (MatchMode::Prefix, k) => &mut tree.prefix_children[k],
+            (MatchMode::Regex { .. }, k) => &mut tree.regex_children[k],
+            // nginx refuses locations in exact or named ones; the flat
+            // lists have them.
+            _ => return 0,
+        };
+        match *slot {
+            Some(level) => level as usize,
+            None => {
+                let level = tree.levels.len();
+                *slot = Some(level as u16);
+                tree.levels.push(LocationLevel::default());
+                level
+            }
+        }
+    };
+    for (i, &(mode, index)) in placed.iter().enumerate() {
+        let level = match parents[i] {
+            Some(p) => level_of(&mut tree, p),
+            None => 0,
+        };
+        let level = &mut tree.levels[level];
+        match mode {
+            MatchMode::Exact => level.exact.push(index as u16),
+            MatchMode::Prefix => level.prefix.push(index as u16),
+            MatchMode::Regex { .. } => level.regex.push(index as u16),
+            MatchMode::Named => {}
+        }
+    }
+    for level in &mut tree.levels {
+        // Longest first: the sorted list's order is by index.
+        level.prefix.sort_unstable();
+    }
+    tree
 }
 
 pub(crate) fn prepare_add_headers(list: Vec<AddHeader>) -> &'static [PreparedAddHeader] {
@@ -3750,6 +3869,7 @@ pub(crate) fn build_prefix_or_exact(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        descendants: _,
         add_header_inherit: _,
         add_trailer_inherit: _,
         header_ancestors: _,
@@ -3970,6 +4090,7 @@ pub(crate) fn build_regex_location(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        descendants: _,
         add_header_inherit: _,
         add_trailer_inherit: _,
         header_ancestors: _,

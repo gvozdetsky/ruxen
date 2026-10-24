@@ -1855,6 +1855,28 @@ impl PreparedClientTimeouts {
     }
 }
 
+/// A server's locations as nginx nests them (ngx_http_core_find_location):
+/// level 0 is the server's own, and each location with nested ones has a
+/// level of its own. Indices are into the server's `exact_locations`,
+/// `prefix_locations` and `regex_locations`.
+#[derive(Debug, Default)]
+pub struct LocationTree {
+    pub levels: Vec<LocationLevel>,
+    /// The level of the locations nested in each prefix location.
+    pub prefix_children: Vec<Option<u16>>,
+    /// The level of the locations nested in each regex location.
+    pub regex_children: Vec<Option<u16>>,
+}
+
+/// One level's locations: exact, prefix (longest first) and regex (in
+/// declaration order).
+#[derive(Debug, Default)]
+pub struct LocationLevel {
+    pub exact: Vec<u16>,
+    pub prefix: Vec<u16>,
+    pub regex: Vec<u16>,
+}
+
 /// One `server {}` block after preparation. `exact_locations` and
 /// `prefix_locations` are pre-split: exact-match candidates are scanned
 /// first and return immediately on a hit; prefix candidates are sorted by
@@ -1925,6 +1947,10 @@ pub struct PreparedServer {
     /// (#248). `None` for fewer than two, or if the set didn't build.
     pub regex_location_set: Option<regex::bytes::RegexSet>,
     pub named_locations: Vec<PreparedLocation>,
+    /// Locations nested in others, as nginx searches them
+    /// (`phase::match_location`): `None` when none is, and the flat lists
+    /// above decide alone.
+    pub location_tree: Option<Box<LocationTree>>,
     /// The anonymous locations of its locations' `if` blocks, by the
     /// index `PreparedRewriteOp::If` carries (#137).
     pub if_locations: Vec<PreparedLocation>,
