@@ -4,6 +4,8 @@
 //! Spawns a tiny in-process backend that captures the request bytes it
 //! received and replies with a canned response.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -26,10 +28,8 @@ impl Drop for ServerGuard {
     }
 }
 
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let guard = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = common::ports::setup_lock();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -48,19 +48,6 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("server did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-}
-
 fn write_conf(conf_body: &str, port: u16) -> (PathBuf, PathBuf) {
     let dir = unique_dir();
     let conf_path = dir.join("ruxen.conf");
@@ -71,20 +58,22 @@ fn write_conf(conf_body: &str, port: u16) -> (PathBuf, PathBuf) {
 fn spawn_ruxen(conf_body: &str) -> (ServerGuard, u16) {
     let (port, _lock) = pick_port();
     let (dir, conf_path) = write_conf(conf_body, port);
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-    wait_for_listen(port);
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 /// Config-check only: `ruxen -t`, returning whether it was accepted.
@@ -111,7 +100,7 @@ struct Backend {
 impl Backend {
     fn spawn(response: Vec<u8>) -> Self {
         let listener = {
-            let _g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = common::ports::setup_lock();
             TcpListener::bind("127.0.0.1:0").unwrap()
         };
         let addr = listener.local_addr().unwrap();

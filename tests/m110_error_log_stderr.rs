@@ -7,7 +7,7 @@ mod common;
 
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The server stops when the test ends, also when an assertion panics:
 /// an orphaned ruxen otherwise keeps its port and CPU after the run.
@@ -31,7 +31,7 @@ fn run(name: &str, location_log: &str) -> (String, String) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("html")).unwrap();
     // Held until ruxen listens: released earlier, another test could take
-    // the same free port, and the readiness probe would reach its server.
+    // the same free port, and requests would reach its server.
     let setup = common::ports::setup_lock();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -57,16 +57,14 @@ fn run(name: &str, location_log: &str) -> (String, String) {
             .arg(dir.join("error.log"))
             .arg("-c")
             .arg(dir.join("nginx.conf"))
+            .arg("-g")
+            .arg(format!("pid {d}/ruxen.pid;"))
             .stdout(Stdio::null())
             .stderr(stderr)
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    common::ports::wait_for_pid_file(&mut child.0, &dir.join("ruxen.pid"), Duration::from_secs(5));
     drop(setup);
     for path in ["/logged/missing-a", "/plain/missing-b"] {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
