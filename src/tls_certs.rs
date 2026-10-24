@@ -453,15 +453,19 @@ impl ServerNameResolver {
         if let Some(slot) = self.exact.get(&normalized) {
             return Self::select(slot, schemes);
         }
-        for (suffix, slot) in &self.wildcard {
-            if &normalized == suffix {
-                return Self::select(slot, schemes);
-            }
-            if let Some(prefix) = normalized.strip_suffix(suffix.as_str())
-                && prefix.ends_with('.')
-            {
-                return Self::select(slot, schemes);
-            }
+        // The longest leading wildcard; `*.example.com` doesn't take
+        // `example.com` itself, as for `Host`.
+        let leading = self
+            .wildcard
+            .iter()
+            .filter(|(suffix, _)| {
+                normalized
+                    .strip_suffix(suffix.as_str())
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+            })
+            .max_by_key(|(suffix, _)| suffix.len());
+        if let Some((_, slot)) = leading {
+            return Self::select(slot, schemes);
         }
         // Then, as for `Host` (and nginx's ngx_http_find_virtual_server):
         // the longest trailing wildcard, then the first regex.
@@ -469,10 +473,9 @@ impl ServerNameResolver {
             .wildcard_trailing
             .iter()
             .filter(|(head, _)| {
-                normalized == *head
-                    || normalized
-                        .strip_prefix(head.as_str())
-                        .is_some_and(|rest| rest.starts_with('.'))
+                normalized
+                    .strip_prefix(head.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
             })
             .max_by_key(|(head, _)| head.len());
         if let Some((_, slot)) = trailing {
@@ -954,8 +957,8 @@ mod tests {
         let mut r = ServerNameResolver::new();
         r.add_wildcard("example.com", key.clone());
 
-        // bare suffix matches
-        assert!(r.lookup("example.com", ALL_SCHEMES).is_some());
+        // the bare suffix doesn't (`.example.com` registers it as exact)
+        assert!(r.lookup("example.com", ALL_SCHEMES).is_none());
         // subdomain matches
         assert!(r.lookup("foo.example.com", ALL_SCHEMES).is_some());
         // multi-label subdomain matches (nginx parity)
