@@ -269,7 +269,7 @@ http {
         send(b"TRACE /t HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .starts_with("HTTP/1.1 405")
     );
-    // Refused after the server is chosen (403 today; nginx says 400).
+    // Refused after the server is chosen: 400, as nginx.
     let resp = send(b"GET /../x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     assert!(resp.starts_with("HTTP/1.1 4"), "{resp}");
     sleep(Duration::from_millis(50));
@@ -283,7 +283,7 @@ http {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("1 4") && l.ends_with(" GET [/../x] []")),
+            .any(|l| l.starts_with("1 400") && l.ends_with(" GET [/../x] []")),
         "{log}"
     );
 }

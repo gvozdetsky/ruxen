@@ -816,7 +816,10 @@ fn process_with_meta_inner(
             if let Err(resp) =
                 normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
             {
-                return (resp, refused_meta(server, true));
+                // A 400 ends the connection, as nginx's does.
+                let mut meta = refused_meta(server, true);
+                meta.keepalive.allow = false;
+                return (resp, meta);
             }
         }
         Some(reroute) => {
