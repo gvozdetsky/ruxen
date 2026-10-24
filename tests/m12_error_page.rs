@@ -424,3 +424,59 @@ http {
     assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
     assert_eq!(body(&resp), b"internal");
 }
+
+fn http_get_with(port: u16, path: &str, header: &str) -> Vec<u8> {
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{header}\r\nConnection: close\r\n\r\n");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+/// An error page served from a file goes whole with its own status, as
+/// nginx's not_modified and range filters skip a non-200: no 304 (it was
+/// turned into a 404 with neither body nor length), no 206, no
+/// `Accept-Ranges`, and no `Last-Modified` (the header filter's rule).
+#[test]
+fn m12_error_page_file_is_sent_whole() {
+    let dir = unique_dir();
+    std::fs::write(dir.join("index.html"), b"<html>app</html>").unwrap();
+    let root = dir.to_str().unwrap();
+    let conf = format!(
+        "http {{ server {{ listen %%PORT%%; root {root}; \
+         location / {{ try_files $uri =404; error_page 404 /index.html; }} \
+         location /ok/ {{ try_files $uri =404; error_page 404 =200 /index.html; }} }} }}\n"
+    );
+    let (_g, port) = spawn_server(&conf);
+    let etag = header_value(&http_get(port, "/index.html"), "ETag")
+        .unwrap()
+        .to_string();
+    for header in [
+        "X-Plain: 1".to_string(),
+        format!("If-None-Match: {etag}"),
+        "If-Modified-Since: Tue, 01 Jan 2041 00:00:00 GMT".to_string(),
+        "Range: bytes=0-3".to_string(),
+        "If-Match: \"nope\"".to_string(),
+    ] {
+        let r = http_get_with(port, "/missing", &header);
+        assert_eq!(status_line(&r), "HTTP/1.1 404 Not Found", "{header}");
+        assert_eq!(header_value(&r, "Content-Length"), Some("16"), "{header}");
+        assert_eq!(body(&r), b"<html>app</html>", "{header}");
+        assert_eq!(header_value(&r, "Last-Modified"), None, "{header}");
+        assert_eq!(header_value(&r, "Accept-Ranges"), None, "{header}");
+        assert_eq!(header_value(&r, "Content-Range"), None, "{header}");
+    }
+    // `=200` makes it a 200 again: ranges and validators apply.
+    let r = http_get_with(port, "/ok/missing", "Range: bytes=0-3");
+    assert_eq!(status_line(&r), "HTTP/1.1 206 Partial Content");
+    assert_eq!(body(&r), b"<htm");
+    let r = http_get_with(port, "/ok/missing", &format!("If-None-Match: {etag}"));
+    assert_eq!(status_line(&r), "HTTP/1.1 304 Not Modified");
+    let r = http_get_with(port, "/ok/missing", "X-Plain: 1");
+    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    assert!(header_value(&r, "Last-Modified").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}

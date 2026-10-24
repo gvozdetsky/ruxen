@@ -640,6 +640,14 @@ pub(crate) fn effective_error_page_status(
         return base_status;
     }
     match forced {
+        // nginx puts `err_status` over the response's before its
+        // not_modified and range filters run, so under a 200 a file's 304
+        // or 206 stays what it is.
+        Some(phase::ErrorPageStatus::Preserve(200) | phase::ErrorPageStatus::Override(200))
+            if matches!(base_status, 206 | 304) =>
+        {
+            base_status
+        }
         Some(phase::ErrorPageStatus::Preserve(status))
         | Some(phase::ErrorPageStatus::Override(status)) => status,
         None => base_status,
@@ -685,6 +693,12 @@ pub(crate) fn rewrite_response_status(response: Vec<u8>, status: u16) -> Vec<u8>
         return out;
     }
     out.extend_from_slice(&response[line_end..]);
+    // nginx's header filter sends `Last-Modified` only with a 200, 206 or
+    // 304 (ngx_http_header_filter_module.c), so an error page served from
+    // a file loses it.
+    if !matches!(status, 200 | 206 | 304) {
+        out = strip_header_lines(out, b"last-modified");
+    }
     out
 }
 

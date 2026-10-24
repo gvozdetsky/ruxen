@@ -1378,6 +1378,34 @@ pub(crate) fn run_location_handler(
                     Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
                 fs_resolve::Outcome::Serve(opened) => {
+                    // An error page that goes out with another status than
+                    // 200 is sent whole: nginx's not_modified and range
+                    // filters only act on a 200, so no 304, no 206 and no
+                    // `Accept-Ranges` (a 304 turned into a 404 had no body
+                    // and no length).
+                    if let Some(
+                        phase::ErrorPageStatus::Preserve(status)
+                        | phase::ErrorPageStatus::Override(status),
+                    ) = error_page_status
+                        && status != 200
+                    {
+                        break 'root file::serve_path(
+                            opened,
+                            req.method,
+                            file::Conditionals {
+                                if_modified_since: None,
+                                if_unmodified_since: None,
+                                if_none_match: None,
+                                if_match: None,
+                                range: None,
+                                if_range: None,
+                                last_modified_override: last_modified_override.as_deref(),
+                                max_ranges: Some(0),
+                            },
+                            server_bytes,
+                            loc.sendfile,
+                        );
+                    }
                     // `max_ranges 0`: nginx's range filter declines, so
                     // the file goes whole, without `Accept-Ranges` (#370).
                     let accept_ranges = loc.max_ranges != Some(0);
