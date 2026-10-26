@@ -1140,9 +1140,63 @@ pub(crate) struct ChunkedBody {
 pub(crate) enum ChunkedBodyError {
     /// Over the size limit: 413, as nginx.
     TooLarge,
-    /// Malformed framing, a line or trailer block too long, EOF, a read
-    /// error or timeout, or a failed temp-file write: 400.
+    /// Malformed framing, a line or trailer block too long, a read error
+    /// or timeout, or a failed temp-file write: 400.
     Invalid,
+    /// The input ended before the body did: 400 from a connection, and
+    /// from `chunked_in_buffer` a body still to come.
+    Ended,
+}
+
+/// A connection with nothing more to read, for `chunked_in_buffer`.
+struct NoMoreInput;
+
+impl AsyncReadRent for NoMoreInput {
+    async fn read<T: monoio::buf::IoBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        (Ok(0), buf)
+    }
+
+    async fn readv<T: monoio::buf::IoVecBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        (Ok(0), buf)
+    }
+}
+
+/// A chunked body nothing reads, as far as it came with the head: nginx's
+/// discard parses that before it answers (ngx_http_discard_request_body_filter),
+/// a framing error being a 400 then. `Ok` when the whole body is there,
+/// `Err(Ended)` when more is to come (`discard_chunked_body` reads it after
+/// the response), `Err(Invalid)` for a malformed one. No reads, so the
+/// timer is only armed.
+pub(crate) async fn chunked_in_buffer(
+    initial: &[u8],
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+) -> Result<ChunkedBody, ChunkedBodyError> {
+    read_chunked_request_body(
+        &mut NoMoreInput,
+        initial,
+        u64::MAX,
+        None,
+        timer,
+        LINGERING_TIMEOUT,
+    )
+    .await
+}
+
+/// The rest of a chunked body nothing reads, after the response, from
+/// `initial` (all of it already read) on: read and dropped under nginx's
+/// `lingering_timeout` per read and `lingering_time` in all, as its discard
+/// does then. The bytes read past it, which start the next request, or
+/// `None`: the connection closes.
+pub(crate) async fn discard_chunked_body<S: AsyncReadRent>(
+    stream: &mut S,
+    initial: &[u8],
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+) -> Option<Vec<u8>> {
+    let read = read_chunked_request_body(stream, initial, u64::MAX, None, timer, LINGERING_TIMEOUT);
+    match monoio::time::timeout(LINGERING_TIME, read).await {
+        Ok(Ok(body)) => Some(body.pipelined_tail),
+        _ => None,
+    }
 }
 
 /// Maximum length of any single chunk-size or trailer line, including the
@@ -1261,15 +1315,16 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
 /// (memory, then a temp file for large bodies). Chunk data is passed on as
 /// it arrives and consumed input is dropped, so memory stays bounded
 /// whatever the chunk sizes.
+/// `sink`: `None` drops the data (a body nothing reads).
 pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
     stream: &mut S,
     initial: &[u8],
     max_body: u64,
-    sink: &mut BodySink<'_>,
+    mut sink: Option<&mut BodySink<'_>>,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
 ) -> Result<ChunkedBody, ChunkedBodyError> {
-    use ChunkedBodyError::{Invalid, TooLarge};
+    use ChunkedBodyError::{Ended, Invalid, TooLarge};
 
     // `raw[cursor..]` is unread input; `raw_base` is how many stream bytes
     // (counted from `initial[0]`) were dropped from the front of `raw`.
@@ -1292,7 +1347,8 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
                 .await
                 .ok_or(Invalid)?;
             match res {
-                Ok(0) | Err(_) => return Err(Invalid),
+                Ok(0) => return Err(Ended),
+                Err(_) => return Err(Invalid),
                 Ok(n) => raw.extend_from_slice(&returned[..n]),
             }
         }};
@@ -1362,7 +1418,8 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
             }
         }
 
-        if chunk_len > max_body.saturating_sub(sink.len()) {
+        let taken = sink.as_ref().map_or(0, |sink| sink.len());
+        if chunk_len > max_body.saturating_sub(taken) {
             return Err(TooLarge);
         }
         // Pass the chunk on as it arrives instead of buffering all of it.
@@ -1372,7 +1429,9 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
                 read_more!((left.min(64 * 1024)) as usize);
             }
             let take = (left.min((raw.len() - cursor) as u64)) as usize;
-            if !sink.extend(&raw[cursor..cursor + take]) {
+            if let Some(sink) = sink.as_deref_mut()
+                && !sink.extend(&raw[cursor..cursor + take])
+            {
                 return Err(Invalid);
             }
             cursor += take;

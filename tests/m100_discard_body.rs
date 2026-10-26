@@ -177,8 +177,9 @@ fn m100_client_stopping_mid_body_closes_the_connection() {
 
 /// The response doesn't wait for a body nothing reads (#627): it comes
 /// while the body is still on its way, as nginx answers before discarding.
-/// A chunked body that is still coming gets the response too, and then the
-/// connection closes, its end being unknown.
+/// A chunked body that is still coming gets the response too, and the
+/// rest is read and dropped after it, chunk by chunk, so the next request
+/// on the connection is served (ngx_http_discard_request_body_filter).
 #[test]
 fn m100_the_response_comes_before_the_body() {
     let (_server, port) = start("first");
@@ -200,12 +201,65 @@ fn m100_the_response_comes_before_the_body() {
 
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+        .unwrap();
+    assert_eq!(
+        responses(&mut c, 1),
+        ["HTTP/1.1 200 OK | ok \n".to_string()]
+    );
+    let mut rest = b"lo\r\n".to_vec();
+    rest.extend_from_slice(
+        &[b"8000\r\n".as_slice(), &[b'x'; 0x8000], b"\r\n"]
+            .concat()
+            .repeat(8),
+    );
+    rest.extend_from_slice(b"0\r\nX-Trailer: 1\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n");
+    c.write_all(&rest).unwrap();
+    assert_eq!(
+        responses(&mut c, 1),
+        ["HTTP/1.1 200 OK | ok \n".to_string()]
+    );
+}
+
+/// A chunked body nothing reads is parsed as far as it came with the head
+/// before the response, as nginx's discard does: a framing error there is
+/// a 400, and a whole body leaves a pipelined request behind it to be
+/// served. One that turns out malformed after the response closes the
+/// connection.
+#[test]
+fn m100_a_dropped_chunked_body_is_still_parsed() {
+    let (_server, port) = start("chunked");
+    let exchange = |raw: &[u8]| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(raw).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).to_string()
+    };
+    let out = exchange(
+        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n",
+    );
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    let out = exchange(
+        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n\
+          GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+        .unwrap();
+    assert_eq!(
+        responses(&mut s, 1),
+        ["HTTP/1.1 200 OK | ok \n".to_string()]
+    );
+    s.write_all(b"lo\r\nzz\r\n0\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
         .unwrap();
     let mut out = Vec::new();
-    let _ = c.read_to_end(&mut out);
-    let out = String::from_utf8_lossy(&out);
-    assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+    let _ = s.read_to_end(&mut out);
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
 }
 
 /// An upstream that answers each request with how many body bytes it got

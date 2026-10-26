@@ -3847,37 +3847,53 @@ where
     ))
 }
 
-/// The rest of a body nobody reads, after the response went out (#627):
-/// `true` when it was read and dropped and the connection may serve the
-/// next request. An HTTP/2 stream ends instead (the `h2` crate then resets
-/// it with NO_ERROR, which tells the client to stop sending, as nginx's
-/// ngx_http_v2_close_stream does); a chunked body, or a connection that
-/// closes anyway, gets a lingering close so the response isn't lost to a
-/// reset.
+/// The rest of a body nobody reads, after the response went out (#627),
+/// as nginx's ngx_http_discarded_request_body_handler reads it: under
+/// `lingering_timeout` per read and `lingering_time` in all
+/// (ngx_http_finalize_connection), not `client_body_timeout`. `buf`: the
+/// read buffer, where a chunked body starts. The bytes read past a chunked
+/// body, which start the next request, when the connection may serve it;
+/// `None` when it closes. An HTTP/2 stream ends instead (the `h2` crate
+/// then resets it with NO_ERROR, which tells the client to stop sending,
+/// as nginx's ngx_http_v2_close_stream does); a connection that closes
+/// anyway gets a lingering close so the response isn't lost to a reset.
 #[cold]
 #[inline(never)]
 async fn discard_after_response<S: ConnIo>(
     stream: &mut S,
-    rest: u64,
+    rest: PendingDiscard,
+    buf: &[u8],
     close_after: bool,
     scratch: &mut Vec<u8>,
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
-) -> bool {
+) -> Option<Vec<u8>> {
     if stream.h2() {
-        return false;
+        return None;
     }
-    if rest == u64::MAX || close_after {
+    if close_after {
         lingering_close(stream, scratch).await;
-        return false;
+        return None;
     }
-    // nginx reads it under `lingering_timeout` per read and `lingering_time`
-    // in all (ngx_http_finalize_connection), not `client_body_timeout`.
-    monoio::time::timeout(
-        LINGERING_TIME,
-        discard_request_body(stream, rest, timer, LINGERING_TIMEOUT),
-    )
-    .await
-    .unwrap_or(false)
+    match rest {
+        PendingDiscard::Chunked { from } => discard_chunked_body(stream, &buf[from..], timer).await,
+        PendingDiscard::Length(rest) => monoio::time::timeout(
+            LINGERING_TIME,
+            discard_request_body(stream, rest, timer, LINGERING_TIMEOUT),
+        )
+        .await
+        .unwrap_or(false)
+        .then(Vec::new),
+    }
+}
+
+/// What is left of a body nobody reads when its response goes out.
+#[derive(Clone, Copy)]
+enum PendingDiscard {
+    /// This many bytes of a Content-Length body.
+    Length(u64),
+    /// A chunked one, all of it read so far starting at `from` in the
+    /// read buffer.
+    Chunked { from: usize },
 }
 
 #[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
@@ -4534,7 +4550,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         // ngx_http_discard_request_body, and the rest is
                         // read and dropped after it (#627). `u64::MAX`: a
                         // chunked one, whose end isn't known.
-                        let mut pending_discard: Option<u64> = None;
+                        let mut pending_discard: Option<PendingDiscard> = None;
                         let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
                             (0, 0)
                         } else if let Some(cl) = req.content_length {
@@ -4550,7 +4566,8 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let take = (already as u64).min(cl) as usize;
                                 if discard_body {
                                     if cl > take as u64 {
-                                        pending_discard = Some(cl - take as u64);
+                                        pending_discard =
+                                            Some(PendingDiscard::Length(cl - take as u64));
                                     }
                                     break 'read (take, cl);
                                 }
@@ -4610,8 +4627,36 @@ pub(crate) async fn handle<S: ConnIo>(
                                 (take, cl)
                             }
                         } else if req.transfer_encoding_chunked && discard_body {
-                            pending_discard = Some(u64::MAX);
-                            (0, 0)
+                            // What came with the head is parsed first, as
+                            // nginx's discard does: a framing error there is
+                            // a 400, and the rest is read after the response.
+                            let body_start = base + req.consumed;
+                            match Box::pin(chunked_in_buffer(
+                                &buf[body_start..filled],
+                                timers.io.as_mut(),
+                            ))
+                            .await
+                            {
+                                Ok(body) => (body.consumed_initial, body.raw_consumed),
+                                Err(ChunkedBodyError::Ended) => {
+                                    pending_discard =
+                                        Some(PendingDiscard::Chunked { from: body_start });
+                                    let came = filled - body_start;
+                                    (came, came as u64)
+                                }
+                                Err(_) => {
+                                    reject_request(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        http.bad_request.pick(method),
+                                        &buf[read_start..filled],
+                                        conn_log!(),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
                         } else if req.transfer_encoding_chunked {
                             let body_start = base + req.consumed;
                             let initial = &buf[body_start..filled];
@@ -4619,7 +4664,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 stream,
                                 initial,
                                 max_body,
-                                &mut sink,
+                                Some(&mut sink),
                                 timers.io.as_mut(),
                                 body_timeout,
                             )
@@ -5372,17 +5417,20 @@ pub(crate) async fn handle<S: ConnIo>(
                         if cut_short {
                             return;
                         }
-                        if let Some(rest) = pending_discard
-                            && !Box::pin(discard_after_response(
+                        if let Some(rest) = pending_discard {
+                            let Some(tail) = Box::pin(discard_after_response(
                                 stream,
                                 rest,
+                                &buf[..filled],
                                 close_after,
                                 &mut *scratch,
                                 timers.io.as_mut(),
                             ))
                             .await
-                        {
-                            return;
+                            else {
+                                return;
+                            };
+                            pipelined_tail = tail;
                         }
 
                         read_start += request_total_consumed;

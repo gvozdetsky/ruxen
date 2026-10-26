@@ -230,7 +230,7 @@ pub mod fuzzing {
                     &mut reader,
                     &data[..initial],
                     max_body,
-                    &mut sink,
+                    Some(&mut sink),
                     timer,
                     std::time::Duration::from_secs(3600),
                 )
