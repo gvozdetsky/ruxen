@@ -5,13 +5,15 @@
 // asserts the responses. Everything cleans up via a guard that kills the
 // child on drop — no zombie processes if an assertion panics.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -26,18 +28,8 @@ impl Drop for ServerGuard {
     }
 }
 
-// Serializes port-picking + spawn + readiness across parallel tests. Without
-// this, `pick_port` drops its `:0` listener before ruxen binds, leaving a
-// window where a sibling test's `bind :0` can return the same port; both
-// ruxens then bind it via `SO_REUSEPORT` and the kernel load-balances
-// requests across two different tempdirs, producing empty / wrong responses.
-// Holding the lock until `wait_for_listen` returns guarantees ruxen owns the
-// port before the next test's `pick_port` runs — Linux won't hand out a port
-// whose binder has `SO_REUSEPORT` to a caller that doesn't request it.
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let g = common::ports::setup_lock();
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let p = l.local_addr().unwrap().port();
     drop(l);
@@ -75,32 +67,22 @@ fn setup_server() -> (ServerGuard, u16) {
     )
     .unwrap();
 
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg(&conf)
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-
-    // Poll for readiness — the server should be up within a second.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 fn setup_prefixed_root_server() -> (ServerGuard, u16) {
@@ -124,31 +106,22 @@ fn setup_prefixed_root_server() -> (ServerGuard, u16) {
     )
     .unwrap();
 
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg(&conf)
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 fn setup_return_server() -> (ServerGuard, u16) {
@@ -162,31 +135,22 @@ fn setup_return_server() -> (ServerGuard, u16) {
     )
     .unwrap();
 
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg(&conf)
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 /// Send one request on a fresh connection, return the raw response bytes.
@@ -282,7 +246,9 @@ fn m3_end_to_end() {
     );
     assert_eq!(status_line(&r), "HTTP/1.1 404 Not Found");
 
-    // 5. Traversal attempts all blocked (403 from URI normalizer)
+    // 5. Traversal attempts all refused: a URI above the root is an
+    // invalid request (400, as ngx_http_parse_complex_uri), and the
+    // connection closes.
     for raw in [
         &b"GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"[..],
         &b"GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"[..],
@@ -290,10 +256,11 @@ fn m3_end_to_end() {
         let r = request(port, raw);
         assert_eq!(
             status_line(&r),
-            "HTTP/1.1 403 Forbidden",
+            "HTTP/1.1 400 Bad Request",
             "request: {:?}",
             std::str::from_utf8(raw).unwrap()
         );
+        assert_eq!(header(&r, "Connection").as_deref(), Some("close"));
     }
 
     // 6. Nested path works
@@ -366,29 +333,22 @@ fn setup_with_http(body_fmt: impl FnOnce(u16) -> String) -> (ServerGuard, u16) {
     let dir = unique_dir();
     let conf = dir.join("ruxen.conf");
     std::fs::write(&conf, body_fmt(port)).unwrap();
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg(&conf)
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 #[test]
@@ -530,14 +490,14 @@ fn head_worker_404_has_no_body() {
 }
 
 #[test]
-fn head_worker_403_has_no_body() {
+fn head_worker_400_has_no_body() {
     let (_guard, port) = setup_server();
 
     let r = request(
         port,
         b"HEAD /../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden");
+    assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request");
     // nginx's HTML page (#34): its length, no body.
     assert_eq!(header(&r, "Content-Type").as_deref(), Some("text/html"));
     assert!(
@@ -781,29 +741,22 @@ fn setup_m6(
     populate(&dir);
     let conf = dir.join("ruxen.conf");
     std::fs::write(&conf, conf_body_fmt(port, dir.to_str().unwrap())).unwrap();
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .arg(&conf)
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 #[test]
@@ -1081,5 +1034,5 @@ fn m6_traversal_via_normalized_uri_still_blocked() {
         port,
         b"GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden");
+    assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request");
 }

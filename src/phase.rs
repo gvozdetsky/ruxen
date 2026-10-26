@@ -816,7 +816,10 @@ fn process_with_meta_inner(
             if let Err(resp) =
                 normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
             {
-                return (resp, refused_meta(server, true));
+                // A 400 ends the connection, as nginx's does.
+                let mut meta = refused_meta(server, true);
+                meta.keepalive.allow = false;
+                return (resp, meta);
             }
         }
         Some(reroute) => {
@@ -2470,9 +2473,8 @@ fn match_server_name<'h>(
 /// or the wildcard would also match `xexample.com` against
 /// `*.example.com`.
 fn host_matches_leading_wildcard(host: &[u8], suffix: &[u8]) -> bool {
-    if host == suffix {
-        return true;
-    }
+    // `*.example.com` doesn't take `example.com` (ngx_hash_find_wc_head);
+    // `.example.com` does, as an exact name the parser adds beside it.
     if host.len() <= suffix.len() {
         return false;
     }
@@ -2480,12 +2482,9 @@ fn host_matches_leading_wildcard(host: &[u8], suffix: &[u8]) -> bool {
     host[split - 1] == b'.' && &host[split..] == suffix
 }
 
-/// Match `host` against a `head.*` wildcard. Matches when the host
-/// equals the head or starts with `head.`.
+/// Match `host` against a `head.*` wildcard: it starts with `head.`
+/// (`www.example.*` doesn't take `www.example`, ngx_hash_find_wc_tail).
 fn host_matches_trailing_wildcard(host: &[u8], head: &[u8]) -> bool {
-    if host == head {
-        return true;
-    }
     if host.len() <= head.len() {
         return false;
     }
@@ -2530,6 +2529,11 @@ pub(crate) fn match_location<'a>(
         return Some(loc);
     }
 
+    // Locations nested in others: nginx's search, level by level.
+    if let Some(tree) = &server.location_tree {
+        return match_nested(server, tree, path, rewrite_state);
+    }
+
     let best = server
         .prefix_locations
         .iter()
@@ -2567,6 +2571,94 @@ pub(crate) fn match_location<'a>(
     }
 
     best.map(MatchedLocation::from_prefix)
+}
+
+/// `match_location` for a server with nested locations, as nginx's
+/// ngx_http_core_find_location: on each level, an exact match ends the
+/// search; else the longest prefix, and the locations nested in it are
+/// searched before this level's regex locations (unless the prefix has
+/// `^~`); a regex match ends it, after a search of its own nested ones.
+/// A regex location nested in a prefix one is tried only for URIs that
+/// prefix matches, and before the server's own (#730).
+#[cold]
+#[inline(never)]
+fn match_nested<'a>(
+    server: &'a PreparedServer,
+    tree: &crate::worker::LocationTree,
+    path: &[u8],
+    rewrite_state: &mut RewriteState,
+) -> Option<MatchedLocation<'a>> {
+    // Which regex locations match at all, in one pass (#248).
+    let hits = server
+        .regex_location_set
+        .as_ref()
+        .map(|set| set.matches(path));
+    let hit = |r: usize| hits.as_ref().is_none_or(|h| h.matched(r));
+    #[derive(PartialEq)]
+    enum Found {
+        /// An exact or a regex location: the search is over.
+        Final,
+        /// A prefix location: a regex one further up may still win.
+        Prefix,
+        Nothing,
+    }
+    fn level<'a>(
+        server: &'a PreparedServer,
+        tree: &crate::worker::LocationTree,
+        at: usize,
+        path: &[u8],
+        rewrite_state: &mut RewriteState,
+        hit: &dyn Fn(usize) -> bool,
+    ) -> (Found, Option<MatchedLocation<'a>>) {
+        let lvl = &tree.levels[at];
+        for &e in &lvl.exact {
+            let loc = &server.exact_locations[e as usize];
+            if loc.pattern == path {
+                return (Found::Final, Some(MatchedLocation::from_prefix(loc)));
+            }
+        }
+        let mut found = (Found::Nothing, None);
+        let mut noregex = false;
+        if let Some(&p) = lvl
+            .prefix
+            .iter()
+            .find(|&&p| path.starts_with(server.prefix_locations[p as usize].pattern))
+        {
+            let loc = &server.prefix_locations[p as usize];
+            found = (Found::Prefix, Some(MatchedLocation::from_prefix(loc)));
+            noregex = loc.noregex;
+            if let Some(child) = tree.prefix_children[p as usize] {
+                let (deeper, m) = level(server, tree, child as usize, path, rewrite_state, hit);
+                if m.is_some() {
+                    found.1 = m;
+                }
+                if deeper == Found::Final {
+                    return (Found::Final, found.1);
+                }
+            }
+        }
+        if !noregex {
+            for &r in &lvl.regex {
+                let rloc = &server.regex_locations[r as usize];
+                if !hit(r as usize) {
+                    continue;
+                }
+                if let Some(captures) = rloc.regex.captures(path) {
+                    rewrite_state.set_numbered_from_regex_captures(&captures, path);
+                    let mut m = MatchedLocation::from_regex(rloc);
+                    if let Some(child) = tree.regex_children[r as usize]
+                        && let (_, Some(deeper)) =
+                            level(server, tree, child as usize, path, rewrite_state, hit)
+                    {
+                        m = deeper;
+                    }
+                    return (Found::Final, Some(m));
+                }
+            }
+        }
+        found
+    }
+    level(server, tree, 0, path, rewrite_state, &hit).1
 }
 
 /// What a `Location` that starts with `/` becomes (#15), as nginx's header
@@ -2719,6 +2811,41 @@ fn match_named_location<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildcards_take_only_names_below_them() {
+        // ngx_hash_find_wc_head / _tail: `*.example.com` and `www.example.*`
+        // need a label more; `.example.com` covers the bare name as an exact
+        // one.
+        assert!(host_matches_leading_wildcard(
+            b"x.example.com",
+            b"example.com"
+        ));
+        assert!(host_matches_leading_wildcard(
+            b"a.b.example.com",
+            b"example.com"
+        ));
+        assert!(!host_matches_leading_wildcard(
+            b"example.com",
+            b"example.com"
+        ));
+        assert!(!host_matches_leading_wildcard(
+            b"xexample.com",
+            b"example.com"
+        ));
+        assert!(host_matches_trailing_wildcard(
+            b"www.example.org",
+            b"www.example"
+        ));
+        assert!(!host_matches_trailing_wildcard(
+            b"www.example",
+            b"www.example"
+        ));
+        assert!(!host_matches_trailing_wildcard(
+            b"www.exampleorg",
+            b"www.example"
+        ));
+    }
     use crate::config;
     use crate::worker::prepare;
     use std::path::Path;

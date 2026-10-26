@@ -198,4 +198,17 @@ fn m97_gzip_like_nginx() {
     // q=0 refuses gzip.
     let (head, _) = get(port, "/", "Accept-Encoding: gzip;q=0\r\n", "1.1");
     assert!(!head.contains("Content-Encoding"), "{head}");
+
+    // A range of a file gzip would take, to a client that doesn't ask for
+    // gzip: a 206 with `Vary`, as nginx's gzip filter saw the whole 200
+    // first. Small (in memory) and big (streamed), one range and several.
+    for (path, range) in [("/", "0-3"), ("/big.css", "0-3"), ("/big.css", "0-3,10-20")] {
+        let (head, _) = get(port, path, &format!("Range: bytes={range}\r\n"), "1.1");
+        assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+        assert_eq!(head.matches("Vary: Accept-Encoding").count(), 1, "{head}");
+    }
+    // Not for a type gzip doesn't take.
+    let (head, _) = get(port, "/pic.png", "Range: bytes=0-3\r\n", "1.1");
+    assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+    assert!(!head.contains("Vary"), "{head}");
 }

@@ -100,6 +100,16 @@ fn prepare_warning(line: String) {
     PREPARE_WARNINGS.with(|w| w.borrow_mut().push(line));
 }
 
+/// A warning about a server, which the server's every address would repeat.
+fn prepare_warning_once(line: String) {
+    PREPARE_WARNINGS.with(|w| {
+        let mut w = w.borrow_mut();
+        if !w.contains(&line) {
+            w.push(line);
+        }
+    });
+}
+
 fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let HttpConfig {
         limit_req_zones,
@@ -119,6 +129,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         autoindex_exact_size,
         autoindex_localtime,
         autoindex_format,
+        if_modified_since,
         split_clients,
         maps,
         auth_basic,
@@ -171,6 +182,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_autoindex_exact_size = autoindex_exact_size.unwrap_or(true);
     let http_autoindex_localtime = autoindex_localtime.unwrap_or(false);
     let http_autoindex_format = autoindex_format.unwrap_or(AutoindexFormat::Html);
+    let http_if_modified_since = if_modified_since.unwrap_or(crate::config::IfModifiedSince::Exact);
     let http_access = resolve_access(
         access,
         auth_basic,
@@ -229,6 +241,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         autoindex_exact_size: http_autoindex_exact_size,
         autoindex_localtime: http_autoindex_localtime,
         autoindex_format: http_autoindex_format,
+        if_modified_since: http_if_modified_since,
         access: http_access,
         client_max_body_size: http_client_max_body_size,
         max_ranges: http_max_ranges,
@@ -271,7 +284,9 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
             .iter()
             .map(|s| s.http2_conf.inherit(&http2_conf))
             .collect();
-        let tls_default_server = servers_for_addr
+        // The address's default server: `listen … default_server`, else
+        // the first (ngx_http_add_addresses), for plain and TLS alike.
+        let default_server = servers_for_addr
             .iter()
             .position(|s| s.listen.default_server)
             .unwrap_or(0);
@@ -365,17 +380,16 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
                 crate::arena::leak(addr.ip().to_string().into_bytes().into_boxed_slice())
             },
             servers,
-            default_server: 0,
+            default_server,
             tls,
             reject_handshake,
             proxy_protocol,
             http2_listen,
-            // The default server is the first (`default_server: 0`).
-            h2_plain: server_http2.first().copied().unwrap_or(false),
+            h2_plain: server_http2.get(default_server).copied().unwrap_or(false),
             h2_by_sni,
             tls_contexts_by_sni,
             client_verify,
-            tls_default_server,
+            tls_default_server: default_server,
             socket,
         });
     }
@@ -533,7 +547,23 @@ pub(crate) fn build_listen_tls(
     // keeps the default server's session context. A server chosen by SNI
     // has its own protocols (#586), as nginx 1.29.2+ selects the server
     // before the version is negotiated.
-    let protocols = default.ssl.protocols.unwrap_or_default();
+    // `ssl_ciphers` / `ssl_prefer_server_ciphers`: each server's, in its
+    // context as its protocols are (an SNI-chosen server's own SSL_CTX in
+    // nginx). A list that leaves no TLS 1.2 suite leaves TLS 1.3 alone.
+    let cipher_policy = |input: &TlsServerInput| {
+        crate::tls_ciphers::Policy::of(
+            input.ssl.ciphers.as_deref(),
+            input.ssl.prefer_server_ciphers,
+        )
+    };
+    let versions_of = |input: &TlsServerInput| {
+        cipher_policy(input).versions(
+            input.ssl.protocols.unwrap_or_default(),
+            input.ssl.ciphers.as_deref(),
+            &mut |w| prepare_warning_once(w),
+        )
+    };
+    let protocols = versions_of(default)?;
     let session_timeout_secs = default
         .ssl
         .session_timeout_ms
@@ -650,8 +680,25 @@ pub(crate) fn build_listen_tls(
     };
     // And certificate compression (#601), an SSL_CTX option nginx copies
     // from the server chosen by SNI too.
-    type ContextKey = (Option<usize>, crate::config::TlsVersionSet, bool);
-    let default_key: ContextKey = (auth_of(default)?, protocols, compress(default));
+    // And the cipher policy, an index into `policies`.
+    let mut policies: Vec<crate::tls_ciphers::Policy> = vec![Default::default()];
+    let mut policy_of = |input: &TlsServerInput| -> usize {
+        let policy = cipher_policy(input);
+        policies
+            .iter()
+            .position(|p| *p == policy)
+            .unwrap_or_else(|| {
+                policies.push(policy);
+                policies.len() - 1
+            })
+    };
+    type ContextKey = (Option<usize>, crate::config::TlsVersionSet, bool, usize);
+    let default_key: ContextKey = (
+        auth_of(default)?,
+        protocols,
+        compress(default),
+        policy_of(default),
+    );
     let mut server_keys: Vec<ContextKey> = Vec::with_capacity(inputs.len());
     for input in inputs {
         server_keys.push(if input.ssl.certs.is_empty() {
@@ -659,22 +706,24 @@ pub(crate) fn build_listen_tls(
         } else {
             (
                 auth_of(input)?,
-                input.ssl.protocols.unwrap_or_default(),
+                versions_of(input)?,
                 compress(input),
+                policy_of(input),
             )
         });
     }
     // The address's config is the default server's context; the others
     // are configs of their own, indexed in `contexts`.
-    let context_config =
-        |(auth, versions, compressed): ContextKey| -> Result<Arc<rustls::ServerConfig>, String> {
-            if (auth, versions, compressed) == (None, protocols, compress(default)) {
+    let context_config = |(auth, versions, compressed, policy): ContextKey|
+     -> Result<Arc<rustls::ServerConfig>, String> {
+            if (auth, versions, compressed, policy) == (None, protocols, compress(default), 0) {
                 return Ok(cfg.clone());
             }
             let mut config = crate::tls_certs::with_context(
                 &cfg,
                 versions,
                 auth.map(|i| auths[i].1.verifier(crate::tls_certs::active_provider())),
+                &policies[policy],
             )
             .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
             if let Some(config) = Arc::get_mut(&mut config) {
@@ -2107,6 +2156,7 @@ pub(crate) struct HttpScope {
     pub(crate) autoindex_exact_size: bool,
     pub(crate) autoindex_localtime: bool,
     pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) if_modified_since: crate::config::IfModifiedSince,
     pub(crate) access: PreparedAccess,
     pub(crate) client_max_body_size: Option<u64>,
     pub(crate) max_ranges: Option<u32>,
@@ -2289,6 +2339,7 @@ pub(crate) fn prepare_server(
         .autoindex_localtime
         .unwrap_or(http.autoindex_localtime);
     let server_autoindex_format = server.autoindex_format.unwrap_or(http.autoindex_format);
+    let server_if_modified_since = server.if_modified_since.unwrap_or(http.if_modified_since);
     // server_tokens inheritance: server scope wins over http scope; both
     // default to `On`. Resolved once here; prepare_handler downstream
     // bakes the right `Server:` bytes into static prebuilts.
@@ -2338,6 +2389,7 @@ pub(crate) fn prepare_server(
         autoindex_exact_size: server_autoindex_exact_size,
         autoindex_localtime: server_autoindex_localtime,
         autoindex_format: server_autoindex_format,
+        if_modified_since: server_if_modified_since,
         access_logs: server_access_logs,
         access: server_access,
         client_max_body_size: server_client_max_body_size,
@@ -2360,7 +2412,40 @@ pub(crate) fn prepare_server(
     for l in if_parsed {
         if_locations.push(build_prefix_or_exact(l, &scope, upstreams, alp)?);
     }
+    // Nesting: what each location, by its place in `locations`, is nested
+    // in. The parser lists a location's nested ones (`descendants`) right
+    // after it.
+    let nesting: Option<Vec<Option<usize>>> =
+        locations.iter().any(|l| l.descendants > 0).then(|| {
+            let mut stack: Vec<(usize, usize)> = Vec::new();
+            locations
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    while stack.last().is_some_and(|&(_, end)| i >= end) {
+                        stack.pop();
+                    }
+                    let parent = stack.last().map(|&(p, _)| p);
+                    if l.descendants > 0 {
+                        stack.push((i, i + 1 + l.descendants));
+                    }
+                    parent
+                })
+                .collect()
+        });
+    // Where each one went: its kind and index in that list (before the
+    // exact and prefix lists are sorted).
+    let mut placed: Vec<(MatchMode, usize)> = Vec::with_capacity(locations.len());
     for l in locations {
+        placed.push((
+            l.mode,
+            match l.mode {
+                MatchMode::Exact => exact.len(),
+                MatchMode::Prefix => prefix.len(),
+                MatchMode::Named => named.len(),
+                MatchMode::Regex { .. } => regex.len(),
+            },
+        ));
         match l.mode {
             MatchMode::Exact => exact.push(build_prefix_or_exact(l, &scope, upstreams, alp)?),
             MatchMode::Prefix => prefix.push(build_prefix_or_exact(l, &scope, upstreams, alp)?),
@@ -2374,8 +2459,32 @@ pub(crate) fn prepare_server(
             )?),
         }
     }
-    exact.sort_by(|a, b| a.pattern.cmp(b.pattern));
-    prefix.sort_by_key(|a| std::cmp::Reverse(a.pattern.len()));
+    // Sorted through a permutation, so `placed` can follow.
+    let sorted = |len: usize, key: &dyn Fn(usize, usize) -> std::cmp::Ordering| {
+        let mut order: Vec<usize> = (0..len).collect();
+        order.sort_by(|&a, &b| key(a, b));
+        let mut at = vec![0; len];
+        for (new, &old) in order.iter().enumerate() {
+            at[old] = new;
+        }
+        (order, at)
+    };
+    let (exact_order, exact_at) =
+        sorted(exact.len(), &|a, b| exact[a].pattern.cmp(exact[b].pattern));
+    let (prefix_order, prefix_at) = sorted(prefix.len(), &|a, b| {
+        prefix[b].pattern.len().cmp(&prefix[a].pattern.len())
+    });
+    let exact = permute(exact, &exact_order);
+    let prefix = permute(prefix, &prefix_order);
+    for (mode, index) in &mut placed {
+        match mode {
+            MatchMode::Exact => *index = exact_at[*index],
+            MatchMode::Prefix => *index = prefix_at[*index],
+            _ => {}
+        }
+    }
+    let location_tree = nesting
+        .map(|parents| Box::new(location_tree(&placed, &parents, prefix.len(), regex.len())));
     // regex_locations stay in declaration order — first match wins.
 
     // Synthesize a nameless catch-all PreparedLocation for requests the
@@ -2414,6 +2523,7 @@ pub(crate) fn prepare_server(
             autoindex_exact_size: server_autoindex_exact_size,
             autoindex_localtime: server_autoindex_localtime,
             autoindex_format: server_autoindex_format,
+            if_modified_since: server_if_modified_since,
             disable_symlinks: server_disable_symlinks.clone(),
             mime: &server.mime,
             tokens: server_tokens_value,
@@ -2493,6 +2603,7 @@ pub(crate) fn prepare_server(
         regex_location_set: first_match_set(regex.iter().map(|r| r.set_pattern.as_str())),
         regex_locations: regex,
         named_locations: named,
+        location_tree,
         if_locations,
         server_default,
         error_logs: server_error_logs,
@@ -2508,6 +2619,67 @@ pub(crate) fn prepare_server(
         add_headers: server_add_headers,
         error_pages: server_error_pages,
     })
+}
+
+/// `list` in the order of `order`'s indices.
+fn permute<T>(list: Vec<T>, order: &[usize]) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = list.into_iter().map(Some).collect();
+    order.iter().map(|&i| slots[i].take().unwrap()).collect()
+}
+
+/// The nesting nginx searches (ngx_http_core_find_location): each location
+/// in its parent's level, the server's being level 0. `placed[i]` is where
+/// the server's `i`th location went, `parents[i]` what it is nested in.
+/// A level's prefix locations are kept longest first, as the sorted list
+/// is, and its regex ones in declaration order.
+fn location_tree(
+    placed: &[(MatchMode, usize)],
+    parents: &[Option<usize>],
+    prefixes: usize,
+    regexes: usize,
+) -> LocationTree {
+    let mut tree = LocationTree {
+        levels: vec![LocationLevel::default()],
+        prefix_children: vec![None; prefixes],
+        regex_children: vec![None; regexes],
+    };
+    // The level of the locations nested in location `i`, made on first use.
+    let level_of = |tree: &mut LocationTree, i: usize| -> usize {
+        let slot = match placed[i] {
+            (MatchMode::Prefix, k) => &mut tree.prefix_children[k],
+            (MatchMode::Regex { .. }, k) => &mut tree.regex_children[k],
+            // nginx refuses locations in exact or named ones; the flat
+            // lists have them.
+            _ => return 0,
+        };
+        match *slot {
+            Some(level) => level as usize,
+            None => {
+                let level = tree.levels.len();
+                *slot = Some(level as u16);
+                tree.levels.push(LocationLevel::default());
+                level
+            }
+        }
+    };
+    for (i, &(mode, index)) in placed.iter().enumerate() {
+        let level = match parents[i] {
+            Some(p) => level_of(&mut tree, p),
+            None => 0,
+        };
+        let level = &mut tree.levels[level];
+        match mode {
+            MatchMode::Exact => level.exact.push(index as u16),
+            MatchMode::Prefix => level.prefix.push(index as u16),
+            MatchMode::Regex { .. } => level.regex.push(index as u16),
+            MatchMode::Named => {}
+        }
+    }
+    for level in &mut tree.levels {
+        // Longest first: the sorted list's order is by index.
+        level.prefix.sort_unstable();
+    }
+    tree
 }
 
 pub(crate) fn prepare_add_headers(list: Vec<AddHeader>) -> &'static [PreparedAddHeader] {
@@ -3486,6 +3658,7 @@ pub(crate) struct HandlerSite<'a> {
     pub(crate) autoindex_exact_size: bool,
     pub(crate) autoindex_localtime: bool,
     pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) if_modified_since: crate::config::IfModifiedSince,
     pub(crate) disable_symlinks: Option<crate::config::DisableSymlinks>,
     pub(crate) mime: &'a crate::config::MimeConf,
     pub(crate) tokens: crate::config::ServerTokens,
@@ -3558,6 +3731,7 @@ pub(crate) fn build_handler(
                 autoindex_exact_size: site.autoindex_exact_size,
                 autoindex_localtime: site.autoindex_localtime,
                 autoindex_format: site.autoindex_format,
+                if_modified_since: site.if_modified_since,
                 try_files,
             })
         }
@@ -3671,6 +3845,7 @@ pub(crate) struct ServerScope<'a> {
     pub(crate) autoindex_exact_size: bool,
     pub(crate) autoindex_localtime: bool,
     pub(crate) autoindex_format: AutoindexFormat,
+    pub(crate) if_modified_since: crate::config::IfModifiedSince,
     pub(crate) access_logs: &'static [PreparedAccessLog],
     pub(crate) access: PreparedAccess,
     pub(crate) client_max_body_size: Option<u64>,
@@ -3721,6 +3896,7 @@ pub(crate) fn build_prefix_or_exact(
         autoindex_exact_size: location_autoindex_exact_size,
         autoindex_localtime: location_autoindex_localtime,
         autoindex_format: location_autoindex_format,
+        if_modified_since: location_if_modified_since,
         access_logs: location_access_logs,
         open_log_file_cache: location_open_log_file_cache,
         auth_basic: location_auth_basic,
@@ -3750,6 +3926,7 @@ pub(crate) fn build_prefix_or_exact(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        descendants: _,
         add_header_inherit: _,
         add_trailer_inherit: _,
         header_ancestors: _,
@@ -3791,6 +3968,7 @@ pub(crate) fn build_prefix_or_exact(
         autoindex_exact_size: location_autoindex_exact_size.unwrap_or(server.autoindex_exact_size),
         autoindex_localtime: location_autoindex_localtime.unwrap_or(server.autoindex_localtime),
         autoindex_format: location_autoindex_format.unwrap_or(server.autoindex_format),
+        if_modified_since: location_if_modified_since.unwrap_or(server.if_modified_since),
         disable_symlinks: location_disable_symlinks.or_else(|| server.disable_symlinks.clone()),
         mime: &mime,
         tokens,
@@ -3941,6 +4119,7 @@ pub(crate) fn build_regex_location(
         autoindex_exact_size: location_autoindex_exact_size,
         autoindex_localtime: location_autoindex_localtime,
         autoindex_format: location_autoindex_format,
+        if_modified_since: location_if_modified_since,
         access_logs: location_access_logs,
         open_log_file_cache: location_open_log_file_cache,
         auth_basic: location_auth_basic,
@@ -3970,6 +4149,7 @@ pub(crate) fn build_regex_location(
         alias_prefix_override,
         inherits_root: _,
         explicit_return: _,
+        descendants: _,
         add_header_inherit: _,
         add_trailer_inherit: _,
         header_ancestors: _,
@@ -4020,6 +4200,7 @@ pub(crate) fn build_regex_location(
         autoindex_exact_size: location_autoindex_exact_size.unwrap_or(server.autoindex_exact_size),
         autoindex_localtime: location_autoindex_localtime.unwrap_or(server.autoindex_localtime),
         autoindex_format: location_autoindex_format.unwrap_or(server.autoindex_format),
+        if_modified_since: location_if_modified_since.unwrap_or(server.if_modified_since),
         disable_symlinks: location_disable_symlinks.or_else(|| server.disable_symlinks.clone()),
         mime: &mime,
         tokens,

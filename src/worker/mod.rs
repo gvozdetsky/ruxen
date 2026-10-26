@@ -765,9 +765,11 @@ pub(crate) fn normalize_request_uri_into(
     merge_slashes: bool,
     out: &mut Vec<u8>,
 ) -> Result<(), Response> {
+    // A client URI that climbs above the root is an invalid request, as
+    // in ngx_http_parse_complex_uri (400 and the connection closes), not
+    // a forbidden one.
     match uri::normalize_with(req.path, merge_slashes, out) {
         Ok(_) => Ok(()),
-        Err(uri::UriError::EscapesRoot) => Err(Response::Prebuilt(http.forbidden.pick(req.method))),
         Err(_) => Err(Response::Prebuilt(http.bad_request.pick(req.method))),
     }
 }
@@ -846,6 +848,27 @@ mod tests {
         assert_eq!(request_arg_value(args, b"flag"), Some(&b""[..]));
         assert_eq!(request_arg_value(args, b"x"), Some(&b"two"[..]));
         assert_eq!(request_arg_value(args, b"missing"), None);
+    }
+
+    #[test]
+    fn default_server_of_a_plain_address_is_the_flagged_one() {
+        // nginx's ngx_http_add_addresses: `default_server`, else the first;
+        // plain HTTP as TLS (the plain one was always the first).
+        let http = prepare(parse_cfg(
+            r#"
+                http {
+                    server { listen 8080; server_name a.test; return 200 "a"; }
+                    server { listen 8080 default_server; server_name b.test; return 200 "b"; }
+                    server { listen 8081; server_name c.test; return 200 "c"; }
+                    server { listen 8081; server_name d.test; return 200 "d"; }
+                }
+            "#,
+        ))
+        .expect("prepare");
+        let by_port = |port: u16| http.listens.iter().find(|l| l.addr.port() == port).unwrap();
+        assert_eq!(by_port(8080).default_server, 1);
+        assert_eq!(by_port(8080).tls_default_server, 1);
+        assert_eq!(by_port(8081).default_server, 0);
     }
 
     #[test]

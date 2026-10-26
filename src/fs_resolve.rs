@@ -973,6 +973,7 @@ mod tests {
             autoindex_exact_size: true,
             autoindex_localtime: false,
             autoindex_format: AutoindexFormat::Html,
+            if_modified_since: crate::config::IfModifiedSince::Exact,
             try_files: None,
         }
     }

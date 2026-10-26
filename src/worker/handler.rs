@@ -1362,7 +1362,12 @@ pub(crate) fn run_location_handler(
             // The static module takes GET, HEAD and POST; it refuses a POST
             // only once the file is found (ngx_http_static_handler).
             let get_or_head = matches!(req.method, Method::Get | Method::Head);
-            if !get_or_head && req.method_bytes != b"POST" {
+            // Another method gets the static module's 405, unless a
+            // `try_files` fallback takes the request first: nginx's
+            // try_files phase runs for every method, so a PUT goes on to
+            // `@app` (ngx_http_core_try_files_phase checks no method).
+            let not_static = !get_or_head && req.method_bytes != b"POST";
+            if not_static && root.try_files.is_none() {
                 break 'root Response::Owned(file::method_not_allowed(req.method, server_bytes));
             }
             // An `alias` after a rewrite: nothing to map (#589).
@@ -1378,6 +1383,35 @@ pub(crate) fn run_location_handler(
                     Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
                 fs_resolve::Outcome::Serve(opened) => {
+                    // An error page that goes out with another status than
+                    // 200 is sent whole: nginx's not_modified and range
+                    // filters only act on a 200, so no 304, no 206 and no
+                    // `Accept-Ranges` (a 304 turned into a 404 had no body
+                    // and no length).
+                    if let Some(
+                        phase::ErrorPageStatus::Preserve(status)
+                        | phase::ErrorPageStatus::Override(status),
+                    ) = error_page_status
+                        && status != 200
+                    {
+                        break 'root file::serve_path(
+                            opened,
+                            req.method,
+                            file::Conditionals {
+                                if_modified_since: None,
+                                if_unmodified_since: None,
+                                if_none_match: None,
+                                if_match: None,
+                                range: None,
+                                if_range: None,
+                                last_modified_override: last_modified_override.as_deref(),
+                                max_ranges: Some(0),
+                                ims_mode: root.if_modified_since,
+                            },
+                            server_bytes,
+                            loc.sendfile,
+                        );
+                    }
                     // `max_ranges 0`: nginx's range filter declines, so
                     // the file goes whole, without `Accept-Ranges` (#370).
                     let accept_ranges = loc.max_ranges != Some(0);
@@ -1399,7 +1433,11 @@ pub(crate) fn run_location_handler(
                         }
                         (range, _) => range,
                     };
-                    file::serve_path(
+                    let vary_cut = match (range, loc.gzip) {
+                        (Some(_), Some(gz)) if gz.vary => Some((gz, opened.mime, opened.size)),
+                        _ => None,
+                    };
+                    let response = file::serve_path(
                         opened,
                         req.method,
                         file::Conditionals {
@@ -1411,10 +1449,24 @@ pub(crate) fn run_location_handler(
                             if_range: req.if_range,
                             last_modified_override: last_modified_override.as_deref(),
                             max_ranges: loc.max_ranges,
+                            ims_mode: root.if_modified_since,
                         },
                         server_bytes,
                         loc.sendfile,
-                    )
+                    );
+                    match vary_cut {
+                        Some((gz, mime, size)) => {
+                            super::gzip::vary_cut_file(gz, mime, size, response)
+                        }
+                        None => response,
+                    }
+                }
+                // What try_files found (a directory, a listing) is the
+                // static module's, and so its 405.
+                fs_resolve::Outcome::Redirect(_) | fs_resolve::Outcome::Autoindex { .. }
+                    if not_static =>
+                {
+                    Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
                 fs_resolve::Outcome::Redirect(location) => {
                     // ngx_http_static_handler: the URI escaped

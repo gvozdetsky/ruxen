@@ -1,10 +1,11 @@
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::sync::MutexGuard;
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -19,13 +20,8 @@ impl Drop for ServerGuard {
     }
 }
 
-// See the SETUP_LOCK comment in tests/file_serving.rs for why port picking
-// has to be serialized against the spawn + readiness-check of the previous
-// setup.
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let g = common::ports::setup_lock();
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let p = l.local_addr().unwrap().port();
     drop(l);
@@ -44,40 +40,28 @@ fn unique_dir() -> PathBuf {
     d
 }
 
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-}
-
 fn spawn_server(conf: &str) -> (ServerGuard, u16) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
     let conf_path = dir.join("nginx.conf");
     std::fs::write(&conf_path, conf.replace("%%PORT%%", &port.to_string())).unwrap();
 
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-
-    wait_for_listen(port);
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 fn http_get(port: u16, path: &str) -> Vec<u8> {
@@ -423,4 +407,60 @@ http {
     let resp = http_get(port, "/tf");
     assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
     assert_eq!(body(&resp), b"internal");
+}
+
+fn http_get_with(port: u16, path: &str, header: &str) -> Vec<u8> {
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{header}\r\nConnection: close\r\n\r\n");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+/// An error page served from a file goes whole with its own status, as
+/// nginx's not_modified and range filters skip a non-200: no 304 (it was
+/// turned into a 404 with neither body nor length), no 206, no
+/// `Accept-Ranges`, and no `Last-Modified` (the header filter's rule).
+#[test]
+fn m12_error_page_file_is_sent_whole() {
+    let dir = unique_dir();
+    std::fs::write(dir.join("index.html"), b"<html>app</html>").unwrap();
+    let root = dir.to_str().unwrap();
+    let conf = format!(
+        "http {{ server {{ listen %%PORT%%; root {root}; \
+         location / {{ try_files $uri =404; error_page 404 /index.html; }} \
+         location /ok/ {{ try_files $uri =404; error_page 404 =200 /index.html; }} }} }}\n"
+    );
+    let (_g, port) = spawn_server(&conf);
+    let etag = header_value(&http_get(port, "/index.html"), "ETag")
+        .unwrap()
+        .to_string();
+    for header in [
+        "X-Plain: 1".to_string(),
+        format!("If-None-Match: {etag}"),
+        "If-Modified-Since: Tue, 01 Jan 2041 00:00:00 GMT".to_string(),
+        "Range: bytes=0-3".to_string(),
+        "If-Match: \"nope\"".to_string(),
+    ] {
+        let r = http_get_with(port, "/missing", &header);
+        assert_eq!(status_line(&r), "HTTP/1.1 404 Not Found", "{header}");
+        assert_eq!(header_value(&r, "Content-Length"), Some("16"), "{header}");
+        assert_eq!(body(&r), b"<html>app</html>", "{header}");
+        assert_eq!(header_value(&r, "Last-Modified"), None, "{header}");
+        assert_eq!(header_value(&r, "Accept-Ranges"), None, "{header}");
+        assert_eq!(header_value(&r, "Content-Range"), None, "{header}");
+    }
+    // `=200` makes it a 200 again: ranges and validators apply.
+    let r = http_get_with(port, "/ok/missing", "Range: bytes=0-3");
+    assert_eq!(status_line(&r), "HTTP/1.1 206 Partial Content");
+    assert_eq!(body(&r), b"<htm");
+    let r = http_get_with(port, "/ok/missing", &format!("If-None-Match: {etag}"));
+    assert_eq!(status_line(&r), "HTTP/1.1 304 Not Modified");
+    let r = http_get_with(port, "/ok/missing", "X-Plain: 1");
+    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    assert!(header_value(&r, "Last-Modified").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
 }

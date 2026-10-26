@@ -497,6 +497,7 @@ pub struct HttpConfig {
     /// http-scope `autoindex_format ...;`. `None` means "not set";
     /// inheritance chain defaults to `html`.
     pub autoindex_format: Option<AutoindexFormat>,
+    pub if_modified_since: Option<IfModifiedSince>,
     /// http-scope `split_clients` programs keyed by output variable name
     /// (without the leading `$`).
     pub split_clients: Vec<SplitClients>,
@@ -792,12 +793,10 @@ pub struct ServerSsl {
     pub keys: Vec<PathBuf>,
     /// `None`: not set here or at http level; TLSv1.2 and TLSv1.3.
     pub protocols: Option<TlsVersionSet>,
-    /// `ssl_ciphers` — verbatim, not applied: rustls's default suites are
-    /// used and the parser warns (`warn_ignored_tls_policy`).
+    /// `ssl_ciphers`, verbatim: `tls_ciphers` evaluates it over rustls's
+    /// TLS 1.2 suites when the TLS contexts are prepared.
     pub ciphers: Option<String>,
-    /// `ssl_prefer_server_ciphers on|off;`. rustls always uses server
-    /// preference for TLS 1.2, so explicit `off` is treated as a parse
-    /// warning (see `HttpConfig.warnings`) but kept here for diagnostics.
+    /// `ssl_prefer_server_ciphers on|off;`: rustls's `ignore_client_order`.
     pub prefer_server_ciphers: Option<bool>,
     /// Parsed `ssl_session_timeout` for this server/listen context.
     /// `None` means directive absent. The prepared TLS config wraps
@@ -1177,6 +1176,7 @@ pub struct Server {
     pub autoindex_localtime: Option<bool>,
     /// Server-scope `autoindex_format ...;`. `None` inherits from http.
     pub autoindex_format: Option<AutoindexFormat>,
+    pub if_modified_since: Option<IfModifiedSince>,
     /// Server-scope `access_log` directives. `None` inherits the http-scope
     /// list. `Some(empty)` means `access_log off;` was used to disable
     /// logging at this scope (parser collapses `off` to an empty vec).
@@ -1460,6 +1460,7 @@ pub struct Location {
     pub autoindex_localtime: Option<bool>,
     /// Location-scope `autoindex_format ...;`. `None` inherits from server.
     pub autoindex_format: Option<AutoindexFormat>,
+    pub if_modified_since: Option<IfModifiedSince>,
     /// Location-scope `access_log` directives. `None` inherits from server.
     /// `Some(empty)` is `access_log off;` — explicit suppression.
     pub access_logs: Option<Vec<AccessLog>>,
@@ -1554,6 +1555,10 @@ pub struct Location {
     /// after the `if` blocks, so it answers even when one of them holds
     /// and has a `proxy_pass` of its own (#137).
     pub explicit_return: bool,
+    /// How many locations nested in this one, at any depth, follow it in
+    /// the server's list: the parser flattens them, and `prepare` builds
+    /// the tree nginx's ngx_http_core_find_location walks from it.
+    pub descendants: usize,
 }
 
 impl Location {
@@ -2760,6 +2765,16 @@ pub enum ServerTokens {
     /// tag so this is identical to `On` today, but we preserve the
     /// distinction so the directive parses and round-trips faithfully).
     Build,
+}
+
+/// `if_modified_since off|exact|before;` (ngx_http_test_if_modified):
+/// `exact`, nginx's default, takes a date equal to the Last-Modified as
+/// unmodified; `before` also one after it; `off` never.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum IfModifiedSince {
+    Off,
+    Exact,
+    Before,
 }
 
 /// `autoindex_format html|xml|json|jsonp;`

@@ -438,7 +438,9 @@ def differences(binary, conf, prefix):
     for line in r.stdout.splitlines():
         m = re.match(r"^(.+:\d+|-): differs: (.*)$", line)
         if m:
-            keys.append(difference(m.group(2), m.group(1) != "-"))
+            # A directive's finding is `directive — note`; a warning,
+            # placed or not, has no ` — `.
+            keys.append(difference(m.group(2), " — " in m.group(2)))
     return sorted(set(keys))
 
 

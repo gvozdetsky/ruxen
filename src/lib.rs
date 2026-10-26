@@ -27,6 +27,7 @@ mod resolver;
 mod syslog;
 mod tls;
 mod tls_certs;
+mod tls_ciphers;
 mod tls_session;
 mod tls_stream;
 mod tls_ticket;
