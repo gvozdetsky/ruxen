@@ -131,14 +131,22 @@ fn body(resp: &[u8]) -> &[u8] {
         .unwrap_or(&[])
 }
 
+/// nginx's not-modified filter runs before `add_header`: If-Modified-Since
+/// is compared with the file's own mtime, not the Last-Modified the
+/// location sets, so the date it sets is no 304. If-Range (the range
+/// filter comes after) does see it.
 #[test]
-fn if_modified_since_uses_overridden_last_modified_date() {
+fn if_modified_since_ignores_overridden_last_modified_date() {
     let (_guard, port) = spawn_server();
     let r = request(
         port,
         b"GET /override.txt HTTP/1.1\r\nHost: localhost\r\nIf-Modified-Since: Mon, 28 Sep 1970 06:00:00 GMT\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 304 Not Modified");
+    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    assert_eq!(
+        header_value(&r, "Last-Modified"),
+        Some("Mon, 28 Sep 1970 06:00:00 GMT")
+    );
 }
 
 #[test]

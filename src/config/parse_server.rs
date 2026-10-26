@@ -64,6 +64,7 @@ pub(crate) fn parse_server_block(
     let mut autoindex_localtime: Option<bool> = None;
     let mut autoindex_format: Option<AutoindexFormat> = None;
     let mut if_modified_since: Option<IfModifiedSince> = None;
+    let mut etag: Option<bool> = None;
     let mut access_logs: Option<Vec<AccessLog>> = None;
     let mut open_log_file_cache: Option<Option<OpenLogFileCache>> = None;
     let mut auth_basic: Option<AuthBasic> = None;
@@ -169,6 +170,7 @@ pub(crate) fn parse_server_block(
                         autoindex_localtime,
                         autoindex_format,
                         if_modified_since,
+                        etag,
                         access_logs,
                         auth_basic,
                         auth_basic_user_file,
@@ -545,6 +547,12 @@ pub(crate) fn parse_server_block(
                 }
                 if_modified_since = Some(parse_if_modified_since_args(&args[1..])?);
             }
+            ("etag", Terminator::Semi) => {
+                if etag.is_some() {
+                    return Err(Error::Duplicate("etag"));
+                }
+                etag = Some(parse_on_off_args(&args[1..], "etag")?);
+            }
             ("access_log", Terminator::Semi) => {
                 let list = access_logs.get_or_insert_with(Vec::new);
                 match parse_access_log_args(&args[1..])? {
@@ -729,6 +737,7 @@ pub(crate) fn parse_server_block(
                 | "autoindex_localtime"
                 | "autoindex_format"
                 | "if_modified_since"
+                | "etag"
                 | "access_log"
                 | "auth_basic"
                 | "auth_basic_user_file"

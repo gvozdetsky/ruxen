@@ -292,6 +292,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut autoindex_localtime: Option<bool> = None;
     let mut autoindex_format: Option<AutoindexFormat> = None;
     let mut if_modified_since: Option<IfModifiedSince> = None;
+    let mut etag: Option<bool> = None;
     let mut split_clients: Vec<SplitClients> = Vec::new();
     let mut maps: Vec<MapBlock> = Vec::new();
     let mut auth_basic: Option<AuthBasic> = None;
@@ -462,6 +463,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         autoindex_localtime,
                         autoindex_format,
                         if_modified_since,
+                        etag,
                         split_clients,
                         maps,
                         auth_basic,
@@ -624,6 +626,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 if_modified_since = Some(parse_if_modified_since_args(&args[1..])?);
             }
+            ("etag", Terminator::Semi) => {
+                if etag.is_some() {
+                    return Err(Error::Duplicate("etag"));
+                }
+                etag = Some(parse_on_off_args(&args[1..], "etag")?);
+            }
             ("split_clients", Terminator::BlockOpen) => {
                 split_clients.push(parse_split_clients_block(&args[1..], lx)?);
             }
@@ -766,6 +774,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "autoindex_localtime"
                 | "autoindex_format"
                 | "if_modified_since"
+                | "etag"
                 | "split_clients"
                 | "ssl_certificate"
                 | "ssl_certificate_key"
@@ -1108,7 +1117,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Misc request handling we treat as no-op for now
     "ignore_invalid_headers",
     "underscores_in_headers",
-    "etag",
     "msie_padding",
     "msie_refresh",
     // Proxy tuning knobs we don't implement yet but accept as no-ops so
@@ -2809,6 +2817,20 @@ mod tests {
         // `ssl_ciphers` is applied (tls_ciphers): no warning.
         assert_eq!(tls_warnings.len(), 1, "{:?}", cfg.warnings);
         assert!(tls_warnings[0].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
+    }
+
+    #[test]
+    fn etag_parses_and_inherits() {
+        let cfg = parse(
+            "http { etag off;
+                    server { listen 80; location / { } location /x { etag on; } } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.etag, Some(false));
+        assert_eq!(cfg.servers[0].etag, None);
+        assert_eq!(cfg.servers[0].locations[1].etag, Some(true));
+        assert!(parse("http { etag maybe; }").is_err());
+        assert!(parse("http { etag on; etag off; }").is_err());
     }
 
     #[test]

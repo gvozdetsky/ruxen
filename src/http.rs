@@ -420,10 +420,14 @@ pub fn parse_request(buf: &[u8], st: &mut ParseState) -> Parse {
                         st.if_match_end = val_end;
                         st.has_if_match = true;
                     }
+                    // The first of several counts, as nginx's
+                    // ngx_http_process_header_line keeps it.
                     Some(KnownHeader::Range) => {
-                        st.range_start = val_start;
-                        st.range_end = val_end;
-                        st.has_range = true;
+                        if !st.has_range {
+                            st.range_start = val_start;
+                            st.range_end = val_end;
+                            st.has_range = true;
+                        }
                     }
                     Some(KnownHeader::IfRange) => {
                         if st.has_if_range {

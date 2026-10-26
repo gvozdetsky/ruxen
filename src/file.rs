@@ -36,6 +36,9 @@ pub struct Conditionals<'a> {
     pub max_ranges: Option<u32>,
     /// The location's `if_modified_since`.
     pub ims_mode: crate::config::IfModifiedSince,
+    /// The location's `etag`: off, a response has none, and the
+    /// conditionals see none (ngx_http_test_if_match).
+    pub etag: bool,
 }
 
 /// Several ranges are read into memory for their multipart response up to
@@ -60,6 +63,14 @@ struct FileMeta {
 struct Etag {
     buf: [u8; Etag::MAX_LEN],
     len: u8,
+}
+
+impl FileMeta {
+    /// Its ETag, unless `etag off` took it away.
+    #[inline]
+    fn etag(&self) -> Option<&[u8]> {
+        (self.etag.len > 0).then(|| self.etag.as_slice())
+    }
 }
 
 impl Etag {
@@ -118,7 +129,7 @@ pub fn serve_path(
         return Response::Owned(method_not_allowed(method, server));
     }
 
-    let meta = meta_from_opened(&opened);
+    let meta = meta_from_opened(&opened, cond.etag);
 
     let accept_ranges = cond.max_ranges != Some(0);
     let head_only = matches!(method, Method::Head);
@@ -198,71 +209,93 @@ pub fn method_not_allowed(method: Method, server: &[u8]) -> Vec<u8> {
     error_response(405, "Method Not Allowed\n", method, server)
 }
 
-fn meta_from_opened(o: &Opened) -> FileMeta {
+/// `etag`: the location's `etag`; off, the file has none.
+fn meta_from_opened(o: &Opened, etag: bool) -> FileMeta {
     FileMeta {
         size: o.size,
         mime: o.mime,
         mtime: o.mtime,
         last_modified: format_http_date(o.mtime),
-        etag: make_etag(o.mtime, o.size),
+        etag: if etag {
+            make_etag(o.mtime, o.size)
+        } else {
+            Etag {
+                buf: [0; Etag::MAX_LEN],
+                len: 0,
+            }
+        },
     }
 }
 
 fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
     // Callers (currently only `serve_path`) 405 non-GET/HEAD at entry, so
-    // everything here runs with a "safe" method and the RFC 9110 §13.1.2
-    // special case (If-None-Match match → 412 on unsafe methods) is
-    // unreachable. Precondition ordering is §13.2.2:
-    //   If-Match → If-Unmodified-Since → If-None-Match → If-Modified-Since → If-Range
-    let has_if_match = cond.if_match.is_some();
-    if let Some(if_match) = cond.if_match {
-        // Strong comparison per §13.1.1: a weak ETag (`W/…`) never matches.
-        if !etag_list_matches_strong(if_match, meta.etag.as_slice()) {
-            return Decision::PreconditionFailed;
-        }
+    // everything here runs with a "safe" method. The preconditions go as
+    // nginx's not-modified filter takes them (ngx_http_not_modified_header_filter),
+    // not in RFC 9110's §13.2.2 order: If-Unmodified-Since and If-Match
+    // both apply, and If-Modified-Since and If-None-Match must both say
+    // unmodified for a 304.
+    // Most requests: nothing conditional and no range.
+    if cond.if_unmodified_since.is_none()
+        && cond.if_match.is_none()
+        && cond.if_modified_since.is_none()
+        && cond.if_none_match.is_none()
+        && cond.range.is_none()
+    {
+        return Decision::Full;
     }
+    let etag = meta.etag();
+    // The file's own: the filter runs before `add_header` could change it.
+    let conditional_last_modified = Some(meta.mtime);
 
-    let conditional_last_modified =
-        resolve_conditional_last_modified(meta, cond.last_modified_override);
-
-    // `If-Unmodified-Since` is only evaluated when `If-Match` is absent
-    // (RFC 9110 §13.1.4 / §13.2.2 ordering). A stale date precondition
-    // fails with 412 before cache validators (`If-None-Match` / IMS).
-    if !has_if_match
-        && let Some(if_unmodified_since) = cond.if_unmodified_since
-        && let Some(current_last_modified) = conditional_last_modified
-        && let Some(since) = parse_http_date(if_unmodified_since)
-        && current_last_modified > since
+    // ngx_http_test_if_unmodified: a date that doesn't parse, or no
+    // Last-Modified to compare it with, fails too.
+    if let Some(if_unmodified_since) = cond.if_unmodified_since
+        && !conditional_last_modified.is_some_and(|current| {
+            parse_http_date(if_unmodified_since).is_some_and(|since| since >= current)
+        })
+    {
+        return Decision::PreconditionFailed;
+    }
+    // Strong comparison per §13.1.1: a weak ETag (`W/…`) never matches;
+    // without an ETag only `*` does.
+    if let Some(if_match) = cond.if_match
+        && !etag_list_matches_strong(if_match, etag)
     {
         return Decision::PreconditionFailed;
     }
 
-    if let Some(if_none_match) = cond.if_none_match {
-        if etag_list_matches(if_none_match, meta.etag.as_slice()) {
-            return Decision::NotModified;
-        }
-        // When `If-None-Match` is present, `If-Modified-Since` MUST be
-        // ignored (§13.1.3). Falling through skips it.
-    } else if let Some(if_modified_since) = cond.if_modified_since {
+    if cond.if_modified_since.is_some() || cond.if_none_match.is_some() {
         // ngx_http_test_if_modified: with nginx's default `exact`,
         // unmodified only when the date is the Last-Modified the client was
         // given; a later one, or one in the future, isn't, so a file put
         // back with an older time is sent again. `before` takes a later
         // date too; `off` none.
         use crate::config::IfModifiedSince as Ims;
-        if let Some(current_last_modified) = conditional_last_modified
-            && cond.ims_mode != Ims::Off
-            && let Some(since) = parse_http_date(if_modified_since)
-            && (current_last_modified == since
-                || (cond.ims_mode == Ims::Before && current_last_modified < since))
-        {
+        let modified = cond.if_modified_since.is_some_and(|if_modified_since| {
+            !(conditional_last_modified.is_some_and(|current| {
+                cond.ims_mode != Ims::Off
+                    && parse_http_date(if_modified_since).is_some_and(|since| {
+                        current == since || (cond.ims_mode == Ims::Before && current < since)
+                    })
+            }))
+        });
+        let other_tag = cond
+            .if_none_match
+            .is_some_and(|if_none_match| !etag_list_matches(if_none_match, etag));
+        if !modified && !other_tag {
             return Decision::NotModified;
         }
     }
 
+    // The range filter comes after `add_header`: an If-Range date is
+    // compared with the Last-Modified it set (range_if_range.t).
     let mut range = cond.range.filter(|_| cond.max_ranges != Some(0));
     if let (Some(_), Some(if_range)) = (range, cond.if_range)
-        && !if_range_matches(if_range, meta, conditional_last_modified)
+        && !if_range_matches(
+            if_range,
+            meta,
+            resolve_conditional_last_modified(meta, cond.last_modified_override),
+        )
     {
         range = None;
     }
@@ -296,11 +329,16 @@ fn resolve_conditional_last_modified(
 /// side make any concrete compare fail. `*` always matches a resource that
 /// exists. Our emitted ETag is syntactically strong (`"hex-hex"`), though
 /// its semantics are only weak-ish because it is derived from mtime+size.
-pub(crate) fn etag_list_matches_strong(value: &[u8], current: &[u8]) -> bool {
+/// Without an ETag (`current` `None`) only `*` matches, as in nginx's
+/// ngx_http_test_if_match.
+pub(crate) fn etag_list_matches_strong(value: &[u8], current: Option<&[u8]>) -> bool {
     let value = trim_ows(value);
     if value == b"*" {
         return true;
     }
+    let Some(current) = current else {
+        return false;
+    };
     if current.starts_with(b"W/") {
         return false;
     }
@@ -372,8 +410,10 @@ fn build_content_headers(
     write_u64(&mut out, body_len);
     out.extend_from_slice(b"\r\nLast-Modified: ");
     out.extend_from_slice(&meta.last_modified);
-    out.extend_from_slice(b"\r\nETag: ");
-    out.extend_from_slice(meta.etag.as_slice());
+    if let Some(etag) = meta.etag() {
+        out.extend_from_slice(b"\r\nETag: ");
+        out.extend_from_slice(etag);
+    }
     if let Some((start, end)) = range {
         out.extend_from_slice(b"\r\nContent-Range: bytes ");
         write_u64(&mut out, start);
@@ -392,18 +432,19 @@ fn build_not_modified_response(meta: &FileMeta, server: &[u8]) -> Vec<u8> {
     crate::http::write_server_and_date(&mut out, server);
     out.extend_from_slice(b"\r\nLast-Modified: ");
     out.extend_from_slice(&meta.last_modified);
-    out.extend_from_slice(b"\r\nETag: ");
-    out.extend_from_slice(meta.etag.as_slice());
+    if let Some(etag) = meta.etag() {
+        out.extend_from_slice(b"\r\nETag: ");
+        out.extend_from_slice(etag);
+    }
     out.extend_from_slice(b"\r\n\r\n");
     out
 }
 
 fn if_range_matches(value: &[u8], meta: &FileMeta, conditional_last_modified: Option<u64>) -> bool {
-    // If-Range with an entity-tag uses strong comparison.
-    if let Some(first) = value.first()
-        && *first == b'"'
-    {
-        return value == meta.etag.as_slice();
+    // An entity-tag (nginx's range filter: it ends with a quote) is
+    // compared byte for byte; without an ETag the whole file goes.
+    if value.len() >= 2 && value.ends_with(b"\"") {
+        return meta.etag() == Some(value);
     }
 
     // Otherwise parse as HTTP-date and compare against second-granularity mtime.
@@ -457,11 +498,15 @@ pub(crate) fn read_at_into(
 /// respecting quoted-string boundaries so that a comma inside a tag body
 /// does not split the entry. Comparison is weak per RFC 9110: strip any
 /// `W/` prefix on both sides, then byte-compare the opaque-tag.
-pub(crate) fn etag_list_matches(value: &[u8], current: &[u8]) -> bool {
+/// Without an ETag only `*` matches.
+pub(crate) fn etag_list_matches(value: &[u8], current: Option<&[u8]>) -> bool {
     let value = trim_ows(value);
     if value == b"*" {
         return true;
     }
+    let Some(current) = current else {
+        return false;
+    };
     let mut i = 0;
     let n = value.len();
     while i < n {
@@ -964,6 +1009,7 @@ mod tests {
             last_modified_override: None,
             max_ranges: None,
             ims_mode: crate::config::IfModifiedSince::Exact,
+            etag: true,
         }
     }
 
@@ -1281,6 +1327,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         )
     }
@@ -1337,6 +1384,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1357,6 +1405,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1381,6 +1430,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1408,6 +1458,7 @@ mod tests {
                     last_modified_override: None,
                     max_ranges: None,
                     ims_mode: crate::config::IfModifiedSince::Exact,
+                    etag: true,
                 },
             );
             assert_ne!(decision, Decision::NotModified, "{since:?}");
@@ -1431,6 +1482,7 @@ mod tests {
                     last_modified_override: None,
                     max_ranges: None,
                     ims_mode: mode,
+                    etag: true,
                 },
             ) == Decision::NotModified
         };
@@ -1446,9 +1498,9 @@ mod tests {
     }
 
     #[test]
-    fn if_modified_since_uses_overridden_last_modified_value() {
-        // Filesystem mtime is much newer than the validator date; only the
-        // override should make this 304.
+    fn if_modified_since_ignores_add_header_last_modified() {
+        // nginx's not-modified filter runs before `add_header`: the file's
+        // own mtime counts, not the Last-Modified the location sets.
         let meta = meta(10, 9_999);
         let decision = decide(
             &meta,
@@ -1462,13 +1514,15 @@ mod tests {
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
-        assert_eq!(decision, Decision::NotModified);
+        assert_eq!(decision, Decision::Full);
     }
 
     #[test]
-    fn if_modified_since_is_ignored_when_last_modified_is_suppressed() {
+    fn if_modified_since_holds_when_last_modified_is_suppressed() {
+        // `add_header Last-Modified ""` hides it from the client only.
         let meta = meta(10, 999);
         let decision = decide(
             &meta,
@@ -1482,9 +1536,10 @@ mod tests {
                 last_modified_override: Some(b""),
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
-        assert_eq!(decision, Decision::Full);
+        assert_eq!(decision, Decision::NotModified);
     }
 
     #[test]
@@ -1502,6 +1557,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::PreconditionFailed);
@@ -1522,15 +1578,16 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::Full);
     }
 
     #[test]
-    fn if_unmodified_since_is_ignored_when_if_match_is_present() {
-        // If-Match is present and succeeds, so IUS must be ignored and
-        // downstream validators are still evaluated.
+    fn if_unmodified_since_applies_with_if_match() {
+        // nginx checks If-Unmodified-Since whether or not If-Match came
+        // (not RFC 9110's §13.2.2 order).
         let meta = meta(10, 120);
         let decision = decide(
             &meta,
@@ -1544,13 +1601,14 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
-        assert_eq!(decision, Decision::NotModified);
+        assert_eq!(decision, Decision::PreconditionFailed);
     }
 
     #[test]
-    fn if_unmodified_since_uses_overridden_last_modified_value() {
+    fn if_unmodified_since_ignores_add_header_last_modified() {
         let meta = meta(10, 9_999);
         let decision = decide(
             &meta,
@@ -1564,13 +1622,14 @@ mod tests {
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
-        assert_eq!(decision, Decision::Full);
+        assert_eq!(decision, Decision::PreconditionFailed);
     }
 
     #[test]
-    fn if_unmodified_since_is_ignored_when_last_modified_is_suppressed() {
+    fn if_unmodified_since_holds_when_last_modified_is_suppressed() {
         let meta = meta(10, 999);
         let decision = decide(
             &meta,
@@ -1584,9 +1643,10 @@ mod tests {
                 last_modified_override: Some(b""),
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
-        assert_eq!(decision, Decision::Full);
+        assert_eq!(decision, Decision::PreconditionFailed);
     }
 
     #[test]
@@ -1604,6 +1664,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1626,6 +1687,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1681,6 +1743,7 @@ mod tests {
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1705,6 +1768,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1725,6 +1789,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1745,6 +1810,7 @@ mod tests {
                 last_modified_override: None,
                 max_ranges: None,
                 ims_mode: crate::config::IfModifiedSince::Exact,
+                etag: true,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1793,6 +1859,7 @@ mod tests {
                     last_modified_override: None,
                     max_ranges: None,
                     ims_mode: crate::config::IfModifiedSince::Exact,
+                    etag: true,
                 },
             );
             assert_eq!(decision, Decision::NotModified, "INM={:?}", inm);
@@ -1804,8 +1871,8 @@ mod tests {
         let meta = meta(10, 100);
         let mut weak: Vec<u8> = b"W/".to_vec();
         weak.extend_from_slice(meta.etag.as_slice());
-        assert!(!etag_list_matches_strong(&weak, meta.etag.as_slice()));
-        assert!(etag_list_matches_strong(b"*", meta.etag.as_slice()));
+        assert!(!etag_list_matches_strong(&weak, Some(meta.etag.as_slice())));
+        assert!(etag_list_matches_strong(b"*", Some(meta.etag.as_slice())));
     }
 
     #[test]
@@ -1813,26 +1880,26 @@ mod tests {
         // A single tag whose opaque body contains a literal comma — the
         // list parser must not split on the inner comma.
         let current = br#""a,b""#;
-        assert!(etag_list_matches(br#""a,b""#, current));
-        assert!(etag_list_matches(br#"W/"a,b""#, current));
-        assert!(!etag_list_matches(br#""a", "b""#, current));
+        assert!(etag_list_matches(br#""a,b""#, Some(current)));
+        assert!(etag_list_matches(br#"W/"a,b""#, Some(current)));
+        assert!(!etag_list_matches(br#""a", "b""#, Some(current)));
     }
 
     #[test]
     fn etag_list_scans_multiple_entries() {
         let current = br#""abc""#;
-        assert!(etag_list_matches(br#""xyz", W/"abc""#, current));
-        assert!(etag_list_matches(br#"W/"abc", "xyz""#, current));
+        assert!(etag_list_matches(br#""xyz", W/"abc""#, Some(current)));
+        assert!(etag_list_matches(br#"W/"abc", "xyz""#, Some(current)));
         // Bare strong form in the list also matches (weak comparison).
-        assert!(etag_list_matches(br#""xyz", "abc""#, current));
-        assert!(!etag_list_matches(br#""xyz", "def""#, current));
+        assert!(etag_list_matches(br#""xyz", "abc""#, Some(current)));
+        assert!(!etag_list_matches(br#""xyz", "def""#, Some(current)));
     }
 
     #[test]
     fn etag_list_tolerates_garbage_entries() {
         // A malformed leading entry (no quotes) is skipped; later entries still evaluated.
         let current = br#"W/"abc""#;
-        assert!(etag_list_matches(br#"*, W/"abc""#, current));
+        assert!(etag_list_matches(br#"*, W/"abc""#, Some(current)));
     }
 
     #[test]

@@ -974,6 +974,7 @@ mod tests {
             autoindex_localtime: false,
             autoindex_format: AutoindexFormat::Html,
             if_modified_since: crate::config::IfModifiedSince::Exact,
+            etag: true,
             try_files: None,
         }
     }
