@@ -459,6 +459,12 @@ pub(crate) fn parse_server_block(
             ) => {
                 client_timeouts.parse(name, &args)?;
             }
+            // Ignored, but kept for nginx's check against
+            // `large_client_header_buffers`.
+            ("connection_pool_size", Terminator::Semi) => {
+                super::check_ignored_args(lx, &args)?;
+                client_timeouts.parse("connection_pool_size", &args)?;
+            }
             ("merge_slashes", Terminator::Semi) => {
                 let raw = args.get(1).ok_or(Error::MissingArg("merge_slashes"))?;
                 merge_slashes = match raw.as_str() {

@@ -1089,6 +1089,7 @@ fn build_intercept_reroute(
             enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
+            closes: crate::http::closes_connection(upstream_status),
         });
     }
     if rule.target[0] == b'@' {
@@ -1099,16 +1100,22 @@ fn build_intercept_reroute(
             enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
+            closes: crate::http::closes_connection(upstream_status),
         });
     }
     // An absolute URL: a redirect to it, 302 unless `=301` etc. says
     // otherwise (ngx_http_send_error_page), as for a local error_page.
-    Response::Owned(crate::http::build_redirect_response(
+    let redirect = crate::http::build_redirect_response(
         crate::worker::external_error_page_status(rule.action),
         &rule.target,
         method,
         server,
-    ))
+    );
+    Response::Owned(if crate::http::closes_connection(upstream_status) {
+        crate::http::with_connection_close(redirect)
+    } else {
+        redirect
+    })
 }
 
 fn parse_response_status(bytes: &[u8]) -> Option<u16> {
@@ -2202,6 +2209,31 @@ async fn attempt(
         None => plan.limit_rate,
     };
     let mut paced_body_bytes: u64 = body_len_in_accum as u64;
+    // The client asked with HEAD and the upstream got another method
+    // (`proxy_method`): the header goes alone and the body isn't read, as
+    // nginx's header_only request finalizes the upstream after the header,
+    // so the connection isn't reused. A HEAD the cache sent as a GET reads
+    // it, for the cache (`strip_body`).
+    if body_has_content
+        && matches!(plan.method, Method::Head)
+        && !plan.cache.as_ref().is_some_and(|c| c.head_as_get)
+    {
+        state.response_length = body_len_in_accum as u64;
+        let head = client_head(
+            plan,
+            &accum[..head_end],
+            first_line_end,
+            None,
+            body_has_content,
+            skip_body,
+            false,
+            upstream_headers,
+            redirect_header,
+            range_allow,
+        );
+        return_proxy_buf(accum);
+        return AttemptOutcome::Ok(Response::Owned(head));
+    }
     // A body that hasn't all arrived goes to the client as it comes (#88),
     // unless something needs it whole: a status that may fail over or be
     // intercepted (decided after the body today), or the plan says so.

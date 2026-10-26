@@ -1508,6 +1508,7 @@ pub(crate) fn run_location_handler(
                         enters_error_page: false,
                         preserved_location: None,
                         preserved_www_authenticate: Vec::new(),
+                        closes: false,
                     });
                 }
                 fs_resolve::Outcome::NotFound => {

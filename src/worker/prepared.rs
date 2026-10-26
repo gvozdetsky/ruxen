@@ -2189,6 +2189,8 @@ pub struct PreparedHttp {
     /// PreparedServer) avoids one copy per server block.
     pub not_found: Prebuilt,
     pub bad_request: Prebuilt,
+    /// A request line with an HTTP major version past 1: 505.
+    pub version_not_supported: Prebuilt,
     /// nginx's 497 page: plain HTTP on an `ssl` port, sent as 400 (#384).
     pub plain_http: Prebuilt,
     /// A request line longer than `large_client_header_buffers` allows: 414

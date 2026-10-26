@@ -1019,9 +1019,14 @@ fn map_wildcard(map: &PreparedMap, host: &[u8]) -> Option<&'static [PreparedValu
         .map(|(_, value)| *value)
 }
 
-/// `HTTP/1.x` at the end of a request line; empty if there is none.
+/// `HTTP/1.x` at the end of a request line, with the spaces after it as
+/// nginx keeps them; empty if there is none.
 fn server_protocol(request_line: &[u8]) -> &[u8] {
-    match request_line.iter().rposition(|&b| b == b' ') {
+    let end = request_line
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map_or(0, |i| i + 1);
+    match request_line[..end].iter().rposition(|&b| b == b' ') {
         Some(i) if request_line[i + 1..].starts_with(b"HTTP/") => &request_line[i + 1..],
         _ => b"",
     }

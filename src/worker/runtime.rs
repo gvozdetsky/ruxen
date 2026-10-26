@@ -769,10 +769,16 @@ fn refused_head_log(
     );
 }
 
-/// Why the parser refused `head` (`http::refusal_reason`), logged.
+/// Why the parser refused `head` (`http::refusal_reason`), logged. True
+/// for an HTTP version past 1, which nginx answers with 505.
 #[cold]
 #[inline(never)]
-fn invalid_head_log(http: &'static PreparedHttp, conn: &ConnLogCtx<'_>, head: &[u8], h2: bool) {
+fn invalid_head_log(
+    http: &'static PreparedHttp,
+    conn: &ConnLogCtx<'_>,
+    head: &[u8],
+    h2: bool,
+) -> bool {
     let refusal = http::refusal_reason(head, h2);
     refused_head_log(
         http,
@@ -781,6 +787,7 @@ fn invalid_head_log(http: &'static PreparedHttp, conn: &ConnLogCtx<'_>, head: &[
         refusal.host,
         &refusal.message,
     );
+    refusal.version_not_supported
 }
 
 /// A parsed head refused for its `Host` or `Transfer-Encoding`, logged.
@@ -1671,6 +1678,7 @@ fn accel_redirect_reroute(target: Vec<u8>) -> phase::Reroute {
         enters_error_page: false,
         preserved_location: None,
         preserved_www_authenticate: Vec::new(),
+        closes: false,
     }
 }
 
@@ -1814,6 +1822,7 @@ async fn run_post_action(
                 enters_error_page: false,
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
+                closes: false,
             },
         )
     };
@@ -2471,6 +2480,7 @@ async fn run_auth_subrequest(
                 enters_error_page: false,
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
+                closes: false,
             }
         });
     // `auth_request_set` reads the upstream's header (`$upstream_http_*`):
@@ -3868,6 +3878,41 @@ where
     ))
 }
 
+/// The `100 Continue` of a request whose body nobody reads, before its
+/// response, where nginx's discard sends it: not before an error the
+/// special response handler answers, as that sets `expect_tested` first
+/// (`phase::discard_continue`). `false`: the write failed.
+#[cold]
+#[inline(never)]
+async fn continue_first<S: ConnIo>(
+    stream: &mut S,
+    response: &Response,
+    continue_status: Option<u16>,
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> bool {
+    let head: &[u8] = match response {
+        Response::Prebuilt(bytes) => bytes,
+        Response::Owned(bytes) => bytes,
+        Response::File { headers, .. } => headers,
+        _ => return true,
+    };
+    let status = response_status(head);
+    let continues = match continue_status {
+        Some(returned) => status == returned,
+        None => matches!(status, 200..=299 | 304 | 412 | 416),
+    };
+    if !continues {
+        return true;
+    }
+    let resp = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+    let len = resp.len();
+    write_all_timed(stream, resp, len, timer, send_timeout)
+        .await
+        .0
+        .is_ok()
+}
+
 /// The rest of a body nobody reads, after the response went out (#627):
 /// `true` when it was read and dropped and the connection may serve the
 /// next request. An HTTP/2 stream ends instead (the `h2` crate then resets
@@ -4440,6 +4485,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut body_temp = &http.body_temp;
                         // Nothing will read the body: drop it as it comes.
                         let mut discard_body = false;
+                        // With it, the response a 100 goes out before.
+                        let mut continue_status = None;
                         // The routed location's client_body_timeout (#147).
                         let mut body_timeout = timeouts.body;
                         // A body is framed, even an empty one (`Content-Length:
@@ -4457,11 +4504,15 @@ pub(crate) async fn handle<S: ConnIo>(
                                 0,
                                 0
                             );
-                            if let Some(first) =
-                                phase::first_body_limit(http, &probe, &mut *url_scratch)
-                            {
+                            if let Some(first) = phase::first_body_limit(
+                                http,
+                                &probe,
+                                &mut *url_scratch,
+                                parse_state.has_expect,
+                            ) {
                                 persistent_body = first.persistent;
                                 discard_body = first.discard;
+                                continue_status = first.continue_status;
                                 body_timeout = first.body_timeout;
                                 body_buffer = first.buffer;
                                 body_temp = first.body_temp.unwrap_or(body_temp);
@@ -4499,16 +4550,20 @@ pub(crate) async fn handle<S: ConnIo>(
                         // Content-Length below: nginx sets expect_tested
                         // before discarding it, so no 100 goes out.
                         let refused_unread = req.content_length.is_some_and(|cl| cl > max_body);
-                        if req.http_11
+                        let expect_continue = req.http_11
                             && refuse.is_none()
                             && !refused_unread
                             && parse_state.has_expect
-                            && let Some(expect) = lookup_request_header(
+                            && lookup_request_header(
                                 &buf[base + req.headers_start..base + req.headers_end],
                                 b"expect",
                             )
-                            && expect.eq_ignore_ascii_case(b"100-continue")
-                        {
+                            .is_some_and(|e| e.eq_ignore_ascii_case(b"100-continue"));
+                        // A body nobody reads gets its 100 with the response
+                        // (#627), and none before an error nginx's special
+                        // response handler answers: a client doesn't upload
+                        // a body to a 401 (`continue_first`).
+                        if expect_continue && !discard_body {
                             // nginx sends it in one send() and gives up
                             // the connection if it doesn't all go out;
                             // here send_timeout bounds the wait.
@@ -4789,6 +4844,19 @@ pub(crate) async fn handle<S: ConnIo>(
                         // the next request's header waits use the default
                         // server's values again, as in nginx.
                         let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
+                        if expect_continue
+                            && discard_body
+                            && !Box::pin(continue_first(
+                                stream,
+                                &response,
+                                continue_status,
+                                timers.io.as_mut(),
+                                send_timeout,
+                            ))
+                            .await
+                        {
+                            return;
+                        }
                         // And on an HTTP/2 stream, its http2_chunk_size (#594).
                         if let Some(t) = process_meta.timeouts {
                             stream.set_h2_chunk(t.h2_chunk);
@@ -5455,24 +5523,39 @@ pub(crate) async fn handle<S: ConnIo>(
                     Parse::Incomplete => break,
                     Parse::Invalid => {
                         request_count = request_count.saturating_add(1);
-                        invalid_head_log(http, conn_log!(), &buf[read_start..filled], stream.h2());
+                        let bad_version = invalid_head_log(
+                            http,
+                            conn_log!(),
+                            &buf[read_start..filled],
+                            stream.h2(),
+                        );
                         // Honor HEAD if the request line parsed before the
-                        // header block went sideways; otherwise default to
-                        // full — we don't know the method and a body on a
-                        // 400 is fine for non-HEAD clients.
+                        // header block went sideways (or did but for its
+                        // version); otherwise default to full — we don't
+                        // know the method and a body on a 400 is fine for
+                        // non-HEAD clients.
                         let method = if parse_state.rline_done {
                             http::classify_method(
                                 &buf[read_start + parse_state.method_start
                                     ..read_start + parse_state.method_end],
                             )
+                        } else if bad_version {
+                            let line = &buf[read_start..filled];
+                            let end = line.iter().position(|&b| b == b' ').unwrap_or(0);
+                            http::classify_method(&line[..end])
                         } else {
                             Method::Other
+                        };
+                        let page = if bad_version {
+                            &http.version_not_supported
+                        } else {
+                            &http.bad_request
                         };
                         reject_request(
                             stream,
                             &mut *scratch,
                             http,
-                            http.bad_request.pick(method),
+                            page.pick(method),
                             &buf[read_start..filled],
                             conn_log!(),
                         )

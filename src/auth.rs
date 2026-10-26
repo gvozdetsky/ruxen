@@ -23,19 +23,18 @@ pub fn decode_basic_authorization(
 ) -> Result<BasicCredentials, BasicHeaderError> {
     let raw =
         lookup_request_header(headers_raw, b"authorization").ok_or(BasicHeaderError::Missing)?;
-    let mut value = trim_ows(raw);
-    if value.len() < 6 || !value[..5].eq_ignore_ascii_case(b"basic") {
+    // ngx_http_auth_basic_user: `Basic ` and spaces, then base64 up to
+    // its first `=` (`decode_base64`), and a user name before a colon.
+    let value = trim_ows(raw);
+    if value.len() < 6 || !value[..6].eq_ignore_ascii_case(b"basic ") {
         return Err(BasicHeaderError::Malformed);
     }
-    value = trim_ows(&value[5..]);
-    if value.is_empty() {
-        return Err(BasicHeaderError::Malformed);
-    }
-    if value.iter().any(|b| matches!(*b, b' ' | b'\t')) {
-        return Err(BasicHeaderError::Malformed);
-    }
-    let decoded = decode_base64(value).ok_or(BasicHeaderError::Malformed)?;
-    let Some(colon) = decoded.iter().position(|&b| b == b':') else {
+    let start = value[6..]
+        .iter()
+        .position(|&b| b != b' ')
+        .ok_or(BasicHeaderError::Malformed)?;
+    let decoded = decode_base64(&value[6 + start..]).ok_or(BasicHeaderError::Malformed)?;
+    let Some(colon) = decoded.iter().position(|&b| b == b':').filter(|&c| c > 0) else {
         return Err(BasicHeaderError::Malformed);
     };
     Ok(BasicCredentials {
@@ -350,38 +349,29 @@ fn trim_ows(mut v: &[u8]) -> &[u8] {
     v
 }
 
+/// nginx's ngx_decode_base64: the input ends at the first `=`, whatever
+/// follows, and a last group of 2 or 3 characters gives 1 or 2 bytes, its
+/// spare bits ignored; only a stray character or a group of 1 is refused.
+/// So `dTpw=` and `dTpw==` decode as `dTpw` does, as nginx takes them.
 fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
-    if input.is_empty() || !input.len().is_multiple_of(4) {
+    let len = input.iter().position(|&b| b == b'=').unwrap_or(input.len());
+    let input = &input[..len];
+    if input.is_empty() || len % 4 == 1 {
         return None;
     }
-    let mut out = Vec::with_capacity(input.len() / 4 * 3);
-    let mut i = 0usize;
-    while i < input.len() {
-        let a = input[i];
-        let b = input[i + 1];
-        let c = input[i + 2];
-        let d = input[i + 3];
-        let va = b64_value(a)?;
-        let vb = b64_value(b)?;
-        if c == b'=' {
-            if d != b'=' || i + 4 != input.len() {
-                return None;
-            }
-            out.push((va << 2) | (vb >> 4));
-            return Some(out);
+    let mut out = Vec::with_capacity(len / 4 * 3 + 2);
+    for group in input.chunks(4) {
+        let mut v = [0u8; 4];
+        for (slot, &c) in v.iter_mut().zip(group) {
+            *slot = b64_value(c)?;
         }
-        let vc = b64_value(c)?;
-        out.push((va << 2) | (vb >> 4));
-        out.push(((vb & 0x0f) << 4) | (vc >> 2));
-        if d == b'=' {
-            if i + 4 != input.len() {
-                return None;
-            }
-            return Some(out);
+        out.push((v[0] << 2) | (v[1] >> 4));
+        if group.len() > 2 {
+            out.push((v[1] << 4) | (v[2] >> 2));
         }
-        let vd = b64_value(d)?;
-        out.push(((vc & 0x03) << 6) | vd);
-        i += 4;
+        if group.len() > 3 {
+            out.push((v[2] << 6) | v[3]);
+        }
     }
     Some(out)
 }
@@ -535,6 +525,36 @@ mod tests {
         let creds = decode_basic_authorization(headers).expect("must decode");
         assert_eq!(creds.username, b"test");
         assert_eq!(creds.password, b"secret");
+    }
+
+    /// As nginx's ngx_decode_base64: the input ends at the first `=`, and
+    /// a short last group decodes; a group of 1 or a stray character
+    /// doesn't, nor an empty user name.
+    #[test]
+    fn decode_basic_authorization_decodes_as_nginx() {
+        for (value, want) in [
+            ("Basic dTpw", Some(("u", "p"))),
+            ("Basic dTpw=", Some(("u", "p"))),
+            ("Basic dTpw==", Some(("u", "p"))),
+            ("Basic dTpw=garbage!", Some(("u", "p"))),
+            ("basic    dTpwcQ", Some(("u", "pq"))),
+            ("Basic dTpwcXI", Some(("u", "pqr"))),
+            ("Basic dTpwc", None),
+            ("Basic dT pw", None),
+            ("Basic\tdTpw", None),
+            ("Basic OnA=", None),
+            ("Basic ", None),
+        ] {
+            let headers = format!("authorization: {value}\r\n");
+            let got = decode_basic_authorization(headers.as_bytes()).ok();
+            let got = got.as_ref().map(|c| {
+                (
+                    std::str::from_utf8(&c.username).unwrap(),
+                    std::str::from_utf8(&c.password).unwrap(),
+                )
+            });
+            assert_eq!(got, want, "{value:?}");
+        }
     }
 
     #[test]
