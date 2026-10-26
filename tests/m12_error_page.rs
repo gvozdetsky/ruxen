@@ -464,3 +464,78 @@ fn m12_error_page_file_is_sent_whole() {
     assert!(header_value(&r, "Last-Modified").is_some());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A request followed by a pipelined `GET /ok` on one connection: the
+/// status lines that came back before the connection closed or went idle.
+fn statuses_then_next(port: u16, path: &str) -> Vec<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\nGET /ok HTTP/1.1\r\nHost: x\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = s.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out)
+        .replace("HTTP/1.1 ", "\r\nHTTP/1.1 ")
+        .split("\r\n")
+        .filter(|l| l.starts_with("HTTP/1.1 ") || l.starts_with("Connection: "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// nginx's special response handler ends the connection after its own
+/// 400, 413, 414, 495–497, 500 and 501, an `error_page` answering one
+/// included; `return 494`…`497` goes out as nginx's 400 page unless an
+/// `error_page` takes the code. A `return` with a text is sent as is.
+#[test]
+fn m12_special_responses_end_the_connection() {
+    let (_g, port) = spawn_server(
+        r#"
+http {
+    server {
+        listen %%PORT%%;
+        location = /ok { return 200 "ok"; }
+        location /r500 { return 500; }
+        location /r501 { return 501; }
+        location /r503 { return 503; }
+        location /t500 { return 500 "text"; }
+        location /r497 { return 497; }
+        location /ep500 { error_page 500 =200 /ok; return 500; }
+        location /ep497 { error_page 497 =200 /ok; return 497; }
+    }
+}
+"#,
+    );
+    let close = |status: &str| vec![status.to_string(), "Connection: close".to_string()];
+    let keep = |status: &str| {
+        vec![
+            status.to_string(),
+            "Connection: keep-alive".to_string(),
+            "HTTP/1.1 200 OK".to_string(),
+            "Connection: keep-alive".to_string(),
+        ]
+    };
+    for (path, want) in [
+        ("/r500", close("HTTP/1.1 500 Internal Server Error")),
+        ("/r501", close("HTTP/1.1 501 Not Implemented")),
+        ("/r497", close("HTTP/1.1 400 Bad Request")),
+        ("/ep500", close("HTTP/1.1 200 OK")),
+        ("/ep497", close("HTTP/1.1 200 OK")),
+        (
+            "/r503",
+            keep("HTTP/1.1 503 Service Temporarily Unavailable"),
+        ),
+        ("/t500", keep("HTTP/1.1 500 Internal Server Error")),
+    ] {
+        assert_eq!(statuses_then_next(port, path), want, "{path}");
+    }
+}

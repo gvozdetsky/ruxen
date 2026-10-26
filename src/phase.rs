@@ -608,6 +608,9 @@ pub struct Reroute {
     /// (a list — `ticket #485`) so multi-value challenges survive. Re-
     /// injected at finalize time when the preserved status is 401.
     pub preserved_www_authenticate: Vec<Vec<u8>>,
+    /// The error page answers a status after which nginx's special
+    /// response handler ends the connection (`http::closes_connection`).
+    pub closes: bool,
 }
 
 /// Test-only helper: run the pipeline and return only the response,
@@ -803,6 +806,8 @@ fn process_with_meta_inner(
     // error_page sent it to a URI, the realip address.
     let mut req_now: Option<RequestCtx<'_>> = None;
     let req_in = req;
+    // An error page for a status that ends the connection (`Reroute::closes`).
+    let mut closes = false;
     match initial_reroute {
         None => {
             // Normalize the URI once at FindConfig entry; Rewrite / internal
@@ -823,6 +828,7 @@ fn process_with_meta_inner(
             }
         }
         Some(reroute) => {
+            closes = reroute.closes;
             if turns_into_get(req, &reroute) {
                 req_now = Some(error_page_request(req));
             }
@@ -888,6 +894,7 @@ fn process_with_meta_inner(
         server_name: server.primary_server_name,
         ..ProcessMeta::default()
     };
+    meta.keepalive.allow = !closes;
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
@@ -1294,6 +1301,9 @@ fn process_with_meta_inner(
                 }
                 if next.enters_error_page {
                     in_error_page = true;
+                }
+                if next.closes {
+                    meta.keepalive.allow = false;
                 }
                 if let Some(loc_header) = next.preserved_location {
                     preserved_location = Some(loc_header);
@@ -2240,7 +2250,9 @@ fn apply_location_meta(
 ) {
     rewrite_state.doc_root = Some(loc.doc_root);
     meta.keepalive = KeepaliveMeta {
-        allow: loc.keepalive.allow,
+        // Once off, it stays off across internal redirects: nginx's
+        // ngx_http_update_location_config only ever clears r->keepalive.
+        allow: meta.keepalive.allow && loc.keepalive.allow,
         idle_timeout_ms: loc.keepalive.idle_timeout_ms,
         header_timeout_secs: loc.keepalive.header_timeout_secs,
         max_requests: loc.keepalive.max_requests,
