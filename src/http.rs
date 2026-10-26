@@ -209,7 +209,7 @@ pub fn parse_request(buf: &[u8], st: &mut ParseState) -> Parse {
                 }
             }
             LineParse::Incomplete => return Parse::Incomplete,
-            LineParse::Invalid => return Parse::Invalid,
+            LineParse::Invalid | LineParse::BadVersion => return Parse::Invalid,
         }
     }
 
@@ -520,6 +520,8 @@ pub fn parse_request(buf: &[u8], st: &mut ParseState) -> Parse {
 /// bytes, off the hot path: `Parse::Invalid` carries nothing.
 pub struct Refusal<'a> {
     pub message: String,
+    /// The request line's version is past HTTP/1: 505, not 400.
+    pub version_not_supported: bool,
     pub request_line: &'a [u8],
     pub host: Option<&'a [u8]>,
 }
@@ -534,10 +536,21 @@ pub fn refusal_reason(buf: &[u8], h2: bool) -> Refusal<'_> {
     let request_line = &buf[..line_end];
     let refusal = |message: String, host| Refusal {
         message,
+        version_not_supported: false,
         request_line,
         host,
     };
-    let LineParse::Ok { next, .. } = parse_request_line(buf, 0, h2) else {
+    let parsed = parse_request_line(buf, 0, h2);
+    if let LineParse::BadVersion = parsed {
+        return Refusal {
+            version_not_supported: true,
+            ..refusal(
+                "client sent invalid version while reading client request line".into(),
+                None,
+            )
+        };
+    }
+    let LineParse::Ok { next, .. } = parsed else {
         // ngx_http_client_errors: a method outside nginx's rule (`A`-`Z`,
         // `_`, `-`), else the rest of the line.
         let method = request_line
@@ -783,6 +796,8 @@ enum LineParse {
     },
     Incomplete,
     Invalid,
+    /// An HTTP major version past 1: nginx's 505.
+    BadVersion,
 }
 
 // Inlined into `parse_request`, its hot caller: `refusal_reason` (#663)
@@ -812,6 +827,10 @@ fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
     let method_end = i;
     let method = classify_method(&buf[method_start..method_end]);
     i += 1;
+    // `sw_spaces_before_uri`: any number of spaces.
+    while i < n && buf[i] == b' ' {
+        i += 1;
+    }
 
     let ParsedTarget {
         version_start,
@@ -852,36 +871,26 @@ fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
             }
         },
     };
-    i = version_start;
-
-    if i + 8 > n {
-        return LineParse::Incomplete;
-    }
-    let v = &buf[i..i + 8];
-    if &v[..7] != b"HTTP/1." || (v[7] != b'0' && v[7] != b'1') {
-        // An HTTP/2 stream's request: HTTP/1.1 semantics otherwise.
-        if !(h2 && v == b"HTTP/2.0") {
-            return LineParse::Invalid;
+    // The usual `HTTP/1.1\r\n` (or an HTTP/2 stream's `HTTP/2.0`) here,
+    // anything else the way nginx parses it.
+    let i = version_start;
+    let (http_11, next) = match buf.get(i..i + 10) {
+        Some(v)
+            if (&v[..7] == b"HTTP/1." && (v[7] == b'1' || v[7] == b'0')
+                || h2 && &v[..8] == b"HTTP/2.0")
+                && &v[8..] == b"\r\n" =>
+        {
+            (v[7] != b'0' || v[5] == b'2', i + 10)
         }
-    }
-    let http_11 = v[7] == b'1' || v[5] == b'2';
-    i += 8;
-
-    if i >= n {
-        return LineParse::Incomplete;
-    }
-    let next = if buf[i] == b'\n' {
-        i + 1
-    } else if buf[i] == b'\r' {
-        if i + 1 >= n {
-            return LineParse::Incomplete;
-        }
-        if buf[i + 1] != b'\n' {
-            return LineParse::Invalid;
-        }
-        i + 2
-    } else {
-        return LineParse::Invalid;
+        _ => match request_line_tail(buf, i, h2) {
+            LineParse::Ok { next, http_11, .. } => (http_11, next),
+            // nginx refuses an origin-form target that doesn't start with
+            // `/` (`PRI *`, `OPTIONS *`) before it reads the version.
+            LineParse::BadVersion if request_line_host.is_none() && buf[path_start] != b'/' => {
+                return LineParse::Invalid;
+            }
+            other => return other,
+        },
     };
 
     LineParse::Ok {
@@ -894,6 +903,85 @@ fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
         request_line_host,
         absolute_query,
         http_11,
+    }
+}
+
+/// The request line after the request target's space, as
+/// ngx_http_parse_request_line takes it (`sw_http_09` on): spaces,
+/// `HTTP/`, a major version of 1 (2 and up are 505), a minor of up to
+/// three digits, spaces, then CRLF or LF. Only `next` and `http_11` of an
+/// `Ok` are set. An HTTP/2 stream's line always takes the fast path.
+#[cold]
+#[inline(never)]
+fn request_line_tail(buf: &[u8], mut i: usize, h2: bool) -> LineParse {
+    let n = buf.len();
+    while i < n && buf[i] == b' ' {
+        i += 1;
+    }
+    for &c in b"HTTP/" {
+        match buf.get(i) {
+            None => return LineParse::Incomplete,
+            Some(&b) if b != c => return LineParse::Invalid,
+            Some(_) => i += 1,
+        }
+    }
+    if h2 {
+        return LineParse::Invalid;
+    }
+    // `sw_first_major_digit`, `sw_major_digit`.
+    let mut major = 0u32;
+    loop {
+        let Some(&c) = buf.get(i) else {
+            return LineParse::Incomplete;
+        };
+        i += 1;
+        if c == b'.' && major > 0 {
+            break;
+        }
+        if !c.is_ascii_digit() || (major == 0 && c == b'0') {
+            return LineParse::Invalid;
+        }
+        major = major * 10 + u32::from(c - b'0');
+        if major > 1 {
+            return LineParse::BadVersion;
+        }
+    }
+    // `sw_first_minor_digit`, `sw_minor_digit`.
+    let mut minor: Option<u32> = None;
+    let mut spaces = false;
+    loop {
+        let Some(&c) = buf.get(i) else {
+            return LineParse::Incomplete;
+        };
+        i += 1;
+        match c {
+            b'\n' if minor.is_some() => break,
+            b'\r' if minor.is_some() => match buf.get(i) {
+                None => return LineParse::Incomplete,
+                Some(b'\n') => {
+                    i += 1;
+                    break;
+                }
+                Some(_) => return LineParse::Invalid,
+            },
+            b' ' if minor.is_some() => spaces = true,
+            b'0'..=b'9' if !spaces => match minor {
+                Some(m) if m > 99 => return LineParse::Invalid,
+                m => minor = Some(m.unwrap_or(0) * 10 + u32::from(c - b'0')),
+            },
+            _ => return LineParse::Invalid,
+        }
+    }
+    LineParse::Ok {
+        next: i,
+        method_start: 0,
+        method_end: 0,
+        path_start: 0,
+        path_end: 0,
+        implicit_path: false,
+        request_line_host: None,
+        absolute_query: None,
+        http_11: minor > Some(0),
     }
 }
 
@@ -2193,6 +2281,11 @@ mod tests {
                 None,
             ),
             (
+                b"GET / HTTP/2.0\r\nHost: x\r\n\r\n",
+                format!("client sent invalid version{LINE}"),
+                None,
+            ),
+            (
                 b"GET / HTTP/1.1\r\nHost: x\r\nBad\x01Header: v\r\n\r\n",
                 format!("client sent invalid header line: \"Bad\\x01...\"{HEADERS}"),
                 Some(b"x"),
@@ -2232,8 +2325,70 @@ mod tests {
             let refusal = refusal_reason(raw, false);
             assert_eq!(&refusal.message, message, "{raw:?}");
             assert_eq!(refusal.host, *host, "{raw:?}");
+            assert_eq!(
+                refusal.version_not_supported,
+                message.contains("version"),
+                "{raw:?}"
+            );
             let line_end = raw.iter().position(|&b| b == b'\r').unwrap();
             assert_eq!(refusal.request_line, &raw[..line_end]);
+        }
+    }
+
+    /// The request line's spaces and version as ngx_http_parse_request_line
+    /// takes them; every shorter prefix of an accepted one is incomplete.
+    #[test]
+    fn request_line_spaces_and_versions_as_nginx() {
+        let accepted: &[(&[u8], bool)] = &[
+            (b"GET  /a  HTTP/1.1\r\n", true),
+            (b"GET /a HTTP/1.2\r\n", true),
+            (b"GET /a HTTP/1.10  \r\n", true),
+            (b"GET /a HTTP/1.999\n", true),
+            (b"GET /a HTTP/1.00\r\n", false),
+            (b"GET /a HTTP/1.0 \n", false),
+            (b"GET  http://h/x  HTTP/1.1\r\n", true),
+            (b"CONNECT h:443  HTTP/1.1\r\n", true),
+        ];
+        for &(line, http_11) in accepted {
+            let mut raw = line.to_vec();
+            raw.extend_from_slice(b"Host: h\r\n\r\n");
+            match parse_fresh(&raw) {
+                Parse::Complete(req) => {
+                    assert_eq!(req.http_11, http_11, "{raw:?}");
+                    assert_eq!(req.consumed, raw.len(), "{raw:?}");
+                }
+                other => panic!("{raw:?}: {other:?}"),
+            }
+            for end in 0..line.len() {
+                assert!(
+                    matches!(parse_fresh(&line[..end]), Parse::Incomplete),
+                    "{:?}",
+                    &line[..end]
+                );
+            }
+        }
+        let refused: &[(&[u8], bool)] = &[
+            (b"GET /a HTTP/2.0\r\n", true),
+            (b"GET /a HTTP/10.0\r\n", true),
+            (b"GET /a HTTP/1.1000\r\n", false),
+            (b"PRI * HTTP/2.0\r\n", false),
+            (b"GET a HTTP/2.0\r\n", false),
+            (b"GET http://h HTTP/2.0\r\n", true),
+            (b"GET /a HTTP/0.9\r\n", false),
+            (b"GET /a HTTP/01.1\r\n", false),
+            (b"GET /a HTTP/1.\r\n", false),
+            (b"GET /a HTTP/1 .1\r\n", false),
+            (b"GET /a HTTP/1.1 x\r\n", false),
+            (b"GET /a HTTP/1.1\r\r\n", false),
+            (b"GET /a http/1.1\r\n", false),
+        ];
+        for &(line, bad_version) in refused {
+            assert!(matches!(parse_fresh(line), Parse::Invalid), "{line:?}");
+            assert_eq!(
+                refusal_reason(line, false).version_not_supported,
+                bad_version,
+                "{line:?}"
+            );
         }
     }
 

@@ -755,10 +755,16 @@ fn refused_head_log(
     );
 }
 
-/// Why the parser refused `head` (`http::refusal_reason`), logged.
+/// Why the parser refused `head` (`http::refusal_reason`), logged. True
+/// for an HTTP version past 1, which nginx answers with 505.
 #[cold]
 #[inline(never)]
-fn invalid_head_log(http: &'static PreparedHttp, conn: &ConnLogCtx<'_>, head: &[u8], h2: bool) {
+fn invalid_head_log(
+    http: &'static PreparedHttp,
+    conn: &ConnLogCtx<'_>,
+    head: &[u8],
+    h2: bool,
+) -> bool {
     let refusal = http::refusal_reason(head, h2);
     refused_head_log(
         http,
@@ -767,6 +773,7 @@ fn invalid_head_log(http: &'static PreparedHttp, conn: &ConnLogCtx<'_>, head: &[
         refusal.host,
         &refusal.message,
     );
+    refusal.version_not_supported
 }
 
 /// A parsed head refused for its `Host` or `Transfer-Encoding`, logged.
@@ -5424,24 +5431,39 @@ pub(crate) async fn handle<S: ConnIo>(
                     Parse::Incomplete => break,
                     Parse::Invalid => {
                         request_count = request_count.saturating_add(1);
-                        invalid_head_log(http, conn_log!(), &buf[read_start..filled], stream.h2());
+                        let bad_version = invalid_head_log(
+                            http,
+                            conn_log!(),
+                            &buf[read_start..filled],
+                            stream.h2(),
+                        );
                         // Honor HEAD if the request line parsed before the
-                        // header block went sideways; otherwise default to
-                        // full — we don't know the method and a body on a
-                        // 400 is fine for non-HEAD clients.
+                        // header block went sideways (or did but for its
+                        // version); otherwise default to full — we don't
+                        // know the method and a body on a 400 is fine for
+                        // non-HEAD clients.
                         let method = if parse_state.rline_done {
                             http::classify_method(
                                 &buf[read_start + parse_state.method_start
                                     ..read_start + parse_state.method_end],
                             )
+                        } else if bad_version {
+                            let line = &buf[read_start..filled];
+                            let end = line.iter().position(|&b| b == b' ').unwrap_or(0);
+                            http::classify_method(&line[..end])
                         } else {
                             Method::Other
+                        };
+                        let page = if bad_version {
+                            &http.version_not_supported
+                        } else {
+                            &http.bad_request
                         };
                         reject_request(
                             stream,
                             &mut *scratch,
                             http,
-                            http.bad_request.pick(method),
+                            page.pick(method),
                             &buf[read_start..filled],
                             conn_log!(),
                         )
