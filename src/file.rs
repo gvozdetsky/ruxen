@@ -129,10 +129,7 @@ pub fn serve_path(
         return Response::Owned(method_not_allowed(method, server));
     }
 
-    let mut meta = meta_from_opened(&opened);
-    if !cond.etag {
-        meta.etag.len = 0;
-    }
+    let meta = meta_from_opened(&opened, cond.etag);
 
     let accept_ranges = cond.max_ranges != Some(0);
     let head_only = matches!(method, Method::Head);
@@ -212,13 +209,21 @@ pub fn method_not_allowed(method: Method, server: &[u8]) -> Vec<u8> {
     error_response(405, "Method Not Allowed\n", method, server)
 }
 
-fn meta_from_opened(o: &Opened) -> FileMeta {
+/// `etag`: the location's `etag`; off, the file has none.
+fn meta_from_opened(o: &Opened, etag: bool) -> FileMeta {
     FileMeta {
         size: o.size,
         mime: o.mime,
         mtime: o.mtime,
         last_modified: format_http_date(o.mtime),
-        etag: make_etag(o.mtime, o.size),
+        etag: if etag {
+            make_etag(o.mtime, o.size)
+        } else {
+            Etag {
+                buf: [0; Etag::MAX_LEN],
+                len: 0,
+            }
+        },
     }
 }
 
@@ -229,6 +234,15 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
     // not in RFC 9110's §13.2.2 order: If-Unmodified-Since and If-Match
     // both apply, and If-Modified-Since and If-None-Match must both say
     // unmodified for a 304.
+    // Most requests: nothing conditional and no range.
+    if cond.if_unmodified_since.is_none()
+        && cond.if_match.is_none()
+        && cond.if_modified_since.is_none()
+        && cond.if_none_match.is_none()
+        && cond.range.is_none()
+    {
+        return Decision::Full;
+    }
     let etag = meta.etag();
     // The file's own: the filter runs before `add_header` could change it.
     let conditional_last_modified = Some(meta.mtime);
@@ -275,10 +289,13 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
 
     // The range filter comes after `add_header`: an If-Range date is
     // compared with the Last-Modified it set (range_if_range.t).
-    let range_last_modified = resolve_conditional_last_modified(meta, cond.last_modified_override);
     let mut range = cond.range.filter(|_| cond.max_ranges != Some(0));
     if let (Some(_), Some(if_range)) = (range, cond.if_range)
-        && !if_range_matches(if_range, meta, range_last_modified)
+        && !if_range_matches(
+            if_range,
+            meta,
+            resolve_conditional_last_modified(meta, cond.last_modified_override),
+        )
     {
         range = None;
     }
