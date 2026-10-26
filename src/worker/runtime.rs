@@ -4466,9 +4466,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                 0,
                                 0
                             );
-                            if let Some(first) =
-                                phase::first_body_limit(http, &probe, &mut *url_scratch)
-                            {
+                            if let Some(first) = phase::first_body_limit(
+                                http,
+                                &probe,
+                                &mut *url_scratch,
+                                parse_state.has_expect,
+                            ) {
                                 persistent_body = first.persistent;
                                 discard_body = first.discard;
                                 continue_status = first.continue_status;

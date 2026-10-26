@@ -1966,7 +1966,7 @@ pub(crate) struct FirstBodyLimit {
     /// ngx_http_discard_request_body does, instead of being kept.
     pub discard: bool,
     /// With `discard`, which response a `100 Continue` goes out before
-    /// (`discard_continue`).
+    /// (`discard_continue`); only looked at, and set, with an `Expect`.
     pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
@@ -1985,6 +1985,8 @@ pub(crate) fn first_body_limit(
     http: &'static PreparedHttp,
     req: &RequestCtx<'_>,
     url_scratch: &mut Vec<u8>,
+    // An `Expect` header came: `continue_status` is wanted.
+    expect: bool,
 ) -> Option<FirstBodyLimit> {
     let listen = select_listen(http, req.listen_index)?;
     if req.refuse.is_some()
@@ -2040,7 +2042,7 @@ pub(crate) fn first_body_limit(
         ),
         body_temp: loc.body_temp,
         discard: discards_body(http, server, &loc, url_scratch, true, 0),
-        continue_status: discard_continue(&loc),
+        continue_status: if expect { discard_continue(&loc) } else { None },
         body_timeout: loc.timeouts.body,
     })
 }
