@@ -3847,6 +3847,41 @@ where
     ))
 }
 
+/// The `100 Continue` of a request whose body nobody reads, before its
+/// response, where nginx's discard sends it: not before an error the
+/// special response handler answers, as that sets `expect_tested` first
+/// (`phase::discard_continue`). `false`: the write failed.
+#[cold]
+#[inline(never)]
+async fn continue_first<S: ConnIo>(
+    stream: &mut S,
+    response: &Response,
+    continue_status: Option<u16>,
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> bool {
+    let head: &[u8] = match response {
+        Response::Prebuilt(bytes) => bytes,
+        Response::Owned(bytes) => bytes,
+        Response::File { headers, .. } => headers,
+        _ => return true,
+    };
+    let status = response_status(head);
+    let continues = match continue_status {
+        Some(returned) => status == returned,
+        None => matches!(status, 200..=299 | 304 | 412 | 416),
+    };
+    if !continues {
+        return true;
+    }
+    let resp = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+    let len = resp.len();
+    write_all_timed(stream, resp, len, timer, send_timeout)
+        .await
+        .0
+        .is_ok()
+}
+
 /// The rest of a body nobody reads, after the response went out (#627):
 /// `true` when it was read and dropped and the connection may serve the
 /// next request. An HTTP/2 stream ends instead (the `h2` crate then resets
@@ -4412,6 +4447,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut body_temp = &http.body_temp;
                         // Nothing will read the body: drop it as it comes.
                         let mut discard_body = false;
+                        // With it, the response a 100 goes out before.
+                        let mut continue_status = None;
                         // The routed location's client_body_timeout (#147).
                         let mut body_timeout = timeouts.body;
                         // A body is framed, even an empty one (`Content-Length:
@@ -4429,11 +4466,15 @@ pub(crate) async fn handle<S: ConnIo>(
                                 0,
                                 0
                             );
-                            if let Some(first) =
-                                phase::first_body_limit(http, &probe, &mut *url_scratch)
-                            {
+                            if let Some(first) = phase::first_body_limit(
+                                http,
+                                &probe,
+                                &mut *url_scratch,
+                                parse_state.has_expect,
+                            ) {
                                 persistent_body = first.persistent;
                                 discard_body = first.discard;
+                                continue_status = first.continue_status;
                                 body_timeout = first.body_timeout;
                                 body_buffer = first.buffer;
                                 body_temp = first.body_temp.unwrap_or(body_temp);
@@ -4471,16 +4512,20 @@ pub(crate) async fn handle<S: ConnIo>(
                         // Content-Length below: nginx sets expect_tested
                         // before discarding it, so no 100 goes out.
                         let refused_unread = req.content_length.is_some_and(|cl| cl > max_body);
-                        if req.http_11
+                        let expect_continue = req.http_11
                             && refuse.is_none()
                             && !refused_unread
                             && parse_state.has_expect
-                            && let Some(expect) = lookup_request_header(
+                            && lookup_request_header(
                                 &buf[base + req.headers_start..base + req.headers_end],
                                 b"expect",
                             )
-                            && expect.eq_ignore_ascii_case(b"100-continue")
-                        {
+                            .is_some_and(|e| e.eq_ignore_ascii_case(b"100-continue"));
+                        // A body nobody reads gets its 100 with the response
+                        // (#627), and none before an error nginx's special
+                        // response handler answers: a client doesn't upload
+                        // a body to a 401 (`continue_first`).
+                        if expect_continue && !discard_body {
                             // nginx sends it in one send() and gives up
                             // the connection if it doesn't all go out;
                             // here send_timeout bounds the wait.
@@ -4761,6 +4806,19 @@ pub(crate) async fn handle<S: ConnIo>(
                         // the next request's header waits use the default
                         // server's values again, as in nginx.
                         let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
+                        if expect_continue
+                            && discard_body
+                            && !Box::pin(continue_first(
+                                stream,
+                                &response,
+                                continue_status,
+                                timers.io.as_mut(),
+                                send_timeout,
+                            ))
+                            .await
+                        {
+                            return;
+                        }
                         // And on an HTTP/2 stream, its http2_chunk_size (#594).
                         if let Some(t) = process_meta.timeouts {
                             stream.set_h2_chunk(t.h2_chunk);
