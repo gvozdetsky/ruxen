@@ -1089,6 +1089,7 @@ fn build_intercept_reroute(
             enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
+            closes: crate::http::closes_connection(upstream_status),
         });
     }
     if rule.target[0] == b'@' {
@@ -1099,16 +1100,22 @@ fn build_intercept_reroute(
             enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
+            closes: crate::http::closes_connection(upstream_status),
         });
     }
     // An absolute URL: a redirect to it, 302 unless `=301` etc. says
     // otherwise (ngx_http_send_error_page), as for a local error_page.
-    Response::Owned(crate::http::build_redirect_response(
+    let redirect = crate::http::build_redirect_response(
         crate::worker::external_error_page_status(rule.action),
         &rule.target,
         method,
         server,
-    ))
+    );
+    Response::Owned(if crate::http::closes_connection(upstream_status) {
+        crate::http::with_connection_close(redirect)
+    } else {
+        redirect
+    })
 }
 
 fn parse_response_status(bytes: &[u8]) -> Option<u16> {

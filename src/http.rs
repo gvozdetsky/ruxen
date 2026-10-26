@@ -1606,6 +1606,22 @@ fn error_page_title(status: u16) -> Option<(&'static str, &'static str)> {
 /// `ngx_http_error_pages` as `text/html`. 494–497 go out as 400 with the
 /// reason on a line of its own. `None` for a status without a page. HEAD
 /// gets the head with the page's length.
+/// The statuses after which nginx's special response handler ends the
+/// connection (`r->keepalive = 0`, ngx_http_special_response.c:436): its
+/// own error page for them says `Connection: close`, and an `error_page`
+/// that answers one does too.
+pub fn closes_connection(status: u16) -> bool {
+    matches!(status, 400 | 413 | 414 | 495 | 496 | 497 | 500 | 501)
+}
+
+/// `response` with `Connection: close` at the end of its header.
+pub fn with_connection_close(mut response: Vec<u8>) -> Vec<u8> {
+    if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+        response.splice(end + 2..end + 2, *b"Connection: close\r\n");
+    }
+    response
+}
+
 pub fn build_error_response(status: u16, method: Method, server: &[u8]) -> Option<Vec<u8>> {
     let reason = match status {
         494 => Some("Request Header Or Cookie Too Large"),
@@ -1630,13 +1646,12 @@ pub fn build_error_response(status: u16, method: Method, server: &[u8]) -> Optio
         }
         None => (status, default_error_page_body_for(status, server)?),
     };
-    Some(build_response_bytes_with_content_type(
-        sent,
-        &body,
-        b"text/html",
-        method,
-        server,
-    ))
+    let out = build_response_bytes_with_content_type(sent, &body, b"text/html", method, server);
+    Some(if closes_connection(status) {
+        with_connection_close(out)
+    } else {
+        out
+    })
 }
 
 /// An error response ruxen answers itself: nginx's page for the status

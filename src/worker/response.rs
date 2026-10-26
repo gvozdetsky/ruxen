@@ -1003,6 +1003,16 @@ pub(crate) fn render_in_subrequest(
     out
 }
 
+/// `return 494`…`497` keeps its code for `error_page` to find; when none
+/// takes it, nginx's page for it goes out as a 400
+/// (ngx_http_special_response_handler), ending the connection for 495–497
+/// (`http::closes_connection`).
+#[cold]
+#[inline(never)]
+fn special_status_page(status: u16, method: crate::http::Method, server: &[u8]) -> Response {
+    Response::Owned(http::error_response_for_method(status, "", method, server))
+}
+
 pub(crate) fn finish_server_response(
     http: &'static PreparedHttp,
     req: &phase::RequestCtx<'_>,
@@ -1833,10 +1843,6 @@ pub(crate) fn maybe_intercept_error_page_as(
     recursive: bool,
     server: &[u8],
 ) -> Response {
-    if in_error_page || error_pages.is_empty() {
-        return response;
-    }
-
     let status = match &response {
         Response::Prebuilt(bytes) => response_status(bytes),
         Response::Owned(bytes) => response_status(bytes),
@@ -1849,9 +1855,21 @@ pub(crate) fn maybe_intercept_error_page_as(
         // A 101 isn't an error.
         Response::Upgrade(_) => return response,
     };
+    let special = (494..=497).contains(&status);
+    if in_error_page || error_pages.is_empty() {
+        return if special {
+            special_status_page(status, req.method, server)
+        } else {
+            response
+        };
+    }
     let status = code.unwrap_or(status);
     let Some(rule) = error_pages.iter().find(|rule| rule.status == status) else {
-        return response;
+        return if special {
+            special_status_page(status, req.method, server)
+        } else {
+            response
+        };
     };
     // Preserve the `Location:` header for 3xx responses across the
     // internal redirect — nginx's `r->headers_out.location` survives
@@ -1907,6 +1925,7 @@ pub(crate) fn maybe_intercept_error_page_as(
             enters_error_page: !recursive,
             preserved_location,
             preserved_www_authenticate,
+            closes: http::closes_connection(status),
         });
     }
     if target[0] == b'@' {
@@ -1924,14 +1943,20 @@ pub(crate) fn maybe_intercept_error_page_as(
             enters_error_page: !recursive,
             preserved_location,
             preserved_www_authenticate,
+            closes: http::closes_connection(status),
         });
     }
-    Response::Owned(http::build_redirect_response(
+    let redirect = http::build_redirect_response(
         external_error_page_status(rule.action),
         &target,
         req.method,
         server,
-    ))
+    );
+    Response::Owned(if http::closes_connection(status) {
+        http::with_connection_close(redirect)
+    } else {
+        redirect
+    })
 }
 
 pub(crate) fn fallback_body(code: u16) -> &'static str {
