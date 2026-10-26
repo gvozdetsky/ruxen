@@ -207,6 +207,12 @@ fn m97_gzip_like_nginx() {
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
         assert_eq!(head.matches("Vary: Accept-Encoding").count(), 1, "{head}");
     }
+    // An unsatisfiable range: the 416 carries it too.
+    for path in ["/", "/big.css"] {
+        let (head, _) = get(port, path, "Range: bytes=99999999-\r\n", "1.1");
+        assert!(head.starts_with("HTTP/1.1 416"), "{head}");
+        assert_eq!(head.matches("Vary: Accept-Encoding").count(), 1, "{head}");
+    }
     // Not for a type gzip doesn't take.
     let (head, _) = get(port, "/pic.png", "Range: bytes=0-3\r\n", "1.1");
     assert!(head.starts_with("HTTP/1.1 206"), "{head}");
