@@ -83,9 +83,10 @@ pub(crate) fn would_compress(
     matches!(decide(gz, req, &head), Decision::Compress)
 }
 
-/// A static file's 206 under `gzip_vary`: nginx's gzip filter sees the
-/// whole 200 before its range filter cuts it, so the 206 carries `Vary`
-/// when the file is a gzip candidate (by type and `gzip_min_length`).
+/// A static file's 206 or 416 under `gzip_vary`: nginx's gzip filter sees
+/// the whole 200 before its range filter cuts or refuses it, so the 206 or
+/// 416 carries `Vary` when the file is a gzip candidate (by type and
+/// `gzip_min_length`).
 #[cold]
 #[inline(never)]
 pub(crate) fn vary_cut_file(
@@ -104,7 +105,7 @@ pub(crate) fn vary_cut_file(
         return response;
     }
     match response {
-        Response::Owned(bytes) if crate::worker::response_status(&bytes) == 206 => {
+        Response::Owned(bytes) if matches!(crate::worker::response_status(&bytes), 206 | 416) => {
             let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
                 return Response::Owned(bytes);
             };
