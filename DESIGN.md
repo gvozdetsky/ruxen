@@ -28,6 +28,8 @@ We are not doing:
 
 The scenarios are in `bench/scenarios/manifest.tsv`, with nginx's frozen baselines next to each config (for the minimal `return 200` config, [`bench/m1/RESULTS.md`](bench/m1/RESULTS.md)). A change to the hot path is measured before it merges, as ABBA pairs against the build before it on a quiet machine (`bench/README.md`); a regression is fixed, not shipped. The scenarios still below the line have issues (`performance` label).
 
+**What holds up a release** (since 2026-10-26, `ROADMAP.md`, "How work is chosen"): no regression against the previous release on the headline scenarios (`m1_hello`, `m3_static_1k`, `proxy_hello`, `proxy_64k`, `tls_hello`, `h2c_hello`, `h2_tls_hello`, `gzip_html_8k`). The ≥ 95% line on every scenario stays the target, but a scenario still below it no longer blocks a release: its issue gets a milestone when a user's workload hits it or the fix is cheap.
+
 ## Runtime & I/O
 
 - **monoio** — thread-per-core async runtime, io_uring-native. Rationale: nginx's performance comes from process-per-core + `SO_REUSEPORT` + per-worker accept queues = zero cross-core contention. Tokio's default multi-thread runtime is work-stealing, which has cache-line bouncing that's the exact opposite of what this workload wants. Published benchmarks show monoio/glommio matching or beating nginx on plaintext; tokio+hyper typically lags by 30–50%.
