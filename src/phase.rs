@@ -608,6 +608,9 @@ pub struct Reroute {
     /// (a list — `ticket #485`) so multi-value challenges survive. Re-
     /// injected at finalize time when the preserved status is 401.
     pub preserved_www_authenticate: Vec<Vec<u8>>,
+    /// The error page answers a status after which nginx's special
+    /// response handler ends the connection (`http::closes_connection`).
+    pub closes: bool,
 }
 
 /// Test-only helper: run the pipeline and return only the response,
@@ -803,6 +806,8 @@ fn process_with_meta_inner(
     // error_page sent it to a URI, the realip address.
     let mut req_now: Option<RequestCtx<'_>> = None;
     let req_in = req;
+    // An error page for a status that ends the connection (`Reroute::closes`).
+    let mut closes = false;
     match initial_reroute {
         None => {
             // Normalize the URI once at FindConfig entry; Rewrite / internal
@@ -823,6 +828,7 @@ fn process_with_meta_inner(
             }
         }
         Some(reroute) => {
+            closes = reroute.closes;
             if turns_into_get(req, &reroute) {
                 req_now = Some(error_page_request(req));
             }
@@ -888,6 +894,7 @@ fn process_with_meta_inner(
         server_name: server.primary_server_name,
         ..ProcessMeta::default()
     };
+    meta.keepalive.allow = !closes;
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
@@ -1023,12 +1030,11 @@ fn process_with_meta_inner(
             }
         };
         apply_location_meta(&loc, &mut meta, &mut rewrite_state);
-        if loc.internal && !internal_request {
-            // ngx_http_core_find_config_phase: an `internal` location is
-            // not found for an external request.
-            return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
-        }
-        if let Some(target) = loc.auto_redirect_to {
+        // ngx_http_core_find_config_phase: an `internal` location is not
+        // found for an external request. The 404 is finalized there, before
+        // the rewrite and access phases, with the location's `error_page`.
+        let refused = loc.internal && !internal_request;
+        if !refused && let Some(target) = loc.auto_redirect_to {
             let args = current_args
                 .as_deref()
                 .unwrap_or_else(|| request_args(req.path));
@@ -1044,7 +1050,8 @@ fn process_with_meta_inner(
                 meta,
             );
         }
-        if let Some(le) = loc.limit_except
+        if !refused
+            && let Some(le) = loc.limit_except
             && limit_except_method_bit(req.method_bytes) & le.methods == 0
         {
             loc = loc.limited(le);
@@ -1058,23 +1065,28 @@ fn process_with_meta_inner(
         let mut rewrite_response = None;
         // A `return` with text is sent as it is: no `error_page` for it.
         let mut takes_error_page = true;
-        let rewrite_broke = match run_rewrite_program(
-            http,
-            server,
-            loc,
-            req,
-            url_scratch,
-            &mut current_args,
-            &mut rewrite_state,
-            regex_captures.as_ref(),
-        ) {
-            RewriteOutcome::Continue => false,
-            RewriteOutcome::Break => true,
-            RewriteOutcome::Reroute => continue,
-            RewriteOutcome::Respond(response, finalized) => {
-                rewrite_response = Some(response);
-                takes_error_page = finalized;
-                false
+        let rewrite_broke = if refused {
+            rewrite_response = Some(Response::Prebuilt(http.not_found.pick(req.method)));
+            false
+        } else {
+            match run_rewrite_program(
+                http,
+                server,
+                loc,
+                req,
+                url_scratch,
+                &mut current_args,
+                &mut rewrite_state,
+                regex_captures.as_ref(),
+            ) {
+                RewriteOutcome::Continue => false,
+                RewriteOutcome::Break => true,
+                RewriteOutcome::Reroute => continue,
+                RewriteOutcome::Respond(response, finalized) => {
+                    rewrite_response = Some(response);
+                    takes_error_page = finalized;
+                    false
+                }
             }
         };
         // An `if` block with settings of its own held: the request goes on
@@ -1294,6 +1306,9 @@ fn process_with_meta_inner(
                 }
                 if next.enters_error_page {
                     in_error_page = true;
+                }
+                if next.closes {
+                    meta.keepalive.allow = false;
                 }
                 if let Some(loc_header) = next.preserved_location {
                     preserved_location = Some(loc_header);
@@ -1965,6 +1980,9 @@ pub(crate) struct FirstBodyLimit {
     /// first and the body is dropped, as nginx's
     /// ngx_http_discard_request_body does, instead of being kept.
     pub discard: bool,
+    /// With `discard`, which response a `100 Continue` goes out before
+    /// (`discard_continue`); only looked at, and set, with an `Expect`.
+    pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
 }
@@ -1982,6 +2000,8 @@ pub(crate) fn first_body_limit(
     http: &'static PreparedHttp,
     req: &RequestCtx<'_>,
     url_scratch: &mut Vec<u8>,
+    // An `Expect` header came: `continue_status` is wanted.
+    expect: bool,
 ) -> Option<FirstBodyLimit> {
     let listen = select_listen(http, req.listen_index)?;
     if req.refuse.is_some()
@@ -2037,7 +2057,34 @@ pub(crate) fn first_body_limit(
         ),
         body_temp: loc.body_temp,
         discard: discards_body(http, server, &loc, url_scratch, true, 0),
+        continue_status: if expect { discard_continue(&loc) } else { None },
         body_timeout: loc.timeouts.body,
+    })
+}
+
+/// Where the body is discarded, which response nginx sends a `100
+/// Continue` before, the discard sending it (ngx_http_test_expect) unless
+/// the special response handler set `expect_tested` first. A `return`
+/// discards in ngx_http_send_response for a status under 400 or with a
+/// text (ngx_http_script_return_code), so `Some` of that status, `Some(0)`
+/// for none; an error it or the access phase answers goes without. `None`
+/// for a static file: its handler discards once the file is open
+/// (ngx_http_static_module.c), so its 200, 206, 304, 412 and 416 follow
+/// a 100, and a 404, a 403 or a 301 to the directory don't.
+fn discard_continue(loc: &MatchedLocation<'_>) -> Option<u16> {
+    use crate::worker::{PreparedHandler, PreparedReturn};
+    let PreparedHandler::Return(ret, finalized) = loc.handler else {
+        return None;
+    };
+    let status = match ret {
+        PreparedReturn::Static(prebuilt, _) => crate::worker::response_status(prebuilt.head),
+        PreparedReturn::Template { status, .. } => *status,
+    };
+    // `finalized`: no text, or a redirect.
+    Some(if status < 400 || !finalized {
+        status
+    } else {
+        0
     })
 }
 
@@ -2240,7 +2287,9 @@ fn apply_location_meta(
 ) {
     rewrite_state.doc_root = Some(loc.doc_root);
     meta.keepalive = KeepaliveMeta {
-        allow: loc.keepalive.allow,
+        // Once off, it stays off across internal redirects: nginx's
+        // ngx_http_update_location_config only ever clears r->keepalive.
+        allow: meta.keepalive.allow && loc.keepalive.allow,
         idle_timeout_ms: loc.keepalive.idle_timeout_ms,
         header_timeout_secs: loc.keepalive.header_timeout_secs,
         max_requests: loc.keepalive.max_requests,

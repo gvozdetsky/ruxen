@@ -495,3 +495,54 @@ fn trailer_lines_refuse_a_bare_lf_or_cr() {
         assert_eq!(responses, if ok { 2 } else { 1 }, "{trailer:?}: {resp}");
     }
 }
+
+/// `Expect: 100-continue` to a request whose body nobody reads: an error
+/// goes out without a 100, so the client doesn't upload its body to a 401
+/// or a 404 (nginx's special response handler sets `expect_tested` before
+/// it discards the body). A `return` under 400 or with a text, and a static
+/// file once found, a 412 included, get their 100 first, as from nginx.
+#[test]
+fn no_continue_before_an_error() {
+    let server = start(
+        "server { listen 127.0.0.1:%%PORT%%; root %%DIR%%;\n\
+           location /ok { return 200 \"ok\"; }\n\
+           location /moved { return 302 /ok; }\n\
+           location /told { return 403 \"no\"; }\n\
+           location /deny { deny all; }\n\
+           location /gone { return 404; }\n\
+           location /static/ { }\n\
+         }",
+    );
+    let first_head = |method: &str, path: &str, extra: &str| {
+        head_only(
+            server.port,
+            &format!(
+                "{method} {path} HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\
+                 Content-Length: 5\r\n{extra}\r\n"
+            ),
+        )
+    };
+    for (method, path, extra, want) in [
+        ("POST", "/ok", "", "HTTP/1.1 100 Continue"),
+        ("POST", "/moved", "", "HTTP/1.1 100 Continue"),
+        ("POST", "/told", "", "HTTP/1.1 100 Continue"),
+        ("POST", "/deny", "", "HTTP/1.1 403"),
+        ("POST", "/gone", "", "HTTP/1.1 404"),
+        ("POST", "/static/missing", "", "HTTP/1.1 404"),
+        ("POST", "/nginx.conf", "", "HTTP/1.1 405"),
+        ("GET", "/", "", "HTTP/1.1 403"),
+        ("GET", "/nginx.conf", "", "HTTP/1.1 100 Continue"),
+        (
+            "GET",
+            "/nginx.conf",
+            "If-Match: \"nope\"\r\n",
+            "HTTP/1.1 100 Continue",
+        ),
+    ] {
+        let head = first_head(method, path, extra);
+        assert!(
+            head.starts_with(want),
+            "{method} {path} {extra:?}: {head:?}"
+        );
+    }
+}

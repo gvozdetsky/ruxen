@@ -414,6 +414,11 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         maps: prepared_maps,
         not_found: Prebuilt::leak_error(404, "Not Found\n", http_server_bytes),
         bad_request: Prebuilt::leak_error(400, "Bad Request\n", http_server_bytes),
+        version_not_supported: Prebuilt::leak_error(
+            505,
+            "HTTP Version Not Supported\n",
+            http_server_bytes,
+        ),
         plain_http: Prebuilt::leak_error(
             497,
             "The plain HTTP request was sent to HTTPS port\n",
