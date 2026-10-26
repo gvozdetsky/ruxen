@@ -388,6 +388,9 @@ http {
     location /rw { rewrite ^ /int/rw last; }
     location /ep { error_page 404 /int/ep; return 404; }
     location /tf { try_files /no-such-file /int/tf; }
+    location /own/ { internal; error_page 404 =200 @own; }
+    location /deny/ { internal; deny all; error_page 404 /int/deny; }
+    location @own { return 200 "own page"; }
   }
 }
 "#;
@@ -406,6 +409,15 @@ http {
 
     let resp = http_get(port, "/tf");
     assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
+    assert_eq!(body(&resp), b"internal");
+
+    // The 404 for an external request is finalized with the location's
+    // `error_page`, before its access phase (`deny` doesn't run).
+    let resp = http_get(port, "/own/x");
+    assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
+    assert_eq!(body(&resp), b"own page");
+    let resp = http_get(port, "/deny/x");
+    assert_eq!(status_line(&resp), "HTTP/1.1 404 Not Found");
     assert_eq!(body(&resp), b"internal");
 }
 
