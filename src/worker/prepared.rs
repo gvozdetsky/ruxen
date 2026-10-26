@@ -1819,6 +1819,10 @@ pub struct PreparedClientTimeouts {
     /// head, and the largest head, `size × number`.
     pub large_header_line: usize,
     pub large_header: usize,
+    /// `client_header_buffer_size` (#467): what a connection's first read
+    /// of a head goes into, nginx's 1k by default. A connection whose head
+    /// or body fills it moves to `READ_BUF` (`grow_head_buffer`).
+    pub header_buffer: usize,
     /// `http2_chunk_size` (#594): the largest DATA frame of a response on
     /// an HTTP/2 stream, nginx's 8k by default.
     pub h2_chunk: usize,
@@ -1850,6 +1854,7 @@ impl PreparedClientTimeouts {
             send: Duration::from_millis(t.send_ms.unwrap_or(DEFAULT_MS)),
             large_header_line: size as usize,
             large_header: (num.saturating_mul(size)).min(usize::MAX as u64) as usize,
+            header_buffer: t.header_buffer.unwrap_or(1024).clamp(1, usize::MAX as u64) as usize,
             h2_chunk: t.h2_chunk_size.unwrap_or(8 * 1024) as usize,
             max_headers,
             max_headers_span: max_headers.saturating_add(1).saturating_mul(3),

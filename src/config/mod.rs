@@ -995,6 +995,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "client_body_timeout"
                 | "send_timeout"
                 | "large_client_header_buffers"
+                | "client_header_buffer_size"
                 | "max_headers"
                 | "http2_chunk_size"),
                 Terminator::Semi,
@@ -1088,7 +1089,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "client_body_in_file_only",
     "client_body_in_single_buffer",
     "client_max_body_size",
-    "client_header_buffer_size",
     "client_header_timeout",
     "send_timeout",
     "connection_pool_size",
@@ -2884,7 +2884,9 @@ mod tests {
                 client_header_timeout 5s;
                 send_timeout 7s;
                 max_headers 50;
+                client_header_buffer_size 2k;
                 server { listen 80; client_body_timeout 3s; send_timeout 9s;
+                         client_header_buffer_size 512;
                          http2_chunk_size 1; max_headers 0;
                          location / { http2_chunk_size 16k; http2_push_preload on; } }
                 server { listen 81; }
@@ -2900,6 +2902,7 @@ mod tests {
                 body_ms: Some(3_000),
                 send_ms: Some(9_000),
                 large_header_buffers: None,
+                header_buffer: Some(512),
                 h2_chunk_size: Some(1),
                 max_headers: Some(0),
                 connection_pool_size: None,
@@ -2919,6 +2922,7 @@ mod tests {
                 body_ms: None,
                 send_ms: Some(7_000),
                 large_header_buffers: None,
+                header_buffer: Some(2048),
                 h2_chunk_size: Some(4096),
                 max_headers: Some(50),
                 connection_pool_size: None,
@@ -2933,6 +2937,11 @@ mod tests {
             Err(Error::Duplicate("send_timeout"))
         ));
         assert!(parse("http { client_body_timeout soon; }").is_err());
+        assert!(parse("http { client_header_buffer_size big; }").is_err());
+        assert!(matches!(
+            parse("http { client_header_buffer_size 1k; client_header_buffer_size 2k; }"),
+            Err(Error::Duplicate("client_header_buffer_size"))
+        ));
         assert!(matches!(
             parse("http { server { location / { http2_chunk_size 1; http2_chunk_size 2; } } }"),
             Err(Error::Duplicate("http2_chunk_size"))

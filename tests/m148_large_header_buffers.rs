@@ -159,6 +159,49 @@ fn smaller_buffers_limit_lines_and_the_head() {
     assert_eq!(s(get(&format!("/{}", "a".repeat(1500)), &[])), [414]);
 }
 
+/// `client_header_buffer_size` (#467): the first read goes into a buffer
+/// that small, and a head or body that doesn't fit moves on, as nginx
+/// moves it to a large buffer. Heads of every size, a body, and pipelined
+/// requests on one connection all come through.
+#[test]
+fn small_client_header_buffer() {
+    let server = start("chb", "client_header_buffer_size 64;");
+    let post = format!(
+        "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 3000\r\n\r\n{}",
+        "b".repeat(3000)
+    );
+    assert_eq!(
+        statuses(
+            server.port,
+            &[
+                get("/", &[]),
+                get("/", &[("X-A", 900)]),
+                get("/", &[("X-A", 7000)]),
+                get("/s", &[]),
+                post.clone(),
+                get("/", &[("X-1", 7000), ("X-2", 7000)]),
+                get("/t", &[]),
+            ]
+        ),
+        [200, 200, 200, 200, 200, 200, 200]
+    );
+    // Two requests in one write, the second past the first's buffer.
+    let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let pair = format!("{}{}", get("/1", &[]), get("/2", &[("X-A", 500)]));
+    s.write_all(pair.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while got.windows(3).filter(|w| w == b"ok\n").count() < 2 {
+        match s.read(&mut buf) {
+            Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&got);
+    assert_eq!(text.matches("HTTP/1.1 200 OK").count(), 2, "{text}");
+}
+
 #[test]
 fn bad_values_are_refused() {
     for (value, ok) in [
