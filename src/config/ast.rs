@@ -26,6 +26,9 @@ pub struct ClientTimeouts {
     /// `max_headers` (nginx 1.29.8, #584): the most header lines a request
     /// may have.
     pub max_headers: Option<u64>,
+    /// `connection_pool_size`, unused but for nginx's check against
+    /// `large_client_header_buffers` (http and server only).
+    pub connection_pool_size: Option<u64>,
 }
 
 impl ClientTimeouts {
@@ -43,6 +46,13 @@ impl ClientTimeouts {
             "send_timeout" => (&mut self.send_ms, "send_timeout"),
             "large_client_header_buffers" => {
                 return self.parse_large_header_buffers(args).map(|()| true);
+            }
+            "connection_pool_size" => {
+                if self.connection_pool_size.is_some() {
+                    return Err(Error::Duplicate("connection_pool_size"));
+                }
+                self.connection_pool_size = Some(parse_pool_size(args)?);
+                return Ok(true);
             }
             "max_headers" => {
                 if self.max_headers.is_some() {
@@ -74,9 +84,8 @@ impl ClientTimeouts {
     }
 
     /// `large_client_header_buffers number size;`, as nginx's
-    /// `ngx_conf_set_bufs_slot`: both above 0. nginx also wants the size
-    /// at least `connection_pool_size`, a directive ruxen takes and
-    /// ignores, so that check isn't made.
+    /// `ngx_conf_set_bufs_slot`: both above 0. The size against
+    /// `connection_pool_size` is `check_large_header_buffers`, per server.
     fn parse_large_header_buffers(&mut self, args: &[String]) -> Result<(), super::error::Error> {
         use super::error::Error;
         const WHAT: &str = "large_client_header_buffers";
@@ -117,8 +126,46 @@ impl ClientTimeouts {
             large_header_buffers: self.large_header_buffers.or(parent.large_header_buffers),
             h2_chunk_size: self.h2_chunk_size.or(parent.h2_chunk_size),
             max_headers: self.max_headers.or(parent.max_headers),
+            connection_pool_size: self.connection_pool_size.or(parent.connection_pool_size),
         }
     }
+
+    /// ngx_http_core_merge_srv_conf: a server's `large_client_header_buffers`
+    /// size (8k by default) is at least its `connection_pool_size` (512 on
+    /// 64-bit, `64 * sizeof(void *)`).
+    pub(crate) fn check_large_header_buffers(&self) -> Result<(), super::error::Error> {
+        let size = self.large_header_buffers.map_or(8192, |(_, size)| size);
+        if size < self.connection_pool_size.unwrap_or(512) {
+            return Err(super::error::Error::Message(
+                "the \"large_client_header_buffers\" size must be equal to or greater than \"connection_pool_size\"",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `connection_pool_size` and `request_pool_size`: a size, then
+/// ngx_http_core_pool_size's checks (`NGX_MIN_POOL_SIZE`, 112 on 64-bit,
+/// and `NGX_POOL_ALIGNMENT`).
+pub(crate) fn parse_pool_size(args: &[String]) -> Result<u64, super::error::Error> {
+    use super::error::Error;
+    let what = if args[0] == "request_pool_size" {
+        "request_pool_size"
+    } else {
+        "connection_pool_size"
+    };
+    let raw = args.get(1).ok_or(Error::MissingArg(what))?;
+    let size = super::parse_server::parse_size_bytes(raw).ok_or_else(|| Error::BadValue {
+        what,
+        got: raw.clone(),
+    })?;
+    if size < 112 {
+        return Err(Error::Message("the pool size must be no less than 112"));
+    }
+    if size % 16 != 0 {
+        return Err(Error::Message("the pool size must be a multiple of 16"));
+    }
+    Ok(size)
 }
 
 /// The `proxy_*` directives every level takes (http, server, location),
