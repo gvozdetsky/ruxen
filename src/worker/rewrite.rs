@@ -462,6 +462,16 @@ pub(crate) fn execute_rewrite_ops(
                     && rewrite_target_is_external(&new_uri);
 
                 if external_redirect {
+                    // nginx escapes the captures of a redirect's target
+                    // (ngx_http_script_copy_capture_code with `e->quote`)
+                    // when the request URI had escapes or a `+`, so that
+                    // unescape_redirect gives a decoded `%` or `#` back
+                    // encoded: `/docs/50%25-off` stays so, not `50-off`.
+                    let path = req.path.split(|&b| b == b'?').next().unwrap_or_default();
+                    if path.contains(&b'%') || path.contains(&b'+') {
+                        new_uri.clear();
+                        render_parts_with_arg_escape(replacement_uri, &ctx, &mut new_uri);
+                    }
                     let status = match flag {
                         PreparedRewriteFlag::Permanent => 301,
                         PreparedRewriteFlag::Redirect => 302,
