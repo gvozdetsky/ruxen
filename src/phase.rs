@@ -1023,12 +1023,11 @@ fn process_with_meta_inner(
             }
         };
         apply_location_meta(&loc, &mut meta, &mut rewrite_state);
-        if loc.internal && !internal_request {
-            // ngx_http_core_find_config_phase: an `internal` location is
-            // not found for an external request.
-            return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
-        }
-        if let Some(target) = loc.auto_redirect_to {
+        // ngx_http_core_find_config_phase: an `internal` location is not
+        // found for an external request. The 404 is finalized there, before
+        // the rewrite and access phases, with the location's `error_page`.
+        let refused = loc.internal && !internal_request;
+        if !refused && let Some(target) = loc.auto_redirect_to {
             let args = current_args
                 .as_deref()
                 .unwrap_or_else(|| request_args(req.path));
@@ -1044,7 +1043,8 @@ fn process_with_meta_inner(
                 meta,
             );
         }
-        if let Some(le) = loc.limit_except
+        if !refused
+            && let Some(le) = loc.limit_except
             && limit_except_method_bit(req.method_bytes) & le.methods == 0
         {
             loc = loc.limited(le);
@@ -1058,23 +1058,28 @@ fn process_with_meta_inner(
         let mut rewrite_response = None;
         // A `return` with text is sent as it is: no `error_page` for it.
         let mut takes_error_page = true;
-        let rewrite_broke = match run_rewrite_program(
-            http,
-            server,
-            loc,
-            req,
-            url_scratch,
-            &mut current_args,
-            &mut rewrite_state,
-            regex_captures.as_ref(),
-        ) {
-            RewriteOutcome::Continue => false,
-            RewriteOutcome::Break => true,
-            RewriteOutcome::Reroute => continue,
-            RewriteOutcome::Respond(response, finalized) => {
-                rewrite_response = Some(response);
-                takes_error_page = finalized;
-                false
+        let rewrite_broke = if refused {
+            rewrite_response = Some(Response::Prebuilt(http.not_found.pick(req.method)));
+            false
+        } else {
+            match run_rewrite_program(
+                http,
+                server,
+                loc,
+                req,
+                url_scratch,
+                &mut current_args,
+                &mut rewrite_state,
+                regex_captures.as_ref(),
+            ) {
+                RewriteOutcome::Continue => false,
+                RewriteOutcome::Break => true,
+                RewriteOutcome::Reroute => continue,
+                RewriteOutcome::Respond(response, finalized) => {
+                    rewrite_response = Some(response);
+                    takes_error_page = finalized;
+                    false
+                }
             }
         };
         // An `if` block with settings of its own held: the request goes on
