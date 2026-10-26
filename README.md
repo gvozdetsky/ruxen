@@ -166,6 +166,10 @@ ruxen does not start with this configuration: 1 unsupported, 2 behaving differen
 
 With nothing unsupported, the configuration is then loaded the way `-t` does it (certificates, roots, log files). The exit status is 0 when ruxen starts with the configuration. A `#N` refers to the GitHub issue that tracks the gap. `-t` errors also carry nginx's ` in file:line`.
 
+### Try it on your traffic, behind nginx
+
+Your nginx can keep answering every request while ruxen answers copies of them on the side: nginx's `mirror` sends ruxen each `GET` and `HEAD`, ruxen's answers are thrown away, and `scripts/shadow-report.py` compares the two access logs and lists where ruxen answered differently. [`docs/shadow.md`](docs/shadow.md) has the setup and what it costs (repeated `GET`s reach your application twice; a hung ruxen delays the next request on a keep-alive connection by up to the mirror's timeout).
+
 ### Run as a service
 
 ruxen stays in the foreground (`daemon` is ignored). `SIGQUIT` stops it gracefully, `SIGTERM` at once, `SIGUSR1` reopens the log files, and `SIGHUP` (or `ruxen -s reload`) reloads the configuration: new workers start with it on the same listening sockets, and the old ones finish their requests. A configuration that fails to load leaves the running one in place.
