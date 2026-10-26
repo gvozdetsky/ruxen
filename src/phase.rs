@@ -1965,6 +1965,9 @@ pub(crate) struct FirstBodyLimit {
     /// first and the body is dropped, as nginx's
     /// ngx_http_discard_request_body does, instead of being kept.
     pub discard: bool,
+    /// With `discard`, which response a `100 Continue` goes out before
+    /// (`discard_continue`).
+    pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
 }
@@ -2037,7 +2040,34 @@ pub(crate) fn first_body_limit(
         ),
         body_temp: loc.body_temp,
         discard: discards_body(http, server, &loc, url_scratch, true, 0),
+        continue_status: discard_continue(&loc),
         body_timeout: loc.timeouts.body,
+    })
+}
+
+/// Where the body is discarded, which response nginx sends a `100
+/// Continue` before, the discard sending it (ngx_http_test_expect) unless
+/// the special response handler set `expect_tested` first. A `return`
+/// discards in ngx_http_send_response for a status under 400 or with a
+/// text (ngx_http_script_return_code), so `Some` of that status, `Some(0)`
+/// for none; an error it or the access phase answers goes without. `None`
+/// for a static file: its handler discards once the file is open
+/// (ngx_http_static_module.c), so its 200, 206, 304, 412 and 416 follow
+/// a 100, and a 404, a 403 or a 301 to the directory don't.
+fn discard_continue(loc: &MatchedLocation<'_>) -> Option<u16> {
+    use crate::worker::{PreparedHandler, PreparedReturn};
+    let PreparedHandler::Return(ret, finalized) = loc.handler else {
+        return None;
+    };
+    let status = match ret {
+        PreparedReturn::Static(prebuilt, _) => crate::worker::response_status(prebuilt.head),
+        PreparedReturn::Template { status, .. } => *status,
+    };
+    // `finalized`: no text, or a redirect.
+    Some(if status < 400 || !finalized {
+        status
+    } else {
+        0
     })
 }
 
