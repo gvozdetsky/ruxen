@@ -83,6 +83,45 @@ pub(crate) fn would_compress(
     matches!(decide(gz, req, &head), Decision::Compress)
 }
 
+/// A static file's 206 under `gzip_vary`: nginx's gzip filter sees the
+/// whole 200 before its range filter cuts it, so the 206 carries `Vary`
+/// when the file is a gzip candidate (by type and `gzip_min_length`).
+#[cold]
+#[inline(never)]
+pub(crate) fn vary_cut_file(
+    gz: &PreparedGzip,
+    content_type: &[u8],
+    size: u64,
+    response: Response,
+) -> Response {
+    let head = Head {
+        status: 200,
+        content_type: Some(content_type),
+        content_length: Some(size),
+        ..Head::default()
+    };
+    if !gz.vary || !candidate(gz, &head) {
+        return response;
+    }
+    match response {
+        Response::Owned(bytes) if crate::worker::response_status(&bytes) == 206 => {
+            let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                return Response::Owned(bytes);
+            };
+            let mut out = rewrite_head(&bytes[..end + 4], true, None);
+            out.extend_from_slice(&bytes[end + 4..]);
+            Response::Owned(out)
+        }
+        Response::File { headers, body } if crate::worker::response_status(&headers) == 206 => {
+            Response::File {
+                headers: rewrite_head(&headers, true, None),
+                body,
+            }
+        }
+        other => other,
+    }
+}
+
 /// How to send a file body that is compressed on the way out.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GzipStream {

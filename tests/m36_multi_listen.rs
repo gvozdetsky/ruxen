@@ -1,10 +1,11 @@
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::sync::MutexGuard;
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -19,10 +20,8 @@ impl Drop for ServerGuard {
     }
 }
 
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_two_ports() -> (u16, u16, MutexGuard<'static, ()>) {
-    let g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let g = common::ports::setup_lock();
     let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
     let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
     let p1 = l1.local_addr().unwrap().port();
@@ -44,19 +43,6 @@ fn unique_dir() -> PathBuf {
     d
 }
 
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpListener::bind(("127.0.0.1", port)).is_err() {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("ruxen did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-}
-
 fn spawn_server(conf_body: &str) -> (ServerGuard, u16, u16) {
     let (port1, port2, _lock) = pick_two_ports();
     let dir = unique_dir();
@@ -70,23 +56,22 @@ fn spawn_server(conf_body: &str) -> (ServerGuard, u16, u16) {
     )
     .unwrap();
 
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-
-    wait_for_listen(port1);
-    wait_for_listen(port2);
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port1,
-        port2,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port1, port2)
 }
 
 fn http_get_with_host(port: u16, path: &str, host: &str) -> Vec<u8> {

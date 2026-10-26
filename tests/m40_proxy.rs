@@ -29,10 +29,8 @@ impl Drop for ServerGuard {
     }
 }
 
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let guard = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = common::ports::setup_lock();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -51,19 +49,6 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("server did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-}
-
 fn spawn_ruxen(conf_body: &str) -> (ServerGuard, u16, PathBuf) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
@@ -76,22 +61,22 @@ fn spawn_ruxen(conf_body: &str) -> (ServerGuard, u16, PathBuf) {
     )
     .unwrap();
 
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-
-    wait_for_listen(port);
-    (
-        ServerGuard {
-            child,
-            tempdir: dir.clone(),
-        },
-        port,
-        dir,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir.clone(),
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port, dir)
 }
 
 /// Tiny one-shot HTTP/1.0 backend. Serves a single request per connection,
@@ -110,10 +95,10 @@ type SeenRequest = (String, Option<String>);
 
 impl Backend {
     fn spawn(response: Vec<u8>) -> Self {
-        // Bind under SETUP_LOCK so a parallel test can't grab this port in the
+        // Bind under the setup lock so a parallel test can't grab this port in the
         // window between its pick_port() drop and its ruxen's bind.
         let listener = {
-            let _g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = common::ports::setup_lock();
             TcpListener::bind("127.0.0.1:0").unwrap()
         };
         listener.set_nonblocking(false).unwrap();

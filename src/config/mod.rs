@@ -291,6 +291,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut autoindex_exact_size: Option<bool> = None;
     let mut autoindex_localtime: Option<bool> = None;
     let mut autoindex_format: Option<AutoindexFormat> = None;
+    let mut if_modified_since: Option<IfModifiedSince> = None;
     let mut split_clients: Vec<SplitClients> = Vec::new();
     let mut maps: Vec<MapBlock> = Vec::new();
     let mut auth_basic: Option<AuthBasic> = None;
@@ -459,6 +460,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         autoindex_exact_size,
                         autoindex_localtime,
                         autoindex_format,
+                        if_modified_since,
                         split_clients,
                         maps,
                         auth_basic,
@@ -615,6 +617,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 autoindex_format = Some(parse_autoindex_format_args(&args[1..])?);
             }
+            ("if_modified_since", Terminator::Semi) => {
+                if if_modified_since.is_some() {
+                    return Err(Error::Duplicate("if_modified_since"));
+                }
+                if_modified_since = Some(parse_if_modified_since_args(&args[1..])?);
+            }
             ("split_clients", Terminator::BlockOpen) => {
                 split_clients.push(parse_split_clients_block(&args[1..], lx)?);
             }
@@ -756,6 +764,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "autoindex_exact_size"
                 | "autoindex_localtime"
                 | "autoindex_format"
+                | "if_modified_since"
                 | "split_clients"
                 | "ssl_certificate"
                 | "ssl_certificate_key"
@@ -1092,7 +1101,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     // Misc request handling we treat as no-op for now
     "ignore_invalid_headers",
     "underscores_in_headers",
-    "if_modified_since",
     "etag",
     "msie_padding",
     "msie_refresh",
@@ -1145,6 +1153,19 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "ssi_silent_errors",
     "ssi_types",
     "override_charset",
+    // HTTP/3 (nginx ≥ 1.25): ruxen has none, and its `listen … quic` is
+    // ignored with a warning already, so these settings have nothing to
+    // apply to. Accepted so a config written for nginx with HTTP/3 starts
+    // and serves HTTP/1.1 and HTTP/2 on its TCP listeners.
+    "http3",
+    "http3_hq",
+    "http3_max_concurrent_streams",
+    "http3_stream_buffer_size",
+    "quic_active_connection_id_limit",
+    "quic_bpf",
+    "quic_gso",
+    "quic_host_key",
+    "quic_retry",
 ];
 
 /// Block directives whose body we swallow wholesale (no inner parsing).
@@ -1442,16 +1463,12 @@ pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<()
     Err(Error::Unenforced { name, consequence })
 }
 
-/// Accepted with a warning: `ssl_ciphers` / `ssl_ecdh_curve`, because
-/// rustls offers only AEAD suites and modern groups, so ignoring a
-/// restriction can't enable a weak cipher, and nearly every real TLS
-/// config sets them; `ssl_verify_client optional*` (see above).
+/// Accepted with a warning: `ssl_ecdh_curve`, because rustls offers only
+/// modern groups, so ignoring a restriction can't enable a weak one, and
+/// many real TLS configs set it. (`ssl_ciphers` is applied: `tls_ciphers`.)
 pub(crate) fn warn_ignored_tls_policy(args: &[String], warnings: &mut Vec<String>) {
     let name = args[0].as_str();
     let w = match (name, args.get(1).map(String::as_str)) {
-        ("ssl_ciphers", _) => format!(
-            "\"{name}\" is not supported yet and is ignored: rustls's default cipher suites are used"
-        ),
         ("ssl_ecdh_curve", _) => format!(
             "\"{name}\" is not supported yet and is ignored: rustls's default key exchange groups \
              are used"
@@ -2378,6 +2395,22 @@ mod tests {
     }
 
     #[test]
+    fn http3_directives_are_accepted_without_effect() {
+        // A config written for nginx with HTTP/3 starts; its TCP listen
+        // serves as before, and only the `quic` listen warns.
+        let cfg = parse(
+            "http { quic_retry on; quic_gso on; http3_stream_buffer_size 64k;
+                    server { listen 127.0.0.1:443 ssl; listen 127.0.0.1:443 quic reuseport;
+                             http3 on; http3_hq off; http3_max_concurrent_streams 128;
+                             quic_active_connection_id_limit 2; quic_host_key k.key;
+                             ssl_certificate a.pem; ssl_certificate_key a.key; } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.warnings, [QUIC_LISTEN_IGNORED.to_string()]);
+    }
+
+    #[test]
     fn listen_quic_rejects_tcp_parameters() {
         // ngx_http_core_listen's checks, in its order.
         for (flags, param) in [
@@ -2763,9 +2796,52 @@ mod tests {
             .iter()
             .filter(|w| w.contains("rustls's default"))
             .collect();
-        assert_eq!(tls_warnings.len(), 2, "{:?}", cfg.warnings);
-        assert!(tls_warnings[0].starts_with("\"ssl_ciphers\" is not supported yet"));
-        assert!(tls_warnings[1].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
+        // `ssl_ciphers` is applied (tls_ciphers): no warning.
+        assert_eq!(tls_warnings.len(), 1, "{:?}", cfg.warnings);
+        assert!(tls_warnings[0].starts_with("\"ssl_ecdh_curve\" is not supported yet"));
+    }
+
+    #[test]
+    fn if_modified_since_parses_and_inherits() {
+        let cfg = parse(
+            "http { if_modified_since before;
+                    server { listen 80; location / { } location /x { if_modified_since off; } }
+                    server { listen 81; if_modified_since exact; location / { } } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.if_modified_since, Some(IfModifiedSince::Before));
+        assert_eq!(cfg.servers[0].if_modified_since, None);
+        assert_eq!(
+            cfg.servers[0].locations[1].if_modified_since,
+            Some(IfModifiedSince::Off)
+        );
+        assert_eq!(
+            cfg.servers[1].if_modified_since,
+            Some(IfModifiedSince::Exact)
+        );
+        assert!(parse("http { if_modified_since sometimes; }").is_err());
+        assert!(parse("http { if_modified_since exact; if_modified_since off; }").is_err());
+    }
+
+    #[test]
+    fn alias_with_one_trailing_slash_warns() {
+        let cfg = parse(
+            "http { server { listen 80;
+                location /a { alias /srv/a/; }
+                location /b/ { alias /srv/b; }
+                location /c/ { alias /srv/c/; }
+                location /d { alias /srv/d; }
+            } }",
+        )
+        .unwrap();
+        let warned: Vec<&String> = cfg
+            .warnings
+            .iter()
+            .filter(|w| w.contains("only one of them ends with"))
+            .collect();
+        assert_eq!(warned.len(), 2, "{:?}", cfg.warnings);
+        assert!(warned[0].contains("nginx would map \"/a../x\" to \"/srv/a/../x\""));
+        assert!(warned[1].contains("nginx would map \"/b/x\" to \"/srv/bx\""));
     }
 
     #[test]
@@ -3119,7 +3195,7 @@ mod tests {
     }
 
     #[test]
-    fn ssl_prefer_server_ciphers_off_emits_warning() {
+    fn ssl_prefer_server_ciphers_off_is_kept_without_warning() {
         let src = r#"
             http {
                 server {
@@ -3133,11 +3209,12 @@ mod tests {
         "#;
         let cfg = parse(src).unwrap();
         assert_eq!(cfg.servers[0].ssl.prefer_server_ciphers, Some(false));
+        // rustls's `ignore_client_order` is off by default, as nginx's.
         assert!(
-            cfg.warnings
+            !cfg.warnings
                 .iter()
                 .any(|w| w.contains("prefer_server_ciphers")),
-            "expected prefer-server-ciphers warning, got {:?}",
+            "{:?}",
             cfg.warnings
         );
     }

@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 185 implemented, 23 accepted with a difference, 72 accepted with no effect, 0 refused, 284 unknown.
+Of 564 directives: 190 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 281 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -232,10 +232,10 @@ Not supported: `modern_browser`, `ancient_browser`, `modern_browser_value`, `anc
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `charset` | accepted, differs | any | no charset is added to Content-Type, and nothing is converted |
-| `source_charset` | accepted, differs | any | nothing is converted |
+| `charset` | yes | http, server, location |  |
+| `source_charset` | accepted, differs | http, server, location | nothing is converted: a response is labelled only when it is already in `charset` |
 | `override_charset` | accepted, differs | any | nothing is converted |
-| `charset_types` | no |  |  |
+| `charset_types` | yes | http, server, location |  |
 | `charset_map` | accepted, no effect | any |  |
 
 ## http_dav
@@ -351,8 +351,8 @@ Not supported: `gunzip`, `gunzip_buffers`.
 | `expires` | yes | http, server, location |  |
 | `add_header` | yes | http, server, location |  |
 | `add_trailer` | yes | http, server, location |  |
-| `add_header_inherit` | no |  |  |
-| `add_trailer_inherit` | no |  |  |
+| `add_header_inherit` | yes | http, server, location |  |
+| `add_trailer_inherit` | yes | http, server, location |  |
 
 ## http_image_filter
 
@@ -603,7 +603,7 @@ Not supported: `slice`.
 | `ssl_dhparam` | accepted, no effect | http, server |  |
 | `ssl_ecdh_curve` | accepted, differs | http, server | "ssl_ecdh_curve" is not supported yet and is ignored: rustls's default key exchange groups are used |
 | `ssl_protocols` | yes | http, server |  |
-| `ssl_ciphers` | accepted, differs | http, server | "ssl_ciphers" is not supported yet and is ignored: rustls's default cipher suites are used |
+| `ssl_ciphers` | yes | http, server |  |
 | `ssl_buffer_size` | accepted, no effect | http, server |  |
 | `ssl_verify_client` | yes | http, server |  |
 | `ssl_verify_depth` | yes | http, server |  |

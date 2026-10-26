@@ -125,6 +125,8 @@ ruxen -c examples/minimal.conf
 
 As with nginx, a valid configuration prints `… syntax is ok` and `… test is successful` (on stderr; `-q` silences them) and exits with status 0.
 
+Without `-c`, ruxen reads `/etc/ruxen/ruxen.conf`, the path the systemd unit and the container image use. `ruxen -h` lists the options, which are nginx's plus `--compat`.
+
 Then, from another terminal:
 
 ```bash
@@ -415,7 +417,7 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
-- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3
+- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
 - a proxied response is still read whole before it is sent in a few cases: a cache store, `add_trailer`, failover and interception (#463)
@@ -424,7 +426,7 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 - nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
 - variables in `root` and `alias` (#232)
 
-Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. Accepted with a warning: `ssl_ciphers` and `ssl_ecdh_curve` (rustls's defaults — AEAD suites, modern groups — are used).
+Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. `ssl_ciphers` is evaluated as OpenSSL would over the TLS 1.2 suites rustls has (all ECDHE with AES-GCM or ChaCha20-Poly1305; the weaker ones a list names don't exist here), and `ssl_prefer_server_ciphers` picks whose order counts. Accepted with a warning: `ssl_ecdh_curve` (rustls's modern groups are used).
 
 Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently. Anything else that behaves unlike nginx is a bug; please report it.
 

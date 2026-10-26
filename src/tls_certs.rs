@@ -453,15 +453,19 @@ impl ServerNameResolver {
         if let Some(slot) = self.exact.get(&normalized) {
             return Self::select(slot, schemes);
         }
-        for (suffix, slot) in &self.wildcard {
-            if &normalized == suffix {
-                return Self::select(slot, schemes);
-            }
-            if let Some(prefix) = normalized.strip_suffix(suffix.as_str())
-                && prefix.ends_with('.')
-            {
-                return Self::select(slot, schemes);
-            }
+        // The longest leading wildcard; `*.example.com` doesn't take
+        // `example.com` itself, as for `Host`.
+        let leading = self
+            .wildcard
+            .iter()
+            .filter(|(suffix, _)| {
+                normalized
+                    .strip_suffix(suffix.as_str())
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+            })
+            .max_by_key(|(suffix, _)| suffix.len());
+        if let Some((_, slot)) = leading {
+            return Self::select(slot, schemes);
         }
         // Then, as for `Host` (and nginx's ngx_http_find_virtual_server):
         // the longest trailing wildcard, then the first regex.
@@ -469,10 +473,9 @@ impl ServerNameResolver {
             .wildcard_trailing
             .iter()
             .filter(|(head, _)| {
-                normalized == *head
-                    || normalized
-                        .strip_prefix(head.as_str())
-                        .is_some_and(|rest| rest.starts_with('.'))
+                normalized
+                    .strip_prefix(head.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
             })
             .max_by_key(|(head, _)| head.len());
         if let Some((_, slot)) = trailing {
@@ -738,8 +741,9 @@ pub fn compress_certificates(cfg: &mut ServerConfig, on: bool) {
     };
 }
 
-/// A server's own context: `base` with its protocol versions (#586) and
-/// client-certificate verifier (#113), if any. A config of its own, since
+/// A server's own context: `base` with its protocol versions (#586),
+/// client-certificate verifier (#113), if any, and cipher suites and
+/// order (`ssl_ciphers`, `ssl_prefer_server_ciphers`). A config of its own, since
 /// rustls keeps both private, with everything else `base`'s, its session
 /// cache and ticket keys included (nginx keeps the default server's too).
 /// A session can't cross contexts anyway: resumption needs the same SNI
@@ -749,6 +753,7 @@ pub fn with_context(
     base: &ServerConfig,
     protocols: TlsVersionSet,
     verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    ciphers: &crate::tls_ciphers::Policy,
 ) -> Result<Arc<ServerConfig>, rustls::Error> {
     let versions: Vec<&'static SupportedProtocolVersion> = [
         (protocols.tlsv1_3, &rustls::version::TLS13),
@@ -762,15 +767,23 @@ pub fn with_context(
             "no TLS protocol versions enabled".into(),
         ));
     }
-    let builder = ServerConfig::builder_with_provider(base.crypto_provider().clone())
-        .with_protocol_versions(&versions)?;
+    // `ssl_ciphers` (the TLS 1.2 suites) is the provider's list.
+    let provider = match &ciphers.tls12 {
+        Some(tls12) => Arc::new(crate::tls_ciphers::provider_with_tls12(
+            base.crypto_provider(),
+            tls12,
+        )),
+        None => base.crypto_provider().clone(),
+    };
+    let builder =
+        ServerConfig::builder_with_provider(provider).with_protocol_versions(&versions)?;
     let builder = match verifier {
         Some(verifier) => builder.with_client_cert_verifier(verifier),
         None => builder.with_no_client_auth(),
     };
     let mut cfg = builder.with_cert_resolver(base.cert_resolver.clone());
     // Every public field, as rustls 0.23 has them.
-    cfg.ignore_client_order = base.ignore_client_order;
+    cfg.ignore_client_order = ciphers.server_order;
     cfg.max_fragment_size = base.max_fragment_size;
     cfg.session_storage = base.session_storage.clone();
     cfg.ticketer = base.ticketer.clone();
@@ -954,8 +967,8 @@ mod tests {
         let mut r = ServerNameResolver::new();
         r.add_wildcard("example.com", key.clone());
 
-        // bare suffix matches
-        assert!(r.lookup("example.com", ALL_SCHEMES).is_some());
+        // the bare suffix doesn't (`.example.com` registers it as exact)
+        assert!(r.lookup("example.com", ALL_SCHEMES).is_none());
         // subdomain matches
         assert!(r.lookup("foo.example.com", ALL_SCHEMES).is_some());
         // multi-label subdomain matches (nginx parity)

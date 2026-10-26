@@ -34,6 +34,8 @@ pub struct Conditionals<'a> {
     /// range filter declines (ngx_http_range_header_filter, #370): `range`
     /// and `if_range` count for nothing and a 200 has no `Accept-Ranges`.
     pub max_ranges: Option<u32>,
+    /// The location's `if_modified_since`.
+    pub ims_mode: crate::config::IfModifiedSince,
 }
 
 /// Several ranges are read into memory for their multipart response up to
@@ -242,12 +244,17 @@ fn decide(meta: &FileMeta, cond: Conditionals<'_>) -> Decision {
         // When `If-None-Match` is present, `If-Modified-Since` MUST be
         // ignored (§13.1.3). Falling through skips it.
     } else if let Some(if_modified_since) = cond.if_modified_since {
-        // Plain `mtime <= since` compare — no weak-validator freshness
-        // gate. Tests rely on files written just before the request
-        // still 304ing.
+        // ngx_http_test_if_modified: with nginx's default `exact`,
+        // unmodified only when the date is the Last-Modified the client was
+        // given; a later one, or one in the future, isn't, so a file put
+        // back with an older time is sent again. `before` takes a later
+        // date too; `off` none.
+        use crate::config::IfModifiedSince as Ims;
         if let Some(current_last_modified) = conditional_last_modified
+            && cond.ims_mode != Ims::Off
             && let Some(since) = parse_http_date(if_modified_since)
-            && current_last_modified <= since
+            && (current_last_modified == since
+                || (cond.ims_mode == Ims::Before && current_last_modified < since))
         {
             return Decision::NotModified;
         }
@@ -956,6 +963,7 @@ mod tests {
             if_range: None,
             last_modified_override: None,
             max_ranges: None,
+            ims_mode: crate::config::IfModifiedSince::Exact,
         }
     }
 
@@ -1272,6 +1280,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         )
     }
@@ -1327,6 +1336,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1346,6 +1356,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1353,11 +1364,10 @@ mod tests {
 
     #[test]
     fn if_modified_since_equal_to_mtime_is_not_modified() {
-        // nginx compares `mtime <= since` unconditionally — no "is this
-        // mtime fresh enough for a weak validator?" gate. An IMS that
-        // exactly matches the file's mtime must 304, even when the file
-        // was written within the last second. Tests in not_modified.t
-        // rely on this with just-written files.
+        // No "is this mtime fresh enough for a weak validator?" gate: an
+        // IMS that exactly matches the file's mtime must 304, even when the
+        // file was written within the last second. Tests in
+        // not_modified.t rely on this with just-written files.
         let meta = meta(10, 999);
         let decision = decide(
             &meta,
@@ -1370,9 +1380,69 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::NotModified);
+    }
+
+    #[test]
+    fn if_modified_since_other_than_mtime_is_modified() {
+        // `if_modified_since exact` (nginx's default): a later date, or one
+        // in the future, isn't the Last-Modified the client was given.
+        let meta = meta(10, 999);
+        for since in [
+            &b"Thu, 01 Jan 1970 00:16:40 GMT"[..],
+            b"Thu, 01 Jan 2099 00:00:00 GMT",
+            b"Thu, 01 Jan 1970 00:16:38 GMT",
+        ] {
+            let decision = decide(
+                &meta,
+                Conditionals {
+                    if_modified_since: Some(since),
+                    if_unmodified_since: None,
+                    if_none_match: None,
+                    if_match: None,
+                    range: None,
+                    if_range: None,
+                    last_modified_override: None,
+                    max_ranges: None,
+                    ims_mode: crate::config::IfModifiedSince::Exact,
+                },
+            );
+            assert_ne!(decision, Decision::NotModified, "{since:?}");
+        }
+    }
+
+    #[test]
+    fn if_modified_since_modes() {
+        use crate::config::IfModifiedSince as Ims;
+        let meta = meta(10, 999);
+        let not_modified = |since: &[u8], mode: Ims| {
+            decide(
+                &meta,
+                Conditionals {
+                    if_modified_since: Some(since),
+                    if_unmodified_since: None,
+                    if_none_match: None,
+                    if_match: None,
+                    range: None,
+                    if_range: None,
+                    last_modified_override: None,
+                    max_ranges: None,
+                    ims_mode: mode,
+                },
+            ) == Decision::NotModified
+        };
+        let (equal, later, earlier) = (
+            &b"Thu, 01 Jan 1970 00:16:39 GMT"[..],
+            &b"Thu, 01 Jan 1970 00:16:40 GMT"[..],
+            &b"Thu, 01 Jan 1970 00:16:38 GMT"[..],
+        );
+        assert!(not_modified(equal, Ims::Exact) && !not_modified(later, Ims::Exact));
+        assert!(not_modified(equal, Ims::Before) && not_modified(later, Ims::Before));
+        assert!(!not_modified(earlier, Ims::Before));
+        assert!(!not_modified(equal, Ims::Off));
     }
 
     #[test]
@@ -1391,6 +1461,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1410,6 +1481,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: Some(b""),
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1429,6 +1501,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::PreconditionFailed);
@@ -1448,6 +1521,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1469,6 +1543,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1488,6 +1563,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1507,6 +1583,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: Some(b""),
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1526,6 +1603,7 @@ mod tests {
                 if_range: Some(b"W/\"other\""),
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1547,6 +1625,7 @@ mod tests {
                 if_range: Some(meta.etag.as_slice()),
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1601,6 +1680,7 @@ mod tests {
                 if_range: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 last_modified_override: Some(b"Thu, 01 Jan 1970 00:00:01 GMT"),
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1624,6 +1704,7 @@ mod tests {
                 if_range: Some(&weak),
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Full);
@@ -1643,6 +1724,7 @@ mod tests {
                 if_range: Some(&meta.last_modified),
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::Range { start: 0, end: 9 });
@@ -1662,6 +1744,7 @@ mod tests {
                 if_range: None,
                 last_modified_override: None,
                 max_ranges: None,
+                ims_mode: crate::config::IfModifiedSince::Exact,
             },
         );
         assert_eq!(decision, Decision::NotModified);
@@ -1709,6 +1792,7 @@ mod tests {
                     if_range: None,
                     last_modified_override: None,
                     max_ranges: None,
+                    ims_mode: crate::config::IfModifiedSince::Exact,
                 },
             );
             assert_eq!(decision, Decision::NotModified, "INM={:?}", inm);

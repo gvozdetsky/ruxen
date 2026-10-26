@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -31,10 +31,8 @@ impl Drop for ServerGuard {
     }
 }
 
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let guard = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = common::ports::setup_lock();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -52,41 +50,29 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-fn wait_for_listen(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("server did not start listening on port {port}");
-        }
-        sleep(Duration::from_millis(20));
-    }
-}
-
 fn spawn_ruxen(conf_body: &str) -> (ServerGuard, u16) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
     let conf_path = dir.join("ruxen.conf");
     std::fs::write(&conf_path, conf_body.replace("%%PORT%%", &port.to_string())).unwrap();
 
+    let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
         .args(["-c", conf_path.to_str().unwrap()])
+        .arg("-g")
+        .arg(format!("pid {};", pid_file.display()))
         .env("RUXEN_WORKERS", "1") // single worker → deterministic pool reuse
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ruxen");
-
-    wait_for_listen(port);
-    (
-        ServerGuard {
-            child,
-            tempdir: dir,
-        },
-        port,
-    )
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard {
+        child,
+        tempdir: dir,
+    };
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, port)
 }
 
 /// Backend that handles many requests over the same socket if the client
@@ -102,10 +88,10 @@ struct Backend {
 
 impl Backend {
     fn spawn(response: &'static [u8]) -> Self {
-        // Bind under SETUP_LOCK so a parallel test can't grab this port in the
+        // Bind under the setup lock so a parallel test can't grab this port in the
         // window between its pick_port() drop and its ruxen's bind.
         let listener = {
-            let _g = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = common::ports::setup_lock();
             TcpListener::bind("127.0.0.1:0").unwrap()
         };
         let addr = listener.local_addr().unwrap();

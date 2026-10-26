@@ -5,13 +5,15 @@
 //! listener and io_uring ring); with `RUXEN_UNSHARE_FILES=0` they list the
 //! same table.
 
+mod common;
+
 use std::collections::BTreeSet;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct ServerGuard {
     child: Child,
@@ -26,10 +28,8 @@ impl Drop for ServerGuard {
     }
 }
 
-static SETUP_LOCK: Mutex<()> = Mutex::new(());
-
 fn pick_port() -> (u16, MutexGuard<'static, ()>) {
-    let guard = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = common::ports::setup_lock();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -66,18 +66,18 @@ fn spawn(unshare: Option<&str>) -> (ServerGuard, u32, u16) {
     };
     let child = cmd.spawn().expect("spawn ruxen");
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "ruxen did not start");
-        sleep(Duration::from_millis(20));
-    }
-    (ServerGuard { child, dir }, pid, port)
+    // Owned by the guard before the wait: if it panics, ruxen still stops.
+    let mut guard = ServerGuard { child, dir };
+    // The configuration sets `pid <dir>/ruxen.pid`.
+    let pid_file = guard.dir.join("ruxen.pid");
+    common::ports::wait_for_pid_file(&mut guard.child, &pid_file, Duration::from_secs(5));
+    (guard, pid, port)
 }
 
 /// fd → link target for each `ruxen-worker-*` thread of `pid`. Entries
-/// whose link vanished mid-listing are skipped, and the startup probe
-/// connection gets a moment to close first, so both snapshots see the same
-/// steady-state table when it is shared.
+/// whose link vanished mid-listing are skipped, and the table gets a
+/// moment to settle first, so both snapshots see the same steady-state
+/// table when it is shared.
 fn worker_fd_tables(pid: u32) -> Vec<BTreeSet<(String, String)>> {
     sleep(Duration::from_millis(200));
     let mut tables = Vec::new();

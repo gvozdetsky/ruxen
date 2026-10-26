@@ -1,6 +1,7 @@
 //! M89 — the static module takes POST as far as the file lookup: a missing
 //! file is a 404, an existing one a 405, a directory without an index a
-//! 403. Other methods get the 405 at once. The 405 goes through
+//! 403. Other methods get the 405 at once, unless a `try_files` fallback
+//! takes them first. The 405 goes through
 //! error_page. ruxen refused every method but GET and HEAD with a 405
 //! that skipped error_page. Checked against nginx 1.24.
 
@@ -58,6 +59,8 @@ fn post_to_static_files_follows_the_lookup() {
                location /ai/ {{ autoindex on; }}\n\
                location /tf/ {{ try_files /f.txt =418; }}\n\
                location /tm/ {{ try_files /missing =418; }}\n\
+               location /app/ {{ try_files $uri @app; }}\n\
+               location @app {{ return 200 \"app\"; }}\n\
                location /ep/ {{ error_page 405 /e405; }}\n\
                location = /e405 {{ return 200 \"error page\"; }}\n\
              }}\n\
@@ -92,7 +95,15 @@ fn post_to_static_files_follows_the_lookup() {
         // try_files probes for POST too.
         ("POST /tf/", "405"),
         ("POST /tm/", "418"),
-        // The other methods are refused before the lookup.
+        // try_files probes for every method: its fallback takes a PUT on
+        // to `@app` (a REST API behind it), and its `=418` answers it; what
+        // it finds is the static module's, which refuses it.
+        ("PUT /app/x", "200"),
+        ("OPTIONS /app/", "200"),
+        ("DELETE /tm/", "418"),
+        ("PUT /tf/", "405"),
+        // Without try_files, the other methods are refused before the
+        // lookup.
         ("PATCH /missing", "405"),
         ("DELETE /f.txt", "405"),
         // The 405 is a special response: error_page applies.

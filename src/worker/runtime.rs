@@ -629,6 +629,24 @@ async fn write_response_paced<S: ConnIo>(
     }
 }
 
+/// A read returns its `Vec` with the length set to the bytes it holds
+/// (monoio's `IoBufMut::set_init` on a `Vec`), so after a 27-byte request
+/// `buf` was 27 bytes long, and the next, longer head on the connection
+/// came in pieces of that size, growing the buffer by half after each (a
+/// 327-byte head took 8 reads). Back to the length it had: every byte below
+/// it was initialized before the read, which only wrote into the buffer.
+#[inline(always)]
+fn restore_read_len(buf: &mut Vec<u8>, ptr: *const u8, len: usize) {
+    // The same allocation, still at least `len` long in capacity: a read
+    // that dropped the buffer gives back another one, left as it is.
+    if buf.as_ptr() == ptr && buf.len() < len && len <= buf.capacity() {
+        // SAFETY: `buf` held `len` initialized bytes in this allocation
+        // before the read, which wrote only into it and shortened the
+        // length; nothing below `len` is uninitialized.
+        unsafe { buf.set_len(len) }
+    }
+}
+
 /// Grow the read buffer for a head that doesn't fit (#482): by half
 /// again, up to `limit` (`large_client_header_buffers`, `size × number`).
 #[cold]
@@ -3990,6 +4008,7 @@ pub(crate) async fn handle<S: ConnIo>(
 
     'idle: loop {
         conn_stats.set(super::stats::Phase::Waiting);
+        let (buf_ptr, buf_len) = (buf.as_ptr(), buf.len());
         let (next, returned) = stream
             .idle_read(
                 std::mem::take(&mut *buf),
@@ -4005,6 +4024,7 @@ pub(crate) async fn handle<S: ConnIo>(
             IdleRead::Ready => 0,
             IdleRead::Read(n) => n,
         };
+        restore_read_len(buf, buf_ptr, buf_len);
         conn_stats.set(super::stats::Phase::Reading);
         keepalive_idle_timeout = None;
         // The header's time starts with its first bytes, as nginx's
@@ -4031,7 +4051,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     scratch.extend_from_slice(&buf[read_start..filled]);
                 }
                 let taken = std::mem::take(&mut *buf);
-                let end = taken.len();
+                let (buf_ptr, end) = (taken.as_ptr(), taken.len());
                 let slice = taken.slice_mut(filled..end);
                 let deadline = *header_deadline
                     .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
@@ -4052,6 +4072,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     return;
                 };
                 *buf = returned.into_inner();
+                restore_read_len(buf, buf_ptr, end);
                 match res {
                     Ok(n) if n > 0 => filled += n,
                     // What a TLS stream couldn't decrypt or rustls refused
@@ -5482,6 +5503,25 @@ pub(crate) async fn handle<S: ConnIo>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_buffer_gets_its_length_back() {
+        use monoio::buf::{IoBufMut, SliceMut};
+        let buf = vec![7u8; 64];
+        let (ptr, len) = (buf.as_ptr(), buf.len());
+        // What a 5-byte read into `[10..64)` leaves: monoio's set_init.
+        let mut slice: SliceMut<Vec<u8>> = buf.slice_mut(10..64);
+        unsafe { slice.set_init(5) };
+        let mut buf = slice.into_inner();
+        assert_eq!(buf.len(), 15);
+        restore_read_len(&mut buf, ptr, len);
+        assert_eq!(buf.len(), 64);
+        assert_eq!(buf[63], 7);
+        // Another allocation (a dropped read's) is left alone.
+        let mut other = Vec::with_capacity(64);
+        restore_read_len(&mut other, ptr, len);
+        assert!(other.is_empty());
+    }
 
     #[test]
     fn repeated_accept_error_is_logged_once_a_minute() {
