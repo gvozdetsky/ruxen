@@ -165,7 +165,8 @@ fn bad_values_are_refused() {
         ("4 8k", true),
         ("1 512", true),
         ("0 8k", false),
-        ("4 256", true),
+        // Under `connection_pool_size` (512 on 64-bit), as nginx refuses.
+        ("4 256", false),
         ("4 0", false),
         ("4", false),
     ] {

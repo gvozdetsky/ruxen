@@ -424,6 +424,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         server.keepalive_time_ms = server.keepalive_time_ms.or(keepalive_time_ms);
                         server.keepalive_disable = server.keepalive_disable.or(keepalive_disable);
                         server.client_timeouts = server.client_timeouts.inherit(client_timeouts);
+                        server.client_timeouts.check_large_header_buffers()?;
                         let ssl = &mut server.ssl;
                         // A server with its own ssl_certificate lines keeps
                         // only those.
@@ -991,6 +992,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             ) => {
                 client_timeouts.parse(name, &args)?;
             }
+            // Ignored, but kept for nginx's check against
+            // `large_client_header_buffers`.
+            ("connection_pool_size", Terminator::Semi) => {
+                check_ignored_args(lx, &args)?;
+                client_timeouts.parse("connection_pool_size", &args)?;
+            }
             (name, Terminator::Semi) if ProxyConf::takes(name) => {
                 proxy.parse(&args, lx.conf_prefix())?
             }
@@ -1550,6 +1557,9 @@ pub(crate) fn check_ignored_args(lx: &Lexer, args: &[String]) -> Result<(), Erro
         "fastcgi_temp_path" => "fastcgi_temp_path",
         "uwsgi_temp_path" => "uwsgi_temp_path",
         "scgi_temp_path" => "scgi_temp_path",
+        "connection_pool_size" | "request_pool_size" => {
+            return ast::parse_pool_size(args).map(drop);
+        }
         _ => return Ok(()),
     };
     parse_temp_path_args(&args[1..], what).map(drop)
@@ -2870,6 +2880,7 @@ mod tests {
                 large_header_buffers: None,
                 h2_chunk_size: Some(1),
                 max_headers: Some(0),
+                connection_pool_size: None,
             }
         );
         assert_eq!(
@@ -2888,6 +2899,7 @@ mod tests {
                 large_header_buffers: None,
                 h2_chunk_size: Some(4096),
                 max_headers: Some(50),
+                connection_pool_size: None,
             }
         );
         assert_eq!(
@@ -4792,6 +4804,53 @@ mod tests {
         ] {
             let src = format!("http {{ {bad} server {{ listen 80; }} }}");
             assert!(parse(&src).is_err(), "{bad}");
+        }
+    }
+
+    /// ngx_http_core_pool_size and ngx_http_core_merge_srv_conf: the pool
+    /// sizes' bounds, and the large header buffers against the connection
+    /// pool per server.
+    #[test]
+    fn pool_sizes_and_large_header_buffers_as_nginx() {
+        const SMALL: &str = "the \"large_client_header_buffers\" size must be equal to or greater than \"connection_pool_size\"";
+        let err = |src: &str| parse(src).unwrap_err().to_string();
+        for (src, msg) in [
+            (
+                "http { large_client_header_buffers 2 256; server { listen 80; } }",
+                SMALL,
+            ),
+            (
+                "http { connection_pool_size 1k; server { listen 80; } server { listen 81; large_client_header_buffers 2 1000; } }",
+                SMALL,
+            ),
+            (
+                "http { server { listen 80; connection_pool_size 16k; } }",
+                SMALL,
+            ),
+            (
+                "http { connection_pool_size 96; }",
+                "the pool size must be no less than 112",
+            ),
+            (
+                "http { request_pool_size 4097; }",
+                "the pool size must be a multiple of 16",
+            ),
+            (
+                "http { server { connection_pool_size 120; } }",
+                "the pool size must be a multiple of 16",
+            ),
+        ] {
+            assert!(err(src).starts_with(msg), "{src}: {}", err(src));
+        }
+        assert!(
+            err("http { connection_pool_size 1k; connection_pool_size 1k; }").contains("duplicate")
+        );
+        for ok in [
+            "http { large_client_header_buffers 2 512; server { listen 80; } }",
+            "http { connection_pool_size 1k; large_client_header_buffers 2 1k; server { listen 80; } }",
+            "http { connection_pool_size 112; request_pool_size 4k; server { listen 80; connection_pool_size 8k; } }",
+        ] {
+            parse(ok).unwrap();
         }
     }
 

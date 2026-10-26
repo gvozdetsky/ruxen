@@ -72,6 +72,9 @@ pub enum Error {
     UnknownVariable(String),
     /// `set` on a built-in nginx doesn't let change (#574).
     DuplicateVariable(String),
+    /// A message nginx logs as it is, with no directive name around it
+    /// (`the pool size must be no less than 112`).
+    Message(&'static str),
     /// Any of the above with where it happened, nginx's ` in file:line`.
     At {
         error: Box<Error>,
@@ -126,6 +129,7 @@ impl std::fmt::Display for Error {
             }
             Error::UnknownVariable(name) => write!(f, "unknown \"{name}\" variable"),
             Error::DuplicateVariable(name) => write!(f, "the duplicate \"{name}\" variable"),
+            Error::Message(msg) => f.write_str(msg),
             Error::At { error, position } => write!(f, "{error} in {position}"),
         }
     }
