@@ -2202,6 +2202,31 @@ async fn attempt(
         None => plan.limit_rate,
     };
     let mut paced_body_bytes: u64 = body_len_in_accum as u64;
+    // The client asked with HEAD and the upstream got another method
+    // (`proxy_method`): the header goes alone and the body isn't read, as
+    // nginx's header_only request finalizes the upstream after the header,
+    // so the connection isn't reused. A HEAD the cache sent as a GET reads
+    // it, for the cache (`strip_body`).
+    if body_has_content
+        && matches!(plan.method, Method::Head)
+        && !plan.cache.as_ref().is_some_and(|c| c.head_as_get)
+    {
+        state.response_length = body_len_in_accum as u64;
+        let head = client_head(
+            plan,
+            &accum[..head_end],
+            first_line_end,
+            None,
+            body_has_content,
+            skip_body,
+            false,
+            upstream_headers,
+            redirect_header,
+            range_allow,
+        );
+        return_proxy_buf(accum);
+        return AttemptOutcome::Ok(Response::Owned(head));
+    }
     // A body that hasn't all arrived goes to the client as it comes (#88),
     // unless something needs it whole: a status that may fail over or be
     // intercepted (decided after the body today), or the plan says so.

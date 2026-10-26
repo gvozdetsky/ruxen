@@ -232,6 +232,39 @@ http {{
     assert_eq!(request_line(&req), "POST /hi HTTP/1.1");
 }
 
+/// A HEAD sent upstream as another method gets the header alone, as from
+/// nginx: the upstream's body is its answer to the POST, not the client's.
+#[test]
+fn m44_head_gets_no_body_under_another_method() {
+    let backend =
+        Backend::spawn(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world".to_vec());
+    let conf = format!(
+        r#"
+http {{
+    server {{
+        listen %%PORT%%;
+        location / {{
+            proxy_pass http://127.0.0.1:{};
+            proxy_method POST;
+        }}
+    }}
+}}
+"#,
+        backend.addr.port()
+    );
+    let (_guard, port) = spawn_ruxen(&conf);
+    let resp = http_send(
+        port,
+        b"HEAD /h HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n",
+    );
+    let req = backend.last_request().expect("backend saw request");
+    assert_eq!(request_line(&req), "POST /h HTTP/1.1");
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(resp.contains("Content-Length: 11\r\n"), "{resp}");
+    assert!(resp.ends_with("\r\n\r\n"), "{resp}");
+}
+
 #[test]
 fn m44_proxy_method_accepts_variables() {
     let backend = Backend::spawn(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
