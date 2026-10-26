@@ -409,7 +409,7 @@ The benchmark suite runs equivalent scenarios against nginx and ruxen and stores
 
 See [`bench/README.md`](bench/README.md) for the benchmark methodology and individual scenarios.
 
-The performance contract is at least **95% of the throughput of nginx's current stable release (1.30) on the same hardware** on every bench scenario, with zero errors. Changes to the hot path are measured as ABBA pairs against the previous build before they merge.
+The performance contract is at least **95% of the throughput of nginx's current stable release (1.30) on the same hardware** on every bench scenario, with zero errors; the few scenarios still below it have issues. Changes to the hot path are measured as ABBA pairs against the previous build before they merge, and a release must not regress the headline scenarios.
 
 See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design decisions.
 

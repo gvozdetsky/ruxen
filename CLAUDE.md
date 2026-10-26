@@ -31,7 +31,8 @@ Sibling checkouts are expected one directory up:
 ## Rules
 
 - Performance contract (DESIGN.md): ≥95% of nginx 1.30 (stable) throughput on the
-  bench configs. Re-measure after hot-path changes.
+  bench configs is the target; a release must not regress the headline
+  scenarios (ROADMAP.md). Re-measure after hot-path changes.
 - Unknown directives are an explicit allowlist, and `-V` feature claims are
   minimal on purpose. Widening either unlocks nginx-tests files, so do it only
   together with the implementation.
