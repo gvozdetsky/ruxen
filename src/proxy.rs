@@ -3050,7 +3050,7 @@ fn not_modified(head: &[u8], request_headers: &[u8]) -> Option<u16> {
         }
     }
     if let Some(if_match) = request(b"if-match")
-        && !etag.is_some_and(|e| crate::file::etag_list_matches_strong(if_match, e))
+        && !crate::file::etag_list_matches_strong(if_match, etag)
     {
         return Some(412);
     }
@@ -3069,7 +3069,7 @@ fn not_modified(head: &[u8], request_headers: &[u8]) -> Option<u16> {
         }
     }
     if let Some(inm) = inm
-        && !etag.is_some_and(|e| crate::file::etag_list_matches(inm, e))
+        && !crate::file::etag_list_matches(inm, etag)
     {
         return None;
     }

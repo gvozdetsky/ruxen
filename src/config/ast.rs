@@ -472,6 +472,7 @@ pub struct HttpConfig {
     /// inheritance chain defaults to `html`.
     pub autoindex_format: Option<AutoindexFormat>,
     pub if_modified_since: Option<IfModifiedSince>,
+    pub etag: Option<bool>,
     /// http-scope `split_clients` programs keyed by output variable name
     /// (without the leading `$`).
     pub split_clients: Vec<SplitClients>,
@@ -1151,6 +1152,7 @@ pub struct Server {
     /// Server-scope `autoindex_format ...;`. `None` inherits from http.
     pub autoindex_format: Option<AutoindexFormat>,
     pub if_modified_since: Option<IfModifiedSince>,
+    pub etag: Option<bool>,
     /// Server-scope `access_log` directives. `None` inherits the http-scope
     /// list. `Some(empty)` means `access_log off;` was used to disable
     /// logging at this scope (parser collapses `off` to an empty vec).
@@ -1435,6 +1437,7 @@ pub struct Location {
     /// Location-scope `autoindex_format ...;`. `None` inherits from server.
     pub autoindex_format: Option<AutoindexFormat>,
     pub if_modified_since: Option<IfModifiedSince>,
+    pub etag: Option<bool>,
     /// Location-scope `access_log` directives. `None` inherits from server.
     /// `Some(empty)` is `access_log off;` — explicit suppression.
     pub access_logs: Option<Vec<AccessLog>>,

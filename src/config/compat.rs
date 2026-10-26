@@ -257,7 +257,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         None,
         "nothing is converted: a response is labelled only when it is already in `charset`",
     ),
-    ("etag", Some("on"), "static responses still carry an ETag"),
     (
         "chunked_transfer_encoding",
         Some("on"),
@@ -551,7 +550,7 @@ mod tests {
     #[test]
     fn ignored_directives_differ_unless_set_to_the_default() {
         let (found, _) = findings(
-            "http { ssi on; etag on; tcp_nopush on; types { text/html html; } server { } }",
+            "http { ssi on; override_charset off; tcp_nopush on; types { text/html html; } server { } }",
         );
         let got: Vec<(Severity, &str)> = found
             .iter()
@@ -561,7 +560,7 @@ mod tests {
             got,
             [
                 (Severity::Differs, "ssi on"),
-                (Severity::Ignored, "etag on"),
+                (Severity::Ignored, "override_charset off"),
                 (Severity::Ignored, "tcp_nopush on"),
             ]
         );

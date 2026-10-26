@@ -46,6 +46,7 @@ fn spawn_server() -> (ServerGuard, u16) {
     std::fs::write(dir.join("plain.txt"), b"abcdefgh").unwrap();
     std::fs::write(dir.join("override.txt"), b"abcdefgh").unwrap();
     std::fs::write(dir.join("clear.txt"), b"abcdefgh").unwrap();
+    std::fs::write(dir.join("untagged.txt"), b"abcdefgh").unwrap();
 
     let conf_path = dir.join("ruxen.conf");
     std::fs::write(
@@ -64,6 +65,10 @@ http {{
 
     location = /clear.txt {{
       add_header Last-Modified "";
+    }}
+
+    location = /untagged.txt {{
+      etag off;
     }}
   }}
 }}
@@ -135,33 +140,107 @@ fn stale_if_unmodified_since_returns_412() {
     assert_eq!(status_line(&r), "HTTP/1.1 412 Precondition Failed");
 }
 
+/// nginx's not-modified filter runs before `add_header`: the file's own
+/// mtime (now) is compared, not the 1970 date the location sets.
 #[test]
-fn if_unmodified_since_uses_overridden_last_modified_date() {
+fn if_unmodified_since_ignores_overridden_last_modified_date() {
     let (_guard, port) = spawn_server();
     let r = request(
         port,
         b"GET /override.txt HTTP/1.1\r\nHost: localhost\r\nIf-Unmodified-Since: Mon, 28 Sep 1970 06:00:00 GMT\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    assert_eq!(status_line(&r), "HTTP/1.1 412 Precondition Failed");
 }
 
+/// `add_header Last-Modified ""` hides the date from the client only: the
+/// precondition still fails against the file's mtime, as in nginx.
 #[test]
-fn suppressed_last_modified_disables_if_unmodified_since_412() {
+fn suppressed_last_modified_keeps_if_unmodified_since_412() {
     let (_guard, port) = spawn_server();
     let r = request(
         port,
         b"GET /clear.txt HTTP/1.1\r\nHost: localhost\r\nIf-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    assert_eq!(status_line(&r), "HTTP/1.1 412 Precondition Failed");
     assert_eq!(header_value(&r, "Last-Modified"), None);
 }
 
+/// nginx checks If-Unmodified-Since whether or not If-Match came (not RFC
+/// 9110's §13.2.2 order, where a present If-Match makes it ignored).
 #[test]
-fn if_match_precedes_if_unmodified_since() {
+fn if_unmodified_since_applies_with_if_match() {
     let (_guard, port) = spawn_server();
     let r = request(
         port,
         b"GET /plain.txt HTTP/1.1\r\nHost: localhost\r\nIf-Match: *\r\nIf-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\nConnection: close\r\n\r\n",
     );
+    assert_eq!(status_line(&r), "HTTP/1.1 412 Precondition Failed");
+}
+
+/// A date that doesn't parse fails If-Unmodified-Since, as nginx's
+/// ngx_http_test_if_unmodified takes it.
+#[test]
+fn garbage_if_unmodified_since_is_412() {
+    let (_guard, port) = spawn_server();
+    let r = request(
+        port,
+        b"GET /plain.txt HTTP/1.1\r\nHost: localhost\r\nIf-Unmodified-Since: garbage\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_line(&r), "HTTP/1.1 412 Precondition Failed");
+}
+
+/// `etag off`: no ETag goes out, and the conditionals see none: only `*`
+/// matches If-Match or If-None-Match, and an If-Range tag sends it all.
+#[test]
+fn etag_off_sends_none_and_only_star_matches() {
+    let (_guard, port) = spawn_server();
+    let get = |extra: &str| {
+        request(
+            port,
+            format!(
+                "GET /untagged.txt HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+    };
+    let tagged = request(
+        port,
+        b"GET /plain.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let tag = header_value(&tagged, "ETag").unwrap().to_string();
+    let r = get("");
     assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    assert_eq!(header_value(&r, "ETag"), None);
+    for (extra, want) in [
+        (
+            "If-None-Match: *\r\n".to_string(),
+            "HTTP/1.1 304 Not Modified",
+        ),
+        (format!("If-None-Match: {tag}\r\n"), "HTTP/1.1 200 OK"),
+        ("If-Match: *\r\n".to_string(), "HTTP/1.1 200 OK"),
+        (
+            format!("If-Match: {tag}\r\n"),
+            "HTTP/1.1 412 Precondition Failed",
+        ),
+        (
+            format!("Range: bytes=0-1\r\nIf-Range: {tag}\r\n"),
+            "HTTP/1.1 200 OK",
+        ),
+    ] {
+        let r = get(&extra);
+        assert_eq!(status_line(&r), want, "{extra:?}");
+        assert_eq!(header_value(&r, "ETag"), None, "{extra:?}");
+    }
+}
+
+/// Of two Range headers the first counts (ngx_http_process_header_line).
+#[test]
+fn first_range_header_counts() {
+    let (_guard, port) = spawn_server();
+    let r = request(
+        port,
+        b"GET /plain.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-1\r\nRange: bytes=2-3\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_line(&r), "HTTP/1.1 206 Partial Content");
+    assert_eq!(header_value(&r, "Content-Range"), Some("bytes 0-1/8"));
 }

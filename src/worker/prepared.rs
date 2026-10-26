@@ -1319,6 +1319,7 @@ pub struct PreparedRoot {
     /// Effective `autoindex_format ...;` for this location.
     pub autoindex_format: AutoindexFormat,
     pub if_modified_since: crate::config::IfModifiedSince,
+    pub etag: bool,
     pub try_files: Option<&'static PreparedTryFiles>,
 }
 
