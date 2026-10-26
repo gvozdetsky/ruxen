@@ -1,7 +1,8 @@
 //! `Authorization: Basic` (#477), as auth_basic and `$remote_user` read
 //! it. Beyond not crashing on any header block: credentials encoded with a
-//! plain base64 encoder decode to the user before the first `:` and the
-//! password after it, however the scheme name is cased and spaced.
+//! plain base64 encoder decode to the (non-empty) user before the first
+//! `:` and the password after it, however the scheme name is cased and
+//! spaced.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -28,12 +29,13 @@ fuzz_target!(|data: &[u8]| {
     headers.extend_from_slice(&base64(creds));
     headers.extend_from_slice(b"\r\n");
     match creds.iter().position(|&b| b == b':') {
-        Some(colon) => assert_eq!(
+        Some(colon) if colon > 0 => assert_eq!(
             basic_authorization(&headers),
             Ok((creds[..colon].to_vec(), creds[colon + 1..].to_vec()))
         ),
-        // No `:`, or nothing at all: malformed.
-        None => assert_eq!(basic_authorization(&headers), Err(false)),
+        // No `:`, an empty user (as ngx_http_auth_basic_user refuses it),
+        // or nothing at all: malformed.
+        _ => assert_eq!(basic_authorization(&headers), Err(false)),
     }
 });
 
