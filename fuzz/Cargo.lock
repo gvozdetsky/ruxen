@@ -500,6 +500,7 @@ dependencies = [
  "bytes",
  "h2",
  "http",
+ "io-uring",
  "libc",
  "memchr",
  "mimalloc",

@@ -2213,10 +2213,19 @@ fn may_lock_memory() -> bool {
         .is_some_and(|caps| caps & (1 << CAP_IPC_LOCK) != 0)
 }
 
+/// Set once the kernel refused `IORING_SETUP_DEFER_TASKRUN` (it came in
+/// Linux 6.1): the workers build plain rings from then on.
+static PLAIN_RINGS: AtomicBool = AtomicBool::new(false);
+
 /// The worker's io_uring runtime, with a ring of `entries`. On ENOMEM (the
 /// limit is shared with the user's other processes, and the rings of
 /// workers a reload retired are freed some time after) a smaller ring,
 /// with one `[warn]` per process.
+///
+/// The ring is `SINGLE_ISSUER | DEFER_TASKRUN`: the kernel runs the
+/// completion work when the worker asks for completions, rather than
+/// interrupting it for each one. The worker builds its runtime on its own
+/// thread and is the only one that submits, which `SINGLE_ISSUER` requires.
 fn io_uring_runtime(
     http: &PreparedHttp,
     entries: u32,
@@ -2227,13 +2236,18 @@ fn io_uring_runtime(
         .copied()
         .filter(|&n| n <= entries)
         .peekable();
+    let mut size = sizes.next().unwrap_or(entries);
     loop {
-        let size = sizes.next().unwrap_or(entries);
-        match RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let deferred = !PLAIN_RINGS.load(Ordering::Relaxed);
+        let mut builder = RuntimeBuilder::<monoio::IoUringDriver>::new()
             .enable_timer()
-            .with_entries(size)
-            .build()
-        {
+            .with_entries(size);
+        if deferred {
+            let mut ring = io_uring::IoUring::builder();
+            ring.setup_single_issuer().setup_defer_taskrun();
+            builder = builder.uring_builder(ring);
+        }
+        match builder.build() {
             Ok(rt) => {
                 if size != entries && !WARNED.swap(true, Ordering::Relaxed) {
                     write_worker_log(
@@ -2249,7 +2263,12 @@ fn io_uring_runtime(
                 }
                 return Ok(rt);
             }
-            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) && sizes.peek().is_some() => {}
+            Err(e) if deferred && e.raw_os_error() == Some(libc::EINVAL) => {
+                PLAIN_RINGS.store(true, Ordering::Relaxed);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) && sizes.peek().is_some() => {
+                size = sizes.next().unwrap_or(size);
+            }
             Err(e) => return Err(e),
         }
     }
