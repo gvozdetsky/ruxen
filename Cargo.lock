@@ -684,6 +684,7 @@ dependencies = [
  "flate2",
  "h2",
  "http",
+ "io-uring",
  "libc",
  "memchr",
  "mimalloc",
