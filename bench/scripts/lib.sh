@@ -5,6 +5,11 @@ BENCH_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_ROOT="$(cd "${BENCH_SCRIPTS_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${BENCH_ROOT}/.." && pwd)"
 
+# wrk's threads open their connections while it still creates the later
+# threads' event loops, so `-c4096` under the common soft limit of 1024
+# descriptors fails with "unable to create thread N: Too many open files".
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+
 die() {
     echo "error: $*" >&2
     exit 1
@@ -52,6 +57,14 @@ wait_for_http() {
         sleep 0.1
     done
     return 1
+}
+
+# Whether something listens on the TCP port of `url` (false without `ss`).
+port_in_use() {
+    local port="${1##*:}"
+    port="${port%%/*}"
+    command -v ss >/dev/null 2>&1 || return 1
+    [[ -n "$(ss -ltnH "sport = :${port}")" ]]
 }
 
 # Both servers run with the config's own directory as the prefix (`-p`), so
@@ -360,6 +373,13 @@ run_iteration() {
     local scheme="${11}"
     local wrk_log="${12}"
     local env_line="${13:-}"
+
+    # A leftover nginx on this config is ours to stop; anything else on the
+    # port would answer in the server's place (a container holding 8082
+    # gave a probe its 404).
+    [[ "$server_kind" != "nginx" ]] || stop_nginx "$conf"
+    ! port_in_use "$url" \
+        || die "the port of $url is in use by another process (ss -ltnp)"
 
     local pid=""
     if [[ "$server_kind" == "nginx" ]]; then

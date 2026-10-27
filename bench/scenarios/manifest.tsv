@@ -10,7 +10,7 @@
 m1_hello|return 200 "hello", keep-alive|8080|/|16|512|30s|5s|20|bench/m1/nginx.conf||none||http
 m1_varied_heads|return 200 "hello", keep-alive requests of 40 B to 2.7 KiB in turn|8080|/|16|512|30s|5s|20|bench/m1/nginx.conf||lua|bench/m1/varied_heads.lua|http
 m1_no_keepalive|return 200 "hello", keepalive_timeout 0|8081|/|16|512|30s|5s|20|bench/m1_no_keepalive/nginx.conf||none||http
-m1_keepalive_requests_1|return 200 "hello", keepalive_requests 1|8082|/|16|512|30s|5s|20|bench/m1_keepalive_requests_1/nginx.conf||none||http
+m1_keepalive_requests_1|return 200 "hello", keepalive_requests 1|8083|/|16|512|30s|5s|20|bench/m1_keepalive_requests_1/nginx.conf||none||http
 m3_static_1k|static 1 KiB file, keep-alive|8090|/hello.txt|16|512|30s|5s|20|bench/m3/nginx.conf||none||http
 m3_static_1k_low_concurrency|static 1 KiB file, low concurrency|8090|/hello.txt|4|32|30s|5s|20|bench/m3/nginx.conf||none||http
 m3_static_1k_no_keepalive|static 1 KiB file, keepalive disabled|8091|/hello.txt|16|512|30s|5s|20|bench/m3_no_keepalive/nginx.conf||none||http
