@@ -1605,5 +1605,14 @@ mod tests {
         .err()
         .expect("duplicate options");
         assert!(err.contains("duplicate listen options"), "{err}");
+
+        // `reuseport` is one of them, as in nginx (#761).
+        let err = prepare(parse_cfg(&format!(
+            "http {{ server {{ listen 127.0.0.1:{port} reuseport; }} \
+             server {{ listen 127.0.0.1:{port} reuseport; }} }}"
+        )))
+        .err()
+        .expect("duplicate options");
+        assert!(err.contains("duplicate listen options"), "{err}");
     }
 }

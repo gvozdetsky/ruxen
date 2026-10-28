@@ -16,7 +16,6 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
-use monoio::io::AsyncReadRent;
 use monoio::time::timeout;
 
 use crate::proxy::{AttemptFailure, Stage, UpstreamError};
@@ -293,18 +292,100 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         crate::proxy::return_proxy_buf(std::mem::replace(&mut s.read_buf, take_relay_buf()));
     }
     let trailers = s.trailers;
+    let direct = !chunked_out
+        && deflater.is_none()
+        && s.window.is_none()
+        && matches!(s.framing, StreamFraming::Length(_));
+    let mut rd = BodyReader {
+        decoded: Vec::new(),
+        plain: Vec::new(),
+        compressed: Vec::new(),
+        deflater,
+        chunked_out,
+        last_chunk,
+        direct,
+        end: ReadEnd {
+            done: false,
+            extra: false,
+            failure: None,
+        },
+        read: 0,
+        body: 0,
+    };
+    // The rest often comes in one read: it goes out without the pipe
+    // (~2% on a 64 KiB response).
+    let step = rd.read(&mut s, Vec::new).await;
+    if let Some((data, false)) = step {
+        Box::pin(pipelined(
+            s,
+            rd,
+            data,
+            client,
+            &mut pacer,
+            timer.as_mut(),
+            send_timeout,
+            default_temp,
+            &mut end,
+        ))
+        .await;
+    } else {
+        end.upstream_read = rd.read;
+        end.upstream_body = rd.body;
+        let mut read_end = rd.end;
+        let mut ok = true;
+        if let Some((data, _)) = step
+            && !data.is_empty()
+        {
+            let len = data.len();
+            let (written, returned) =
+                write_out(client, data, len, &mut pacer, timer.as_mut(), send_timeout).await;
+            if s.read_buf.capacity() == 0 {
+                s.read_buf = returned;
+            }
+            ok = written;
+            if ok {
+                end.body_sent += len as u64;
+            }
+        }
+        // Released after the write, as before #764: the other way round
+        // the next request's read mostly finds nothing yet and parks.
+        end.response_ms = release(s, read_end.done, read_end.extra, &mut read_end.failure);
+        end.failure = read_end.failure;
+        end.complete = ok && read_end.done;
+    }
+    end.trailers_due = trailers && end.complete;
+    (end, head)
+}
+
+/// The relay past its first read: that read's `first` bytes are queued,
+/// and the upstream is read on while the client writes.
+#[allow(clippy::too_many_arguments)]
+async fn pipelined<S: crate::worker::ConnIo>(
+    s: Box<ProxyStream>,
+    rd: BodyReader,
+    first: Vec<u8>,
+    client: &mut S,
+    pacer: &mut Option<crate::worker::Pacer>,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+    default_temp: &crate::worker::BodyTempDir,
+    end: &mut RelayEnd,
+) {
     let started = s.started;
     let has_cache = s.cache.is_some();
     let pipe = Pipe::new(s.buffering, default_temp);
+    pipe.upstream_read.set(rd.read);
+    pipe.upstream_body.set(rd.body);
+    pipe.push(first);
     // The reader's end once the upstream is released, and its time.
     let mut released: Option<(ReadEnd, u64)> = None;
     let mut writer_ok = true;
     {
-        let mut reader = std::pin::pin!(read_side(s, &pipe, chunked_out, last_chunk, deflater));
+        let mut reader = std::pin::pin!(read_side(s, rd, &pipe));
         let mut writer = std::pin::pin!(write_side(
             client,
             &pipe,
-            &mut pacer,
+            pacer,
             timer.as_mut(),
             send_timeout
         ));
@@ -357,9 +438,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         }
         None => end.response_ms = started.elapsed().as_millis() as u64,
     }
-    end.trailers_due = trailers && end.complete;
     pipe.return_bufs();
-    (end, head)
 }
 
 /// What the upstream side of a relay left.
@@ -583,30 +662,136 @@ impl<'t> Pipe<'t> {
     }
 }
 
-/// The upstream side of a relay: read, decode, compress, cut and cache the
-/// body, and queue the client's bytes, while the pipe has room.
-async fn read_side(
-    mut s: Box<ProxyStream>,
-    pipe: &Pipe<'_>,
+/// The upstream side of a relay: decode, compress, cut and cache the body
+/// as it is read.
+struct BodyReader {
+    /// The decoded body of a chunked upstream, and gzip's input and output.
+    decoded: Vec<u8>,
+    plain: Vec<u8>,
+    compressed: Vec<u8>,
+    deflater: Option<crate::worker::gzip::Deflater>,
     chunked_out: bool,
     last_chunk: &'static [u8],
-    mut deflater: Option<crate::worker::gzip::Deflater>,
+    /// A length-framed body to a client that takes it as it is goes out
+    /// in the read buffers themselves.
+    direct: bool,
+    end: ReadEnd,
+    /// `$upstream_bytes_received` and `$upstream_response_length` so far.
+    read: u64,
+    body: u64,
+}
+
+impl BodyReader {
+    /// One upstream read into `s.read_buf`: the client's bytes from it
+    /// (that buffer, or one from `out_buf`), and whether it has all it
+    /// gets. `None`: the relay ends (`end.failure`).
+    async fn read(
+        &mut self,
+        s: &mut ProxyStream,
+        out_buf: impl FnOnce() -> Vec<u8>,
+    ) -> Option<(Vec<u8>, bool)> {
+        let mut buf = std::mem::take(&mut s.read_buf);
+        buf.clear();
+        if s.limit_rate != 0 {
+            buf = paced_read_buf(buf, s.limit_rate, s.paced, s.pacer_start);
+        }
+        let (res, returned) = match timeout(s.read_timeout, s.upstream.read_now(buf)).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                self.end.failure = Some(failure(s, UpstreamError::TimedOut(Stage::ReadingBody)));
+                return None;
+            }
+        };
+        s.read_buf = returned;
+        let n = match res {
+            Ok(0) => {
+                if !matches!(s.framing, StreamFraming::Close) {
+                    self.end.failure = Some(failure(
+                        s,
+                        UpstreamError::PrematurelyClosed(Stage::ReadingBody),
+                    ));
+                    return None;
+                }
+                // The upstream closed: the body is complete, and nothing
+                // goes back to the pool.
+                s.pool = None;
+                let mut framed = out_buf();
+                // The rest of the compressed body.
+                if let Some(d) = self.deflater.as_mut() {
+                    self.compressed.clear();
+                    d.push(&[], &mut self.compressed, true);
+                    push_body(&mut framed, &self.compressed, self.chunked_out);
+                }
+                framed.extend_from_slice(self.last_chunk);
+                self.end.done = true;
+                return Some((framed, true));
+            }
+            Ok(n) => n,
+            Err(e) => {
+                self.end.failure =
+                    Some(failure(s, UpstreamError::RecvFailed(e, Stage::ReadingBody)));
+                return None;
+            }
+        };
+        self.read += n as u64;
+        s.paced += n as u64;
+        // proxy_limit_rate: what was read goes out once it is due, the
+        // last read too (#700), as the whole-body path waits after each
+        // read.
+        crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
+        if self.direct
+            && let StreamFraming::Length(left) = &mut s.framing
+        {
+            let take = n.min(*left as usize);
+            self.end.extra |= n > take;
+            *left -= take as u64;
+            let done = *left == 0;
+            self.body += take as u64;
+            if let Some(fill) = s.cache.as_deref_mut() {
+                fill.write(&s.read_buf[..take]);
+            }
+            let mut buf = std::mem::take(&mut s.read_buf);
+            buf.truncate(take);
+            self.end.done = done;
+            return Some((buf, done));
+        }
+        let mut framed = out_buf();
+        match consume_out(
+            &mut s.framing,
+            &s.read_buf[..n],
+            self.chunked_out,
+            &mut self.decoded,
+            self.deflater
+                .as_mut()
+                .map(|d| (d, &mut self.plain, &mut self.compressed)),
+            s.cache.as_deref_mut(),
+            s.window.as_mut(),
+            &mut framed,
+        ) {
+            Ok((done, used, more)) => {
+                self.end.extra |= more;
+                self.body += used as u64;
+                if done {
+                    framed.extend_from_slice(self.last_chunk);
+                }
+                let done = done || window_sent(s.window.as_ref());
+                self.end.done = done;
+                Some((framed, done))
+            }
+            Err(()) => {
+                self.end.failure = Some(failure(s, UpstreamError::InvalidChunked));
+                None
+            }
+        }
+    }
+}
+
+/// Read and queue the client's bytes while the pipe has room.
+async fn read_side(
+    mut s: Box<ProxyStream>,
+    mut rd: BodyReader,
+    pipe: &Pipe<'_>,
 ) -> (Box<ProxyStream>, ReadEnd) {
-    let mut end = ReadEnd {
-        done: false,
-        extra: false,
-        failure: None,
-    };
-    // The decoded body of a chunked upstream, and gzip's input and output.
-    let mut decoded = Vec::new();
-    let mut plain = Vec::new();
-    let mut compressed = Vec::new();
-    // A length-framed body to a client that takes it as it is goes out in
-    // the read buffers themselves.
-    let direct = !chunked_out
-        && deflater.is_none()
-        && s.window.is_none()
-        && matches!(s.framing, StreamFraming::Length(_));
     loop {
         std::future::poll_fn(|_| {
             if pipe.stop.get() || pipe.room() {
@@ -619,113 +804,21 @@ async fn read_side(
         if pipe.stop.get() {
             break;
         }
-        let mut buf = std::mem::take(&mut s.read_buf);
-        if buf.capacity() == 0 {
-            buf = pipe.read_buf();
+        if s.read_buf.capacity() == 0 {
+            s.read_buf = pipe.read_buf();
         }
-        buf.clear();
-        if s.limit_rate != 0 {
-            buf = paced_read_buf(buf, s.limit_rate, s.paced, s.pacer_start);
-        }
-        let (res, returned) = match timeout(s.read_timeout, s.upstream.read(buf)).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                end.failure = Some(failure(&s, UpstreamError::TimedOut(Stage::ReadingBody)));
-                break;
-            }
+        let step = rd.read(&mut s, || pipe.out_buf()).await;
+        pipe.upstream_read.set(rd.read);
+        pipe.upstream_body.set(rd.body);
+        let Some((data, done)) = step else {
+            break;
         };
-        s.read_buf = returned;
-        let n = match res {
-            Ok(0) => {
-                if matches!(s.framing, StreamFraming::Close) {
-                    // The upstream closed: the body is complete, and
-                    // nothing goes back to the pool.
-                    s.pool = None;
-                    let mut framed = pipe.out_buf();
-                    // The rest of the compressed body.
-                    if let Some(d) = deflater.as_mut() {
-                        compressed.clear();
-                        d.push(&[], &mut compressed, true);
-                        push_body(&mut framed, &compressed, chunked_out);
-                    }
-                    framed.extend_from_slice(last_chunk);
-                    pipe.push(framed);
-                    end.done = true;
-                } else {
-                    end.failure = Some(failure(
-                        &s,
-                        UpstreamError::PrematurelyClosed(Stage::ReadingBody),
-                    ));
-                }
-                break;
-            }
-            Ok(n) => n,
-            Err(e) => {
-                end.failure = Some(failure(
-                    &s,
-                    UpstreamError::RecvFailed(e, Stage::ReadingBody),
-                ));
-                break;
-            }
-        };
-        pipe.upstream_read.set(pipe.upstream_read.get() + n as u64);
-        s.paced += n as u64;
-        // proxy_limit_rate: what was read goes out once it is due, the
-        // last read too (#700), as the whole-body path waits after each
-        // read.
-        crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
-        if direct && let StreamFraming::Length(left) = &mut s.framing {
-            let take = n.min(*left as usize);
-            end.extra |= n > take;
-            *left -= take as u64;
-            let done = *left == 0;
-            pipe.upstream_body
-                .set(pipe.upstream_body.get() + take as u64);
-            if let Some(fill) = s.cache.as_deref_mut() {
-                fill.write(&s.read_buf[..take]);
-            }
-            let mut buf = std::mem::take(&mut s.read_buf);
-            buf.truncate(take);
-            pipe.push(buf);
-            if done {
-                end.done = true;
-                break;
-            }
-            continue;
-        }
-        let mut framed = pipe.out_buf();
-        let done = match consume_out(
-            &mut s.framing,
-            &s.read_buf[..n],
-            chunked_out,
-            &mut decoded,
-            deflater.as_mut().map(|d| (d, &mut plain, &mut compressed)),
-            s.cache.as_deref_mut(),
-            s.window.as_mut(),
-            &mut framed,
-        ) {
-            Ok((done, used, more)) => {
-                end.extra |= more;
-                pipe.upstream_body
-                    .set(pipe.upstream_body.get() + used as u64);
-                if done {
-                    framed.extend_from_slice(last_chunk);
-                }
-                done
-            }
-            Err(()) => {
-                pipe.recycle(framed);
-                end.failure = Some(failure(&s, UpstreamError::InvalidChunked));
-                break;
-            }
-        };
-        pipe.push(framed);
-        if done || window_sent(s.window.as_ref()) {
-            end.done = true;
+        pipe.push(data);
+        if done {
             break;
         }
     }
-    (s, end)
+    (s, rd.end)
 }
 
 /// The client side of a relay: write what the pipe holds until the reader
@@ -967,7 +1060,7 @@ pub(crate) async fn fill_cache(mut s: Box<ProxyStream>) {
         }
         let mut buf = std::mem::take(&mut s.read_buf);
         buf.clear();
-        let Ok((res, returned)) = timeout(s.read_timeout, s.upstream.read(buf)).await else {
+        let Ok((res, returned)) = timeout(s.read_timeout, s.upstream.read_now(buf)).await else {
             return;
         };
         s.read_buf = returned;

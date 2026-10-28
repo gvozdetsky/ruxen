@@ -2385,5 +2385,5 @@ pub struct PreparedGzip {
     pub proxied: u16,
     pub disable_msie6: bool,
     /// `gzip_disable` User-Agent patterns, case-insensitive.
-    pub disable: Option<regex::RegexSet>,
+    pub disable: Option<regex::bytes::RegexSet>,
 }
