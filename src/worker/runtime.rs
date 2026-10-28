@@ -4293,8 +4293,6 @@ pub(crate) async fn handle_tls(
             .collect()
     });
     if info.alpn_protocol.as_deref() == Some(b"h2") {
-        // A read and a write run at once on an HTTP/2 connection.
-        tls_stream.begin_tunnel();
         let sni = sni.clone();
         return serve_h2(
             tls_stream,
