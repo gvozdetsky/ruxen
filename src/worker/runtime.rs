@@ -6251,7 +6251,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             {
                                 let body = file_body.take().expect("checked is_some");
                                 if let Err(n) = send_head_and_file(
-                                    &*stream,
+                                    stream,
                                     &mut sock_nonblocking,
                                     scratch,
                                     body,

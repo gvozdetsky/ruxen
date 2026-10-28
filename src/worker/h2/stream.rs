@@ -733,8 +733,10 @@ impl super::super::ConnIo for StreamIo {
     async fn send_file_body(&mut self, body: &crate::phase::FileBody) -> Option<bool> {
         use std::os::fd::AsRawFd;
         const MAX: u64 = 1 << 20;
+        // Multipart parts go through `stream_file`.
         if self.head_request
             || body.len > MAX
+            || body.parts.is_some()
             || !matches!(self.out, Out::Length(n) if n == body.len)
         {
             return None;

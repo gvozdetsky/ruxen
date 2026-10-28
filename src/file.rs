@@ -41,10 +41,6 @@ pub struct Conditionals<'a> {
     pub etag: bool,
 }
 
-/// Several ranges are read into memory for their multipart response up to
-/// this many bytes in total; beyond it the file goes whole, a 200 (#401).
-pub(crate) const MULTIPART_MAX: u64 = 1 << 20;
-
 struct FileMeta {
     size: u64,
     mime: &'static [u8],
@@ -133,11 +129,7 @@ pub fn serve_path(
 
     let accept_ranges = cond.max_ranges != Some(0);
     let head_only = matches!(method, Method::Head);
-    let decision = match decide(&meta, cond) {
-        Decision::Ranges(ranges) if ranges.size() > MULTIPART_MAX => Decision::Full,
-        decision => decision,
-    };
-    match decision {
+    match decide(&meta, cond) {
         Decision::NotModified => Response::Owned(build_not_modified_response(&meta, server)),
         Decision::Full => {
             let body_len = meta.size;
@@ -157,6 +149,7 @@ pub fn serve_path(
                         fd: opened.fd,
                         offset: 0,
                         len: body_len,
+                        parts: None,
                     },
                 }
             }
@@ -181,6 +174,7 @@ pub fn serve_path(
                         fd: opened.fd,
                         offset: start,
                         len: body_len,
+                        parts: None,
                     },
                 }
             }
@@ -188,6 +182,13 @@ pub fn serve_path(
         Decision::Ranges(ranges) => {
             let mut head = build_content_headers(&meta, 200, None, false, server);
             head.truncate(head.len() - 4);
+            // Like one range: small parts are read, larger ones sent from
+            // the file (#414).
+            if !head_only && ranges.size() > inline_limit {
+                return crate::worker::range::multipart_file(
+                    &head, meta.size, &ranges, opened.fd, 0,
+                );
+            }
             let fd = opened.fd.as_raw_fd();
             let read =
                 |start: u64, end: u64, out: &mut Vec<u8>| read_at_into(fd, start, end - start, out);
@@ -449,6 +450,22 @@ fn if_range_matches(value: &[u8], meta: &FileMeta, conditional_last_modified: Op
 
     // Otherwise parse as HTTP-date and compare against second-granularity mtime.
     parse_http_date(value).is_some_and(|date| conditional_last_modified == Some(date))
+}
+
+/// The whole of `body` appended to `out`: its range of the file, or each
+/// part's header and range and the closing boundary.
+#[cfg(test)]
+fn read_body_into(body: &FileBody, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let fd = body.fd.as_raw_fd();
+    let Some(parts) = &body.parts else {
+        return read_at_into(fd, body.offset, body.len, out);
+    };
+    for (part, offset, len) in &parts.parts {
+        out.extend_from_slice(part);
+        read_at_into(fd, *offset, *len, out)?;
+    }
+    out.extend_from_slice(&parts.trailer);
+    Ok(())
 }
 
 /// Append exactly `len` bytes starting at `start` from `fd` onto `out`.
@@ -1998,6 +2015,73 @@ mod tests {
             assert!(s.contains("<title>416 Requested Range Not Satisfiable</title>"));
             assert!(!s.contains("ETag") && !s.contains("Accept-Ranges"), "{s}");
         }
+    }
+
+    /// Parts larger than an inline body are sent from the file, with the
+    /// layout the in-memory response has (#414); HEAD stays inline.
+    #[test]
+    fn large_multipart_parts_are_sent_from_the_file() {
+        let dir = unique_dir();
+        let path = dir.join("big.bin");
+        let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let serve = |method| {
+            serve_path(
+                open_for_test(&path),
+                method,
+                Conditionals {
+                    range: Some(b"bytes=10-20009,-30000"),
+                    ..no_cond()
+                },
+                b"nginx/1.30.6",
+                true,
+            )
+        };
+        let Response::File { headers, body } = serve(Method::Get) else {
+            panic!("expected a file body");
+        };
+        let parts = body.parts.as_ref().expect("parts");
+        let ranges: Vec<_> = parts.parts.iter().map(|p| (p.1, p.2)).collect();
+        assert_eq!(ranges, [(10, 20_000), (64 * 1024 - 30_000, 30_000)]);
+        let mut out = Vec::new();
+        read_body_into(&body, &mut out).unwrap();
+        assert_eq!(out.len() as u64, body.len);
+        let head = String::from_utf8(headers).unwrap();
+        assert!(
+            head.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains(&format!("\r\nContent-Length: {}\r\n", body.len)),
+            "{head}"
+        );
+        let boundary = head
+            .split("boundary=")
+            .nth(1)
+            .and_then(|b| b.split("\r\n").next())
+            .unwrap();
+        let mut want = Vec::new();
+        for (start, end) in [(10, 20_010), (64 * 1024 - 30_000, 64 * 1024)] {
+            want.extend_from_slice(
+                format!(
+                    "\r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                     Content-Range: bytes {start}-{}/65536\r\n\r\n",
+                    end - 1
+                )
+                .as_bytes(),
+            );
+            want.extend_from_slice(&data[start..end]);
+        }
+        want.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        assert!(out == want);
+
+        let Response::Owned(head) = serve(Method::Head) else {
+            panic!("expected an inline HEAD");
+        };
+        let head = String::from_utf8(head).unwrap();
+        assert!(head.ends_with("\r\n\r\n"), "{head}");
+        assert!(head.contains(&format!("\r\nContent-Length: {}\r\n", want.len())));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
