@@ -197,6 +197,58 @@ fn refused_heads_answer_as_nginx() {
     }
 }
 
+/// A request bad in its line and in a header gets the line's answer, as
+/// nginx checks the line before it reads a header (#807).
+#[test]
+fn the_request_line_is_refused_before_a_header() {
+    let server = start("line-first", "add_header X \"$request_method\" always;");
+    let long = "a".repeat(9000);
+    for (req, status, method) in [
+        (
+            format!("GET /?{long} HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n"),
+            "414",
+            None,
+        ),
+        (
+            "GET /x%4 HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n".to_string(),
+            "400",
+            Some("GET"),
+        ),
+        (
+            format!("OPTIONS /x%00 HTTP/1.1\r\nHost: x\r\nX-Long: {long}\r\n\r\n"),
+            "400",
+            Some("OPTIONS"),
+        ),
+        (
+            "GET * HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n".to_string(),
+            "400",
+            None,
+        ),
+        ("GET /x%4 HTTP/1.1\r\n\r\n".to_string(), "400", Some("GET")),
+    ] {
+        let (r, _) = answer(server.port, req.as_bytes());
+        assert!(
+            r.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{}: {r}",
+            &req[..40]
+        );
+        assert!(
+            !r.contains("Too Large</title>") || status == "414",
+            "{}: {r}",
+            &req[..40]
+        );
+        if let Some(method) = method {
+            assert!(
+                r.contains(&format!("\r\nX: {method}\r\n")),
+                "{}: {r}",
+                &req[..40]
+            );
+        } else {
+            assert!(!r.contains("\r\nX: G"), "{}: {r}", &req[..40]);
+        }
+    }
+}
+
 #[test]
 fn smaller_buffers_limit_lines_and_the_head() {
     let server = start("small", "large_client_header_buffers 2 1k;");

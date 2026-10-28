@@ -511,6 +511,20 @@ fn bad_uri(
     response: Response,
 ) -> (Response, ProcessMeta) {
     let server = &listen.servers[listen.default_server];
+    crate::worker::write_error_log(
+        server.error_logs,
+        crate::config::ErrorLogLevel::Info,
+        // Before the headers: no host in the line.
+        &crate::worker::ErrorLogRequest::new(
+            &RequestCtx {
+                headers_raw: b"",
+                ..*req
+            },
+            server.primary_server_name,
+        ),
+        b"client sent invalid request while reading client request line",
+        None,
+    );
     // A target that isn't a path (`*`, `x`) fails nginx's request-line
     // parse, before `$request_method` and `$request` are set.
     let unparsed;
@@ -529,6 +543,26 @@ fn bad_uri(
     // No `$uri` for the log, unless an error page gave it one.
     meta.invalid_uri |= !server.error_pages.iter().any(|p| p.status == 400);
     (response, meta)
+}
+
+/// A refusal for the headers comes after the request target's, as nginx
+/// checks the target while it reads the request line (#807): only on the
+/// way to such a refusal is the target checked here first.
+#[cold]
+#[inline(never)]
+fn bad_target_first(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+) -> Option<(Response, ProcessMeta)> {
+    // CONNECT's target is an authority, not a path.
+    if req.method == Method::Connect {
+        return None;
+    }
+    url_scratch.clear();
+    let bad = normalize_request_uri_into(http, req, false, url_scratch).err()?;
+    Some(bad_uri(http, req, url_scratch, listen, bad))
 }
 
 /// The server's charset on what it answers before a location (#464);
@@ -764,6 +798,10 @@ fn process_with_meta_inner(
     // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
     // — empty Host is treated as "default server".
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
+        if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+            return out;
+        }
+        url_scratch.clear();
         let server = &listen.servers[listen.default_server];
         // Not past an invalid one, logged already.
         if req.refuse.is_none() {
@@ -777,6 +815,10 @@ fn process_with_meta_inner(
 
     if refusing {
         if let Some(status) = req.refuse {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 501 => &http.not_implemented,
                 // nginx's 497: plain HTTP on an `ssl` port, sent as 400
@@ -805,6 +847,10 @@ fn process_with_meta_inner(
             && let Some(tls) = req.tls
             && let Some((status, close)) = client_certificate_refusal(listen, server, req, tls)
         {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 421 => &http.misdirected,
                 495 => &http.cert_error,
@@ -815,6 +861,10 @@ fn process_with_meta_inner(
             return refuse(http, req, url_scratch, server, response, close, false, code);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             if req.method == Method::Trace
                 && crate::worker::test_panic() == crate::worker::TestPanic::Trace
             {

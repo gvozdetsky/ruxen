@@ -820,6 +820,100 @@ fn shrink_head_buffer(buf: &mut Vec<u8>) {
     buf.shrink_to_fit();
 }
 
+/// What nginx refuses while it reads the request line, before any header
+/// (#807): a line past `large_client_header_buffers` (414), or a target
+/// that doesn't normalise (400). Checked only on the way to a refusal for
+/// the headers. `target`: its range in `head` (`None`: an implicit `/`).
+#[cold]
+#[inline(never)]
+fn line_refusal(
+    head: &[u8],
+    target: Option<(usize, usize)>,
+    max_line: usize,
+) -> Option<LineRefusal> {
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = head[..line_end]
+        .strip_suffix(b"\r")
+        .unwrap_or(&head[..line_end]);
+    if line.len() > max_line {
+        return Some(LineRefusal::TooLong);
+    }
+    // CONNECT's target is an authority, not a path.
+    if head.starts_with(b"CONNECT ") {
+        return None;
+    }
+    let target = &head[target?.0..target?.1];
+    let mut out = Vec::new();
+    crate::uri::normalize_with(target, false, &mut out)
+        .is_err()
+        .then_some(LineRefusal::BadTarget(target.first() == Some(&b'/')))
+}
+
+/// See `line_refusal`.
+enum LineRefusal {
+    TooLong,
+    /// A target that doesn't normalise; `true`: a path, where nginx has the
+    /// method (`$request_method`), not a line it couldn't parse (`*`, `x`).
+    BadTarget(bool),
+}
+
+/// The 414 or 400 of `line_refusal`, from the default server, as nginx
+/// answers it while reading the request line.
+#[cold]
+#[inline(never)]
+async fn refuse_line<S: ConnIo>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    http: &'static PreparedHttp,
+    head: &[u8],
+    refusal: LineRefusal,
+    conn: &ConnLogCtx<'_>,
+) {
+    let line_parsed = match refusal {
+        LineRefusal::TooLong => {
+            head_too_large(stream, scratch, http, head, None, conn).await;
+            return;
+        }
+        LineRefusal::BadTarget(line_parsed) => line_parsed,
+    };
+    // Before the headers: no host in the line.
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    refused_head_log(
+        http,
+        conn,
+        &head[..line_end],
+        None,
+        "client sent invalid request while reading client request line",
+    );
+    let (method, refused) = if line_parsed {
+        (head_method(head), Refused::Headers)
+    } else {
+        (Method::Other, Refused::Line)
+    };
+    reject_request(
+        stream,
+        scratch,
+        http,
+        http.bad_request.pick(method),
+        head,
+        refused,
+        conn,
+    )
+    .await;
+}
+
+/// `line_refusal` for a parsed request.
+#[cold]
+#[inline(never)]
+fn parsed_line_refusal(head: &[u8], req: &http::Request, max_line: usize) -> Option<LineRefusal> {
+    let target = (!req.implicit_path && req.absolute_query.is_none())
+        .then_some((req.path_start, req.path_end));
+    line_refusal(head, target, max_line)
+}
+
 /// The start of the first line of `head` longer than `max` bytes, without
 /// its line end (0 for the request line), or of the line that takes the
 /// head past `total`, as nginx's large buffers would run out there.
@@ -4418,11 +4512,27 @@ pub(crate) async fn handle<S: ConnIo>(
                                 timeouts.large_header,
                             )
                         {
+                            let head = &buf[read_start..read_start + req.consumed];
+                            if line > 0
+                                && let Some(refusal) =
+                                    parsed_line_refusal(head, &req, timeouts.large_header_line)
+                            {
+                                refuse_line(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    head,
+                                    refusal,
+                                    conn_log!(),
+                                )
+                                .await;
+                                return;
+                            }
                             head_too_large(
                                 stream,
                                 &mut *scratch,
                                 http,
-                                &buf[read_start..read_start + req.consumed],
+                                head,
                                 (line > 0).then_some(line),
                                 conn_log!(),
                             )
@@ -4439,14 +4549,22 @@ pub(crate) async fn handle<S: ConnIo>(
                                     .saturating_add(stream.h2_synthetic_lines()),
                             )
                         {
-                            many_header_lines(
-                                stream,
-                                &mut *scratch,
-                                http,
-                                &buf[read_start..read_start + req.consumed],
-                                conn_log!(),
-                            )
-                            .await;
+                            let head = &buf[read_start..read_start + req.consumed];
+                            if let Some(refusal) =
+                                parsed_line_refusal(head, &req, timeouts.large_header_line)
+                            {
+                                refuse_line(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    head,
+                                    refusal,
+                                    conn_log!(),
+                                )
+                                .await;
+                                return;
+                            }
+                            many_header_lines(stream, &mut *scratch, http, head, conn_log!()).await;
                             return;
                         }
                         conn_stats.request();
@@ -4501,7 +4619,14 @@ pub(crate) async fn handle<S: ConnIo>(
                                     RequestTransferEncoding::Invalid => Some(400),
                                 }
                             };
-                            if refuse.is_some() {
+                            if refuse.is_some()
+                                && parsed_line_refusal(
+                                    &buf[base..base + req.consumed],
+                                    &req,
+                                    usize::MAX,
+                                )
+                                .is_none()
+                            {
                                 let message = if !req.http_11 {
                                     "client sent HTTP/1.0 request with \"Transfer-Encoding\" header"
                                         .to_string()
@@ -4537,12 +4662,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
-                                    refused_parsed_head_log(
-                                        http,
-                                        conn_log!(),
-                                        &buf[base..base + req.headers_end],
-                                        "client sent invalid host in request line while reading client request line",
-                                    );
+                                    if parsed_line_refusal(
+                                        &buf[base..base + req.consumed],
+                                        &req,
+                                        usize::MAX,
+                                    )
+                                    .is_none()
+                                    {
+                                        refused_parsed_head_log(
+                                            http,
+                                            conn_log!(),
+                                            &buf[base..base + req.headers_end],
+                                            "client sent invalid host in request line while reading client request line",
+                                        );
+                                    }
                                     None
                                 }
                             },
@@ -4558,12 +4691,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
-                                    refused_parsed_head_log(
-                                        http,
-                                        conn_log!(),
-                                        &buf[base..base + req.headers_end],
-                                        "client sent invalid host header while reading client request headers",
-                                    );
+                                    if parsed_line_refusal(
+                                        &buf[base..base + req.consumed],
+                                        &req,
+                                        usize::MAX,
+                                    )
+                                    .is_none()
+                                    {
+                                        refused_parsed_head_log(
+                                            http,
+                                            conn_log!(),
+                                            &buf[base..base + req.headers_end],
+                                            "client sent invalid host header while reading client request headers",
+                                        );
+                                    }
                                     None
                                 }
                             },
@@ -5788,6 +5929,25 @@ pub(crate) async fn handle<S: ConnIo>(
                     Parse::Incomplete => break,
                     Parse::Invalid => {
                         request_count = request_count.saturating_add(1);
+                        if parse_state.rline_done
+                            && let Some(refusal) = line_refusal(
+                                &buf[read_start..filled],
+                                (!parse_state.implicit_path && !parse_state.has_absolute_query)
+                                    .then_some((parse_state.path_start, parse_state.path_end)),
+                                timeouts.large_header_line,
+                            )
+                        {
+                            refuse_line(
+                                stream,
+                                &mut *scratch,
+                                http,
+                                &buf[read_start..filled],
+                                refusal,
+                                conn_log!(),
+                            )
+                            .await;
+                            return;
+                        }
                         let bad_version = invalid_head_log(
                             http,
                             conn_log!(),
@@ -5863,6 +6023,25 @@ pub(crate) async fn handle<S: ConnIo>(
                     if buf.len() < limit {
                         grow_head_buffer(buf, limit);
                         continue;
+                    }
+                    if parse_state.rline_done
+                        && let Some(refusal) = line_refusal(
+                            &buf[..filled],
+                            (!parse_state.implicit_path && !parse_state.has_absolute_query)
+                                .then_some((parse_state.path_start, parse_state.path_end)),
+                            usize::MAX,
+                        )
+                    {
+                        refuse_line(
+                            stream,
+                            &mut *scratch,
+                            http,
+                            &buf[..filled],
+                            refusal,
+                            conn_log!(),
+                        )
+                        .await;
+                        return;
                     }
                     head_too_large(
                         stream,
