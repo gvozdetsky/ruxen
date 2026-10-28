@@ -436,12 +436,25 @@ async fn reject_request<S: ConnIo>(
     http: &'static PreparedHttp,
     response: &[u8],
     request_head: &[u8],
+    refused: Refused,
     conn: &ConnLogCtx<'_>,
 ) {
     let listen = &http.listens[conn.listen_index];
     let server = &listen.servers[listen.default_server];
+    let request_id = super::draw_request_id(http);
     scratch.clear();
     scratch.extend_from_slice(response);
+    if !server.add_headers.is_empty() && refused != Refused::Body {
+        *scratch = reject_add_headers(
+            http,
+            server,
+            std::mem::take(scratch),
+            request_head,
+            refused == Refused::Headers,
+            request_id,
+            conn,
+        );
+    }
     inject_connection_header(scratch, true);
     refresh_date_header(scratch);
     let taken = std::mem::take(scratch);
@@ -466,15 +479,113 @@ async fn reject_request<S: ConnIo>(
         request_head.len() as u64,
         sent,
         sent.saturating_sub(head_len),
+        request_id,
         conn,
     )
     .await;
+}
+
+/// What of a refused request was read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// Its request line was refused.
+    Line,
+    /// One of its headers.
+    Headers,
+    /// Its body, which nginx reads in the location, whose configuration
+    /// then answers (not modelled: the default server's canned page).
+    Body,
+}
+
+/// The default server's `add_header … always` on a request refused before
+/// routing (#779): nginx answers it with that server's configuration, so
+/// its header filter adds them. Rendered with what is known of the
+/// request: the request line's variables once it parsed (`line_parsed`).
+#[cold]
+#[inline(never)]
+fn reject_add_headers(
+    http: &'static PreparedHttp,
+    server: &PreparedServer,
+    response: Vec<u8>,
+    head: &[u8],
+    line_parsed: bool,
+    request_id: u128,
+    conn: &ConnLogCtx<'_>,
+) -> Vec<u8> {
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    let request_line = if line_parsed { &head[..line_end] } else { b"" };
+    let mut words = request_line.split(|&b| b == b' ').filter(|w| !w.is_empty());
+    let method = words.next().unwrap_or(b"");
+    let request_uri = words.next().unwrap_or(b"");
+    let args = request_args(request_uri);
+    let uri = request_uri
+        .iter()
+        .position(|&b| b == b'?')
+        .map_or(request_uri, |i| &request_uri[..i]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ctx = RenderCtx {
+        uri,
+        request_uri,
+        request_method: method,
+        request_line,
+        host: server.primary_server_name,
+        remote_addr: conn.remote_addr,
+        remote_port: conn.remote_port,
+        remote_user: b"",
+        server_name: server.primary_server_name,
+        status: response_status(&response),
+        args,
+        is_args: if args.is_empty() { b"" } else { b"?" },
+        scheme: if conn.tls.is_some() {
+            b"https"
+        } else {
+            b"http"
+        },
+        hostname: hostname(),
+        headers_raw: if line_parsed { &head[line_end..] } else { b"" },
+        underscores_in_headers: server.underscores_in_headers,
+        sent_headers: &[],
+        connection_id: conn.connection_id,
+        request_id,
+        connection_requests: conn.connection_requests,
+        connection_time_us: conn.connection_start.elapsed().as_micros() as u64,
+        request_time_us: 0,
+        server_port: server.listen_port,
+        request_port: &[],
+        pipe: b'.',
+        request_length: head.len() as u64,
+        request_body: &[],
+        request_body_file: &[],
+        bytes_sent: 0,
+        body_bytes_sent: 0,
+        epoch_secs: now.as_secs(),
+        epoch_ms: now.subsec_millis() as u16,
+        server_name_captures: &[],
+        rewrite_state: None,
+        split_clients: Some(&http.split_clients),
+        maps: Some(&http.maps),
+        proxy_host: &[],
+        proxy_tls: false,
+        upstream_headers: &[],
+        upstream_states: &[],
+        upstream_cache_status: &[],
+        sent_trailers: &[],
+        tls: conn.tls,
+        conn: conn.conn,
+    };
+    super::response::inject_add_headers(response, server.add_headers, &ctx)
 }
 
 /// The access-log line of a request that ended before a server was chosen,
 /// to the address's default server's logs: `response` holds the status,
 /// `$request` is whatever of the request line arrived (nginx's then is up
 /// to the first CR or LF).
+#[allow(clippy::too_many_arguments)]
 async fn log_before_routing(
     http: &'static PreparedHttp,
     response: &[u8],
@@ -482,6 +593,7 @@ async fn log_before_routing(
     request_length: u64,
     sent: u64,
     body_sent: u64,
+    request_id: u128,
     conn: &ConnLogCtx<'_>,
 ) {
     let listen = &http.listens[conn.listen_index];
@@ -513,7 +625,7 @@ async fn log_before_routing(
         response,
         conn.connection_id,
         conn.connection_requests,
-        super::draw_request_id(http),
+        request_id,
         conn.connection_start.elapsed().as_micros() as u64,
         0,
         server.listen_port,
@@ -594,7 +706,17 @@ async fn log_unfinished_head(
         _ => 400,
     };
     // `$request_length`: the lines parsed, as nginx's r->request_length.
-    log_before_routing(http, &lost_head(status), head, complete as u64, 0, 0, conn).await;
+    log_before_routing(
+        http,
+        &lost_head(status),
+        head,
+        complete as u64,
+        0,
+        0,
+        super::draw_request_id(http),
+        conn,
+    )
+    .await;
 }
 
 /// A response under `limit_rate`: the head, then the file body if any,
@@ -626,6 +748,26 @@ async fn write_response_paced<S: ConnIo>(
             .await
             .map_err(|n| len as u64 + n),
         None => Ok(()),
+    }
+}
+
+/// The next request's first bytes if they are already in the socket after
+/// a body read up to its end, as nginx's keep-alive handler reads at once
+/// when the last read filled its buffer (`rev->ready`). A request queued
+/// there is read while it is in the cache, not after a trip through the
+/// ring (#757). `None`: wait in `idle_read`.
+#[inline(never)]
+fn read_queued<S: ConnIo>(
+    stream: &mut S,
+    buf: &mut [u8],
+    state: &RuntimeState,
+) -> Option<IdleRead> {
+    if state.is_shutting_down() {
+        return None;
+    }
+    match stream.read_queued(buf)? {
+        Ok(n) if n > 0 => Some(IdleRead::Read(n)),
+        _ => Some(IdleRead::Close),
     }
 }
 
@@ -676,6 +818,100 @@ fn grow_read_buffer(buf: &mut Vec<u8>) {
 fn shrink_head_buffer(buf: &mut Vec<u8>) {
     buf.truncate(READ_BUF);
     buf.shrink_to_fit();
+}
+
+/// What nginx refuses while it reads the request line, before any header
+/// (#807): a line past `large_client_header_buffers` (414), or a target
+/// that doesn't normalise (400). Checked only on the way to a refusal for
+/// the headers. `target`: its range in `head` (`None`: an implicit `/`).
+#[cold]
+#[inline(never)]
+fn line_refusal(
+    head: &[u8],
+    target: Option<(usize, usize)>,
+    max_line: usize,
+) -> Option<LineRefusal> {
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = head[..line_end]
+        .strip_suffix(b"\r")
+        .unwrap_or(&head[..line_end]);
+    if line.len() > max_line {
+        return Some(LineRefusal::TooLong);
+    }
+    // CONNECT's target is an authority, not a path.
+    if head.starts_with(b"CONNECT ") {
+        return None;
+    }
+    let target = &head[target?.0..target?.1];
+    let mut out = Vec::new();
+    crate::uri::normalize_with(target, false, &mut out)
+        .is_err()
+        .then_some(LineRefusal::BadTarget(target.first() == Some(&b'/')))
+}
+
+/// See `line_refusal`.
+enum LineRefusal {
+    TooLong,
+    /// A target that doesn't normalise; `true`: a path, where nginx has the
+    /// method (`$request_method`), not a line it couldn't parse (`*`, `x`).
+    BadTarget(bool),
+}
+
+/// The 414 or 400 of `line_refusal`, from the default server, as nginx
+/// answers it while reading the request line.
+#[cold]
+#[inline(never)]
+async fn refuse_line<S: ConnIo>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    http: &'static PreparedHttp,
+    head: &[u8],
+    refusal: LineRefusal,
+    conn: &ConnLogCtx<'_>,
+) {
+    let line_parsed = match refusal {
+        LineRefusal::TooLong => {
+            head_too_large(stream, scratch, http, head, None, conn).await;
+            return;
+        }
+        LineRefusal::BadTarget(line_parsed) => line_parsed,
+    };
+    // Before the headers: no host in the line.
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    refused_head_log(
+        http,
+        conn,
+        &head[..line_end],
+        None,
+        "client sent invalid request while reading client request line",
+    );
+    let (method, refused) = if line_parsed {
+        (head_method(head), Refused::Headers)
+    } else {
+        (Method::Other, Refused::Line)
+    };
+    reject_request(
+        stream,
+        scratch,
+        http,
+        http.bad_request.pick(method),
+        head,
+        refused,
+        conn,
+    )
+    .await;
+}
+
+/// `line_refusal` for a parsed request.
+#[cold]
+#[inline(never)]
+fn parsed_line_refusal(head: &[u8], req: &http::Request, max_line: usize) -> Option<LineRefusal> {
+    let target = (!req.implicit_path && req.absolute_query.is_none())
+        .then_some((req.path_start, req.path_end));
+    line_refusal(head, target, max_line)
 }
 
 /// The start of the first line of `head` longer than `max` bytes, without
@@ -735,8 +971,18 @@ async fn many_header_lines<S: ConnIo>(
         b"client sent too many header lines while reading client request headers",
         None,
     );
-    let response = http.header_too_large.pick(Method::Get);
-    reject_request(stream, scratch, http, response, head, conn).await;
+    let response = http.header_too_large.pick(head_method(head));
+    reject_request(
+        stream,
+        scratch,
+        http,
+        response,
+        head,
+        Refused::Headers,
+        conn,
+    )
+    .await;
+    linger_after_reject(stream, scratch).await;
 }
 
 /// nginx's `[info]` line for a request refused while its head is read
@@ -836,7 +1082,7 @@ async fn head_too_large<S: ConnIo>(
     let (message, response) = match header_line {
         None => (
             "client sent too long URI while reading client request line".to_string(),
-            http.uri_too_large.pick(Method::Get),
+            http.uri_too_large.pick(head_method(head)),
         ),
         Some(start) => {
             let line = &head[start..];
@@ -851,7 +1097,7 @@ async fn head_too_large<S: ConnIo>(
                      headers",
                     String::from_utf8_lossy(line)
                 ),
-                http.header_too_large.pick(Method::Get),
+                http.header_too_large.pick(head_method(head)),
             )
         }
     };
@@ -866,7 +1112,35 @@ async fn head_too_large<S: ConnIo>(
             String::from_utf8_lossy(request_line),
         ),
     );
-    reject_request(stream, scratch, http, response, head, conn).await;
+    let refused = match header_line {
+        None => Refused::Line,
+        Some(_) => Refused::Headers,
+    };
+    reject_request(stream, scratch, http, response, head, refused, conn).await;
+    linger_after_reject(stream, scratch).await;
+}
+
+/// After a head refused for its size the rest of it is likely still
+/// coming: a close with it unread would be a reset, which can lose the
+/// response, so it is read and dropped first, as nginx's lingering close
+/// does (#780).
+#[cold]
+#[inline(never)]
+async fn linger_after_reject<S: ConnIo>(stream: &mut S, scratch: &mut Vec<u8>) {
+    if !stream.h2() {
+        Box::pin(lingering_close(stream, scratch)).await;
+    }
+}
+
+/// The method of a refused head, once the request line got past it: a
+/// `HEAD` gets its error without a body (#783).
+#[cold]
+#[inline(never)]
+fn head_method(head: &[u8]) -> Method {
+    match head.iter().position(|&b| b == b' ') {
+        Some(end) => http::classify_method(&head[..end]),
+        None => Method::Other,
+    }
 }
 
 /// A response head for the access log when a timed-out write took the
@@ -1144,7 +1418,7 @@ fn finish_proxy_response(
     // with no body, then goes back with the upstream connection.
     // A body in the cache file (#515) likewise: the head is filtered,
     // the ranges cut the file.
-    let (upstream_resp, relayed, file) = match upstream_resp {
+    let (upstream_resp, mut relayed, file) = match upstream_resp {
         Response::ProxyStream(mut body) => (
             Response::Owned(std::mem::take(&mut body.head)),
             Some(body),
@@ -1212,7 +1486,7 @@ fn finish_proxy_response(
                 }
             }
             (upstream_resp, file) => (
-                range_filter(upstream_resp, relayed.is_some(), &process_meta, ctx),
+                range_filter(upstream_resp, &mut relayed, &process_meta, ctx),
                 file,
             ),
         }
@@ -1283,23 +1557,41 @@ fn may_cut_ranges(
 }
 
 /// nginx's range filter over a proxied or cached response (#370): an
-/// in-memory one is cut, a relayed one only says it could be.
+/// in-memory one is cut, a relayed one cut as it passes (#463).
 #[cold]
 #[inline(never)]
 fn range_filter(
     response: Response,
-    relayed: bool,
+    relayed: &mut Option<Box<crate::proxy_stream::ProxyStream>>,
     meta: &phase::ProcessMeta,
     ctx: &phase::RequestCtx<'_>,
 ) -> Response {
+    use super::range::RelayedCut;
     let req = super::range::RangeRequest {
         range: ctx.range,
         if_range: ctx.if_range,
         head_only: matches!(ctx.method, Method::Head),
     };
     match response {
-        Response::Owned(head) if relayed => {
-            Response::Owned(super::range::relayed_head(head, meta.max_ranges))
+        Response::Owned(head) if relayed.is_some() => {
+            match super::range::filter_relayed(head, meta.max_ranges, req, |len, server| {
+                super::range::not_satisfiable(len, req.head_only, server)
+            }) {
+                RelayedCut::Head(head) => Response::Owned(head),
+                RelayedCut::Window(head, start, end) => {
+                    if let Some(body) = relayed.as_deref_mut() {
+                        body.window = Some(crate::proxy_stream::Window::new(start, end));
+                    }
+                    Response::Owned(head)
+                }
+                // The body isn't the client's: only a cache reads on.
+                RelayedCut::Answer(answer) => {
+                    if let Some(body) = relayed.take() {
+                        crate::proxy_stream::fill_detached(body);
+                    }
+                    Response::Owned(answer)
+                }
+            }
         }
         Response::Owned(bytes) => Response::Owned(super::range::filter(
             bytes,
@@ -1379,14 +1671,11 @@ enum PassOutcome {
 async fn run_proxy_pass(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
-    mut plan: Box<crate::proxy::ProxyPlan>,
+    plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
     uri: Option<&[u8]>,
 ) -> PassOutcome {
-    // After an internal redirect the answer's head is rewritten further
-    // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
-    plan.stream = false;
     let response_rules = plan.response;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
@@ -1775,6 +2064,10 @@ fn carry_accel_headers(response: Response, carried: &[u8], proxied: bool) -> Res
             headers: merge(headers),
             body,
         },
+        Response::ProxyStream(mut s) => {
+            s.head = merge(std::mem::take(&mut s.head));
+            Response::ProxyStream(s)
+        }
         other => other,
     }
 }
@@ -4067,6 +4360,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // keep-alive ones; client_header_timeout bounds the wait. A connection
     // an old worker accepted just before it stopped is served, not reset.
     let mut fresh = true;
+    // The last request's body was read from the socket, up to its end: the
+    // next request may be queued behind it (`read_queued`).
+    let mut body_read = false;
 
     // Per-connection scratch buffers — allocated once and reused across
     // every request on this connection. `mem::take` during `write_all`
@@ -4117,16 +4413,26 @@ pub(crate) async fn handle<S: ConnIo>(
     'idle: loop {
         conn_stats.set(super::stats::Phase::Waiting);
         let (buf_ptr, buf_len) = (buf.as_ptr(), buf.len());
-        let (next, returned) = stream
-            .idle_read(
-                std::mem::take(&mut *buf),
-                state,
-                keepalive_idle_timeout,
-                std::mem::take(&mut fresh),
-                &mut timers,
-            )
-            .await;
-        *buf = returned;
+        let next = match std::mem::take(&mut body_read) {
+            true => read_queued(stream, buf, state),
+            false => None,
+        };
+        let next = match next {
+            Some(next) => next,
+            None => {
+                let (next, returned) = stream
+                    .idle_read(
+                        std::mem::take(&mut *buf),
+                        state,
+                        keepalive_idle_timeout,
+                        std::mem::take(&mut fresh),
+                        &mut timers,
+                    )
+                    .await;
+                *buf = returned;
+                next
+            }
+        };
         let mut filled: usize = match next {
             IdleRead::Close => return,
             IdleRead::Ready => 0,
@@ -4225,11 +4531,27 @@ pub(crate) async fn handle<S: ConnIo>(
                                 timeouts.large_header,
                             )
                         {
+                            let head = &buf[read_start..read_start + req.consumed];
+                            if line > 0
+                                && let Some(refusal) =
+                                    parsed_line_refusal(head, &req, timeouts.large_header_line)
+                            {
+                                refuse_line(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    head,
+                                    refusal,
+                                    conn_log!(),
+                                )
+                                .await;
+                                return;
+                            }
                             head_too_large(
                                 stream,
                                 &mut *scratch,
                                 http,
-                                &buf[read_start..read_start + req.consumed],
+                                head,
                                 (line > 0).then_some(line),
                                 conn_log!(),
                             )
@@ -4246,14 +4568,22 @@ pub(crate) async fn handle<S: ConnIo>(
                                     .saturating_add(stream.h2_synthetic_lines()),
                             )
                         {
-                            many_header_lines(
-                                stream,
-                                &mut *scratch,
-                                http,
-                                &buf[read_start..read_start + req.consumed],
-                                conn_log!(),
-                            )
-                            .await;
+                            let head = &buf[read_start..read_start + req.consumed];
+                            if let Some(refusal) =
+                                parsed_line_refusal(head, &req, timeouts.large_header_line)
+                            {
+                                refuse_line(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    head,
+                                    refusal,
+                                    conn_log!(),
+                                )
+                                .await;
+                                return;
+                            }
+                            many_header_lines(stream, &mut *scratch, http, head, conn_log!()).await;
                             return;
                         }
                         conn_stats.request();
@@ -4308,7 +4638,14 @@ pub(crate) async fn handle<S: ConnIo>(
                                     RequestTransferEncoding::Invalid => Some(400),
                                 }
                             };
-                            if refuse.is_some() {
+                            if refuse.is_some()
+                                && parsed_line_refusal(
+                                    &buf[base..base + req.consumed],
+                                    &req,
+                                    usize::MAX,
+                                )
+                                .is_none()
+                            {
                                 let message = if !req.http_11 {
                                     "client sent HTTP/1.0 request with \"Transfer-Encoding\" header"
                                         .to_string()
@@ -4344,12 +4681,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
-                                    refused_parsed_head_log(
-                                        http,
-                                        conn_log!(),
-                                        &buf[base..base + req.headers_end],
-                                        "client sent invalid host in request line while reading client request line",
-                                    );
+                                    if parsed_line_refusal(
+                                        &buf[base..base + req.consumed],
+                                        &req,
+                                        usize::MAX,
+                                    )
+                                    .is_none()
+                                    {
+                                        refused_parsed_head_log(
+                                            http,
+                                            conn_log!(),
+                                            &buf[base..base + req.headers_end],
+                                            "client sent invalid host in request line while reading client request line",
+                                        );
+                                    }
                                     None
                                 }
                             },
@@ -4365,12 +4710,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
-                                    refused_parsed_head_log(
-                                        http,
-                                        conn_log!(),
-                                        &buf[base..base + req.headers_end],
-                                        "client sent invalid host header while reading client request headers",
-                                    );
+                                    if parsed_line_refusal(
+                                        &buf[base..base + req.consumed],
+                                        &req,
+                                        usize::MAX,
+                                    )
+                                    .is_none()
+                                    {
+                                        refused_parsed_head_log(
+                                            http,
+                                            conn_log!(),
+                                            &buf[base..base + req.headers_end],
+                                            "client sent invalid host header while reading client request headers",
+                                        );
+                                    }
                                     None
                                 }
                             },
@@ -4668,8 +5021,10 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let take = (already as u64).min(cl) as usize;
                                 if discard_body {
                                     if cl > take as u64 {
-                                        pending_discard =
-                                            Some(PendingDiscard::Length(cl - take as u64));
+                                        let rest = stream.discard_queued(cl - take as u64);
+                                        if rest > 0 {
+                                            pending_discard = Some(PendingDiscard::Length(rest));
+                                        }
                                     }
                                     break 'read (take, cl);
                                 }
@@ -4714,7 +5069,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         let Some((res, returned)) = with_timeout(
                                             timers.io.as_mut(),
                                             body_timeout,
-                                            stream.read(slice),
+                                            stream.read_now(slice),
                                         )
                                         .await
                                         else {
@@ -4753,6 +5108,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         http,
                                         http.bad_request.pick(method),
                                         &buf[read_start..filled],
+                                        Refused::Body,
                                         conn_log!(),
                                     )
                                     .await;
@@ -4787,6 +5143,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         http,
                                         http.bad_request.pick(method),
                                         &buf[read_start..filled],
+                                        Refused::Body,
                                         conn_log!(),
                                     )
                                     .await;
@@ -4796,6 +5153,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         } else {
                             (0, 0)
                         };
+                        body_read = request_body_len > body_in_buf as u64;
                         // Over the limit: big enough for the location's check.
                         let body_len = if body_too_large {
                             request_body_len.max(max_body.saturating_add(1))
@@ -5590,28 +5948,41 @@ pub(crate) async fn handle<S: ConnIo>(
                     Parse::Incomplete => break,
                     Parse::Invalid => {
                         request_count = request_count.saturating_add(1);
+                        if parse_state.rline_done
+                            && let Some(refusal) = line_refusal(
+                                &buf[read_start..filled],
+                                (!parse_state.implicit_path && !parse_state.has_absolute_query)
+                                    .then_some((parse_state.path_start, parse_state.path_end)),
+                                timeouts.large_header_line,
+                            )
+                        {
+                            refuse_line(
+                                stream,
+                                &mut *scratch,
+                                http,
+                                &buf[read_start..filled],
+                                refusal,
+                                conn_log!(),
+                            )
+                            .await;
+                            return;
+                        }
                         let bad_version = invalid_head_log(
                             http,
                             conn_log!(),
                             &buf[read_start..filled],
                             stream.h2(),
                         );
-                        // Honor HEAD if the request line parsed before the
-                        // header block went sideways (or did but for its
-                        // version); otherwise default to full — we don't
-                        // know the method and a body on a 400 is fine for
-                        // non-HEAD clients.
+                        // Honor HEAD once the request line got past the
+                        // method, as nginx knows it then; otherwise a full
+                        // response.
                         let method = if parse_state.rline_done {
                             http::classify_method(
                                 &buf[read_start + parse_state.method_start
                                     ..read_start + parse_state.method_end],
                             )
-                        } else if bad_version {
-                            let line = &buf[read_start..filled];
-                            let end = line.iter().position(|&b| b == b' ').unwrap_or(0);
-                            http::classify_method(&line[..end])
                         } else {
-                            Method::Other
+                            head_method(&buf[read_start..filled])
                         };
                         let page = if bad_version {
                             &http.version_not_supported
@@ -5624,6 +5995,11 @@ pub(crate) async fn handle<S: ConnIo>(
                             http,
                             page.pick(method),
                             &buf[read_start..filled],
+                            if parse_state.rline_done {
+                                Refused::Headers
+                            } else {
+                                Refused::Line
+                            },
                             conn_log!(),
                         )
                         .await;
@@ -5666,6 +6042,25 @@ pub(crate) async fn handle<S: ConnIo>(
                     if buf.len() < limit {
                         grow_head_buffer(buf, limit);
                         continue;
+                    }
+                    if parse_state.rline_done
+                        && let Some(refusal) = line_refusal(
+                            &buf[..filled],
+                            (!parse_state.implicit_path && !parse_state.has_absolute_query)
+                                .then_some((parse_state.path_start, parse_state.path_end)),
+                            usize::MAX,
+                        )
+                    {
+                        refuse_line(
+                            stream,
+                            &mut *scratch,
+                            http,
+                            &buf[..filled],
+                            refusal,
+                            conn_log!(),
+                        )
+                        .await;
+                        return;
                     }
                     head_too_large(
                         stream,

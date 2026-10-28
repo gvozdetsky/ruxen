@@ -182,8 +182,8 @@ pub struct ProxyPlan {
     /// connections are bound to. Pooled ones are reused as they are.
     pub bind: Option<LocalBind>,
     /// A body that doesn't arrive with the header may be relayed as it
-    /// comes (#88): nothing on this location needs it whole (no cache or
-    /// `add_trailer`), and this is the request's first pass.
+    /// comes (#88): nothing on this location needs it whole (no
+    /// `add_trailer`).
     pub stream: bool,
     /// `proxy_force_ranges`: the range filter may cut the response whatever
     /// the upstream says (#370).
@@ -374,6 +374,12 @@ async fn write_request_parts(
     send_timeout: Duration,
 ) -> Option<std::io::Result<()>> {
     let mut parts = RequestParts::new(head, body);
+    if parts.body.len() >= SEND_NOW_FROM
+        && let UpstreamIo::Plain(sock) = stream
+        && crate::worker::driver() == crate::worker::Driver::IoUring
+    {
+        return send_parts_now(sock, parts, send_timeout).await;
+    }
     while parts.len() > 0 {
         let (res, returned) = timeout(
             send_timeout,
@@ -387,6 +393,54 @@ async fn write_request_parts(
             Ok(n) => parts.advance(n),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(()))
+}
+
+/// A request body this large goes to the upstream with `send_parts_now`;
+/// smaller requests are cheaper batched in the ring (a syscall each cost
+/// `proxy_hello` 0.5–0.9%).
+const SEND_NOW_FROM: usize = 16 * 1024;
+
+/// `write_request_parts` on plain TCP under io_uring: `sendmsg` now, while
+/// a body just read is in the cache, waiting only when the socket is full
+/// (#757, as `write_all_now`).
+async fn send_parts_now(
+    sock: &monoio::net::TcpStream,
+    mut parts: RequestParts,
+    send_timeout: Duration,
+) -> Option<std::io::Result<()>> {
+    use std::os::unix::io::AsRawFd;
+    while parts.len() > 0 {
+        // SAFETY: a msghdr over `parts`' iovecs, which point into its live
+        // `head` and `body`.
+        let n = unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = parts.iov.as_mut_ptr();
+            msg.msg_iovlen = 2;
+            libc::sendmsg(
+                sock.as_raw_fd(),
+                &msg,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n > 0 {
+            parts.advance(n as usize);
+            continue;
+        }
+        if n == 0 {
+            return Some(Err(std::io::ErrorKind::WriteZero.into()));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if let Err(e) = timeout(send_timeout, sock.writable(false)).await.ok()? {
+                    return Some(Err(e));
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return Some(Err(e)),
         }
     }
     Some(Ok(()))
@@ -873,13 +927,13 @@ pub async fn run_proxy(
                     .as_ref()
                     .and_then(|rules| rules.iter().find(|r| r.status == status));
                 let mut resp = resp;
-                if let Some(cache) = plan.cache.as_deref() {
+                if let Some(cache) = plan.cache.as_deref_mut() {
                     if let Some(storable) = storable.take() {
-                        store_response(cache, storable, status, intercepted.is_some(), &resp);
+                        store_response(cache, storable, status, intercepted.is_some(), &mut resp);
                         // The client may already have it (#349): the
                         // not-modified filter of a cacheable response.
                         if status == 200 && intercepted.is_none() {
-                            conditional_fresh(&plan, cache, &mut resp);
+                            conditional_fresh(plan.method, plan.server_bytes, cache, &mut resp);
                         }
                     }
                     if cache.head_as_get {
@@ -1028,6 +1082,7 @@ fn response_status(resp: &Response) -> Option<u16> {
         Response::Prebuilt(b) => parse_response_status(b),
         Response::Owned(b) => parse_response_status(b),
         Response::File { headers, .. } => parse_response_status(headers),
+        Response::ProxyStream(s) => parse_response_status(&s.head),
         _ => None,
     }
 }
@@ -1068,6 +1123,7 @@ fn build_intercept_reroute(
             Response::Prebuilt(b) => b,
             Response::Owned(b) => b,
             Response::File { headers, .. } => headers,
+            Response::ProxyStream(s) => &s.head,
             _ => &[],
         };
         crate::worker::response_header_values_all(bytes, b"www-authenticate")
@@ -2235,15 +2291,11 @@ async fn attempt(
         return AttemptOutcome::Ok(Response::Owned(head));
     }
     // A body that hasn't all arrived goes to the client as it comes (#88),
-    // unless something needs it whole: a status that may fail over or be
-    // intercepted (decided after the body today), or the plan says so.
+    // unless the plan needs it whole. A status that fails over or is
+    // intercepted drops it unread, as nginx decides both on the header;
+    // a cacheable one goes into the cache file on the way (#463).
     if plan.stream
         && body_has_content
-        && !plan.next_upstream.matches_status(status_code)
-        && !plan
-            .intercept
-            .as_ref()
-            .is_some_and(|rules| rules.iter().any(|r| r.status == status_code))
         && let Some(framing) = stream_framing(
             &accum[body_start..],
             chunked,
@@ -2273,6 +2325,9 @@ async fn attempt(
                     opened_at,
                     requests_served,
                 });
+        if plan.cache.as_ref().is_some_and(|c| c.store) {
+            *storable = storable_response(plan, &accum[..head_end], status_code, 0);
+        }
         let pending = accum[body_start..].to_vec();
         return_proxy_buf(accum);
         return AttemptOutcome::Ok(Response::ProxyStream(Box::new(
@@ -2292,6 +2347,8 @@ async fn attempt(
                 upstream_url: upstream_url(plan, peer_idx),
                 lease: None,
                 gzip: None,
+                cache: None,
+                window: None,
             },
         )));
     }
@@ -2781,11 +2838,11 @@ fn storable_response(
 /// `proxy_intercept_errors` takes it (nginx's cached `error`).
 #[cold]
 fn store_response(
-    cache: &CachePlan,
+    cache: &mut CachePlan,
     storable: Storable,
     status: u16,
     intercepted: bool,
-    resp: &Response,
+    resp: &mut Response,
 ) {
     if intercepted {
         cache
@@ -2793,8 +2850,11 @@ fn store_response(
             .store_error(&cache.hash, status, storable.valid_sec);
         return;
     }
-    let Response::Owned(out) = resp else {
-        return;
+    let (body, relayed): (&[u8], _) = match resp {
+        Response::Owned(out) => (&out[storable.client_head_len..], None),
+        // Relayed: the body goes into the file as it arrives (#463).
+        Response::ProxyStream(s) => (&[], Some(s)),
+        _ => return,
     };
     let variant = if storable.vary.is_empty() {
         [0; 16]
@@ -2817,11 +2877,21 @@ fn store_response(
         vary: &storable.vary,
         variant,
         head: &storable.head,
-        body: &out[storable.client_head_len..],
+        body,
     };
     // A file that can't be written leaves the entry uncached; the
     // response itself still goes out.
-    let _ = cache.zone.store(at, &entry);
+    let Some(relayed) = relayed else {
+        let _ = cache.zone.store(at, &entry);
+        return;
+    };
+    if let Ok(mut fill) = cache.zone.fill(at, &entry) {
+        // Other requests wait for this one's file (proxy_cache_lock).
+        if let Some(token) = cache.token.take() {
+            fill.hold_lock(cache.hash, token);
+        }
+        relayed.cache = Some(Box::new(fill));
+    }
 }
 
 /// The upstream said 304 to a revalidation (ngx_http_upstream_test_next):
@@ -2937,17 +3007,32 @@ fn background_update(
     }
     Box::pin(async move {
         let mut report = ProxyReport::default();
-        let _ = run_proxy(plan, &mut report, None).await;
+        // A relayed body goes into the cache only.
+        if let Response::ProxyStream(s) = run_proxy(plan, &mut report, None).await
+            && s.cache.is_some()
+        {
+            crate::proxy_stream::fill_cache(s).await;
+        }
     })
 }
 
 /// The client asked with HEAD and the upstream got a GET: keep the header
-/// block, with the body's length, and drop the body.
+/// block, with the body's length, and drop the body (a relayed one still
+/// goes into the cache).
 fn strip_body(resp: &mut Response) {
-    if let Response::Owned(out) = resp
-        && let Some((end, terminator)) = find_head_end(out, 0)
-    {
-        out.truncate(end + terminator);
+    match resp {
+        Response::Owned(out) => {
+            if let Some((end, terminator)) = find_head_end(out, 0) {
+                out.truncate(end + terminator);
+            }
+        }
+        Response::ProxyStream(s) => {
+            let head = std::mem::take(&mut s.head);
+            if let Response::ProxyStream(s) = std::mem::replace(resp, Response::Owned(head)) {
+                crate::proxy_stream::fill_detached(s);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3109,24 +3194,29 @@ fn not_modified(head: &[u8], request_headers: &[u8]) -> Option<u16> {
 }
 
 /// `not_modified` for a response just fetched and stored: `resp` (the
-/// client's response, buffered with a cache) becomes the 304 or 412.
+/// client's response) becomes the 304 or 412. A relayed body still goes
+/// into the cache.
 #[cold]
 #[inline(never)]
-fn conditional_fresh(plan: &ProxyPlan, cache: &CachePlan, resp: &mut Response) {
-    let Response::Owned(out) = resp else {
-        return;
+fn conditional_fresh(method: Method, server: &[u8], cache: &CachePlan, resp: &mut Response) {
+    let out = match resp {
+        Response::Owned(out) => out,
+        Response::ProxyStream(s) => &s.head,
+        _ => return,
     };
     let Some((end, terminator)) = find_head_end(out, 0) else {
         return;
     };
-    match not_modified(&out[..end + terminator], &cache.request_headers) {
+    let answer = match not_modified(&out[..end + terminator], &cache.request_headers) {
         Some(412) => {
             let body = format!("{}\n", crate::http::reason_phrase(412));
-            *out =
-                crate::http::error_response_for_method(412, &body, plan.method, plan.server_bytes);
+            crate::http::error_response_for_method(412, &body, method, server)
         }
-        Some(status) => *out = conditional_head(&out[..end], status),
-        None => {}
+        Some(status) => conditional_head(&out[..end], status),
+        None => return,
+    };
+    if let Response::ProxyStream(s) = std::mem::replace(resp, Response::Owned(answer)) {
+        crate::proxy_stream::fill_detached(s);
     }
 }
 

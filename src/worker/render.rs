@@ -618,6 +618,26 @@ pub(crate) fn lookup_request_header<'a>(mut block: &'a [u8], name: &[u8]) -> Opt
     None
 }
 
+/// Every value of `name` in the raw header block, trimmed, in order.
+pub(crate) fn request_header_values<'a>(
+    block: &'a [u8],
+    name: &'a [u8],
+) -> impl DoubleEndedIterator<Item = &'a [u8]> {
+    block.split(|&b| b == b'\n').filter_map(move |line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let colon = line.iter().position(|&b| b == b':')?;
+        header_name_eq_ci(&line[..colon], name)
+            .then(|| line[colon + 1..].trim_ascii_start())
+            .map(|v| {
+                let end = v
+                    .iter()
+                    .rposition(|&c| c != b' ' && c != b'\t')
+                    .map_or(0, |i| i + 1);
+                &v[..end]
+            })
+    })
+}
+
 /// Walk every occurrence of `name` in the raw header block and write each
 /// trimmed value into `out`, joined with `, ` (or `; ` for Cookie, matching
 /// nginx's `ngx_http_variables.c::ngx_http_variable_headers` /
@@ -1148,12 +1168,10 @@ fn json_escape_into(value: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Render parts for the args side of a rewrite replacement. Numbered
-/// regex captures (`$1`..`$9`) get arg-escaped (nginx's `NGX_ESCAPE_ARGS`),
-/// since they were captured from the decoded URI and may contain bytes
-/// that need percent-encoding to be safe in args context (e.g. `%`).
-/// Literals and other variables pass through unchanged — nginx applies
-/// the escape only to capture variables in this context.
+/// Render a rewrite replacement with its numbered captures (`$1`..`$9`,
+/// from the decoded URI) escaped as nginx's `NGX_ESCAPE_ARGS`; literals
+/// and other variables pass through. When nginx escapes at all is the
+/// caller's (`execute_rewrite_ops`).
 pub(crate) fn render_parts_with_arg_escape(
     parts: &[PreparedValuePart],
     ctx: &RenderCtx<'_>,
@@ -1172,19 +1190,12 @@ pub(crate) fn render_parts_with_arg_escape(
     }
 }
 
-/// nginx's `ngx_escape_uri(... NGX_ESCAPE_ARGS)`: percent-encode bytes
-/// that aren't safe inside a URL query string. Conservative: covers
-/// control bytes, high bytes, space, and the args-meta characters
-/// (`#`, `%`, `&`, `+`, `?`) plus a handful of non-args-safe ASCII
-/// punctuation.
+/// nginx's `ngx_escape_uri(… NGX_ESCAPE_ARGS)` (ngx_string.c, `args`):
+/// control bytes, space, DEL and above, and ``"#%&+;<>?\^`{|}``.
 pub(crate) fn escape_args_into(input: &[u8], out: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in input {
-        let escape = !(0x21..0x7f).contains(&b)
-            || matches!(
-                b,
-                b'"' | b'#' | b'%' | b'&' | b'+' | b'<' | b'>' | b'?' | b'`'
-            );
+        let escape = !(0x21..0x7f).contains(&b) || b"\"#%&+;<>?\\^`{|}".contains(&b);
         if escape {
             out.push(b'%');
             out.push(HEX[(b >> 4) as usize]);

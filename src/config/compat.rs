@@ -30,7 +30,16 @@ pub struct Finding {
     /// The directive as written, arguments included.
     pub directive: String,
     pub note: String,
+    /// What to do about it: the section of `docs/migrating.md`.
+    pub section: &'static str,
 }
+
+/// The migration guide, as of this version.
+const GUIDE: &str = concat!(
+    "https://github.com/gvozdetsky/ruxen/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/docs/migrating.md"
+);
 
 thread_local! {
     static FINDINGS: RefCell<Option<Vec<Finding>>> = const { RefCell::new(None) };
@@ -50,12 +59,13 @@ fn collecting() -> bool {
     FINDINGS.with(|f| f.borrow().is_some())
 }
 
-fn record(lx: &Lexer, severity: Severity, args: &[String], note: String) {
+fn record(lx: &Lexer, severity: Severity, args: &[String], note: String, section: &'static str) {
     let finding = Finding {
         severity,
         position: lx.position(),
         directive: args.join(" "),
         note,
+        section,
     };
     FINDINGS.with(|f| {
         if let Some(list) = f.borrow_mut().as_mut() {
@@ -79,10 +89,12 @@ pub(crate) fn unknown(
         });
     }
     let mut note = format!("unknown directive {}", super::error::in_block(ctx));
-    if let Some(module) = missing_module(&args[0]) {
+    let mut section = "other-modules-and-unknown-directives";
+    if let Some((module, s)) = missing_module(&args[0]) {
         note.push_str(&format!(" ({module} isn't in ruxen: README, Limitations)"));
+        section = s;
     }
-    record(lx, Severity::Unsupported, args, note);
+    record(lx, Severity::Unsupported, args, note, section);
     if matches!(term, Terminator::BlockOpen) {
         skip_block(lx)?;
     }
@@ -90,39 +102,44 @@ pub(crate) fn unknown(
 }
 
 /// The nginx module a directive ruxen doesn't know belongs to, for the
-/// ones a configuration commonly has and ruxen doesn't implement.
-fn missing_module(name: &str) -> Option<&'static str> {
-    const PREFIXES: &[(&str, &str)] = &[
-        ("fastcgi_", "FastCGI"),
-        ("uwsgi_", "uwsgi"),
-        ("scgi_", "SCGI"),
-        ("memcached_", "memcached"),
-        ("grpc_", "gRPC proxying"),
-        ("ssi_", "SSI"),
-        ("sub_filter", "sub_filter"),
-        ("geoip", "GeoIP"),
-        ("perl", "embedded Perl"),
-        ("js_", "njs"),
-        ("image_filter", "image_filter"),
-        ("xslt", "XSLT"),
-        ("mp4", "MP4 streaming"),
-        ("flv", "FLV streaming"),
-        ("dav_", "WebDAV"),
-        ("slice", "slice"),
-        ("mirror", "mirror"),
-        ("userid", "userid"),
-        ("secure_link", "secure_link"),
+/// ones a configuration commonly has and ruxen doesn't implement, and its
+/// section of the guide.
+fn missing_module(name: &str) -> Option<(&'static str, &'static str)> {
+    const UPSTREAMS: &str = "fastcgi-uwsgi-scgi-memcached";
+    const OTHER: &str = "other-modules-and-unknown-directives";
+    const PREFIXES: &[(&str, &str, &str)] = &[
+        ("fastcgi_", "FastCGI", UPSTREAMS),
+        ("uwsgi_", "uwsgi", UPSTREAMS),
+        ("scgi_", "SCGI", UPSTREAMS),
+        ("memcached_", "memcached", UPSTREAMS),
+        ("grpc_", "gRPC proxying", "grpc_pass"),
+        ("ssi_", "SSI", "ssi"),
+        ("sub_filter", "sub_filter", "sub_filter"),
+        ("geoip", "GeoIP", OTHER),
+        ("perl", "embedded Perl", OTHER),
+        ("js_", "njs", OTHER),
+        ("image_filter", "image_filter", OTHER),
+        ("xslt", "XSLT", OTHER),
+        ("mp4", "MP4 streaming", OTHER),
+        ("flv", "FLV streaming", OTHER),
+        ("dav_", "WebDAV", OTHER),
+        ("slice", "slice", OTHER),
+        ("mirror", "mirror", OTHER),
+        ("userid", "userid", OTHER),
+        ("secure_link", "secure_link", OTHER),
     ];
     match name {
-        "geo" => Some("geo"),
-        "stream" => Some("the stream module"),
-        "mail" => Some("the mail module"),
-        "ssi" => Some("SSI"),
-        _ if name.contains("_by_lua") || name.starts_with("lua_") => Some("Lua (OpenResty)"),
+        "geo" => Some(("geo", OTHER)),
+        "stream" => Some(("the stream module", "stream-and-mail")),
+        "mail" => Some(("the mail module", "stream-and-mail")),
+        "ssi" => Some(("SSI", "ssi")),
+        _ if name.contains("_by_lua") || name.starts_with("lua_") => {
+            Some(("Lua (OpenResty)", OTHER))
+        }
         _ => PREFIXES
             .iter()
-            .find(|(p, _)| name.starts_with(p))
-            .map(|(_, m)| *m),
+            .find(|(p, _, _)| name.starts_with(p))
+            .map(|(_, m, s)| (*m, *s)),
     }
 }
 
@@ -138,7 +155,8 @@ pub(crate) fn unenforced(lx: &Lexer, args: &[String], err: Error) -> Result<(), 
         }
         other => other.to_string(),
     };
-    record(lx, Severity::Unsupported, args, note);
+    // `location $var` is the only one left (#596).
+    record(lx, Severity::Unsupported, args, note, "location-var");
     Ok(())
 }
 
@@ -150,7 +168,13 @@ pub(crate) fn include_failed(lx: &Lexer, args: &[String], err: Error) -> Result<
         return Err(err);
     }
     let note = format!("{err}; the check goes on without it");
-    record(lx, Severity::Unsupported, args, note);
+    record(
+        lx,
+        Severity::Unsupported,
+        args,
+        note,
+        "an-include-that-cant-be-read",
+    );
     Ok(())
 }
 
@@ -183,6 +207,7 @@ pub(crate) fn precheck(lx: &Lexer, args: &mut Vec<String>) {
             "{} rejected: ruxen speaks TLSv1.2 and TLSv1.3 only, and nothing else is listed",
             old.join(", ")
         ),
+        "ssl_protocols",
     );
     args.retain(|v| !old.contains(v));
     if args.len() == 1 {
@@ -208,8 +233,8 @@ pub(crate) fn ignored(lx: &Lexer, args: &[String]) {
     if seen {
         return;
     }
-    let (severity, note) = classify(args);
-    record(lx, severity, args, note);
+    let (severity, note, section) = classify(args);
+    record(lx, severity, args, note, section);
 }
 
 /// A block ruxen skips (`IGNORED_BLOCK`).
@@ -217,169 +242,166 @@ pub(crate) fn ignored_block(lx: &Lexer, args: &[String]) {
     if !collecting() {
         return;
     }
-    let (severity, note) = match args[0].as_str() {
-        // Read by nginx only to size its connection table; ruxen takes
-        // `worker_connections` from it.
-        "events" => return,
-        _ => (
-            Severity::Ignored,
-            "accepted, no effect in ruxen".to_string(),
-        ),
-    };
-    record(lx, severity, args, note);
+    // `events`: read by nginx only to size its connection table; ruxen
+    // takes `worker_connections` from it.
+    if args[0] == "events" {
+        return;
+    }
+    record(
+        lx,
+        Severity::Ignored,
+        args,
+        "accepted, no effect in ruxen".to_string(),
+        IGNORED,
+    );
 }
 
 /// Ignored directives whose effect a user would notice: nginx's default
 /// value (a directive set to it changes nothing), or `None` when any use
-/// differs, and what happens in ruxen instead.
-const DIFFERS: &[(&str, Option<&str>, &str)] = &[
-    // gzip works at http, server and location level; only inside `if`
-    // it is still accepted and ignored.
+/// differs, what happens in ruxen instead, and the guide's section.
+const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
+    // gzip works at http, server and location level, and in a location's
+    // `if`; only in a server's `if` it is still accepted and ignored.
     (
         "gzip",
         Some("off"),
         "not applied inside `if`: set it in the location instead",
+        "gzip-in-if",
     ),
     (
         "gzip_static",
         Some("off"),
-        "precompressed .gz files are not served (#93)",
+        "precompressed .gz files are not served (#760)",
+        "gzip_static-on",
     ),
-    ("ssi", Some("off"), "server-side includes are not processed"),
+    (
+        "ssi",
+        Some("off"),
+        "server-side includes are not processed",
+        "ssi",
+    ),
     (
         "charset",
         None,
         "a charset from a variable is not supported yet: none is added to Content-Type",
+        "charset-conversion",
     ),
-    ("override_charset", Some("off"), "nothing is converted"),
+    (
+        "override_charset",
+        Some("off"),
+        "nothing is converted",
+        "charset-conversion",
+    ),
     (
         "source_charset",
         None,
         "nothing is converted: a response is labelled only when it is already in `charset`",
+        "charset-conversion",
     ),
     (
         "chunked_transfer_encoding",
         Some("on"),
-        "not applied at this level (ruxen reads it in location only)",
+        "not applied at this level (ruxen reads it in server and location only)",
+        "chunked_transfer_encoding",
     ),
     (
         "proxy_buffering",
         Some("on"),
-        "ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #88)",
+        "ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #463)",
+        "proxy_buffering-off",
     ),
     (
         "proxy_request_buffering",
         Some("on"),
         "request bodies are still read whole before they are proxied (#134)",
+        "proxy_request_buffering-off",
     ),
     (
         "proxy_store",
         Some("off"),
         "proxied responses are not stored",
+        "proxy_store",
     ),
     // The ssl_* lines the server parser takes and doesn't apply.
     (
         "ssl_early_data",
         Some("off"),
         "TLS 1.3 early data is not accepted",
+        "ssl_early_data-on",
     ),
     (
         "ssl_conf_command",
         None,
         "OpenSSL commands are not applied: ruxen's TLS is rustls",
+        "ssl_conf_command",
     ),
-    (
-        "ssl_password_file",
-        None,
-        "encrypted private keys can't be loaded yet (#139)",
-    ),
-    (
-        "ssl_verify_client",
-        Some("off"),
-        "client certificates are not requested yet (#113)",
-    ),
-    (
-        "ssl_client_certificate",
-        None,
-        "client certificates are not requested yet (#113)",
-    ),
-    (
-        "ssl_trusted_certificate",
-        None,
-        "client certificates are not requested yet (#113)",
-    ),
-    (
-        "ssl_verify_depth",
-        None,
-        "client certificates are not requested yet (#113)",
-    ),
-    (
-        "ssl_crl",
-        None,
-        "client certificates are not requested yet (#113)",
-    ),
-    (
-        "http3",
-        None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
-    ),
-    (
-        "http3_hq",
-        None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
-    ),
+    ("http3", None, NO_HTTP3, "http3-and-quic"),
+    ("http3_hq", None, NO_HTTP3, "http3-and-quic"),
     (
         "http3_max_concurrent_streams",
         None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+        NO_HTTP3,
+        "http3-and-quic",
     ),
-    (
-        "http3_stream_buffer_size",
-        None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
-    ),
+    ("http3_stream_buffer_size", None, NO_HTTP3, "http3-and-quic"),
     (
         "quic_active_connection_id_limit",
         None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
+        NO_HTTP3,
+        "http3-and-quic",
     ),
-    (
-        "quic_bpf",
-        None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
-    ),
-    (
-        "quic_gso",
-        None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
-    ),
-    (
-        "quic_host_key",
-        None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
-    ),
-    (
-        "quic_retry",
-        None,
-        "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2",
-    ),
+    ("quic_bpf", None, NO_HTTP3, "http3-and-quic"),
+    ("quic_gso", None, NO_HTTP3, "http3-and-quic"),
+    ("quic_host_key", None, NO_HTTP3, "http3-and-quic"),
+    ("quic_retry", None, NO_HTTP3, "http3-and-quic"),
 ];
 
-fn classify(args: &[String]) -> (Severity, String) {
+const NO_HTTP3: &str =
+    "no HTTP/3 in ruxen: `quic` listens are ignored, the TCP listens serve HTTP/1.1 and HTTP/2";
+
+/// The guide's section for the tuning directives ruxen accepts and ignores.
+const IGNORED: &str = "ignored-tuning-directives";
+
+fn classify(args: &[String]) -> (Severity, String, &'static str) {
     let name = args[0].as_str();
     let value = args[1..].join(" ");
-    match DIFFERS.iter().find(|(d, _, _)| *d == name) {
-        Some((_, Some(default), _)) if value == *default => (
+    match DIFFERS.iter().find(|(d, ..)| *d == name) {
+        Some((_, Some(default), ..)) if value == *default => (
             Severity::Ignored,
             "nginx's default value, accepted".to_string(),
+            IGNORED,
         ),
-        Some((_, _, note)) => (Severity::Differs, (*note).to_string()),
+        Some((_, _, note, section)) => (Severity::Differs, (*note).to_string(), section),
         None => (
             Severity::Ignored,
             "accepted, no effect in ruxen".to_string(),
+            IGNORED,
         ),
     }
 }
+
+/// The guide's section for a parser or `prepare` warning, by how it
+/// starts; `None` for the ones nginx gives as well.
+fn warning_section(w: &str) -> Option<&'static str> {
+    WARNING_SECTIONS
+        .iter()
+        .find(|(start, _)| w.starts_with(start))
+        .map(|(_, section)| *section)
+}
+
+const WARNING_SECTIONS: &[(&str, &str)] = &[
+    ("\"ssl_protocols\"", "ssl_protocols"),
+    ("\"ssl_ciphers\"", "ssl_ciphers"),
+    ("\"ssl_ecdh_curve\"", "ssl_ecdh_curve"),
+    (
+        "server with ssl_* directives",
+        "tls-settings-in-a-server-without-tls",
+    ),
+    ("\"alias ", "alias-and-the-trailing-slash"),
+    ("variable \"$", "variables-that-are-always-empty"),
+    (QUIC_LISTEN_IGNORED, "http3-and-quic"),
+    ("no TCP listen is left", "http3-and-quic"),
+];
 
 /// A warning's trailing ` in <file>:<line>`, split off: (text, place).
 fn split_position(w: &str) -> Option<(&str, &str)> {
@@ -397,6 +419,13 @@ pub fn report(
     prepare_error: Option<&str>,
 ) -> String {
     let mut out = String::new();
+    // The guide's sections for what is listed, in order, once each.
+    let mut sections: Vec<&'static str> = Vec::new();
+    let mut see = |s: &'static str| {
+        if !sections.contains(&s) {
+            sections.push(s);
+        }
+    };
     let line = |f: &Finding| {
         let at = f.position.as_deref().unwrap_or("-");
         let label = match f.severity {
@@ -425,6 +454,7 @@ pub fn report(
                     more += 1;
                 }
             }
+            see(f.section);
             let mut text = line(f);
             if more > 0 {
                 text.pop();
@@ -441,6 +471,9 @@ pub fn report(
             // with a difference ruxen already explains; where the warning
             // ends with its place, the place goes first, as for findings.
             for w in warnings {
+                if let Some(s) = warning_section(w) {
+                    see(s);
+                }
                 out.push_str(&match split_position(w) {
                     Some((text, at)) => format!("{at}: differs: {text}\n"),
                     None => format!("-: differs: {w}\n"),
@@ -466,15 +499,21 @@ pub fn report(
             names.join(", ")
         ));
     }
+    let unsupported = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Unsupported)
+        .count();
+    if fatal.is_some() || (unsupported == 0 && prepare_error.is_some()) {
+        see("when-the-check-stops");
+    }
+    for s in &sections {
+        out.push_str(&format!("what to do: {GUIDE}#{s}\n"));
+    }
     if let Some(e) = fatal {
         out.push_str(&format!("error: {e}\n"));
         out.push_str("the check stopped here: ruxen does not start with this configuration\n");
         return out;
     }
-    let unsupported = findings
-        .iter()
-        .filter(|f| f.severity == Severity::Unsupported)
-        .count();
     let differs = findings
         .iter()
         .filter(|f| f.severity == Severity::Differs)
@@ -582,7 +621,7 @@ mod tests {
         );
         let out = report(&found, &[], None, None);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "{out}");
+        assert_eq!(lines.len(), 4, "{out}");
         assert!(
             lines[0].contains("unsupported: fastcgi_param A a — unknown directive")
                 && lines[0].ends_with("(FastCGI isn't in ruxen: README, Limitations) (and 2 more `fastcgi_param` lines)"),
@@ -590,7 +629,7 @@ mod tests {
         );
         assert!(lines[1].contains("unsupported: fastcgi_pass x"), "{out}");
         assert!(
-            lines[2].starts_with("ruxen does not start with this configuration: 4 unsupported"),
+            lines[3].starts_with("ruxen does not start with this configuration: 4 unsupported"),
             "{out}"
         );
     }
@@ -620,5 +659,75 @@ mod tests {
             Err(Error::UnknownDirective { .. })
         ));
         assert!(finish().is_empty());
+    }
+
+    #[test]
+    fn the_report_links_each_section_once() {
+        let (found, _) = findings(
+            "http { server { location / { proxy_buffering off; fastcgi_pass x; \
+             uwsgi_pass y; } } }",
+        );
+        let out = report(
+            &found,
+            &["variable \"$date_gmt\" …".to_string()],
+            None,
+            None,
+        );
+        let links: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("what to do: "))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                format!("{GUIDE}#fastcgi-uwsgi-scgi-memcached"),
+                format!("{GUIDE}#proxy_buffering-off"),
+                format!("{GUIDE}#variables-that-are-always-empty"),
+            ],
+            "{out}"
+        );
+        assert!(
+            out.ends_with("2 unsupported, 2 behaving differently\n"),
+            "{out}"
+        );
+    }
+
+    /// Every section a finding can link to is a heading of the guide, by
+    /// GitHub's anchor for it.
+    #[test]
+    fn every_section_is_in_the_guide() {
+        let anchor = |heading: &str| -> String {
+            heading
+                .trim()
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+                .map(|c| if c == ' ' { '-' } else { c })
+                .collect()
+        };
+        let headings: Vec<String> = include_str!("../../docs/migrating.md")
+            .lines()
+            .filter_map(|l| l.strip_prefix("## ").or_else(|| l.strip_prefix("### ")))
+            .map(anchor)
+            .collect();
+
+        let mut sections: Vec<&str> = vec![IGNORED, "when-the-check-stops"];
+        sections.extend(DIFFERS.iter().map(|d| d.3));
+        sections.extend(WARNING_SECTIONS.iter().map(|w| w.1));
+        // The other findings, as the parser records them.
+        let (found, _) = findings(
+            "http { ssl_protocols TLSv1; include /nonexistent/x.conf; server { \
+             location $x { } \
+             no_such_directive; fastcgi_pass a; grpc_pass b; sub_filter c d; ssi_value_length 9; \
+             mirror /m; } } stream { } mail { }",
+        );
+        assert_eq!(found.len(), 11, "{found:?}");
+        sections.extend(found.iter().map(|f| f.section));
+        for s in sections {
+            assert!(
+                headings.iter().any(|h| h == s),
+                "no section #{s} in docs/migrating.md"
+            );
+        }
     }
 }

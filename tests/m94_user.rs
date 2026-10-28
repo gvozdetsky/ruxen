@@ -379,3 +379,126 @@ fn m94_root_helper_follows_a_reload() {
         );
     }
 }
+
+/// `CapPrm` and `CapEff` of every thread of `pid`.
+fn thread_caps(pid: u32) -> Vec<(u64, u64)> {
+    let mut caps = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let status = std::fs::read_to_string(task.unwrap().path().join("status")).unwrap();
+        let field = |name: &str| {
+            let line = status.lines().find(|l| l.starts_with(name)).unwrap();
+            u64::from_str_radix(line[name.len()..].trim(), 16).unwrap()
+        };
+        caps.push((field("CapPrm:"), field("CapEff:")));
+    }
+    caps
+}
+
+/// A free TCP port below 1024 on 127.0.0.1, as root binds it.
+fn low_port() -> u16 {
+    (900..1024)
+        .find(|&p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+        .expect("a free port below 1024")
+}
+
+/// A reload binds a new port below 1024 after the switch (#344): the
+/// process keeps `CAP_NET_BIND_SERVICE` alone, effective only while
+/// `main` binds. In a container, run it with
+/// `--sysctl net.ipv4.ip_unprivileged_port_start=1024`: Docker lets
+/// anyone bind any port otherwise.
+#[test]
+fn m94_root_reload_binds_a_new_port_below_1024() {
+    if !is_root() {
+        return;
+    }
+    let conf = |extra: &str| {
+        format!(
+            "pid %%DIR%%/ruxen.pid;\nworker_processes 2;\nevents {{}}\nhttp {{ access_log off;\n\
+             server {{ listen 127.0.0.1:%%PORT%%; location / {{ return 200 \"a\\n\"; }} }}\n\
+             {extra} }}\n"
+        )
+    };
+    let (server, port, dir) = start("lowport", "user nobody nogroup;", &conf(""));
+    let pid = server.child.id();
+    let bind_service = 1u64 << 10;
+    let only_permitted = |caps: &[(u64, u64)]| {
+        caps.iter()
+            .all(|&(prm, eff)| prm & !bind_service == 0 && eff == 0)
+    };
+    let caps = thread_caps(pid);
+    assert!(only_permitted(&caps), "{caps:x?}");
+    let low = low_port();
+    let with_low = conf(&format!(
+        "server {{ listen 127.0.0.1:{low}; location / {{ return 200 \"b\\n\"; }} }}"
+    ))
+    .replace("%%DIR%%", dir.to_str().unwrap())
+    .replace("%%PORT%%", &port.to_string());
+    std::fs::write(
+        dir.join("ruxen.conf"),
+        format!("user nobody nogroup;\n{with_low}"),
+    )
+    .unwrap();
+    // SAFETY: signalling the child we spawned.
+    unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", low)).is_err() {
+        assert!(Instant::now() < deadline, "the reload did not bind {low}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let b = get(low, "/");
+    assert!(b.starts_with("HTTP/1.1 200") && b.ends_with("b\n"), "{b}");
+    // Lowered again: the new workers have it permitted at most.
+    let caps = thread_caps(pid);
+    assert!(only_permitted(&caps), "{caps:x?}");
+    assert!(thread_uids(pid).iter().all(|&u| u == 65534));
+}
+
+/// A key only root may read loads at startup, but a reload reads it as the
+/// user: a `[warn]` says so up front (#774).
+#[test]
+fn m94_root_warns_about_files_a_reload_cant_read() {
+    if !is_root() {
+        return;
+    }
+    let tls = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata/tls");
+    let conf = r#"
+events { }
+http {
+    server {
+        listen 127.0.0.1:%%PORT%% ssl;
+        ssl_certificate KEYDIR/rsa.crt;
+        ssl_certificate_key KEYDIR/rsa.key;
+        location /up { return 200 "ok"; }
+    }
+}
+"#;
+    let keys = temp_dir("keys");
+    for (name, mode) in [("rsa.crt", 0o644), ("rsa.key", 0o600)] {
+        std::fs::copy(tls.join(name), keys.join(name)).unwrap();
+        std::fs::set_permissions(keys.join(name), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let conf = conf.replace("KEYDIR", keys.to_str().unwrap());
+    let (mut server, _port, _dir) = start("unreadable", "user nobody nogroup;", &conf);
+    let pid = server.child.id();
+    // SAFETY: signalling the child we spawned.
+    unsafe { libc::kill(pid as i32, libc::SIGQUIT) };
+    let mut stderr = String::new();
+    server
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(server.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&keys);
+    let key = format!(
+        "user \"nobody\" can't read \"{}\"",
+        keys.join("rsa.key").display()
+    );
+    assert!(
+        stderr.contains("[warn]") && stderr.contains(&key),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("rsa.crt"), "{stderr}");
+}

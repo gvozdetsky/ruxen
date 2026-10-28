@@ -149,10 +149,6 @@ fn eval_guard_plain(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> bool {
     }
 }
 
-pub(crate) fn rewrite_target_is_external(rendered: &[u8]) -> bool {
-    rendered.starts_with(b"http://") || rendered.starts_with(b"https://")
-}
-
 /// `ngx_unescape_uri(…, NGX_UNESCAPE_REDIRECT)`, which a `rewrite …
 /// redirect` target goes through before the request's arguments are
 /// added: `%XX` turns into the byte when it is printable and above `%`,
@@ -448,28 +444,35 @@ pub(crate) fn execute_rewrite_ops(
                     captures_slice,
                     rewrite_state,
                 );
+                // ngx_http_script_copy_capture_code escapes captures in the
+                // target's arguments, and in all of a redirect's target,
+                // only when the request's path had an escape or a `+`
+                // (`quoted_uri`, `plus_in_uri`): then unescape_redirect
+                // gives a decoded `%` or `#` back encoded, `/docs/50%25-off`
+                // stays so.
+                let path = req.path.split(|&b| b == b'?').next().unwrap_or_default();
+                let quoted = path.contains(&b'%') || path.contains(&b'+');
                 let mut new_uri = Vec::with_capacity(uri_path.len() + 32);
                 render_parts(replacement_uri, &ctx, &mut new_uri);
                 let mut new_args: Option<Vec<u8>> = replacement_args.map(|parts| {
                     let mut buf = Vec::with_capacity(32);
-                    render_parts_with_arg_escape(parts, &ctx, &mut buf);
+                    if quoted {
+                        render_parts_with_arg_escape(parts, &ctx, &mut buf);
+                    } else {
+                        render_parts(parts, &ctx, &mut buf);
+                    }
                     buf
                 });
 
+                // A replacement starting with a scheme is a `Redirect` since
+                // the parser (#798).
                 let external_redirect = matches!(
                     flag,
                     PreparedRewriteFlag::Redirect | PreparedRewriteFlag::Permanent
-                ) || matches!(flag, PreparedRewriteFlag::None)
-                    && rewrite_target_is_external(&new_uri);
+                );
 
                 if external_redirect {
-                    // nginx escapes the captures of a redirect's target
-                    // (ngx_http_script_copy_capture_code with `e->quote`)
-                    // when the request URI had escapes or a `+`, so that
-                    // unescape_redirect gives a decoded `%` or `#` back
-                    // encoded: `/docs/50%25-off` stays so, not `50-off`.
-                    let path = req.path.split(|&b| b == b'?').next().unwrap_or_default();
-                    if path.contains(&b'%') || path.contains(&b'+') {
+                    if quoted {
                         new_uri.clear();
                         render_parts_with_arg_escape(replacement_uri, &ctx, &mut new_uri);
                     }
@@ -488,7 +491,13 @@ pub(crate) fn execute_rewrite_ops(
                     }
                     let mut rendered = unescape_redirect(&rendered);
                     if !*drop_args && !args.is_empty() {
-                        rendered.push(if rendered.contains(&b'?') { b'&' } else { b'?' });
+                        // `&` after a `?` written in the replacement only
+                        // (`code->args`), not after a decoded `%3F`.
+                        rendered.push(if replacement_args.is_some() {
+                            b'&'
+                        } else {
+                            b'?'
+                        });
                         rendered.extend_from_slice(args);
                     }
                     let location = escape_redirect_location(&rendered);
@@ -505,7 +514,7 @@ pub(crate) fn execute_rewrite_ops(
                 }
 
                 if new_uri.is_empty() {
-                    new_uri.push(b'/');
+                    return empty_uri_error(req, server_header);
                 }
                 *uri_path = new_uri;
                 // Internal rewrite: append the original request args to
@@ -593,6 +602,27 @@ pub(crate) fn execute_rewrite_ops(
         }
     }
     RewriteControl::Continue
+}
+
+/// ngx_http_script_regex_end_code: an internal rewrite to an empty URI is
+/// a 500.
+#[cold]
+#[inline(never)]
+fn empty_uri_error(req: &phase::RequestCtx<'_>, server_header: &[u8]) -> RewriteControl {
+    crate::fs_resolve::note_failed_lookup_at(
+        "the rewritten URI has a zero length".to_string(),
+        false,
+        crate::config::ErrorLogLevel::Error,
+    );
+    RewriteControl::Respond(
+        Response::Owned(http::error_response_for_method(
+            500,
+            "Internal Server Error\n",
+            req.method,
+            server_header,
+        )),
+        true,
+    )
 }
 
 /// The server-level rewrite program, nginx's SERVER_REWRITE phase: it
