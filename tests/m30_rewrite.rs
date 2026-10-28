@@ -514,3 +514,40 @@ http { server { listen 127.0.0.1:%%PORT%%;
         assert_eq!(header_value(&r, "Location"), Some(want), "{path}");
     }
 }
+
+/// nginx's script code (#762): captures in the arguments are escaped only
+/// for a request path with an escape or a `+`, with NGX_ESCAPE_ARGS; a
+/// redirect joins the request's arguments with `&` only after a `?` of the
+/// replacement's own; an empty URI is a 500.
+#[test]
+fn rewrite_target_renders_like_nginx() {
+    let (_guard, port) = spawn_server(
+        r#"
+events {}
+http { absolute_redirect off; server { listen 127.0.0.1:%%PORT%%;
+    location / {
+        rewrite ^/a/([^/]*)/(.*)$ /in/$2?x=$1 last;
+        rewrite ^/r/(.*)$ /t/$1 redirect;
+        rewrite ^/e/(.*)$ $1 last;
+        return 200 "root uri=$uri args=$args";
+    }
+    location /in/ { return 200 "uri=$uri args=$args"; }
+} }
+"#,
+    );
+    for (path, want) in [
+        ("/a/x&y/z", "uri=/in/z args=x=x&y"),
+        ("/a/x%26y/z", "uri=/in/z args=x=x%26y"),
+        ("/a/x%7Cy;%5E/z", "uri=/in/z args=x=x%7Cy%3B%5E"),
+        ("/a/x+y/z?k=1", "uri=/in/z args=x=x%2By&k=1"),
+    ] {
+        let r = http_get(port, path);
+        assert_eq!(body(&r), want.as_bytes(), "{path}");
+    }
+    for (path, want) in [("/r/a%3Fb?c=1", "/t/a?b?c=1"), ("/r/a?c=1", "/t/a?c=1")] {
+        let r = http_get(port, path);
+        assert_eq!(header_value(&r, "Location"), Some(want), "{path}");
+    }
+    let r = http_get(port, "/e/");
+    assert_eq!(status_line(&r), "HTTP/1.1 500 Internal Server Error");
+}
