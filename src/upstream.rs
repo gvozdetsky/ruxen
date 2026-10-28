@@ -45,7 +45,7 @@ use std::collections::VecDeque;
 /// The per-worker maps here are keyed by configuration addresses, not by
 /// anything a client sends: FxHash (`NameHasher`) instead of SipHash, which
 /// cost about 1% of `proxy_hello`'s instructions (callgrind).
-type FxBuild = std::hash::BuildHasherDefault<crate::worker::NameHasher>;
+pub(crate) type FxBuild = std::hash::BuildHasherDefault<crate::worker::NameHasher>;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
@@ -543,10 +543,12 @@ fn is_single(upstream: &PreparedUpstream) -> bool {
 /// `hash` carries a hash balancer's state for the request (`None` for
 /// round-robin and least_conn).
 pub fn pick_peer(
-    upstream: &'static PreparedUpstream,
+    upstream: &UpstreamRef,
     tried: &Tried,
     hash: Option<&mut HashPick>,
 ) -> Option<LeasedPeer> {
+    let leased = upstream.clone();
+    let upstream: &PreparedUpstream = upstream;
     let now = Instant::now();
     LB_STATE.with(|state| {
         let mut map = state.borrow_mut();
@@ -571,7 +573,7 @@ pub fn pick_peer(
             None => rt.peers[idx].active = rt.peers[idx].active.saturating_add(1),
         }
         Some(LeasedPeer {
-            upstream,
+            upstream: leased,
             peer_idx: idx,
         })
     })
@@ -731,7 +733,7 @@ fn least_conn_pick(
 /// PEER_FAILED branch (line 1025–1080): increment `fails`; subtract
 /// `weight / max_fails` from `effective_weight` (floor at 0). Failures are
 /// counted within a `fail_timeout` window measured from the most recent fail.
-pub fn report_failure(upstream: &'static PreparedUpstream, peer_idx: usize) {
+pub fn report_failure(upstream: &PreparedUpstream, peer_idx: usize) {
     // nginx never marks a lone server unavailable: with one peer and no
     // backups (`peers->single`), max_fails and fail_timeout are ignored and
     // failures aren't even counted (ngx_http_upstream_free_round_robin_peer
@@ -782,7 +784,7 @@ pub fn report_failure(upstream: &'static PreparedUpstream, peer_idx: usize) {
     });
 }
 
-fn ensure_rt(upstream: &'static PreparedUpstream) -> UpstreamRt {
+fn ensure_rt(upstream: &PreparedUpstream) -> UpstreamRt {
     UpstreamRt {
         peers: upstream
             .peers
@@ -803,7 +805,7 @@ fn ensure_rt(upstream: &'static PreparedUpstream) -> UpstreamRt {
 /// Fail counters are time-windowed: clear them only once the most recent
 /// failure is older than `fail_timeout`, so intermittent failures still
 /// accumulate and can trip `max_fails`.
-pub fn report_success(upstream: &'static PreparedUpstream, peer_idx: usize) {
+pub fn report_success(upstream: &PreparedUpstream, peer_idx: usize) {
     if let Some(shared) = upstream.shared {
         let (Some(shared), Some(peer)) = (shared.get(peer_idx), upstream.peers.get(peer_idx))
         else {
@@ -840,23 +842,26 @@ pub fn report_success(upstream: &'static PreparedUpstream, peer_idx: usize) {
 /// counter on Drop. Used by least_conn for accurate pick state and by
 /// the metrics surface (eventual `$upstream_*` variables).
 pub struct LeasedPeer {
-    upstream: &'static PreparedUpstream,
+    upstream: UpstreamRef,
     pub peer_idx: usize,
 }
 
 impl LeasedPeer {
     /// Peer `peer_idx` of a request's own set (`ProxyPlan::adhoc`), which
     /// `upstream`, a placeholder, doesn't count.
-    pub fn adhoc(upstream: &'static PreparedUpstream, peer_idx: usize) -> LeasedPeer {
-        LeasedPeer { upstream, peer_idx }
+    pub fn adhoc(upstream: &UpstreamRef, peer_idx: usize) -> LeasedPeer {
+        LeasedPeer {
+            upstream: upstream.clone(),
+            peer_idx,
+        }
     }
     #[allow(dead_code)]
     pub fn addr(&self) -> crate::worker::PeerAddr {
         self.upstream.peers[self.peer_idx].addr
     }
     #[allow(dead_code)]
-    pub fn upstream(&self) -> &'static PreparedUpstream {
-        self.upstream
+    pub fn upstream(&self) -> &PreparedUpstream {
+        &self.upstream
     }
 }
 
@@ -868,7 +873,7 @@ impl Drop for LeasedPeer {
         }
         LB_STATE.with(|state| {
             let mut map = state.borrow_mut();
-            let key = self.upstream as *const PreparedUpstream;
+            let key = std::ptr::from_ref::<PreparedUpstream>(&self.upstream);
             if let Some(rt) = map.get_mut(&key)
                 && let Some(s) = rt.peers.get_mut(self.peer_idx)
             {
@@ -952,7 +957,7 @@ fn idle_conn_open(stream: &crate::upstream_io::UpstreamIo) -> bool {
 /// idle timeout; keepalive-time is enforced on release so over-age conns
 /// may be reused once and then retired (nginx behavior).
 pub fn pool_take(
-    upstream: &'static PreparedUpstream,
+    upstream: &PreparedUpstream,
     peer_idx: usize,
     tls: Option<&crate::upstream_tls::TlsPlan>,
     tag: usize,
@@ -999,51 +1004,80 @@ pub fn pool_take(
     })
 }
 
-/// Peer `peer_idx` of `version` in the version of its upstream that is
-/// current: a connection released after a DNS change goes to the list
+/// Peer `peer_idx` of `version` in the version this worker took last: a
+/// connection released after a DNS change goes to the pool of the list
 /// requests use, or is closed if its peer is gone (#597).
 #[cold]
-fn in_current(
-    dynamic: &'static crate::upstream_resolve::Dynamic,
-    version: &'static PreparedUpstream,
+fn in_seen(
+    dynamic: &'static crate::upstream_resolve::Version,
+    version: &PreparedUpstream,
     peer_idx: usize,
 ) -> Option<(&'static PreparedUpstream, usize)> {
-    let current = dynamic.version();
-    if std::ptr::eq(current, version) {
-        return Some((version, peer_idx));
+    let seen = dynamic.seen();
+    if std::ptr::eq(seen, version) {
+        return Some((seen, peer_idx));
     }
     let addr = version.peers.get(peer_idx)?.addr;
-    let i = current.peers.iter().position(|p| p.addr == addr)?;
-    Some((current, i))
+    let i = seen.peers.iter().position(|p| p.addr == addr)?;
+    Some((seen, i))
 }
 
-thread_local! {
-    /// The version of each resolved upstream this worker used last.
-    static SEEN: RefCell<HashMap<usize, usize, FxBuild>> = RefCell::new(HashMap::default());
-}
+/// An upstream as a request uses it. For one with `resolve` servers, a
+/// version of its peer list that this worker holds until the last
+/// `UpstreamRef` of it goes (#597); otherwise just the upstream.
+pub struct UpstreamRef(&'static PreparedUpstream);
 
-/// A request of this worker takes `version` of `dynamic`: if the list
-/// changed since the last one, the idle connections to peers that stay
-/// move to it, and the round-robin state of the old one goes.
-pub(crate) fn notice_version(
-    dynamic: &'static crate::upstream_resolve::Dynamic,
-    version: &'static PreparedUpstream,
-) {
-    let key = std::ptr::from_ref(dynamic) as usize;
-    let now = std::ptr::from_ref(version) as usize;
-    let last = SEEN.with(|seen| seen.borrow_mut().insert(key, now));
-    if let Some(last) = last
-        && last != now
-    {
-        // SAFETY: a version of `dynamic`, kept as long as it is, and
-        // this worker serves its generation.
-        switch_version(unsafe { &*(last as *const PreparedUpstream) }, version);
+impl UpstreamRef {
+    /// `upstream`'s peers now.
+    #[inline]
+    pub fn current(upstream: &'static PreparedUpstream) -> UpstreamRef {
+        match upstream.dynamic {
+            None => UpstreamRef(upstream),
+            Some(dynamic) => UpstreamRef(dynamic.current()),
+        }
     }
 }
 
+impl std::ops::Deref for UpstreamRef {
+    type Target = PreparedUpstream;
+    #[inline]
+    fn deref(&self) -> &PreparedUpstream {
+        self.0
+    }
+}
+
+impl Clone for UpstreamRef {
+    #[inline]
+    fn clone(&self) -> UpstreamRef {
+        if self.0.dynamic.is_some() {
+            crate::upstream_resolve::hold(self.0);
+        }
+        UpstreamRef(self.0)
+    }
+}
+
+impl Drop for UpstreamRef {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0.dynamic.is_some() {
+            crate::upstream_resolve::release(self.0);
+        }
+    }
+}
+
+impl std::fmt::Debug for UpstreamRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("UpstreamRef")
+            .field(&String::from_utf8_lossy(self.0.name))
+            .finish()
+    }
+}
+
+/// This worker moves from `old` to `new`: the idle connections to peers
+/// that stay move along, the round-robin state of `old` goes.
 #[cold]
 #[inline(never)]
-fn switch_version(old: &'static PreparedUpstream, new: &'static PreparedUpstream) {
+pub(crate) fn switch_version(old: &PreparedUpstream, new: &PreparedUpstream) {
     let old_key = std::ptr::from_ref(old);
     LB_STATE.with(|state| state.borrow_mut().remove(&old_key));
     POOL.with(|p| {
@@ -1087,7 +1121,7 @@ pub fn pool_close_one() -> bool {
 ///  - `requests_served` has reached `keepalive_requests`
 ///  - lifetime exceeds `keepalive_time`
 pub fn pool_release(
-    upstream: &'static PreparedUpstream,
+    upstream: &PreparedUpstream,
     peer_idx: usize,
     tag: usize,
     mut conn: PooledConn,
@@ -1097,7 +1131,7 @@ pub fn pool_release(
     };
     let (upstream, peer_idx) = match upstream.dynamic {
         None => (upstream, peer_idx),
-        Some(dynamic) => match in_current(dynamic, upstream, peer_idx) {
+        Some(dynamic) => match in_seen(dynamic, upstream, peer_idx) {
             Some(found) => found,
             None => return,
         },
@@ -1192,6 +1226,14 @@ fn sweep_closed() -> bool {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    fn pick_peer(
+        u: &'static PreparedUpstream,
+        tried: &Tried,
+        hash: Option<&mut HashPick>,
+    ) -> Option<LeasedPeer> {
+        super::pick_peer(&UpstreamRef::current(u), tried, hash)
+    }
 
     fn mk_upstream(specs: &[(u32, bool, bool)]) -> &'static PreparedUpstream {
         mk_upstream_lb(specs, Lb::RoundRobin)
