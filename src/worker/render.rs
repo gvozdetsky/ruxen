@@ -191,7 +191,9 @@ impl RenderCtx<'_> {
     pub(crate) fn write_var(&self, var: &Variable, out: &mut Vec<u8>) {
         match var {
             Variable::Uri => out.extend_from_slice(self.uri),
-            Variable::RequestUri => out.extend_from_slice(self.request_uri),
+            Variable::RequestUri => {
+                out.extend_from_slice(phase::unparsed_uri(self.request_uri, self.request_line))
+            }
             Variable::RequestMethod => out.extend_from_slice(self.request_method),
             Variable::Request => out.extend_from_slice(self.request_line),
             Variable::ProxyProtocolAddr

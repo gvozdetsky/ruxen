@@ -2040,6 +2040,35 @@ fn write_auth_path_var(
     }
 }
 
+/// The client's request target with its `#fragment`, nginx's
+/// r->unparsed_uri (#748): `$request_uri`, and what `proxy_pass` without
+/// a URI part sends. `path` stops at the `#` (`$uri` and `$args` do); when
+/// it lies in `request_line` and a `#` follows it there, the target runs
+/// on to the next space. No work otherwise: a synthesized path isn't in
+/// the line.
+#[inline]
+pub(crate) fn unparsed_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    // Distinct live buffers don't overlap: an offset inside the line means
+    // `path` is part of it.
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start.checked_add(path.len()) {
+        Some(end) if request_line.get(end) == Some(&b'#') => {
+            with_fragment(request_line, start, end)
+        }
+        _ => path,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn with_fragment(request_line: &[u8], start: usize, end: usize) -> &[u8] {
+    let len = request_line[end..]
+        .iter()
+        .position(|&b| b == b' ')
+        .unwrap_or(request_line.len() - end);
+    &request_line[start..end + len]
+}
+
 fn request_uri_path(request_uri: &[u8]) -> &[u8] {
     match request_uri.iter().position(|&b| b == b'?') {
         Some(i) => &request_uri[..i],
@@ -2983,6 +3012,20 @@ fn match_named_location<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparsed_uri_keeps_the_fragment() {
+        let line = b"GET /a?b#f?x HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b#f?x");
+        let line = b"GET /a#f";
+        assert_eq!(unparsed_uri(&line[4..6], line), b"/a#f");
+        let line = b"GET /a?b HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b");
+        // A path from elsewhere (absolute-form without one) stays as is.
+        let other = b"/#x".to_vec();
+        assert_eq!(unparsed_uri(&other[..1], line), b"/");
+        assert_eq!(unparsed_uri(b"/", b""), b"/");
+    }
 
     #[test]
     fn wildcards_take_only_names_below_them() {

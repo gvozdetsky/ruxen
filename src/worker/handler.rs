@@ -971,8 +971,8 @@ pub(crate) fn run_location_handler(
         } else if request_path.is_empty() {
             if rewrite_state.unparsed_uri && current_args.is_none() && req.path.starts_with(b"/") {
                 // Unchanged: the client's own request target (nginx's
-                // `r->unparsed_uri`).
-                req.path
+                // `r->unparsed_uri`), `#fragment` included.
+                phase::unparsed_uri(req.path, req.request_line)
             } else {
                 let mut buf = Vec::with_capacity(url_path.len() + 1 + args.len());
                 write_upstream_path(url_path, escape(), &mut buf);
