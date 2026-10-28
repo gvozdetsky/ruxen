@@ -2605,6 +2605,15 @@ fn client_certificate_refusal(
             log(format!("client SSL certificate verify error: ({code}:{text})").as_bytes());
             Some((495, true))
         }
+        // `ssl_ocsp` (#142); a pending check fails closed.
+        (_, ClientVerify::Revoked(_) | ClientVerify::OcspPending(_)) => {
+            let text = match &tls.client_verify {
+                ClientVerify::Revoked(text) => text,
+                _ => crate::ocsp::REQUEST_FAILED,
+            };
+            log(format!("client SSL certificate verify error: {text}").as_bytes());
+            Some((495, true))
+        }
         (VerifyClient::On, ClientVerify::None) => {
             log(b"client sent no required SSL certificate");
             Some((496, true))

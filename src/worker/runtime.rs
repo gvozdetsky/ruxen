@@ -4312,7 +4312,7 @@ pub(crate) async fn handle_tls(
         } else {
             crate::tls::accept_with_timeout(&acceptor, stream, budget).await
         };
-    let (mut tls_stream, info) = match accepted {
+    let (mut tls_stream, mut info) = match accepted {
         Ok(crate::tls::Handshake::Tls(stream, info)) => (stream, info),
         Ok(crate::tls::Handshake::Plain(stream, read)) => {
             // Plain HTTP on the `ssl` port (#384): read as HTTP/1, then
@@ -4347,6 +4347,23 @@ pub(crate) async fn handle_tls(
             return;
         }
     };
+    // `ssl_ocsp` (#142): the handshake ends with the client certificate's
+    // status, as in ngx_ssl_handshake, within the same timeout.
+    if matches!(
+        info.client_verify,
+        crate::client_verify::ClientVerify::OcspPending(_)
+    ) && !check_ocsp(
+        &mut info,
+        http,
+        listen_index,
+        connection_id,
+        peer_addr,
+        accepted_at,
+    )
+    .await
+    {
+        return;
+    }
     // Lowercase SNI once at handshake time so the per-request find_config
     // fallback can do byte-equal comparisons against prepared (already-
     // lowercased) server_name tables. rustls validates the SNI as a DNS
@@ -4395,6 +4412,45 @@ pub(crate) async fn handle_tls(
         monoio::io::AsyncWriteRent::shutdown(&mut tls_stream),
     )
     .await;
+}
+
+/// The OCSP check of a client certificate (`ssl_ocsp`, #142), boxed and
+/// cold: only its servers pay. `false`: the handshake timed out first,
+/// and the connection closes.
+#[cold]
+#[inline(never)]
+fn check_ocsp<'a>(
+    info: &'a mut crate::tls::HandshakeInfo,
+    http: &'static PreparedHttp,
+    listen_index: usize,
+    connection_id: u64,
+    peer_addr: SocketAddr,
+    accepted_at: Instant,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
+    Box::pin(async move {
+        let listen = &http.listens[listen_index];
+        let default = &listen.servers[listen.default_server];
+        let log = crate::ocsp::ConnLog {
+            id: connection_id,
+            logs: default.error_logs,
+            context: format!(
+                " while SSL handshaking, client: {}, server: {}",
+                peer_addr.ip(),
+                listen.addr
+            ),
+        };
+        let budget = default
+            .timeouts
+            .header
+            .saturating_sub(accepted_at.elapsed());
+        let check = info.client_verify.resolve_ocsp(&log);
+        if monoio::time::timeout(budget, check).await.is_ok() {
+            return true;
+        }
+        let timeout = crate::tls::AcceptError::Timeout;
+        handshake_failed(http, listen_index, connection_id, peer_addr, &timeout);
+        false
+    })
 }
 
 /// An HTTP/2 connection (#144), cold: boxed so its future isn't part of
