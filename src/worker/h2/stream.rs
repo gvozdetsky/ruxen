@@ -666,7 +666,7 @@ impl super::super::ConnIo for StreamIo {
     async fn idle_wait(
         &self,
         _state: &RuntimeState,
-        _idle: Option<std::time::Duration>,
+        _idle: super::super::IdleLimits,
         _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> bool {
@@ -678,7 +678,7 @@ impl super::super::ConnIo for StreamIo {
         &mut self,
         mut buf: Vec<u8>,
         _state: &RuntimeState,
-        _idle: Option<std::time::Duration>,
+        _idle: super::super::IdleLimits,
         _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
