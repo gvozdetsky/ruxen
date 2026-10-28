@@ -203,3 +203,55 @@ fn m9_location_precedence_matches_http_location_t() {
         assert_eq!(got, *expected, "GET {path}: wrong X-Location");
     }
 }
+
+// #797: regexes match bytes, as nginx's PCRE without UTF does, so a byte
+// that isn't UTF-8 can't slip past a regex location's `deny`.
+const NON_UTF8_CONF: &str = r#"
+daemon off;
+
+events { }
+
+http {
+    server {
+        listen       127.0.0.1:%%PORT%%;
+        server_name  localhost;
+
+        location ~ ^/private/.*$ { deny all; }
+        location ~* ^/caf\w$ { return 200 "word"; }
+        location /g/ { rewrite ^/g/(.*)$ /x/$1 last; }
+        location /x/ { return 200 "[$uri]"; }
+        location / { return 200 "open"; }
+    }
+}
+"#;
+
+fn status_and_body(resp: &[u8]) -> (u16, &[u8]) {
+    let status = std::str::from_utf8(&resp[9..12]).unwrap().parse().unwrap();
+    let at = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    (status, &resp[at..])
+}
+
+#[test]
+fn m9_regex_matches_bytes_that_are_not_utf8() {
+    let (_g, port) = spawn_server(NON_UTF8_CONF);
+    for path in [
+        "/private/a",
+        "/private/%FF",
+        "/private/caf%E9",
+        "/private/%C3%A9",
+    ] {
+        let resp = http_get(port, path);
+        assert_eq!(status_and_body(&resp).0, 403, "GET {path}");
+    }
+    // `\w` is ASCII: neither é nor its bytes are word chars.
+    for (path, want) in [
+        ("/cafe", &b"word"[..]),
+        ("/caf%E9", b"open"),
+        ("/CAFE", b"word"),
+    ] {
+        let resp = http_get(port, path);
+        assert_eq!(status_and_body(&resp), (200, want), "GET {path}");
+    }
+    let resp = http_get(port, "/g/caf%E9/%FF");
+    assert_eq!(status_and_body(&resp), (200, &b"[/x/caf\xE9/\xFF]"[..]));
+}
