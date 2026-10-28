@@ -1332,6 +1332,17 @@ pub struct PreparedRoot<'a> {
     pub if_modified_since: crate::config::IfModifiedSince,
     pub etag: bool,
     pub try_files: Option<&'static PreparedTryFiles>,
+    /// `gzip_static on|always` (#760).
+    pub gzip_static: Option<&'static PreparedGzipStatic>,
+}
+
+/// A location's `gzip_static on|always` (#760).
+#[derive(Debug)]
+pub struct PreparedGzipStatic {
+    pub always: bool,
+    /// The location's `gzip_vary`, `gzip_http_version`, `gzip_proxied` and
+    /// `gzip_disable`: they apply with `gzip off` too.
+    pub checks: &'static PreparedGzip,
 }
 
 /// Where a location's URIs map on disk, whatever its handler: its `root`

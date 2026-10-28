@@ -2532,6 +2532,7 @@ pub(crate) fn prepare_server(
     );
     let server_default = if !have_root_catchall {
         let root_path = server.root.clone().unwrap_or_else(|| "html".into());
+        let (gzip, gzip_static) = prepare_gzip_and_static(server_gzip.clone())?;
         let pattern: &'static [u8] = b"/";
         let site = HandlerSite {
             pattern,
@@ -2548,6 +2549,7 @@ pub(crate) fn prepare_server(
             mime: &server.mime,
             tokens: server_tokens_value,
             upstreams,
+            gzip_static,
         };
         let handler = build_handler(
             Handler::Root {
@@ -2581,7 +2583,7 @@ pub(crate) fn prepare_server(
             max_ranges: server_max_ranges,
             client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
-            gzip: prepare_gzip(server_gzip.clone())?,
+            gzip,
             limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             body_temp: server_body_temp,
@@ -3725,6 +3727,7 @@ pub(crate) struct HandlerSite<'a> {
     pub(crate) mime: &'a crate::config::MimeConf,
     pub(crate) tokens: crate::config::ServerTokens,
     pub(crate) upstreams: &'a UpstreamMap,
+    pub(crate) gzip_static: Option<&'static PreparedGzipStatic>,
 }
 
 pub(crate) fn build_handler(
@@ -3803,6 +3806,7 @@ pub(crate) fn build_handler(
                 if_modified_since: site.if_modified_since,
                 etag: site.etag,
                 try_files,
+                gzip_static: site.gzip_static,
             })
         }
     })
@@ -4005,7 +4009,7 @@ pub(crate) fn build_prefix_or_exact(
         charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
-    let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let (gzip, gzip_static) = prepare_gzip_and_static(location_gzip.inherit(server.gzip))?;
     let charset = prepare_charset(&location_charset);
     // Only an `if` block's anonymous location in a regex location is
     // built here with a regex mode (#137): its alias takes the captures.
@@ -4046,6 +4050,7 @@ pub(crate) fn build_prefix_or_exact(
         mime: &mime,
         tokens,
         upstreams,
+        gzip_static,
     };
     let limited_handler = match &limit_except {
         // `proxy_pass` in the block: the other methods are proxied there,
@@ -4230,7 +4235,7 @@ pub(crate) fn build_regex_location(
         charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
-    let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let (gzip, gzip_static) = prepare_gzip_and_static(location_gzip.inherit(server.gzip))?;
     let charset = prepare_charset(&location_charset);
     // The parser already validated it; the compiled `Regex` doesn't
     // survive the AST.
@@ -4276,6 +4281,7 @@ pub(crate) fn build_regex_location(
         mime: &mime,
         tokens,
         upstreams,
+        gzip_static,
     };
     let limited_handler = match &limit_except {
         // `proxy_pass` in the block: the other methods are proxied there,
@@ -4476,12 +4482,34 @@ pub(crate) fn prepare_charset(
     })))
 }
 
-pub(crate) fn prepare_gzip(
+/// The gzip filter (`gzip on`) and `gzip_static`, sharing one
+/// `PreparedGzip`.
+pub(crate) fn prepare_gzip_and_static(
     conf: crate::config::GzipConf,
-) -> Result<Option<&'static PreparedGzip>, String> {
-    if conf.enable != Some(true) {
-        return Ok(None);
+) -> Result<
+    (
+        Option<&'static PreparedGzip>,
+        Option<&'static PreparedGzipStatic>,
+    ),
+    String,
+> {
+    use crate::config::GzipStatic;
+    let enable = conf.enable == Some(true);
+    let mode = conf.static_mode.unwrap_or(GzipStatic::Off);
+    if !enable && mode == GzipStatic::Off {
+        return Ok((None, None));
     }
+    let gz = build_gzip(conf)?;
+    let gzip_static = (mode != GzipStatic::Off).then(|| {
+        &*crate::arena::leak(Box::new(PreparedGzipStatic {
+            always: mode == GzipStatic::Always,
+            checks: gz,
+        }))
+    });
+    Ok((enable.then_some(gz), gzip_static))
+}
+
+fn build_gzip(conf: crate::config::GzipConf) -> Result<&'static PreparedGzip, String> {
     let mut any_type = false;
     // nginx always compresses text/html (ngx_http_html_default_types).
     let mut types: Vec<&'static str> = vec!["text/html"];
@@ -4509,7 +4537,7 @@ pub(crate) fn prepare_gzip(
                 .map_err(|e| format!("gzip_disable: {e}"))?,
         )
     };
-    Ok(Some(crate::arena::leak(Box::new(PreparedGzip {
+    Ok(crate::arena::leak(Box::new(PreparedGzip {
         any_type,
         types: crate::arena::leak(types.into_boxed_slice()),
         min_length: conf.min_length.unwrap_or(20),
@@ -4519,7 +4547,7 @@ pub(crate) fn prepare_gzip(
         proxied: conf.proxied.unwrap_or(crate::config::gzip_proxied::OFF),
         disable_msie6,
         disable,
-    }))))
+    })))
 }
 
 /// `pattern` as a `RegexSet` member, with the case flag its own `Regex`
