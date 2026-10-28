@@ -15,5 +15,3 @@ status	^status: nginx 40[1345], ruxen 400$		body:POST-chunked-bad		#806: a malfo
 status	^status: nginx 400, ruxen		absolute-uri.* 400$		#781: an absolute-form HTTP/1.1 request without Host is served
 status	^status: nginx (412|304), ruxen 200$		(im-|ius-|inm-star|rand)		#782: `return 200` ignores If-Match, If-Unmodified-Since, `If-None-Match: *`
 			version:0\.9		#784: an HTTP/0.9 request waits for client_header_timeout
-status	^status: nginx (400|414), ruxen (400|501)$		/rand\d+:(pct-|long|star|no-slash|semicolon|backslash|slash-escaped)		#807: a bad request target is refused only after the headers are checked
-body	body differs		/rand\d+:(pct-|long|star|no-slash|semicolon|backslash|slash-escaped)	400 Bad Request.* -> .*Too Large	#807: a bad request target is refused only after the headers are checked

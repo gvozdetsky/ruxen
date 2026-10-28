@@ -585,6 +585,7 @@ mod tests {
             lb: Lb::RoundRobin,
             shared: None,
             dynamic: None,
+            metrics: None,
         };
         let resolver = Box::leak(Box::new(crate::resolver::Resolver {
             servers: Box::new(["127.0.0.1:53".parse().unwrap()]),

@@ -335,13 +335,13 @@ http {
         Some("application/javascript")
     );
     let b = std::str::from_utf8(body(&r)).unwrap();
-    assert!(b.starts_with("cb("), "body: {b}");
+    assert!(b.starts_with("/* callback */\r\ncb([\r\n{ "), "body: {b}");
     assert!(b.ends_with(");"), "body: {b}");
     assert!(b.contains(r#""name":"a.txt""#), "body: {b}");
 
     // The argument name in any case; the value as sent.
     let r = http_get(port, "/?CallBack=a.b_1");
-    assert!(body(&r).starts_with(b"a.b_1("), "{r:?}");
+    assert!(body(&r).starts_with(b"/* callback */\r\na.b_1("), "{r:?}");
 
     // No callback => bare JSON array, typed as JSON.
     for target in ["/", "/?callback=", "/?callback"] {

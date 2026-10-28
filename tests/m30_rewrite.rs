@@ -514,3 +514,71 @@ http { server { listen 127.0.0.1:%%PORT%%;
         assert_eq!(header_value(&r, "Location"), Some(want), "{path}");
     }
 }
+
+/// nginx's script code (#762): captures in the arguments are escaped only
+/// for a request path with an escape or a `+`, with NGX_ESCAPE_ARGS; a
+/// redirect joins the request's arguments with `&` only after a `?` of the
+/// replacement's own; an empty URI is a 500.
+#[test]
+fn rewrite_target_renders_like_nginx() {
+    let (_guard, port) = spawn_server(
+        r#"
+events {}
+http { absolute_redirect off; server { listen 127.0.0.1:%%PORT%%;
+    location / {
+        rewrite ^/a/([^/]*)/(.*)$ /in/$2?x=$1 last;
+        rewrite ^/r/(.*)$ /t/$1 redirect;
+        rewrite ^/e/(.*)$ $1 last;
+        return 200 "root uri=$uri args=$args";
+    }
+    location /in/ { return 200 "uri=$uri args=$args"; }
+} }
+"#,
+    );
+    for (path, want) in [
+        ("/a/x&y/z", "uri=/in/z args=x=x&y"),
+        ("/a/x%26y/z", "uri=/in/z args=x=x%26y"),
+        ("/a/x%7Cy;%5E/z", "uri=/in/z args=x=x%7Cy%3B%5E"),
+        ("/a/x+y/z?k=1", "uri=/in/z args=x=x%2By&k=1"),
+    ] {
+        let r = http_get(port, path);
+        assert_eq!(body(&r), want.as_bytes(), "{path}");
+    }
+    for (path, want) in [("/r/a%3Fb?c=1", "/t/a?b?c=1"), ("/r/a?c=1", "/t/a?c=1")] {
+        let r = http_get(port, path);
+        assert_eq!(header_value(&r, "Location"), Some(want), "{path}");
+    }
+    let r = http_get(port, "/e/");
+    assert_eq!(status_line(&r), "HTTP/1.1 500 Internal Server Error");
+}
+
+/// #798: a redirect is decided on the replacement as written. One starting
+/// with a capture stays internal even when it renders as a URL (no open
+/// redirect); one starting with a scheme redirects despite `last`/`break`.
+#[test]
+fn redirect_is_decided_by_the_replacement_as_written() {
+    let (_guard, port) = spawn_server(
+        r#"
+events {}
+http { merge_slashes off; server { listen 127.0.0.1:%%PORT%%;
+    location /v/ { rewrite ^/v/(.*)$ $1; }
+    location /r  { rewrite ^ http://x last; }
+    location /b  { rewrite ^ https://x/b?c=1 break; }
+    location /s  { rewrite ^/s(.*)$ $scheme://y$1; }
+    location / { return 200 "ok"; }
+} }
+"#,
+    );
+    let r = http_get(port, "/v/http://evil.example/");
+    assert_eq!(status_line(&r), "HTTP/1.1 404 Not Found");
+    assert_eq!(header_value(&r, "Location"), None);
+    for (path, want) in [
+        ("/r?a=1", "http://x?a=1"),
+        ("/b", "https://x/b?c=1"),
+        ("/sx?q=2", "http://yx?q=2"),
+    ] {
+        let r = http_get(port, path);
+        assert_eq!(status_line(&r), "HTTP/1.1 302 Moved Temporarily", "{path}");
+        assert_eq!(header_value(&r, "Location"), Some(want), "{path}");
+    }
+}

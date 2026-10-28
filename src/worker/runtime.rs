@@ -257,15 +257,15 @@ async fn write_access_line_by_path(
     ctx: &RenderCtx<'_>,
     line: Vec<u8>,
 ) {
-    if let Some(root) = doc_root
-        && let Err(e) = std::fs::metadata(root.path)
+    if let Some(root) = doc_root.map(|d| d.path_for(ctx))
+        && let Err(e) = std::fs::metadata(&root)
     {
         write_worker_log(
             error_logs,
             ErrorLogLevel::Error,
             &format!(
                 "testing \"{}\" existence failed ({}) while logging request",
-                root.path.display(),
+                root.display(),
                 errno_text(&e)
             ),
         );
@@ -598,6 +598,9 @@ async fn log_before_routing(
 ) {
     let listen = &http.listens[conn.listen_index];
     let server = &listen.servers[listen.default_server];
+    if http.metrics.is_some() {
+        super::metrics::response(server.metrics_slot, response, sent);
+    }
     if server.access_logs.is_empty() {
         return;
     }
@@ -818,6 +821,100 @@ fn grow_read_buffer(buf: &mut Vec<u8>) {
 fn shrink_head_buffer(buf: &mut Vec<u8>) {
     buf.truncate(READ_BUF);
     buf.shrink_to_fit();
+}
+
+/// What nginx refuses while it reads the request line, before any header
+/// (#807): a line past `large_client_header_buffers` (414), or a target
+/// that doesn't normalise (400). Checked only on the way to a refusal for
+/// the headers. `target`: its range in `head` (`None`: an implicit `/`).
+#[cold]
+#[inline(never)]
+fn line_refusal(
+    head: &[u8],
+    target: Option<(usize, usize)>,
+    max_line: usize,
+) -> Option<LineRefusal> {
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = head[..line_end]
+        .strip_suffix(b"\r")
+        .unwrap_or(&head[..line_end]);
+    if line.len() > max_line {
+        return Some(LineRefusal::TooLong);
+    }
+    // CONNECT's target is an authority, not a path.
+    if head.starts_with(b"CONNECT ") {
+        return None;
+    }
+    let target = &head[target?.0..target?.1];
+    let mut out = Vec::new();
+    crate::uri::normalize_with(target, false, &mut out)
+        .is_err()
+        .then_some(LineRefusal::BadTarget(target.first() == Some(&b'/')))
+}
+
+/// See `line_refusal`.
+enum LineRefusal {
+    TooLong,
+    /// A target that doesn't normalise; `true`: a path, where nginx has the
+    /// method (`$request_method`), not a line it couldn't parse (`*`, `x`).
+    BadTarget(bool),
+}
+
+/// The 414 or 400 of `line_refusal`, from the default server, as nginx
+/// answers it while reading the request line.
+#[cold]
+#[inline(never)]
+async fn refuse_line<S: ConnIo>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    http: &'static PreparedHttp,
+    head: &[u8],
+    refusal: LineRefusal,
+    conn: &ConnLogCtx<'_>,
+) {
+    let line_parsed = match refusal {
+        LineRefusal::TooLong => {
+            head_too_large(stream, scratch, http, head, None, conn).await;
+            return;
+        }
+        LineRefusal::BadTarget(line_parsed) => line_parsed,
+    };
+    // Before the headers: no host in the line.
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    refused_head_log(
+        http,
+        conn,
+        &head[..line_end],
+        None,
+        "client sent invalid request while reading client request line",
+    );
+    let (method, refused) = if line_parsed {
+        (head_method(head), Refused::Headers)
+    } else {
+        (Method::Other, Refused::Line)
+    };
+    reject_request(
+        stream,
+        scratch,
+        http,
+        http.bad_request.pick(method),
+        head,
+        refused,
+        conn,
+    )
+    .await;
+}
+
+/// `line_refusal` for a parsed request.
+#[cold]
+#[inline(never)]
+fn parsed_line_refusal(head: &[u8], req: &http::Request, max_line: usize) -> Option<LineRefusal> {
+    let target = (!req.implicit_path && req.absolute_query.is_none())
+        .then_some((req.path_start, req.path_end));
+    line_refusal(head, target, max_line)
 }
 
 /// The start of the first line of `head` longer than `max` bytes, without
@@ -1324,17 +1421,13 @@ fn finish_proxy_response(
     // with no body, then goes back with the upstream connection.
     // A body in the cache file (#515) likewise: the head is filtered,
     // the ranges cut the file.
-    let (upstream_resp, relayed, file) = match upstream_resp {
+    let (upstream_resp, mut relayed, file) = match upstream_resp {
         Response::ProxyStream(mut body) => (
             Response::Owned(std::mem::take(&mut body.head)),
             Some(body),
             None,
         ),
-        Response::File { headers, body } if process_meta.proxy_add_trailers.is_empty() => {
-            (Response::Owned(headers), None, Some(body))
-        }
-        // Trailers go after a chunked body built in memory.
-        Response::File { headers, body } => (read_file_body(headers, body, ctx), None, None),
+        Response::File { headers, body } => (Response::Owned(headers), None, Some(body)),
         other => (other, None, None),
     };
     // Reached through an `error_page` without `=`: the error's status
@@ -1392,7 +1485,7 @@ fn finish_proxy_response(
                 }
             }
             (upstream_resp, file) => (
-                range_filter(upstream_resp, relayed.is_some(), &process_meta, ctx),
+                range_filter(upstream_resp, &mut relayed, &process_meta, ctx),
                 file,
             ),
         }
@@ -1409,10 +1502,25 @@ fn finish_proxy_response(
     );
     let response = match (response, relayed, file) {
         (Response::Owned(head), Some(mut body), _) => {
-            body.head = head;
+            body.head = if process_meta.proxy_add_trailers.is_empty() {
+                head
+            } else {
+                expect_relay_trailers(head, &mut body, ctx, &process_meta)
+            };
             Response::ProxyStream(body)
         }
-        (Response::Owned(headers), _, Some(body)) => Response::File { headers, body },
+        (Response::Owned(headers), _, Some(body)) => Response::File {
+            headers: if process_meta.proxy_add_trailers.is_empty() {
+                headers
+            } else {
+                expect_file_trailers(headers, ctx, &mut process_meta)
+            },
+            body,
+        },
+        (Response::Owned(bytes), None, None) if !process_meta.proxy_add_trailers.is_empty() => {
+            process_meta.trailers_due = trailers_due(&bytes, ctx, &process_meta);
+            Response::Owned(bytes)
+        }
         (response, ..) => response,
     };
     // The header is filtered. A buffered body is already read, so the
@@ -1423,6 +1531,181 @@ fn finish_proxy_response(
     }
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
+}
+
+/// The last chunk with the trailers, after a relayed body. Returns the
+/// bytes written, `None` when the write failed.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn send_relay_trailers<S: ConnIo>(
+    stream: &mut S,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    uri: Option<&[u8]>,
+    head: &[u8],
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Option<u64> {
+    let out = super::response::relay_trailers(http, ctx, meta, uri, head);
+    let len = out.len();
+    let (res, _) = write_all_timed(stream, out, len, timer, send_timeout).await;
+    res.ok().map(|()| len as u64)
+}
+
+/// What the trailers render with.
+struct TrailerCtx<'a, 'r> {
+    http: &'static PreparedHttp,
+    ctx: &'a phase::RequestCtx<'r>,
+    meta: &'a phase::ProcessMeta,
+    uri: Option<&'a [u8]>,
+}
+
+/// A cached body with trailers (#793): the head, the file as one chunk
+/// (gzip: its chunks), then the last chunk with the trailers, rendered
+/// once the body is out. Plain writes, no sendfile: HTTP/2 decodes the
+/// chunks. Returns all bytes written, head included.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn send_file_trailers<S: ConnIo>(
+    stream: &mut S,
+    head: &mut Vec<u8>,
+    body: phase::FileBody,
+    gzip: Option<super::gzip::GzipStream>,
+    limit: Option<&phase::ResponseLimit>,
+    request_start: Instant,
+    tc: TrailerCtx<'_, '_>,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Result<u64, u64> {
+    let head_len = head.len();
+    let len = body.len;
+    let plain_chunk = gzip.is_none() && len > 0;
+    if plain_chunk {
+        head.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+    }
+    let out = std::mem::take(head);
+    let n = out.len();
+    let (res, mut returned) = write_all_timed(stream, out, n, timer.as_mut(), send_timeout).await;
+    returned.truncate(head_len);
+    *head = returned;
+    res.map_err(|n| n as u64)?;
+    let mut sent = n as u64;
+    match gzip {
+        Some(gz) => {
+            sent += stream_file_gzip(stream, body, gz, timer.as_mut(), send_timeout, false)
+                .await
+                .map_err(|n| sent + n)?;
+        }
+        None => {
+            let mut pacer = limit
+                .filter(|l| l.rate > 0)
+                .and_then(|l| super::Pacer::new(l.rate, l.after, request_start));
+            stream_file(stream, body, timer.as_mut(), send_timeout, pacer.as_mut())
+                .await
+                .map_err(|n| sent + n)?;
+            sent += len;
+        }
+    }
+    let mut out = if plain_chunk {
+        b"\r\n".to_vec()
+    } else {
+        Vec::new()
+    };
+    out.extend_from_slice(&super::response::relay_trailers(
+        tc.http, tc.ctx, tc.meta, tc.uri, head,
+    ));
+    let n = out.len();
+    let (res, _) = write_all_timed(stream, out, n, timer, send_timeout).await;
+    res.map_err(|n| sent + n as u64)?;
+    Ok(sent + n as u64)
+}
+
+/// `add_trailer` on a proxied body in memory (#793): one chunk, then the
+/// trailers. gzip already made it chunked (`compressed_response`): the
+/// trailers go in its last chunk.
+#[cold]
+#[inline(never)]
+fn trailers_in_memory(
+    bytes: Vec<u8>,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    uri: Option<&[u8]>,
+) -> Vec<u8> {
+    let Some(sep) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return bytes;
+    };
+    let chunked = super::response::response_header_value(&bytes, b"transfer-encoding")
+        .is_some_and(|v| v.eq_ignore_ascii_case(b"chunked"));
+    let (mut out, body) = if chunked {
+        let mut bytes = bytes;
+        if !bytes.ends_with(b"0\r\n\r\n") {
+            return bytes;
+        }
+        bytes.truncate(bytes.len() - 5);
+        (bytes, Vec::new())
+    } else {
+        let body = bytes[sep + 4..].to_vec();
+        let mut head = strip_header_lines(bytes, b"content-length");
+        let end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+        head.truncate(end + 2);
+        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        (head, body)
+    };
+    let head_end = out
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(0, |p| p + 4);
+    let trailers = super::response::relay_trailers(http, ctx, meta, uri, &out[..head_end]);
+    out.extend_from_slice(&super::response::build_single_chunk_body(&body));
+    out.extend_from_slice(&trailers);
+    out
+}
+
+/// `add_trailer` on a relayed body (#463): it goes chunked, without its
+/// length, and the worker writes the trailers after it.
+#[cold]
+#[inline(never)]
+fn expect_relay_trailers(
+    head: Vec<u8>,
+    body: &mut crate::proxy_stream::ProxyStream,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+) -> Vec<u8> {
+    if !super::response::trailers_allowed(ctx, meta)
+        || !super::response::expects_trailers(meta.proxy_add_trailers, response_status(&head))
+    {
+        return head;
+    }
+    body.trailers = true;
+    strip_header_lines(head, b"content-length")
+}
+
+/// nginx's `r->expect_trailers` for a response with `add_trailer`.
+#[cold]
+#[inline(never)]
+fn trailers_due(head: &[u8], ctx: &phase::RequestCtx<'_>, meta: &phase::ProcessMeta) -> bool {
+    super::response::trailers_allowed(ctx, meta)
+        && super::response::expects_trailers(meta.proxy_add_trailers, response_status(head))
+}
+
+/// `add_trailer` on a cached body sent from its file (#793): it goes
+/// chunked, without its length, the trailers after it.
+#[cold]
+#[inline(never)]
+fn expect_file_trailers(
+    head: Vec<u8>,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &mut phase::ProcessMeta,
+) -> Vec<u8> {
+    if !trailers_due(&head, ctx, meta) {
+        return head;
+    }
+    meta.trailers_due = true;
+    strip_header_lines(head, b"content-length")
 }
 
 /// A proxied response's head with the status of the `error_page` that led
@@ -1463,23 +1746,41 @@ fn may_cut_ranges(
 }
 
 /// nginx's range filter over a proxied or cached response (#370): an
-/// in-memory one is cut, a relayed one only says it could be.
+/// in-memory one is cut, a relayed one cut as it passes (#463).
 #[cold]
 #[inline(never)]
 fn range_filter(
     response: Response,
-    relayed: bool,
+    relayed: &mut Option<Box<crate::proxy_stream::ProxyStream>>,
     meta: &phase::ProcessMeta,
     ctx: &phase::RequestCtx<'_>,
 ) -> Response {
+    use super::range::RelayedCut;
     let req = super::range::RangeRequest {
         range: ctx.range,
         if_range: ctx.if_range,
         head_only: matches!(ctx.method, Method::Head),
     };
     match response {
-        Response::Owned(head) if relayed => {
-            Response::Owned(super::range::relayed_head(head, meta.max_ranges))
+        Response::Owned(head) if relayed.is_some() => {
+            match super::range::filter_relayed(head, meta.max_ranges, req, |len, server| {
+                super::range::not_satisfiable(len, req.head_only, server)
+            }) {
+                RelayedCut::Head(head) => Response::Owned(head),
+                RelayedCut::Window(head, start, end) => {
+                    if let Some(body) = relayed.as_deref_mut() {
+                        body.window = Some(crate::proxy_stream::Window::new(start, end));
+                    }
+                    Response::Owned(head)
+                }
+                // The body isn't the client's: only a cache reads on.
+                RelayedCut::Answer(answer) => {
+                    if let Some(body) = relayed.take() {
+                        crate::proxy_stream::fill_detached(body);
+                    }
+                    Response::Owned(answer)
+                }
+            }
         }
         Response::Owned(bytes) => Response::Owned(super::range::filter(
             bytes,
@@ -1517,22 +1818,6 @@ fn range_filter_file(
     .unwrap_or_else(|_| internal_error_response(ctx.method))
 }
 
-/// A cached response's body read from its file after `head`, for the
-/// filters that need it in memory (`add_trailer`).
-#[cold]
-#[inline(never)]
-fn read_file_body(
-    mut head: Vec<u8>,
-    body: phase::FileBody,
-    ctx: &phase::RequestCtx<'_>,
-) -> Response {
-    use std::os::fd::AsRawFd;
-    match crate::file::read_at_into(body.fd.as_raw_fd(), body.offset, body.len, &mut head) {
-        Ok(()) => Response::Owned(head),
-        Err(_) => internal_error_response(ctx.method),
-    }
-}
-
 #[allow(clippy::large_enum_variant)] // per request: boxing waits for #467's measurements
 enum PassOutcome {
     /// The response to send, with its metadata.
@@ -1559,14 +1844,11 @@ enum PassOutcome {
 async fn run_proxy_pass(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
-    mut plan: Box<crate::proxy::ProxyPlan>,
+    plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
     uri: Option<&[u8]>,
 ) -> PassOutcome {
-    // After an internal redirect the answer's head is rewritten further
-    // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
-    plan.stream = false;
     let response_rules = plan.response;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
@@ -1955,6 +2237,10 @@ fn carry_accel_headers(response: Response, carried: &[u8], proxied: bool) -> Res
             headers: merge(headers),
             body,
         },
+        Response::ProxyStream(mut s) => {
+            s.head = merge(std::mem::take(&mut s.head));
+            Response::ProxyStream(s)
+        }
         other => other,
     }
 }
@@ -2141,6 +2427,9 @@ pub fn run(
     let ready_on_failure = ready.clone();
     let body = async move {
         WORKER_CONNS.with(|w| w.http.set(Some(http)));
+        if let Some(m) = http.metrics {
+            m.attach();
+        }
         // Open one fd per configured access_log for this worker. Kept in a
         // thread-local so `write_access_logs` can do io_uring writes without
         // re-opening the file per request.
@@ -2322,6 +2611,7 @@ pub fn run(
         },
         Driver::Epoll => run_epoll(body),
     }
+    super::metrics::detach();
 }
 
 /// nginx's notice lines for a worker's end, from its own thread
@@ -3270,12 +3560,20 @@ impl AcceptTick {
 pub(crate) async fn wait_readable_or_shutdown(
     stream: &TcpStream,
     state: &RuntimeState,
-    idle_timeout: Option<Duration>,
+    limits: IdleLimits,
     fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> bool {
     use std::task::Poll;
 
+    let mut idle_timeout = limits.timeout;
+    if let Some(min) = limits.min {
+        match hold_keepalive(stream, state, min, idle_timeout, timers).await {
+            Held::Readable => return true,
+            Held::Close => return false,
+            Held::Idle(rest) => idle_timeout = rest,
+        }
+    }
     let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
     if let Some(due) = due {
         arm_idle(timers.idle.as_mut(), due);
@@ -3318,12 +3616,20 @@ pub(crate) async fn read_first_or_shutdown<T: monoio::buf::IoBufMut>(
     stream: &mut TcpStream,
     buf: T,
     state: &RuntimeState,
-    idle_timeout: Option<Duration>,
+    limits: IdleLimits,
     fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> (IdleRead, Option<T>) {
     use std::task::Poll;
 
+    let mut idle_timeout = limits.timeout;
+    if let Some(min) = limits.min {
+        match hold_keepalive(stream, state, min, idle_timeout, timers).await {
+            Held::Readable => return (IdleRead::Ready, Some(buf)),
+            Held::Close => return (IdleRead::Close, Some(buf)),
+            Held::Idle(rest) => idle_timeout = rest,
+        }
+    }
     let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
     if let Some(due) = due {
         arm_idle(timers.idle.as_mut(), due);
@@ -3354,6 +3660,56 @@ pub(crate) async fn read_first_or_shutdown<T: monoio::buf::IoBufMut>(
         // The read is dropped with this frame, and cancelled with it.
         None => (IdleRead::Close, None),
     }
+}
+
+/// How the first part of a keep-alive wait under `keepalive_min_timeout`
+/// ended.
+enum Held {
+    Readable,
+    Close,
+    /// Idle from now on, for this much longer (`None`: no limit).
+    Idle(Option<Duration>),
+}
+
+/// The first `min` of a keep-alive wait (`keepalive_min_timeout`, #601):
+/// not idle yet, so shutdown, a reload and a drain leave the connection
+/// open (ngx_http_set_keepalive leaves it out of the reusable ones). At its
+/// end the connection closes when shutting down or when `timeout` (no
+/// longer than `min`) is over, as ngx_http_keepalive_handler does.
+#[cold]
+async fn hold_keepalive(
+    stream: &TcpStream,
+    state: &RuntimeState,
+    min: Duration,
+    timeout: Option<Duration>,
+    timers: &mut ConnTimers<'_>,
+) -> Held {
+    use std::task::Poll;
+
+    let hold = timeout.map_or(min, |t| t.min(min));
+    let end = monoio::time::Instant::now() + hold;
+    arm_idle(timers.idle.as_mut(), end);
+    let mut readable = std::pin::pin!(stream.readable(false));
+    let ready = std::future::poll_fn(|cx| {
+        if let Poll::Ready(res) = readable.as_mut().poll(cx) {
+            return Poll::Ready(Some(res.is_ok()));
+        }
+        if idle_expired(timers.idle.as_mut(), end, cx) {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await;
+    match ready {
+        Some(true) => return Held::Readable,
+        Some(false) => return Held::Close,
+        None => {}
+    }
+    let rest = timeout.map(|t| t.saturating_sub(min));
+    if rest == Some(Duration::ZERO) || state.is_shutting_down() {
+        return Held::Close;
+    }
+    Held::Idle(rest)
 }
 
 /// A connection's read buffer and scratch buffers (see `handle`).
@@ -4004,8 +4360,6 @@ pub(crate) async fn handle_tls(
             .collect()
     });
     if info.alpn_protocol.as_deref() == Some(b"h2") {
-        // A read and a write run at once on an HTTP/2 connection.
-        tls_stream.begin_tunnel();
         let sni = sni.clone();
         return serve_h2(
             tls_stream,
@@ -4227,10 +4581,12 @@ pub(crate) async fn handle<S: ConnIo>(
         .accepted_at
         .filter(|_| !stream.h2())
         .map(|at| at + timeouts.header);
-    let mut keepalive_idle_timeout: Option<Duration> =
-        Some(first_head_due.map_or(timeouts.header, |due| {
+    let mut keepalive_idle = IdleLimits {
+        timeout: Some(first_head_due.map_or(timeouts.header, |due| {
             due.saturating_duration_since(Instant::now())
-        }));
+        })),
+        min: None,
+    };
     // When the current request's header must be complete; set on the first
     // read for it, cleared once the request is handled.
     let mut header_deadline: Option<monoio::time::Instant>;
@@ -4312,7 +4668,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     .idle_read(
                         std::mem::take(&mut *buf),
                         state,
-                        keepalive_idle_timeout,
+                        keepalive_idle,
                         std::mem::take(&mut fresh),
                         &mut timers,
                     )
@@ -4328,7 +4684,10 @@ pub(crate) async fn handle<S: ConnIo>(
         };
         restore_read_len(buf, buf_ptr, buf_len);
         conn_stats.set(super::stats::Phase::Reading);
-        keepalive_idle_timeout = None;
+        keepalive_idle = IdleLimits {
+            timeout: None,
+            min: None,
+        };
         // The header's time starts with its first bytes, as nginx's
         // client_header_timeout after the keep-alive read; the first
         // request's runs from the accept.
@@ -4419,11 +4778,27 @@ pub(crate) async fn handle<S: ConnIo>(
                                 timeouts.large_header,
                             )
                         {
+                            let head = &buf[read_start..read_start + req.consumed];
+                            if line > 0
+                                && let Some(refusal) =
+                                    parsed_line_refusal(head, &req, timeouts.large_header_line)
+                            {
+                                refuse_line(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    head,
+                                    refusal,
+                                    conn_log!(),
+                                )
+                                .await;
+                                return;
+                            }
                             head_too_large(
                                 stream,
                                 &mut *scratch,
                                 http,
-                                &buf[read_start..read_start + req.consumed],
+                                head,
                                 (line > 0).then_some(line),
                                 conn_log!(),
                             )
@@ -4440,14 +4815,22 @@ pub(crate) async fn handle<S: ConnIo>(
                                     .saturating_add(stream.h2_synthetic_lines()),
                             )
                         {
-                            many_header_lines(
-                                stream,
-                                &mut *scratch,
-                                http,
-                                &buf[read_start..read_start + req.consumed],
-                                conn_log!(),
-                            )
-                            .await;
+                            let head = &buf[read_start..read_start + req.consumed];
+                            if let Some(refusal) =
+                                parsed_line_refusal(head, &req, timeouts.large_header_line)
+                            {
+                                refuse_line(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    head,
+                                    refusal,
+                                    conn_log!(),
+                                )
+                                .await;
+                                return;
+                            }
+                            many_header_lines(stream, &mut *scratch, http, head, conn_log!()).await;
                             return;
                         }
                         conn_stats.request();
@@ -4502,7 +4885,14 @@ pub(crate) async fn handle<S: ConnIo>(
                                     RequestTransferEncoding::Invalid => Some(400),
                                 }
                             };
-                            if refuse.is_some() {
+                            if refuse.is_some()
+                                && parsed_line_refusal(
+                                    &buf[base..base + req.consumed],
+                                    &req,
+                                    usize::MAX,
+                                )
+                                .is_none()
+                            {
                                 let message = if !req.http_11 {
                                     "client sent HTTP/1.0 request with \"Transfer-Encoding\" header"
                                         .to_string()
@@ -4538,12 +4928,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
-                                    refused_parsed_head_log(
-                                        http,
-                                        conn_log!(),
-                                        &buf[base..base + req.headers_end],
-                                        "client sent invalid host in request line while reading client request line",
-                                    );
+                                    if parsed_line_refusal(
+                                        &buf[base..base + req.consumed],
+                                        &req,
+                                        usize::MAX,
+                                    )
+                                    .is_none()
+                                    {
+                                        refused_parsed_head_log(
+                                            http,
+                                            conn_log!(),
+                                            &buf[base..base + req.headers_end],
+                                            "client sent invalid host in request line while reading client request line",
+                                        );
+                                    }
                                     None
                                 }
                             },
@@ -4559,12 +4957,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                     // reading the headers).
                                     refuse = Some(400);
                                     bad_host = true;
-                                    refused_parsed_head_log(
-                                        http,
-                                        conn_log!(),
-                                        &buf[base..base + req.headers_end],
-                                        "client sent invalid host header while reading client request headers",
-                                    );
+                                    if parsed_line_refusal(
+                                        &buf[base..base + req.consumed],
+                                        &req,
+                                        usize::MAX,
+                                    )
+                                    .is_none()
+                                    {
+                                        refused_parsed_head_log(
+                                            http,
+                                            conn_log!(),
+                                            &buf[base..base + req.headers_end],
+                                            "client sent invalid host header while reading client request headers",
+                                        );
+                                    }
                                     None
                                 }
                             },
@@ -5216,13 +5622,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                 last.bytes_received += tunnelled.from_upstream;
                                 last.bytes_sent += tunnelled.to_upstream;
                             }
+                            let bytes_sent = if head_sent {
+                                head_len as u64 + tunnelled.to_client
+                            } else {
+                                head_cut_at
+                            };
+                            if http.metrics.is_some() {
+                                super::metrics::response(
+                                    process_meta.metrics_server,
+                                    &head,
+                                    bytes_sent,
+                                );
+                            }
                             if !process_meta.access_logs.is_empty() {
                                 let request_time_us = request_start.elapsed().as_micros() as u64;
-                                let bytes_sent = if head_sent {
-                                    head_len as u64 + tunnelled.to_client
-                                } else {
-                                    head_cut_at
-                                };
                                 write_access_logs(
                                     process_meta.access_logs,
                                     path,
@@ -5284,6 +5697,19 @@ pub(crate) async fn handle<S: ConnIo>(
                             ),
                             None => (response, None),
                         };
+                        // `add_trailer` on a body in memory: after gzip.
+                        if process_meta.trailers_due
+                            && let Response::Owned(bytes) = &mut response
+                        {
+                            *bytes = trailers_in_memory(
+                                std::mem::take(bytes),
+                                http,
+                                &ctx,
+                                &process_meta,
+                                final_uri(&process_meta, url_scratch),
+                            );
+                            process_meta.trailers_due = false;
+                        }
                         // `charset` (#464): the label on Content-Type, from
                         // the location's DocRoot, in place.
                         if let Some(charset) = process_meta.doc_root.and_then(|d| d.charset) {
@@ -5299,6 +5725,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             _ => false,
                         };
                         if closes {
+                            if http.metrics.is_some() {
+                                let head: &[u8] = match &response {
+                                    Response::Prebuilt(b) => b,
+                                    Response::Owned(b) => b,
+                                    _ => &[],
+                                };
+                                super::metrics::response(process_meta.metrics_server, head, 0);
+                            }
                             if !process_meta.access_logs.is_empty() {
                                 let logged: &[u8] = match &response {
                                     Response::Prebuilt(b) => b,
@@ -5421,9 +5855,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                 scan
                             }
                         };
+                        // No idle timeout: `keepalive_timeout 0` of a
+                        // server answering before any location.
                         let mut close_after = !keep_alive
                             || body_too_large
                             || !process_meta.keepalive.allow
+                            || process_meta.keepalive.idle_timeout_ms.is_none()
                             || request_count >= process_meta.keepalive.max_requests
                             || connection_time_us / 1_000 > process_meta.keepalive.max_time_ms
                             || matches!(method, Method::Trace | Method::Connect)
@@ -5446,6 +5883,12 @@ pub(crate) async fn handle<S: ConnIo>(
                             } else {
                                 close_after = true;
                             }
+                        } else if process_meta.trailers_due && gzip_stream.is_none() {
+                            insert_header_at(
+                                &mut *scratch,
+                                &mut scan.head_end,
+                                b"Transfer-Encoding: chunked\r\n",
+                            );
                         }
                         // The client stopped taking the response: it is
                         // logged with what is known to have gone out, then
@@ -5569,6 +6012,51 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // Cut short: the client can't tell, so the
                                 // connection closes (nginx closes it too).
                                 cut_short = !end.complete;
+                                if end.trailers_due && chunked_out {
+                                    match Box::pin(send_relay_trailers(
+                                        stream,
+                                        http,
+                                        &ctx,
+                                        &process_meta,
+                                        final_uri(&process_meta, url_scratch),
+                                        scratch,
+                                        timers.io.as_mut(),
+                                        send_timeout,
+                                    ))
+                                    .await
+                                    {
+                                        Some(sent) => streamed_body_len += sent,
+                                        None => cut_short = true,
+                                    }
+                                }
+                            } else if process_meta.trailers_due
+                                && let Some(body) = file_body.take()
+                            {
+                                let head_len = scratch.len() as u64;
+                                match Box::pin(send_file_trailers(
+                                    stream,
+                                    scratch,
+                                    body,
+                                    gzip_stream,
+                                    process_meta.limit_rate.as_deref(),
+                                    request_start,
+                                    TrailerCtx {
+                                        http,
+                                        ctx: &ctx,
+                                        meta: &process_meta,
+                                        uri: final_uri(&process_meta, url_scratch),
+                                    },
+                                    timers.io.as_mut(),
+                                    send_timeout,
+                                ))
+                                .await
+                                {
+                                    Ok(sent) => streamed_body_len = sent - head_len,
+                                    Err(n) => {
+                                        cut_short = true;
+                                        cut_sent = Some(n);
+                                    }
+                                }
                             } else if let Some(limit) = process_meta.limit_rate.as_deref()
                                 && limit.rate > 0
                                 && gzip_stream.is_none()
@@ -5644,6 +6132,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                             gz,
                                             timers.io.as_mut(),
                                             send_timeout,
+                                            true,
                                         )
                                         .await
                                     }
@@ -5678,6 +6167,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             }
                         }
 
+                        if http.metrics.is_some() {
+                            super::metrics::response(
+                                process_meta.metrics_server,
+                                response_for_logs,
+                                cut_sent
+                                    .unwrap_or(response_for_logs.len() as u64 + streamed_body_len),
+                            );
+                        }
                         if !process_meta.access_logs.is_empty() {
                             let request_time_us = request_start.elapsed().as_micros() as u64;
                             // Body bytes = total minus header block. The header
@@ -5781,14 +6278,35 @@ pub(crate) async fn handle<S: ConnIo>(
                             return;
                         }
 
-                        keepalive_idle_timeout = process_meta
-                            .keepalive
-                            .idle_timeout_ms
-                            .map(Duration::from_millis);
+                        let keepalive = &process_meta.keepalive;
+                        keepalive_idle = IdleLimits {
+                            timeout: keepalive.idle_timeout_ms.map(Duration::from_millis),
+                            min: (keepalive.min_timeout_ms > 0)
+                                .then(|| Duration::from_millis(keepalive.min_timeout_ms.into())),
+                        };
                     }
                     Parse::Incomplete => break,
                     Parse::Invalid => {
                         request_count = request_count.saturating_add(1);
+                        if parse_state.rline_done
+                            && let Some(refusal) = line_refusal(
+                                &buf[read_start..filled],
+                                (!parse_state.implicit_path && !parse_state.has_absolute_query)
+                                    .then_some((parse_state.path_start, parse_state.path_end)),
+                                timeouts.large_header_line,
+                            )
+                        {
+                            refuse_line(
+                                stream,
+                                &mut *scratch,
+                                http,
+                                &buf[read_start..filled],
+                                refusal,
+                                conn_log!(),
+                            )
+                            .await;
+                            return;
+                        }
                         let bad_version = invalid_head_log(
                             http,
                             conn_log!(),
@@ -5864,6 +6382,25 @@ pub(crate) async fn handle<S: ConnIo>(
                     if buf.len() < limit {
                         grow_head_buffer(buf, limit);
                         continue;
+                    }
+                    if parse_state.rline_done
+                        && let Some(refusal) = line_refusal(
+                            &buf[..filled],
+                            (!parse_state.implicit_path && !parse_state.has_absolute_query)
+                                .then_some((parse_state.path_start, parse_state.path_end)),
+                            usize::MAX,
+                        )
+                    {
+                        refuse_line(
+                            stream,
+                            &mut *scratch,
+                            http,
+                            &buf[..filled],
+                            refusal,
+                            conn_log!(),
+                        )
+                        .await;
+                        return;
                     }
                     head_too_large(
                         stream,
