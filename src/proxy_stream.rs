@@ -1030,10 +1030,9 @@ fn store(s: &mut ProxyStream) {
 fn close(s: Box<ProxyStream>, complete: bool, extra: bool) {
     let s = *s;
     return_read_buf(s.read_buf);
-    if complete
-        && !extra
-        && let Some(pool) = s.pool
-    {
+    if !complete || extra {
+        // Closed as it is.
+    } else if let Some(pool) = s.pool {
         upstream::pool_release(
             pool.upstream,
             pool.peer_idx,
@@ -1046,6 +1045,9 @@ fn close(s: Box<ProxyStream>, complete: bool, extra: bool) {
                 slot: s.slot,
             },
         );
+    } else if !matches!(s.framing, StreamFraming::Close) {
+        // A close-delimited body ended at the upstream's close already.
+        upstream::close_after_peer(s.upstream, s.slot);
     }
 }
 

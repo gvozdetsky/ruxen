@@ -435,8 +435,7 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   `ServerSessionMemoryCache` (4096 entries) shared by all workers, with
   `ssl_session_timeout` enforced on lookup. `ssl_session_tickets` is on
   by default. A `shared:` cache is kept across a reload, not a restart.
-  0-RTT and OCSP checks of client certificates aren't implemented yet
-  (README, Limitations).
+  0-RTT isn't implemented yet (README, Limitations).
 - **Session ticket keys are nginx's (#140).** `tls_ticket::NginxTicketer`
   builds tickets in the layout OpenSSL uses for nginx's key callback
   (`key name | IV | AES-CBC | HMAC-SHA256`), so the key name is visible.
@@ -519,6 +518,25 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   to clone an `Arc`, for stapling certificates only. A server on several
   addresses staples once: `prepare` keeps the stapling certificates of a
   load by their files and settings.
+- **OCSP checks of client certificates (#142)** follow
+  ngx_ssl_ocsp_validate with the same `ocsp` code. A client-certificate
+  context with `ssl_ocsp on|leaf` has an `ocsp::ClientOcsp`; a chain that
+  verifies is `ClientVerify::OcspPending` (with the chain X509_verify_cert
+  built) until `handle_tls` awaits its check, before the first request,
+  under what is left of the handshake's timeout, as nginx holds the
+  handshake open. Each certificate but the last (`leaf`: the leaf only) is
+  asked about at `ssl_ocsp_responder` or its AIA URL, which isn't resolved
+  then: a name needs `resolver`, else the check fails as in nginx.
+  OCSP_basic_verify runs without flags, with the verified chain and the
+  context's certificates. Anything but `good` for all is
+  `ClientVerify::Revoked` with nginx's text (`certificate revoked`,
+  `certificate status unknown`, `certificate status request failed`), and
+  the request is refused with 495; a check that never ran is refused too.
+  `ssl_ocsp_cache shared:NAME:SIZE` is a map shared by the workers and the
+  servers naming it, about 4 entries per KB (nginx's 256-byte slab
+  chunk), the oldest dropped when full, kept across a reload. A resumed
+  session is checked again, as in nginx. Contexts without `ssl_ocsp` pay
+  one comparison after the handshake.
 - **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
   rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
   When the variable is used and the listen resumes sessions, a full

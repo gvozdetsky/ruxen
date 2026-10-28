@@ -1035,9 +1035,14 @@ fn process_with_meta_inner(
         let req = req_now.as_ref().unwrap_or(req_in);
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
+        // A jump to a named location keeps `valid_unparsed_uri`
+        // (ngx_http_named_location); a redirect to a URI clears it.
         let internal_request = !refusing || hop > 0;
         if internal_request {
-            rewrite_state.unparsed_uri = false;
+            rewrite_state.internal = true;
+            if named_target.is_none() {
+                rewrite_state.unparsed_uri = false;
+            }
         }
         let mut loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
@@ -1069,6 +1074,13 @@ fn process_with_meta_inner(
             {
                 // Answered before any location: the server's error_page,
                 // add_header and logs, and the realip address.
+                let mut response = response;
+                crate::worker::generated_preconditions(
+                    &mut response,
+                    req,
+                    error_page_status,
+                    server.server_header,
+                );
                 let (response, mut refused) = refuse(
                     http,
                     req,
@@ -2591,6 +2603,15 @@ fn client_certificate_refusal(
                 || !crate::x509_verify::error_is_optional(*code as std::ffi::c_long) =>
         {
             log(format!("client SSL certificate verify error: ({code}:{text})").as_bytes());
+            Some((495, true))
+        }
+        // `ssl_ocsp` (#142); a pending check fails closed.
+        (_, ClientVerify::Revoked(_) | ClientVerify::OcspPending(_)) => {
+            let text = match &tls.client_verify {
+                ClientVerify::Revoked(text) => text,
+                _ => crate::ocsp::REQUEST_FAILED,
+            };
+            log(format!("client SSL certificate verify error: {text}").as_bytes());
             Some((495, true))
         }
         (VerifyClient::On, ClientVerify::None) => {
