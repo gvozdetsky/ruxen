@@ -55,6 +55,9 @@ pub struct ProxyStream {
     /// The range filter's one range: the client gets these body bytes
     /// only.
     pub(crate) window: Option<Window>,
+    /// `add_trailer`: the body goes chunked, and the worker writes the
+    /// last chunk with the trailers (`RelayEnd::trailers_due`).
+    pub(crate) trailers: bool,
 }
 
 /// The part of the body still to skip, then to send.
@@ -111,7 +114,7 @@ impl ProxyStream {
     /// The client learns the length from the head (`Content-Length`);
     /// otherwise the worker chunks the body (HTTP/1.1) or closes after it.
     pub fn length_known(&self) -> bool {
-        matches!(self.framing, StreamFraming::Length(_)) && self.gzip.is_none()
+        matches!(self.framing, StreamFraming::Length(_)) && self.gzip.is_none() && !self.trailers
     }
 }
 
@@ -131,6 +134,9 @@ pub struct RelayEnd {
     pub failure: Option<AttemptFailure>,
     /// The body reached the client whole.
     pub complete: bool,
+    /// `add_trailer`: the last chunk is still to be written, with the
+    /// trailers.
+    pub trailers_due: bool,
 }
 
 /// Read buffer of a relay: one read takes whatever the upstream socket
@@ -191,6 +197,13 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         response_ms: 0,
         failure: None,
         complete: false,
+        trailers_due: false,
+    };
+    // The last chunk, unless the worker writes it with the trailers.
+    let last_chunk: &[u8] = if chunked_out && !s.trailers {
+        b"0\r\n\r\n"
+    } else {
+        b""
     };
     // Bytes past the end of the body: the connection can't be pooled.
     let mut extra = false;
@@ -218,6 +231,9 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
     ) {
         Ok((done, _, more)) => {
             extra |= more;
+            if done {
+                head.extend_from_slice(last_chunk);
+            }
             done
         }
         Err(()) => {
@@ -272,9 +288,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
                         d.push(&[], &mut compressed, true);
                         push_body(&mut framed, &compressed, chunked_out);
                     }
-                    if chunked_out {
-                        framed.extend_from_slice(b"0\r\n\r\n");
-                    }
+                    framed.extend_from_slice(last_chunk);
                     if !framed.is_empty() {
                         let len = framed.len();
                         let (ok, _) = write_out(
@@ -359,6 +373,9 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
             Ok((done, used, more)) => {
                 extra |= more;
                 end.upstream_body += used as u64;
+                if done {
+                    framed.extend_from_slice(last_chunk);
+                }
                 done
             }
             Err(()) => {
@@ -403,7 +420,6 @@ fn consume(
     window: Option<&mut Window>,
     out: &mut Vec<u8>,
 ) -> Result<(bool, usize, bool), ()> {
-    let chunked_in = matches!(framing, StreamFraming::Chunked(_));
     let (body, done, used, more) = body_of(framing, input, decoded)?;
     if let Some(fill) = cache {
         fill.write(body);
@@ -413,9 +429,6 @@ fn consume(
         None => body,
     };
     push_body(out, body, chunked_out);
-    if done && chunked_out && chunked_in {
-        out.extend_from_slice(b"0\r\n\r\n");
-    }
     Ok((done, used, more))
 }
 
@@ -469,9 +482,6 @@ fn consume_out(
     compressed.clear();
     deflater.push(plain, compressed, done);
     push_body(out, compressed, chunked_out);
-    if done && chunked_out {
-        out.extend_from_slice(b"0\r\n\r\n");
-    }
     Ok((done, used, more))
 }
 
@@ -484,6 +494,7 @@ fn finish(
     head: Vec<u8>,
 ) -> (RelayEnd, Vec<u8>) {
     end.response_ms = s.started.elapsed().as_millis() as u64;
+    end.trailers_due = s.trailers && end.complete;
     // The client may be done before the body: a range's window.
     let body_done = match &s.framing {
         StreamFraming::Length(left) => *left == 0,
