@@ -29,12 +29,10 @@ Checked against ruxen 0.2.2 and nginx 1.30.6.
 ```text
 $ ruxen --compat -c /etc/nginx/nginx.conf
 ruxen 0.2.2: checking /etc/nginx/nginx.conf
-/etc/nginx/sites-enabled/mastodon:74: differs: gzip_static on — precompressed .gz files are not served (#760)
 /etc/nginx/sites-enabled/mastodon:141: differs: proxy_buffering off — ruxen relays a response as it arrives either way, except where it still reads it whole (…: #463)
 ignored: 4 tuning directives with no effect in ruxen: gzip_buffers, proxy_buffering, tcp_nodelay
-what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#gzip_static-on
 what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#proxy_buffering-off
-ruxen starts with this configuration; 2 directives behave differently from nginx
+ruxen starts with this configuration; 1 directive behaves differently from nginx
 ```
 
 - **unsupported**: ruxen refuses to start with it.
@@ -69,24 +67,6 @@ directive of these modules (`fastcgi_param` from `fastcgi_params`, …).
   TCP proxy) of its own, on its own ports, and run ruxen with the `http {}`
   part. Both can read the same `include` files.
 - **Issue:** none; out of scope for now ([`ROADMAP.md`](../ROADMAP.md)).
-
-### `root` or `alias` with variables
-
-`root /var/www/$host;`, `alias /srv/$1;`.
-
-- **ruxen:** refuses them. Taken literally, the path would point at a
-  directory named `$host` and serve other files than nginx serves.
-- **Do:** a literal `root` and `try_files` with the variable:
-  ```nginx
-  root /var/www;
-  location / {
-      try_files /$host$uri /$host$uri/index.html =404;
-  }
-  ```
-  ruxen refuses a `Host` with `/`, `..` or a leading `.` (400), as nginx
-  does, so `$host` can't leave the root. For `alias` with captures, one
-  `location` per directory with a literal `alias`.
-- **Issue:** [#232] (open).
 
 ### `grpc_pass`
 
@@ -190,18 +170,6 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
 - **Do:** `ssl_protocols TLSv1.2 TLSv1.3;`. Keep nginx for a server whose
   clients need TLS 1.0.
 - **Issue:** none; [#36] (closed) made the old names a warning.
-
-### `gzip_static on`
-
-- **ruxen:** doesn't look for `file.gz`; it sends `file`, compressed per
-  request when `gzip on` and `gzip_types` cover it.
-- **Matters:** CPU per request instead of once at build time, and the
-  compressed response is chunked, with a weak `ETag`. With `gzip_static
-  always`, clients without gzip get the plain file, which is what they can
-  read anyway.
-- **Do:** `gzip on;` with the types in `gzip_types` (`text/html` is always
-  included).
-- **Issue:** [#760] (open).
 
 ### `proxy_request_buffering off`
 
@@ -391,11 +359,40 @@ Started as root, ruxen binds its ports, opens certificates and logs, then
 switches the whole process to `user` (nginx's default `nobody`) before it
 accepts a connection. A helper process stays root to recreate rotated log
 files for that user and remove the pid file; it takes only fixed one-byte
-commands. After the switch, a reload reads the configuration as `user` and
-can't bind a new port below 1024 ([#344], open): restart to add one.
+commands. A reload binds new ports below 1024 as nginx's root master
+does, but it reads the configuration, certificates, keys and password
+files as `user`, where nginx's master reads them as root ([#774], open).
+A key only root may read loads at startup, and the first reload after it
+is replaced fails: the old configuration keeps running with the old
+certificate, with an `[emerg]` in the error log. certbot writes its keys
+like that (`0600 root`, in a `0700` directory), so the reload after a
+renewal fails. ruxen warns at startup about every file it read as root that
+`user` can't read (`user "www-data" can't read "...": a reload will fail
+to read it`). Either make those files readable by `user`, for example with
+a group (`chgrp ssl-cert`, `chmod 640`, in a certbot `--deploy-hook` too),
+or run ruxen without root.
+
 Started unprivileged, as the systemd unit and the container image do,
 ruxen ignores `user` with nginx's warning; grant `CAP_NET_BIND_SERVICE` for
-ports below 1024.
+ports below 1024. Under systemd, root-only keys reach the service with
+`LoadCredential=`: systemd reads them as root at every start and puts
+copies the service can read in `$CREDENTIALS_DIRECTORY`
+(`/run/credentials/ruxen.service`):
+
+```ini
+# systemctl edit ruxen
+[Service]
+LoadCredential=example.com.key:/etc/letsencrypt/live/example.com/privkey.pem
+LoadCredential=example.com.crt:/etc/letsencrypt/live/example.com/fullchain.pem
+```
+
+```nginx
+ssl_certificate     /run/credentials/ruxen.service/example.com.crt;
+ssl_certificate_key /run/credentials/ruxen.service/example.com.key;
+```
+
+The copies are made at start only: after a renewal, `systemctl restart
+ruxen`, not `reload`.
 
 ### Reload and binary upgrade
 
@@ -439,9 +436,7 @@ start without it.
 
 [#36]: https://github.com/gvozdetsky/ruxen/issues/36
 [#134]: https://github.com/gvozdetsky/ruxen/issues/134
-[#232]: https://github.com/gvozdetsky/ruxen/issues/232
 [#337]: https://github.com/gvozdetsky/ruxen/issues/337
-[#344]: https://github.com/gvozdetsky/ruxen/issues/344
 [#463]: https://github.com/gvozdetsky/ruxen/issues/463
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
 [#526]: https://github.com/gvozdetsky/ruxen/issues/526
@@ -450,5 +445,5 @@ start without it.
 [#599]: https://github.com/gvozdetsky/ruxen/issues/599
 [#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
-[#760]: https://github.com/gvozdetsky/ruxen/issues/760
 [#764]: https://github.com/gvozdetsky/ruxen/issues/764
+[#774]: https://github.com/gvozdetsky/ruxen/issues/774
