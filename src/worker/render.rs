@@ -615,6 +615,26 @@ pub(crate) fn lookup_request_header<'a>(mut block: &'a [u8], name: &[u8]) -> Opt
     None
 }
 
+/// Every value of `name` in the raw header block, trimmed, in order.
+pub(crate) fn request_header_values<'a>(
+    block: &'a [u8],
+    name: &'a [u8],
+) -> impl DoubleEndedIterator<Item = &'a [u8]> {
+    block.split(|&b| b == b'\n').filter_map(move |line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let colon = line.iter().position(|&b| b == b':')?;
+        header_name_eq_ci(&line[..colon], name)
+            .then(|| line[colon + 1..].trim_ascii_start())
+            .map(|v| {
+                let end = v
+                    .iter()
+                    .rposition(|&c| c != b' ' && c != b'\t')
+                    .map_or(0, |i| i + 1);
+                &v[..end]
+            })
+    })
+}
+
 /// Walk every occurrence of `name` in the raw header block and write each
 /// trimmed value into `out`, joined with `, ` (or `; ` for Cookie, matching
 /// nginx's `ngx_http_variables.c::ngx_http_variable_headers` /
