@@ -1486,10 +1486,15 @@ pub(crate) fn run_location_handler(
                         server_bytes,
                     ))
                 }
-                fs_resolve::Outcome::Reroute(target) => {
-                    // A try_files fallback such as `/index.php?$args`
-                    // brings its own arguments: nginx's internal redirect
-                    // takes the part after `?` as the new `$args`.
+                outcome @ (fs_resolve::Outcome::Reroute(_) | fs_resolve::Outcome::Fallback(_)) => {
+                    // A try_files fallback URI brings its own arguments,
+                    // the part after `?`, and none without one
+                    // (ngx_http_try_files_module.c, ngx_http_split_args).
+                    let (target, fallback) = match outcome {
+                        fs_resolve::Outcome::Fallback(target) => (target, true),
+                        fs_resolve::Outcome::Reroute(target) => (target, false),
+                        _ => unreachable!(),
+                    };
                     let (target, args) = match target {
                         phase::RerouteTarget::Uri(mut uri) => {
                             match uri.iter().position(|&b| b == b'?') {
@@ -1498,7 +1503,7 @@ pub(crate) fn run_location_handler(
                                     uri.truncate(q);
                                     (phase::RerouteTarget::Uri(uri), Some(args))
                                 }
-                                None => (phase::RerouteTarget::Uri(uri), None),
+                                None => (phase::RerouteTarget::Uri(uri), fallback.then(Vec::new)),
                             }
                         }
                         named => (named, None),
