@@ -1011,21 +1011,41 @@ fn discard_queued_on(fd: std::os::unix::io::RawFd, mut len: u64) -> u64 {
     len
 }
 
-/// `write_all_timed`, but on plain TCP the bytes go out at once with
-/// `send(MSG_DONTWAIT)`, while they are still in the cache from being
-/// read; it waits for writability only when the socket is full (#247).
-/// An io_uring write would run at the next submit, after other
-/// connections' reads have pushed them out. TLS and HTTP/2 use the
-/// io_uring write.
-pub(crate) async fn write_all_now<S: ConnIo>(
+/// A response: `write_all_now` after a request whose body was read from
+/// the socket, else `write_all_timed`. Answering a body request at once
+/// spares it a trip through the ring, which cost `proxy_post_64k` about 9%
+/// (#289); other responses are cheaper batched in the ring. Both loops are
+/// here rather than behind a call: a nested future cost ~130 instructions
+/// per `proxy_hello` request.
+pub(crate) async fn write_response<S: ConnIo>(
     stream: &mut S,
-    buf: Vec<u8>,
+    mut buf: Vec<u8>,
     len: usize,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     timeout: Duration,
+    after_body: bool,
 ) -> (Result<(), usize>, Vec<u8>) {
-    let Some(sock) = stream.sendfile_fd() else {
-        return write_all_timed(stream, buf, len, timer, timeout).await;
+    let sock = match after_body {
+        true => stream.sendfile_fd(),
+        false => None,
+    };
+    let Some(sock) = sock else {
+        // `write_all_timed`.
+        let mut written = 0;
+        while written < len {
+            let slice = buf.slice(written..len);
+            let Some((res, slice)) =
+                with_timeout(timer.as_mut(), timeout, stream.write(slice)).await
+            else {
+                return (Err(written), Vec::new());
+            };
+            buf = slice.into_inner();
+            match res {
+                Ok(n) if n > 0 => written += n,
+                _ => return (Err(written), buf),
+            }
+        }
+        return (Ok(()), buf);
     };
     let mut sent = 0usize;
     while sent < len {
@@ -1057,6 +1077,22 @@ pub(crate) async fn write_all_now<S: ConnIo>(
         }
     }
     (Ok(()), buf)
+}
+
+/// `write_all_timed`, but on plain TCP the bytes go out at once with
+/// `send(MSG_DONTWAIT)`, while they are still in the cache from being
+/// read; it waits for writability only when the socket is full (#247).
+/// An io_uring write would run at the next submit, after other
+/// connections' reads have pushed them out. TLS and HTTP/2 use the
+/// io_uring write.
+pub(crate) async fn write_all_now<S: ConnIo>(
+    stream: &mut S,
+    buf: Vec<u8>,
+    len: usize,
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    timeout: Duration,
+) -> (Result<(), usize>, Vec<u8>) {
+    write_response(stream, buf, len, timer, timeout, true).await
 }
 
 /// `write_all` with nginx's `send_timeout`: the connection is given up

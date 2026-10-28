@@ -879,6 +879,7 @@ fn stapling_trust(verify: &crate::config::ClientVerifyConf) -> crate::config::Cl
         trusted_certificate: verify.trusted_certificate.clone(),
         depth: None,
         crl: verify.crl.clone(),
+        ..Default::default()
     }
 }
 
@@ -925,6 +926,17 @@ struct ClientAuthKey {
     trusted_certificate: Option<Vec<u8>>,
     crl: Option<Vec<u8>>,
     depth: u32,
+    ocsp: Option<OcspKey>,
+}
+
+/// `ssl_ocsp on|leaf` (#142) and what it uses.
+#[derive(PartialEq, Eq)]
+struct OcspKey {
+    leaf_only: bool,
+    responder: Option<String>,
+    cache: Option<crate::config::OcspCacheZone>,
+    resolver: Option<crate::config::ResolverConf>,
+    resolver_timeout_ms: Option<u64>,
 }
 
 /// A server's `ssl_verify_client` settings, read: `None` with it off.
@@ -959,11 +971,28 @@ fn client_auth_key(input: &TlsServerInput) -> Result<Option<ClientAuthKey>, Stri
                 .to_string(),
         );
     }
+    let ocsp = match conf.ocsp.unwrap_or(crate::config::OcspMode::Off) {
+        crate::config::OcspMode::Off => None,
+        _ if mode == VerifyClient::OptionalNoCa => {
+            return Err(
+                "\"ssl_ocsp\" is incompatible with \"ssl_verify_client optional_no_ca\""
+                    .to_string(),
+            );
+        }
+        on => Some(OcspKey {
+            leaf_only: on == crate::config::OcspMode::Leaf,
+            responder: conf.ocsp_responder.clone(),
+            cache: conf.ocsp_cache.clone().flatten(),
+            resolver: input.resolver.clone(),
+            resolver_timeout_ms: input.resolver_timeout_ms,
+        }),
+    };
     Ok(Some(ClientAuthKey {
         client_certificate: read(&conf.client_certificate, "SSL_CTX_load_verify_locations")?,
         trusted_certificate,
         crl,
         depth: conf.depth.unwrap_or(1),
+        ocsp,
     }))
 }
 
@@ -992,9 +1021,44 @@ fn client_auth(key: &ClientAuthKey) -> Result<crate::client_verify::ClientAuth, 
             .add_crl(pem)
             .map_err(|e| fail("X509_LOOKUP_load_file(ssl_crl)", e))?;
     }
+    let ocsp = match &key.ocsp {
+        Some(ocsp) => {
+            // The same certificates without the verify depth, which limits
+            // the SSL_CTX and not its store (OCSP_basic_verify).
+            let mut ocsp_store = crate::x509_verify::Store::without_depth()
+                .map_err(|e| fail("X509_STORE_new()", e))?;
+            for pem in [&key.client_certificate, &key.trusted_certificate]
+                .into_iter()
+                .flatten()
+            {
+                ocsp_store
+                    .add_trusted(pem)
+                    .map_err(|e| fail("SSL_CTX_load_verify_locations()", e))?;
+            }
+            if let Some(pem) = &key.crl {
+                ocsp_store
+                    .add_crl(pem)
+                    .map_err(|e| fail("X509_LOOKUP_load_file(ssl_crl)", e))?;
+            }
+            let settings = crate::ocsp::ClientSettings {
+                leaf_only: ocsp.leaf_only,
+                responder: ocsp.responder.as_deref(),
+                store: Arc::new(ocsp_store),
+                resolver: ocsp.resolver.clone().map(prepare_resolver),
+                resolver_timeout: std::time::Duration::from_millis(
+                    ocsp.resolver_timeout_ms
+                        .unwrap_or(ProxyEffective::defaults().resolver_timeout_ms),
+                ),
+                cache: ocsp.cache.as_ref().map(|c| (c.name.as_str(), c.size)),
+            };
+            Some(Arc::new(crate::ocsp::ClientOcsp::new(settings)?))
+        }
+        None => None,
+    };
     Ok(crate::client_verify::ClientAuth {
         store: Arc::new(store),
         hints,
+        ocsp,
     })
 }
 
