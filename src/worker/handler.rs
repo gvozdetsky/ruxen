@@ -1312,10 +1312,6 @@ pub(crate) fn run_location_handler(
             intercept,
             // No protocol switch over HTTP/2 (ngx_http_proxy_v2_module).
             upgrade: client_upgrade && proxy.http_version != 2,
-            // A response the range filter may cut is read whole (#370).
-            stream: cache.is_none()
-                && loc.add_trailers.is_empty()
-                && !(force_ranges && req.range.is_some()),
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
             h2: proxy.http_version == 2,

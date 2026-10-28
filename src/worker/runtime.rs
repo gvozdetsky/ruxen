@@ -1144,7 +1144,7 @@ fn finish_proxy_response(
     // with no body, then goes back with the upstream connection.
     // A body in the cache file (#515) likewise: the head is filtered,
     // the ranges cut the file.
-    let (upstream_resp, relayed, file) = match upstream_resp {
+    let (upstream_resp, mut relayed, file) = match upstream_resp {
         Response::ProxyStream(mut body) => (
             Response::Owned(std::mem::take(&mut body.head)),
             Some(body),
@@ -1212,7 +1212,7 @@ fn finish_proxy_response(
                 }
             }
             (upstream_resp, file) => (
-                range_filter(upstream_resp, relayed.is_some(), &process_meta, ctx),
+                range_filter(upstream_resp, &mut relayed, &process_meta, ctx),
                 file,
             ),
         }
@@ -1221,6 +1221,7 @@ fn finish_proxy_response(
     };
     let response = apply_proxy_add_headers(
         upstream_resp,
+        relayed.is_some(),
         http,
         ctx,
         &process_meta,
@@ -1229,7 +1230,11 @@ fn finish_proxy_response(
     );
     let response = match (response, relayed, file) {
         (Response::Owned(head), Some(mut body), _) => {
-            body.head = head;
+            body.head = if process_meta.proxy_add_trailers.is_empty() {
+                head
+            } else {
+                expect_relay_trailers(head, &mut body, ctx, &process_meta)
+            };
             Response::ProxyStream(body)
         }
         (Response::Owned(headers), _, Some(body)) => Response::File { headers, body },
@@ -1243,6 +1248,46 @@ fn finish_proxy_response(
     }
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
+}
+
+/// The last chunk with the trailers, after a relayed body. Returns the
+/// bytes written, `None` when the write failed.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn send_relay_trailers<S: ConnIo>(
+    stream: &mut S,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    uri: Option<&[u8]>,
+    head: &[u8],
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Option<u64> {
+    let out = super::response::relay_trailers(http, ctx, meta, uri, head);
+    let len = out.len();
+    let (res, _) = write_all_timed(stream, out, len, timer, send_timeout).await;
+    res.ok().map(|()| len as u64)
+}
+
+/// `add_trailer` on a relayed body (#463): it goes chunked, without its
+/// length, and the worker writes the trailers after it.
+#[cold]
+#[inline(never)]
+fn expect_relay_trailers(
+    head: Vec<u8>,
+    body: &mut crate::proxy_stream::ProxyStream,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+) -> Vec<u8> {
+    if !super::response::trailers_allowed(ctx, meta)
+        || !super::response::expects_trailers(meta.proxy_add_trailers, response_status(&head))
+    {
+        return head;
+    }
+    body.trailers = true;
+    strip_header_lines(head, b"content-length")
 }
 
 /// A proxied response's head with the status of the `error_page` that led
@@ -1283,23 +1328,41 @@ fn may_cut_ranges(
 }
 
 /// nginx's range filter over a proxied or cached response (#370): an
-/// in-memory one is cut, a relayed one only says it could be.
+/// in-memory one is cut, a relayed one cut as it passes (#463).
 #[cold]
 #[inline(never)]
 fn range_filter(
     response: Response,
-    relayed: bool,
+    relayed: &mut Option<Box<crate::proxy_stream::ProxyStream>>,
     meta: &phase::ProcessMeta,
     ctx: &phase::RequestCtx<'_>,
 ) -> Response {
+    use super::range::RelayedCut;
     let req = super::range::RangeRequest {
         range: ctx.range,
         if_range: ctx.if_range,
         head_only: matches!(ctx.method, Method::Head),
     };
     match response {
-        Response::Owned(head) if relayed => {
-            Response::Owned(super::range::relayed_head(head, meta.max_ranges))
+        Response::Owned(head) if relayed.is_some() => {
+            match super::range::filter_relayed(head, meta.max_ranges, req, |len, server| {
+                super::range::not_satisfiable(len, req.head_only, server)
+            }) {
+                RelayedCut::Head(head) => Response::Owned(head),
+                RelayedCut::Window(head, start, end) => {
+                    if let Some(body) = relayed.as_deref_mut() {
+                        body.window = Some(crate::proxy_stream::Window::new(start, end));
+                    }
+                    Response::Owned(head)
+                }
+                // The body isn't the client's: only a cache reads on.
+                RelayedCut::Answer(answer) => {
+                    if let Some(body) = relayed.take() {
+                        crate::proxy_stream::fill_detached(body);
+                    }
+                    Response::Owned(answer)
+                }
+            }
         }
         Response::Owned(bytes) => Response::Owned(super::range::filter(
             bytes,
@@ -1379,14 +1442,11 @@ enum PassOutcome {
 async fn run_proxy_pass(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
-    mut plan: Box<crate::proxy::ProxyPlan>,
+    plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
     uri: Option<&[u8]>,
 ) -> PassOutcome {
-    // After an internal redirect the answer's head is rewritten further
-    // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
-    plan.stream = false;
     let response_rules = plan.response;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
@@ -1775,6 +1835,10 @@ fn carry_accel_headers(response: Response, carried: &[u8], proxied: bool) -> Res
             headers: merge(headers),
             body,
         },
+        Response::ProxyStream(mut s) => {
+            s.head = merge(std::mem::take(&mut s.head));
+            Response::ProxyStream(s)
+        }
         other => other,
     }
 }
@@ -5375,6 +5439,23 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // Cut short: the client can't tell, so the
                                 // connection closes (nginx closes it too).
                                 cut_short = !end.complete;
+                                if end.trailers_due && chunked_out {
+                                    match Box::pin(send_relay_trailers(
+                                        stream,
+                                        http,
+                                        &ctx,
+                                        &process_meta,
+                                        final_uri(&process_meta, url_scratch),
+                                        scratch,
+                                        timers.io.as_mut(),
+                                        send_timeout,
+                                    ))
+                                    .await
+                                    {
+                                        Some(sent) => streamed_body_len += sent,
+                                        None => cut_short = true,
+                                    }
+                                }
                             } else if let Some(limit) = process_meta.limit_rate.as_deref()
                                 && limit.rate > 0
                                 && gzip_stream.is_none()
