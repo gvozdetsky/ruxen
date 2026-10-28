@@ -9,7 +9,10 @@
 //! after that (requests, log reopen on SIGUSR1) runs as the user, as in
 //! nginx's workers. What nginx's master still does as root afterwards
 //! (recreate rotated logs, remove the pid file) a small root helper
-//! process does here, see `start_helper`.
+//! process does here, see `start_helper`. The master's binding of a
+//! reload's new ports below 1024 takes one capability the process keeps,
+//! `CAP_NET_BIND_SERVICE` (#344, `keep_bind_capability`): what the
+//! systemd unit in `contrib/` grants an unprivileged ruxen too.
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -165,6 +168,12 @@ pub(crate) fn switch(creds: &Credentials) -> Result<(), String> {
     // glibc applies these to every thread of the process (SIGSETXID).
     // SAFETY: plain credential syscalls with owned arguments.
     unsafe {
+        // This thread (`main`, which binds a reload's listeners) keeps its
+        // permitted capabilities across setuid, for `keep_bind_capability`
+        // to narrow; the other threads lose theirs.
+        if creds.uid != 0 {
+            libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0);
+        }
         if libc::setgid(creds.gid) != 0 {
             return Err(os_error(&format!("setgid({})", creds.gid)));
         }
@@ -174,6 +183,9 @@ pub(crate) fn switch(creds: &Credentials) -> Result<(), String> {
         if libc::setuid(creds.uid) != 0 {
             return Err(os_error(&format!("setuid({})", creds.uid)));
         }
+    }
+    if creds.uid != 0 {
+        keep_bind_capability()?;
     }
     verify(creds)?;
     // As nginx's workers: setuid clears the dumpable flag, which would
@@ -203,7 +215,150 @@ fn verify(creds: &Credentials) -> Result<(), String> {
     if creds.uid != 0 && unsafe { libc::setuid(0) } == 0 {
         return Err("root could be regained after switching users".to_string());
     }
+    if creds.uid != 0 {
+        let caps = capget().map_err(|e| format!("capget() failed ({})", errno_text(&e)))?;
+        if caps.permitted & !BIND_SERVICE != 0 || caps.effective != 0 || caps.inheritable != 0 {
+            return Err(format!(
+                "switching to user {} left capabilities {caps:x?}",
+                creds.name.to_string_lossy()
+            ));
+        }
+    }
     Ok(())
+}
+
+/// `CAP_NET_BIND_SERVICE` (linux/capability.h), as a capability mask.
+const BIND_SERVICE: u64 = 1 << 10;
+
+/// Whether the switch kept `CAP_NET_BIND_SERVICE` (#344).
+static BIND_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A thread's capability sets, as masks of capability numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Caps {
+    effective: u64,
+    permitted: u64,
+    inheritable: u64,
+}
+
+/// `struct __user_cap_header_struct` and `__user_cap_data_struct`
+/// (linux/capability.h); version 3 takes two data structs, the low and
+/// the high 32 capabilities.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+impl Caps {
+    fn to_data(self) -> [CapData; 2] {
+        let word = |mask: u64, i: u32| (mask >> (32 * i)) as u32;
+        [0, 1].map(|i| CapData {
+            effective: word(self.effective, i),
+            permitted: word(self.permitted, i),
+            inheritable: word(self.inheritable, i),
+        })
+    }
+
+    fn from_data(data: [CapData; 2]) -> Self {
+        let mask = |f: fn(&CapData) -> u32| u64::from(f(&data[0])) | u64::from(f(&data[1])) << 32;
+        Caps {
+            effective: mask(|d| d.effective),
+            permitted: mask(|d| d.permitted),
+            inheritable: mask(|d| d.inheritable),
+        }
+    }
+}
+
+/// The calling thread's capabilities.
+fn capget() -> std::io::Result<Caps> {
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: the kernel fills the two data structs of a version 3 header.
+    let rc = unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Caps::from_data(data))
+}
+
+/// Sets the calling thread's capabilities (only this thread's: Linux
+/// keeps them per thread).
+fn capset(caps: Caps) -> std::io::Result<()> {
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = caps.to_data();
+    // SAFETY: the kernel reads the two data structs of a version 3 header.
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// After setuid under `PR_SET_KEEPCAPS` this thread still holds root's
+/// permitted capabilities: keep `CAP_NET_BIND_SERVICE` alone, and not
+/// effective until a reload binds (`with_bind_capability`), so a new
+/// `listen` below 1024 binds as under nginx's root master (#344). Threads
+/// `main` starts later inherit it; the workers running now lost all of
+/// theirs in setuid. Where the kernel refuses, nothing is kept, and such
+/// a reload fails as before.
+fn keep_bind_capability() -> Result<(), String> {
+    let only_bind = Caps {
+        effective: 0,
+        permitted: BIND_SERVICE,
+        inheritable: 0,
+    };
+    let kept = capset(only_bind).is_ok();
+    if !kept && let Err(e) = capset(Caps::default()) {
+        return Err(format!("capset() failed ({})", errno_text(&e)));
+    }
+    // SAFETY: prctl with integer arguments.
+    unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) };
+    BIND_KEPT.store(
+        kept && capget().is_ok_and(|c| c.permitted == BIND_SERVICE),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(())
+}
+
+/// Runs `bind` with `CAP_NET_BIND_SERVICE` effective on this thread when
+/// the switch to `user` kept it (#344), and lowers it again after.
+pub(crate) fn with_bind_capability<T>(bind: impl FnOnce() -> T) -> T {
+    if !BIND_KEPT.load(std::sync::atomic::Ordering::Relaxed) {
+        return bind();
+    }
+    let raise = |effective| {
+        capset(Caps {
+            effective,
+            permitted: BIND_SERVICE,
+            inheritable: 0,
+        })
+    };
+    let raised = raise(BIND_SERVICE).is_ok();
+    let out = bind();
+    if raised && let Err(e) = raise(0) {
+        eprintln!(
+            "ruxen: [alert] capset() failed ({}): CAP_NET_BIND_SERVICE stays effective",
+            errno_text(&e)
+        );
+    }
+    out
 }
 
 /// nginx's `ngx_create_paths`: create the directory (0700), give it to the
@@ -576,6 +731,37 @@ mod tests {
         assert_eq!(err, "getgrnam(\"no-such-group-ruxen\") failed");
         let err = resolve(0, Some(&user("no-such-user-ruxen", None))).unwrap_err();
         assert_eq!(err, "getpwnam(\"no-such-user-ruxen\") failed");
+    }
+
+    /// The capability sets go to the kernel's two 32-bit words and back.
+    #[test]
+    fn capability_masks_round_trip() {
+        let caps = Caps {
+            effective: BIND_SERVICE,
+            permitted: BIND_SERVICE | 1 << 40,
+            inheritable: 1,
+        };
+        let data = caps.to_data();
+        assert_eq!(data[0].effective, 1 << 10);
+        assert_eq!(data[1].permitted, 1 << 8);
+        assert_eq!(data[0].inheritable, 1);
+        assert_eq!(Caps::from_data(data), caps);
+    }
+
+    /// capget works for any user, and setting what a thread has changes
+    /// nothing. Without a switch nothing is kept, and the bind runs as is.
+    #[test]
+    fn capabilities_of_this_thread() {
+        // A thread of its own: capabilities are per thread.
+        std::thread::spawn(|| {
+            let caps = capget().unwrap();
+            capset(caps).unwrap();
+            assert_eq!(capget().unwrap(), caps);
+            assert_eq!(with_bind_capability(|| 7), 7);
+            assert_eq!(capget().unwrap(), caps);
+        })
+        .join()
+        .unwrap();
     }
 
     /// The fork of the root helper needs one thread (#527); io_uring's

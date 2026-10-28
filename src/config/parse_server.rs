@@ -822,39 +822,6 @@ pub(crate) fn parse_server_block(
     }
 }
 
-/// Translate PCRE `\Q...\E` literal escapes into per-character regex
-/// escapes that the `regex` crate accepts. Untouched outside the `\Q\E`
-/// blocks; an unterminated `\Q` runs to end-of-string. Mirrors the way
-/// nginx forwards `server_name ~^...$` patterns to PCRE — production
-/// configs (and `http_server_name.t`) commonly bracket literal hostnames
-/// with `\Q\E` so dots aren't misread as metacharacters.
-pub(crate) fn expand_pcre_quote_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    let mut quoted = false;
-    while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek() == Some(if quoted { &'E' } else { &'Q' }) {
-            chars.next();
-            quoted = !quoted;
-        } else if !quoted {
-            out.push(c);
-            // An escaped char is copied as is: `\\Q` isn't a quote.
-            if c == '\\'
-                && let Some(next) = chars.next()
-            {
-                out.push(next);
-            }
-        } else if c.is_ascii_alphanumeric() || !c.is_ascii() {
-            // `crate::pcre` spells a non-ASCII char as its bytes.
-            out.push(c);
-        } else {
-            out.push('\\');
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// Classify one `server_name` argument into one or more `ServerNameSpec`
 /// entries. Most names produce a single entry; `.foo.example.com` (leading
 /// dot) is shorthand for two entries — `Exact("foo.example.com")` and
@@ -881,16 +848,15 @@ pub(crate) fn classify_server_name(raw: &str) -> Result<Vec<ServerNameSpec>, Err
         if !case_insensitive && raw_pattern.bytes().any(|b| b.is_ascii_uppercase()) {
             case_insensitive = true;
         }
-        // PCRE allows `\Q...\E` literal escapes; nginx forwards regexes to
-        // PCRE so test configs use the form. Rust's `regex` crate doesn't
-        // recognize `\Q\E`, so translate to per-character escapes before
-        // compile.
-        let pattern = expand_pcre_quote_escapes(&raw_pattern);
+        // PCRE syntax `regex` reads differently (`\Q…\E`, literal `{`).
+        let pattern = pcre::translate(&raw_pattern).into_owned();
         // Validate at parse time so a typo fails `nginx -t` instead of
         // crashing a worker.
-        let _ = crate::pcre::regex(&pattern, case_insensitive).map_err(|_| Error::BadValue {
-            what: "server_name regex",
-            got: raw.to_string(),
+        let _ = crate::config::pcre::regex(&pattern, case_insensitive).map_err(|_| {
+            Error::BadValue {
+                what: "server_name regex",
+                got: raw.to_string(),
+            }
         })?;
         return Ok(vec![ServerNameSpec::Regex {
             display: raw.to_string(),
@@ -1373,12 +1339,13 @@ pub(crate) fn parse_proxy_redirect(
                     Some(r) => (r, true),
                     None => (regex, false),
                 };
-                crate::pcre::regex(regex, case_insensitive).map_err(|e| Error::InvalidRegex {
+                let translated = pcre::translate(regex);
+                pcre::regex(&translated, case_insensitive).map_err(|e| Error::InvalidRegex {
                     pattern: regex.to_string(),
                     msg: e.to_string(),
                 })?;
                 ProxyRedirectRule::Regex {
-                    pattern: regex.to_string(),
+                    pattern: translated.into_owned(),
                     case_insensitive,
                     replacement,
                 }
@@ -1433,12 +1400,13 @@ pub(crate) fn parse_proxy_cookie(
                     Some(r) if !domain => (r, true),
                     _ => (regex, domain),
                 };
-                crate::pcre::regex(regex, case_insensitive).map_err(|e| Error::InvalidRegex {
+                let translated = pcre::translate(regex);
+                pcre::regex(&translated, case_insensitive).map_err(|e| Error::InvalidRegex {
                     pattern: regex.to_string(),
                     msg: e.to_string(),
                 })?;
                 ProxyRedirectRule::Regex {
-                    pattern: regex.to_string(),
+                    pattern: translated.into_owned(),
                     case_insensitive,
                     // Its captures, $1…$9.
                     replacement: super::values::parse_value_with_vars_rewrite(replacement)?,
@@ -1493,11 +1461,12 @@ pub(crate) fn parse_proxy_cookie_flags(
         [cookie, flags @ ..] if (1..=3).contains(&flags.len()) => {
             let cookie = match cookie.strip_prefix('~') {
                 Some(regex) => {
-                    crate::pcre::regex(regex, true).map_err(|e| Error::InvalidRegex {
+                    let translated = pcre::translate(regex);
+                    pcre::regex(&translated, true).map_err(|e| Error::InvalidRegex {
                         pattern: regex.to_string(),
                         msg: e.to_string(),
                     })?;
-                    CookieName::Regex(regex.to_string())
+                    CookieName::Regex(translated.into_owned())
                 }
                 None => CookieName::Name(crate::config::parse_value_with_vars(cookie)?),
             };

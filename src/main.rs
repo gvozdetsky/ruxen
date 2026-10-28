@@ -26,7 +26,6 @@ mod fs_resolve;
 mod http;
 mod http_date;
 mod ocsp;
-mod pcre;
 mod phase;
 mod privileges;
 mod proxy;
@@ -1080,7 +1079,11 @@ impl Master {
         for w in &warnings {
             log(old_http, config::ErrorLogLevel::Warn, w);
         }
-        let worker_listeners = match self.listeners.open(http, settings.workers) {
+        // After the switch to `user`, ports below 1024 bind with the one
+        // capability kept for it (#344).
+        let worker_listeners = match privileges::with_bind_capability(|| {
+            self.listeners.open(http, settings.workers)
+        }) {
             Ok(l) => l,
             Err(e) => {
                 http.close_root_fds();

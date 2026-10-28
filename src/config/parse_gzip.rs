@@ -167,7 +167,7 @@ impl GzipConf {
                     // `degradation` needs nginx's degradation module, which
                     // ruxen (like most nginx builds) doesn't have.
                     if v != "msie6" && v != "degradation" {
-                        crate::pcre::regex(v, true).map_err(|e| Error::InvalidRegex {
+                        crate::config::pcre::regex(v, true).map_err(|e| Error::InvalidRegex {
                             pattern: v.clone(),
                             msg: e.to_string(),
                         })?;

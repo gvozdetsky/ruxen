@@ -271,10 +271,10 @@ pub(crate) fn parse_location_spec(args: &[String]) -> Result<LocationSpec, Error
 /// prepare time; storing it here would force `Location` to be non-`Debug`-
 /// friendly and bloat the parser surface.
 ///
-/// Compiled with `crate::pcre::regex`, as in `prepare`, so validation and
+/// Compiled with `crate::config::pcre::regex`, as in `prepare`, so validation and
 /// runtime agree.
 pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<(), Error> {
-    crate::pcre::regex(pattern, case_insensitive)
+    crate::config::pcre::regex(pattern, case_insensitive)
         .map(|_| ())
         .map_err(|e| Error::InvalidRegex {
             pattern: pattern.to_string(),

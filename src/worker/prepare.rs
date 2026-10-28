@@ -613,7 +613,7 @@ pub(crate) fn build_listen_tls(
                         case_insensitive,
                         ..
                     } => {
-                        let regex = crate::pcre::regex(pattern, *case_insensitive)
+                        let regex = crate::config::pcre::regex(pattern, *case_insensitive)
                             .map_err(|e| format!("server_name regex \"{pattern}\": {e}"))?;
                         resolver.add_regex(&regex, ck.clone());
                     }
@@ -1739,7 +1739,7 @@ fn prepare_cookie_flags(
                     PreparedCookieName::Name(prepare_value_parts(parts.clone()))
                 }
                 CookieName::Regex(pattern) => PreparedCookieName::Regex(leak_regex(
-                    crate::pcre::regex(pattern, true).map_err(|e| {
+                    crate::config::pcre::regex(pattern, true).map_err(|e| {
                         format!("invalid proxy_cookie_flags regex \"{pattern}\": {e}")
                     })?,
                 )),
@@ -1785,7 +1785,7 @@ fn prepare_cookie_rules(
                 case_insensitive,
                 replacement,
             } => Some(
-                crate::pcre::regex(pattern, *case_insensitive)
+                crate::config::pcre::regex(pattern, *case_insensitive)
                     .map_err(|e| format!("invalid {what} regex \"{pattern}\": {e}"))
                     .map(|regex| PreparedRedirect::Regex {
                         regex: leak_regex(regex),
@@ -1840,7 +1840,7 @@ fn prepare_redirects(
                     case_insensitive,
                     replacement,
                 } => {
-                    let regex = crate::pcre::regex(pattern, *case_insensitive)
+                    let regex = crate::config::pcre::regex(pattern, *case_insensitive)
                         .map_err(|e| format!("invalid proxy_redirect regex \"{pattern}\": {e}"))?;
                     Ok(PreparedRedirect::Regex {
                         regex: leak_regex(regex),
@@ -2223,7 +2223,7 @@ pub(crate) fn prepare_server(
                 case_insensitive,
                 ..
             } => {
-                let regex = crate::pcre::regex(&pattern, case_insensitive).unwrap_or_else(|e| {
+                let regex = crate::config::pcre::regex(&pattern, case_insensitive).unwrap_or_else(|e| {
                         panic!(
                             "ruxen: server_name regex {:?} failed to compile after parse-time validation: {e}",
                             pattern
@@ -2767,7 +2767,7 @@ pub(crate) fn prepare_guard(guard: IfGuard) -> PreparedGuard {
             case_insensitive,
             negated,
         } => {
-            let regex = crate::pcre::regex(&pattern, case_insensitive)
+            let regex = crate::config::pcre::regex(&pattern, case_insensitive)
                 .unwrap_or_else(|e| panic!("ruxen: if regex {:?} failed to compile: {e}", pattern));
             PreparedGuard::Regex {
                 left,
@@ -2851,7 +2851,7 @@ pub(crate) fn prepare_rewrite_ops(
                 flag,
                 drop_args,
             }) => {
-                let regex = crate::pcre::regex(&regex, false).unwrap_or_else(|e| {
+                let regex = crate::config::pcre::regex(&regex, false).unwrap_or_else(|e| {
                     panic!("ruxen: rewrite regex {:?} failed to compile: {e}", regex)
                 });
                 PreparedRewriteOp::Rewrite {
@@ -2961,9 +2961,10 @@ pub(crate) fn prepare_maps(
             value,
         } in regex
         {
+            let pattern = crate::config::pcre::translate(&pattern);
             regex_set_patterns.push(set_pattern(&pattern, case_insensitive));
             // Already validated at parse time; a failure here is a bug.
-            let compiled = crate::pcre::regex(&pattern, case_insensitive)
+            let compiled = crate::config::pcre::regex(&pattern, case_insensitive)
                 .expect("map regex validated at parse time");
             regex_entries.push(PreparedMapRegex {
                 regex: compiled,
@@ -4162,7 +4163,7 @@ pub(crate) fn build_regex_location(
     let charset = prepare_charset(&location_charset);
     // The parser already validated it; the compiled `Regex` doesn't
     // survive the AST.
-    let regex = crate::pcre::regex(&pattern, case_insensitive).unwrap_or_else(|e| {
+    let regex = crate::config::pcre::regex(&pattern, case_insensitive).unwrap_or_else(|e| {
         panic!(
             "ruxen: regex {:?} failed to compile after passing parse validation: {e}",
             pattern
@@ -4433,7 +4434,7 @@ pub(crate) fn prepare_gzip(
         None
     } else {
         Some(
-            crate::pcre::regex_set(patterns.iter().map(String::as_str))
+            crate::config::pcre::regex_set(patterns.iter().map(String::as_str))
                 .map_err(|e| format!("gzip_disable: {e}"))?,
         )
     };
@@ -4451,8 +4452,10 @@ pub(crate) fn prepare_gzip(
 }
 
 /// `pattern` as a `RegexSet` member, with the case flag its own `Regex`
-/// was built with.
+/// was built with. Translated here: an unended `\Q` in the wrapped one
+/// would take the `)`.
 pub(crate) fn set_pattern(pattern: &str, case_insensitive: bool) -> String {
+    let pattern = crate::config::pcre::translate(pattern);
     if case_insensitive {
         format!("(?i:{pattern})")
     } else {
@@ -4471,7 +4474,7 @@ pub(crate) fn first_match_set<'a>(
     if patterns.len() < 2 {
         return None;
     }
-    crate::pcre::regex_set(patterns).ok()
+    crate::config::pcre::regex_set(patterns).ok()
 }
 
 #[cfg(test)]
