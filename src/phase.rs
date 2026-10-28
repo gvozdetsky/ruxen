@@ -248,18 +248,39 @@ pub struct KeepaliveMeta {
     pub header_timeout_secs: Option<u64>,
     pub max_requests: u64,
     pub max_time_ms: u64,
+    /// `keepalive_min_timeout`, saturated: a u32 fits the padding.
+    pub min_timeout_ms: u32,
     pub disable_msie6: bool,
     pub disable_safari: bool,
+}
+
+impl KeepaliveMeta {
+    /// A server's settings, for a response before any location (a
+    /// server-level `return`, a refused URI).
+    fn of_server(server: &PreparedServer) -> Self {
+        let k = &server.keepalive;
+        KeepaliveMeta {
+            allow: k.allow,
+            idle_timeout_ms: k.idle_timeout_ms,
+            header_timeout_secs: k.header_timeout_secs,
+            max_requests: k.max_requests,
+            max_time_ms: k.max_time_ms,
+            min_timeout_ms: u32::try_from(k.min_timeout_ms).unwrap_or(u32::MAX),
+            disable_msie6: k.disable_msie6,
+            disable_safari: k.disable_safari,
+        }
+    }
 }
 
 impl Default for KeepaliveMeta {
     fn default() -> Self {
         KeepaliveMeta {
             allow: true,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(crate::worker::DEFAULT_KEEPALIVE_TIMEOUT_MS),
             header_timeout_secs: None,
             max_requests: 1_000,
             max_time_ms: 3_600_000,
+            min_timeout_ms: 0,
             disable_msie6: true,
             disable_safari: false,
         }
@@ -287,6 +308,8 @@ pub struct ProcessMeta {
     pub log: LogMeta,
     /// `$server_port` for access-log rendering on this request.
     pub server_port: u16,
+    /// The server's metrics slot (`PreparedServer::metrics_slot`).
+    pub metrics_server: u32,
     /// `access_log` sinks for the matched location (or server scope if no
     /// location matched). The worker uses this list — not `PreparedHttp::
     /// access_logs` — so location-scope `access_log` directives fire
@@ -356,6 +379,10 @@ pub struct ProcessMeta {
     /// the upstream's, or there is none, and the worker doesn't stamp one
     /// (#360).
     pub keep_upstream_date: bool,
+    /// `add_trailer`'s trailers go after a proxied body in memory or in
+    /// its cache file, added by the worker after gzip, as nginx's chunked
+    /// filter runs after its gzip filter (#793).
+    pub trailers_due: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
@@ -399,6 +426,7 @@ impl Default for ProcessMeta {
             keepalive: KeepaliveMeta::default(),
             log: LogMeta::default(),
             server_port: 0,
+            metrics_server: 0,
             access_logs: &[],
             limit_req_delay_ms: 0,
             limit_conn_held: None,
@@ -419,6 +447,7 @@ impl Default for ProcessMeta {
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
             keep_upstream_date: false,
+            trailers_due: false,
             gzip: None,
             max_ranges: None,
             range_allow: crate::worker::range::RangeAllow::No,
@@ -451,9 +480,11 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
             log_not_found: server.log_not_found,
         },
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
+        keepalive: KeepaliveMeta::of_server(server),
         ..ProcessMeta::default()
     }
 }
@@ -495,6 +526,74 @@ fn refuse(
         meta.keepalive.allow = false;
     }
     (response, meta)
+}
+
+/// A request target that doesn't normalise: nginx refuses it while
+/// reading the request line, with the default server's configuration
+/// (its `error_page`, `add_header … always`, #779). A 400 ends the
+/// connection.
+#[cold]
+#[inline(never)]
+fn bad_uri(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+    response: Response,
+) -> (Response, ProcessMeta) {
+    let server = &listen.servers[listen.default_server];
+    crate::worker::write_error_log(
+        server.error_logs,
+        crate::config::ErrorLogLevel::Info,
+        // Before the headers: no host in the line.
+        &crate::worker::ErrorLogRequest::new(
+            &RequestCtx {
+                headers_raw: b"",
+                ..*req
+            },
+            server.primary_server_name,
+        ),
+        b"client sent invalid request while reading client request line",
+        None,
+    );
+    // A target that isn't a path (`*`, `x`) fails nginx's request-line
+    // parse, before `$request_method` and `$request` are set.
+    let unparsed;
+    let req = if req.path.first() == Some(&b'/') {
+        req
+    } else {
+        unparsed = RequestCtx {
+            method_bytes: b"",
+            request_line: b"",
+            path: b"",
+            ..*req
+        };
+        &unparsed
+    };
+    let (response, mut meta) = refuse(http, req, url_scratch, server, response, true, false, None);
+    // No `$uri` for the log, unless an error page gave it one.
+    meta.invalid_uri |= !server.error_pages.iter().any(|p| p.status == 400);
+    (response, meta)
+}
+
+/// A refusal for the headers comes after the request target's, as nginx
+/// checks the target while it reads the request line (#807): only on the
+/// way to such a refusal is the target checked here first.
+#[cold]
+#[inline(never)]
+fn bad_target_first(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+) -> Option<(Response, ProcessMeta)> {
+    // CONNECT's target is an authority, not a path.
+    if req.method == Method::Connect {
+        return None;
+    }
+    url_scratch.clear();
+    let bad = normalize_request_uri_into(http, req, false, url_scratch).err()?;
+    Some(bad_uri(http, req, url_scratch, listen, bad))
 }
 
 /// The server's charset on what it answers before a location (#464);
@@ -730,6 +829,10 @@ fn process_with_meta_inner(
     // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
     // — empty Host is treated as "default server".
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
+        if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+            return out;
+        }
+        url_scratch.clear();
         let server = &listen.servers[listen.default_server];
         // Not past an invalid one, logged already.
         if req.refuse.is_none() {
@@ -743,6 +846,10 @@ fn process_with_meta_inner(
 
     if refusing {
         if let Some(status) = req.refuse {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 501 => &http.not_implemented,
                 // nginx's 497: plain HTTP on an `ssl` port, sent as 400
@@ -771,6 +878,10 @@ fn process_with_meta_inner(
             && let Some(tls) = req.tls
             && let Some((status, close)) = client_certificate_refusal(listen, server, req, tls)
         {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 421 => &http.misdirected,
                 495 => &http.cert_error,
@@ -781,6 +892,10 @@ fn process_with_meta_inner(
             return refuse(http, req, url_scratch, server, response, close, false, code);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             if req.method == Method::Trace
                 && crate::worker::test_panic() == crate::worker::TestPanic::Trace
             {
@@ -821,10 +936,7 @@ fn process_with_meta_inner(
             if let Err(resp) =
                 normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
             {
-                // A 400 ends the connection, as nginx's does.
-                let mut meta = refused_meta(server, true);
-                meta.keepalive.allow = false;
-                return (resp, meta);
+                return bad_uri(http, req, url_scratch, listen, resp);
             }
         }
         Some(reroute) => {
@@ -891,10 +1003,17 @@ fn process_with_meta_inner(
     }
     let mut meta = ProcessMeta {
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
+        // `allow` is the client's until a location's applies: its
+        // keepalive_timeout decides, not the server's (nginx's
+        // ngx_http_update_location_config).
+        keepalive: KeepaliveMeta {
+            allow: !closes,
+            ..KeepaliveMeta::of_server(server)
+        },
         ..ProcessMeta::default()
     };
-    meta.keepalive.allow = !closes;
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
@@ -1954,6 +2073,72 @@ fn write_auth_path_var(
     }
 }
 
+/// The client's request target with its `#fragment`, nginx's
+/// r->unparsed_uri (#748): `$request_uri`, and what `proxy_pass` without
+/// a URI part sends. `path` stops at the `#` (`$uri` and `$args` do); when
+/// it lies in `request_line` and a `#` follows it there, the target runs
+/// on to the next space. No work otherwise: a synthesized path isn't in
+/// the line.
+#[inline]
+pub(crate) fn unparsed_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    // Distinct live buffers don't overlap: an offset inside the line means
+    // `path` is part of it.
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start.checked_add(path.len()) {
+        Some(end) if request_line.get(end) == Some(&b'#') => {
+            with_fragment(request_line, start, end)
+        }
+        _ => path,
+    }
+}
+
+/// `$request_uri`: [`unparsed_uri`], except for an absolute-form target
+/// without a path (`GET http://h?a=1`), whose `/?a=1` is synthesized for
+/// `$uri`; nginx's unparsed_uri starts at the `?` there (#769). The
+/// upstream target keeps the `/` (valid_unparsed_uri is off for it).
+#[inline]
+pub(crate) fn request_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start
+        .checked_add(path.len())
+        .map(|end| (end, request_line.get(end)))
+    {
+        Some((end, Some(b'#'))) => with_fragment(request_line, start, end),
+        Some((_, Some(_))) => path,
+        _ => absolute_query(path, request_line),
+    }
+}
+
+/// The client's `?args…` for a synthesized `/?args`, else `path`.
+#[cold]
+#[inline(never)]
+fn absolute_query<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let Some(query) = path.strip_prefix(b"/").filter(|q| q.first() == Some(&b'?')) else {
+        return path;
+    };
+    let target = request_line
+        .split(|&b| b == b' ')
+        .nth(1)
+        .unwrap_or_default();
+    if target.first() == Some(&b'/') {
+        return path;
+    }
+    match target.iter().position(|&b| b == b'?') {
+        Some(i) if target[i..].starts_with(query) => &target[i..],
+        _ => path,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn with_fragment(request_line: &[u8], start: usize, end: usize) -> &[u8] {
+    let len = request_line[end..]
+        .iter()
+        .position(|&b| b == b' ')
+        .unwrap_or(request_line.len() - end);
+    &request_line[start..end + len]
+}
+
 fn request_uri_path(request_uri: &[u8]) -> &[u8] {
     match request_uri.iter().position(|&b| b == b'?') {
         Some(i) => &request_uri[..i],
@@ -2491,6 +2676,7 @@ fn apply_location_meta(
         header_timeout_secs: loc.keepalive.header_timeout_secs,
         max_requests: loc.keepalive.max_requests,
         max_time_ms: loc.keepalive.max_time_ms,
+        min_timeout_ms: u32::try_from(loc.keepalive.min_timeout_ms).unwrap_or(u32::MAX),
         disable_msie6: loc.keepalive.disable_msie6,
         disable_safari: loc.keepalive.disable_safari,
     };
@@ -3057,6 +3243,39 @@ fn match_named_location<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparsed_uri_keeps_the_fragment() {
+        let line = b"GET /a?b#f?x HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b#f?x");
+        let line = b"GET /a#f";
+        assert_eq!(unparsed_uri(&line[4..6], line), b"/a#f");
+        let line = b"GET /a?b HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b");
+        // A path from elsewhere (absolute-form without one) stays as is.
+        let other = b"/#x".to_vec();
+        assert_eq!(unparsed_uri(&other[..1], line), b"/");
+        assert_eq!(unparsed_uri(b"/", b""), b"/");
+    }
+
+    #[test]
+    fn request_uri_of_an_absolute_target_without_a_path() {
+        let synth = b"/?a=1".to_vec();
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1 HTTP/1.1"), b"?a=1");
+        assert_eq!(
+            request_uri(&synth, b"GET http://h?a=1#f HTTP/1.1"),
+            b"?a=1#f"
+        );
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1#f"), b"?a=1#f");
+        // Not the target's query, or an origin-form line: as is.
+        assert_eq!(request_uri(&synth, b"GET http://h?b=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(&synth, b"GET /x?a=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(b"/", b"GET http://h HTTP/1.1"), b"/");
+        assert_eq!(request_uri(b"/", b""), b"/");
+        let line = b"GET http://h/?a=1#f HTTP/1.1";
+        assert_eq!(request_uri(&line[12..17], line), b"/?a=1#f");
+        assert_eq!(request_uri(&line[12..13], line), b"/");
+    }
 
     #[test]
     fn wildcards_take_only_names_below_them() {
