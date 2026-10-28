@@ -351,6 +351,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut client_verify = ClientVerifyConf::default();
     let mut stapling = StaplingConf::default();
     let mut ssl_password_file: Option<PathBuf> = None;
+    let mut ssl_conf_commands: Option<Vec<(String, String)>> = None;
     let mut warnings: Vec<String> = Vec::new();
     loop {
         let (args, term) = lx.read_directive()?;
@@ -455,6 +456,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                             ssl.password_file.clone_from(&ssl_password_file);
                         }
                         ssl.stapling = std::mem::take(&mut ssl.stapling).inherit(&stapling);
+                        if ssl.conf_commands.is_none() {
+                            ssl.conf_commands.clone_from(&ssl_conf_commands);
+                        }
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -760,9 +764,22 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             (name, Terminator::Semi) if StaplingConf::takes(name) => {
                 stapling.parse(&args, lx.conf_prefix())?
             }
+            ("ssl_conf_command", Terminator::Semi) => {
+                let [_, name, value] = args.as_slice() else {
+                    return Err(Error::BadValue {
+                        what: "ssl_conf_command (invalid number of arguments)",
+                        got: args[1..].join(" "),
+                    });
+                };
+                if !conf_command_applied(name, value) {
+                    compat::ignored(lx, &args);
+                }
+                ssl_conf_commands
+                    .get_or_insert_with(Vec::new)
+                    .push((name.clone(), value.clone()));
+            }
             (
-                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data"
-                | "ssl_conf_command",
+                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data",
                 Terminator::Semi,
             ) => {
                 warn_ignored_tls_policy(&args, &mut warnings);
@@ -3374,6 +3391,31 @@ mod tests {
         let cfg = parse(src).unwrap();
         // Directives parsed without error and didn't disturb the populated SSL state.
         assert_eq!(cfg.servers[0].ssl.certs.len(), 1);
+    }
+
+    #[test]
+    fn ssl_conf_command_options_ktls() {
+        let cfg = parse(
+            "http { ssl_conf_command Options KTLS; \
+             server { listen 443 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; } \
+             server { listen 444 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_conf_command Options KTLS; ssl_conf_command Options -KTLS; } \
+             server { listen 445 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256; } \
+             server { listen 446 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_conf_command options ServerPreference,ktls; } }",
+        )
+        .unwrap();
+        let ktls: Vec<bool> = cfg.servers.iter().map(|s| s.ssl.ktls()).collect();
+        // A server's own lines replace the http level's, as nginx merges.
+        assert_eq!(ktls, [true, false, false, true]);
+        assert!(conf_command_applied("Options", "KTLS"));
+        assert!(!conf_command_applied("Options", "KTLS,ServerPreference"));
+        assert!(!conf_command_applied("Ciphersuites", "KTLS"));
+        assert!(matches!(
+            parse("http { ssl_conf_command Options; }"),
+            Err(Error::BadValue { .. })
+        ));
     }
 
     #[test]

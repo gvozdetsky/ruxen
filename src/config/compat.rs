@@ -326,7 +326,7 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
     (
         "ssl_conf_command",
         None,
-        "OpenSSL commands are not applied: ruxen's TLS is rustls",
+        "OpenSSL commands are not applied, but for `Options KTLS`: ruxen's TLS is rustls",
         "ssl_conf_command",
     ),
     ("http3", None, NO_HTTP3, "http3-and-quic"),

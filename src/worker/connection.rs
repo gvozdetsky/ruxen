@@ -395,28 +395,100 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     /// `EPOLLRDHUP` does. What the stream and the socket hold stays for
     /// the next read.
     async fn peer_closed(&self) {
-        use std::os::unix::io::AsRawFd;
-        let io = self.io();
-        loop {
-            if io.readable(false).await.is_err() {
-                return;
-            }
-            let mut fd = libc::pollfd {
-                fd: io.as_raw_fd(),
-                events: libc::POLLIN | libc::POLLRDHUP,
-                revents: 0,
-            };
-            // SAFETY: one pollfd of our own; a zero timeout doesn't wait.
-            let n = unsafe { libc::poll(&mut fd, 1, 0) };
-            if n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
-                return;
-            }
-            if n != 0 {
-                // Bytes and no FIN yet: the readiness wait would complete
-                // at once again, so look again a while later.
-                monoio::time::sleep(PEER_RECHECK).await;
-            }
+        fin_behind_records(self.io()).await
+    }
+}
+
+/// `peer_closed` of a TLS connection: the FIN on its socket.
+async fn fin_behind_records(io: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        if io.readable(false).await.is_err() {
+            return;
         }
+        let mut fd = libc::pollfd {
+            fd: io.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: one pollfd of our own; a zero timeout doesn't wait.
+        let n = unsafe { libc::poll(&mut fd, 1, 0) };
+        if n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+            return;
+        }
+        if n != 0 {
+            // Bytes and no FIN yet: the readiness wait would complete
+            // at once again, so look again a while later.
+            monoio::time::sleep(PEER_RECHECK).await;
+        }
+    }
+}
+
+/// A connection on kernel TLS (#673): the socket takes plaintext and
+/// `sendfile`, as plain TCP does; what rustls decrypted before the switch
+/// is read first.
+impl ConnIo for crate::ktls::KtlsStream {
+    async fn idle_read(
+        &mut self,
+        mut buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: IdleLimits,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        if self.has_buffered_input() {
+            // As `read_first_or_shutdown`: into `buf[..buf.len()]`.
+            // SAFETY: `buf` holds `len` initialized bytes to overwrite.
+            let n = unsafe { self.take_into(buf.as_mut_ptr(), buf.len()) };
+            let next = if n == 0 {
+                IdleRead::Close
+            } else {
+                IdleRead::Read(n)
+            };
+            return (next, buf);
+        }
+        if !self.within_limit() {
+            return (IdleRead::Close, buf);
+        }
+        use monoio::buf::IoBufMut;
+        let len = buf.len();
+        // A record other than data (close_notify) fails the read: closed.
+        let (next, buf) = read_first_or_shutdown(
+            self.io_mut(),
+            buf.slice_mut(0..len),
+            state,
+            idle,
+            fresh,
+            timers,
+        )
+        .await;
+        (next, buf.map_or_else(Vec::new, |b| b.into_inner()))
+    }
+
+    async fn idle_wait(
+        &self,
+        state: &RuntimeState,
+        idle: IdleLimits,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> bool {
+        if self.has_buffered_input() {
+            return fresh || !state.is_shutting_down();
+        }
+        wait_readable_or_shutdown(self.io(), state, idle, fresh, timers).await
+    }
+
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.io().as_raw_fd())
+    }
+
+    async fn wait_writable(&self) -> std::io::Result<()> {
+        self.io().writable(false).await
+    }
+
+    async fn peer_closed(&self) {
+        fin_behind_records(self.io()).await
     }
 }
 

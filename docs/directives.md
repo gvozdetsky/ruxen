@@ -623,7 +623,7 @@ Not supported: `slice`.
 | `ssl_stapling_responder` | yes | http, server |  |
 | `ssl_stapling_verify` | yes | http, server |  |
 | `ssl_early_data` | accepted, differs | http, server | TLS 1.3 early data is not accepted |
-| `ssl_conf_command` | accepted, differs | http, server | OpenSSL commands are not applied: ruxen's TLS is rustls |
+| `ssl_conf_command` | accepted, differs | http, server | OpenSSL commands are not applied, but for `Options KTLS`: ruxen's TLS is rustls |
 | `ssl_reject_handshake` | yes | http, server |  |
 
 ## http_stub_status

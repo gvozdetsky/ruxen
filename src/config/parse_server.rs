@@ -37,6 +37,7 @@ pub(crate) fn parse_server_block(
     let mut client_verify = ClientVerifyConf::default();
     let mut stapling = StaplingConf::default();
     let mut ssl_password_file: Option<PathBuf> = None;
+    let mut ssl_conf_commands: Option<Vec<(String, String)>> = None;
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -129,6 +130,7 @@ pub(crate) fn parse_server_block(
                         client_verify,
                         password_file: ssl_password_file,
                         stapling,
+                        conf_commands: ssl_conf_commands,
                     };
                     let ssl_directives = if saw_any_ssl_directive || saw_local_ssl_cert_or_key {
                         listens.iter().map(|l| (l.addr, l.unix.clone())).collect()
@@ -372,9 +374,23 @@ pub(crate) fn parse_server_block(
                 saw_any_ssl_directive = true;
                 stapling.parse(&args, lx.conf_prefix())?;
             }
+            ("ssl_conf_command", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                let [_, name, value] = args.as_slice() else {
+                    return Err(Error::BadValue {
+                        what: "ssl_conf_command (invalid number of arguments)",
+                        got: args[1..].join(" "),
+                    });
+                };
+                if !super::ast::conf_command_applied(name, value) {
+                    compat::ignored(lx, &args);
+                }
+                ssl_conf_commands
+                    .get_or_insert_with(Vec::new)
+                    .push((name.clone(), value.clone()));
+            }
             (
-                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data"
-                | "ssl_conf_command",
+                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data",
                 Terminator::Semi,
             ) => {
                 saw_any_ssl_directive = true;

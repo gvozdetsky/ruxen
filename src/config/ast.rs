@@ -875,6 +875,41 @@ pub struct ServerSsl {
     pub password_file: Option<PathBuf>,
     /// `ssl_stapling` and its companions (#141), merged with http scope.
     pub stapling: StaplingConf,
+    /// `ssl_conf_command NAME VALUE` lines, in order; a server's own
+    /// replace the http level's, as nginx merges the array.
+    pub conf_commands: Option<Vec<(String, String)>>,
+}
+
+impl ServerSsl {
+    /// `ssl_conf_command Options KTLS` (#673), the one command applied:
+    /// later `Options` items override earlier ones, as OpenSSL sets and
+    /// clears SSL_OP_ENABLE_KTLS in order.
+    pub fn ktls(&self) -> bool {
+        let mut on = false;
+        for (name, value) in self.conf_commands.iter().flatten() {
+            if !name.eq_ignore_ascii_case("Options") {
+                continue;
+            }
+            for item in value.split(',').map(str::trim) {
+                if item.eq_ignore_ascii_case("KTLS") {
+                    on = true;
+                } else if item.eq_ignore_ascii_case("-KTLS") {
+                    on = false;
+                }
+            }
+        }
+        on
+    }
+}
+
+/// Whether an `ssl_conf_command` is applied in full: `Options` with
+/// only `KTLS` / `-KTLS` items. Anything else is accepted and not applied.
+pub(crate) fn conf_command_applied(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("Options")
+        && value
+            .split(',')
+            .map(str::trim)
+            .all(|item| item.eq_ignore_ascii_case("KTLS") || item.eq_ignore_ascii_case("-KTLS"))
 }
 
 /// `ssl_verify_client`'s modes (ngx_http_ssl_verify).

@@ -4244,6 +4244,32 @@ fn handshake_failed(
     );
 }
 
+/// The switch to kTLS failed past the point of return (#673).
+#[cold]
+#[inline(never)]
+fn ktls_failed(
+    http: &PreparedHttp,
+    listen_index: usize,
+    connection_id: u64,
+    peer_addr: SocketAddr,
+    e: std::io::Error,
+) {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        let e = crate::tls::AcceptError::Tls(e);
+        return handshake_failed(http, listen_index, connection_id, peer_addr, &e);
+    }
+    let listen = &http.listens[listen_index];
+    write_worker_log(
+        listen.servers[listen.default_server].error_logs,
+        ErrorLogLevel::Info,
+        &format!(
+            "*{connection_id} kTLS: {e} while SSL handshaking, client: {}, server: {}",
+            peer_addr.ip(),
+            listen.addr
+        ),
+    );
+}
+
 /// A TLS record after the handshake that rustls refused, as nginx's
 /// `SSL_read() failed` at `info` (#595): `while waiting for request` before
 /// any byte of one, else while reading its head.
@@ -4375,6 +4401,36 @@ pub(crate) async fn handle_tls(
             .map(|b| b.to_ascii_lowercase())
             .collect()
     });
+    // `ssl_conf_command Options KTLS` (#673). The switch's result is gone
+    // before the await: it would be in every connection's future.
+    'ktls: {
+        if !tls_stream.wants_ktls() {
+            break 'ktls;
+        }
+        let stream = match crate::ktls::switch(tls_stream) {
+            crate::ktls::Switch::Kernel(stream) => stream,
+            crate::ktls::Switch::Userspace(stream) => {
+                tls_stream = stream;
+                break 'ktls;
+            }
+            crate::ktls::Switch::Failed(e) => {
+                ktls_failed(http, listen_index, connection_id, peer_addr, e);
+                return;
+            }
+        };
+        return serve_ktls(
+            stream,
+            peer_addr,
+            listen_index,
+            sni,
+            info,
+            conn,
+            http,
+            state,
+            connection_id,
+        )
+        .await;
+    }
     if info.alpn_protocol.as_deref() == Some(b"h2") {
         let sni = sni.clone();
         return serve_h2(
@@ -4412,6 +4468,59 @@ pub(crate) async fn handle_tls(
         monoio::io::AsyncWriteRent::shutdown(&mut tls_stream),
     )
     .await;
+}
+
+/// A connection on kernel TLS (#673), as `handle_tls` serves one in
+/// userspace; boxed, so that its future isn't part of the others'.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::boxed_local)] // boxed by `switch`: `handle_tls` holds a pointer across the await
+fn serve_ktls(
+    stream: Box<crate::ktls::KtlsStream>,
+    peer_addr: SocketAddr,
+    listen_index: usize,
+    sni: Option<Vec<u8>>,
+    info: crate::tls::HandshakeInfo,
+    conn: phase::ConnInfo,
+    http: &'static PreparedHttp,
+    state: &'static RuntimeState,
+    connection_id: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    let mut stream = *stream;
+    Box::pin(async move {
+        if info.alpn_protocol.as_deref() == Some(b"h2") {
+            return serve_h2(
+                stream,
+                peer_addr,
+                listen_index,
+                sni,
+                Some(info),
+                conn,
+                http,
+                state,
+                connection_id,
+            )
+            .await;
+        }
+        handle(
+            &mut stream,
+            peer_addr,
+            listen_index,
+            sni.as_deref(),
+            Some(&info),
+            &conn,
+            http,
+            state,
+            connection_id,
+        )
+        .await;
+        let _ = monoio::time::timeout(
+            Duration::from_secs(3),
+            monoio::io::AsyncWriteRent::shutdown(&mut stream),
+        )
+        .await;
+    })
 }
 
 /// The OCSP check of a client certificate (`ssl_ocsp`, #142), boxed and
