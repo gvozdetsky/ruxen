@@ -581,7 +581,7 @@ pub fn pick_peer(
 
 /// Whether peer `i` can be picked: not `down`, and not cooling off after
 /// `max_fails` (without a zone, as this worker sees it). For metrics.
-pub(crate) fn peer_up(up: &'static PreparedUpstream, i: usize) -> bool {
+pub(crate) fn peer_up(up: &PreparedUpstream, i: usize) -> bool {
     let Some(p) = up.peers.get(i) else {
         return false;
     };

@@ -60,6 +60,9 @@ Labels:
 - `upstream`: the `upstream {}` block's name, or the `host:port` of a
   `proxy_pass` without one; `peer`: the peer's address. A `proxy_pass` with
   variables that resolves a name at run time (`resolver`) isn't counted.
+  The peers of a `server … resolve` line have series while some answer has
+  their address: up to 64 addresses at once per `upstream` block (more aren't
+  counted). An address that comes back counts from zero again.
 - `zone`: the `limit_req_zone`, `limit_conn_zone` or `proxy_cache_path`
   `keys_zone` name.
 - Label values are escaped as the format requires (`\\`, `\"`, `\n`).

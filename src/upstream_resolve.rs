@@ -96,6 +96,8 @@ pub struct Dynamic {
     /// Whether a worker resolves for it already (nginx: worker 0).
     claimed: AtomicBool,
     state: Mutex<State>,
+    /// Metrics slots for its peers (#879), with `ruxen_metrics`.
+    pool: Option<&'static crate::worker::metrics::PeerPool>,
 }
 
 impl std::fmt::Debug for Dynamic {
@@ -163,6 +165,7 @@ impl Dynamic {
         hosts: Vec<HostConf>,
         resolver: &'static crate::resolver::Resolver,
         timeout: Duration,
+        pool: Option<&'static crate::worker::metrics::PeerPool>,
     ) -> &'static PreparedUpstream {
         let now = Instant::now();
         let zone: &'static str = crate::arena::leak(zone.into());
@@ -216,6 +219,7 @@ impl Dynamic {
             current: AtomicPtr::new(std::ptr::null_mut()),
             loading: AtomicUsize::new(0),
             claimed: AtomicBool::new(false),
+            pool,
             state: Mutex::new(State {
                 resolved,
                 versions: Vec::new(),
@@ -375,6 +379,13 @@ impl Dynamic {
             lb => lb,
         };
         let shared: &'static [PeerShared] = owner.leak(shared);
+        let metrics = self.pool.map(|pool| -> &'static [u32] {
+            let slots: Box<[u32]> = peers
+                .iter()
+                .map(|p| pool.slot(&p.addr.to_string()))
+                .collect();
+            owner.leak(slots)
+        });
         let tag: &'static Version = owner.leak(Box::new(Version {
             dynamic: self,
             holds: AtomicUsize::new(0),
@@ -384,6 +395,7 @@ impl Dynamic {
             lb,
             shared: Some(shared),
             dynamic: Some(tag),
+            metrics,
             ..self.template
         }));
         state.versions.push((version, owner));
@@ -402,6 +414,15 @@ impl Dynamic {
         state
             .versions
             .retain(|(v, _)| std::ptr::eq(*v, current) || holds(v).load(Ordering::SeqCst) != 0);
+        // An address no list has any more gives its slot up.
+        if let Some(pool) = self.pool {
+            pool.keep(|slot| {
+                state
+                    .versions
+                    .iter()
+                    .any(|(v, _)| v.metrics.is_some_and(|m| m.contains(&slot)))
+            });
+        }
     }
 
     /// The number of versions not freed, for tests.
@@ -813,6 +834,7 @@ mod tests {
             vec![host("A.test", false), host("b.test", true)],
             resolver,
             Duration::from_secs(1),
+            None,
         )
     }
 

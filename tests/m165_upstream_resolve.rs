@@ -470,3 +470,71 @@ fn m165_kept_peers_keep_their_connections() {
     assert!(server.bodies(6).iter().any(|b| b == "one"));
     assert_eq!(accepted.load(Ordering::SeqCst), 1, "{}", server.error_log());
 }
+
+/// The metrics page of a server on `port`.
+fn scrape(port: u16) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "GET / HTTP/1.0\r\nHost: m\r\n\r\n").unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+/// The value of `series` on `page`, if it is there.
+fn value(page: &str, series: &str) -> Option<u64> {
+    page.lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+        .map(|v| v.parse().unwrap())
+}
+
+#[test]
+fn m165_resolved_peers_have_metrics() {
+    let dns = Dns::start(Reply::Addrs(vec![ONE]));
+    let (backend, _) = backends(false);
+    let metrics = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let server = start_with(
+        &format!(
+            "resolver 127.0.0.1:{} valid=1s ipv6=off; resolver_timeout 1s;\n\
+             upstream u {{ zone z 64k; server 127.0.0.3:{backend} down; \
+             server svc.test:{backend} resolve; }}\n\
+             server {{ listen 127.0.0.1:{metrics}; location / {{ ruxen_metrics; }} }}",
+            dns.port
+        ),
+        1,
+    );
+    let series = |name: &str, ip: &str| format!("{name}{{upstream=\"u\",peer=\"{ip}:{backend}\"}}");
+    server.wait_for((200, "one"));
+    server.bodies(3);
+    let page = scrape(metrics);
+    // The static peer, down, and the resolved one.
+    let up = |page: &str, ip| value(page, &series("ruxen_upstream_peer_up", ip));
+    let requests = |page: &str, ip| value(page, &series("ruxen_upstream_peer_requests_total", ip));
+    assert_eq!(up(&page, "127.0.0.3"), Some(0), "{page}");
+    assert_eq!(up(&page, "127.0.0.1"), Some(1), "{page}");
+    let first = requests(&page, "127.0.0.1");
+    assert!(first.is_some_and(|n| n >= 4), "{page}");
+    // A new address has its series; the one gone has none.
+    dns.set(Reply::Addrs(vec![TWO]));
+    server.wait_for((200, "two"));
+    server.bodies(2);
+    let page = scrape(metrics);
+    assert!(
+        requests(&page, "127.0.0.2").is_some_and(|n| n >= 3),
+        "{page}"
+    );
+    assert_eq!(up(&page, "127.0.0.1"), None, "{page}");
+    // Back again, it counts from zero.
+    dns.set(Reply::Addrs(vec![ONE]));
+    server.wait_for((200, "one"));
+    let page = scrape(metrics);
+    let again = requests(&page, "127.0.0.1");
+    assert!(
+        again.is_some_and(|n| n >= 1 && n < first.unwrap()),
+        "{page}"
+    );
+}
