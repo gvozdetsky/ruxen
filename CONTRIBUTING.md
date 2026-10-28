@@ -129,6 +129,9 @@ separate step, so do them in this order:
 
 1. On `main`, bump `version` in `Cargo.toml` (and `Cargo.lock` with
    `cargo update -p ruxen`), and add `.github/release-notes/v<version>.md`.
+   The same PR adds the release's row to `ROADMAP.md`'s table; its
+   fuzzing column comes from the private machine's log,
+   `scripts/fuzz_long.sh --report <out>/fuzz-hours.tsv <date of the previous release>`.
    Merge that through a PR so CI runs on it.
 2. `cargo publish --dry-run --locked` on that commit: it packages the
    crate and builds the package on its own.

@@ -761,6 +761,100 @@ impl super::super::ConnIo for StreamIo {
     }
 }
 
+/// One stream the `h2` crate accepted, as `handle` would see it.
+#[cfg(feature = "fuzzing")]
+pub(crate) struct FuzzStream {
+    pub head: Vec<u8>,
+    pub method: String,
+    pub target: String,
+    pub header_block: u64,
+}
+
+/// For the `h2_request` fuzz target (#477): `data` (preface and frames)
+/// read `piece` bytes at a time by the `h2` crate's server over `PollIo`,
+/// with `serve`'s settings; each stream it accepts becomes the head
+/// `StreamIo` gives `handle`. What the server writes is dropped.
+#[cfg(feature = "fuzzing")]
+pub(crate) async fn fuzz_connection(data: &[u8], piece: usize) -> Vec<FuzzStream> {
+    struct Wire {
+        data: Vec<u8>,
+        pos: usize,
+        piece: usize,
+    }
+    impl AsyncReadRent for Wire {
+        async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+            let n = self
+                .piece
+                .min(self.data.len() - self.pos)
+                .min(buf.bytes_total());
+            // SAFETY: `n` is within the source and the buffer's capacity.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data[self.pos..].as_ptr(), buf.write_ptr(), n);
+                buf.set_init(n);
+            }
+            self.pos += n;
+            (Ok(n), buf)
+        }
+        async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            (Err(io::ErrorKind::Unsupported.into()), buf)
+        }
+    }
+    impl AsyncWriteRent for Wire {
+        async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            let n = buf.bytes_init();
+            (Ok(n), buf)
+        }
+        async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            // SAFETY: valid iovecs, owned here until returned.
+            let iovecs =
+                unsafe { std::slice::from_raw_parts(buf.read_iovec_ptr(), buf.read_iovec_len()) };
+            let n = iovecs.iter().map(|v| v.iov_len).sum();
+            (Ok(n), buf)
+        }
+        async fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let io = super::compat::PollIo::new(Wire {
+        data: data.to_vec(),
+        pos: 0,
+        piece: piece.max(1),
+    });
+    let blocks = io.header_blocks();
+    let handshake = h2::server::Builder::new()
+        .max_concurrent_streams(128)
+        .initial_window_size(64 * 1024)
+        .initial_connection_window_size((1 << 31) - 1)
+        .max_header_list_size(super::max_header_list(32 * 1024))
+        .handshake::<_, Bytes>(io);
+    let mut out = Vec::new();
+    let Ok(mut conn) = handshake.await else {
+        return out;
+    };
+    while let Some(Ok((request, respond))) = conn.accept().await {
+        let (parts, body) = request.into_parts();
+        let chunked =
+            !body.is_end_stream() && !parts.headers.contains_key(http::header::CONTENT_LENGTH);
+        let mut head = Vec::new();
+        request_head(&parts, chunked, &mut head);
+        out.push(FuzzStream {
+            head,
+            method: parts.method.as_str().to_string(),
+            target: parts
+                .uri
+                .path_and_query()
+                .map_or("/", |p| p.as_str())
+                .to_string(),
+            header_block: blocks.take(u32::from(respond.stream_id())),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

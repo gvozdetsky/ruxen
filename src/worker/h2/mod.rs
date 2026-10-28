@@ -8,7 +8,7 @@
 //! negotiated `h2` through ALPN.
 
 pub(crate) mod compat;
-mod stream;
+pub(crate) mod stream;
 
 use std::cell::Cell;
 use std::net::SocketAddr;

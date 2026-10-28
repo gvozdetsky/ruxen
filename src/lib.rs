@@ -41,6 +41,17 @@ mod x509_verify;
 /// Entry points for the fuzz targets: thin wrappers over the parsers that
 /// see untrusted bytes.
 pub mod fuzzing {
+    thread_local! {
+        static RUNTIME: std::cell::RefCell<
+            monoio::Runtime<monoio::time::TimeDriver<monoio::LegacyDriver>>,
+        > = std::cell::RefCell::new(
+            monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+                .enable_timer()
+                .build()
+                .expect("monoio runtime"),
+        );
+    }
+
     /// `http::parse_request` over `data`; `Some(consumed)` when it found a
     /// complete request head, `None` for "need more", panics never.
     pub fn parse_request(data: &[u8]) -> Option<Result<usize, ()>> {
@@ -176,6 +187,224 @@ pub mod fuzzing {
         crate::worker::h2::compat::scan_header_blocks(data, cuts)
     }
 
+    /// A stream the `h2` crate accepted (`h2_connection`).
+    pub struct H2Stream {
+        /// The HTTP/1.1-style head `StreamIo` hands `handle`.
+        pub head: Vec<u8>,
+        pub method: String,
+        /// `:path` (path and query), `/` without one.
+        pub target: String,
+        /// Its header block size as `PollIo` counted it (#409).
+        pub header_block: u64,
+    }
+
+    /// Client bytes (preface, then frames) into the `h2` crate's server
+    /// over `PollIo`, read `piece` bytes at a time: the streams it
+    /// accepted.
+    pub fn h2_connection(data: &[u8], piece: usize) -> Vec<H2Stream> {
+        RUNTIME
+            .with(|rt| {
+                rt.borrow_mut()
+                    .block_on(crate::worker::h2::stream::fuzz_connection(data, piece))
+            })
+            .into_iter()
+            .map(|s| H2Stream {
+                head: s.head,
+                method: s.method,
+                target: s.target,
+                header_block: s.header_block,
+            })
+            .collect()
+    }
+
+    /// `http::parse_request` over an HTTP/2 stream's head, as the worker
+    /// parses it: `Some(Ok((consumed, method, path)))` for a complete
+    /// request, `Some(Err(()))` for a refused one (whose log line must be
+    /// found), `None` for "need more".
+    pub fn parse_h2_head(head: &[u8]) -> Option<Result<(usize, Vec<u8>, Vec<u8>), ()>> {
+        let mut st = crate::http::ParseState {
+            h2: true,
+            ..Default::default()
+        };
+        match crate::http::parse_request(head, &mut st) {
+            crate::http::Parse::Complete(req) => Some(Ok((
+                req.consumed,
+                head[req.method_start..req.method_end].to_vec(),
+                head[req.path_start..req.path_end].to_vec(),
+            ))),
+            crate::http::Parse::Incomplete => None,
+            crate::http::Parse::Invalid => {
+                let refusal = crate::http::refusal_reason(head, true);
+                assert!(head.starts_with(refusal.request_line));
+                Some(Err(()))
+            }
+        }
+    }
+
+    /// A server prepared from a configuration, for requests that the
+    /// rewrite phases answer (`rewrite` target).
+    pub struct Server(&'static crate::worker::PreparedHttp);
+
+    /// What `prepare` leaked, kept reachable for LeakSanitizer.
+    static KEPT: std::sync::Mutex<Vec<crate::arena::Arena>> = std::sync::Mutex::new(Vec::new());
+
+    impl Server {
+        pub fn new(config: &str) -> Server {
+            let cfg = crate::config::parse_with_main(
+                std::path::PathBuf::from("/nonexistent/ruxen-fuzz.conf"),
+                config.to_string(),
+                None,
+            )
+            .expect("config");
+            crate::arena::open();
+            let http = crate::worker::prepare(cfg);
+            KEPT.lock().unwrap().push(crate::arena::close());
+            Server(http.expect("prepare"))
+        }
+
+        /// `GET <target> HTTP/1.1` with `Host: x` through the request
+        /// phases: the target as parsed, the status, `Location`, and body.
+        /// `None` when the parser refuses the request or the target isn't
+        /// a path.
+        pub fn get(&self, target: &[u8]) -> Option<ServerResponse> {
+            let mut head = b"GET ".to_vec();
+            head.extend_from_slice(target);
+            head.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut st = crate::http::ParseState::default();
+            let crate::http::Parse::Complete(parsed) = crate::http::parse_request(&head, &mut st)
+            else {
+                return None;
+            };
+            if parsed.implicit_path || head.get(parsed.path_start) != Some(&b'/') {
+                return None;
+            }
+            let req = crate::phase::RequestCtx {
+                method: crate::http::Method::Get,
+                method_bytes: b"GET",
+                path: &head[parsed.path_start..parsed.path_end],
+                request_line: &head[..head.len() - 21],
+                upstream: None,
+                http_11: true,
+                host: Some(b"x"),
+                sni: None,
+                listen_index: 0,
+                remote_addr: b"127.0.0.1",
+                remote_port: 12345,
+                if_modified_since: None,
+                if_unmodified_since: None,
+                if_none_match: None,
+                if_match: None,
+                range: None,
+                if_range: None,
+                headers_raw: &head[parsed.headers_start..parsed.headers_end],
+                connection_id: 0,
+                request_id: 0,
+                connection_requests: 0,
+                connection_time_us: 0,
+                request_time_us: 0,
+                request_port: &[],
+                pipe: b'.',
+                request_length: 0,
+                epoch_secs: 0,
+                epoch_ms: 0,
+                body: &crate::phase::NO_BODY,
+                body_len: 0,
+                body_file: None,
+                tls: None,
+                conn: &crate::phase::ConnInfo::NONE,
+                refuse: None,
+            };
+            let mut scratch = Vec::new();
+            let response = match crate::phase::process_with_meta(self.0, &req, &mut scratch).0 {
+                crate::phase::Response::Prebuilt(b) => b.to_vec(),
+                crate::phase::Response::Owned(b) => b,
+                _ => panic!("not a buffered response"),
+            };
+            let end = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response head");
+            let status = std::str::from_utf8(&response[9..12])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .expect("status");
+            let location = response[..end]
+                .split(|&b| b == b'\n')
+                .find_map(|line| line.strip_prefix(b"Location: "))
+                .map(|v| v.strip_suffix(b"\r").unwrap_or(v).to_vec());
+            Some(ServerResponse {
+                target: req.path.to_vec(),
+                status,
+                location,
+                body: response[end + 4..].to_vec(),
+            })
+        }
+    }
+
+    /// `Server::get`'s answer.
+    pub struct ServerResponse {
+        pub target: Vec<u8>,
+        pub status: u16,
+        pub location: Option<Vec<u8>>,
+        pub body: Vec<u8>,
+    }
+
+    /// `ngx_unescape_uri(…, NGX_UNESCAPE_REDIRECT)` as a redirect's
+    /// target goes through it.
+    pub fn unescape_redirect(raw: &[u8]) -> Vec<u8> {
+        crate::worker::rewrite::unescape_redirect(raw)
+    }
+
+    /// The escaping of a `Location` ruxen writes.
+    pub fn escape_redirect_location(raw: &[u8]) -> Vec<u8> {
+        crate::worker::rewrite::escape_redirect_location(raw)
+    }
+
+    /// realip's walk of an `X-Forwarded-For` value (`real_ip_header
+    /// X-Forwarded-For`) for a connection from `peer`, `from` holding
+    /// `set_real_ip_from`'s networks as (address, prefix length).
+    pub fn forwarded_addr(
+        peer: std::net::IpAddr,
+        list: &[u8],
+        from: &[(std::net::IpAddr, u8)],
+        recursive: bool,
+    ) -> Option<(std::net::IpAddr, u16)> {
+        use crate::config::AccessAddr;
+        let from: Vec<AccessAddr> = from
+            .iter()
+            .map(|&(ip, prefix)| match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let mask = u32::MAX
+                        .checked_shl(32 - u32::from(prefix.min(32)))
+                        .unwrap_or(0);
+                    AccessAddr::V4 {
+                        addr: u32::from(v4) & mask,
+                        mask,
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    let mask = u128::MAX
+                        .checked_shl(128 - u32::from(prefix.min(128)))
+                        .unwrap_or(0);
+                    AccessAddr::V6 {
+                        addr: u128::from(v6) & mask,
+                        mask,
+                    }
+                }
+            })
+            .collect();
+        let conn = crate::phase::ConnInfo {
+            peer_ip: peer,
+            ..crate::phase::ConnInfo::NONE
+        };
+        crate::phase::forwarded_addr(&conn, list, &from, recursive)
+    }
+
+    /// `ngx_parse_addr_port` as realip reads one entry.
+    pub fn parse_addr_port(text: &[u8]) -> Option<(std::net::IpAddr, u16)> {
+        crate::phase::parse_addr_port(text)
+    }
+
     /// `gzip::accepts_gzip`: whether `Accept-Encoding` takes gzip.
     pub fn accepts_gzip(accept_encoding: &[u8]) -> bool {
         crate::worker::gzip::accepts_gzip(accept_encoding)
@@ -202,17 +431,6 @@ pub mod fuzzing {
         piece: usize,
         max_body: u64,
     ) -> Result<(Vec<u8>, u64), ()> {
-        thread_local! {
-            static RUNTIME: std::cell::RefCell<
-                monoio::Runtime<monoio::time::TimeDriver<monoio::LegacyDriver>>,
-            > =
-                std::cell::RefCell::new(
-                    monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
-                        .enable_timer()
-                        .build()
-                        .expect("monoio runtime"),
-                );
-        }
         let initial = initial.min(data.len());
         let mut reader = Pieces {
             data: data[initial..].to_vec(),
