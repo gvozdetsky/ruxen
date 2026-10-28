@@ -93,6 +93,7 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
 
 fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     reset_variable_registry();
+    AIO_POOLS_USED.with(|u| u.borrow_mut().clear());
     let mut runtime = RuntimeOpts::default();
     let mut http: Option<HttpConfig> = None;
 
@@ -249,6 +250,16 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
+            ("thread_pool", Terminator::Semi) => {
+                let def = parse_thread_pool_args(&args)?;
+                if runtime.thread_pools.iter().any(|p| p.name == def.name) {
+                    return Err(Error::Text(format!(
+                        "duplicate thread pool \"{}\"",
+                        def.name
+                    )));
+                }
+                runtime.thread_pools.push(def);
+            }
             (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
             (n, Terminator::BlockOpen) if is_ignored_block(n) => {
                 compat::ignored_block(lx, &args);
@@ -261,6 +272,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     }
 
     let mut http = http.ok_or(Error::UnexpectedEof)?;
+    check_thread_pools(&mut runtime.thread_pools)?;
     http.warnings.extend(lx.take_warnings());
     http.uses_request_body_file = values::request_body_file_used();
     http.uses_request_body = values::request_body_used();
@@ -306,6 +318,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
+    let mut aio: Option<Aio> = None;
     let mut http2: Option<bool> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
@@ -491,6 +504,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         uses_metrics: false,
                         client_body_temp_path,
                         sendfile,
+                        aio,
                         http2,
                         http2_conf,
                         disable_symlinks,
@@ -930,6 +944,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
             }
+            ("aio", Terminator::Semi) => {
+                if aio.is_some() {
+                    return Err(Error::Duplicate("aio"));
+                }
+                aio = Some(parse_aio_args(lx, &args)?);
+            }
             ("post_action", Terminator::Semi) => {
                 if post_action.is_some() {
                     return Err(Error::Duplicate("post_action"));
@@ -1105,7 +1125,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "error_log",
     "timer_resolution",
     "pcre_jit",
-    "thread_pool",
     "lock_file",
     "working_directory",
     "debug_points",
@@ -1175,8 +1194,8 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_socket_keepalive",
     "proxy_store",
     "proxy_store_access",
-    // File I/O knobs (we use std::fs; these are nginx-only tuning)
-    "aio",
+    // File I/O knobs: nginx-only tuning. `aio_write`: temp-file writes
+    // stay on the worker (#526).
     "aio_write",
     "directio",
     "directio_alignment",
@@ -1213,6 +1232,114 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "quic_host_key",
     "quic_retry",
 ];
+
+thread_local! {
+    /// The pools `aio threads` names, with where: checked against the
+    /// `thread_pool`s once the whole configuration is read, which may
+    /// define them after the `http` block.
+    static AIO_POOLS_USED: std::cell::RefCell<Vec<(String, Option<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `aio off|on|threads[=pool]` (ngx_http_core_set_aio). `on` is Linux
+/// native AIO, which ruxen doesn't have: accepted, a `--compat` finding.
+pub(crate) fn parse_aio_args(lx: &Lexer, args: &[String]) -> Result<Aio, Error> {
+    let [_, value] = args else {
+        return Err(Error::BadValue {
+            what: "aio",
+            got: args[1..].join(" "),
+        });
+    };
+    let aio = match value.as_str() {
+        "off" => Aio::Off,
+        "on" => Aio::On,
+        "threads" => Aio::Threads("default".to_string()),
+        v => match v.strip_prefix("threads=") {
+            Some(name) if name.contains('$') => {
+                return Err(Error::Directive {
+                    name: "aio",
+                    msg: "with a variable in the thread pool name is not supported".to_string(),
+                });
+            }
+            Some(name) => Aio::Threads(name.to_string()),
+            None => {
+                return Err(Error::BadValue {
+                    what: "aio",
+                    got: v.to_string(),
+                });
+            }
+        },
+    };
+    match &aio {
+        Aio::Threads(name) => {
+            AIO_POOLS_USED.with(|u| u.borrow_mut().push((name.clone(), lx.position())));
+        }
+        _ => compat::ignored(lx, args),
+    }
+    Ok(aio)
+}
+
+/// `thread_pool name threads=N [max_queue=M];` (ngx_thread_pool): other
+/// parameters are ignored, as nginx does.
+fn parse_thread_pool_args(args: &[String]) -> Result<ThreadPoolDef, Error> {
+    if !(3..=4).contains(&args.len()) {
+        return Err(Error::Text(
+            "invalid number of arguments in \"thread_pool\" directive".to_string(),
+        ));
+    }
+    let mut threads = 0;
+    let mut max_queue = crate::aio::DEFAULT_MAX_QUEUE;
+    for arg in &args[2..] {
+        if let Some(n) = arg.strip_prefix("threads=") {
+            threads = match n.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => return Err(Error::Text(format!("invalid threads value \"{arg}\""))),
+            };
+        } else if let Some(n) = arg.strip_prefix("max_queue=") {
+            max_queue = n
+                .parse::<usize>()
+                .map_err(|_| Error::Text(format!("invalid max_queue value \"{arg}\"")))?;
+        }
+    }
+    if threads == 0 {
+        return Err(Error::Text(
+            "\"thread_pool\" must have \"threads\" parameter".to_string(),
+        ));
+    }
+    Ok(ThreadPoolDef {
+        name: args[1].clone(),
+        threads,
+        max_queue,
+    })
+}
+
+/// Every pool an `aio threads` names is defined; `default` is when it
+/// isn't (ngx_thread_pool_init_conf).
+fn check_thread_pools(pools: &mut Vec<ThreadPoolDef>) -> Result<(), Error> {
+    let used = AIO_POOLS_USED.with(|u| std::mem::take(&mut *u.borrow_mut()));
+    for (name, position) in used {
+        if pools.iter().any(|p| p.name == name) {
+            continue;
+        }
+        if name == "default" {
+            pools.push(ThreadPoolDef {
+                name,
+                threads: crate::aio::DEFAULT_THREADS,
+                max_queue: crate::aio::DEFAULT_MAX_QUEUE,
+            });
+            continue;
+        }
+        let error = Error::Text(format!("unknown thread pool \"{name}\""));
+        return Err(match position {
+            Some(position) => Error::At {
+                error: Box::new(error),
+                position,
+            },
+            None => error,
+        });
+    }
+    Ok(())
+}
 
 /// Block directives whose body we swallow wholesale (no inner parsing).
 pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "charset_map"];
@@ -5638,6 +5765,61 @@ mod tests {
                 what: "autoindex_format",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn thread_pools_and_aio_threads_as_nginx() {
+        let cfg = parse(
+            "thread_pool big threads=4 max_queue=10; \
+             http { aio threads=big; server { aio off; location / { aio threads; } \
+             location /n { location /n/x { } } } } thread_pool late foo=1 threads=2;",
+        )
+        .unwrap();
+        let pools: Vec<(&str, usize, usize)> = cfg
+            .runtime
+            .thread_pools
+            .iter()
+            .map(|p| (p.name.as_str(), p.threads, p.max_queue))
+            .collect();
+        // `default` is added for the bare `aio threads`.
+        assert_eq!(
+            pools,
+            [("big", 4, 10), ("late", 2, 65536), ("default", 32, 65536)]
+        );
+        assert_eq!(cfg.aio, Some(Aio::Threads("big".into())));
+        let server = &cfg.servers[0];
+        assert_eq!(server.aio, Some(Aio::Off));
+        assert_eq!(
+            server.locations[0].aio,
+            Some(Aio::Threads("default".into()))
+        );
+        assert_eq!(server.locations[1].aio, None);
+
+        let err = |src: &str| parse(src).unwrap_err().to_string();
+        assert_eq!(
+            err("http { server { aio threads=nope; } }"),
+            "unknown thread pool \"nope\""
+        );
+        assert_eq!(
+            err("thread_pool a threads=1; thread_pool a threads=2; http { }"),
+            "duplicate thread pool \"a\""
+        );
+        assert_eq!(
+            err("thread_pool a max_queue=1; http { }"),
+            "\"thread_pool\" must have \"threads\" parameter"
+        );
+        assert_eq!(
+            err("thread_pool a threads=0; http { }"),
+            "invalid threads value \"threads=0\""
+        );
+        assert!(err("http { aio threads=$x; }").contains("variable"));
+        assert!(err("http { aio maybe; }").contains("aio"));
+        assert!(err("http { aio on; aio off; }").contains("duplicate"));
+        // Not a main-context directive.
+        assert!(matches!(
+            parse("aio threads; http { }"),
+            Err(Error::UnknownDirective { .. })
         ));
     }
 }

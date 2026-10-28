@@ -730,7 +730,11 @@ impl super::super::ConnIo for StreamIo {
     /// The file read straight into the `Bytes` its DATA frames carry: no
     /// zeroed buffer per request and no copy into the frames (#348). Only
     /// for a body the head announced with its length, up to 1 MiB.
-    async fn send_file_body(&mut self, body: &crate::phase::FileBody) -> Option<bool> {
+    async fn send_file_body(
+        &mut self,
+        body: crate::phase::FileBody,
+        aio: Option<&'static crate::aio::ThreadPool>,
+    ) -> Result<bool, crate::phase::FileBody> {
         use std::os::fd::AsRawFd;
         const MAX: u64 = 1 << 20;
         // Multipart parts go through `stream_file`.
@@ -739,7 +743,19 @@ impl super::super::ConnIo for StreamIo {
             || body.parts.is_some()
             || !matches!(self.out, Out::Length(n) if n == body.len)
         {
-            return None;
+            return Err(body);
+        }
+        if let Some(pool) = aio {
+            let read = Box::pin(crate::aio::run(pool, move || {
+                let mut buf = bytes::BytesMut::zeroed(body.len as usize);
+                crate::aio::pread_exact(body.fd.as_raw_fd(), &mut buf, body.offset).map(|()| buf)
+            }))
+            .await;
+            let Ok(Ok(buf)) = read else {
+                return Ok(false);
+            };
+            self.out = Out::Done;
+            return Ok(self.send_data_owned(buf.freeze()).await.is_ok());
         }
         let len = body.len as usize;
         let mut buf = bytes::BytesMut::with_capacity(len);
@@ -757,14 +773,14 @@ impl super::super::ConnIo for StreamIo {
             };
             if n <= 0 {
                 // An error, or a file shorter than its stat said.
-                return Some(false);
+                return Ok(false);
             }
             filled += n as usize;
         }
         // SAFETY: `filled == len` bytes were written above.
         unsafe { buf.set_len(len) };
         self.out = Out::Done;
-        Some(self.send_data_owned(buf.freeze()).await.is_ok())
+        Ok(self.send_data_owned(buf.freeze()).await.is_ok())
     }
 
     fn h2_header_block(&self) -> Option<u64> {

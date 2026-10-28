@@ -77,6 +77,7 @@ pub(crate) fn parse_server_block(
     let mut max_ranges: Option<u32> = None;
     let mut client_body_buffer_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
+    let mut aio: Option<Aio> = None;
     let mut http2: Option<bool> = None;
     let mut http2_conf = Http2Conf::default();
     let mut client_body_temp_path: Option<TempPath> = None;
@@ -185,6 +186,7 @@ pub(crate) fn parse_server_block(
                         client_body_buffer_size,
                         client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
+                        aio: aio.clone(),
                         http2,
                         http2_conf,
                         disable_symlinks: disable_symlinks.clone(),
@@ -670,6 +672,12 @@ pub(crate) fn parse_server_block(
                     return Err(Error::Duplicate("sendfile"));
                 }
                 sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
+            }
+            ("aio", Terminator::Semi) => {
+                if aio.is_some() {
+                    return Err(Error::Duplicate("aio"));
+                }
+                aio = Some(parse_aio_args(lx, &args)?);
             }
             ("post_action", Terminator::Semi) => {
                 if post_action.is_some() {

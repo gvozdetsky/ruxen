@@ -1471,6 +1471,10 @@ pub(crate) fn run_location_handler(
                     server_bytes,
                 ),
                 fs_resolve::Outcome::Serve(opened) => {
+                    // `aio threads`: even a small body is read on the pool
+                    // (`file::inline_limit`), except under `add_trailer`,
+                    // which needs it in memory here.
+                    let aio_reads = loc.aio.is_some() && loc.add_trailers.is_empty();
                     // An error page that goes out with another status than
                     // 200 is sent whole: nginx's not_modified and range
                     // filters only act on a 200, so no 304, no 206 and no
@@ -1499,6 +1503,7 @@ pub(crate) fn run_location_handler(
                             },
                             server_bytes,
                             loc.sendfile,
+                            aio_reads,
                         );
                     }
                     // `max_ranges 0`: nginx's range filter declines, so
@@ -1543,6 +1548,7 @@ pub(crate) fn run_location_handler(
                         },
                         server_bytes,
                         loc.sendfile,
+                        aio_reads,
                     );
                     match vary_cut {
                         Some((gz, mime, size)) => {
@@ -1827,6 +1833,7 @@ fn serve_gzip_static(
         conditionals(error_status.is_none()),
         server_bytes,
         loc.sendfile,
+        loc.aio.is_some() && loc.add_trailers.is_empty(),
     );
     if let (Some(_), Some(gz)) = (range, filter)
         && gz.vary

@@ -7,6 +7,7 @@
 #![cfg(feature = "fuzzing")]
 #![allow(dead_code, unused_imports, unused_variables, unused_macros, unused_mut)]
 
+mod aio;
 mod arena;
 mod auth;
 mod autoindex;

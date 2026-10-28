@@ -513,6 +513,9 @@ pub struct RuntimeOpts {
     /// waits for in-flight connections, in ms. `None` (and nginx's `0`)
     /// waits without limit.
     pub worker_shutdown_timeout_ms: Option<u64>,
+    /// `thread_pool` definitions, with nginx's `default` added when an
+    /// `aio threads` uses it undefined.
+    pub thread_pools: Vec<ThreadPoolDef>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -594,6 +597,8 @@ pub struct HttpConfig {
     pub client_body_temp_path: Option<TempPath>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
+    /// http-scope `aio`. `None`: not set (off).
+    pub aio: Option<Aio>,
     /// http-scope `http2 on|off` (nginx 1.25.1+). `None`: not set (off).
     pub http2: Option<bool>,
     /// http-scope `http2_*` settings (#346).
@@ -1378,6 +1383,8 @@ pub struct Server {
     pub client_body_temp_path: Option<TempPath>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
     pub sendfile: Option<bool>,
+    /// Server-scope `aio`. `None` inherits from http.
+    pub aio: Option<Aio>,
     /// Server-scope `http2 on|off`. `None` inherits from http.
     pub http2: Option<bool>,
     /// Server-scope `http2_*` settings; unset ones inherit from http.
@@ -1667,6 +1674,8 @@ pub struct Location {
     /// Location-scope `sendfile on|off`, inherited through nested locations
     /// at parse time. `None` inherits from server/http at prepare time.
     pub sendfile: Option<bool>,
+    /// Location-scope `aio`, inherited like `sendfile`.
+    pub aio: Option<Aio>,
     /// Location-scope `client_body_temp_path`, inherited like `sendfile`.
     pub client_body_temp_path: Option<TempPath>,
     /// Location-scope `disable_symlinks`, inherited through nested
@@ -2252,6 +2261,24 @@ pub fn limit_except_method_bit(method: &[u8]) -> u16 {
         .iter()
         .position(|m| m.as_bytes() == method)
         .map_or(0, |i| 1 << i)
+}
+
+/// `aio off|on|threads[=pool]` (#526). `On` (Linux native AIO) is
+/// accepted and reads stay on the worker, as with `Off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Aio {
+    Off,
+    On,
+    /// The pool's name, `default` when none is given.
+    Threads(String),
+}
+
+/// `thread_pool name threads=N [max_queue=M];` (main context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPoolDef {
+    pub name: String,
+    pub threads: usize,
+    pub max_queue: usize,
 }
 
 /// `client_body_temp_path path [level1 [level2 [level3]]]`: the directory

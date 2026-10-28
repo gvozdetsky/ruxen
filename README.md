@@ -233,6 +233,7 @@ Supported functionality includes:
 - byte ranges (one range per request; `max_ranges 0` turns them off)
 - streamed large files
 - zero-copy `sendfile on|off` (plain TCP, and TLS with `ssl_conf_command Options KTLS`)
+- `aio threads[=pool]` and `thread_pool`: file reads and `sendfile` on a per-worker thread pool, so a slow disk doesn't stall the worker
 - URI decoding and normalization
 - trailing-slash redirects
 - `autoindex`
