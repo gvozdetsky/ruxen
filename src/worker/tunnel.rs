@@ -5,11 +5,8 @@
 //! (the upstream's) go first.
 //!
 //! The two directions run at once, so a peer that writes without reading
-//! can't stall the other way. The upstream connection is split as monoio
-//! splits a `TcpStream`, or shared like the client's when it is TLS
-//! (`UpstreamIo::into_tunnel`); the client connection is borrowed by both
-//! directions, which `ConnIo::begin_tunnel` makes safe for TLS (see
-//! `TlsStream::begin_tunnel`).
+//! can't stall the other way: each connection is split into a read and a
+//! write half (`crate::duplex`, #501).
 //!
 //! Timeouts are nginx's: the tunnel ends after `proxy_read_timeout` with
 //! nothing read from either side (nginx re-arms the upstream read timer on
@@ -19,7 +16,7 @@
 //! connection lives on until `worker_shutdown_timeout`, as on an old
 //! nginx worker.
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::Cell;
 use std::time::Duration;
 
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -69,9 +66,8 @@ pub(crate) async fn run_tunnel<S: ConnIo>(
     upstream_early: Vec<u8>,
     conf: TunnelConf<'_>,
 ) -> Tunnelled {
-    client.begin_tunnel();
+    let (mut client_read, mut client_write) = crate::duplex::split(client);
     let (mut up_read, mut up_write) = upstream.into_tunnel();
-    let client = UnsafeCell::from_mut(client);
     let activity = Cell::new(Instant::now());
     // Writes in progress. While one waits for its peer to read, nginx
     // reads nothing from the other side and its read timer is off: only
@@ -86,11 +82,8 @@ pub(crate) async fn run_tunnel<S: ConnIo>(
         buf.reserve(BUF.saturating_sub(buf.len()));
         loop {
             if !buf.is_empty() {
-                // SAFETY: the other direction only reads from the client
-                // (see `begin_tunnel`); this is the only writer.
-                let c = unsafe { &mut *client.get() };
                 writing.set(writing.get() + 1);
-                let written = timeout(conf.client_send_timeout, c.write_all(buf)).await;
+                let written = timeout(conf.client_send_timeout, client_write.write_all(buf)).await;
                 writing.set(writing.get() - 1);
                 let (res, returned) = match written {
                     Ok(pair) => pair,
@@ -134,10 +127,7 @@ pub(crate) async fn run_tunnel<S: ConnIo>(
                 activity.set(Instant::now());
             }
             buf.clear();
-            // SAFETY: the other direction only writes to the client; this
-            // is the only reader.
-            let c = unsafe { &mut *client.get() };
-            let (res, returned) = c.read(buf).await;
+            let (res, returned) = client_read.read(buf).await;
             buf = returned;
             match res {
                 Ok(0) | Err(_) => return TunnelEnd::Closed,

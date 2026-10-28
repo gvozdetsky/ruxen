@@ -271,14 +271,10 @@ pub(crate) fn parse_location_spec(args: &[String]) -> Result<LocationSpec, Error
 /// prepare time; storing it here would force `Location` to be non-`Debug`-
 /// friendly and bloat the parser surface.
 ///
-/// Uses `regex::bytes::RegexBuilder`: nginx matches PCRE against
-/// `r->uri.data` as raw bytes, and our normalized path is also a `Vec<u8>`
-/// (percent-decoding can produce arbitrary octets). Compiling here with
-/// the same builder used in `prepare` keeps validation and runtime in sync.
+/// Compiled with `crate::config::pcre::regex`, as in `prepare`, so validation and
+/// runtime agree.
 pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<(), Error> {
-    regex::bytes::RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
+    crate::config::pcre::regex(pattern, case_insensitive)
         .map(|_| ())
         .map_err(|e| Error::InvalidRegex {
             pattern: pattern.to_string(),
@@ -483,8 +479,10 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
                     location.alias_prefix_override = parent.alias_prefix_override.clone();
                     location.inherits_root = parent.inherits_root;
                 }
-                let static_parent =
-                    !matches!(parent.handler, Handler::Proxy(_) | Handler::StubStatus);
+                let static_parent = !matches!(
+                    parent.handler,
+                    Handler::Proxy(_) | Handler::StubStatus | Handler::Metrics
+                );
                 let keeps_own =
                     !parent.explicit_return && (*own_handler || (*own_root && static_parent));
                 if keeps_own && *own_handler {
@@ -598,6 +596,7 @@ pub(crate) fn parse_location_block(
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
     let mut stub_status = false;
+    let mut metrics = false;
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
     let mut limit_req = LimitReqConf::default();
@@ -673,6 +672,8 @@ pub(crate) fn parse_location_block(
                         Handler::Return { status, body }
                     } else if stub_status {
                         Handler::StubStatus
+                    } else if metrics {
+                        Handler::Metrics
                     } else if let Some(pp) = proxy_pass {
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
@@ -1062,7 +1063,7 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("root/alias"));
                 }
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some((PathBuf::from(path), PathMapping::Root));
+                root = Some((parse_root_path(false, path)?, PathMapping::Root));
                 local_path_mapping = Some(PathMapping::Root);
                 alias_prefix_override = None;
             }
@@ -1104,7 +1105,7 @@ pub(crate) fn parse_location_block(
                         spec.pattern,
                     ));
                 }
-                root = Some((PathBuf::from(path), PathMapping::Alias));
+                root = Some((parse_root_path(true, path)?, PathMapping::Alias));
                 local_path_mapping = Some(PathMapping::Alias);
                 alias_prefix_override = None;
             }
@@ -1146,6 +1147,17 @@ pub(crate) fn parse_location_block(
             ("stub_status", Terminator::Semi) if args.len() <= 2 => {
                 stub_status = true;
                 crate::config::values::note_stats_used();
+            }
+            // ruxen's own (#481), where `stub_status` goes.
+            ("ruxen_metrics", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::Directive {
+                        name: "ruxen_metrics",
+                        msg: "takes no arguments".to_string(),
+                    });
+                }
+                metrics = true;
+                crate::config::values::note_metrics_used();
             }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {

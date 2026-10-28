@@ -332,17 +332,36 @@ http {
     assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
     assert_eq!(
         header(&r, "content-type").as_deref(),
-        Some("application/json")
+        Some("application/javascript")
     );
     let b = std::str::from_utf8(body(&r)).unwrap();
-    assert!(b.starts_with("cb("), "body: {b}");
+    assert!(b.starts_with("/* callback */\r\ncb([\r\n{ "), "body: {b}");
     assert!(b.ends_with(");"), "body: {b}");
     assert!(b.contains(r#""name":"a.txt""#), "body: {b}");
 
-    // No callback => bare JSON array.
-    let r = http_get(port, "/");
-    let b = std::str::from_utf8(body(&r)).unwrap();
-    assert!(b.starts_with('[') && b.ends_with(']'), "body: {b}");
+    // The argument name in any case; the value as sent.
+    let r = http_get(port, "/?CallBack=a.b_1");
+    assert!(body(&r).starts_with(b"/* callback */\r\na.b_1("), "{r:?}");
+
+    // No callback => bare JSON array, typed as JSON.
+    for target in ["/", "/?callback=", "/?callback"] {
+        let r = http_get(port, target);
+        assert_eq!(
+            header(&r, "content-type").as_deref(),
+            Some("application/json")
+        );
+        let b = std::str::from_utf8(body(&r)).unwrap();
+        assert!(b.starts_with('[') && b.ends_with(']'), "body: {b}");
+    }
+
+    // nginx answers 400 to a name outside [A-Za-z0-9_.] or over 128 bytes.
+    let long = format!("/?callback={}", "a".repeat(129));
+    for target in ["/?callback=a(1)", "/?callback=a%28", long.as_str()] {
+        let r = http_get(port, target);
+        assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request", "{target}");
+    }
+    let ok = format!("/?callback={}", "a".repeat(128));
+    assert_eq!(status_line(&http_get(port, &ok)), "HTTP/1.1 200 OK");
 }
 
 #[test]

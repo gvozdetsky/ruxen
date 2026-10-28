@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 195 implemented, 19 accepted with a difference, 71 accepted with no effect, 0 refused, 279 unknown.
+Of 564 directives: 196 implemented, 18 accepted with a difference, 71 accepted with no effect, 0 refused, 279 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -166,7 +166,7 @@ Not supported: `ssl_engine`.
 | `server_tokens` | yes | http, server, location |  |
 | `if_modified_since` | yes | http, server, location |  |
 | `max_ranges` | yes | http, server, location |  |
-| `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in location only) |
+| `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in server and location only) |
 | `etag` | yes | http, server, location |  |
 | `early_hints` | no |  |  |
 | `error_page` | yes | http, server, location |  |
@@ -342,7 +342,7 @@ Not supported: `gunzip`, `gunzip_buffers`.
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `gzip_static` | accepted, differs | any | precompressed .gz files are not served (#93) |
+| `gzip_static` | yes | http, server, location |  |
 
 ## http_headers_filter
 
@@ -423,7 +423,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_cookie_flags` | yes | http, server, location |  |
 | `proxy_store` | accepted, differs | any | proxied responses are not stored |
 | `proxy_store_access` | accepted, no effect | any |  |
-| `proxy_buffering` | accepted, differs | any | ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #88) |
+| `proxy_buffering` | accepted, differs | any | ruxen relays a response as it arrives either way (#88, #463) |
 | `proxy_request_buffering` | accepted, differs | any | request bodies are still read whole before they are proxied (#134) |
 | `proxy_ignore_client_abort` | yes | http, server, location |  |
 | `proxy_bind` | yes | http, server, location |  |

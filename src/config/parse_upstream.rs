@@ -1374,9 +1374,8 @@ pub(crate) fn parse_proxy_cache_use_stale(args: &[String]) -> Result<UseStale, E
     Ok(stale)
 }
 
-/// `proxy_cache_path` (ngx_http_file_cache_set_slot). The loader and
-/// manager tunables are checked and otherwise unused: the index learns
-/// files lazily and eviction runs as entries are stored.
+/// `proxy_cache_path` (ngx_http_file_cache_set_slot). The loader's
+/// tunables are checked and otherwise unused.
 pub(crate) fn parse_proxy_cache_path(args: &[String]) -> Result<ProxyCachePath, Error> {
     let (path, params) = args
         .split_first()
@@ -1394,6 +1393,9 @@ pub(crate) fn parse_proxy_cache_path(args: &[String]) -> Result<ProxyCachePath, 
     let mut inactive_secs = 600;
     let mut max_size = None;
     let mut min_free = None;
+    let mut manager_files = 100;
+    let mut manager_sleep_ms = 50;
+    let mut manager_threshold_ms = 200;
     for param in params {
         let (name, value) = param.split_once('=').ok_or_else(|| bad(param))?;
         match name {
@@ -1436,10 +1438,18 @@ pub(crate) fn parse_proxy_cache_path(args: &[String]) -> Result<ProxyCachePath, 
                     Some(super::parse_server::parse_size_bytes(value).ok_or_else(|| bad(param))?);
             }
             "loader_files" | "manager_files" => {
-                value.parse::<u64>().map_err(|_| bad(param))?;
+                let n = value.parse::<u64>().map_err(|_| bad(param))?;
+                if name == "manager_files" {
+                    manager_files = n;
+                }
             }
             "loader_sleep" | "loader_threshold" | "manager_sleep" | "manager_threshold" => {
-                super::parse_server::parse_duration_ms(value, "proxy_cache_path")?;
+                let ms = super::parse_server::parse_duration_ms(value, "proxy_cache_path")?;
+                match name {
+                    "manager_sleep" => manager_sleep_ms = ms,
+                    "manager_threshold" => manager_threshold_ms = ms,
+                    _ => {}
+                }
             }
             _ => return Err(bad(param)),
         }
@@ -1453,6 +1463,9 @@ pub(crate) fn parse_proxy_cache_path(args: &[String]) -> Result<ProxyCachePath, 
         inactive_secs,
         max_size,
         min_free,
+        manager_files,
+        manager_sleep_ms,
+        manager_threshold_ms,
     })
 }
 

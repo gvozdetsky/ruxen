@@ -92,10 +92,9 @@ where
     let ctx = Rc::new(ctx);
     let listen = &ctx.http.listens[ctx.listen_index];
     let timeouts = listen.servers[listen.default_server].timeouts;
-    let io = compat::PollIo::new(stream);
+    let (io, stream) = compat::PollIo::new(stream);
     let writing_since = io.writing_since();
     let header_blocks = io.header_blocks();
-    let stream = io.stream_handle();
     // What nginx announces (ngx_http_v2_send_settings), from the default
     // server's settings: http2_max_concurrent_streams (128), a stream
     // window of http2_body_preread_size (64k); then it opens the
@@ -138,9 +137,9 @@ where
     // lingering close): what the client still sends (a WINDOW_UPDATE, a
     // PING) would otherwise make the kernel reset the connection, and the
     // client could lose the end of a response.
-    // SAFETY: nothing else borrows the stream any more (see above).
-    let stream = unsafe { &mut *stream.get() };
-    super::lingering_close(stream, &mut Vec::new()).await;
+    if let Some(mut stream) = stream.take() {
+        super::lingering_close(&mut stream, &mut Vec::new()).await;
+    }
 }
 
 /// Accept streams and keep the connection going until the client or a
