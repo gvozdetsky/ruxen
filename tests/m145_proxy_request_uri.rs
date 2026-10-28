@@ -92,6 +92,11 @@ fn start(up: u16) -> Server {
                location /sr/ {{ set $args \"a=1\";\n\
                  return 200 \"$args|$arg_a|$arg_b|$is_args|$query_string|$request_uri\"; }}\n\
                location /ru {{ return 200 \"$request_uri|$uri|$args|$is_args\"; }}\n\
+               location /t/ {{ try_files $uri @app; }}\n\
+               location /e/ {{ error_page 404 = @app; }}\n\
+               location /tr/ {{ rewrite ^/tr/(.*)$ /n/$1 break; try_files $uri @app; }}\n\
+               location /tu/ {{ try_files $uri /n/; }}\n\
+               location @app {{ proxy_pass http://127.0.0.1:{up}; }}\n\
              }} }}\n"
         ),
     )
@@ -259,6 +264,32 @@ fn absolute_target_without_a_path() {
             resp.contains(&format!("\r\nX-RU: {ru}\r\n")),
             "{target}: {resp}"
         );
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
+}
+
+/// A jump to a named location (`try_files … @app`, `error_page … @app`)
+/// keeps the client's target; a rewrite before it, or a redirect to a URI,
+/// sends the escaped `$uri` (#777).
+#[test]
+fn named_location_keeps_the_client_target() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, upstream_gets) in [
+        ("/t/a%2Fb", "/t/a%2Fb"),
+        ("/t/x/../a", "/t/x/../a"),
+        ("/t//a", "/t//a"),
+        ("/t/%41?q=1", "/t/%41?q=1"),
+        ("/t/a\\b", "/t/a\\b"),
+        ("/e/a%2Fb", "/e/a%2Fb"),
+        ("/tr/a%2Fb", "/n/a/b"),
+        ("/tr/a\\b", "/n/a%5Cb"),
+        ("/tu/a%2Fb", "/n/"),
+    ] {
+        let resp = get(server.port, target);
         assert!(
             resp.ends_with(&format!("[{upstream_gets}] lines=2")),
             "{target}: {resp}"
