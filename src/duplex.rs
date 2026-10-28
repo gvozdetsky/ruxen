@@ -64,6 +64,7 @@ pub(crate) unsafe trait Duplex: 'static {
 // future holds those, not the stream; `shutdown` is a syscall in the call.
 // The `&mut` made here ends with the call. Recheck on a monoio update.
 unsafe impl Duplex for TcpStream {
+    #[inline]
     unsafe fn read_raw<T: IoBufMut>(
         this: NonNull<Self>,
         buf: T,
@@ -72,6 +73,7 @@ unsafe impl Duplex for TcpStream {
         unsafe { (*this.as_ptr()).read(buf) }
     }
 
+    #[inline]
     unsafe fn write_raw<T: IoBuf>(
         this: NonNull<Self>,
         buf: T,
@@ -80,6 +82,7 @@ unsafe impl Duplex for TcpStream {
         unsafe { (*this.as_ptr()).write(buf) }
     }
 
+    #[inline]
     unsafe fn shutdown_raw(this: NonNull<Self>) -> impl Future<Output = io::Result<()>> + 'static {
         // SAFETY: as in `read_raw`.
         unsafe { (*this.as_ptr()).shutdown() }
@@ -157,6 +160,7 @@ impl<S> Reclaim<S> {
 // are gone.
 
 impl<S: Duplex, K> AsyncReadRent for ReadHalf<S, K> {
+    #[inline]
     fn read<T: IoBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // SAFETY: see above.
         unsafe { S::read_raw(self.stream, buf) }
@@ -178,6 +182,7 @@ impl<S: Duplex, K> AsyncReadRent for ReadHalf<S, K> {
 }
 
 impl<S: Duplex, K> AsyncWriteRent for WriteHalf<S, K> {
+    #[inline]
     fn write<T: IoBuf>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // SAFETY: see above.
         unsafe { S::write_raw(self.stream, buf) }
@@ -223,7 +228,7 @@ pub(crate) async unsafe fn write_all_raw<S: Duplex>(
 
 /// An in-memory `Duplex` stream, and a test of the halves. No io_uring or
 /// sockets, so these run under Miri (#501):
-/// `cargo +nightly miri test --bin ruxen duplex`, also with
+/// `cargo +nightly miri test --bin ruxen -- duplex poll_io`, also with
 /// `MIRIFLAGS=-Zmiri-tree-borrows`.
 #[cfg(test)]
 pub(crate) mod testing {

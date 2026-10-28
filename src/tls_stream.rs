@@ -419,6 +419,7 @@ where
 
     /// `take_read_buf`, when the socket is to be read: everything read so
     /// far went to rustls.
+    #[inline]
     fn read_buf_if_drained(&mut self) -> Option<Vec<u8>> {
         (self.rpos == self.rbuf.len()).then(|| self.take_read_buf())
     }
@@ -426,6 +427,7 @@ where
     /// Hand rustls the ciphertext read and not yet handed, and process it.
     /// At EOF the slice is empty: rustls records the TCP EOF, so its
     /// plaintext reader reports `UnexpectedEof` instead of `WouldBlock`.
+    #[inline]
     fn process_read(&mut self) -> io::Result<usize> {
         let mut pending = &self.rbuf[self.rpos..];
         let n = self.conn.read_tls(&mut pending)?;
@@ -438,6 +440,9 @@ where
 
     /// What rustls has queued for the peer, as ciphertext for the socket;
     /// `None` when nothing is queued.
+    // Inline, as it was in `write_tls`: out of line it cost ~90
+    // instructions per TLS response (callgrind).
+    #[inline(always)]
     fn take_ciphertext(&mut self) -> io::Result<Option<Vec<u8>>>
     where
         IO: 'static,
@@ -513,6 +518,7 @@ where
     }
 
     /// Back from the socket write of `take_ciphertext`'s buffer.
+    #[inline]
     fn put_write_buf(&mut self, buf: Vec<u8>) {
         if buf.capacity() <= WRITE_BUF_KEEP {
             self.wbuf = buf;
@@ -933,7 +939,7 @@ mod tests {
     /// A read in flight while a large write goes out, on the `Duplex`
     /// halves (an HTTP/2 connection, a tunnel, #501).
     #[test]
-    fn duplex_read_while_writing() {
+    fn halves_read_while_writing() {
         const LEN: usize = 200 * 1024;
         run(
             |acceptor, sock| async move {
