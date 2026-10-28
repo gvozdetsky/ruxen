@@ -109,7 +109,7 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent + crate::duplex::Du
     async fn idle_wait(
         &self,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool;
@@ -214,7 +214,7 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent + crate::duplex::Du
         &mut self,
         buf: Vec<u8>,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
@@ -245,7 +245,7 @@ impl ConnIo for TcpStream {
         &mut self,
         buf: Vec<u8>,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
@@ -259,7 +259,7 @@ impl ConnIo for TcpStream {
     async fn idle_wait(
         &self,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool {
@@ -348,12 +348,12 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
         &mut self,
         buf: Vec<u8>,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
         if self.has_buffered_input() {
-            let next = if fresh || !state.is_shutting_down() {
+            let next = if fresh || idle.min.is_some() || !state.is_shutting_down() {
                 IdleRead::Ready
             } else {
                 IdleRead::Close
@@ -375,12 +375,12 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     async fn idle_wait(
         &self,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool {
         if self.has_buffered_input() {
-            return fresh || !state.is_shutting_down();
+            return fresh || idle.min.is_some() || !state.is_shutting_down();
         }
         wait_readable_or_shutdown(self.io(), state, idle, fresh, timers).await
     }
@@ -565,7 +565,7 @@ impl ConnIo for Preread {
         &mut self,
         mut buf: Vec<u8>,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
@@ -592,12 +592,12 @@ impl ConnIo for Preread {
     async fn idle_wait(
         &self,
         state: &RuntimeState,
-        idle: Option<Duration>,
+        idle: IdleLimits,
         fresh: bool,
         timers: &mut ConnTimers<'_>,
     ) -> bool {
         if self.has_pending() {
-            return fresh || !state.is_shutting_down();
+            return fresh || idle.min.is_some() || !state.is_shutting_down();
         }
         wait_readable_or_shutdown(&self.io, state, idle, fresh, timers).await
     }
@@ -846,6 +846,15 @@ async fn read_at_on_pool(
     .await?;
     *buf = returned;
     res
+}
+
+/// A keep-alive wait's limits: `timeout` ends it (`None`: no limit), and
+/// for its first `min` (`keepalive_min_timeout`, #601) shutdown, a reload
+/// and a drain don't.
+#[derive(Clone, Copy)]
+pub(crate) struct IdleLimits {
+    pub timeout: Option<Duration>,
+    pub min: Option<Duration>,
 }
 
 /// A connection's long-lived timers. monoio extends a registered timer

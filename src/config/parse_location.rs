@@ -321,6 +321,10 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     or(&mut child.keepalive_timeout, &parent.keepalive_timeout);
     or(&mut child.keepalive_requests, &parent.keepalive_requests);
     or(&mut child.keepalive_time_ms, &parent.keepalive_time_ms);
+    or(
+        &mut child.keepalive_min_timeout_ms,
+        &parent.keepalive_min_timeout_ms,
+    );
     or(&mut child.keepalive_disable, &parent.keepalive_disable);
     or(&mut child.error_logs, &parent.error_logs);
     or(&mut child.log_not_found, &parent.log_not_found);
@@ -566,6 +570,7 @@ pub(crate) fn parse_location_block(
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
+    let mut keepalive_min_timeout_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
     let mut error_logs: Option<Vec<ErrorLog>> = None;
     let mut log_not_found: Option<bool> = None;
@@ -739,6 +744,7 @@ pub(crate) fn parse_location_block(
                         keepalive_timeout,
                         keepalive_requests,
                         keepalive_time_ms,
+                        keepalive_min_timeout_ms,
                         keepalive_disable,
                         error_logs,
                         log_not_found,
@@ -878,6 +884,12 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("keepalive_time"));
                 }
                 keepalive_time_ms = Some(parse_keepalive_time_args(&args[1..])?);
+            }
+            ("keepalive_min_timeout", Terminator::Semi) => {
+                if keepalive_min_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("keepalive_min_timeout"));
+                }
+                keepalive_min_timeout_ms = Some(parse_keepalive_min_timeout_args(&args[1..])?);
             }
             ("keepalive_disable", Terminator::Semi) => {
                 if keepalive_disable.is_some() {
@@ -1307,6 +1319,7 @@ pub(crate) fn parse_location_block(
                 | "keepalive_timeout"
                 | "keepalive_requests"
                 | "keepalive_time"
+                | "keepalive_min_timeout"
                 | "keepalive_disable"
                 | "error_log"
                 | "log_not_found"

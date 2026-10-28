@@ -1647,6 +1647,7 @@ fn prepare_upstream_tls(
                 settings.server_name,
                 settings.session_reuse,
                 store.clone(),
+                settings.certificate_cache,
             ));
             None
         }
@@ -2333,6 +2334,7 @@ pub(crate) fn prepare_server(
         server.keepalive_timeout,
         server.keepalive_requests,
         server.keepalive_time_ms,
+        server.keepalive_min_timeout_ms,
         server.keepalive_disable,
     );
     let server_error_logs: &'static [PreparedErrorLog] = match server.error_logs {
@@ -3331,10 +3333,12 @@ pub(crate) fn prepare_keepalive(
     timeout: Option<KeepaliveTimeout>,
     keepalive_requests: Option<u64>,
     keepalive_time_ms: Option<u64>,
+    keepalive_min_timeout_ms: Option<u64>,
     keepalive_disable: Option<KeepaliveDisable>,
 ) -> PreparedKeepalive {
     let max_requests = keepalive_requests.unwrap_or(DEFAULT_KEEPALIVE_REQUESTS);
     let max_time_ms = keepalive_time_ms.unwrap_or(DEFAULT_KEEPALIVE_TIME_MS);
+    let min_timeout_ms = keepalive_min_timeout_ms.unwrap_or(0);
     let keepalive_disable = keepalive_disable.unwrap_or(KeepaliveDisable {
         msie6: true,
         safari: false,
@@ -3354,6 +3358,7 @@ pub(crate) fn prepare_keepalive(
             },
             max_requests,
             max_time_ms,
+            min_timeout_ms,
             disable_msie6: keepalive_disable.msie6,
             disable_safari: keepalive_disable.safari,
         },
@@ -3363,6 +3368,7 @@ pub(crate) fn prepare_keepalive(
             header_timeout_secs: None,
             max_requests,
             max_time_ms,
+            min_timeout_ms,
             disable_msie6: keepalive_disable.msie6,
             disable_safari: keepalive_disable.safari,
         },
@@ -3386,6 +3392,7 @@ pub(crate) fn resolve_keepalive(
     location_keepalive: Option<KeepaliveTimeout>,
     location_keepalive_requests: Option<u64>,
     location_keepalive_time_ms: Option<u64>,
+    location_keepalive_min_timeout_ms: Option<u64>,
     location_keepalive_disable: Option<KeepaliveDisable>,
     server_keepalive: PreparedKeepalive,
 ) -> PreparedKeepalive {
@@ -3408,6 +3415,9 @@ pub(crate) fn resolve_keepalive(
     }
     if let Some(max_time_ms) = location_keepalive_time_ms {
         resolved.max_time_ms = max_time_ms;
+    }
+    if let Some(min_timeout_ms) = location_keepalive_min_timeout_ms {
+        resolved.min_timeout_ms = min_timeout_ms;
     }
     if let Some(disable) = location_keepalive_disable {
         resolved.disable_msie6 = disable.msie6;
@@ -3997,6 +4007,7 @@ pub(crate) fn build_prefix_or_exact(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         error_logs: location_error_logs,
         log_not_found: location_log_not_found,
@@ -4058,6 +4069,7 @@ pub(crate) fn build_prefix_or_exact(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         server.keepalive,
     );
@@ -4229,6 +4241,7 @@ pub(crate) fn build_regex_location(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         error_logs: location_error_logs,
         log_not_found: location_log_not_found,
@@ -4295,6 +4308,7 @@ pub(crate) fn build_regex_location(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         server.keepalive,
     );
