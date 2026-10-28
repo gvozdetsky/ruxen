@@ -452,3 +452,53 @@ fn m94_root_reload_binds_a_new_port_below_1024() {
     assert!(only_permitted(&caps), "{caps:x?}");
     assert!(thread_uids(pid).iter().all(|&u| u == 65534));
 }
+
+/// A key only root may read loads at startup, but a reload reads it as the
+/// user: a `[warn]` says so up front (#774).
+#[test]
+fn m94_root_warns_about_files_a_reload_cant_read() {
+    if !is_root() {
+        return;
+    }
+    let tls = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata/tls");
+    let conf = r#"
+events { }
+http {
+    server {
+        listen 127.0.0.1:%%PORT%% ssl;
+        ssl_certificate KEYDIR/rsa.crt;
+        ssl_certificate_key KEYDIR/rsa.key;
+        location /up { return 200 "ok"; }
+    }
+}
+"#;
+    let keys = temp_dir("keys");
+    for (name, mode) in [("rsa.crt", 0o644), ("rsa.key", 0o600)] {
+        std::fs::copy(tls.join(name), keys.join(name)).unwrap();
+        std::fs::set_permissions(keys.join(name), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let conf = conf.replace("KEYDIR", keys.to_str().unwrap());
+    let (mut server, _port, _dir) = start("unreadable", "user nobody nogroup;", &conf);
+    let pid = server.child.id();
+    // SAFETY: signalling the child we spawned.
+    unsafe { libc::kill(pid as i32, libc::SIGQUIT) };
+    let mut stderr = String::new();
+    server
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(server.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&keys);
+    let key = format!(
+        "user \"nobody\" can't read \"{}\"",
+        keys.join("rsa.key").display()
+    );
+    assert!(
+        stderr.contains("[warn]") && stderr.contains(&key),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("rsa.crt"), "{stderr}");
+}

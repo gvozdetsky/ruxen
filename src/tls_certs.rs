@@ -307,7 +307,7 @@ pub struct ServerNameResolver {
     /// Lowercased head (without trailing `.*`) of `www.example.*` names.
     wildcard_trailing: Vec<(String, Vec<ServerKey>)>,
     /// `~regex` names, in declaration order.
-    regex: Vec<(regex::Regex, Vec<ServerKey>)>,
+    regex: Vec<(regex::bytes::Regex, Vec<ServerKey>)>,
     default: Vec<ServerKey>,
 }
 
@@ -403,7 +403,7 @@ impl ServerNameResolver {
 
     /// Register `key` under a `~regex` server name. A regex registered
     /// again (same server, RSA + ECDSA) adds to its slot.
-    pub fn add_regex(&mut self, regex: &regex::Regex, key: impl Into<ServerKey>) {
+    pub fn add_regex(&mut self, regex: &regex::bytes::Regex, key: impl Into<ServerKey>) {
         let key = key.into();
         if let Some((_, slot)) = self
             .regex
@@ -482,7 +482,7 @@ impl ServerNameResolver {
             return Self::select(slot, schemes);
         }
         for (regex, slot) in &self.regex {
-            if regex.is_match(&normalized) {
+            if regex.is_match(normalized.as_bytes()) {
                 return Self::select(slot, schemes);
             }
         }
@@ -649,6 +649,7 @@ pub fn password_file(path: &Path) -> Result<Arc<[Vec<u8>]>, String> {
             crate::worker::errno_text(&e)
         )
     })?;
+    crate::privileges::note_read(path);
     let passwords: Arc<[Vec<u8>]> = text
         .split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
@@ -695,6 +696,7 @@ pub fn pem_file(path: &Path) -> std::io::Result<Arc<[u8]>> {
         Some(bytes) => bytes,
         None => std::fs::read(path)?.into(),
     };
+    crate::privileges::note_read(path);
     files.push((path.to_path_buf(), id, bytes.clone()));
     Ok(bytes)
 }
