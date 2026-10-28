@@ -151,10 +151,6 @@ configurations hit:
 - `bad value for upstream server param: resolve`: `server … resolve` in an
   `upstream` (nginx 1.27.3). ruxen resolves upstream names once, at start
   and reload. [#597] (open).
-- `invalid location regex … repetition quantifier expects a valid decimal`:
-  a `{` that doesn't start a quantifier, often a template variable that was
-  never substituted (`^${PREFIX}/`). nginx's PCRE reads it as a literal.
-  Escape it (`\{`), or substitute the template. [#763] (open).
 - `bad value for disable_symlinks from=`: `from=` with a variable other
   than `$document_root`. ruxen refuses it rather than not enforce it; use
   `$document_root` or a literal path.
@@ -455,5 +451,4 @@ start without it.
 [#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
 [#760]: https://github.com/gvozdetsky/ruxen/issues/760
-[#763]: https://github.com/gvozdetsky/ruxen/issues/763
 [#764]: https://github.com/gvozdetsky/ruxen/issues/764
