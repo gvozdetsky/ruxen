@@ -68,24 +68,6 @@ directive of these modules (`fastcgi_param` from `fastcgi_params`, …).
   part. Both can read the same `include` files.
 - **Issue:** none; out of scope for now ([`ROADMAP.md`](../ROADMAP.md)).
 
-### `root` or `alias` with variables
-
-`root /var/www/$host;`, `alias /srv/$1;`.
-
-- **ruxen:** refuses them. Taken literally, the path would point at a
-  directory named `$host` and serve other files than nginx serves.
-- **Do:** a literal `root` and `try_files` with the variable:
-  ```nginx
-  root /var/www;
-  location / {
-      try_files /$host$uri /$host$uri/index.html =404;
-  }
-  ```
-  ruxen refuses a `Host` with `/`, `..` or a leading `.` (400), as nginx
-  does, so `$host` can't leave the root. For `alias` with captures, one
-  `location` per directory with a literal `alias`.
-- **Issue:** [#232] (open).
-
 ### `grpc_pass`
 
 - **ruxen:** no gRPC proxying: it needs HTTP/2 to the upstream and
@@ -149,10 +131,6 @@ configurations hit:
 - `bad value for upstream server param: resolve`: `server … resolve` in an
   `upstream` (nginx 1.27.3). ruxen resolves upstream names once, at start
   and reload. [#597] (open).
-- `invalid location regex … repetition quantifier expects a valid decimal`:
-  a `{` that doesn't start a quantifier, often a template variable that was
-  never substituted (`^${PREFIX}/`). nginx's PCRE reads it as a literal.
-  Escape it (`\{`), or substitute the template. [#763] (open).
 - `bad value for disable_symlinks from=`: `from=` with a variable other
   than `$document_root`. ruxen refuses it rather than not enforce it; use
   `$document_root` or a literal path.
@@ -381,11 +359,40 @@ Started as root, ruxen binds its ports, opens certificates and logs, then
 switches the whole process to `user` (nginx's default `nobody`) before it
 accepts a connection. A helper process stays root to recreate rotated log
 files for that user and remove the pid file; it takes only fixed one-byte
-commands. After the switch, a reload reads the configuration as `user` and
-can't bind a new port below 1024 ([#344], open): restart to add one.
+commands. A reload binds new ports below 1024 as nginx's root master
+does, but it reads the configuration, certificates, keys and password
+files as `user`, where nginx's master reads them as root ([#774], open).
+A key only root may read loads at startup, and the first reload after it
+is replaced fails: the old configuration keeps running with the old
+certificate, with an `[emerg]` in the error log. certbot writes its keys
+like that (`0600 root`, in a `0700` directory), so the reload after a
+renewal fails. ruxen warns at startup about every file it read as root that
+`user` can't read (`user "www-data" can't read "...": a reload will fail
+to read it`). Either make those files readable by `user`, for example with
+a group (`chgrp ssl-cert`, `chmod 640`, in a certbot `--deploy-hook` too),
+or run ruxen without root.
+
 Started unprivileged, as the systemd unit and the container image do,
 ruxen ignores `user` with nginx's warning; grant `CAP_NET_BIND_SERVICE` for
-ports below 1024.
+ports below 1024. Under systemd, root-only keys reach the service with
+`LoadCredential=`: systemd reads them as root at every start and puts
+copies the service can read in `$CREDENTIALS_DIRECTORY`
+(`/run/credentials/ruxen.service`):
+
+```ini
+# systemctl edit ruxen
+[Service]
+LoadCredential=example.com.key:/etc/letsencrypt/live/example.com/privkey.pem
+LoadCredential=example.com.crt:/etc/letsencrypt/live/example.com/fullchain.pem
+```
+
+```nginx
+ssl_certificate     /run/credentials/ruxen.service/example.com.crt;
+ssl_certificate_key /run/credentials/ruxen.service/example.com.key;
+```
+
+The copies are made at start only: after a renewal, `systemctl restart
+ruxen`, not `reload`.
 
 ### Reload and binary upgrade
 
@@ -429,9 +436,7 @@ start without it.
 
 [#36]: https://github.com/gvozdetsky/ruxen/issues/36
 [#134]: https://github.com/gvozdetsky/ruxen/issues/134
-[#232]: https://github.com/gvozdetsky/ruxen/issues/232
 [#337]: https://github.com/gvozdetsky/ruxen/issues/337
-[#344]: https://github.com/gvozdetsky/ruxen/issues/344
 [#463]: https://github.com/gvozdetsky/ruxen/issues/463
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
 [#526]: https://github.com/gvozdetsky/ruxen/issues/526
@@ -440,5 +445,5 @@ start without it.
 [#599]: https://github.com/gvozdetsky/ruxen/issues/599
 [#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
-[#763]: https://github.com/gvozdetsky/ruxen/issues/763
 [#764]: https://github.com/gvozdetsky/ruxen/issues/764
+[#774]: https://github.com/gvozdetsky/ruxen/issues/774

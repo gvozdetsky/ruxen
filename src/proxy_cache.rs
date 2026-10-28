@@ -37,6 +37,22 @@ pub enum CacheStatus {
 }
 
 impl CacheStatus {
+    /// Every status, in the order of `index`.
+    pub const ALL: [CacheStatus; 7] = [
+        CacheStatus::Miss,
+        CacheStatus::Bypass,
+        CacheStatus::Expired,
+        CacheStatus::Stale,
+        CacheStatus::Updating,
+        CacheStatus::Revalidated,
+        CacheStatus::Hit,
+    ];
+
+    /// The status's place in `ALL`.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
     pub fn as_bytes(self) -> &'static [u8] {
         match self {
             CacheStatus::Miss => b"MISS",
@@ -246,6 +262,9 @@ pub struct CacheZone {
     /// No configuration uses the zone any more after a reload: its
     /// manager stops.
     retired: AtomicBool,
+    /// Requests by `$upstream_cache_status` (`CacheStatus::ALL` order), for
+    /// `ruxen_metrics` (#481).
+    pub counters: crate::worker::metrics::ZoneCounters<7>,
 }
 
 /// The zones of the configurations workers serve. A reload that declares a
@@ -329,6 +348,7 @@ impl CacheZone {
             zone_size: conf.size,
             managed: AtomicBool::new(false),
             retired: AtomicBool::new(false),
+            counters: Default::default(),
         }
     }
 
@@ -556,27 +576,43 @@ impl CacheZone {
     /// Write the response to a temporary file next to the cache and rename
     /// it into place, as nginx does with `use_temp_path=off`.
     pub fn store(&self, hash: &CacheHash, entry: &EntryParts<'_>) -> std::io::Result<()> {
-        let path = self.file_path(hash);
+        self.fill(hash, entry)?.finish()
+    }
+
+    /// Start writing a response whose body is still coming (nginx's
+    /// cacheable pipe, #463): the temp file gets the header and
+    /// `entry.body`, `CacheFill::write` the rest.
+    pub fn fill(&self, hash: &CacheHash, entry: &EntryParts<'_>) -> std::io::Result<CacheFill<'_>> {
         let seq = self.temp_seq.fetch_add(1, Ordering::Relaxed);
         let temp = self
             .path
             .join(format!(".tmp-{}-{seq:010}", std::process::id()));
-        let written = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            entry.write_to(&mut file)?;
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::rename(&temp, &path)
-        })();
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&temp);
-            return Err(e);
-        }
-        let fs_size = entry.len();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let mut fill = CacheFill {
+            zone: self,
+            hash: *hash,
+            temp,
+            file: None,
+            valid_sec: entry.valid_sec,
+            updating_sec: entry.updating_sec,
+            error_sec: entry.error_sec,
+            header_len: entry.len() - entry.body.len() as u64,
+            body_len: entry.body.len() as u64,
+            lock: None,
+        };
+        // On an error, dropping `fill` removes the temp file.
+        entry.write_to(&mut file)?;
+        fill.file = Some(file);
+        Ok(fill)
+    }
+
+    /// A file renamed into place: the index counts it, and `max_size`
+    /// evicts others for it.
+    fn stored(&self, hash: &CacheHash, fill: &CacheFill<'_>) {
+        let fs_size = fill.header_len + fill.body_len;
         let mut freed = Vec::new();
         {
             let mut shard = self.lock(hash);
@@ -589,9 +625,9 @@ impl CacheZone {
                 }
                 node.exists = true;
                 node.error = 0;
-                node.valid_sec = entry.valid_sec;
-                node.updating_sec = entry.updating_sec;
-                node.error_sec = entry.error_sec;
+                node.valid_sec = fill.valid_sec;
+                node.updating_sec = fill.updating_sec;
+                node.error_sec = fill.error_sec;
                 node.fs_size = fs_size;
                 self.size.fetch_add(fs_size, Ordering::Relaxed);
             }
@@ -612,7 +648,6 @@ impl CacheZone {
             }
         }
         self.delete_files(freed);
-        Ok(())
     }
 
     /// One pass of nginx's cache manager (ngx_http_file_cache_expire and
@@ -816,6 +851,8 @@ const MAGIC: &[u8; 4] = b"RXC1";
 /// Magic, valid_sec, updating_sec, error_sec, the key's, Vary's and the
 /// head's lengths, the body's length.
 const FIXED: usize = 4 + 8 + 8 + 8 + 4 + 4 + 4 + 8;
+/// Where the body's length is in the fixed header.
+const BODY_LEN_AT: u64 = 4 + 8 + 8 + 8 + 4 + 4 + 4;
 
 /// A response to store.
 pub struct EntryParts<'a> {
@@ -854,6 +891,82 @@ impl EntryParts<'_> {
         file.write_all(&fixed)?;
         file.write_all(self.head)?;
         file.write_all(self.body)
+    }
+}
+
+/// A response on its way into the cache: its temp file, written as the
+/// body is relayed; `finish` puts it in place. Dropped unfinished (the
+/// upstream failed, or the client went away and nothing reads on), the
+/// temp file goes, as ngx_http_file_cache_free deletes it.
+pub struct CacheFill<'z> {
+    zone: &'z CacheZone,
+    /// Where the file goes.
+    hash: CacheHash,
+    /// Empty once renamed into place.
+    temp: PathBuf,
+    /// `None` once a write failed: the entry isn't stored.
+    file: Option<std::fs::File>,
+    valid_sec: i64,
+    updating_sec: i64,
+    error_sec: i64,
+    /// The file's bytes before the body.
+    header_len: u64,
+    body_len: u64,
+    /// The update lock (`proxy_cache_lock`, a stale entry's update), held
+    /// until the file is in place: the lookup hash and the token.
+    lock: Option<(CacheHash, u64)>,
+}
+
+impl CacheFill<'_> {
+    /// Hold the zone's lock for `hash` until the fill ends.
+    pub fn hold_lock(&mut self, hash: CacheHash, token: u64) {
+        self.lock = Some((hash, token));
+    }
+
+    /// The file is still being written.
+    pub fn writing(&self) -> bool {
+        self.file.is_some()
+    }
+
+    #[inline(never)]
+    pub fn write(&mut self, body: &[u8]) {
+        if let Some(file) = &mut self.file {
+            if file.write_all(body).is_ok() {
+                self.body_len += body.len() as u64;
+            } else {
+                self.file = None;
+            }
+        }
+    }
+
+    /// The body is complete: its length into the header, the file into
+    /// place.
+    pub fn finish(mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let Some(file) = self.file.take() else {
+            return Err(std::io::ErrorKind::Other.into());
+        };
+        file.write_all_at(&self.body_len.to_le_bytes(), BODY_LEN_AT)?;
+        drop(file);
+        let path = self.zone.file_path(&self.hash);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::rename(&self.temp, &path)?;
+        self.temp = PathBuf::new();
+        self.zone.stored(&self.hash, &self);
+        Ok(())
+    }
+}
+
+impl Drop for CacheFill<'_> {
+    fn drop(&mut self) {
+        if !self.temp.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.temp);
+        }
+        if let Some((hash, token)) = self.lock {
+            self.zone.release(&hash, token);
+        }
     }
 }
 

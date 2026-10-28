@@ -39,7 +39,10 @@ fn conf(tag: &str, listen: &str) -> (PathBuf, u16) {
 }
 
 fn start(path: &Path) -> Server {
-    let pid_file = path.with_file_name("ruxen.pid");
+    start_with_pid(path, &path.with_file_name("ruxen.pid"))
+}
+
+fn start_with_pid(path: &Path, pid_file: &Path) -> Server {
     // Owned by `Server` before the wait: if it panics, ruxen still stops.
     let mut server = Server(
         Command::new(env!("CARGO_BIN_EXE_ruxen"))
@@ -51,7 +54,7 @@ fn start(path: &Path) -> Server {
             .spawn()
             .unwrap(),
     );
-    common::ports::wait_for_pid_file(&mut server.0, &pid_file, Duration::from_secs(5));
+    common::ports::wait_for_pid_file(&mut server.0, pid_file, Duration::from_secs(5));
     server
 }
 
@@ -94,22 +97,18 @@ fn m95_second_instance_fails_with_address_in_use() {
 
 #[test]
 fn m95_reuseport_lets_a_second_instance_share_the_port() {
-    // Held until the first instance listens, as above.
-    let setup = common::ports::setup_lock();
-    let (path, _port) = conf("reuseport", " reuseport");
-    let _first = start(&path);
-    drop(setup);
-    let mut second = Server(
-        Command::new(env!("CARGO_BIN_EXE_ruxen"))
-            .args(["-c", path.to_str().unwrap()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        second.0.try_wait().unwrap().is_none(),
-        "the second instance exited"
-    );
+    // `reuseport` alone, and with another socket option (#761).
+    for (tag, listen) in [
+        ("reuseport", " reuseport"),
+        ("reuseport-backlog", " reuseport backlog=511"),
+    ] {
+        // Held until the first instance listens, as above.
+        let setup = common::ports::setup_lock();
+        let (path, _port) = conf(tag, listen);
+        let _first = start(&path);
+        drop(setup);
+        // The pid file appears once the second instance has bound; a
+        // refused bind ends in `still could not bind()` within 2.5 s.
+        let _second = start_with_pid(&path, &path.with_file_name("second.pid"));
+    }
 }

@@ -579,6 +579,8 @@ pub struct HttpConfig {
     /// `stub_status` or a `$connections_*` variable appears in the config:
     /// the counters are kept.
     pub uses_stats: bool,
+    /// A location uses `ruxen_metrics` (#481).
+    pub uses_metrics: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,
@@ -733,8 +735,8 @@ pub struct Listen {
     /// Parsed-but-not-honored at routing time yet; first declaration wins
     /// today (nginx default behavior is the same when no flag is set).
     pub default_server: bool,
-    /// `reuseport` — set `SO_REUSEPORT` per-listener. Already implicit in the
-    /// thread-per-core design; presence is a parse-time noop.
+    /// `reuseport`: other processes may share the address (workers always
+    /// bind with `SO_REUSEPORT`; without it startup claims the address).
     pub reuseport: bool,
     /// `http2`: HTTP/2 on this address, the nginx 1.24 spelling of
     /// `http2 on` (#144).
@@ -799,6 +801,7 @@ impl Listen {
     /// server (nginx's "duplicate listen options" check).
     pub(crate) fn has_socket_options(&self) -> bool {
         self.deferred
+            || self.reuseport
             || self.fastopen.is_some()
             || self.backlog.is_some()
             || self.rcvbuf.is_some()
@@ -2907,6 +2910,8 @@ pub enum Handler {
     Proxy(ProxyPass),
     /// `stub_status;` — the connection and request counters (#96).
     StubStatus,
+    /// `ruxen_metrics;` — the counters in Prometheus text format (#481).
+    Metrics,
 }
 
 /// Parsed `proxy_pass` argument. nginx allows two forms:

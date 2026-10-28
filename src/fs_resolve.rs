@@ -25,7 +25,7 @@ use crate::phase::RerouteTarget;
 use crate::worker::{
     Prebuilt, PreparedFallback, PreparedGzipStatic, PreparedIndexEntry, PreparedPathMapping,
     PreparedProbe, PreparedRoot, PreparedSymlinkFrom, PreparedSymlinks, PreparedTryFiles,
-    RenderCtx, render_parts,
+    RenderCtx, RootTemplate, render_parts,
 };
 
 /// A file successfully opened under the server root, with its metadata
@@ -86,7 +86,66 @@ pub enum Outcome {
 /// apply the configured fallback.
 /// `http_11`: for `gzip_http_version` under `gzip_static`.
 pub fn resolve(
-    root: &'static PreparedRoot,
+    root: &'static PreparedRoot<'static>,
+    url_path: &[u8],
+    render_ctx: &RenderCtx<'_>,
+    http_11: bool,
+) -> Outcome {
+    if let Some(template) = root.template {
+        return resolve_rendered(root, template, url_path, render_ctx, http_11);
+    }
+    resolve_under(root, url_path, render_ctx, http_11)
+}
+
+/// `resolve` for a `root` / `alias` with variables (#232): rendered as
+/// nginx's ngx_http_map_uri_to_path does, then opened as this request's
+/// anchor, beneath which the URI resolves as under a literal root.
+#[cold]
+#[inline(never)]
+fn resolve_rendered(
+    root: &PreparedRoot<'static>,
+    template: &RootTemplate,
+    url_path: &[u8],
+    render_ctx: &RenderCtx<'_>,
+    http_11: bool,
+) -> Outcome {
+    let path = template.render(render_ctx);
+    if template.is_unsafe(&path) {
+        note_failed_lookup(
+            format!(
+                "unsafe path \"{}\" from variables",
+                String::from_utf8_lossy(path.as_os_str().as_bytes())
+            ),
+            false,
+        );
+        return Outcome::Forbidden;
+    }
+    // O_NONBLOCK: a regex `alias` names the file itself, which may be a
+    // FIFO (READ_FLAGS).
+    let anchor = with_c_path(path.as_os_str().as_bytes(), |c| unsafe {
+        libc::open(c, READ_FLAGS | libc::O_CLOEXEC)
+    })
+    .and_then(|fd| {
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    });
+    // Its error is reported where the anchor is needed (`PreparedRoot::fd`).
+    let root_fd = match &anchor {
+        Ok(fd) => fd.as_raw_fd(),
+        Err(e) => -1 - e.raw_os_error().unwrap_or(libc::EIO),
+    };
+    let rendered = PreparedRoot {
+        root: &path,
+        root_fd,
+        ..*root
+    };
+    resolve_under(&rendered, url_path, render_ctx, http_11)
+}
+
+fn resolve_under(
+    root: &PreparedRoot<'_>,
     url_path: &[u8],
     render_ctx: &RenderCtx<'_>,
     http_11: bool,
@@ -285,6 +344,30 @@ fn open_failed(root: &PreparedRoot, rel: &[u8], e: std::io::Error) -> Outcome {
     io_to_outcome(e)
 }
 
+/// nginx's index module, testing the directory: the line names the first
+/// index file (ngx_http_index_test_dir restores the cut path). Only the
+/// first entry can have got here: an absolute one redirects.
+#[cold]
+fn index_dir_failed(
+    root: &PreparedRoot,
+    fs_path: &Path,
+    render_ctx: &RenderCtx<'_>,
+    e: &std::io::Error,
+) {
+    let mut path = fs_path.to_path_buf();
+    if let Some(name) = root.index.first() {
+        path.push(std::ffi::OsStr::from_bytes(&render_index(name, render_ctx)));
+    }
+    note_failed_lookup(
+        format!(
+            "\"{}\" is not found ({})",
+            path.display(),
+            crate::worker::errno_text(e)
+        ),
+        is_not_found(e),
+    );
+}
+
 /// The static+index half. Looks up `<root><url>`, deals with the four
 /// shapes a request can take: file, directory-with-slash, directory-no-
 /// slash, missing.
@@ -358,15 +441,7 @@ fn resolve_static(
             }
             Ok(_) => return Outcome::NotFound,
             Err(e) => {
-                // nginx's index module, testing the directory.
-                note_failed_lookup(
-                    format!(
-                        "\"{}\" is not found ({})",
-                        fs_path.display(),
-                        crate::worker::errno_text(&e)
-                    ),
-                    is_not_found(&e),
-                );
+                index_dir_failed(root, &fs_path, render_ctx, &e);
                 return io_to_outcome(e);
             }
         }
@@ -970,7 +1045,11 @@ fn relative_uri_path_for_try_files_probe<'a>(root: &PreparedRoot, probe_uri: &'a
 }
 
 /// `$request_filename`: `uri` under a location's root or alias.
-pub(crate) fn request_filename(doc_root: &crate::worker::DocRoot, uri: &[u8]) -> PathBuf {
+pub(crate) fn request_filename(
+    doc_root: &crate::worker::DocRoot,
+    path: &Path,
+    uri: &[u8],
+) -> PathBuf {
     let rel = match doc_root.mapping {
         PreparedPathMapping::Root => trim_leading_slashes(uri),
         PreparedPathMapping::AliasPrefix { prefix } => {
@@ -978,7 +1057,7 @@ pub(crate) fn request_filename(doc_root: &crate::worker::DocRoot, uri: &[u8]) ->
         }
         PreparedPathMapping::AliasRegex => b"",
     };
-    join(doc_root.path, rel)
+    join(path, rel)
 }
 
 fn map_uri_for_static(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -> PathBuf {
@@ -1079,7 +1158,7 @@ mod tests {
 
     use super::*;
 
-    fn fake_root(mapping: PreparedPathMapping) -> PreparedRoot {
+    fn fake_root(mapping: PreparedPathMapping) -> PreparedRoot<'static> {
         PreparedRoot {
             root: Path::new("/srv"),
             types: crate::arena::leak(Box::new(crate::worker::PreparedTypes {
@@ -1090,6 +1169,7 @@ mod tests {
             // `AT_FDCWD` is fine for tests that only exercise the path
             // utilities below — none of them hit `openat2`.
             root_fd: libc::AT_FDCWD,
+            template: None,
             symlinks: PreparedSymlinks::new(None),
             path_mapping: mapping,
             index: &[],

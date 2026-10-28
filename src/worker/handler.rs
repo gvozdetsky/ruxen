@@ -556,7 +556,8 @@ fn cache_plan(
     }
     // ngx_http_upstream_cache_check_range: a range from too far into the
     // response isn't worth fetching it whole for the cache; it goes
-    // upstream as asked, and nothing is stored.
+    // upstream as asked, and nothing is stored. A `proxy_cache_lock` taken
+    // stays with the request, released when it ends, as nginx's (#864).
     if hit.is_none()
         && cacheable
         && let Some(max) = conf.max_range_offset
@@ -565,7 +566,6 @@ fn cache_plan(
     {
         cacheable = false;
         store = false;
-        token = None;
     }
     Ok(Some(Box::new(CachePlan {
         conf,
@@ -971,8 +971,8 @@ pub(crate) fn run_location_handler(
         } else if request_path.is_empty() {
             if rewrite_state.unparsed_uri && current_args.is_none() && req.path.starts_with(b"/") {
                 // Unchanged: the client's own request target (nginx's
-                // `r->unparsed_uri`).
-                req.path
+                // `r->unparsed_uri`), `#fragment` included.
+                phase::unparsed_uri(req.path, req.request_line)
             } else {
                 let mut buf = Vec::with_capacity(url_path.len() + 1 + args.len());
                 write_upstream_path(url_path, escape(), &mut buf);
@@ -1305,10 +1305,6 @@ pub(crate) fn run_location_handler(
             error_page_status,
             intercept,
             upgrade: client_upgrade,
-            // A response the range filter may cut is read whole (#370).
-            stream: cache.is_none()
-                && loc.add_trailers.is_empty()
-                && !(force_ranges && req.range.is_some()),
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
             cache,
@@ -1353,6 +1349,19 @@ pub(crate) fn run_location_handler(
                 super::stats::status_text().len(),
                 server_bytes,
             )),
+            _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
+        },
+        // As `stub_status`: GET and HEAD.
+        PreparedHandler::Metrics => match (req.method, http.metrics) {
+            (Method::Get | Method::Head, Some(m)) => {
+                Response::Owned(http::build_response_bytes_with_content_type(
+                    200,
+                    super::metrics::render(m).as_bytes(),
+                    b"text/plain; version=0.0.4; charset=utf-8",
+                    req.method,
+                    server_bytes,
+                ))
+            }
             _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
         },
         // Static-file mapping follows the configured path mode:
@@ -1588,61 +1597,49 @@ pub(crate) fn run_location_handler(
                             ))
                         }
                     },
-                    AutoindexFormat::Json => {
-                        match autoindex::render_json(&dir_path, autoindex::JsonMode::Json) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"application/json",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex json render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                        }
-                    }
-                    AutoindexFormat::Jsonp => {
-                        match autoindex::render_json(
-                            &dir_path,
-                            autoindex::JsonMode::Jsonp {
-                                args: render_ctx_base.args,
+                    AutoindexFormat::Json | AutoindexFormat::Jsonp => {
+                        let callback = if format == AutoindexFormat::Jsonp {
+                            autoindex::jsonp_callback(render_ctx_base.args)
+                        } else {
+                            Ok(&[][..])
+                        };
+                        match callback {
+                            Err(()) => Response::Owned(http::error_response_for_method(
+                                400,
+                                "Bad Request\n",
+                                req.method,
+                                server_bytes,
+                            )),
+                            Ok(callback) => match autoindex::render_json(&dir_path, callback) {
+                                // ngx_http_autoindex_handler: JSONP only with a callback.
+                                Ok(body) => {
+                                    let content_type: &[u8] = if callback.is_empty() {
+                                        b"application/json"
+                                    } else {
+                                        b"application/javascript"
+                                    };
+                                    Response::Owned(http::build_response_bytes_with_content_type(
+                                        200,
+                                        &body,
+                                        content_type,
+                                        req.method,
+                                        server_bytes,
+                                    ))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ruxen: autoindex json render failed for {} (uri={}): {e}",
+                                        dir_path.display(),
+                                        String::from_utf8_lossy(&uri)
+                                    );
+                                    Response::Owned(http::error_response_for_method(
+                                        500,
+                                        "Internal Server Error\n",
+                                        req.method,
+                                        server_bytes,
+                                    ))
+                                }
                             },
-                        ) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"application/json",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex jsonp render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
                         }
                     }
                 },
