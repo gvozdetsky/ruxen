@@ -1351,6 +1351,19 @@ pub(crate) fn run_location_handler(
             )),
             _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
         },
+        // As `stub_status`: GET and HEAD.
+        PreparedHandler::Metrics => match (req.method, http.metrics) {
+            (Method::Get | Method::Head, Some(m)) => {
+                Response::Owned(http::build_response_bytes_with_content_type(
+                    200,
+                    super::metrics::render(m).as_bytes(),
+                    b"text/plain; version=0.0.4; charset=utf-8",
+                    req.method,
+                    server_bytes,
+                ))
+            }
+            _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
+        },
         // Static-file mapping follows the configured path mode:
         // `root` appends the whole normalized URI, while `alias` strips the
         // matched location prefix first. `PreparedRoot` carries that choice.

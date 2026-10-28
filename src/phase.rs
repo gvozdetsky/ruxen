@@ -287,6 +287,8 @@ pub struct ProcessMeta {
     pub log: LogMeta,
     /// `$server_port` for access-log rendering on this request.
     pub server_port: u16,
+    /// The server's metrics slot (`PreparedServer::metrics_slot`).
+    pub metrics_server: u32,
     /// `access_log` sinks for the matched location (or server scope if no
     /// location matched). The worker uses this list — not `PreparedHttp::
     /// access_logs` — so location-scope `access_log` directives fire
@@ -403,6 +405,7 @@ impl Default for ProcessMeta {
             keepalive: KeepaliveMeta::default(),
             log: LogMeta::default(),
             server_port: 0,
+            metrics_server: 0,
             access_logs: &[],
             limit_req_delay_ms: 0,
             limit_conn_held: None,
@@ -456,6 +459,7 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
             log_not_found: server.log_not_found,
         },
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
@@ -977,6 +981,7 @@ fn process_with_meta_inner(
     }
     let mut meta = ProcessMeta {
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
         ..ProcessMeta::default()
     };
