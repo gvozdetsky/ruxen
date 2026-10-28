@@ -109,12 +109,16 @@ jobs:
             "$bin" -t -c "$PWD/$conf"
           done
 
+      # Binary, README, LICENSE, NOTICE, examples/ and the contrib/ files
+      # the README's "Run as a service" uses (#554); fails if a relative
+      # README link doesn't resolve in the tarball. The README's links to
+      # source-tree docs point at GitHub, at the tag (the commit on a
+      # manual run).
       - name: Package
         run: |
           dist=${{ steps.version.outputs.dist }}
-          mkdir -p "$dist/examples"
-          cp target/${{ matrix.target }}/release/ruxen README.md LICENSE NOTICE "$dist/"
-          cp examples/*.conf examples/mime.types "$dist/examples/"
+          scripts/package.sh target/${{ matrix.target }}/release/ruxen "$dist" \
+            "${{ github.ref_type == 'tag' && github.ref_name || github.sha }}"
           tar czf "$dist.tar.gz" "$dist"
           # The same tarball under a version-less name, so
           # releases/latest/download/ruxen-<target>.tar.gz (the README's
