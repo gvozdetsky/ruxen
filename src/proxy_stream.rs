@@ -150,6 +150,11 @@ pub struct RelayEnd {
 const RELAY_BUF: usize = 64 * 1024;
 const RELAY_POOL_LIMIT: usize = 32;
 
+/// How long in all a relay waits on a client while memory is full before
+/// the rest goes to the temp file. One that keeps up takes it from memory:
+/// spilled at once, proxy_1m ran at 62% (ABBA on #834).
+const SPILL_AFTER: Duration = Duration::from_millis(100);
+
 thread_local! {
     // Relay buffers have a pool of their own: back in the proxy's pool, one
     // would become the next header read's buffer, which then takes a whole
@@ -474,6 +479,9 @@ struct Pipe<'t> {
     reader_done: Cell<bool>,
     /// The client is gone: the reader stops.
     stop: Cell<bool>,
+    /// The client stalled (`SPILL_AFTER`): past memory, reads go to the
+    /// temp file.
+    spilling: Cell<bool>,
     /// Bumped on each change the other side may wait for.
     generation: Cell<u32>,
     sent: Cell<u64>,
@@ -504,6 +512,7 @@ impl<'t> Pipe<'t> {
             writing: Cell::new(false),
             reader_done: Cell::new(false),
             stop: Cell::new(false),
+            spilling: Cell::new(false),
             generation: Cell::new(0),
             sent: Cell::new(0),
             upstream_read: Cell::new(0),
@@ -515,15 +524,22 @@ impl<'t> Pipe<'t> {
         self.generation.set(self.generation.get().wrapping_add(1));
     }
 
-    /// Whether the reader may read on. Unbuffered, only once the client
-    /// has the last read.
+    /// Whether the reader may read on now. Unbuffered, only once the
+    /// client has the last read.
     fn room(&self) -> bool {
         let Some(b) = self.buffering else {
             return self.segs.borrow().is_empty() && !self.writing.get();
         };
-        if self.mem.get() < b.mem {
-            return true;
-        }
+        self.mem.get() < b.mem || (self.spilling.get() && self.file_room(b))
+    }
+
+    /// Memory is full, and the temp file could take more.
+    fn file_room_only(&self) -> bool {
+        self.buffering
+            .is_some_and(|b| self.mem.get() >= b.mem && self.file_room(b))
+    }
+
+    fn file_room(&self, b: Buffering) -> bool {
         let spill = self.spill.borrow();
         !spill.off && spill.write < b.max_temp_file_size
     }
@@ -792,15 +808,31 @@ async fn read_side(
     mut rd: BodyReader,
     pipe: &Pipe<'_>,
 ) -> (Box<ProxyStream>, ReadEnd) {
+    // Time spent waiting on a full memory, to `SPILL_AFTER`.
+    let mut stalled = Duration::ZERO;
     loop {
-        std::future::poll_fn(|_| {
+        let mut stall: Option<(Instant, std::pin::Pin<Box<monoio::time::Sleep>>)> = None;
+        std::future::poll_fn(|cx| {
             if pipe.stop.get() || pipe.room() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
+                return Poll::Ready(());
             }
+            if !pipe.file_room_only() {
+                return Poll::Pending;
+            }
+            let (_, timer) = stall.get_or_insert_with(|| {
+                let left = SPILL_AFTER.saturating_sub(stalled);
+                (Instant::now(), Box::pin(monoio::time::sleep(left)))
+            });
+            if timer.as_mut().poll(cx).is_ready() {
+                pipe.spilling.set(true);
+                return Poll::Ready(());
+            }
+            Poll::Pending
         })
         .await;
+        if let Some((since, _)) = stall {
+            stalled += since.elapsed();
+        }
         if pipe.stop.get() {
             break;
         }
