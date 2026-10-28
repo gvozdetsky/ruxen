@@ -384,3 +384,55 @@ fn m100_a_refused_body_goes_upstream_empty() {
     let out = responses(&mut s, 1);
     assert!(out[0].ends_with("| got 0 of 0"), "{out:?}");
 }
+
+/// What answers before a location (a server-level `return`, a bad target,
+/// a missing Host) and `try_files` to a file (also via an SPA's `@router`)
+/// answer before the body has come, as nginx discards it (#776); a
+/// `try_files` that ends in a proxy still sends the body upstream.
+#[test]
+fn m100_unrouted_answers_and_try_files_come_before_the_body() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with("unrouted", |dir, _| {
+        let html = dir.join("html");
+        std::fs::create_dir_all(&html).unwrap();
+        std::fs::write(html.join("index.html"), "index").unwrap();
+        format!(
+            "root {html};\n\
+             if ($http_x_redirect) {{ return 301 https://example.com/; }}\n\
+             location / {{ try_files $uri $uri/ @router; }}\n\
+             location @router {{ rewrite ^ /index.html last; }}\n\
+             location /p/ {{ try_files $uri @up; }}\n\
+             location @up {{ proxy_pass http://127.0.0.1:{upstream}; }}",
+            html = html.display()
+        )
+    });
+    let first = |head: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(format!("{head}Content-Length: 10\r\n\r\nabc").as_bytes())
+            .unwrap();
+        let out = responses(&mut s, 1).remove(0);
+        (s, out)
+    };
+    let (_, out) = first("POST /x HTTP/1.1\r\nHost: x\r\nX-Redirect: 1\r\n");
+    assert!(out.starts_with("HTTP/1.1 301 "), "{out}");
+    let (_, out) = first("GET /%4 HTTP/1.1\r\nHost: x\r\n");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    let (_, out) = first("GET / HTTP/1.1\r\n");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    let (mut s, out) = first("GET /missing HTTP/1.1\r\nHost: x\r\n");
+    assert_eq!(out, "HTTP/1.1 200 OK | index");
+    s.write_all(b"defghijGET /index.html HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    assert_eq!(
+        responses(&mut s, 1),
+        ["HTTP/1.1 200 OK | index".to_string()]
+    );
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"POST /p/none HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+        .unwrap();
+    let out = responses(&mut s, 1);
+    assert!(out[0].ends_with("| got 5 of 5"), "{out:?}");
+}

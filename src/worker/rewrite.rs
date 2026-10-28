@@ -597,7 +597,8 @@ pub(crate) fn execute_rewrite_ops(
 /// The server-level rewrite program, nginx's SERVER_REWRITE phase: it
 /// runs before the location is searched, so a server-level `return`
 /// answers every request. `break` and `rewrite … last` end it; the
-/// location search follows either way.
+/// location search follows either way. With the answer, whether it is
+/// "finalized" (a `return` without text, or a redirect).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_server_rewrite(
     http: &'static PreparedHttp,
@@ -607,7 +608,7 @@ pub(crate) fn run_server_rewrite(
     current_args: &mut Option<Vec<u8>>,
     rewrite_state: &mut RewriteState,
     server_name_captures: Option<&phase::ServerNameCaptures>,
-) -> Option<Response> {
+) -> Option<(Response, bool)> {
     match execute_rewrite_ops(
         server.rewrite_program,
         http,
@@ -620,7 +621,7 @@ pub(crate) fn run_server_rewrite(
         rewrite_state,
         server_name_captures,
     ) {
-        RewriteControl::Respond(response, _) => Some(response),
+        RewriteControl::Respond(response, finalized) => Some((response, finalized)),
         RewriteControl::Continue | RewriteControl::Stop | RewriteControl::Reroute => {
             // The location is found with the URI this left
             // (ngx_http_core_find_config_phase clears `uri_changed`, #682).
