@@ -40,6 +40,14 @@ impl UpstreamIo {
         }
     }
 
+    /// `read` for a relayed body: on plain TCP, `recv_now` (#757).
+    pub async fn read_now<T: IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
+        match self {
+            UpstreamIo::Plain(s) => crate::worker::recv_now(s, buf).await,
+            UpstreamIo::Tls(s) => s.stream.read(buf).await,
+        }
+    }
+
     /// The two directions of a tunnel after a 101 (#87): TCP splits as
     /// monoio splits it; TLS is shared by both, which `begin_tunnel` makes
     /// safe (a read no longer writes to the socket).

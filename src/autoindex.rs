@@ -3,11 +3,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-pub enum JsonMode<'a> {
-    Json,
-    Jsonp { args: &'a [u8] },
-}
-
 pub fn render_html(
     dir_path: &Path,
     uri: &[u8],
@@ -81,7 +76,8 @@ pub fn render_xml(dir_path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-pub fn render_json(dir_path: &Path, mode: JsonMode<'_>) -> std::io::Result<Vec<u8>> {
+/// A non-empty `callback` wraps the array in `callback(…);` (JSONP).
+pub fn render_json(dir_path: &Path, callback: &[u8]) -> std::io::Result<Vec<u8>> {
     let entries = read_sorted_entries(dir_path)?;
     let mut array = Vec::with_capacity(2048);
     array.extend_from_slice(b"[");
@@ -115,23 +111,31 @@ pub fn render_json(dir_path: &Path, mode: JsonMode<'_>) -> std::io::Result<Vec<u
     }
     array.extend_from_slice(b"]");
 
-    match mode {
-        JsonMode::Json => Ok(array),
-        JsonMode::Jsonp { args } => {
-            let callback = query_arg(args, b"callback").and_then(percent_decode);
-            if let Some(cb) = callback
-                && !cb.is_empty()
-            {
-                let mut out = Vec::with_capacity(cb.len() + array.len() + 8);
-                out.extend_from_slice(&cb);
-                out.extend_from_slice(b"(");
-                out.extend_from_slice(&array);
-                out.extend_from_slice(b");");
-                return Ok(out);
-            }
-            Ok(array)
-        }
+    if callback.is_empty() {
+        return Ok(array);
     }
+    let mut out = Vec::with_capacity(callback.len() + array.len() + 3);
+    out.extend_from_slice(callback);
+    out.extend_from_slice(b"(");
+    out.extend_from_slice(&array);
+    out.extend_from_slice(b");");
+    Ok(out)
+}
+
+/// The `callback` argument as sent (empty if absent); `Err` for a name
+/// nginx answers 400 to (ngx_http_autoindex_jsonp_callback).
+pub fn jsonp_callback(args: &[u8]) -> Result<&[u8], ()> {
+    let Some(cb) = query_arg(args, b"callback") else {
+        return Ok(&[]);
+    };
+    if cb.len() > 128
+        || !cb
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.')
+    {
+        return Err(());
+    }
+    Ok(cb)
 }
 
 struct Entry {
@@ -409,40 +413,12 @@ fn query_arg<'a>(args: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
             Some(i) => (&pair[..i], &pair[i + 1..]),
             None => (pair, &[][..]),
         };
-        if k == key {
+        // ngx_http_arg: the name matches whatever its case.
+        if k.eq_ignore_ascii_case(key) {
             return Some(v);
         }
     }
     None
-}
-
-fn percent_decode(raw: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0usize;
-    while i < raw.len() {
-        if raw[i] == b'%' {
-            if i + 2 >= raw.len() {
-                return None;
-            }
-            let hi = hex_nibble(raw[i + 1])?;
-            let lo = hex_nibble(raw[i + 2])?;
-            out.push((hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        out.push(raw[i]);
-        i += 1;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(10 + b - b'a'),
-        b'A'..=b'F' => Some(10 + b - b'A'),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

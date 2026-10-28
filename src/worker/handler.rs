@@ -1580,61 +1580,49 @@ pub(crate) fn run_location_handler(
                             ))
                         }
                     },
-                    AutoindexFormat::Json => {
-                        match autoindex::render_json(&dir_path, autoindex::JsonMode::Json) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"application/json",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex json render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                        }
-                    }
-                    AutoindexFormat::Jsonp => {
-                        match autoindex::render_json(
-                            &dir_path,
-                            autoindex::JsonMode::Jsonp {
-                                args: render_ctx_base.args,
+                    AutoindexFormat::Json | AutoindexFormat::Jsonp => {
+                        let callback = if format == AutoindexFormat::Jsonp {
+                            autoindex::jsonp_callback(render_ctx_base.args)
+                        } else {
+                            Ok(&[][..])
+                        };
+                        match callback {
+                            Err(()) => Response::Owned(http::error_response_for_method(
+                                400,
+                                "Bad Request\n",
+                                req.method,
+                                server_bytes,
+                            )),
+                            Ok(callback) => match autoindex::render_json(&dir_path, callback) {
+                                // ngx_http_autoindex_handler: JSONP only with a callback.
+                                Ok(body) => {
+                                    let content_type: &[u8] = if callback.is_empty() {
+                                        b"application/json"
+                                    } else {
+                                        b"application/javascript"
+                                    };
+                                    Response::Owned(http::build_response_bytes_with_content_type(
+                                        200,
+                                        &body,
+                                        content_type,
+                                        req.method,
+                                        server_bytes,
+                                    ))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ruxen: autoindex json render failed for {} (uri={}): {e}",
+                                        dir_path.display(),
+                                        String::from_utf8_lossy(&uri)
+                                    );
+                                    Response::Owned(http::error_response_for_method(
+                                        500,
+                                        "Internal Server Error\n",
+                                        req.method,
+                                        server_bytes,
+                                    ))
+                                }
                             },
-                        ) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"application/json",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex jsonp render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
                         }
                     }
                 },
