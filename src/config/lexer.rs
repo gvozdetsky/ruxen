@@ -178,6 +178,7 @@ impl Lexer {
                 path: resolved.display().to_string(),
                 reason: format!("{e}"),
             })?;
+            crate::privileges::note_read(&resolved);
             let name = Some(std::rc::Rc::from(resolved.display().to_string()));
             let canonical = resolved.canonicalize().unwrap_or(resolved);
             let contents = String::from_utf8_lossy(&bytes).into_owned();

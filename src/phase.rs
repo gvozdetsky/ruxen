@@ -497,6 +497,74 @@ fn refuse(
     (response, meta)
 }
 
+/// A request target that doesn't normalise: nginx refuses it while
+/// reading the request line, with the default server's configuration
+/// (its `error_page`, `add_header … always`, #779). A 400 ends the
+/// connection.
+#[cold]
+#[inline(never)]
+fn bad_uri(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+    response: Response,
+) -> (Response, ProcessMeta) {
+    let server = &listen.servers[listen.default_server];
+    crate::worker::write_error_log(
+        server.error_logs,
+        crate::config::ErrorLogLevel::Info,
+        // Before the headers: no host in the line.
+        &crate::worker::ErrorLogRequest::new(
+            &RequestCtx {
+                headers_raw: b"",
+                ..*req
+            },
+            server.primary_server_name,
+        ),
+        b"client sent invalid request while reading client request line",
+        None,
+    );
+    // A target that isn't a path (`*`, `x`) fails nginx's request-line
+    // parse, before `$request_method` and `$request` are set.
+    let unparsed;
+    let req = if req.path.first() == Some(&b'/') {
+        req
+    } else {
+        unparsed = RequestCtx {
+            method_bytes: b"",
+            request_line: b"",
+            path: b"",
+            ..*req
+        };
+        &unparsed
+    };
+    let (response, mut meta) = refuse(http, req, url_scratch, server, response, true, false, None);
+    // No `$uri` for the log, unless an error page gave it one.
+    meta.invalid_uri |= !server.error_pages.iter().any(|p| p.status == 400);
+    (response, meta)
+}
+
+/// A refusal for the headers comes after the request target's, as nginx
+/// checks the target while it reads the request line (#807): only on the
+/// way to such a refusal is the target checked here first.
+#[cold]
+#[inline(never)]
+fn bad_target_first(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+) -> Option<(Response, ProcessMeta)> {
+    // CONNECT's target is an authority, not a path.
+    if req.method == Method::Connect {
+        return None;
+    }
+    url_scratch.clear();
+    let bad = normalize_request_uri_into(http, req, false, url_scratch).err()?;
+    Some(bad_uri(http, req, url_scratch, listen, bad))
+}
+
 /// The server's charset on what it answers before a location (#464);
 /// a location's answers get theirs from its DocRoot in the worker.
 #[cold]
@@ -730,6 +798,10 @@ fn process_with_meta_inner(
     // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
     // — empty Host is treated as "default server".
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
+        if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+            return out;
+        }
+        url_scratch.clear();
         let server = &listen.servers[listen.default_server];
         // Not past an invalid one, logged already.
         if req.refuse.is_none() {
@@ -743,6 +815,10 @@ fn process_with_meta_inner(
 
     if refusing {
         if let Some(status) = req.refuse {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 501 => &http.not_implemented,
                 // nginx's 497: plain HTTP on an `ssl` port, sent as 400
@@ -771,6 +847,10 @@ fn process_with_meta_inner(
             && let Some(tls) = req.tls
             && let Some((status, close)) = client_certificate_refusal(listen, server, req, tls)
         {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 421 => &http.misdirected,
                 495 => &http.cert_error,
@@ -781,6 +861,10 @@ fn process_with_meta_inner(
             return refuse(http, req, url_scratch, server, response, close, false, code);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             if req.method == Method::Trace
                 && crate::worker::test_panic() == crate::worker::TestPanic::Trace
             {
@@ -821,10 +905,7 @@ fn process_with_meta_inner(
             if let Err(resp) =
                 normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
             {
-                // A 400 ends the connection, as nginx's does.
-                let mut meta = refused_meta(server, true);
-                meta.keepalive.allow = false;
-                return (resp, meta);
+                return bad_uri(http, req, url_scratch, listen, resp);
             }
         }
         Some(reroute) => {
@@ -1392,7 +1473,6 @@ pub struct RealIpState {
 #[inline(never)]
 fn real_ip(req: &RequestCtx<'_>, conf: &crate::worker::PreparedRealIp) -> Option<RealIpState> {
     use crate::worker::PreparedRealIpHeader as H;
-    let mut joined = Vec::new();
     let (ip, port) = match conf.header {
         H::ProxyProtocol => {
             let source = req.conn.proxy_protocol.as_ref()?.source?;
@@ -1401,22 +1481,21 @@ fn real_ip(req: &RequestCtx<'_>, conf: &crate::worker::PreparedRealIp) -> Option
             }
             (source.ip(), source.port())
         }
-        header => {
-            let value = match header {
-                H::XRealIp => crate::worker::lookup_request_header(req.headers_raw, b"x-real-ip")?,
-                H::Other(name) => crate::worker::lookup_request_header(req.headers_raw, name)?,
-                // Every X-Forwarded-For line, in order, as one list.
-                _ => {
-                    crate::worker::write_all_request_header_values(
-                        &mut joined,
-                        req.headers_raw,
-                        b"x-forwarded-for",
-                    );
-                    &joined
-                }
+        H::XRealIp | H::Other(_) => {
+            let name = match conf.header {
+                H::Other(name) => name,
+                _ => &b"x-real-ip"[..],
             };
+            let value = crate::worker::lookup_request_header(req.headers_raw, name)?;
             forwarded_addr(req.conn, value, conf.from, conf.recursive)?
         }
+        // Every X-Forwarded-For line, from the last.
+        _ => forwarded_addr_lines(
+            req.conn,
+            crate::worker::request_header_values(req.headers_raw, b"x-forwarded-for"),
+            conf.from,
+            conf.recursive,
+        )?,
     };
     let mut conn = req.conn.clone();
     conn.peer_ip = ip;
@@ -1443,30 +1522,69 @@ fn with_real_ip<'a>(req: &RequestCtx<'a>, state: &'a RealIpState) -> RequestCtx<
     }
 }
 
-/// `ngx_http_get_forwarded_addr_internal`: walk `list` (`addr, addr, …`)
-/// from the right while the address in hand is trusted. Without
-/// `recursive`, only the last entry is taken. `None` when the peer isn't
+/// realip's walk of one header value (`addr, addr, …`), from the peer:
+/// `ngx_http_get_forwarded_addr` with one value. `None` when the peer isn't
 /// trusted or the last entry doesn't parse.
-fn forwarded_addr(
+pub(crate) fn forwarded_addr(
     peer: &ConnInfo,
     list: &[u8],
     from: &[AccessAddr],
     recursive: bool,
 ) -> Option<(IpAddr, u16)> {
+    match walk_forwarded(list, from, recursive, peer_trusted(from, peer)) {
+        Walk::Declined => None,
+        Walk::Stopped(found) | Walk::Whole(found) => Some(found),
+    }
+}
+
+/// `ngx_http_get_forwarded_addr` with several lines: each is walked from
+/// the last, the next one only with `recursive` and after a whole line. A
+/// line that gives no address (empty, only `,`, an untrusted address in
+/// hand) ends the walk with the address found so far, if any.
+pub(crate) fn forwarded_addr_lines<'a>(
+    peer: &ConnInfo,
+    lines: impl DoubleEndedIterator<Item = &'a [u8]>,
+    from: &[AccessAddr],
+    recursive: bool,
+) -> Option<(IpAddr, u16)> {
+    let mut found: Option<(IpAddr, u16)> = None;
+    for line in lines.rev() {
+        let trusted = match found {
+            None => peer_trusted(from, peer),
+            Some((ip, _)) => real_ip_trusted(from, ip),
+        };
+        match walk_forwarded(line, from, recursive, trusted) {
+            Walk::Declined => return found,
+            Walk::Stopped(addr) => return Some(addr),
+            Walk::Whole(addr) if !recursive => return Some(addr),
+            Walk::Whole(addr) => found = Some(addr),
+        }
+    }
+    found
+}
+
+/// What `ngx_http_get_forwarded_addr_internal` made of one value.
+enum Walk {
+    /// No address (`NGX_DECLINED`).
+    Declined,
+    /// An address, then an untrusted one or an entry that doesn't parse
+    /// (`NGX_DONE`).
+    Stopped((IpAddr, u16)),
+    /// To the value's first entry, or the last one without `recursive`
+    /// (`NGX_OK`).
+    Whole((IpAddr, u16)),
+}
+
+/// `ngx_http_get_forwarded_addr_internal`: walk `list` from the right
+/// while the address in hand is trusted (`trusted`: the one before the
+/// list). Without `recursive`, only the last entry is taken.
+fn walk_forwarded(list: &[u8], from: &[AccessAddr], recursive: bool, mut trusted: bool) -> Walk {
     let is_sep = |b: u8| b == b' ' || b == b',';
-    let mut current = peer.peer_ip;
-    // The connection's own peer may be a unix-domain one.
-    let mut first = true;
     let mut found = None;
     let mut len = list.len();
     loop {
-        let trusted = if std::mem::take(&mut first) {
-            peer_trusted(from, peer)
-        } else {
-            real_ip_trusted(from, current)
-        };
         if !trusted || len == 0 {
-            return found;
+            return found.map_or(Walk::Declined, Walk::Stopped);
         }
         let mut p = len - 1;
         while p > 0 && is_sep(list[p]) {
@@ -1481,14 +1599,14 @@ fn forwarded_addr(
             p -= 1;
         }
         let Some((ip, port)) = parse_addr_port(&list[p..len]) else {
-            return found;
+            return found.map_or(Walk::Declined, Walk::Stopped);
         };
-        current = ip;
         found = Some((ip, port));
         if !recursive || p == 0 {
-            return found;
+            return Walk::Whole((ip, port));
         }
         len = p - 1;
+        trusted = real_ip_trusted(from, ip);
     }
 }
 
@@ -3069,6 +3187,59 @@ mod tests {
         assert_eq!(
             forwarded_addr(&unix_peer, b"1.2.3.4", &with_unix, false),
             Some((ip("1.2.3.4"), 0))
+        );
+    }
+
+    /// Several X-Forwarded-For lines: walked one by one from the last
+    /// (ngx_http_get_forwarded_addr), not as one list (#786).
+    #[test]
+    fn forwarded_addr_walks_the_lines_from_the_last() {
+        use crate::config::AccessAddr::V4;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 127.0.0.0/8 and 192.0.2.0/24 trusted.
+        let from = [
+            V4 {
+                addr: 0x7f00_0000,
+                mask: 0xff00_0000,
+            },
+            V4 {
+                addr: 0xc000_0200,
+                mask: 0xffff_ff00,
+            },
+        ];
+        let peer = ConnInfo {
+            peer_ip: ip("127.0.0.1"),
+            ..ConnInfo::NONE
+        };
+        let get = |lines: &[&str], recursive| {
+            forwarded_addr_lines(&peer, lines.iter().map(|l| l.as_bytes()), &from, recursive)
+        };
+        let addr = |s| Some((ip(s), 0));
+        for recursive in [false, true] {
+            // A last line without an address: none, not an earlier one.
+            assert_eq!(get(&["1.2.3.4", ","], recursive), None);
+            assert_eq!(get(&["1.2.3.4", ""], recursive), None);
+            assert_eq!(get(&["1.2.3.4", "bogus"], recursive), None);
+            assert_eq!(get(&[], recursive), None);
+        }
+        // Off: the last line's last entry.
+        assert_eq!(get(&["1.2.3.4", "192.0.2.7"], false), addr("192.0.2.7"));
+        // On: on to the earlier lines while trusted.
+        assert_eq!(get(&["1.2.3.4", "192.0.2.7"], true), addr("1.2.3.4"));
+        assert_eq!(
+            get(&["1.2.3.4, 192.0.2.8", "192.0.2.7"], true),
+            addr("1.2.3.4")
+        );
+        assert_eq!(
+            get(&["1.2.3.4", "5.6.7.8, 192.0.2.7"], true),
+            addr("5.6.7.8")
+        );
+        // A line in between without an address ends the walk.
+        assert_eq!(get(&["1.2.3.4", ",", "192.0.2.7"], true), addr("192.0.2.7"));
+        assert_eq!(get(&["1.2.3.4", ", 192.0.2.7"], true), addr("192.0.2.7"));
+        assert_eq!(
+            get(&["1.2.3.4", "192.0.2.9,", "192.0.2.7"], true),
+            addr("1.2.3.4")
         );
     }
 

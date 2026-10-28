@@ -487,3 +487,52 @@ fn m116_large_hits_come_from_the_file() {
         assert!(std::fs::read(&out).unwrap() == big, "{proto}");
     }
 }
+
+/// A range past `proxy_cache_max_range_offset` goes upstream as asked,
+/// holding the `proxy_cache_lock` it took only until it ends (#864): the
+/// next request isn't left waiting for the lock to age.
+#[test]
+fn m116_far_range_releases_the_cache_lock() {
+    let setup_lock = common::ports::setup_lock();
+    let dir = std::env::temp_dir().join(format!("ruxen-m116-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("html")).unwrap();
+    std::fs::write(dir.join("html/f"), "a".repeat(1000)).unwrap();
+    let [port, backend] = common::ports::free_ports();
+    let d = dir.display();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "events {{}}\nhttp {{ access_log off;\n\
+             proxy_cache_path {d}/cache keys_zone=one:1m;\n\
+             server {{ listen 127.0.0.1:{port};\n\
+               add_header X-Cache $upstream_cache_status;\n\
+               location / {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 1m; proxy_cache_lock on;\n\
+                 proxy_cache_max_range_offset 10; }}\n\
+             }}\n\
+             server {{ listen 127.0.0.1:{backend}; root {d}/html; }} }}\n"
+        ),
+    )
+    .unwrap();
+    let _server = start(&dir.join("nginx.conf"));
+    drop(setup_lock);
+
+    let r = request(
+        port,
+        "GET /f HTTP/1.0\r\nHost: localhost\r\nRange: bytes=100-199\r\n\r\n",
+    );
+    assert!(r.starts_with("HTTP/1.1 206"), "{r}");
+    assert_eq!(body_of(&r).len(), 100, "{r}");
+    let started = Instant::now();
+    let r = get(port, "/f");
+    assert_eq!(status_of(&r), "MISS", "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "waited {:?} for the lock",
+        started.elapsed()
+    );
+    let r = get(port, "/f");
+    assert_eq!((status_of(&r), body_of(&r).len()), ("HIT", 1000), "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
