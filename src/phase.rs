@@ -251,18 +251,39 @@ pub struct KeepaliveMeta {
     pub header_timeout_secs: Option<u64>,
     pub max_requests: u64,
     pub max_time_ms: u64,
+    /// `keepalive_min_timeout`, saturated: a u32 fits the padding.
+    pub min_timeout_ms: u32,
     pub disable_msie6: bool,
     pub disable_safari: bool,
+}
+
+impl KeepaliveMeta {
+    /// A server's settings, for a response before any location (a
+    /// server-level `return`, a refused URI).
+    fn of_server(server: &PreparedServer) -> Self {
+        let k = &server.keepalive;
+        KeepaliveMeta {
+            allow: k.allow,
+            idle_timeout_ms: k.idle_timeout_ms,
+            header_timeout_secs: k.header_timeout_secs,
+            max_requests: k.max_requests,
+            max_time_ms: k.max_time_ms,
+            min_timeout_ms: u32::try_from(k.min_timeout_ms).unwrap_or(u32::MAX),
+            disable_msie6: k.disable_msie6,
+            disable_safari: k.disable_safari,
+        }
+    }
 }
 
 impl Default for KeepaliveMeta {
     fn default() -> Self {
         KeepaliveMeta {
             allow: true,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(crate::worker::DEFAULT_KEEPALIVE_TIMEOUT_MS),
             header_timeout_secs: None,
             max_requests: 1_000,
             max_time_ms: 3_600_000,
+            min_timeout_ms: 0,
             disable_msie6: true,
             disable_safari: false,
         }
@@ -290,6 +311,8 @@ pub struct ProcessMeta {
     pub log: LogMeta,
     /// `$server_port` for access-log rendering on this request.
     pub server_port: u16,
+    /// The server's metrics slot (`PreparedServer::metrics_slot`).
+    pub metrics_server: u32,
     /// `access_log` sinks for the matched location (or server scope if no
     /// location matched). The worker uses this list — not `PreparedHttp::
     /// access_logs` — so location-scope `access_log` directives fire
@@ -359,6 +382,10 @@ pub struct ProcessMeta {
     /// the upstream's, or there is none, and the worker doesn't stamp one
     /// (#360).
     pub keep_upstream_date: bool,
+    /// `add_trailer`'s trailers go after a proxied body in memory or in
+    /// its cache file, added by the worker after gzip, as nginx's chunked
+    /// filter runs after its gzip filter (#793).
+    pub trailers_due: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
@@ -402,6 +429,7 @@ impl Default for ProcessMeta {
             keepalive: KeepaliveMeta::default(),
             log: LogMeta::default(),
             server_port: 0,
+            metrics_server: 0,
             access_logs: &[],
             limit_req_delay_ms: 0,
             limit_conn_held: None,
@@ -422,6 +450,7 @@ impl Default for ProcessMeta {
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
             keep_upstream_date: false,
+            trailers_due: false,
             gzip: None,
             max_ranges: None,
             range_allow: crate::worker::range::RangeAllow::No,
@@ -454,9 +483,11 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
             log_not_found: server.log_not_found,
         },
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
+        keepalive: KeepaliveMeta::of_server(server),
         ..ProcessMeta::default()
     }
 }
@@ -975,10 +1006,17 @@ fn process_with_meta_inner(
     }
     let mut meta = ProcessMeta {
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
+        // `allow` is the client's until a location's applies: its
+        // keepalive_timeout decides, not the server's (nginx's
+        // ngx_http_update_location_config).
+        keepalive: KeepaliveMeta {
+            allow: !closes,
+            ..KeepaliveMeta::of_server(server)
+        },
         ..ProcessMeta::default()
     };
-    meta.keepalive.allow = !closes;
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
@@ -2038,6 +2076,72 @@ fn write_auth_path_var(
     }
 }
 
+/// The client's request target with its `#fragment`, nginx's
+/// r->unparsed_uri (#748): `$request_uri`, and what `proxy_pass` without
+/// a URI part sends. `path` stops at the `#` (`$uri` and `$args` do); when
+/// it lies in `request_line` and a `#` follows it there, the target runs
+/// on to the next space. No work otherwise: a synthesized path isn't in
+/// the line.
+#[inline]
+pub(crate) fn unparsed_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    // Distinct live buffers don't overlap: an offset inside the line means
+    // `path` is part of it.
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start.checked_add(path.len()) {
+        Some(end) if request_line.get(end) == Some(&b'#') => {
+            with_fragment(request_line, start, end)
+        }
+        _ => path,
+    }
+}
+
+/// `$request_uri`: [`unparsed_uri`], except for an absolute-form target
+/// without a path (`GET http://h?a=1`), whose `/?a=1` is synthesized for
+/// `$uri`; nginx's unparsed_uri starts at the `?` there (#769). The
+/// upstream target keeps the `/` (valid_unparsed_uri is off for it).
+#[inline]
+pub(crate) fn request_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start
+        .checked_add(path.len())
+        .map(|end| (end, request_line.get(end)))
+    {
+        Some((end, Some(b'#'))) => with_fragment(request_line, start, end),
+        Some((_, Some(_))) => path,
+        _ => absolute_query(path, request_line),
+    }
+}
+
+/// The client's `?args…` for a synthesized `/?args`, else `path`.
+#[cold]
+#[inline(never)]
+fn absolute_query<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let Some(query) = path.strip_prefix(b"/").filter(|q| q.first() == Some(&b'?')) else {
+        return path;
+    };
+    let target = request_line
+        .split(|&b| b == b' ')
+        .nth(1)
+        .unwrap_or_default();
+    if target.first() == Some(&b'/') {
+        return path;
+    }
+    match target.iter().position(|&b| b == b'?') {
+        Some(i) if target[i..].starts_with(query) => &target[i..],
+        _ => path,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn with_fragment(request_line: &[u8], start: usize, end: usize) -> &[u8] {
+    let len = request_line[end..]
+        .iter()
+        .position(|&b| b == b' ')
+        .unwrap_or(request_line.len() - end);
+    &request_line[start..end + len]
+}
+
 fn request_uri_path(request_uri: &[u8]) -> &[u8] {
     match request_uri.iter().position(|&b| b == b'?') {
         Some(i) => &request_uri[..i],
@@ -2431,6 +2535,7 @@ fn apply_location_meta(
         header_timeout_secs: loc.keepalive.header_timeout_secs,
         max_requests: loc.keepalive.max_requests,
         max_time_ms: loc.keepalive.max_time_ms,
+        min_timeout_ms: u32::try_from(loc.keepalive.min_timeout_ms).unwrap_or(u32::MAX),
         disable_msie6: loc.keepalive.disable_msie6,
         disable_safari: loc.keepalive.disable_safari,
     };
@@ -2997,6 +3102,39 @@ fn match_named_location<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparsed_uri_keeps_the_fragment() {
+        let line = b"GET /a?b#f?x HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b#f?x");
+        let line = b"GET /a#f";
+        assert_eq!(unparsed_uri(&line[4..6], line), b"/a#f");
+        let line = b"GET /a?b HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b");
+        // A path from elsewhere (absolute-form without one) stays as is.
+        let other = b"/#x".to_vec();
+        assert_eq!(unparsed_uri(&other[..1], line), b"/");
+        assert_eq!(unparsed_uri(b"/", b""), b"/");
+    }
+
+    #[test]
+    fn request_uri_of_an_absolute_target_without_a_path() {
+        let synth = b"/?a=1".to_vec();
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1 HTTP/1.1"), b"?a=1");
+        assert_eq!(
+            request_uri(&synth, b"GET http://h?a=1#f HTTP/1.1"),
+            b"?a=1#f"
+        );
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1#f"), b"?a=1#f");
+        // Not the target's query, or an origin-form line: as is.
+        assert_eq!(request_uri(&synth, b"GET http://h?b=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(&synth, b"GET /x?a=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(b"/", b"GET http://h HTTP/1.1"), b"/");
+        assert_eq!(request_uri(b"/", b""), b"/");
+        let line = b"GET http://h/?a=1#f HTTP/1.1";
+        assert_eq!(request_uri(&line[12..17], line), b"/?a=1#f");
+        assert_eq!(request_uri(&line[12..13], line), b"/");
+    }
 
     #[test]
     fn wildcards_take_only_names_below_them() {

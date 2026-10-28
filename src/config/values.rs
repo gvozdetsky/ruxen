@@ -184,6 +184,8 @@ struct VariableRegistry {
     stderr_log: bool,
     /// `stub_status` or a `$connections_*` variable appears in the config.
     stats: bool,
+    /// `ruxen_metrics` appears in the config.
+    metrics: bool,
 }
 
 /// Whether the config just parsed reads `$request_body` anywhere: if not,
@@ -216,6 +218,20 @@ pub(crate) fn stats_used() -> bool {
 /// `stub_status` was parsed.
 pub(crate) fn note_stats_used() {
     VARIABLES.with(|v| v.borrow_mut().stats = true);
+}
+
+/// Whether the config just parsed has `ruxen_metrics`.
+pub(crate) fn metrics_used() -> bool {
+    VARIABLES.with(|v| v.borrow().metrics)
+}
+
+/// `ruxen_metrics` was parsed: it shows the connection counters too.
+pub(crate) fn note_metrics_used() {
+    VARIABLES.with(|v| {
+        let mut v = v.borrow_mut();
+        v.metrics = true;
+        v.stats = true;
+    });
 }
 
 /// Whether the config just parsed reads `$request_body_file` anywhere: if

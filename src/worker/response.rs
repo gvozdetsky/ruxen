@@ -721,7 +721,6 @@ pub(crate) fn rewrite_response_status(response: Vec<u8>, status: u16) -> Vec<u8>
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_proxy_add_headers(
     response: Response,
-    relayed: bool,
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
     meta: &phase::ProcessMeta,
@@ -764,26 +763,7 @@ pub(crate) fn apply_proxy_add_headers(
         out = apply_expires(out, meta.proxy_expires, &render_ctx);
     }
     out = inject_add_headers(out, meta.proxy_add_headers, &render_ctx);
-    // A relayed body's trailers go after it (`relay_trailers`).
-    if !relayed && trailers_allowed(ctx, meta) {
-        // Refresh `$msec` / `$time_local` / `$time_iso8601` to wall-clock-now
-        // for the trailer block. Trailers are emitted after the upstream body
-        // has finished arriving, which under `proxy_limit_rate` can lag the
-        // request-start epoch by seconds; nginx's variable cache likewise
-        // advances across that gap. Headers keep the request-start epoch via
-        // the outer `render_ctx`, so a `$msec` rendered into both `add_header`
-        // and `add_trailer` reflects the time difference.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let render_ctx = RenderCtx {
-            status: response_status(&out),
-            epoch_secs: now.as_secs(),
-            epoch_ms: (now.subsec_millis()) as u16,
-            ..render_ctx
-        };
-        out = inject_add_trailers(out, meta.proxy_add_trailers, &render_ctx);
-    }
+    // `add_trailer`: after the body, in the worker (`relay_trailers`).
     Response::Owned(out)
 }
 

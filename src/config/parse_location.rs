@@ -321,6 +321,10 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     or(&mut child.keepalive_timeout, &parent.keepalive_timeout);
     or(&mut child.keepalive_requests, &parent.keepalive_requests);
     or(&mut child.keepalive_time_ms, &parent.keepalive_time_ms);
+    or(
+        &mut child.keepalive_min_timeout_ms,
+        &parent.keepalive_min_timeout_ms,
+    );
     or(&mut child.keepalive_disable, &parent.keepalive_disable);
     or(&mut child.error_logs, &parent.error_logs);
     or(&mut child.log_not_found, &parent.log_not_found);
@@ -475,8 +479,10 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
                     location.alias_prefix_override = parent.alias_prefix_override.clone();
                     location.inherits_root = parent.inherits_root;
                 }
-                let static_parent =
-                    !matches!(parent.handler, Handler::Proxy(_) | Handler::StubStatus);
+                let static_parent = !matches!(
+                    parent.handler,
+                    Handler::Proxy(_) | Handler::StubStatus | Handler::Metrics
+                );
                 let keeps_own =
                     !parent.explicit_return && (*own_handler || (*own_root && static_parent));
                 if keeps_own && *own_handler {
@@ -562,6 +568,7 @@ pub(crate) fn parse_location_block(
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
+    let mut keepalive_min_timeout_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
     let mut error_logs: Option<Vec<ErrorLog>> = None;
     let mut log_not_found: Option<bool> = None;
@@ -589,6 +596,7 @@ pub(crate) fn parse_location_block(
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
     let mut stub_status = false;
+    let mut metrics = false;
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
     let mut limit_req = LimitReqConf::default();
@@ -664,6 +672,8 @@ pub(crate) fn parse_location_block(
                         Handler::Return { status, body }
                     } else if stub_status {
                         Handler::StubStatus
+                    } else if metrics {
+                        Handler::Metrics
                     } else if let Some(pp) = proxy_pass {
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
@@ -730,6 +740,7 @@ pub(crate) fn parse_location_block(
                         keepalive_timeout,
                         keepalive_requests,
                         keepalive_time_ms,
+                        keepalive_min_timeout_ms,
                         keepalive_disable,
                         error_logs,
                         log_not_found,
@@ -868,6 +879,12 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("keepalive_time"));
                 }
                 keepalive_time_ms = Some(parse_keepalive_time_args(&args[1..])?);
+            }
+            ("keepalive_min_timeout", Terminator::Semi) => {
+                if keepalive_min_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("keepalive_min_timeout"));
+                }
+                keepalive_min_timeout_ms = Some(parse_keepalive_min_timeout_args(&args[1..])?);
             }
             ("keepalive_disable", Terminator::Semi) => {
                 if keepalive_disable.is_some() {
@@ -1046,7 +1063,7 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("root/alias"));
                 }
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some((PathBuf::from(path), PathMapping::Root));
+                root = Some((parse_root_path(false, path)?, PathMapping::Root));
                 local_path_mapping = Some(PathMapping::Root);
                 alias_prefix_override = None;
             }
@@ -1088,7 +1105,7 @@ pub(crate) fn parse_location_block(
                         spec.pattern,
                     ));
                 }
-                root = Some((PathBuf::from(path), PathMapping::Alias));
+                root = Some((parse_root_path(true, path)?, PathMapping::Alias));
                 local_path_mapping = Some(PathMapping::Alias);
                 alias_prefix_override = None;
             }
@@ -1130,6 +1147,17 @@ pub(crate) fn parse_location_block(
             ("stub_status", Terminator::Semi) if args.len() <= 2 => {
                 stub_status = true;
                 crate::config::values::note_stats_used();
+            }
+            // ruxen's own (#481), where `stub_status` goes.
+            ("ruxen_metrics", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::Directive {
+                        name: "ruxen_metrics",
+                        msg: "takes no arguments".to_string(),
+                    });
+                }
+                metrics = true;
+                crate::config::values::note_metrics_used();
             }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {
@@ -1278,6 +1306,7 @@ pub(crate) fn parse_location_block(
                 | "keepalive_timeout"
                 | "keepalive_requests"
                 | "keepalive_time"
+                | "keepalive_min_timeout"
                 | "keepalive_disable"
                 | "error_log"
                 | "log_not_found"
