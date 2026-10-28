@@ -41,9 +41,8 @@ pub(crate) fn parse_value_with_vars_rewrite(s: &str) -> Result<Vec<ValuePart>, E
     parse_value_with_vars_impl(s, true)
 }
 
-/// For `log_format`, `map` and `split_clients`, where `$1` stays literal
-/// text: nginx refuses it in `log_format` (`unknown "1" variable`), and a
-/// map's `$1` is its own regex's capture, which ruxen doesn't provide.
+/// For `log_format`, a `map`'s key and `split_clients`, where `$1` stays
+/// literal text: nginx refuses it in `log_format` (`unknown "1" variable`).
 pub(crate) fn parse_value_without_captures(s: &str) -> Result<Vec<ValuePart>, Error> {
     parse_value_with_vars_impl(s, false)
 }

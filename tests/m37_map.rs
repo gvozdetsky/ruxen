@@ -364,3 +364,40 @@ http {
     };
     assert_eq!(log, "/b /a /b\n");
 }
+
+#[test]
+fn map_regex_value_takes_its_captures() {
+    // A regex entry's value sees the regex's captures, numbered and named
+    // (#800); an exact entry's `$1` is the request's (the location's).
+    // Answers checked against nginx 1.30.6.
+    let conf = r#"
+events {}
+http {
+  map $uri $m {
+    ~^/m/(?<name>\w+)/(\w+)$  "$2-$name";
+    ~*^/n/(\w+)$              "n:$1$3";
+    /x/y                      "x:$1";
+    default                   -;
+  }
+
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location ~ ^/(x)/ { return 200 "m:$m"; }
+    location / { return 200 "m:$m"; }
+  }
+}
+"#;
+    let (_g, port) = spawn_server(conf);
+    for (path, want) in [
+        ("/m/ab/cd", "m:cd-ab"),
+        ("/N/Zz", "m:n:Zz"),
+        ("/x/y", "m:x:x"),
+        ("/other", "m:-"),
+    ] {
+        assert_eq!(
+            String::from_utf8_lossy(body(&http_get(port, path))),
+            want,
+            "{path}"
+        );
+    }
+}

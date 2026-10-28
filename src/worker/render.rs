@@ -973,24 +973,42 @@ fn render_map(program: &PreparedMap, ctx: &RenderCtx<'_>, out: &mut Vec<u8>) {
         return;
     }
     // One pass over the regex keys (#248), else each in turn.
-    match &program.regex_set {
-        Some(set) => {
-            if let Some(i) = set.matches(&key).iter().next() {
-                render_parts(program.regex[i].value, ctx, out);
-                return;
-            }
+    let matched = match &program.regex_set {
+        Some(set) => set.matches(&key).iter().next().map(|i| &program.regex[i]),
+        None => program.regex.iter().find(|e| e.regex.is_match(&key)),
+    };
+    if let Some(entry) = matched {
+        if entry.captures.is_empty() {
+            render_parts(entry.value, ctx, out);
+        } else {
+            render_map_captures(entry, &key, ctx, out);
         }
-        None => {
-            for entry in program.regex {
-                if entry.regex.is_match(&key) {
-                    render_parts(entry.value, ctx, out);
-                    return;
-                }
-            }
-        }
+        return;
     }
     if let Some(default) = program.default {
         render_parts(default, ctx, out);
+    }
+}
+
+/// A map regex entry's value with the regex's captures of `key` (#800).
+#[cold]
+#[inline(never)]
+fn render_map_captures(
+    entry: &PreparedMapRegex,
+    key: &[u8],
+    ctx: &RenderCtx<'_>,
+    out: &mut Vec<u8>,
+) {
+    let caps = entry.regex.captures(key);
+    for (i, part) in entry.value.iter().enumerate() {
+        match entry.captures.iter().find(|(p, _)| *p == i) {
+            Some(&(_, group)) => {
+                if let Some(m) = caps.as_ref().and_then(|c| c.get(group)) {
+                    out.extend_from_slice(m.as_bytes());
+                }
+            }
+            None => render_parts(std::slice::from_ref(part), ctx, out),
+        }
     }
 }
 

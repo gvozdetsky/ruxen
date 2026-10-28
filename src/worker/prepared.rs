@@ -208,6 +208,9 @@ pub struct PreparedSplitClients {
 pub struct PreparedMapRegex {
     pub regex: regex::bytes::Regex,
     pub value: &'static [PreparedValuePart],
+    /// The parts of `value` that are this regex's captures (`$1`, a named
+    /// group), as (part index, group); empty for most entries (#800).
+    pub captures: &'static [(usize, usize)],
 }
 
 /// Prepared form of one `map $source $dest { ... }` program.
