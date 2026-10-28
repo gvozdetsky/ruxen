@@ -1,0 +1,148 @@
+name: Bench on hosted hardware
+
+# ruxen vs nginx on GitHub's hosted runners (#14): non-laptop x86_64 and
+# ARM64 data. Shared VMs, wrk on the same VM: read B/A next to the A/A
+# spread, not as absolute req/s.
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: Scenarios (bench/scenarios/manifest.tsv), space-separated
+        default: m1_hello m3_static_1k static_8k m5_conditional_304 m1_no_keepalive proxy_hello tls_hello
+      pairs:
+        description: Pairs per scenario (even)
+        default: "6"
+  # TEMPORARY (development, removed before review)
+  pull_request:
+    paths: [.github/workflows/bench-hardware.yml]
+
+defaults:
+  run:
+    # pipefail: `pair.sh | tee` fails with pair.sh.
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  NGINX_VERSION: 1.30.6
+  SCENARIOS: ${{ inputs.scenarios || 'm1_hello m3_static_1k static_8k m5_conditional_304 m1_no_keepalive proxy_hello tls_hello' }}
+  PAIRS: ${{ inputs.pairs || '6' }}
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends wrk libpcre2-dev zlib1g-dev libssl-dev
+      - name: Cache nginx
+        id: nginx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/nginx
+          key: nginx-${{ env.NGINX_VERSION }}-${{ runner.arch }}-v1
+      - name: Build nginx
+        if: steps.nginx-cache.outputs.cache-hit != 'true'
+        # The configure line of the laptop reference build
+        # (~/ruxen-night/build-nginx-1.30.sh); -fcf-protection is x86-only.
+        run: |
+          prot=-fcf-protection
+          [ "$(uname -m)" = aarch64 ] && prot=-mbranch-protection=standard
+          P="$HOME/nginx"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz"
+          tar xzf "nginx-$NGINX_VERSION.tar.gz" && cd "nginx-$NGINX_VERSION"
+          ./configure --prefix="$P" --conf-path="$P/conf/nginx.conf" \
+            --with-cc-opt="-g -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -flto=auto -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security $prot -fPIC -Wdate-time -D_FORTIFY_SOURCE=3 -Wno-unterminated-string-initialization" \
+            --with-ld-opt="-Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -Wl,-z,relro -Wl,-z,now -fPIC" \
+            --with-compat --with-debug --with-pcre-jit --with-http_ssl_module --with-http_stub_status_module \
+            --with-http_realip_module --with-http_auth_request_module --with-http_v2_module --with-http_dav_module \
+            --with-http_slice_module --with-threads --with-http_addition_module --with-http_gunzip_module \
+            --with-http_gzip_static_module --with-http_sub_module --with-http_secure_link_module \
+            --with-http_random_index_module --with-http_flv_module --with-http_mp4_module \
+            --with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_ssl_preread_module \
+            --with-mail --with-mail_ssl_module > configure.log
+          make -j"$(nproc)" > make.log 2>&1 || { tail -50 make.log; exit 1; }
+          make install > /dev/null
+      - name: Build ruxen
+        run: |
+          cargo build --release --locked
+          echo "$HOME/nginx/sbin" >> "$GITHUB_PATH"
+      - name: Tests (TEMPORARY, portability check)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: cargo test --release --locked 2>&1 | tail -80
+      - name: System and driver
+        # RUXEN_DRIVER=io_uring refuses to start without io_uring; pair.sh
+        # runs ruxen on the automatic choice, which is then io_uring.
+        run: |
+          mkdir -p out
+          RUXEN_DRIVER=io_uring target/release/ruxen -p bench/m1/ -c "$PWD/bench/m1/nginx.conf" \
+            > out/driver.log 2>&1 &
+          pid=$!
+          driver=epoll
+          for i in $(seq 50); do
+            if curl -sf -o /dev/null http://127.0.0.1:8080/; then driver=io_uring; break; fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+          done
+          kill -QUIT "$pid" 2>/dev/null || true
+          for i in $(seq 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+          {
+            echo "runner: ${{ matrix.runner }}"
+            echo "cpu: $(lscpu | sed -n 's/^Model name: *//p' | head -1), $(nproc) vCPUs"
+            echo "kernel: $(uname -r)"
+            echo "distro: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "nginx: $(nginx -v 2>&1)"
+            echo "rustc: $(rustc -V)"
+            echo "ruxen: $(git rev-parse --short HEAD)"
+            echo "wrk: $(wrk -v 2>&1 | head -1)"
+            echo "client: wrk on the same VM, loopback"
+            echo "ruxen driver: $driver"
+            echo "kernel.io_uring_disabled: $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo n/a)"
+          } | tee out/system.txt
+          [ "$driver" = io_uring ] || cat out/driver.log
+          lscpu > out/lscpu.txt
+      - name: Fixtures
+        run: bench/scripts/prepare_fixtures.sh
+      - name: A/A calibration
+        run: |
+          cp target/release/ruxen "$RUNNER_TEMP/ruxen-copy"
+          bench/scripts/pair.sh m1_hello --a-bin "$RUNNER_TEMP/ruxen-copy" --pairs "$PAIRS" \
+            2>&1 | tee out/aa_m1_hello.txt
+      - name: ruxen vs nginx
+        run: |
+          rc=0
+          for s in $SCENARIOS; do
+            bench/scripts/pair.sh "$s" --pairs "$PAIRS" 2>&1 | tee "out/$s.txt" || rc=1
+          done
+          exit $rc
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.runner }}"
+            echo '```'
+            cat out/system.txt 2>/dev/null
+            echo '```'
+            echo '| run | result |'
+            echo '|---|---|'
+            for f in out/aa_m1_hello.txt $(for s in $SCENARIOS; do echo "out/$s.txt"; done); do
+              [ -f "$f" ] || continue
+              r="$(grep -E '^[^ ]+ / [^ ]+: ' "$f" | tail -1 || true)"
+              echo "| $(basename "$f" .txt) | ${r:-failed, see the artifact} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.runner }}
+          path: out/
