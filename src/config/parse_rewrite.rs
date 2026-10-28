@@ -24,7 +24,7 @@ pub(crate) fn parse_rewrite_op(args: &[String]) -> Result<RewriteOp, Error> {
             got: args.join(" "),
         });
     }
-    let pattern = expand_pcre_quote_escapes(&args[0]);
+    let pattern = pcre::translate(&args[0]).into_owned();
     validate_regex(&pattern, false)?;
 
     let raw_replacement = &args[1];
@@ -50,6 +50,18 @@ pub(crate) fn parse_rewrite_op(args: &[String]) -> Result<RewriteOp, Error> {
                 got: other.to_string(),
             });
         }
+    };
+    // A redirect is decided on the replacement as written, whatever `last`
+    // or `break` say (ngx_http_rewrite); never on the rendered target, which
+    // a capture can make look like a URL (#798).
+    let external = ["http://", "https://", "$scheme"]
+        .iter()
+        .any(|p| raw_replacement.starts_with(p));
+    let flag = match flag {
+        RewriteFlag::None | RewriteFlag::Last | RewriteFlag::Break if external => {
+            RewriteFlag::Redirect
+        }
+        flag => flag,
     };
 
     Ok(RewriteOp::Rewrite(RewriteRule {
@@ -264,7 +276,7 @@ pub(crate) fn parse_if_guard_inner(inner: &str) -> Result<IfGuard, Error> {
             Ok(IfGuard::NotEq { left, right })
         }
         "~" | "~*" | "!~" | "!~*" => {
-            let pattern = expand_pcre_quote_escapes(rhs);
+            let pattern = pcre::translate(rhs).into_owned();
             let case_insensitive = op.ends_with('*');
             validate_regex(&pattern, case_insensitive)?;
             Ok(IfGuard::Regex {
