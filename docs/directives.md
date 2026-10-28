@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 194 implemented, 18 accepted with a difference, 71 accepted with no effect, 0 refused, 281 unknown.
+Of 564 directives: 196 implemented, 18 accepted with a difference, 71 accepted with no effect, 0 refused, 279 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -145,7 +145,7 @@ Not supported: `ssl_engine`.
 | `limit_rate_after` | yes | http, server, location |  |
 | `keepalive_time` | yes | http, server, location, upstream |  |
 | `keepalive_timeout` | yes | http, server, location, upstream |  |
-| `keepalive_min_timeout` | no |  |  |
+| `keepalive_min_timeout` | yes | http, server, location |  |
 | `keepalive_requests` | yes | http, server, location, upstream |  |
 | `keepalive_disable` | yes | http, server, location |  |
 | `satisfy` | yes | http, server, location |  |
@@ -483,7 +483,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_ssl_crl` | yes | http, server, location |  |
 | `proxy_ssl_certificate` | yes | http, server, location |  |
 | `proxy_ssl_certificate_key` | yes | http, server, location |  |
-| `proxy_ssl_certificate_cache` | no |  |  |
+| `proxy_ssl_certificate_cache` | yes | http, server, location |  |
 | `proxy_ssl_password_file` | yes | http, server, location |  |
 | `proxy_ssl_conf_command` | no |  |  |
 
