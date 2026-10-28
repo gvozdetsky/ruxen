@@ -632,6 +632,9 @@ pub(crate) const DEFAULT_KEEPALIVE_REQUESTS: u64 = 1_000;
 
 pub(crate) const DEFAULT_KEEPALIVE_TIME_MS: u64 = 3_600_000;
 
+/// nginx's `keepalive_timeout` when none is set (#773).
+pub(crate) const DEFAULT_KEEPALIVE_TIMEOUT_MS: u64 = 75_000;
+
 #[derive(Debug, Copy, Clone)]
 pub struct PreparedErrorPage {
     pub status: u16,

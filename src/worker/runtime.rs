@@ -5783,9 +5783,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                 scan
                             }
                         };
+                        // No idle timeout: `keepalive_timeout 0` of a
+                        // server answering before any location.
                         let mut close_after = !keep_alive
                             || body_too_large
                             || !process_meta.keepalive.allow
+                            || process_meta.keepalive.idle_timeout_ms.is_none()
                             || request_count >= process_meta.keepalive.max_requests
                             || connection_time_us / 1_000 > process_meta.keepalive.max_time_ms
                             || matches!(method, Method::Trace | Method::Connect)
