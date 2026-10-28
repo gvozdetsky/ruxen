@@ -497,6 +497,40 @@ fn refuse(
     (response, meta)
 }
 
+/// A request target that doesn't normalise: nginx refuses it while
+/// reading the request line, with the default server's configuration
+/// (its `error_page`, `add_header … always`, #779). A 400 ends the
+/// connection.
+#[cold]
+#[inline(never)]
+fn bad_uri(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+    response: Response,
+) -> (Response, ProcessMeta) {
+    let server = &listen.servers[listen.default_server];
+    // A target that isn't a path (`*`, `x`) fails nginx's request-line
+    // parse, before `$request_method` and `$request` are set.
+    let unparsed;
+    let req = if req.path.first() == Some(&b'/') {
+        req
+    } else {
+        unparsed = RequestCtx {
+            method_bytes: b"",
+            request_line: b"",
+            path: b"",
+            ..*req
+        };
+        &unparsed
+    };
+    let (response, mut meta) = refuse(http, req, url_scratch, server, response, true, false, None);
+    // No `$uri` for the log, unless an error page gave it one.
+    meta.invalid_uri |= !server.error_pages.iter().any(|p| p.status == 400);
+    (response, meta)
+}
+
 /// The server's charset on what it answers before a location (#464);
 /// a location's answers get theirs from its DocRoot in the worker.
 #[cold]
@@ -821,10 +855,7 @@ fn process_with_meta_inner(
             if let Err(resp) =
                 normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
             {
-                // A 400 ends the connection, as nginx's does.
-                let mut meta = refused_meta(server, true);
-                meta.keepalive.allow = false;
-                return (resp, meta);
+                return bad_uri(http, req, url_scratch, listen, resp);
             }
         }
         Some(reroute) => {
