@@ -1406,6 +1406,7 @@ pub(crate) fn build_proxy(
                 set_headers: eff.set_headers,
                 pass_request_headers: eff.pass_request_headers,
                 pass_request_body: eff.pass_request_body,
+                request_buffering: eff.request_buffering,
                 set_body: eff.set_body,
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
@@ -1454,6 +1455,7 @@ pub(crate) fn build_proxy(
                 set_headers: eff.set_headers,
                 pass_request_headers: eff.pass_request_headers,
                 pass_request_body: eff.pass_request_body,
+                request_buffering: eff.request_buffering,
                 set_body: eff.set_body,
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
@@ -1515,6 +1517,7 @@ pub(crate) fn build_proxy(
                 set_headers: eff.set_headers,
                 pass_request_headers: eff.pass_request_headers,
                 pass_request_body: eff.pass_request_body,
+                request_buffering: eff.request_buffering,
                 set_body: eff.set_body,
                 connect_timeout_ms: eff.connect_timeout_ms,
                 read_timeout_ms: eff.read_timeout_ms,
@@ -1869,6 +1872,7 @@ pub(crate) struct ServerProxyDefaults {
     pub set_headers: &'static [PreparedProxySetHeader],
     pub pass_request_headers: bool,
     pub pass_request_body: bool,
+    pub request_buffering: bool,
     pub set_body: Option<&'static [PreparedValuePart]>,
     pub ignore_accel_redirect: bool,
     pub ignore_accel_limit_rate: bool,
@@ -1948,6 +1952,7 @@ impl ServerProxyDefaults {
                 .pass_request_headers
                 .unwrap_or(defaults.pass_request_headers),
             pass_request_body: conf.pass_request_body.unwrap_or(defaults.pass_request_body),
+            request_buffering: conf.request_buffering.unwrap_or(defaults.request_buffering),
             set_body: conf.set_body.map(prepare_value_parts),
             ignore_accel_redirect: ignores(conf.ignore_headers.as_deref(), "x-accel-redirect")
                 .unwrap_or(false),
@@ -2069,6 +2074,9 @@ pub(crate) fn resolve_proxy_effective(
         pass_request_body: location
             .pass_request_body
             .unwrap_or(server_defaults.pass_request_body),
+        request_buffering: location
+            .request_buffering
+            .unwrap_or(server_defaults.request_buffering),
         ignore_accel_redirect: ignores(location.ignore_headers.as_deref(), "x-accel-redirect")
             .unwrap_or(server_defaults.ignore_accel_redirect),
         ignore_accel_limit_rate: ignores(location.ignore_headers.as_deref(), "x-accel-limit-rate")

@@ -226,6 +226,9 @@ pub struct RequestCtx<'a> {
     /// Path to a temp file containing the request body when the worker
     /// spilled it. Empty when no spill file exists.
     pub body_file: Option<&'a crate::worker::SpilledBody>,
+    /// `proxy_request_buffering off` (#134): the body is read as the proxy
+    /// sends it, from here; `body` holds what came with the header.
+    pub body_feed: Option<&'a crate::request_feed::BodyFeed>,
     /// Negotiated TLS handshake info, taken once at handshake completion.
     /// `None` for plain-HTTP connections. Drives `$scheme` and `$ssl_*`
     /// variable rendering; otherwise untouched on the hot path.
@@ -1985,6 +1988,12 @@ pub(crate) struct FirstBodyLimit {
     pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
+    /// `proxy_request_buffering off` (#134): the body goes upstream as it
+    /// arrives, with the `proxy_http_version` (a chunked one needs 1.1).
+    /// `None` where it is read first: nginx's `request_body_no_buffering`
+    /// also needs the body passed as it is (`proxy_pass_request_body`, no
+    /// `proxy_set_body`).
+    pub unbuffered: Option<u8>,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -2059,6 +2068,16 @@ pub(crate) fn first_body_limit(
         discard: discards_body(http, server, &loc, url_scratch, true, 0),
         continue_status: if expect { discard_continue(&loc) } else { None },
         body_timeout: loc.timeouts.body,
+        unbuffered: match &loc.handler {
+            crate::worker::PreparedHandler::Proxy(proxy)
+                if !proxy.request_buffering
+                    && proxy.pass_request_body
+                    && proxy.set_body.is_none() =>
+            {
+                Some(proxy.http_version)
+            }
+            _ => None,
+        },
     })
 }
 
@@ -2986,6 +3005,7 @@ mod tests {
             body: &NO_BODY,
             body_len: 0,
             body_file: None,
+            body_feed: None,
             tls: None,
             conn: &ConnInfo::NONE,
             refuse: None,

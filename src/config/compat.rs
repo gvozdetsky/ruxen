@@ -268,11 +268,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         "ruxen relays a response as it arrives either way (#88, #463)",
     ),
     (
-        "proxy_request_buffering",
-        Some("on"),
-        "request bodies are still read whole before they are proxied (#134)",
-    ),
-    (
         "proxy_store",
         Some("off"),
         "proxied responses are not stored",

@@ -735,6 +735,7 @@ impl ProxyConf {
         "proxy_set_header",
         "proxy_pass_request_headers",
         "proxy_pass_request_body",
+        "proxy_request_buffering",
         "proxy_set_body",
         "proxy_ignore_headers",
         "proxy_connect_timeout",
@@ -826,6 +827,13 @@ impl ProxyConf {
                     });
                 }
                 self.set_body = Some(parse_value_with_vars(&args[1])?);
+            }
+            "proxy_request_buffering" => {
+                if self.request_buffering.is_some() {
+                    return Err(Error::Duplicate("proxy_request_buffering"));
+                }
+                self.request_buffering =
+                    Some(parse_on_off_args(&args[1..], "proxy_request_buffering")?);
             }
             "proxy_pass_request_body" => {
                 if self.pass_request_body.is_some() {

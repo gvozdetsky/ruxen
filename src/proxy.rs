@@ -161,6 +161,9 @@ pub struct ProxyPlan {
     /// A request body too large to keep in memory: sent from this file
     /// after `request` (which then holds only the header block).
     pub body_file: Option<RequestBodyFile>,
+    /// `proxy_request_buffering off` (#134): the body, sent after
+    /// `request` as the client sends it.
+    pub body_feed: Option<crate::request_feed::BodyFeed>,
     /// Keep the upstream's header lines in `ProxyReport` because the
     /// location's add_header / add_trailer may read `$upstream_http_*`.
     pub keep_upstream_headers: bool,
@@ -702,6 +705,10 @@ pub async fn run_proxy(
     // `proxy_next_upstream non_idempotent`. Before that (connect failed)
     // any request may.
     let sent_may_retry = plan.method_idempotent || plan.next_upstream.non_idempotent;
+    // A body sent as it came (#134) can't be sent again once a piece of it
+    // went (ngx_http_upstream_next, `request_body_no_buffering`).
+    let may_resend =
+        |plan: &ProxyPlan| sent_may_retry && !plan.body_feed.as_ref().is_some_and(|f| f.started());
     // Tracks the last response we'd return if the next failover branch
     // doesn't fire. The first iteration always overwrites it before any
     // read — `unused_assignments` complains about the initializer, but
@@ -752,7 +759,7 @@ pub async fn run_proxy(
                     // if the body can be safely re-sent. The stale socket
                     // isn't an attempt of its own in nginx's terms.
                     *state = UpstreamState::new(state.peer);
-                    if sent_may_retry {
+                    if may_resend(&plan) {
                         attempt(
                             &plan,
                             current.peer_idx,
@@ -818,7 +825,7 @@ pub async fn run_proxy(
                 // the peer isn't blamed and proxy_intercept_errors applies.
                 if plan.next_upstream.matches_status(status)
                     && attempts < max_tries
-                    && sent_may_retry
+                    && may_resend(&plan)
                     && !deadline_exceeded(overall_deadline)
                 {
                     // http_403 / http_404 move on without counting against
@@ -912,6 +919,9 @@ pub async fn run_proxy(
                 record_failure(failures, &plan, current.peer_idx, error);
                 return crate::worker::internal_error_response(plan.method);
             }
+            AttemptOutcome::ClientBody(status) => {
+                return client_body_error(&plan, status);
+            }
             AttemptOutcome::PooledStale => {
                 // The pre-match collapses PooledStale into either a fresh
                 // retry or a Failed; reaching here is a logic bug.
@@ -934,7 +944,7 @@ pub async fn run_proxy(
                 last_failure = Some(resp);
                 if !triggers
                     || attempts >= max_tries
-                    || (sent && !sent_may_retry)
+                    || (sent && !may_resend(&plan))
                     || deadline_exceeded(overall_deadline)
                 {
                     if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Failed(kind)) {
@@ -1559,6 +1569,9 @@ enum AttemptOutcome {
     /// (`proxy_bind`): the request ends with a 500, the peer not blamed
     /// (ngx_http_upstream_connect on NGX_ERROR).
     LocalError(Box<UpstreamError>),
+    /// The client's body, sent as it came (#134), failed on the client's
+    /// side: the request ends with this status, the peer not blamed.
+    ClientBody(u16),
 }
 
 /// A `proxy_bind` address, resolved for one request.
@@ -1774,7 +1787,11 @@ async fn attempt(
     // are never copied per attempt. `proxy_send_timeout` bounds each write
     // (#490): a request without a body usually goes in one, and the rest
     // of a head the socket didn't take goes as a body does.
-    let res = if plan.body.is_empty() {
+    let res = if plan.body_feed.is_some() || plan.body_file.is_some() {
+        // The head goes with the body's first piece (`send_body_feed`,
+        // `send_body_file`).
+        Some(Ok(()))
+    } else if plan.body.is_empty() {
         let len = plan.request.len();
         match timeout(
             plan.send_timeout,
@@ -1825,8 +1842,13 @@ async fn attempt(
     }
     state.bytes_sent = (plan.request.len() + plan.body.len()) as u64;
     if let Some(file) = &plan.body_file
-        && let Err(error) = send_body_file(&mut stream, file, plan.send_timeout).await
+        && let Err((error, first)) =
+            send_body_file(&mut stream, plan.request.clone(), file, plan.send_timeout).await
     {
+        // As a failed head write: a pooled connection the upstream closed.
+        if first && from_pool && matches!(error, UpstreamError::SendFailed(_)) {
+            return AttemptOutcome::PooledStale;
+        }
         let kind = match error {
             UpstreamError::TimedOut(_) => FailKind::Timeout,
             _ => FailKind::Error,
@@ -1843,6 +1865,35 @@ async fn attempt(
     }
     if let Some(file) = &plan.body_file {
         state.bytes_sent += file.len;
+    }
+    if let Some(feed) = &plan.body_feed {
+        match Box::pin(send_body_feed(
+            &mut stream,
+            plan.request.clone(),
+            feed,
+            plan.send_timeout,
+        ))
+        .await
+        {
+            Ok(sent) => state.bytes_sent = sent,
+            Err(FeedSendError::Client(e)) => return AttemptOutcome::ClientBody(e.status()),
+            Err(FeedSendError::Upstream(UpstreamError::SendFailed(_)))
+                if from_pool && !feed.started() =>
+            {
+                return AttemptOutcome::PooledStale;
+            }
+            Err(FeedSendError::Upstream(error)) => {
+                let (kind, response) = match error {
+                    UpstreamError::TimedOut(_) => (FailKind::Timeout, plan.gateway_timeout),
+                    _ => (FailKind::Error, plan.bad_gateway),
+                };
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(response.pick(plan.method)),
+                    kind,
+                    Box::new(error),
+                );
+            }
+        }
     }
 
     // 3. Receive the header block. We need at least the head/body
@@ -3181,40 +3232,119 @@ fn upgraded(
 }
 
 /// Stream a request body that was too large to keep in memory from its
-/// temp file. Opened per attempt, so a retry on the next peer re-sends it
-/// from the start; `proxy_send_timeout` bounds each write.
+/// temp file, after the request `head`, which goes in the first write: a
+/// backend that reads the head alone may take the body for one still to
+/// come (#134). Opened per attempt, so a retry on the next peer re-sends
+/// it from the start; `proxy_send_timeout` bounds each write. The error
+/// says whether the first write failed.
 async fn send_body_file(
     stream: &mut UpstreamIo,
+    head: bytes::Bytes,
     file: &RequestBodyFile,
     send_timeout: Duration,
-) -> Result<(), UpstreamError> {
+) -> Result<(), (UpstreamError, bool)> {
     use monoio::buf::IoBuf;
     use std::os::unix::fs::FileExt;
+    const PIECE: usize = 64 * 1024;
     // Positional reads from the start: each attempt re-sends the whole
     // body through the same descriptor.
     let mut offset = 0u64;
     let mut left = file.len;
-    let mut buf = vec![0u8; 64 * 1024];
-    while left > 0 {
-        let want = left.min(buf.len() as u64) as usize;
+    let mut buf = Vec::with_capacity(head.len() + PIECE);
+    buf.extend_from_slice(&head);
+    let mut first = true;
+    while left > 0 || first {
+        let start = buf.len();
+        let want = left.min(PIECE as u64) as usize;
+        buf.resize(start + want, 0);
         let n = file
             .file
-            .read_at(&mut buf[..want], offset)
-            .map_err(UpstreamError::SendFailed)?;
-        if n == 0 {
-            return Err(UpstreamError::SendFailed(
-                std::io::ErrorKind::UnexpectedEof.into(),
+            .read_at(&mut buf[start..], offset)
+            .map_err(|e| (UpstreamError::SendFailed(e), false))?;
+        if n == 0 && want > 0 {
+            return Err((
+                UpstreamError::SendFailed(std::io::ErrorKind::UnexpectedEof.into()),
+                false,
             ));
         }
-        let (res, returned) = timeout(send_timeout, stream.write_all(buf.slice(..n)))
+        let len = start + n;
+        let (res, returned) = timeout(send_timeout, stream.write_all(buf.slice(..len)))
             .await
-            .map_err(|_| UpstreamError::TimedOut(Stage::SendingRequest))?;
+            .map_err(|_| (UpstreamError::TimedOut(Stage::SendingRequest), false))?;
         buf = returned.into_inner();
-        res.map_err(UpstreamError::SendFailed)?;
+        buf.clear();
+        res.map_err(|e| (UpstreamError::SendFailed(e), first))?;
+        first = false;
         left -= n as u64;
         offset += n as u64;
     }
     Ok(())
+}
+
+enum FeedSendError {
+    Client(crate::request_feed::FeedError),
+    Upstream(UpstreamError),
+}
+
+/// The request head, then the client's body as it arrives (#134):
+/// re-chunked when the client's is chunked (nginx's
+/// ngx_http_proxy_body_output_filter). What is there goes in one write,
+/// the head with the first piece and the last chunk with the one before,
+/// as nginx sends its buffers. The bytes written.
+#[cold]
+#[inline(never)]
+async fn send_body_feed(
+    stream: &mut UpstreamIo,
+    head: bytes::Bytes,
+    feed: &crate::request_feed::BodyFeed,
+    send_timeout: Duration,
+) -> Result<u64, FeedSendError> {
+    let mut out = head.to_vec();
+    let mut piece = feed.try_take();
+    let mut sent = 0u64;
+    loop {
+        if let Some(piece) = piece.take() {
+            if feed.chunked() {
+                out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                out.extend_from_slice(&piece);
+                out.extend_from_slice(b"\r\n");
+            } else {
+                out.extend_from_slice(&piece);
+            }
+        }
+        let last = feed.ended();
+        if last && feed.chunked() {
+            out.extend_from_slice(b"0\r\n\r\n");
+        }
+        if !out.is_empty() {
+            let len = out.len() as u64;
+            let (res, _) = timeout(send_timeout, stream.write_all(std::mem::take(&mut out)))
+                .await
+                .map_err(|_| {
+                    FeedSendError::Upstream(UpstreamError::TimedOut(Stage::SendingRequest))
+                })?;
+            res.map_err(|e| FeedSendError::Upstream(UpstreamError::SendFailed(e)))?;
+            sent += len;
+        }
+        if last {
+            return Ok(sent);
+        }
+        // `None`: the end, `ended` says so next time round.
+        piece = feed.next().await.map_err(FeedSendError::Client)?;
+    }
+}
+
+/// The client's body failed while it was sent upstream (#134).
+#[cold]
+#[inline(never)]
+fn client_body_error(plan: &ProxyPlan, status: u16) -> Response {
+    let body = format!("{}\n", crate::http::reason_phrase(status));
+    Response::Owned(crate::http::error_response_for_method(
+        status,
+        &body,
+        plan.method,
+        plan.server_bytes,
+    ))
 }
 
 /// A `proxy_limit_rate` with variables, from the upstream's head: its

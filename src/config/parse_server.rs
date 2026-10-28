@@ -760,6 +760,7 @@ pub(crate) fn parse_server_block(
                 | "proxy_set_header"
                 | "proxy_pass_request_headers"
                 | "proxy_pass_request_body"
+                | "proxy_request_buffering"
                 | "proxy_set_body"
                 | "proxy_ignore_headers"
                 | "proxy_connect_timeout"

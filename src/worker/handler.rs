@@ -1123,13 +1123,22 @@ pub(crate) fn run_location_handler(
             render_parts(parts, &proxy_render_ctx, &mut body);
             body
         });
+        // `proxy_request_buffering off` (#134): the body goes from the
+        // feed, what came with the header included, as the client sends
+        // it. Once a pass sent some, there is none for another.
+        let body_feed = req
+            .body_feed
+            .filter(|f| set_body.is_none() && proxy.pass_request_body && !f.started());
         let forward_body: &[u8] = match &set_body {
             Some(body) => body,
+            None if body_feed.is_some() => &[],
             None if proxy.pass_request_body => req.body,
             None => &[],
         };
         let forward_len = match &set_body {
             Some(body) => body.len() as u64,
+            None if body_feed.is_some_and(|f| f.chunked()) => 0,
+            None if body_feed.is_some() => req.body_len,
             None if proxy.pass_request_body && req.body_file.is_some() => req.body_len,
             // A body dropped unread (discarded, or over the limit, on the
             // way to an error page) has a length and no bytes: none go
@@ -1152,7 +1161,9 @@ pub(crate) fn run_location_handler(
         // client framed a body (a Content-Length, a chunked body, an
         // HTTP/2 stream with DATA) or `proxy_set_body` gave one, whatever
         // the method; a request without body framing has none (#493).
-        if !have_content_length_override {
+        if body_feed.is_some_and(|f| f.chunked()) {
+            overrides_buf.push((b"Transfer-Encoding", b"chunked".to_vec()));
+        } else if !have_content_length_override {
             if forward_len > 0 {
                 overrides_buf.push((b"Content-Length", forward_len.to_string().into_bytes()));
             } else if set_body.is_some() || body_framed(req.headers_raw) {
@@ -1296,6 +1307,7 @@ pub(crate) fn run_location_handler(
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
             body_file,
+            body_feed: body_feed.cloned(),
             keep_upstream_headers: !loc.add_headers.is_empty()
                 || !loc.add_trailers.is_empty()
                 || loc.access_logs.iter().any(|l| l.reads_upstream_headers),

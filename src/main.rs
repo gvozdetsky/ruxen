@@ -32,6 +32,7 @@ mod proxy;
 mod proxy_cache;
 mod proxy_protocol;
 mod proxy_stream;
+mod request_feed;
 mod resolver;
 mod sd_notify;
 mod syslog;
