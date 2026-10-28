@@ -5938,12 +5938,13 @@ pub(crate) async fn handle<S: ConnIo>(
                             stamp_date(&mut *scratch, &mut scan);
                             let taken = std::mem::take(&mut *scratch);
                             let len = taken.len();
-                            let (res, returned) = write_all_timed(
+                            let (res, returned) = write_response(
                                 stream,
                                 taken,
                                 len,
                                 timers.io.as_mut(),
                                 send_timeout,
+                                body_read,
                             )
                             .await;
                             *scratch = returned;
@@ -6098,18 +6099,19 @@ pub(crate) async fn handle<S: ConnIo>(
                                     cut_sent = Some(n);
                                 }
                             } else {
-                                // Hand scratch to monoio for the io_uring
-                                // write; it returns the Vec after the write
-                                // completes so we reuse the same allocation
-                                // next request.
+                                // Hand scratch to the write (io_uring, or at
+                                // once after a body); it returns the Vec after
+                                // the write completes so we reuse the same
+                                // allocation next request.
                                 let taken = std::mem::take(&mut *scratch);
                                 let len = taken.len();
-                                let (res, returned) = write_all_timed(
+                                let (res, returned) = write_response(
                                     stream,
                                     taken,
                                     len,
                                     timers.io.as_mut(),
                                     send_timeout,
+                                    body_read,
                                 )
                                 .await;
                                 *scratch = returned;
