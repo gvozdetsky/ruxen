@@ -611,6 +611,19 @@ pub struct Reroute {
     /// The error page answers a status after which nginx's special
     /// response handler ends the connection (`http::closes_connection`).
     pub closes: bool,
+    /// A named target reached from the proxy path: where the request was.
+    pub named_from: Option<Box<NamedFrom>>,
+}
+
+/// The URI, arguments and URI state a proxying location left, for a jump
+/// to a named location after `proxy_intercept_errors` (#814): nginx's
+/// ngx_http_named_location keeps `r->uri`, `r->args`, `valid_unparsed_uri`.
+#[derive(Clone)]
+pub struct NamedFrom {
+    pub uri: Vec<u8>,
+    pub args: Option<Vec<u8>>,
+    pub unparsed_uri: bool,
+    pub internal: bool,
 }
 
 /// Test-only helper: run the pipeline and return only the response,
@@ -808,6 +821,7 @@ fn process_with_meta_inner(
     let req_in = req;
     // An error page for a status that ends the connection (`Reroute::closes`).
     let mut closes = false;
+    let mut named_state: Option<(bool, bool)> = None;
     match initial_reroute {
         None => {
             // Normalize the URI once at FindConfig entry; Rewrite / internal
@@ -829,6 +843,10 @@ fn process_with_meta_inner(
         }
         Some(reroute) => {
             closes = reroute.closes;
+            named_state = reroute
+                .named_from
+                .as_ref()
+                .map(|from| (from.unparsed_uri, from.internal));
             if turns_into_get(req, &reroute) {
                 req_now = Some(error_page_request(req));
             }
@@ -867,10 +885,12 @@ fn process_with_meta_inner(
                     }
                 }
                 RerouteTarget::Named(name) => {
-                    // Named-location jumps preserve the current URI. Seed the
-                    // normalized request URI and start the loop with a named target.
+                    // Named-location jumps preserve the current URI: the
+                    // one the proxying location had, else the request's.
                     url_scratch.clear();
-                    if let Err(resp) =
+                    if let Some(from) = &reroute.named_from {
+                        url_scratch.extend_from_slice(&from.uri);
+                    } else if let Err(resp) =
                         normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
                     {
                         return (resp, refused_meta(server, true));
@@ -882,6 +902,10 @@ fn process_with_meta_inner(
     }
     let mut rewrite_state = RewriteState::default();
     rewrite_state.doc_root = Some(server.doc_root);
+    if let Some((unparsed_uri, internal)) = named_state {
+        rewrite_state.unparsed_uri = unparsed_uri;
+        rewrite_state.internal = internal;
+    }
     // A regex server_name's captures are `$1`…`$9` until another regex
     // matches (nginx's r->captures from ngx_http_find_virtual_server).
     if let Some(captures) = regex_captures.as_ref() {

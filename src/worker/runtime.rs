@@ -1679,6 +1679,7 @@ fn accel_redirect_reroute(target: Vec<u8>) -> phase::Reroute {
         preserved_location: None,
         preserved_www_authenticate: Vec::new(),
         closes: false,
+        named_from: None,
     }
 }
 
@@ -1823,6 +1824,7 @@ async fn run_post_action(
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
                 closes: false,
+                named_from: None,
             },
         )
     };
@@ -2500,6 +2502,7 @@ async fn run_auth_subrequest(
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
                 closes: false,
+                named_from: None,
             }
         });
     // `auth_request_set` reads the upstream's header (`$upstream_http_*`):

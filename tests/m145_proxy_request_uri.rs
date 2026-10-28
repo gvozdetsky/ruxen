@@ -55,9 +55,15 @@ fn spawn_target_echo() -> u16 {
                 .map_or("", |(t, _)| t);
             let lines = head.trim_end().split("\r\n").count() - 1;
             let body = format!("[{target}] lines={lines}");
+            // `/st404…` answers 404, for `proxy_intercept_errors`.
+            let status = if target.starts_with("/st404") {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
             let _ = write!(
                 s,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }
@@ -96,6 +102,13 @@ fn start(up: u16) -> Server {
                location /tr/ {{ rewrite ^/tr/(.*)$ /n/$1 break; try_files $uri @app; }}\n\
                location /tu/ {{ try_files $uri /n/; }}\n\
                location @app {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+               location /pi/ {{ proxy_pass http://127.0.0.1:{up}/st404/;\n\
+                 proxy_intercept_errors on; error_page 404 = @app; }}\n\
+               location /pr/ {{ rewrite ^/pr/(.*)$ /st404/$1 break;\n\
+                 proxy_pass http://127.0.0.1:{up};\n\
+                 proxy_intercept_errors on; error_page 404 = @app; }}\n\
+               location /pa/ {{ set $args \"x=1\"; proxy_pass http://127.0.0.1:{up}/st404/;\n\
+                 proxy_intercept_errors on; error_page 404 = @app; }}\n\
              }} }}\n"
         ),
     )
@@ -226,6 +239,30 @@ fn named_location_keeps_the_client_target() {
         ("/tr/a%2Fb", "/n/a/b"),
         ("/tr/a\\b", "/n/a%5Cb"),
         ("/tu/a%2Fb", "/n/"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
+}
+
+/// `proxy_intercept_errors` to `error_page … @app`: the named location
+/// starts from where the proxying location was, its rewritten URI and
+/// arguments, as ngx_http_named_location keeps them (#814).
+#[test]
+fn intercepted_error_to_a_named_location_keeps_the_uri() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, upstream_gets) in [
+        // Unchanged: the client's own target.
+        ("/pi/a%2Fb", "/pi/a%2Fb"),
+        // Rewritten: the new `$uri`, escaped, with the client's args.
+        ("/pr/a%2Fb?q=1", "/st404/a/b?q=1"),
+        ("/pr/a\\b", "/st404/a%5Cb"),
+        // `set $args`: the new arguments.
+        ("/pa/a%2Fb?q=1", "/pa/a/b?x=1"),
     ] {
         let resp = get(server.port, target);
         assert!(
