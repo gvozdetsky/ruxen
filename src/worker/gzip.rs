@@ -353,7 +353,7 @@ fn gzip_ok(gz: &PreparedGzip, req: &GzipRequest<'_>, head: &Head<'_>) -> bool {
         return false;
     }
     if let (Some(set), Some(ua)) = (&gz.disable, req.user_agent)
-        && set.is_match(&String::from_utf8_lossy(ua))
+        && set.is_match(ua)
     {
         return false;
     }

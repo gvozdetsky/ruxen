@@ -16,7 +16,6 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
-use monoio::io::AsyncReadRent;
 use monoio::time::timeout;
 
 use crate::proxy::{AttemptFailure, Stage, UpstreamError};
@@ -696,7 +695,7 @@ impl BodyReader {
         if s.limit_rate != 0 {
             buf = paced_read_buf(buf, s.limit_rate, s.paced, s.pacer_start);
         }
-        let (res, returned) = match timeout(s.read_timeout, s.upstream.read(buf)).await {
+        let (res, returned) = match timeout(s.read_timeout, s.upstream.read_now(buf)).await {
             Ok(pair) => pair,
             Err(_) => {
                 self.end.failure = Some(failure(s, UpstreamError::TimedOut(Stage::ReadingBody)));
@@ -1061,7 +1060,7 @@ pub(crate) async fn fill_cache(mut s: Box<ProxyStream>) {
         }
         let mut buf = std::mem::take(&mut s.read_buf);
         buf.clear();
-        let Ok((res, returned)) = timeout(s.read_timeout, s.upstream.read(buf)).await else {
+        let Ok((res, returned)) = timeout(s.read_timeout, s.upstream.read_now(buf)).await else {
             return;
         };
         s.read_buf = returned;

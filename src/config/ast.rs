@@ -815,8 +815,8 @@ pub struct Listen {
     /// Parsed-but-not-honored at routing time yet; first declaration wins
     /// today (nginx default behavior is the same when no flag is set).
     pub default_server: bool,
-    /// `reuseport` — set `SO_REUSEPORT` per-listener. Already implicit in the
-    /// thread-per-core design; presence is a parse-time noop.
+    /// `reuseport`: other processes may share the address (workers always
+    /// bind with `SO_REUSEPORT`; without it startup claims the address).
     pub reuseport: bool,
     /// `http2`: HTTP/2 on this address, the nginx 1.24 spelling of
     /// `http2 on` (#144).
@@ -881,6 +881,7 @@ impl Listen {
     /// server (nginx's "duplicate listen options" check).
     pub(crate) fn has_socket_options(&self) -> bool {
         self.deferred
+            || self.reuseport
             || self.fastopen.is_some()
             || self.backlog.is_some()
             || self.rcvbuf.is_some()
