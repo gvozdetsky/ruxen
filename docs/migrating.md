@@ -294,8 +294,9 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
   `Options KTLS` (and `-KTLS`): as in nginx, the kernel then encrypts the
   records after the handshake, and `sendfile` works over TLS. It needs the
   `tls` kernel module (`modprobe tls`; ruxen started as root loads it);
-  without it ruxen warns at startup and serves TLS in userspace. A TLS 1.3
-  KeyUpdate from the client closes a kTLS connection.
+  without it ruxen warns at startup and serves TLS in userspace. TLS 1.3
+  key updates need Linux 6.14 or later; on older kernels a client's
+  KeyUpdate closes a kTLS connection.
 - **Do:** check what the other commands set. `Ciphersuites`: rustls's
   TLS 1.3 suites are AES-GCM and ChaCha20-Poly1305.
 

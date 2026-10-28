@@ -379,6 +379,8 @@ pub(crate) enum IntoKtls<IO> {
         secrets: rustls::ExtractedSecrets,
         read: Vec<u8>,
         closed: bool,
+        /// The ClientHello's random, for the logged secrets (#852).
+        random: Option<[u8; 32]>,
     },
     /// Not switched, nothing changed: serve it in userspace.
     Userspace(TlsStream<IO>),
@@ -449,6 +451,7 @@ impl<IO> TlsStream<IO> {
                 secrets,
                 read,
                 closed,
+                random: records.client_random(),
             },
             Err(e) => IntoKtls::Failed(io::Error::other(e)),
         }

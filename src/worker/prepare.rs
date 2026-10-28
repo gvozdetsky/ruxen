@@ -755,8 +755,12 @@ pub(crate) fn build_listen_tls(
             .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
             if let Some(config) = Arc::get_mut(&mut config) {
                 crate::tls_certs::compress_certificates(config, compressed);
-                // The traffic keys go to the kernel after the handshake.
+                // The traffic keys go to the kernel after the handshake,
+                // and the secrets for key updates with them (#852).
                 config.enable_secret_extraction = ktls;
+                if ktls {
+                    config.key_log = Arc::new(crate::ktls::SecretLog);
+                }
             }
             Ok(config)
         };
