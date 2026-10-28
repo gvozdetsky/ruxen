@@ -407,7 +407,7 @@ pub(crate) fn parse_server_block(
             }
             ("root", Terminator::Semi) => {
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some(PathBuf::from(path));
+                root = Some(parse_root_path(false, path)?);
             }
             ("return", Terminator::Semi) => {
                 let (status, body) = parse_return_args(&args[1..])?;

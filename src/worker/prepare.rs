@@ -3484,6 +3484,41 @@ pub(crate) fn prepare_path_mapping(
     }
 }
 
+/// A `root` / `alias` path with variables, compiled as ngx_http_core_root
+/// does (#232); `None` for a literal one.
+pub(crate) fn prepare_root_template(
+    path: &Path,
+    mapping: PathMapping,
+) -> Option<&'static RootTemplate> {
+    let raw = path.to_str()?;
+    if !raw.contains('$') {
+        return None;
+    }
+    // nginx drops a `root`'s trailing slash, not an `alias`'s.
+    let raw = match mapping {
+        PathMapping::Root if raw.len() > 1 => raw.strip_suffix('/').unwrap_or(raw),
+        _ => raw,
+    };
+    let parts = crate::config::parse_value_with_vars(raw).ok()?;
+    if !parts.iter().any(|p| matches!(p, ValuePart::Var(_))) {
+        return None;
+    }
+    // ruxen runs in the prefix (`-p`), so a relative path opens as is; the
+    // prefix makes `$document_root` and the log lines absolute.
+    let prefix = match parts.first() {
+        Some(ValuePart::Literal(text)) if text.starts_with('/') => None,
+        _ => std::env::current_dir().ok().map(leak_path_buf),
+    };
+    let literal_dot_dot = parts
+        .iter()
+        .any(|p| matches!(p, ValuePart::Literal(text) if text.contains("..")));
+    Some(crate::arena::leak(Box::new(RootTemplate {
+        parts: prepare_value_parts(parts),
+        prefix,
+        literal_dot_dot,
+    })))
+}
+
 /// A location's (or server's) `DocRoot`, leaked for the process.
 pub(crate) fn leak_doc_root(
     (path, mapping): (std::path::PathBuf, PathMapping),
@@ -3493,6 +3528,7 @@ pub(crate) fn leak_doc_root(
     disable_symlinks: Option<crate::config::DisableSymlinks>,
     charset: Option<&'static PreparedCharset>,
 ) -> &'static DocRoot {
+    let template = prepare_root_template(&path, mapping);
     // nginx resolves a relative root under the prefix (ruxen's working
     // directory by now) and prints it absolute.
     let path = if path.is_relative() {
@@ -3511,6 +3547,7 @@ pub(crate) fn leak_doc_root(
         ),
         symlinks: PreparedSymlinks::new(disable_symlinks),
         charset,
+        template,
     }))
 }
 
@@ -3706,8 +3743,13 @@ pub(crate) fn build_handler(
             // missing root is a 404 at request time. ruxen opens the root
             // as an `openat2(RESOLVE_BENEATH)` anchor, at startup when it
             // exists, else on first use (`PreparedRoot::fd`).
+            let template = prepare_root_template(&path, mapping);
             let root: &'static Path = crate::arena::leak(path.into_boxed_path());
-            let root_fd = open_root(root).unwrap_or(-1);
+            // A rendered root is opened per request.
+            let root_fd = match template {
+                None => open_root(root).unwrap_or(-1),
+                Some(_) => -1,
+            };
             if root_fd != -1 {
                 ROOT_FDS.with(|fds| fds.borrow_mut().push(root_fd));
             }
@@ -3737,6 +3779,7 @@ pub(crate) fn build_handler(
                 root,
                 types: prepare_types(site.mime),
                 root_fd,
+                template,
                 symlinks: PreparedSymlinks::new(site.disable_symlinks.clone()),
                 path_mapping,
                 index,

@@ -162,12 +162,15 @@ impl RenderCtx<'_> {
                 {
                     return;
                 }
-                let path = crate::fs_resolve::request_filename(doc_root, self.uri);
+                let root = doc_root.path_for(self);
+                let path = crate::fs_resolve::request_filename(doc_root, &root, self.uri);
                 out.extend_from_slice(path.as_os_str().as_bytes());
             }
-            Variable::DocumentRoot => out.extend_from_slice(doc_root.path.as_os_str().as_bytes()),
+            Variable::DocumentRoot => {
+                out.extend_from_slice(doc_root.path_for(self).as_os_str().as_bytes())
+            }
             _ => {
-                if let Ok(real) = doc_root.path.canonicalize() {
+                if let Ok(real) = doc_root.path_for(self).canonicalize() {
                     out.extend_from_slice(real.as_os_str().as_bytes());
                 }
             }

@@ -24,7 +24,8 @@ use crate::config::{ErrorLogLevel, SymlinkMode};
 use crate::phase::RerouteTarget;
 use crate::worker::{
     Prebuilt, PreparedFallback, PreparedIndexEntry, PreparedPathMapping, PreparedProbe,
-    PreparedRoot, PreparedSymlinkFrom, PreparedSymlinks, PreparedTryFiles, RenderCtx, render_parts,
+    PreparedRoot, PreparedSymlinkFrom, PreparedSymlinks, PreparedTryFiles, RenderCtx, RootTemplate,
+    render_parts,
 };
 
 /// A file successfully opened under the server root, with its metadata
@@ -77,10 +78,63 @@ pub enum Outcome {
 /// into the static/index pass with the rewritten URL; on full miss we
 /// apply the configured fallback.
 pub fn resolve(
-    root: &'static PreparedRoot,
+    root: &'static PreparedRoot<'static>,
     url_path: &[u8],
     render_ctx: &RenderCtx<'_>,
 ) -> Outcome {
+    if let Some(template) = root.template {
+        return resolve_rendered(root, template, url_path, render_ctx);
+    }
+    resolve_under(root, url_path, render_ctx)
+}
+
+/// `resolve` for a `root` / `alias` with variables (#232): rendered as
+/// nginx's ngx_http_map_uri_to_path does, then opened as this request's
+/// anchor, beneath which the URI resolves as under a literal root.
+#[cold]
+#[inline(never)]
+fn resolve_rendered(
+    root: &PreparedRoot<'static>,
+    template: &RootTemplate,
+    url_path: &[u8],
+    render_ctx: &RenderCtx<'_>,
+) -> Outcome {
+    let path = template.render(render_ctx);
+    if template.is_unsafe(&path) {
+        note_failed_lookup(
+            format!(
+                "unsafe path \"{}\" from variables",
+                String::from_utf8_lossy(path.as_os_str().as_bytes())
+            ),
+            false,
+        );
+        return Outcome::Forbidden;
+    }
+    // O_NONBLOCK: a regex `alias` names the file itself, which may be a
+    // FIFO (READ_FLAGS).
+    let anchor = with_c_path(path.as_os_str().as_bytes(), |c| unsafe {
+        libc::open(c, READ_FLAGS | libc::O_CLOEXEC)
+    })
+    .and_then(|fd| {
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    });
+    // Its error is reported where the anchor is needed (`PreparedRoot::fd`).
+    let root_fd = match &anchor {
+        Ok(fd) => fd.as_raw_fd(),
+        Err(e) => -1 - e.raw_os_error().unwrap_or(libc::EIO),
+    };
+    let rendered = PreparedRoot {
+        root: &path,
+        root_fd,
+        ..*root
+    };
+    resolve_under(&rendered, url_path, render_ctx)
+}
+
+fn resolve_under(root: &PreparedRoot<'_>, url_path: &[u8], render_ctx: &RenderCtx<'_>) -> Outcome {
     if let Some(tf) = root.try_files {
         match run_try_files(root, tf, url_path, render_ctx) {
             TryFilesResult::Hit {
@@ -846,7 +900,11 @@ fn relative_uri_path_for_try_files_probe<'a>(root: &PreparedRoot, probe_uri: &'a
 }
 
 /// `$request_filename`: `uri` under a location's root or alias.
-pub(crate) fn request_filename(doc_root: &crate::worker::DocRoot, uri: &[u8]) -> PathBuf {
+pub(crate) fn request_filename(
+    doc_root: &crate::worker::DocRoot,
+    path: &Path,
+    uri: &[u8],
+) -> PathBuf {
     let rel = match doc_root.mapping {
         PreparedPathMapping::Root => trim_leading_slashes(uri),
         PreparedPathMapping::AliasPrefix { prefix } => {
@@ -854,7 +912,7 @@ pub(crate) fn request_filename(doc_root: &crate::worker::DocRoot, uri: &[u8]) ->
         }
         PreparedPathMapping::AliasRegex => b"",
     };
-    join(doc_root.path, rel)
+    join(path, rel)
 }
 
 fn map_uri_for_static(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -> PathBuf {
@@ -955,7 +1013,7 @@ mod tests {
 
     use super::*;
 
-    fn fake_root(mapping: PreparedPathMapping) -> PreparedRoot {
+    fn fake_root(mapping: PreparedPathMapping) -> PreparedRoot<'static> {
         PreparedRoot {
             root: Path::new("/srv"),
             types: crate::arena::leak(Box::new(crate::worker::PreparedTypes {
@@ -966,6 +1024,7 @@ mod tests {
             // `AT_FDCWD` is fine for tests that only exercise the path
             // utilities below — none of them hit `openat2`.
             root_fd: libc::AT_FDCWD,
+            template: None,
             symlinks: PreparedSymlinks::new(None),
             path_mapping: mapping,
             index: &[],

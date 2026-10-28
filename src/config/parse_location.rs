@@ -1050,7 +1050,7 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("root/alias"));
                 }
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some((PathBuf::from(path), PathMapping::Root));
+                root = Some((parse_root_path(false, path)?, PathMapping::Root));
                 local_path_mapping = Some(PathMapping::Root);
                 alias_prefix_override = None;
             }
@@ -1092,7 +1092,7 @@ pub(crate) fn parse_location_block(
                         spec.pattern,
                     ));
                 }
-                root = Some((PathBuf::from(path), PathMapping::Alias));
+                root = Some((parse_root_path(true, path)?, PathMapping::Alias));
                 local_path_mapping = Some(PathMapping::Alias);
                 alias_prefix_override = None;
             }

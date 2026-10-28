@@ -568,10 +568,10 @@ mod tests {
 
     #[test]
     fn unenforced_restrictions_are_unsupported() {
-        let (found, _) = findings("http { server { root /srv/$host; } }");
+        let (found, _) = findings("http { server { location $arg_x { return 403; } } }");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].severity, Severity::Unsupported);
-        assert_eq!(found[0].directive, "root /srv/$host");
+        assert_eq!(found[0].directive, "location $arg_x");
     }
 
     #[test]
