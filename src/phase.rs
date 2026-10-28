@@ -248,6 +248,8 @@ pub struct KeepaliveMeta {
     pub header_timeout_secs: Option<u64>,
     pub max_requests: u64,
     pub max_time_ms: u64,
+    /// `keepalive_min_timeout`, saturated: a u32 fits the padding.
+    pub min_timeout_ms: u32,
     pub disable_msie6: bool,
     pub disable_safari: bool,
 }
@@ -260,6 +262,7 @@ impl Default for KeepaliveMeta {
             header_timeout_secs: None,
             max_requests: 1_000,
             max_time_ms: 3_600_000,
+            min_timeout_ms: 0,
             disable_msie6: true,
             disable_safari: false,
         }
@@ -2294,6 +2297,7 @@ fn apply_location_meta(
         header_timeout_secs: loc.keepalive.header_timeout_secs,
         max_requests: loc.keepalive.max_requests,
         max_time_ms: loc.keepalive.max_time_ms,
+        min_timeout_ms: u32::try_from(loc.keepalive.min_timeout_ms).unwrap_or(u32::MAX),
         disable_msie6: loc.keepalive.disable_msie6,
         disable_safari: loc.keepalive.disable_safari,
     };

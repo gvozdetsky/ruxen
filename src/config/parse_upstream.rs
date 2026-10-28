@@ -782,6 +782,7 @@ impl ProxyConf {
         "proxy_ssl_certificate",
         "proxy_ssl_certificate_key",
         "proxy_ssl_password_file",
+        "proxy_ssl_certificate_cache",
         "resolver",
         "resolver_timeout",
     ];
@@ -996,6 +997,15 @@ impl ProxyConf {
                         std::path::PathBuf::from(&args[1]),
                     )))
                 });
+            }
+            "proxy_ssl_certificate_cache" => {
+                if self.ssl_certificate_cache.is_some() {
+                    return Err(Error::Duplicate("proxy_ssl_certificate_cache"));
+                }
+                self.ssl_certificate_cache = Some(super::parse_ssl_cache_args(
+                    &args[1..],
+                    "proxy_ssl_certificate_cache",
+                )?);
             }
             "proxy_ssl_password_file" => {
                 if self.ssl_password_file.is_some() {
