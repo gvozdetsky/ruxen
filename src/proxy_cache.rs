@@ -7,7 +7,8 @@
 //! `&'static`, split into shards by the key's hash, each a `Mutex` around a
 //! map and an LRU list, as the `limit_req` zones are. The capacity comes
 //! from the zone's size (nginx's node is about 128 bytes) and is fixed: a
-//! full shard drops its least recently used entry and that entry's file.
+//! full shard drops its least recently used entry and that entry's file,
+//! and sets the watermark the manager brings the zone under (#839).
 //!
 //! The files are ruxen's own format, not nginx's (a cache directory is not
 //! shared between the two): a fixed header, the key, the upstream's header
@@ -37,6 +38,22 @@ pub enum CacheStatus {
 }
 
 impl CacheStatus {
+    /// Every status, in the order of `index`.
+    pub const ALL: [CacheStatus; 7] = [
+        CacheStatus::Miss,
+        CacheStatus::Bypass,
+        CacheStatus::Expired,
+        CacheStatus::Stale,
+        CacheStatus::Updating,
+        CacheStatus::Revalidated,
+        CacheStatus::Hit,
+    ];
+
+    /// The status's place in `ALL`.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
     pub fn as_bytes(self) -> &'static [u8] {
         match self {
             CacheStatus::Miss => b"MISS",
@@ -152,8 +169,9 @@ impl Shard {
 
     /// Drop node `i`, taking its file's size off `size`; the hash of the
     /// file to delete, if it had one.
-    fn remove(&mut self, i: usize, size: &AtomicU64) -> Option<CacheHash> {
+    fn remove(&mut self, i: usize, size: &AtomicU64, count: &AtomicU64) -> Option<CacheHash> {
         self.unlink(i);
+        count.fetch_sub(1, Ordering::Relaxed);
         let node = &self.nodes[i];
         let hash = node.hash;
         let file = node.exists.then_some(hash);
@@ -165,7 +183,8 @@ impl Shard {
         file
     }
 
-    fn insert(&mut self, hash: CacheHash, now: i64) -> usize {
+    fn insert(&mut self, hash: CacheHash, now: i64, count: &AtomicU64) -> usize {
+        count.fetch_add(1, Ordering::Relaxed);
         let node = Node {
             hash,
             uses: 0,
@@ -237,6 +256,17 @@ pub struct CacheZone {
     shards: Box<[Mutex<Shard>]>,
     /// Bytes of the files the index knows.
     size: AtomicU64,
+    /// Entries in the index, and how many the manager brings it under
+    /// once the index was full (nginx's `sh->watermark`: 7/8 of what it
+    /// held then).
+    count: AtomicU64,
+    watermark: AtomicU64,
+    /// `manager_files`, `manager_sleep`, `manager_threshold`: a pass
+    /// removes at most this many files, or works this long, then sleeps.
+    /// A reload that keeps the zone sets them anew.
+    manager_files: AtomicU64,
+    manager_sleep_ms: AtomicU64,
+    manager_threshold_ms: AtomicU64,
     temp_seq: AtomicU64,
     lock_seq: AtomicU64,
     /// The configured zone size (`keys_zone=name:size`).
@@ -246,6 +276,9 @@ pub struct CacheZone {
     /// No configuration uses the zone any more after a reload: its
     /// manager stops.
     retired: AtomicBool,
+    /// Requests by `$upstream_cache_status` (`CacheStatus::ALL` order), for
+    /// `ruxen_metrics` (#481).
+    pub counters: crate::worker::metrics::ZoneCounters<7>,
 }
 
 /// The zones of the configurations workers serve. A reload that declares a
@@ -267,6 +300,7 @@ pub fn zone_for(conf: ZoneConf) -> &'static CacheZone {
             && z.min_free == conf.min_free.unwrap_or(0)
     });
     if let Some(zone) = same {
+        zone.set_manager(&conf);
         return zone;
     }
     let zone: &'static CacheZone = Box::leak(Box::new(CacheZone::new(conf)));
@@ -296,9 +330,21 @@ pub struct ZoneConf {
     pub inactive_secs: u64,
     pub max_size: Option<u64>,
     pub min_free: Option<u64>,
+    pub manager_files: u64,
+    pub manager_sleep_ms: u64,
+    pub manager_threshold_ms: u64,
 }
 
 impl CacheZone {
+    fn set_manager(&self, conf: &ZoneConf) {
+        self.manager_files
+            .store(conf.manager_files, Ordering::Relaxed);
+        self.manager_sleep_ms
+            .store(conf.manager_sleep_ms, Ordering::Relaxed);
+        self.manager_threshold_ms
+            .store(conf.manager_threshold_ms, Ordering::Relaxed);
+    }
+
     pub fn new(conf: ZoneConf) -> CacheZone {
         const SHARDS: usize = 16;
         let entries = (conf.size / 128).max(SHARDS as u64) as usize;
@@ -324,11 +370,17 @@ impl CacheZone {
             min_free: conf.min_free.unwrap_or(0),
             shards,
             size: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            watermark: AtomicU64::new(u64::MAX),
+            manager_files: AtomicU64::new(conf.manager_files),
+            manager_sleep_ms: AtomicU64::new(conf.manager_sleep_ms),
+            manager_threshold_ms: AtomicU64::new(conf.manager_threshold_ms),
             temp_seq: AtomicU64::new(0),
             lock_seq: AtomicU64::new(1),
             zone_size: conf.size,
             managed: AtomicBool::new(false),
             retired: AtomicBool::new(false),
+            counters: Default::default(),
         }
     }
 
@@ -366,7 +418,7 @@ impl CacheZone {
             if let Some(i) = found
                 && now - shard.nodes[i].accessed > self.inactive
             {
-                freed.extend(shard.remove(i, &self.size));
+                freed.extend(shard.remove(i, &self.size, &self.count));
                 found = None;
             }
             match found {
@@ -413,12 +465,17 @@ impl CacheZone {
                     }
                 }
                 None => {
-                    // nginx's forced expire when the zone is full.
+                    // The zone is full: nginx sets the watermark the
+                    // manager brings it under, and expires the oldest now.
+                    if shard.map.len() >= shard.capacity {
+                        let count = self.count.load(Ordering::Relaxed);
+                        self.watermark.store(count - count / 8, Ordering::Relaxed);
+                    }
                     while shard.map.len() >= shard.capacity && shard.tail != NIL {
                         let tail = shard.tail;
-                        freed.extend(shard.remove(tail, &self.size));
+                        freed.extend(shard.remove(tail, &self.size, &self.count));
                     }
-                    let i = shard.insert(*hash, now);
+                    let i = shard.insert(*hash, now, &self.count);
                     shard.nodes[i].uses = 1;
                     Lookup::Miss {
                         store: min_uses <= 1,
@@ -589,93 +646,120 @@ impl CacheZone {
         Ok(fill)
     }
 
-    /// A file renamed into place: the index counts it, and `max_size`
-    /// evicts others for it.
+    /// A file renamed into place: the index counts it. Past `max_size`,
+    /// the manager's next pass removes the oldest, as nginx's does.
     fn stored(&self, hash: &CacheHash, fill: &CacheFill<'_>) {
         let fs_size = fill.header_len + fill.body_len;
-        let mut freed = Vec::new();
-        {
-            let mut shard = self.lock(hash);
-            // Evicted while the response was fetched: the file stays for
-            // a later lookup to adopt.
-            if let Some(i) = shard.map.get(hash).copied() {
-                let node = &mut shard.nodes[i];
-                if node.exists {
-                    self.size.fetch_sub(node.fs_size, Ordering::Relaxed);
-                }
-                node.exists = true;
-                node.error = 0;
-                node.valid_sec = fill.valid_sec;
-                node.updating_sec = fill.updating_sec;
-                node.error_sec = fill.error_sec;
-                node.fs_size = fs_size;
-                self.size.fetch_add(fs_size, Ordering::Relaxed);
+        let mut shard = self.lock(hash);
+        // Evicted while the response was fetched: the file stays for a
+        // later lookup to adopt.
+        if let Some(i) = shard.map.get(hash).copied() {
+            let node = &mut shard.nodes[i];
+            if node.exists {
+                self.size.fetch_sub(node.fs_size, Ordering::Relaxed);
             }
+            node.exists = true;
+            node.error = 0;
+            node.valid_sec = fill.valid_sec;
+            node.updating_sec = fill.updating_sec;
+            node.error_sec = fill.error_sec;
+            node.fs_size = fs_size;
+            self.size.fetch_add(fs_size, Ordering::Relaxed);
         }
-        // `max_size`: the least recently used files go, in the other
-        // shards too, never the one just stored.
-        if self.size.load(Ordering::Relaxed) > self.max_size {
-            for shard in self.shards.iter() {
-                let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
-                let mut i = shard.tail;
-                while i != NIL && self.size.load(Ordering::Relaxed) > self.max_size {
-                    let prev = shard.nodes[i].prev;
-                    if shard.nodes[i].exists && shard.nodes[i].hash != *hash {
-                        freed.extend(shard.remove(i, &self.size));
-                    }
-                    i = prev;
-                }
-            }
-        }
-        self.delete_files(freed);
     }
 
-    /// One pass of nginx's cache manager (ngx_http_file_cache_expire and
-    /// _forced_expire): entries not asked for in `inactive` go, then the
-    /// least recently used while the files are over `max_size` or the file
-    /// system has less than `min_free`.
-    /// Entries a request is updating stay.
-    pub fn manage(&self, now: i64) {
+    /// One pass of nginx's cache manager (ngx_http_file_cache_manager):
+    /// entries not asked for in `inactive` go (_expire), then the least
+    /// recently used while the files are over `max_size`, the index is at
+    /// its watermark or the file system has less than `min_free`
+    /// (_forced_expire). A pass removes at most `manager_files` entries and
+    /// works at most `manager_threshold`; entries a request is updating
+    /// stay. Returns how long to sleep before the next one.
+    pub fn manage(&self, now: i64) -> std::time::Duration {
+        use std::time::Duration;
+        let started = std::time::Instant::now();
+        let files_max = self.manager_files.load(Ordering::Relaxed);
+        let sleep = Duration::from_millis(self.manager_sleep_ms.load(Ordering::Relaxed));
+        let threshold = Duration::from_millis(self.manager_threshold_ms.load(Ordering::Relaxed));
+        let mut files = 0u64;
         let mut freed = Vec::new();
+        // A pass that did its share sleeps `manager_sleep`.
+        let spent = |files: &mut u64| {
+            *files += 1;
+            *files >= files_max || started.elapsed() >= threshold
+        };
+        // Until the oldest entry left would expire, at most 10 s.
+        let mut next = 10i64;
         for shard in self.shards.iter() {
             let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
             let mut i = shard.tail;
-            while i != NIL
-                && now - shard.nodes[i].accessed > self.inactive
-                && !shard.nodes[i].updating
-            {
-                let prev = shard.nodes[i].prev;
-                freed.extend(shard.remove(i, &self.size));
+            while i != NIL {
+                let node = &shard.nodes[i];
+                let wait = node.accessed + self.inactive - now;
+                if wait >= 0 {
+                    next = next.min(wait.max(1));
+                    break;
+                }
+                let prev = node.prev;
+                if !node.updating {
+                    freed.extend(shard.remove(i, &self.size, &self.count));
+                    if spent(&mut files) {
+                        drop(shard);
+                        self.delete_files(freed);
+                        return sleep;
+                    }
+                }
                 i = prev;
             }
         }
-        // Over max_size, or under min_free: a shard's oldest file at a
-        // time, round robin.
         let mut free = if self.min_free > 0 {
             free_space(self.path).unwrap_or(u64::MAX)
         } else {
             u64::MAX
         };
-        let mut idle_rounds = 0;
-        let mut next = 0;
-        while (self.size.load(Ordering::Relaxed) > self.max_size || free < self.min_free)
-            && idle_rounds < self.shards.len()
+        // The least recently used entry of the zone at a time: the oldest of
+        // the shards' oldest.
+        let mut wait = Duration::from_secs(next as u64);
+        while self.size.load(Ordering::Relaxed) > self.max_size
+            || self.count.load(Ordering::Relaxed) >= self.watermark.load(Ordering::Relaxed)
+            || free < self.min_free
         {
-            let mut shard = self.shards[next].lock().unwrap_or_else(|e| e.into_inner());
-            next = (next + 1) % self.shards.len();
-            let mut i = shard.tail;
-            while i != NIL && (!shard.nodes[i].exists || shard.nodes[i].updating) {
-                i = shard.nodes[i].prev;
+            let oldest = |shard: &Shard| {
+                let mut i = shard.tail;
+                while i != NIL && shard.nodes[i].updating {
+                    i = shard.nodes[i].prev;
+                }
+                (i != NIL).then_some(i)
+            };
+            let mut pick: Option<(usize, i64)> = None;
+            for (at, shard) in self.shards.iter().enumerate() {
+                let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(i) = oldest(&shard)
+                    && pick.is_none_or(|(_, accessed)| shard.nodes[i].accessed < accessed)
+                {
+                    pick = Some((at, shard.nodes[i].accessed));
+                }
             }
-            if i == NIL {
-                idle_rounds += 1;
-                continue;
+            let Some((at, _)) = pick else {
+                // Nothing to remove (all being updated): nginx waits 10 s.
+                wait = Duration::from_secs(10);
+                break;
+            };
+            let mut shard = self.shards[at].lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = oldest(&shard) {
+                if shard.nodes[i].exists {
+                    free = free.saturating_add(shard.nodes[i].fs_size);
+                }
+                freed.extend(shard.remove(i, &self.size, &self.count));
             }
-            idle_rounds = 0;
-            free = free.saturating_add(shard.nodes[i].fs_size);
-            freed.extend(shard.remove(i, &self.size));
+            drop(shard);
+            if spent(&mut files) {
+                wait = sleep;
+                break;
+            }
         }
         self.delete_files(freed);
+        wait
     }
 
     /// nginx's cache loader: index the files already in the directory
@@ -720,10 +804,16 @@ impl CacheZone {
                     continue;
                 };
                 let mut shard = self.lock(&hash);
-                if shard.map.contains_key(&hash) || shard.map.len() >= shard.capacity {
+                if shard.map.contains_key(&hash) {
                     continue;
                 }
-                let i = shard.insert(hash, now);
+                if shard.map.len() >= shard.capacity {
+                    // nginx's loader, when the zone is full.
+                    let count = self.count.load(Ordering::Relaxed);
+                    self.watermark.store(count - count / 8, Ordering::Relaxed);
+                    continue;
+                }
+                let i = shard.insert(hash, now, &self.count);
                 let node = &mut shard.nodes[i];
                 node.uses = 1;
                 node.exists = true;
@@ -763,15 +853,26 @@ pub fn start_manager(zone: &'static CacheZone) {
             pass(&|| zone.load(now_secs()));
             let mut test_panic =
                 crate::worker::panics::test_panic() == crate::worker::panics::TestPanic::Cache;
+            let mut next = std::time::Duration::from_secs(1);
             while !zone.retired.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                // In steps of at most a second, for `retired`.
+                let until = std::time::Instant::now() + next;
+                loop {
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() || zone.retired.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(left.min(std::time::Duration::from_secs(1)));
+                }
                 let panic_now = std::mem::take(&mut test_panic);
+                let wait = std::cell::Cell::new(std::time::Duration::from_secs(1));
                 pass(&|| {
                     if panic_now {
                         panic!("RUXEN_TEST_PANIC=cache");
                     }
-                    zone.manage(now_secs());
+                    wait.set(zone.manage(now_secs()));
                 });
+                next = wait.get();
             }
         });
     if let Err(e) = spawned {
@@ -1552,7 +1653,11 @@ mod tests {
     }
 
     fn zone(dir: &Path, size: u64, max_size: Option<u64>) -> CacheZone {
-        CacheZone::new(ZoneConf {
+        CacheZone::new(zone_conf(dir, size, max_size))
+    }
+
+    fn zone_conf(dir: &Path, size: u64, max_size: Option<u64>) -> ZoneConf {
+        ZoneConf {
             name: "z".into(),
             path: dir.to_path_buf(),
             levels: [1, 2, 0],
@@ -1560,7 +1665,10 @@ mod tests {
             inactive_secs: 600,
             max_size,
             min_free: None,
-        })
+            manager_files: 100,
+            manager_sleep_ms: 50,
+            manager_threshold_ms: 200,
+        }
     }
 
     fn parts<'a>(key: &'a [u8], body: &'a [u8]) -> EntryParts<'a> {
@@ -1649,11 +1757,53 @@ mod tests {
             }
         );
         z.store(&a, &parts(b"a", &[b'x'; 100])).unwrap();
-        z.lookup(&b, 1, NOW);
+        z.lookup(&b, 1, NOW + 1);
         z.store(&b, &parts(b"b", &[b'y'; 100])).unwrap();
-        // Over 200 bytes: `a`, the least recently used, went.
+        // Over 200 bytes: the manager's next pass removes `a`, the least
+        // recently used.
+        assert!(z.file_path(&a).exists());
+        z.manage(NOW + 1);
         assert!(!z.file_path(&a).exists());
         assert!(z.file_path(&b).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `manager_files` per pass, then `manager_sleep`; a full index sets
+    /// the watermark the manager brings it under (#839).
+    #[test]
+    fn manager_files_and_watermark() {
+        let dir = std::env::temp_dir().join(format!("ruxen-cache-unit5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conf = zone_conf(&dir, 1 << 20, Some(0));
+        conf.manager_files = 2;
+        conf.manager_sleep_ms = 5000;
+        let z = CacheZone::new(conf);
+        let keys: Vec<_> = (0..5u8).map(|k| hash_key(&[k])).collect();
+        for (n, k) in keys.iter().enumerate() {
+            z.lookup(k, 1, NOW + n as i64);
+            z.store(k, &parts(b"k", b"body")).unwrap();
+        }
+        let on_disk = |z: &CacheZone| keys.iter().filter(|k| z.file_path(k).exists()).count();
+        assert_eq!(z.manage(NOW + 5), std::time::Duration::from_secs(5));
+        assert_eq!(on_disk(&z), 3);
+        // The oldest went first.
+        assert!(!z.file_path(&keys[0]).exists() && !z.file_path(&keys[1]).exists());
+        z.manage(NOW + 5);
+        z.manage(NOW + 5);
+        assert_eq!(on_disk(&z), 0);
+
+        // 16 entries fit (one per shard): filling past that sets the
+        // watermark at 7/8, and a pass removes down below it.
+        let z = zone(&dir, 2048, None);
+        for k in 0..200u16 {
+            z.lookup(&hash_key(&k.to_be_bytes()), 1, NOW);
+        }
+        let full = z.count.load(Ordering::Relaxed);
+        let watermark = z.watermark.load(Ordering::Relaxed);
+        assert!(watermark < full, "{watermark} {full}");
+        z.manage(NOW);
+        assert!(z.count.load(Ordering::Relaxed) < watermark);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

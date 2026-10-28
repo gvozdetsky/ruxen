@@ -140,7 +140,8 @@ fn eval_guard_plain(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> bool {
             // (ngx_http_script_file_code): a refused link fails the test
             // like a missing file.
             let refused = ctx.rewrite_state.and_then(|s| s.doc_root).is_some_and(|d| {
-                crate::fs_resolve::symlink_refusal(&d.symlinks, d.path, &rendered).is_some()
+                crate::fs_resolve::symlink_refusal(&d.symlinks, &d.path_for(ctx), &rendered)
+                    .is_some()
             });
             let ok = !refused && guard_file_test(*kind, &rendered);
             if *negated { !ok } else { ok }
