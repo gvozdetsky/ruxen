@@ -1653,14 +1653,11 @@ enum PassOutcome {
 async fn run_proxy_pass(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
-    mut plan: Box<crate::proxy::ProxyPlan>,
+    plan: Box<crate::proxy::ProxyPlan>,
     process_meta: phase::ProcessMeta,
     as_get: bool,
     uri: Option<&[u8]>,
 ) -> PassOutcome {
-    // After an internal redirect the answer's head is rewritten further
-    // (`carry_accel_headers`), which takes it whole: no relayed body (#88).
-    plan.stream = false;
     let response_rules = plan.response;
     let server_bytes = plan.server_bytes;
     let recursive_error_pages = plan.response.recursive_error_pages;
@@ -2049,6 +2046,10 @@ fn carry_accel_headers(response: Response, carried: &[u8], proxied: bool) -> Res
             headers: merge(headers),
             body,
         },
+        Response::ProxyStream(mut s) => {
+            s.head = merge(std::mem::take(&mut s.head));
+            Response::ProxyStream(s)
+        }
         other => other,
     }
 }

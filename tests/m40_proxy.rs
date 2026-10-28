@@ -558,9 +558,8 @@ fn m40_invalid_upstream_framing_is_502() {
 }
 
 /// A chunk-size line that never ends is refused once it passes the line
-/// cap, also when the body is buffered (a status `proxy_next_upstream`
-/// may retry on): it used to be read into memory for as long as the
-/// upstream kept sending it.
+/// cap, also when the body is buffered (`add_trailer`): it used to be
+/// read into memory for as long as the upstream kept sending it.
 #[test]
 fn m40_endless_chunk_size_line_is_502() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -583,7 +582,7 @@ http {{
         listen %%PORT%%;
         location /up/ {{
             proxy_pass http://127.0.0.1:{backend_port};
-            proxy_next_upstream http_404;
+            add_trailer X-T 1;
         }}
     }}
 }}
