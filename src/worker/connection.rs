@@ -90,8 +90,9 @@ pub(crate) fn classify_request_transfer_encoding(value: &[u8]) -> RequestTransfe
 /// Connection I/O abstraction: anything the request loop runs against,
 /// be it a raw `TcpStream` or a `ServerTlsStream<TcpStream>`. Plain HTTP
 /// uses the per-byte `read`/`write` path; the trait factors out the
-/// keep-alive idle wait, which differs by IO type.
-pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
+/// keep-alive idle wait, which differs by IO type. `Duplex` is for the
+/// tunnel after a 101 (#87), a read and a write in flight at once.
+pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent + crate::duplex::Duplex {
     /// Wait until the next request *may* be available, or shutdown / idle
     /// timeout fires. Returns `true` to proceed to the read step, `false`
     /// to drop the connection.
@@ -120,11 +121,6 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// Wait until the socket accepts more data. Only used by the zero-copy
     /// path, which writes to the fd directly.
     async fn wait_writable(&self) -> std::io::Result<()>;
-
-    /// The connection is about to carry a tunnel (#87), where one read and
-    /// one write are in flight at once; after this, `read` must not write
-    /// to the socket itself.
-    fn begin_tunnel(&mut self) {}
 
     /// Whether `send_file_body` may take a file body: a plain check, so
     /// that HTTP/1 connections don't pay for the call.
@@ -335,10 +331,6 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
-    fn begin_tunnel(&mut self) {
-        crate::tls_stream::TlsStream::begin_tunnel(self);
-    }
-
     /// The TCP socket under the TLS, as nginx checks a TLS client: on the
     /// raw fd (#489). Bytes there don't end the watch as they do on plain
     /// TCP, since a client that closes cleanly sends a close_notify alert
@@ -457,6 +449,52 @@ impl AsyncWriteRent for Preread {
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         self.io.shutdown().await
+    }
+}
+
+// SAFETY: a reference to the stream only before the socket's operation,
+// which is `TcpStream`'s, on `io` projected without one.
+unsafe impl crate::duplex::Duplex for Preread {
+    async unsafe fn read_raw<T: IoBufMut>(
+        this: std::ptr::NonNull<Self>,
+        mut buf: T,
+    ) -> monoio::BufResult<usize, T> {
+        // SAFETY: valid, and no other reference to it is live
+        // (`Duplex::read_raw`); this one ends before the await.
+        let s = unsafe { &mut *this.as_ptr() };
+        if s.has_pending() {
+            // SAFETY: as in `read`.
+            unsafe {
+                let n = s.take_into(buf.write_ptr(), buf.bytes_total());
+                buf.set_init(n);
+                return (Ok(n), buf);
+            }
+        }
+        // SAFETY: as above.
+        unsafe { TcpStream::read_raw(Self::io_ptr(this), buf) }.await
+    }
+
+    unsafe fn write_raw<T: IoBuf>(
+        this: std::ptr::NonNull<Self>,
+        buf: T,
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> + 'static {
+        // SAFETY: the caller's.
+        unsafe { TcpStream::write_raw(Self::io_ptr(this), buf) }
+    }
+
+    unsafe fn shutdown_raw(
+        this: std::ptr::NonNull<Self>,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + 'static {
+        // SAFETY: the caller's.
+        unsafe { TcpStream::shutdown_raw(Self::io_ptr(this)) }
+    }
+}
+
+impl Preread {
+    /// The socket, projected without a reference to `*this`.
+    fn io_ptr(this: std::ptr::NonNull<Self>) -> std::ptr::NonNull<TcpStream> {
+        // SAFETY: a field of a valid pointer.
+        unsafe { std::ptr::NonNull::new_unchecked(&raw mut (*this.as_ptr()).io) }
     }
 }
 
