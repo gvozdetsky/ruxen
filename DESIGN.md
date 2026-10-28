@@ -371,7 +371,12 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   whole outgoing queue into one socket write (upstream wrote in 16 KiB
   pieces); `writev` encrypts all iovecs as one run of records.
   Throughput on `tls_hello` is unchanged (ABBA pairs vs the old
-  adapter, 2026-10-02: 99–100%).
+  adapter, 2026-10-02: 99–100%). A run of 16 KiB or more over plain
+  TCP goes from rustls's queue to the socket with `sendmsg` at once
+  (`SendNow`), with no copy into the write buffer: what the socket
+  doesn't take goes through it and the ring (#247, #545; a 1 MiB file
+  over TLS 1.3 then takes 3.97M instructions per request where nginx
+  1.30.6 takes 5.28M, callgrind).
 - **Per-listen `TlsAcceptor`, built once at startup.** `build_listen_tls`
   walks every `server {}` on a given listen address, loads each
   `ssl_certificate` / `ssl_certificate_key` pair into a

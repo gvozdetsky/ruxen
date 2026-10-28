@@ -38,9 +38,38 @@ const READ_BUF_SIZE: usize = 17 * 1024;
 /// `wbuf` keeps its allocation between writes only up to this size, so a
 /// connection that once streamed a large body doesn't pin ~64 KiB (rustls's
 /// outgoing limit) for the rest of its keepalive life.
-/// A write of at least this much ciphertext is tried on the socket at once
-/// (`write_tls`); smaller ones, most responses, stay batched in io_uring.
+/// A write of at least this much plaintext is tried on the socket at once
+/// (`write_tls_from`); smaller ones, most responses, stay batched in io_uring.
 const DIRECT_SEND_MIN: usize = 16 * 1024;
+
+/// rustls's queued records straight to a socket: `sendmsg` without waiting,
+/// `WouldBlock` when it is full.
+struct SendNow(std::os::unix::io::RawFd);
+
+impl io::Write for SendNow {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(buf)])
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        // SAFETY: a msghdr over `bufs`, which `IoSlice` lays out as iovecs
+        // and which live through the call.
+        let r = unsafe {
+            let mut msg: libc::msghdr = mem::zeroed();
+            msg.msg_iov = bufs.as_ptr() as *mut libc::iovec;
+            msg.msg_iovlen = bufs.len().min(1024) as _;
+            libc::sendmsg(self.0, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+        };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(r as usize)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 const WRITE_BUF_KEEP: usize = 32 * 1024;
 
@@ -514,6 +543,29 @@ where
 
     /// Move everything rustls has queued for the peer onto the socket.
     async fn write_tls(&mut self) -> io::Result<()> {
+        self.write_tls_from(false).await
+    }
+
+    /// `write_tls`; `large`: a large run of records, which over plain TCP
+    /// goes out at once from rustls's queue, while it is still in the cache
+    /// from being encrypted (#247), without a copy into `wbuf` (#545).
+    /// What the socket doesn't take goes through io_uring.
+    async fn write_tls_from(&mut self, large: bool) -> io::Result<()> {
+        if large
+            && let Some(tcp) =
+                (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()
+        {
+            use std::os::unix::io::AsRawFd;
+            let mut sock = SendNow(tcp.as_raw_fd());
+            while self.conn.wants_write() {
+                match self.conn.write_tls(&mut sock) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         // Again after each write: in a tunnel, a read may queue records
         // while the write is in flight.
         while self.conn.wants_write() {
@@ -522,38 +574,6 @@ where
             // A `Vec` sink never pushes back, so this drains the whole queue.
             while self.conn.wants_write() {
                 self.conn.write_tls(&mut buf)?;
-            }
-            // A large run of records over plain TCP goes out at once, while
-            // it is still in the cache from being encrypted (#247); what
-            // the socket doesn't take goes through io_uring.
-            if buf.len() >= DIRECT_SEND_MIN
-                && let Some(tcp) =
-                    (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = tcp.as_raw_fd();
-                let mut sent = 0usize;
-                while sent < buf.len() {
-                    // SAFETY: the pointer/len pair stays within `buf`.
-                    let r = unsafe {
-                        libc::send(
-                            fd,
-                            buf[sent..].as_ptr().cast(),
-                            buf.len() - sent,
-                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                        )
-                    };
-                    if r > 0 {
-                        sent += r as usize;
-                        continue;
-                    }
-                    if r < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-                    {
-                        continue;
-                    }
-                    break;
-                }
-                buf.drain(..sent);
             }
             let (res, buf) = if buf.is_empty() {
                 (Ok(()), buf)
@@ -577,7 +597,7 @@ where
         // applies to this write alone.
         self.write_tls().await?;
         let n = self.conn.writer().write_vectored(bufs)?;
-        self.write_tls().await?;
+        self.write_tls_from(n >= DIRECT_SEND_MIN).await?;
         Ok(n)
     }
 
@@ -815,6 +835,45 @@ mod tests {
                 c.write_all(&buf).unwrap();
                 c.flush().unwrap();
                 c.sock.shutdown(std::net::Shutdown::Both).unwrap();
+            },
+        );
+    }
+
+    /// #545: records sent from rustls's queue at once until the socket is
+    /// full, the rest through the ring, in order.
+    #[test]
+    fn large_write_to_a_slow_reader() {
+        const LEN: usize = 4 * 1024 * 1024;
+        let body: Vec<u8> = (0..LEN).map(|i| (i % 253) as u8).collect();
+        let expect = body.clone();
+        run(
+            |acceptor, sock| async move {
+                // A small send buffer: the socket fills long before the end.
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let size: libc::c_int = 16 * 1024;
+                    // SAFETY: a c_int option value on the accepted socket.
+                    let r = unsafe {
+                        libc::setsockopt(
+                            sock.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_SNDBUF,
+                            (&size as *const libc::c_int).cast(),
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                        )
+                    };
+                    assert_eq!(r, 0);
+                }
+                let mut s = tls(acceptor.accept(sock).await.unwrap());
+                let (res, _) = s.write_all(body).await;
+                assert_eq!(res.unwrap(), LEN);
+                s.shutdown().await.unwrap();
+            },
+            move |mut c| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let mut out = Vec::new();
+                c.read_to_end(&mut out).unwrap();
+                assert!(out == expect, "{} bytes, not the body", out.len());
             },
         );
     }
