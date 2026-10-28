@@ -4,37 +4,66 @@
 //! ngx_event_openssl.c).
 //!
 //! The switch happens once, right after the handshake (`switch`). Rustls
-//! is gone then, so: a TLS 1.3 KeyUpdate from the client closes the
-//! connection (rustls's buffered API gives no traffic secret to derive
-//! the next keys from), and the server never updates its own keys: an
-//! AES-GCM connection ends near the record limit instead (`RECORD_LIMIT`).
+//! is gone then. TLS 1.3 key updates (#852) go on with the application
+//! traffic secrets rustls logs (`SecretLog`): rustls's buffered API has
+//! no `KernelConnection`, so the next keys are derived here (RFC 8446,
+//! 7.2), and the kernel takes them again (`TLS_RX` / `TLS_TX`, Linux 6.14
+//! and later; on older kernels the connection closes). A client's
+//! KeyUpdate rekeys RX, and our own goes before the next write when it
+//! asks (so a reader never writes, as a tunnel needs); near the AES-GCM
+//! record limit the server updates its keys itself.
 
+use std::cell::RefCell;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use monoio::BufResult;
 use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
 use monoio::net::TcpStream;
+use rustls::crypto::tls13::{Hkdf, OkmBlock};
 use rustls::{ConnectionTrafficSecrets, ProtocolVersion, SupportedCipherSuite};
 
 use crate::duplex::Duplex;
 use crate::tls_stream::{IntoKtls, TlsStream};
 
 /// Where a stream of TLS records stands: in a header, in a body, or
-/// between records.
-#[derive(Debug, Clone, Copy, Default)]
+/// between records. Also its first bytes, for the ClientHello's random.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct RecordCursor {
     header: [u8; 5],
     have: u8,
     body_left: usize,
+    start: [u8; START],
+    start_len: u8,
+}
+
+/// Record header, handshake header, version, random.
+const START: usize = 5 + 4 + 2 + 32;
+
+impl Default for RecordCursor {
+    fn default() -> Self {
+        RecordCursor {
+            header: [0; 5],
+            have: 0,
+            body_left: 0,
+            start: [0; START],
+            start_len: 0,
+        }
+    }
 }
 
 impl RecordCursor {
     pub(crate) fn feed(&mut self, mut bytes: &[u8]) {
+        let have = usize::from(self.start_len);
+        if have < START {
+            let n = (START - have).min(bytes.len());
+            self.start[have..have + n].copy_from_slice(&bytes[..n]);
+            self.start_len = (have + n) as u8;
+        }
         while !bytes.is_empty() {
             if self.body_left > 0 {
                 let n = self.body_left.min(bytes.len());
@@ -58,6 +87,240 @@ impl RecordCursor {
     pub(crate) fn at_boundary(&self) -> bool {
         self.have == 0 && self.body_left == 0
     }
+
+    /// The ClientHello's random: the key `SecretLog` files secrets by.
+    pub(crate) fn client_random(&self) -> Option<[u8; 32]> {
+        let s = &self.start;
+        (usize::from(self.start_len) == START && s[0] == HANDSHAKE && s[5] == 1)
+            .then(|| s[11..].try_into().expect("32 bytes"))
+    }
+}
+
+const CLIENT_SECRET: &str = "CLIENT_TRAFFIC_SECRET_0";
+const SERVER_SECRET: &str = "SERVER_TRAFFIC_SECRET_0";
+/// Logged secrets a worker keeps for handshakes not switched yet; past
+/// that the oldest go first, and their connections close on a KeyUpdate.
+const LOGGED_KEEP: usize = 256;
+
+/// The longest handshake a kTLS listen allows (its default server's
+/// `client_header_timeout`), in ms; 0 until one is prepared. A logged
+/// secret older than that has no handshake left to take it.
+static HANDSHAKE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A kTLS listen's handshake budget, for `HANDSHAKE_TIMEOUT_MS`.
+pub(crate) fn note_handshake_timeout(timeout: Duration) {
+    let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    HANDSHAKE_TIMEOUT_MS.fetch_max(ms, Ordering::Relaxed);
+}
+
+fn handshake_timeout() -> Duration {
+    match HANDSHAKE_TIMEOUT_MS.load(Ordering::Relaxed) {
+        0 => Duration::from_secs(60),
+        ms => Duration::from_millis(ms),
+    }
+}
+
+struct Logged {
+    random: [u8; 32],
+    client: bool,
+    /// Zeroed when dropped, which every way out of a slot does in place.
+    secret: OkmBlock,
+    at: Instant,
+}
+
+thread_local! {
+    /// What `SecretLog` got on this worker: rustls logs from inside the
+    /// handshake calls, on the connection's thread. `LOGGED_KEEP` slots,
+    /// allocated once: an entry never moves (a move would leave a copy of
+    /// the secret behind), it is dropped in its slot.
+    static LOGGED: RefCell<Vec<Option<Logged>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drop what no handshake can take any more.
+fn expire(slots: &mut [Option<Logged>], now: Instant) {
+    let timeout = handshake_timeout();
+    for slot in slots {
+        if slot
+            .as_ref()
+            .is_some_and(|l| now.duration_since(l.at) > timeout)
+        {
+            *slot = None;
+        }
+    }
+}
+
+/// The `KeyLog` of kTLS configs: keeps the TLS 1.3 application traffic
+/// secrets until `switch` takes them, by ClientHello random.
+#[derive(Debug)]
+pub(crate) struct SecretLog;
+
+impl rustls::KeyLog for SecretLog {
+    fn will_log(&self, label: &str) -> bool {
+        label == CLIENT_SECRET || label == SERVER_SECRET
+    }
+
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        let (Ok(random), true) = (client_random.try_into(), secret.len() <= OkmBlock::MAX_LEN)
+        else {
+            return;
+        };
+        let now = Instant::now();
+        LOGGED.with_borrow_mut(|slots| {
+            if slots.is_empty() {
+                slots.reserve_exact(LOGGED_KEEP);
+                slots.resize_with(LOGGED_KEEP, || None);
+            }
+            expire(slots, now);
+            let slot = match slots.iter().position(Option::is_none) {
+                Some(free) => free,
+                None => (0..slots.len())
+                    .min_by_key(|&i| slots[i].as_ref().map(|l| l.at))
+                    .unwrap_or(0),
+            };
+            slots[slot] = Some(Logged {
+                random,
+                client: label == CLIENT_SECRET,
+                secret: OkmBlock::new(secret),
+                at: now,
+            });
+        });
+    }
+}
+
+/// The client's and the server's secrets logged for `random`, taken: as
+/// copies, the logged ones zeroed in their slots.
+fn take_logged(random: &[u8; 32]) -> (Option<OkmBlock>, Option<OkmBlock>) {
+    LOGGED.with_borrow_mut(|slots| {
+        expire(slots, Instant::now());
+        let (mut client, mut server) = (None, None);
+        for slot in slots.iter_mut() {
+            let Some(l) = slot else { continue };
+            if l.random != *random {
+                continue;
+            }
+            let secret = OkmBlock::new(l.secret.as_ref());
+            if l.client {
+                client = Some(secret);
+            } else {
+                server = Some(secret);
+            }
+            *slot = None;
+        }
+        (client, server)
+    })
+}
+
+/// Forget the secrets of a handshake that stays in userspace.
+pub(crate) fn forget_logged(random: &[u8; 32]) {
+    drop(take_logged(random));
+}
+
+/// HKDF-Expand-Label with an empty context (RFC 8446, 7.1).
+fn expand_label(hkdf: &dyn Hkdf, secret: &OkmBlock, label: &[u8], out: &mut [u8]) {
+    let len = (out.len() as u16).to_be_bytes();
+    let label_len = [(6 + label.len()) as u8];
+    hkdf.expander_for_okm(secret)
+        .expand_slice(&[&len, &label_len, b"tls13 ", label, &[0]], out)
+        .expect("short output");
+}
+
+/// A traffic secret's key and IV (RFC 8446, 7.3).
+fn key_iv(hkdf: &dyn Hkdf, secret: &OkmBlock, key_len: usize) -> ([u8; 32], [u8; 12]) {
+    let mut key = [0; 32];
+    let mut iv = [0; 12];
+    expand_label(hkdf, secret, b"key", &mut key[..key_len]);
+    expand_label(hkdf, secret, b"iv", &mut iv);
+    (key, iv)
+}
+
+/// The secret after a KeyUpdate (RFC 8446, 7.2).
+fn next_secret(hkdf: &dyn Hkdf, secret: &OkmBlock) -> OkmBlock {
+    let mut next = [0; OkmBlock::MAX_LEN];
+    let len = hkdf.expander_for_okm(secret).hash_len();
+    expand_label(hkdf, secret, b"traffic upd", &mut next[..len]);
+    let next_block = OkmBlock::new(&next[..len]);
+    wipe(&mut next);
+    next_block
+}
+
+/// What a TLS 1.3 kTLS connection needs for key updates.
+struct Rekey {
+    hkdf: &'static dyn Hkdf,
+    key_len: usize,
+    client: OkmBlock,
+    server: OkmBlock,
+}
+
+impl Rekey {
+    /// From the logged secrets, checked against the keys rustls handed
+    /// over: a client may have updated its keys already, before the switch.
+    fn new(
+        suite: SupportedCipherSuite,
+        cipher: Cipher,
+        random: [u8; 32],
+        secrets: &rustls::ExtractedSecrets,
+    ) -> Option<Rekey> {
+        let SupportedCipherSuite::Tls13(suite) = suite else {
+            return None;
+        };
+        let (Some(mut client), Some(server)) = take_logged(&random) else {
+            return None;
+        };
+        let hkdf = suite.hkdf_provider;
+        let key_len = cipher.key_len();
+        let matches = |secret: &OkmBlock, (_, s): &(u64, ConnectionTrafficSecrets)| {
+            let (key, iv) = key_iv(hkdf, secret, key_len);
+            traffic_key_iv(s).is_some_and(|(k, i)| k == &key[..key_len] && i == &iv[..])
+        };
+        if !matches(&server, &secrets.tx) {
+            return None;
+        }
+        for _ in 0..3 {
+            if matches(&client, &secrets.rx) {
+                return Some(Rekey {
+                    hkdf,
+                    key_len,
+                    client,
+                    server,
+                });
+            }
+            client = next_secret(hkdf, &client);
+        }
+        None
+    }
+
+    /// The next generation of one direction's keys, set on the socket.
+    fn update(&mut self, fd: RawFd, cipher: Cipher, dir: libc::c_int) -> io::Result<()> {
+        let secret = if dir == libc::TLS_RX {
+            &mut self.client
+        } else {
+            &mut self.server
+        };
+        *secret = next_secret(self.hkdf, secret);
+        let (mut key, iv) = key_iv(self.hkdf, secret, self.key_len);
+        let r = set_crypto(
+            fd,
+            dir,
+            libc::TLS_1_3_VERSION,
+            cipher,
+            &key[..self.key_len],
+            &iv,
+            0,
+        );
+        wipe(&mut key);
+        r
+    }
+}
+
+fn traffic_key_iv(secrets: &ConnectionTrafficSecrets) -> Option<(&[u8], &[u8])> {
+    match secrets {
+        ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+        | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+        | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => {
+            Some((key.as_ref(), iv.as_ref()))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +328,15 @@ enum Cipher {
     Aes128Gcm,
     Aes256Gcm,
     Chacha20Poly1305,
+}
+
+impl Cipher {
+    fn key_len(self) -> usize {
+        match self {
+            Cipher::Aes128Gcm => 16,
+            Cipher::Aes256Gcm | Cipher::Chacha20Poly1305 => 32,
+        }
+    }
 }
 
 const CIPHERS: [Cipher; 3] = [
@@ -257,17 +529,12 @@ fn set_secrets(
     cipher: Cipher,
     (seq, secrets): &(u64, ConnectionTrafficSecrets),
 ) -> io::Result<()> {
-    let (key, iv) = match secrets {
-        ConnectionTrafficSecrets::Aes128Gcm { key, iv }
-        | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
-        | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => (key, iv),
-        _ => return Err(io::Error::from(io::ErrorKind::Unsupported)),
-    };
+    let (key, iv) =
+        traffic_key_iv(secrets).ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
     let iv: &[u8; 12] = iv
-        .as_ref()
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "iv length"))?;
-    set_crypto(fd, dir, version, cipher, key.as_ref(), iv, *seq)
+    set_crypto(fd, dir, version, cipher, key, iv, *seq)
 }
 
 /// How a TLS connection goes on after `switch`.
@@ -292,19 +559,34 @@ pub(crate) fn switch(stream: TlsStream<TcpStream>) -> Switch {
         {
             return false;
         }
-        chosen = Some((version, cipher));
+        chosen = Some((version, cipher, suite));
         true
     };
+    let random = stream.client_random();
     match stream.into_ktls(attach) {
-        IntoKtls::Userspace(stream) => Switch::Userspace(stream),
-        IntoKtls::Failed(e) => Switch::Failed(e),
+        IntoKtls::Userspace(stream) => {
+            if let Some(random) = random {
+                forget_logged(&random);
+            }
+            Switch::Userspace(stream)
+        }
+        IntoKtls::Failed(e) => {
+            if let Some(random) = random {
+                forget_logged(&random);
+            }
+            Switch::Failed(e)
+        }
         IntoKtls::Kernel {
             io,
             secrets,
             read,
             closed,
+            random,
         } => {
-            let Some((version, cipher)) = chosen else {
+            let Some((version, cipher, suite)) = chosen else {
+                if let Some(random) = random {
+                    forget_logged(&random);
+                }
                 return Switch::Failed(io::Error::other("kTLS: no cipher"));
             };
             let fd = io.as_raw_fd();
@@ -315,12 +597,15 @@ pub(crate) fn switch(stream: TlsStream<TcpStream>) -> Switch {
                     "setsockopt(SOL_TLS) failed ({e})"
                 )));
             }
+            let rekey = random.and_then(|r| Rekey::new(suite, cipher, r, &secrets));
             Switch::Kernel(Box::new(KtlsStream {
                 io,
                 read,
                 pos: 0,
                 closed,
                 cipher,
+                rekey: rekey.map(Box::new),
+                tx_update_due: false,
                 next_check: Instant::now() + LIMIT_CHECK,
                 shut: false,
             }))
@@ -330,6 +615,7 @@ pub(crate) fn switch(stream: TlsStream<TcpStream>) -> Switch {
 
 /// Records an AES-GCM key may seal: RFC 8446, 5.5 allows 2^24.5. What
 /// goes out between two checks (`LIMIT_CHECK`) stays below the rest.
+/// TLS 1.3 updates its key there, TLS 1.2 closes.
 const RECORD_LIMIT: u64 = 1 << 24;
 const LIMIT_CHECK: Duration = Duration::from_secs(1);
 
@@ -342,6 +628,12 @@ pub(crate) struct KtlsStream {
     /// The client sent close_notify: reads end there.
     closed: bool,
     cipher: Cipher,
+    /// TLS 1.3 with the secrets for key updates, else `None`: a KeyUpdate
+    /// closes then.
+    rekey: Option<Box<Rekey>>,
+    /// Our KeyUpdate goes before the next write: the client asked, or the
+    /// record limit is near.
+    tx_update_due: bool,
     next_check: Instant,
     /// close_notify went out (a lingering close shuts down first).
     shut: bool,
@@ -350,6 +642,9 @@ pub(crate) struct KtlsStream {
 /// TLS record content types (RFC 8446, 5.1).
 const ALERT: u8 = 21;
 const HANDSHAKE: u8 = 22;
+/// A KeyUpdate handshake message (RFC 8446, 4.6.3), without its
+/// `request_update` byte.
+const KEY_UPDATE: [u8; 4] = [24, 0, 0, 1];
 
 impl KtlsStream {
     pub(crate) fn io(&self) -> &TcpStream {
@@ -382,9 +677,9 @@ impl KtlsStream {
         n
     }
 
-    /// Whether the connection may go on sealing records: an AES-GCM key
-    /// stops near `RECORD_LIMIT`, looked at once per `LIMIT_CHECK`.
-    pub(crate) fn within_limit(&mut self) -> bool {
+    /// Whether the key may go on sealing records: an AES-GCM key stops
+    /// near `RECORD_LIMIT`, looked at once per `LIMIT_CHECK`.
+    fn within_limit(&mut self) -> bool {
         if self.cipher == Cipher::Chacha20Poly1305 {
             return true;
         }
@@ -396,17 +691,86 @@ impl KtlsStream {
         tx_records(self.io.as_raw_fd(), self.cipher).is_none_or(|n| n < RECORD_LIMIT)
     }
 
-    fn check_read(&mut self, res: io::Result<usize>) -> io::Result<usize> {
+    /// Before a write: our KeyUpdate when one is due. `WouldBlock`: the
+    /// socket is full, try again once it isn't; other errors end the
+    /// connection (the record limit without a key update).
+    #[inline]
+    pub(crate) fn ready_to_write(&mut self) -> io::Result<()> {
+        if !self.tx_update_due && self.within_limit() {
+            return Ok(());
+        }
+        self.send_tx_update()
+    }
+
+    #[cold]
+    fn send_tx_update(&mut self) -> io::Result<()> {
+        if self.rekey.is_none() {
+            return Err(limit_reached());
+        }
+        self.tx_update_due = true;
+        self.update_tx()?;
+        self.tx_update_due = false;
+        Ok(())
+    }
+
+    /// Our KeyUpdate, with the old key, then the new key for what follows.
+    fn update_tx(&mut self) -> io::Result<()> {
+        let fd = self.io.as_raw_fd();
+        let Some(rekey) = &mut self.rekey else {
+            return Err(io::Error::other("no key update on this connection"));
+        };
+        let mut message = [0; 5];
+        message[..4].copy_from_slice(&KEY_UPDATE);
+        send_record(fd, HANDSHAKE, &message)?;
+        rekey.update(fd, self.cipher, libc::TLS_TX)
+    }
+
+    /// A read failed: `EIO` is a record that isn't data, which the kernel
+    /// gives with a control buffer only. `None`: a KeyUpdate, handled;
+    /// read again.
+    fn check_read(&mut self, res: io::Result<usize>) -> Option<io::Result<usize>> {
         match res {
-            // A record that isn't data: the kernel wants a control buffer.
             Err(e) if e.raw_os_error() == Some(libc::EIO) => self.control_record(),
-            other => other,
+            other => Some(other),
         }
     }
 
     #[cold]
-    fn control_record(&mut self) -> io::Result<usize> {
-        let mut payload = [0u8; 2];
+    fn control_record(&mut self) -> Option<io::Result<usize>> {
+        match self.recv_control() {
+            Ok(Some(request_update)) => match self.key_update(request_update) {
+                Ok(()) => None,
+                Err(e) => Some(Err(e)),
+            },
+            Ok(None) => Some(Ok(0)),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// The client's KeyUpdate: its new keys for RX, and ours for TX before
+    /// our next data when it asks (RFC 8446, 4.6.3).
+    fn key_update(&mut self, request_update: bool) -> io::Result<()> {
+        let fd = self.io.as_raw_fd();
+        let Some(rekey) = &mut self.rekey else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "KeyUpdate without the secrets for it (kTLS)",
+            ));
+        };
+        rekey.update(fd, self.cipher, libc::TLS_RX).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("KeyUpdate: setsockopt(TLS_RX) failed ({e})"),
+            )
+        })?;
+        self.tx_update_due |= request_update;
+        Ok(())
+    }
+
+    /// Read the control record waiting: a close_notify is `Ok(None)`, a
+    /// KeyUpdate `Ok(Some(request_update))`, anything else an error.
+    fn recv_control(&mut self) -> io::Result<Option<bool>> {
+        let mut payload = [0u8; 16];
         let mut control = [0u64; 4];
         let mut iov = libc::iovec {
             iov_base: payload.as_mut_ptr().cast(),
@@ -437,49 +801,73 @@ impl KtlsStream {
                 cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
             }
         }
+        let n = n as usize;
         let invalid = |what: String| Err(io::Error::new(io::ErrorKind::InvalidData, what));
         match record_type {
             Some(ALERT) if n == 2 && payload[1] == 0 => {
                 self.closed = true;
-                Ok(0)
+                Ok(None)
             }
             Some(ALERT) => invalid(format!("received fatal alert: {}", payload[1])),
+            Some(HANDSHAKE) if n == 5 && payload[..4] == KEY_UPDATE && payload[4] <= 1 => {
+                Ok(Some(payload[4] == 1))
+            }
             Some(HANDSHAKE) => invalid("handshake message after the handshake (kTLS)".into()),
             other => invalid(format!("unexpected TLS record type {other:?} (kTLS)")),
         }
     }
 
     fn send_close_notify(&self) -> io::Result<()> {
-        let mut payload = [1u8, 0];
-        let mut control = [0u64; 4];
-        let mut iov = libc::iovec {
-            iov_base: payload.as_mut_ptr().cast(),
-            iov_len: payload.len(),
-        };
-        // SAFETY: as in `control_record`; the one control message fits
-        // `control` (CMSG_SPACE(1) is 24 bytes).
-        unsafe {
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = control.as_mut_ptr().cast();
-            msg.msg_controllen = libc::CMSG_SPACE(1) as usize;
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_level = libc::SOL_TLS;
-            (*cmsg).cmsg_type = libc::TLS_SET_RECORD_TYPE;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(1) as usize;
-            *libc::CMSG_DATA(cmsg) = ALERT;
-            let n = libc::sendmsg(
-                self.io.as_raw_fd(),
-                &msg,
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            );
-            if n < 0 {
-                return Err(io::Error::last_os_error());
+        send_record(self.io.as_raw_fd(), ALERT, &[1, 0])
+    }
+
+    /// A read in a keep-alive wait failed or saw EOF: a KeyUpdate is
+    /// handled there too (`Some(true)`: wait again).
+    pub(crate) fn idle_control_record(&mut self) -> bool {
+        self.control_record().is_none()
+    }
+
+    /// `ready_to_write`, waiting for room in the socket.
+    #[inline]
+    async fn write_ready(&mut self) -> io::Result<()> {
+        loop {
+            match self.ready_to_write() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.io.writable(false).await?;
+                }
+                other => return other,
             }
         }
-        Ok(())
     }
+}
+
+/// One record of `record_type` on a kTLS socket, without waiting.
+fn send_record(fd: RawFd, record_type: u8, payload: &[u8]) -> io::Result<()> {
+    let mut control = [0u64; 4];
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    // SAFETY: as in `recv_control`; the one control message fits
+    // `control` (CMSG_SPACE(1) is 24 bytes), and the kernel only reads
+    // the payload.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(1) as usize;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_TLS;
+        (*cmsg).cmsg_type = libc::TLS_SET_RECORD_TYPE;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(1) as usize;
+        *libc::CMSG_DATA(cmsg) = record_type;
+        let n = libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// The records sent so far, from the kernel's TX state.
@@ -522,11 +910,16 @@ impl AsyncReadRent for KtlsStream {
                 return (Ok(n), buf);
             }
         }
-        if self.closed {
-            return (Ok(0), buf);
+        loop {
+            if self.closed {
+                return (Ok(0), buf);
+            }
+            let (res, returned) = self.io.read(buf).await;
+            buf = returned;
+            if let Some(res) = self.check_read(res) {
+                return (res, buf);
+            }
         }
-        let (res, buf) = self.io.read(buf).await;
-        (self.check_read(res), buf)
     }
 
     async fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
@@ -543,26 +936,34 @@ impl AsyncReadRent for KtlsStream {
             }
             return (res, buf);
         }
-        let (res, buf) = self.io.readv(buf).await;
-        (self.check_read(res), buf)
+        loop {
+            if self.closed {
+                return (Ok(0), buf);
+            }
+            let (res, returned) = self.io.readv(buf).await;
+            buf = returned;
+            if let Some(res) = self.check_read(res) {
+                return (res, buf);
+            }
+        }
     }
 }
 
 fn limit_reached() -> io::Error {
-    io::Error::other("AES-GCM record limit reached (kTLS)")
+    io::Error::other("AES-GCM record limit reached, and no key update (kTLS)")
 }
 
 impl AsyncWriteRent for KtlsStream {
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-        if !self.within_limit() {
-            return (Err(limit_reached()), buf);
+        if let Err(e) = self.write_ready().await {
+            return (Err(e), buf);
         }
         self.io.write(buf).await
     }
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-        if !self.within_limit() {
-            return (Err(limit_reached()), buf);
+        if let Err(e) = self.write_ready().await {
+            return (Err(e), buf);
         }
         self.io.writev(buf).await
     }
@@ -602,32 +1003,41 @@ impl KtlsStream {
 // SAFETY: as just said.
 unsafe impl Duplex for KtlsStream {
     async unsafe fn read_raw<T: IoBufMut>(this: NonNull<Self>, mut buf: T) -> BufResult<usize, T> {
-        {
-            // SAFETY: valid, no other reference live (the caller's); this
-            // one ends before the await.
-            let s = unsafe { &mut *this.as_ptr() };
-            if s.pos < s.read.len() {
-                // SAFETY: as in `read`.
-                unsafe {
-                    let n = s.take_into(buf.write_ptr(), buf.bytes_total());
-                    buf.set_init(n);
-                    return (Ok(n), buf);
-                }
-            }
-            if s.closed {
-                return (Ok(0), buf);
+        // SAFETY: valid, no other reference live (the caller's); each
+        // ends before an await.
+        let s = unsafe { &mut *this.as_ptr() };
+        if s.pos < s.read.len() {
+            // SAFETY: as in `read`.
+            unsafe {
+                let n = s.take_into(buf.write_ptr(), buf.bytes_total());
+                buf.set_init(n);
+                return (Ok(n), buf);
             }
         }
-        // SAFETY: as above.
-        let (res, buf) = unsafe { TcpStream::read_raw(Self::io_ptr(this), buf) }.await;
-        // SAFETY: as above.
-        (unsafe { &mut *this.as_ptr() }.check_read(res), buf)
+        loop {
+            // SAFETY: as above, here and below.
+            if unsafe { (*this.as_ptr()).closed } {
+                return (Ok(0), buf);
+            }
+            let (res, returned) = unsafe { TcpStream::read_raw(Self::io_ptr(this), buf) }.await;
+            buf = returned;
+            if let Some(res) = unsafe { &mut *this.as_ptr() }.check_read(res) {
+                return (res, buf);
+            }
+        }
     }
 
     async unsafe fn write_raw<T: IoBuf>(this: NonNull<Self>, buf: T) -> BufResult<usize, T> {
         // SAFETY: as in `read_raw`, here and below.
-        if !unsafe { &mut *this.as_ptr() }.within_limit() {
-            return (Err(limit_reached()), buf);
+        loop {
+            match unsafe { &mut *this.as_ptr() }.ready_to_write() {
+                Ok(()) => break,
+                // Polled, as in `shutdown_raw`.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    monoio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => return (Err(e), buf),
+            }
         }
         unsafe { TcpStream::write_raw(Self::io_ptr(this), buf) }.await
     }
@@ -660,6 +1070,73 @@ mod tests {
             Ok(()) => assert_eq!(SUPPORTED.load(Ordering::Relaxed), 0b11_1111),
             Err(e) => eprintln!("no kTLS here: {e}"),
         }
+    }
+
+    /// RFC 8448, 3 (Simple 1-RTT Handshake): the server's application
+    /// traffic secret, its key and IV; the KeyUpdate step is the same
+    /// HKDF-Expand-Label, checked against rustls in `tests/m166_ktls.rs`.
+    #[test]
+    fn traffic_keys_derive_as_rfc_8448() {
+        let unhex = |s: &str| -> Vec<u8> {
+            let s: String = s.split_whitespace().collect();
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let suite = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256;
+        let SupportedCipherSuite::Tls13(suite) = suite else {
+            unreachable!()
+        };
+        let secret = OkmBlock::new(&unhex(
+            "a1 1a f9 f0 55 31 f8 56 ad 47 11 6b 45 a9 50 32 82 04 b4 f4 4b fb 6b 3a 4b 4f 1f 3f cb 63 16 43",
+        ));
+        let (key, iv) = key_iv(suite.hkdf_provider, &secret, 16);
+        assert_eq!(
+            key[..16],
+            unhex("9f 02 28 3b 6c 9c 07 ef c2 6b b9 f2 ac 92 e3 56")[..]
+        );
+        assert_eq!(iv[..], unhex("cf 78 2b 88 dd 83 54 9a ad f1 e9 84")[..]);
+        assert_eq!(next_secret(suite.hkdf_provider, &secret).as_ref().len(), 32);
+    }
+
+    #[test]
+    fn logged_secrets_are_taken_once_and_expire() {
+        use rustls::KeyLog;
+        let log = SecretLog;
+        log.log(CLIENT_SECRET, &[1; 32], &[7; 32]);
+        log.log(SERVER_SECRET, &[1; 32], &[8; 32]);
+        log.log(CLIENT_SECRET, &[2; 32], &[9; 32]);
+        let (c, s) = take_logged(&[1; 32]);
+        assert_eq!(c.unwrap().as_ref(), &[7; 32]);
+        assert_eq!(s.unwrap().as_ref(), &[8; 32]);
+        assert!(matches!(take_logged(&[1; 32]), (None, None)));
+        // The slots are never reallocated: past LOGGED_KEEP the oldest go.
+        for i in 0..LOGGED_KEEP {
+            log.log(CLIENT_SECRET, &[3; 32], &[i as u8; 32]);
+        }
+        LOGGED.with_borrow(|slots| assert_eq!(slots.len(), LOGGED_KEEP));
+        assert!(take_logged(&[2; 32]).0.is_none());
+        // Older than any handshake: gone at the next look.
+        LOGGED.with_borrow_mut(|slots| {
+            for l in slots.iter_mut().flatten() {
+                l.at -= handshake_timeout() + Duration::from_secs(1);
+            }
+        });
+        assert!(take_logged(&[3; 32]).0.is_none());
+        LOGGED.with_borrow(|slots| assert!(slots.iter().all(Option::is_none)));
+    }
+
+    #[test]
+    fn client_random_from_the_first_record() {
+        let mut c = RecordCursor::default();
+        let mut hello = vec![22, 3, 1, 0, 200, 1, 0, 0, 196, 3, 3];
+        hello.extend(1..=32u8);
+        c.feed(&hello[..20]);
+        assert_eq!(c.client_random(), None);
+        c.feed(&hello[20..]);
+        let want: Vec<u8> = (1..=32).collect();
+        assert_eq!(c.client_random().map(|r| r.to_vec()), Some(want));
     }
 
     #[test]

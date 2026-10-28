@@ -378,6 +378,8 @@ pub(crate) enum IntoKtls<IO> {
         secrets: rustls::ExtractedSecrets,
         read: Vec<u8>,
         closed: bool,
+        /// The ClientHello's random, for the logged secrets (#852).
+        random: Option<[u8; 32]>,
     },
     /// Not switched, nothing changed: serve it in userspace.
     Userspace(TlsStream<IO>),
@@ -389,6 +391,11 @@ impl<IO> TlsStream<IO> {
     /// Whether the config asked for kTLS (`ssl_conf_command Options KTLS`).
     pub(crate) fn wants_ktls(&self) -> bool {
         self.records.is_some()
+    }
+
+    /// The ClientHello's random, with kTLS on (#852).
+    pub(crate) fn client_random(&self) -> Option<[u8; 32]> {
+        self.records.and_then(|r| r.client_random())
     }
 
     /// Hand the session to the kernel (#673), after the handshake.
@@ -448,6 +455,7 @@ impl<IO> TlsStream<IO> {
                 secrets,
                 read,
                 closed,
+                random: records.client_random(),
             },
             Err(e) => IntoKtls::Failed(io::Error::other(e)),
         }

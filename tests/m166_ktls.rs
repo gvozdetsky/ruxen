@@ -191,21 +191,31 @@ fn serve_over_ktls(driver: &str) {
         connections += 1;
     }
 
-    // TLS 1.3 KeyUpdate: rustls's buffered API has no secrets for the
-    // next keys, so on kTLS the connection ends; in userspace it goes on.
-    let tls13 = suites
+    // TLS 1.3 KeyUpdates (#852), each asking for ours: the next keys on
+    // both sides, a few generations, every TLS 1.3 suite (SHA-384 too).
+    let mut updated = Vec::new();
+    for &suite in suites
         .iter()
-        .find(|s| matches!(s, rustls::SupportedCipherSuite::Tls13(_)))
-        .unwrap();
-    let mut c = connect(port, &client_config(&ca, *tls13));
-    c.write_all(b"GET /small.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .unwrap();
-    read_response(&mut c).unwrap();
-    c.conn.refresh_traffic_keys().unwrap();
-    let after_update = c
-        .write_all(b"GET /small.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .and_then(|()| read_response(&mut c));
-    connections += 1;
+        .filter(|s| matches!(s, rustls::SupportedCipherSuite::Tls13(_)))
+    {
+        let mut c = connect(port, &client_config(&ca, suite));
+        c.write_all(b"GET /small.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        read_response(&mut c).unwrap();
+        let mut result = Ok(());
+        for _ in 0..3 {
+            c.conn.refresh_traffic_keys().unwrap();
+            result = c
+                .write_all(b"GET /big.bin HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .and_then(|()| read_response(&mut c))
+                .map(|(_, body)| assert!(body == big, "{suite:?} ({driver}): body differs"));
+            if result.is_err() {
+                break;
+            }
+        }
+        updated.push((suite, result));
+        connections += 1;
+    }
 
     if let (Some(before), Some(after)) = (before, ktls_tx_count()) {
         // Other tests may switch connections too, never fewer.
@@ -214,9 +224,14 @@ fn serve_over_ktls(driver: &str) {
             "{} of {connections} connections on kTLS ({driver})",
             after - before
         );
-        assert!(after_update.is_err(), "{after_update:?}");
-    } else {
-        assert_eq!(after_update.unwrap().1, b"hello\n");
+    }
+    // Without kTLS rustls updates the keys; with it the kernel does, where
+    // it takes new keys (Linux 6.14, `TlsRxRekeyOk`), else the connection
+    // closes.
+    let rekeys = ktls_tx_count().is_none()
+        || std::fs::read_to_string("/proc/net/tls_stat").is_ok_and(|s| s.contains("TlsRxRekeyOk"));
+    for (suite, result) in updated {
+        assert_eq!(result.is_ok(), rekeys, "{suite:?} ({driver}): {result:?}");
     }
     let log = std::fs::read_to_string(dir.join("error.log")).unwrap_or_default();
     assert!(!log.contains("[alert]") && !log.contains("[crit]"), "{log}");

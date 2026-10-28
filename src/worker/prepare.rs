@@ -319,6 +319,12 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         let h2_by_sni = server_http2.iter().any(|&on| on != http2);
         let tls = match build_listen_tls(addr, &tls_inputs, http2, h2_by_sni)? {
             Some((acceptor, contexts)) => {
+                // How long a handshake's logged secrets may wait (#852).
+                if tls_inputs.iter().any(|i| i.ssl.ktls()) {
+                    for server in &servers {
+                        crate::ktls::note_handshake_timeout(server.timeouts.header);
+                    }
+                }
                 for ((server, context), input) in servers.iter_mut().zip(contexts).zip(&tls_inputs)
                 {
                     server.tls_context = context;
@@ -759,8 +765,12 @@ pub(crate) fn build_listen_tls(
             .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
             if let Some(config) = Arc::get_mut(&mut config) {
                 crate::tls_certs::compress_certificates(config, compressed);
-                // The traffic keys go to the kernel after the handshake.
+                // The traffic keys go to the kernel after the handshake,
+                // and the secrets for key updates with them (#852).
                 config.enable_secret_extraction = ktls;
+                if ktls {
+                    config.key_log = Arc::new(crate::ktls::SecretLog);
+                }
             }
             Ok(config)
         };

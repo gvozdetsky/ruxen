@@ -447,22 +447,34 @@ impl ConnIo for crate::ktls::KtlsStream {
             };
             return (next, buf);
         }
-        if !self.within_limit() {
+        // Our KeyUpdate when due; at the record limit without one, closed.
+        if let Err(e) = self.ready_to_write()
+            && e.kind() != std::io::ErrorKind::WouldBlock
+        {
             return (IdleRead::Close, buf);
         }
         use monoio::buf::IoBufMut;
-        let len = buf.len();
-        // A record other than data (close_notify) fails the read: closed.
-        let (next, buf) = read_first_or_shutdown(
-            self.io_mut(),
-            buf.slice_mut(0..len),
-            state,
-            idle,
-            fresh,
-            timers,
-        )
-        .await;
-        (next, buf.map_or_else(Vec::new, |b| b.into_inner()))
+        loop {
+            let len = buf.len();
+            // A record other than data fails the read: a close_notify
+            // closes, a KeyUpdate is taken and the wait goes on.
+            let (next, returned) = read_first_or_shutdown(
+                self.io_mut(),
+                buf.slice_mut(0..len),
+                state,
+                idle,
+                fresh,
+                timers,
+            )
+            .await;
+            let Some(returned) = returned else {
+                return (next, Vec::new());
+            };
+            buf = returned.into_inner();
+            if !matches!(next, IdleRead::Close) || !self.idle_control_record() {
+                return (next, buf);
+            }
+        }
     }
 
     async fn idle_wait(
