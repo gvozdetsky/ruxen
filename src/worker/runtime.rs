@@ -436,12 +436,25 @@ async fn reject_request<S: ConnIo>(
     http: &'static PreparedHttp,
     response: &[u8],
     request_head: &[u8],
+    refused: Refused,
     conn: &ConnLogCtx<'_>,
 ) {
     let listen = &http.listens[conn.listen_index];
     let server = &listen.servers[listen.default_server];
+    let request_id = super::draw_request_id(http);
     scratch.clear();
     scratch.extend_from_slice(response);
+    if !server.add_headers.is_empty() && refused != Refused::Body {
+        *scratch = reject_add_headers(
+            http,
+            server,
+            std::mem::take(scratch),
+            request_head,
+            refused == Refused::Headers,
+            request_id,
+            conn,
+        );
+    }
     inject_connection_header(scratch, true);
     refresh_date_header(scratch);
     let taken = std::mem::take(scratch);
@@ -466,15 +479,113 @@ async fn reject_request<S: ConnIo>(
         request_head.len() as u64,
         sent,
         sent.saturating_sub(head_len),
+        request_id,
         conn,
     )
     .await;
+}
+
+/// What of a refused request was read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// Its request line was refused.
+    Line,
+    /// One of its headers.
+    Headers,
+    /// Its body, which nginx reads in the location, whose configuration
+    /// then answers (not modelled: the default server's canned page).
+    Body,
+}
+
+/// The default server's `add_header … always` on a request refused before
+/// routing (#779): nginx answers it with that server's configuration, so
+/// its header filter adds them. Rendered with what is known of the
+/// request: the request line's variables once it parsed (`line_parsed`).
+#[cold]
+#[inline(never)]
+fn reject_add_headers(
+    http: &'static PreparedHttp,
+    server: &PreparedServer,
+    response: Vec<u8>,
+    head: &[u8],
+    line_parsed: bool,
+    request_id: u128,
+    conn: &ConnLogCtx<'_>,
+) -> Vec<u8> {
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    let request_line = if line_parsed { &head[..line_end] } else { b"" };
+    let mut words = request_line.split(|&b| b == b' ').filter(|w| !w.is_empty());
+    let method = words.next().unwrap_or(b"");
+    let request_uri = words.next().unwrap_or(b"");
+    let args = request_args(request_uri);
+    let uri = request_uri
+        .iter()
+        .position(|&b| b == b'?')
+        .map_or(request_uri, |i| &request_uri[..i]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ctx = RenderCtx {
+        uri,
+        request_uri,
+        request_method: method,
+        request_line,
+        host: server.primary_server_name,
+        remote_addr: conn.remote_addr,
+        remote_port: conn.remote_port,
+        remote_user: b"",
+        server_name: server.primary_server_name,
+        status: response_status(&response),
+        args,
+        is_args: if args.is_empty() { b"" } else { b"?" },
+        scheme: if conn.tls.is_some() {
+            b"https"
+        } else {
+            b"http"
+        },
+        hostname: hostname(),
+        headers_raw: if line_parsed { &head[line_end..] } else { b"" },
+        underscores_in_headers: server.underscores_in_headers,
+        sent_headers: &[],
+        connection_id: conn.connection_id,
+        request_id,
+        connection_requests: conn.connection_requests,
+        connection_time_us: conn.connection_start.elapsed().as_micros() as u64,
+        request_time_us: 0,
+        server_port: server.listen_port,
+        request_port: &[],
+        pipe: b'.',
+        request_length: head.len() as u64,
+        request_body: &[],
+        request_body_file: &[],
+        bytes_sent: 0,
+        body_bytes_sent: 0,
+        epoch_secs: now.as_secs(),
+        epoch_ms: now.subsec_millis() as u16,
+        server_name_captures: &[],
+        rewrite_state: None,
+        split_clients: Some(&http.split_clients),
+        maps: Some(&http.maps),
+        proxy_host: &[],
+        proxy_tls: false,
+        upstream_headers: &[],
+        upstream_states: &[],
+        upstream_cache_status: &[],
+        sent_trailers: &[],
+        tls: conn.tls,
+        conn: conn.conn,
+    };
+    super::response::inject_add_headers(response, server.add_headers, &ctx)
 }
 
 /// The access-log line of a request that ended before a server was chosen,
 /// to the address's default server's logs: `response` holds the status,
 /// `$request` is whatever of the request line arrived (nginx's then is up
 /// to the first CR or LF).
+#[allow(clippy::too_many_arguments)]
 async fn log_before_routing(
     http: &'static PreparedHttp,
     response: &[u8],
@@ -482,6 +593,7 @@ async fn log_before_routing(
     request_length: u64,
     sent: u64,
     body_sent: u64,
+    request_id: u128,
     conn: &ConnLogCtx<'_>,
 ) {
     let listen = &http.listens[conn.listen_index];
@@ -513,7 +625,7 @@ async fn log_before_routing(
         response,
         conn.connection_id,
         conn.connection_requests,
-        super::draw_request_id(http),
+        request_id,
         conn.connection_start.elapsed().as_micros() as u64,
         0,
         server.listen_port,
@@ -594,7 +706,17 @@ async fn log_unfinished_head(
         _ => 400,
     };
     // `$request_length`: the lines parsed, as nginx's r->request_length.
-    log_before_routing(http, &lost_head(status), head, complete as u64, 0, 0, conn).await;
+    log_before_routing(
+        http,
+        &lost_head(status),
+        head,
+        complete as u64,
+        0,
+        0,
+        super::draw_request_id(http),
+        conn,
+    )
+    .await;
 }
 
 /// A response under `limit_rate`: the head, then the file body if any,
@@ -626,6 +748,26 @@ async fn write_response_paced<S: ConnIo>(
             .await
             .map_err(|n| len as u64 + n),
         None => Ok(()),
+    }
+}
+
+/// The next request's first bytes if they are already in the socket after
+/// a body read up to its end, as nginx's keep-alive handler reads at once
+/// when the last read filled its buffer (`rev->ready`). A request queued
+/// there is read while it is in the cache, not after a trip through the
+/// ring (#757). `None`: wait in `idle_read`.
+#[inline(never)]
+fn read_queued<S: ConnIo>(
+    stream: &mut S,
+    buf: &mut [u8],
+    state: &RuntimeState,
+) -> Option<IdleRead> {
+    if state.is_shutting_down() {
+        return None;
+    }
+    match stream.read_queued(buf)? {
+        Ok(n) if n > 0 => Some(IdleRead::Read(n)),
+        _ => Some(IdleRead::Close),
     }
 }
 
@@ -735,8 +877,18 @@ async fn many_header_lines<S: ConnIo>(
         b"client sent too many header lines while reading client request headers",
         None,
     );
-    let response = http.header_too_large.pick(Method::Get);
-    reject_request(stream, scratch, http, response, head, conn).await;
+    let response = http.header_too_large.pick(head_method(head));
+    reject_request(
+        stream,
+        scratch,
+        http,
+        response,
+        head,
+        Refused::Headers,
+        conn,
+    )
+    .await;
+    linger_after_reject(stream, scratch).await;
 }
 
 /// nginx's `[info]` line for a request refused while its head is read
@@ -836,7 +988,7 @@ async fn head_too_large<S: ConnIo>(
     let (message, response) = match header_line {
         None => (
             "client sent too long URI while reading client request line".to_string(),
-            http.uri_too_large.pick(Method::Get),
+            http.uri_too_large.pick(head_method(head)),
         ),
         Some(start) => {
             let line = &head[start..];
@@ -851,7 +1003,7 @@ async fn head_too_large<S: ConnIo>(
                      headers",
                     String::from_utf8_lossy(line)
                 ),
-                http.header_too_large.pick(Method::Get),
+                http.header_too_large.pick(head_method(head)),
             )
         }
     };
@@ -866,7 +1018,35 @@ async fn head_too_large<S: ConnIo>(
             String::from_utf8_lossy(request_line),
         ),
     );
-    reject_request(stream, scratch, http, response, head, conn).await;
+    let refused = match header_line {
+        None => Refused::Line,
+        Some(_) => Refused::Headers,
+    };
+    reject_request(stream, scratch, http, response, head, refused, conn).await;
+    linger_after_reject(stream, scratch).await;
+}
+
+/// After a head refused for its size the rest of it is likely still
+/// coming: a close with it unread would be a reset, which can lose the
+/// response, so it is read and dropped first, as nginx's lingering close
+/// does (#780).
+#[cold]
+#[inline(never)]
+async fn linger_after_reject<S: ConnIo>(stream: &mut S, scratch: &mut Vec<u8>) {
+    if !stream.h2() {
+        Box::pin(lingering_close(stream, scratch)).await;
+    }
+}
+
+/// The method of a refused head, once the request line got past it: a
+/// `HEAD` gets its error without a body (#783).
+#[cold]
+#[inline(never)]
+fn head_method(head: &[u8]) -> Method {
+    match head.iter().position(|&b| b == b' ') {
+        Some(end) => http::classify_method(&head[..end]),
+        None => Method::Other,
+    }
 }
 
 /// A response head for the access log when a timed-out write took the
@@ -4068,6 +4248,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // keep-alive ones; client_header_timeout bounds the wait. A connection
     // an old worker accepted just before it stopped is served, not reset.
     let mut fresh = true;
+    // The last request's body was read from the socket, up to its end: the
+    // next request may be queued behind it (`read_queued`).
+    let mut body_read = false;
 
     // Per-connection scratch buffers — allocated once and reused across
     // every request on this connection. `mem::take` during `write_all`
@@ -4118,16 +4301,26 @@ pub(crate) async fn handle<S: ConnIo>(
     'idle: loop {
         conn_stats.set(super::stats::Phase::Waiting);
         let (buf_ptr, buf_len) = (buf.as_ptr(), buf.len());
-        let (next, returned) = stream
-            .idle_read(
-                std::mem::take(&mut *buf),
-                state,
-                keepalive_idle_timeout,
-                std::mem::take(&mut fresh),
-                &mut timers,
-            )
-            .await;
-        *buf = returned;
+        let next = match std::mem::take(&mut body_read) {
+            true => read_queued(stream, buf, state),
+            false => None,
+        };
+        let next = match next {
+            Some(next) => next,
+            None => {
+                let (next, returned) = stream
+                    .idle_read(
+                        std::mem::take(&mut *buf),
+                        state,
+                        keepalive_idle_timeout,
+                        std::mem::take(&mut fresh),
+                        &mut timers,
+                    )
+                    .await;
+                *buf = returned;
+                next
+            }
+        };
         let mut filled: usize = match next {
             IdleRead::Close => return,
             IdleRead::Ready => 0,
@@ -4669,8 +4862,10 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let take = (already as u64).min(cl) as usize;
                                 if discard_body {
                                     if cl > take as u64 {
-                                        pending_discard =
-                                            Some(PendingDiscard::Length(cl - take as u64));
+                                        let rest = stream.discard_queued(cl - take as u64);
+                                        if rest > 0 {
+                                            pending_discard = Some(PendingDiscard::Length(rest));
+                                        }
                                     }
                                     break 'read (take, cl);
                                 }
@@ -4715,7 +4910,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         let Some((res, returned)) = with_timeout(
                                             timers.io.as_mut(),
                                             body_timeout,
-                                            stream.read(slice),
+                                            stream.read_now(slice),
                                         )
                                         .await
                                         else {
@@ -4754,6 +4949,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         http,
                                         http.bad_request.pick(method),
                                         &buf[read_start..filled],
+                                        Refused::Body,
                                         conn_log!(),
                                     )
                                     .await;
@@ -4788,6 +4984,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         http,
                                         http.bad_request.pick(method),
                                         &buf[read_start..filled],
+                                        Refused::Body,
                                         conn_log!(),
                                     )
                                     .await;
@@ -4797,6 +4994,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         } else {
                             (0, 0)
                         };
+                        body_read = request_body_len > body_in_buf as u64;
                         // Over the limit: big enough for the location's check.
                         let body_len = if body_too_large {
                             request_body_len.max(max_body.saturating_add(1))
@@ -5597,22 +5795,16 @@ pub(crate) async fn handle<S: ConnIo>(
                             &buf[read_start..filled],
                             stream.h2(),
                         );
-                        // Honor HEAD if the request line parsed before the
-                        // header block went sideways (or did but for its
-                        // version); otherwise default to full — we don't
-                        // know the method and a body on a 400 is fine for
-                        // non-HEAD clients.
+                        // Honor HEAD once the request line got past the
+                        // method, as nginx knows it then; otherwise a full
+                        // response.
                         let method = if parse_state.rline_done {
                             http::classify_method(
                                 &buf[read_start + parse_state.method_start
                                     ..read_start + parse_state.method_end],
                             )
-                        } else if bad_version {
-                            let line = &buf[read_start..filled];
-                            let end = line.iter().position(|&b| b == b' ').unwrap_or(0);
-                            http::classify_method(&line[..end])
                         } else {
-                            Method::Other
+                            head_method(&buf[read_start..filled])
                         };
                         let page = if bad_version {
                             &http.version_not_supported
@@ -5625,6 +5817,11 @@ pub(crate) async fn handle<S: ConnIo>(
                             http,
                             page.pick(method),
                             &buf[read_start..filled],
+                            if parse_state.rline_done {
+                                Refused::Headers
+                            } else {
+                                Refused::Line
+                            },
                             conn_log!(),
                         )
                         .await;

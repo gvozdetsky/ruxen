@@ -305,7 +305,7 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
 /// happens again in `prepare_maps`, but we do it here so malformed
 /// patterns surface during `-t` rather than at worker startup.
 pub(crate) fn compile_map_regex(pattern: &str, case_insensitive: bool) -> Result<(), Error> {
-    let mut builder = regex::bytes::RegexBuilder::new(pattern);
+    let mut builder = regex::bytes::RegexBuilder::new(&pcre::translate(pattern));
     builder.case_insensitive(case_insensitive);
     builder.build().map(|_| ()).map_err(|_| Error::BadValue {
         what: "map regex",

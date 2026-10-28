@@ -649,6 +649,7 @@ pub fn password_file(path: &Path) -> Result<Arc<[Vec<u8>]>, String> {
             crate::worker::errno_text(&e)
         )
     })?;
+    crate::privileges::note_read(path);
     let passwords: Arc<[Vec<u8>]> = text
         .split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
@@ -695,6 +696,7 @@ pub fn pem_file(path: &Path) -> std::io::Result<Arc<[u8]>> {
         Some(bytes) => bytes,
         None => std::fs::read(path)?.into(),
     };
+    crate::privileges::note_read(path);
     files.push((path.to_path_buf(), id, bytes.clone()));
     Ok(bytes)
 }

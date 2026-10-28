@@ -146,6 +146,57 @@ fn default_buffers_are_nginx_4_8k() {
     );
 }
 
+/// The whole answer to `request` (written whole), up to the close, and
+/// whether the close was clean.
+fn answer(port: u16, request: &[u8]) -> (String, bool) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let written = s.write_all(request).is_ok();
+    let mut out = Vec::new();
+    let clean = s.read_to_end(&mut out).is_ok() && written;
+    (String::from_utf8_lossy(&out).into_owned(), clean)
+}
+
+/// A head refused for its size (#779, #780, #783): the server's
+/// `add_header … always`, no body for HEAD, and a close without a reset
+/// while the client is still sending.
+#[test]
+fn refused_heads_answer_as_nginx() {
+    let server = start("refused", "add_header X-Srv s always;");
+    let long = "a".repeat(60_000);
+    let (r, clean) = answer(
+        server.port,
+        format!("GET /?{long} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+    );
+    assert!(r.starts_with("HTTP/1.1 414 "), "{r}");
+    assert!(r.contains("\r\nX-Srv: s\r\n"), "{r}");
+    assert!(clean, "{r}");
+    let (r, clean) = answer(
+        server.port,
+        format!("GET / HTTP/1.1\r\nHost: x\r\nX-Long: {long}\r\n\r\n").as_bytes(),
+    );
+    assert!(r.starts_with("HTTP/1.1 400 "), "{r}");
+    assert!(r.contains("\r\nX-Srv: s\r\n"), "{r}");
+    assert!(clean, "{r}");
+    let (r, _) = answer(
+        server.port,
+        format!("HEAD /?{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(9000)).as_bytes(),
+    );
+    assert!(r.starts_with("HTTP/1.1 414 "), "{r}");
+    assert!(r.ends_with("\r\n\r\n"), "a body: {r}");
+    // Refused for its line or a header, before routing.
+    for req in [
+        "GET /%4 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
+        "GET / HTTP/2.0\r\nHost: x\r\n\r\n",
+        "HEAD /a\x01 HTTP/1.1\r\nHost: x\r\n\r\n",
+    ] {
+        let (r, _) = answer(server.port, req.as_bytes());
+        assert!(r.contains("\r\nX-Srv: s\r\n"), "{req:?}: {r}");
+        assert_eq!(req.starts_with("HEAD"), r.ends_with("\r\n\r\n"), "{r}");
+    }
+}
+
 #[test]
 fn smaller_buffers_limit_lines_and_the_head() {
     let server = start("small", "large_client_header_buffers 2 1k;");

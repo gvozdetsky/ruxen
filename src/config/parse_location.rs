@@ -276,7 +276,7 @@ pub(crate) fn parse_location_spec(args: &[String]) -> Result<LocationSpec, Error
 /// (percent-decoding can produce arbitrary octets). Compiling here with
 /// the same builder used in `prepare` keeps validation and runtime in sync.
 pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<(), Error> {
-    regex::bytes::RegexBuilder::new(pattern)
+    regex::bytes::RegexBuilder::new(&pcre::translate(pattern))
         .case_insensitive(case_insensitive)
         .build()
         .map(|_| ())
