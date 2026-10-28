@@ -1139,7 +1139,7 @@ impl ProxyEffective {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PreparedUpstream {
     /// Display name. For named upstream blocks: the block name.
     /// For synthesized direct-form blocks: the literal host:port.
@@ -1170,6 +1170,21 @@ pub struct PreparedUpstream {
     /// all workers (one slot per peer). `None`: per worker, as nginx's
     /// without a zone.
     pub shared: Option<&'static [crate::upstream::PeerShared]>,
+    /// `resolve` servers (#597): the peers change at run time, and
+    /// requests use `current()`'s list.
+    pub dynamic: Option<&'static crate::upstream_resolve::Dynamic>,
+}
+
+impl PreparedUpstream {
+    /// The peer list a request starts with: this one, or the latest
+    /// version of an upstream with `resolve` servers.
+    #[inline]
+    pub fn current(&'static self) -> &'static PreparedUpstream {
+        match self.dynamic {
+            None => self,
+            Some(dynamic) => dynamic.current(),
+        }
+    }
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in

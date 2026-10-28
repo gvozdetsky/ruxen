@@ -980,10 +980,11 @@ pub(crate) fn prepare_upstreams(
     for u in upstreams {
         let name_static: &'static str = crate::arena::leak(u.name.into_boxed_str());
         let mut peers_vec: Vec<PreparedPeer> = Vec::with_capacity(u.servers.len());
+        let mut hosts = Vec::new();
         for s in u.servers {
             let display: &'static [u8] =
                 crate::arena::leak(s.display.into_bytes().into_boxed_slice());
-            peers_vec.push(PreparedPeer {
+            let peer = PreparedPeer {
                 addr: PeerAddr::from_config(s.addr),
                 display,
                 weight: s.weight,
@@ -992,7 +993,17 @@ pub(crate) fn prepare_upstreams(
                 max_conns: s.max_conns,
                 down: s.down,
                 backup: s.backup,
-            });
+            };
+            match (s.resolve, peer.addr) {
+                (Some(name), PeerAddr::Inet(addr)) => {
+                    hosts.push(crate::upstream_resolve::HostConf {
+                        name,
+                        port: addr.port(),
+                        template: peer,
+                    })
+                }
+                _ => peers_vec.push(peer),
+            }
         }
         let peers: &'static [PreparedPeer] = crate::arena::leak(peers_vec.into_boxed_slice());
         // ngx_http_upstream_keepalive_init_main_conf: since 1.29.7 every
@@ -1014,9 +1025,23 @@ pub(crate) fn prepare_upstreams(
             lb: crate::upstream::Lb::prepare(u.lb, peers),
             shared: u
                 .zone
+                .as_ref()
                 .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
+            dynamic: None,
         }));
-        out.insert(name_static, &*prepared);
+        let prepared: &'static PreparedUpstream = match (&u.zone, u.resolver) {
+            (Some(zone), Some(resolver)) if !hosts.is_empty() => {
+                crate::upstream_resolve::Dynamic::prepare(
+                    *prepared,
+                    zone,
+                    hosts,
+                    prepare_resolver(resolver),
+                    std::time::Duration::from_millis(u.resolver_timeout_ms.unwrap_or(30_000)),
+                )
+            }
+            _ => prepared,
+        };
+        out.insert(name_static, prepared);
     }
     out
 }
@@ -1396,6 +1421,7 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    dynamic: None,
                 }));
             if inet && let Ok(authority) = std::str::from_utf8(host_header_static) {
                 note_implicit_upstream(authority, upstream);
@@ -1443,7 +1469,7 @@ pub(crate) fn build_proxy(
             let upstream = *upstreams.get(name.as_str()).unwrap_or_else(|| {
                 panic!("ruxen: proxy_pass http://{name} references undeclared upstream block")
             });
-            if upstream.peers.is_empty() {
+            if upstream.peers.is_empty() && upstream.dynamic.is_none() {
                 panic!("ruxen: upstream {name} has no servers (parser invariant violated)");
             }
             let host_header_static: &'static [u8] =
@@ -1508,6 +1534,7 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    dynamic: None,
                 }));
             PreparedProxy {
                 upstream,

@@ -148,9 +148,9 @@ too, the line only differs.
 (`error: … the check stopped here`), as `-t` does. The ones real
 configurations hit:
 
-- `bad value for upstream server param: resolve`: `server … resolve` in an
-  `upstream` (nginx 1.27.3). ruxen resolves upstream names once, at start
-  and reload. [#597] (open).
+- `bad value for upstream server param: service=…`: SRV records for an
+  upstream `server` (nginx 1.27.3). `server … resolve` without `service=`
+  works. [#597] (open).
 - `invalid location regex … repetition quantifier expects a valid decimal`:
   a `{` that doesn't start a quantifier, often a template variable that was
   never substituted (`^${PREFIX}/`). nginx's PCRE reads it as a literal.

@@ -75,6 +75,17 @@ impl PeerShared {
     pub(crate) fn for_peers(n: usize) -> &'static [PeerShared] {
         crate::arena::leak((0..n).map(|_| PeerShared::default()).collect())
     }
+
+    /// The failure window of the same peer in another version of a
+    /// resolved upstream (#597).
+    pub(crate) fn carry(&self, from: &PeerShared) {
+        self.fails
+            .store(from.fails.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.fails_started_ms.store(
+            from.fails_started_ms.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 fn origin() -> Instant {
@@ -181,7 +192,7 @@ fn crc32(data: &[u8]) -> u32 {
 /// ngx_http_upstream_init_chash: `160 × weight` points per primary peer,
 /// each `crc32(HOST \0 PORT PREV_HASH)` from the `server` text as written,
 /// sorted, equal hashes kept once.
-fn chash_ring(peers: &[PreparedPeer]) -> Box<[ChashPoint]> {
+pub(crate) fn chash_ring(peers: &[PreparedPeer]) -> Box<[ChashPoint]> {
     let mut points = Vec::new();
     for (i, peer) in peers.iter().enumerate().filter(|(_, p)| !p.backup) {
         let server = peer.display;
@@ -988,6 +999,74 @@ pub fn pool_take(
     })
 }
 
+/// Peer `peer_idx` of `version` in the version of its upstream that is
+/// current: a connection released after a DNS change goes to the list
+/// requests use, or is closed if its peer is gone (#597).
+#[cold]
+fn in_current(
+    dynamic: &'static crate::upstream_resolve::Dynamic,
+    version: &'static PreparedUpstream,
+    peer_idx: usize,
+) -> Option<(&'static PreparedUpstream, usize)> {
+    let current = dynamic.version();
+    if std::ptr::eq(current, version) {
+        return Some((version, peer_idx));
+    }
+    let addr = version.peers.get(peer_idx)?.addr;
+    let i = current.peers.iter().position(|p| p.addr == addr)?;
+    Some((current, i))
+}
+
+thread_local! {
+    /// The version of each resolved upstream this worker used last.
+    static SEEN: RefCell<HashMap<usize, usize, FxBuild>> = RefCell::new(HashMap::default());
+}
+
+/// A request of this worker takes `version` of `dynamic`: if the list
+/// changed since the last one, the idle connections to peers that stay
+/// move to it, and the round-robin state of the old one goes.
+pub(crate) fn notice_version(
+    dynamic: &'static crate::upstream_resolve::Dynamic,
+    version: &'static PreparedUpstream,
+) {
+    let key = std::ptr::from_ref(dynamic) as usize;
+    let now = std::ptr::from_ref(version) as usize;
+    let last = SEEN.with(|seen| seen.borrow_mut().insert(key, now));
+    if let Some(last) = last
+        && last != now
+    {
+        // SAFETY: a version of `dynamic`, kept as long as it is, and
+        // this worker serves its generation.
+        switch_version(unsafe { &*(last as *const PreparedUpstream) }, version);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn switch_version(old: &'static PreparedUpstream, new: &'static PreparedUpstream) {
+    let old_key = std::ptr::from_ref(old);
+    LB_STATE.with(|state| state.borrow_mut().remove(&old_key));
+    POOL.with(|p| {
+        let mut map = p.borrow_mut();
+        let Some(idle) = map.remove(&old_key) else {
+            return;
+        };
+        let queue = map.entry(std::ptr::from_ref(new)).or_default();
+        for mut e in idle {
+            let addr = old.peers[e.peer_idx].addr;
+            if let Some(i) = new.peers.iter().position(|p| p.addr == addr) {
+                e.peer_idx = i;
+                queue.push_back(e);
+            }
+        }
+        // Most recently used first, as `pool_take` expects.
+        queue
+            .make_contiguous()
+            .sort_by_key(|e| std::cmp::Reverse(e.conn.last_used));
+        queue.truncate(new.keepalive_max_idle.unwrap_or(0) as usize);
+    });
+}
+
 /// Close one idle keep-alive connection, the least recently used of some
 /// pool, to free its `worker_connections` slot. `false` if every pool is
 /// empty.
@@ -1015,6 +1094,13 @@ pub fn pool_release(
 ) {
     let Some(max_idle) = upstream.keepalive_max_idle else {
         return;
+    };
+    let (upstream, peer_idx) = match upstream.dynamic {
+        None => (upstream, peer_idx),
+        Some(dynamic) => match in_current(dynamic, upstream, peer_idx) {
+            Some(found) => found,
+            None => return,
+        },
     };
     if conn.requests_served as u64 >= upstream.keepalive_requests {
         return;
@@ -1144,6 +1230,7 @@ mod tests {
             keepalive_max_lifetime_ms: 3_600_000,
             lb,
             shared: None,
+            dynamic: None,
         }))
     }
 
@@ -1344,6 +1431,7 @@ mod tests {
             keepalive_max_lifetime_ms: 3_600_000,
             lb: Lb::prepare(lb, peers),
             shared: None,
+            dynamic: None,
         }))
     }
 
@@ -1468,6 +1556,7 @@ mod tests {
             keepalive_max_lifetime_ms: 3_600_000,
             lb: Lb::RoundRobin,
             shared: zone.then(|| PeerShared::for_peers(peers.len())),
+            dynamic: None,
         }))
     }
 

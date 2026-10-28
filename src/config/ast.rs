@@ -668,6 +668,10 @@ pub struct UpstreamBlock {
     /// `zone name [size]` (#143): the peers' state is shared by all
     /// workers.
     pub zone: Option<String>,
+    /// `resolver` / `resolver_timeout` in the block (#597), else http's,
+    /// filled in once the http block is read.
+    pub resolver: Option<ResolverConf>,
+    pub resolver_timeout_ms: Option<u64>,
 }
 
 /// Load-balancing algorithm for an `upstream {}` block. Smoothed weighted
@@ -695,15 +699,17 @@ pub enum UpstreamAddr {
 }
 
 /// One `server <host:port> [weight=N] [max_fails=N] [fail_timeout=Ts]
-/// [down] [backup];` entry inside an `upstream {}` block. The host+port
-/// is resolved at parse time via `to_socket_addrs` — we don't carry a
-/// runtime resolver. Hostname-only resolution picks the first address.
+/// [down] [backup] [resolve];` entry inside an `upstream {}` block. The
+/// host+port is resolved at parse time via `to_socket_addrs`, unless the
+/// name is `resolve`d at run time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamServer {
     /// Resolved peer address. A `server` whose name resolves to several
     /// addresses is one `UpstreamServer` per address, as nginx makes a
-    /// peer of each (#330).
+    /// peer of each (#330). For a `resolve` name, only its port counts.
     pub addr: UpstreamAddr,
+    /// `resolve` with a name (#597): the name, asked at run time.
+    pub resolve: Option<String>,
     /// Original `host:port` string as written. Used for the upstream
     /// `Host:` header default and for diagnostics.
     pub display: String,

@@ -929,7 +929,10 @@ pub(crate) fn run_location_handler(
                 }
             },
         };
-        let upstream = variable.as_ref().map_or(proxy.upstream, |v| v.upstream);
+        let upstream = variable
+            .as_ref()
+            .map_or(proxy.upstream, |v| v.upstream)
+            .current();
         let host_header: &[u8] = variable
             .as_ref()
             .map_or(proxy.host_header, |v| &v.host_header);
