@@ -159,9 +159,11 @@ fn proxy_http_version_2() {
     let echo = TcpListener::bind("127.0.0.1:0").unwrap();
     let echo_port = echo.local_addr().unwrap().port();
     echo_backend(echo);
-    let [front, h2c, h2tls] = common::ports::free_ports();
-    let s = start(format!(
+    let [front, h2c, h2tls, h2404] = common::ports::free_ports();
+    let mut s = start(format!(
         "upstream u {{ server 127.0.0.1:{h2c}; keepalive 4; }}\n\
+         upstream next {{ server 127.0.0.1:{h2404}; server 127.0.0.1:{h2c}; }}\n\
+         server {{ listen 127.0.0.1:{h2404}; http2 on; return 404; }}\n\
          server {{ listen 127.0.0.1:{h2c}; http2 on;\n\
            location /info {{ return 200 \"$server_protocol|$connection_requests|$host|$http_te\"; }}\n\
            location /echo {{ proxy_pass http://127.0.0.1:{echo_port}; }}\n\
@@ -174,7 +176,8 @@ fn proxy_http_version_2() {
            location / {{ proxy_pass http://u; }}\n\
            location /nobuf/ {{ proxy_pass http://u/; proxy_buffering off; }}\n\
            location /host/ {{ proxy_pass http://u/; proxy_set_header Host example.org; }}\n\
-           location /tls/ {{ proxy_pass https://127.0.0.1:{h2tls}/; }} }}",
+           location /tls/ {{ proxy_pass https://127.0.0.1:{h2tls}/; }}\n\
+           location /next/ {{ proxy_pass http://next/; proxy_next_upstream http_404; }} }}",
         cert = cert.cert_path().display(),
         key = cert.key_path().display(),
     ));
@@ -259,5 +262,30 @@ fn proxy_http_version_2() {
         text(&body)
     );
 
-    drop(s);
+    // An upstream that answers without reading the body: its 404 is read
+    // (and the next one gets the whole body), not a failed send.
+    let big = "y".repeat(300_000);
+    let (status, _, body) = request(
+        front,
+        &format!(
+            "GET /next/echo HTTP/1.1\r\nHost: front\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{big}",
+            big.len()
+        ),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(text(&body), format!("GET|{big}|"));
+
+    // Pooled HTTP/2 connections close with the worker: a clean exit.
+    // SAFETY: a signal to the child this test started.
+    unsafe { libc::kill(s.child.id() as i32, libc::SIGQUIT) };
+    let mut status = None;
+    for _ in 0..100 {
+        if let Some(exit) = s.child.try_wait().unwrap() {
+            status = Some(exit);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
 }

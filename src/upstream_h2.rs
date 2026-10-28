@@ -19,6 +19,7 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::task::Poll;
 
 use bytes::Bytes;
 use h2::client::{ResponseFuture, SendRequest};
@@ -42,6 +43,9 @@ enum Phase {
     Idle,
     /// The request body: what is left of its Content-Length.
     Body(SendStream<Bytes>, u64),
+    /// The upstream stopped taking the body (a response, a reset): what is
+    /// left of it is taken and dropped, and the response read.
+    Discard(u64),
     /// The request is sent; the response head is awaited.
     Sent,
     /// The response body; for a Content-Length one, what is left of it.
@@ -56,6 +60,8 @@ pub struct H2Conn {
     identity: Option<TlsIdentity>,
     phase: Phase,
     response: Option<ResponseFuture>,
+    /// The response, when it came while the body was being sent.
+    early: Option<Result<http::Response<RecvStream>, h2::Error>>,
     /// The request head, until its end is written.
     head: Vec<u8>,
     /// The request is a HEAD: its response has no body.
@@ -96,6 +102,7 @@ pub async fn handshake(
         identity,
         phase: Phase::Idle,
         response: None,
+        early: None,
         head: Vec::new(),
         head_request: false,
         out: Vec::new(),
@@ -130,8 +137,16 @@ impl H2Conn {
             // its end: that stream is reset (CANCEL) as its handles go.
             self.phase = Phase::Idle;
             self.response = None;
+            self.early = None;
             self.out.clear();
             self.out_pos = 0;
+        }
+        if let Phase::Discard(left) = &mut self.phase {
+            *left = left.saturating_sub(data.len() as u64);
+            if *left == 0 {
+                self.phase = Phase::Sent;
+            }
+            return Ok(data.len());
         }
         let mut taken = 0;
         if matches!(self.phase, Phase::Idle) {
@@ -173,22 +188,44 @@ impl H2Conn {
             return Ok(data.len());
         }
         // As hyper does: wait for some window, then hand the crate the
-        // chunk, which it sends as the window opens.
+        // chunk, which it sends as the window opens. An upstream that
+        // answers (or resets the stream) without taking the whole body
+        // gets no more of it, and its response is read, as nginx does.
         stream.reserve_capacity(n);
-        while stream.capacity() == 0 {
-            match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(h2_io(e)),
-                None => return Err(io::Error::other("http2 upstream: stream closed")),
-            }
+        let mut taking = true;
+        while taking && stream.capacity() == 0 {
+            let response = &mut self.response;
+            let early = &mut self.early;
+            taking = poll_fn(|cx| {
+                if let Poll::Ready(capacity) = stream.poll_capacity(cx) {
+                    return Poll::Ready(matches!(capacity, Some(Ok(_))));
+                }
+                if let Some(future) = response.as_mut()
+                    && let Poll::Ready(r) = Pin::new(future).poll(cx)
+                {
+                    *response = None;
+                    *early = Some(r);
+                    return Poll::Ready(false);
+                }
+                Poll::Pending
+            })
+            .await;
         }
-        *left -= n as u64;
-        let end = *left == 0;
-        stream
-            .send_data(Bytes::copy_from_slice(&body[..n]), end)
-            .map_err(h2_io)?;
-        if end {
-            self.phase = Phase::Sent;
+        let left_after = *left - n as u64;
+        if taking {
+            let end = left_after == 0;
+            stream
+                .send_data(Bytes::copy_from_slice(&body[..n]), end)
+                .map_err(h2_io)?;
+            *left = left_after;
+            if end {
+                self.phase = Phase::Sent;
+            }
+        } else {
+            self.phase = Phase::Discard(left_after);
+            if left_after == 0 {
+                self.phase = Phase::Sent;
+            }
         }
         Ok(taken + n)
     }
@@ -201,10 +238,16 @@ impl H2Conn {
         }
         self.out.clear();
         self.out_pos = 0;
-        if let Some(response) = self.response.as_mut() {
-            let response = poll_fn(|cx| Pin::new(&mut *response).poll(cx))
-                .await
-                .map_err(h2_io)?;
+        let early = self.early.take();
+        if early.is_some() || self.response.is_some() {
+            let response = match early {
+                Some(r) => r,
+                None => {
+                    let future = self.response.as_mut().expect("checked");
+                    poll_fn(|cx| Pin::new(&mut *future).poll(cx)).await
+                }
+            }
+            .map_err(h2_io)?;
             self.response = None;
             let (parts, mut recv) = response.into_parts();
             let status = parts.status.as_u16();

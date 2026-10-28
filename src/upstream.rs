@@ -897,8 +897,31 @@ thread_local! {
     /// peer, nor one opened with other `proxy_ssl_*` settings, such as
     /// without verification (#116, #117), and only for the name it was
     /// opened for (`UpstreamIo::tls_identity`).
-    static POOL: RefCell<HashMap<*const PreparedUpstream, VecDeque<Idle>, FxBuild>> =
-        RefCell::new(HashMap::default());
+    static POOL: Pool = Pool(RefCell::new(HashMap::default()));
+}
+
+struct Pool(RefCell<HashMap<*const PreparedUpstream, VecDeque<Idle>, FxBuild>>);
+
+impl std::ops::Deref for Pool {
+    type Target = RefCell<HashMap<*const PreparedUpstream, VecDeque<Idle>, FxBuild>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for Pool {
+    /// A worker that ended without `pool_clear` (a panic): an HTTP/2
+    /// connection would wake its task, gone with the runtime, so it is
+    /// leaked; the process is ending.
+    fn drop(&mut self) {
+        for (_, q) in self.0.get_mut().drain() {
+            for e in q {
+                if matches!(e.conn.stream, crate::upstream_io::UpstreamIo::H2(_)) {
+                    std::mem::forget(e);
+                }
+            }
+        }
+    }
 }
 
 /// How long a pooled connection sits idle before `pool_take` checks that
@@ -998,6 +1021,19 @@ pub fn pool_close_one() -> bool {
         let mut map = p.borrow_mut();
         map.values_mut().find_map(|q| q.pop_back()).is_some()
     })
+}
+
+/// Close every idle connection, as a worker exits: inside the runtime, as
+/// an HTTP/2 one wakes its task when dropped, which can't be done from the
+/// thread-local's destructor. `true` if one was HTTP/2.
+pub fn pool_clear() -> bool {
+    let map = POOL.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    let h2 = map
+        .values()
+        .flatten()
+        .any(|e| matches!(e.conn.stream, crate::upstream_io::UpstreamIo::H2(_)));
+    drop(map);
+    h2
 }
 
 /// Return an upstream connection to the pool, for the location `tag`
