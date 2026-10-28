@@ -81,7 +81,7 @@ fn start(up: u16) -> Server {
         dir.join("nginx.conf"),
         format!(
             "events {{}}\nhttp {{ access_log off; server {{ listen 127.0.0.1:{port};\n\
-               location / {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+               location / {{ add_header X-RU $request_uri; proxy_pass http://127.0.0.1:{up}; }}\n\
                location /p/ {{ proxy_pass http://127.0.0.1:{up}/x/; }}\n\
                location /r/ {{ rewrite ^/r/(.*)$ /n/$1 break; proxy_pass http://127.0.0.1:{up}; }}\n\
                location /v/ {{ proxy_pass http://127.0.0.1:{up}$uri; }}\n\
@@ -237,6 +237,30 @@ fn fragment_stays_in_the_unparsed_uri() {
         let resp = get(server.port, target);
         assert!(
             resp.ends_with(&format!("\r\n\r\n{body}")),
+            "{target}: {resp}"
+        );
+    }
+}
+
+/// #769: an absolute-form target without a path has `$request_uri` from
+/// its `?`, as nginx's unparsed_uri; the upstream still gets `/?…`.
+#[test]
+fn absolute_target_without_a_path() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, ru, upstream_gets) in [
+        ("http://h?a=1", "?a=1", "/?a=1"),
+        ("http://h?a=1#f", "?a=1#f", "/?a=1"),
+        ("http://h", "/", "/"),
+        ("http://h/?a=1", "/?a=1", "/?a=1"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.contains(&format!("\r\nX-RU: {ru}\r\n")),
+            "{target}: {resp}"
+        );
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
             "{target}: {resp}"
         );
     }

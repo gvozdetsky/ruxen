@@ -1936,6 +1936,43 @@ pub(crate) fn unparsed_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u
     }
 }
 
+/// `$request_uri`: [`unparsed_uri`], except for an absolute-form target
+/// without a path (`GET http://h?a=1`), whose `/?a=1` is synthesized for
+/// `$uri`; nginx's unparsed_uri starts at the `?` there (#769). The
+/// upstream target keeps the `/` (valid_unparsed_uri is off for it).
+#[inline]
+pub(crate) fn request_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start
+        .checked_add(path.len())
+        .map(|end| (end, request_line.get(end)))
+    {
+        Some((end, Some(b'#'))) => with_fragment(request_line, start, end),
+        Some((_, Some(_))) => path,
+        _ => absolute_query(path, request_line),
+    }
+}
+
+/// The client's `?args…` for a synthesized `/?args`, else `path`.
+#[cold]
+#[inline(never)]
+fn absolute_query<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let Some(query) = path.strip_prefix(b"/").filter(|q| q.first() == Some(&b'?')) else {
+        return path;
+    };
+    let target = request_line
+        .split(|&b| b == b' ')
+        .nth(1)
+        .unwrap_or_default();
+    if target.first() == Some(&b'/') {
+        return path;
+    }
+    match target.iter().position(|&b| b == b'?') {
+        Some(i) if target[i..].starts_with(query) => &target[i..],
+        _ => path,
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn with_fragment(request_line: &[u8], start: usize, end: usize) -> &[u8] {
@@ -2902,6 +2939,25 @@ mod tests {
         let other = b"/#x".to_vec();
         assert_eq!(unparsed_uri(&other[..1], line), b"/");
         assert_eq!(unparsed_uri(b"/", b""), b"/");
+    }
+
+    #[test]
+    fn request_uri_of_an_absolute_target_without_a_path() {
+        let synth = b"/?a=1".to_vec();
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1 HTTP/1.1"), b"?a=1");
+        assert_eq!(
+            request_uri(&synth, b"GET http://h?a=1#f HTTP/1.1"),
+            b"?a=1#f"
+        );
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1#f"), b"?a=1#f");
+        // Not the target's query, or an origin-form line: as is.
+        assert_eq!(request_uri(&synth, b"GET http://h?b=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(&synth, b"GET /x?a=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(b"/", b"GET http://h HTTP/1.1"), b"/");
+        assert_eq!(request_uri(b"/", b""), b"/");
+        let line = b"GET http://h/?a=1#f HTTP/1.1";
+        assert_eq!(request_uri(&line[12..17], line), b"/?a=1#f");
+        assert_eq!(request_uri(&line[12..13], line), b"/");
     }
 
     #[test]

@@ -358,7 +358,8 @@ http {
 fn absolute_form_request_with_query_and_no_path_synthesises_slash() {
     // `GET http://host?args HTTP/1.1` has no path byte but carries a
     // query. The worker splices a `/` in front of `?args` so normal URI
-    // variables populate correctly.
+    // variables populate correctly; `$request_uri` is the raw `?args`, as
+    // in nginx (#769).
     let conf = r#"
 events { }
 http {
@@ -381,7 +382,7 @@ http {
     assert_eq!(status_line(&r), "HTTP/1.1 204 No Content");
     assert_eq!(header_value(&r, "X-URI"), Some("/"));
     assert_eq!(header_value(&r, "X-Args"), Some("k=v"));
-    assert_eq!(header_value(&r, "X-Req"), Some("/?k=v"));
+    assert_eq!(header_value(&r, "X-Req"), Some("?k=v"));
 }
 
 #[test]
