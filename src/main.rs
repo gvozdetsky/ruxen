@@ -21,6 +21,7 @@ mod auth;
 mod autoindex;
 mod client_verify;
 mod config;
+mod duplex;
 mod file;
 mod fs_resolve;
 mod http;
@@ -1429,6 +1430,7 @@ const VERSION_BODY: &str = concat!(
     " --with-http_stub_status_module",
     " --with-http_auth_request_module",
     " --with-http_v2_module",
+    " --with-http_gzip_static_module",
     " --without-pcre",
     " --without-http_charset_module",
     " --without-http_ssi_module",
@@ -1717,6 +1719,7 @@ mod tests {
                 " --with-http_stub_status_module",
                 " --with-http_auth_request_module",
                 " --with-http_v2_module",
+                " --with-http_gzip_static_module",
                 " --without-pcre",
                 " --without-http_charset_module",
                 " --without-http_ssi_module",
