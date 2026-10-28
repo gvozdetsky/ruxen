@@ -25,11 +25,6 @@ use crate::phase;
 /// The client connection preface (RFC 9113, 3.4).
 const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-/// How long a connection without streams stays: nginx's default
-/// keepalive_timeout, which it applies to HTTP/2 connections (the default
-/// server's own setting comes with the connection lifecycle, #144 phase 3).
-const IDLE: Duration = Duration::from_secs(75);
-
 /// What every stream of a connection shares.
 pub(crate) struct ConnCtx {
     pub peer_addr: SocketAddr,
@@ -92,10 +87,12 @@ where
     let ctx = Rc::new(ctx);
     let listen = &ctx.http.listens[ctx.listen_index];
     let timeouts = listen.servers[listen.default_server].timeouts;
-    let io = compat::PollIo::new(stream);
+    // Until its first stream, client_header_timeout bounds the connection
+    // (ngx_http_v2_init), keepalive_timeout only after one.
+    let first_stream_by = monoio::time::Instant::now() + timeouts.header;
+    let (io, stream) = compat::PollIo::new(stream);
     let writing_since = io.writing_since();
     let header_blocks = io.header_blocks();
-    let stream = io.stream_handle();
     // What nginx announces (ngx_http_v2_send_settings), from the default
     // server's settings: http2_max_concurrent_streams (128), a stream
     // window of http2_body_preread_size (64k); then it opens the
@@ -120,7 +117,7 @@ where
         .handshake::<_, Bytes>(io);
     // The preface and SETTINGS come under client_header_timeout, as the
     // first request line would.
-    let conn = match monoio::time::timeout(timeouts.header, handshake).await {
+    let conn = match monoio::time::timeout_at(first_stream_by, handshake).await {
         Ok(Ok(conn)) => conn,
         _ => return,
     };
@@ -128,6 +125,7 @@ where
         conn,
         &ctx,
         timeouts,
+        first_stream_by,
         max_streams as usize,
         writing_since,
         header_blocks,
@@ -138,9 +136,9 @@ where
     // lingering close): what the client still sends (a WINDOW_UPDATE, a
     // PING) would otherwise make the kernel reset the connection, and the
     // client could lose the end of a response.
-    // SAFETY: nothing else borrows the stream any more (see above).
-    let stream = unsafe { &mut *stream.get() };
-    super::lingering_close(stream, &mut Vec::new()).await;
+    if let Some(mut stream) = stream.take() {
+        super::lingering_close(&mut stream, &mut Vec::new()).await;
+    }
 }
 
 /// Accept streams and keep the connection going until the client or a
@@ -160,6 +158,7 @@ async fn drive<IO>(
     mut conn: h2::server::Connection<IO, Bytes>,
     ctx: &Rc<ConnCtx>,
     timeouts: super::PreparedClientTimeouts,
+    first_stream_by: monoio::time::Instant,
     max_streams: usize,
     writing_since: Rc<Cell<Option<std::time::Instant>>>,
     header_blocks: Rc<compat::HeaderBlocks>,
@@ -171,9 +170,10 @@ async fn drive<IO>(
     // default server's to the connection (ngx_http_v2_state_headers,
     // ngx_http_v2_handle_connection).
     let keepalive = listen.servers[listen.default_server].keepalive;
+    // None: keepalive_timeout 0, `allow` closes the connection.
     let idle = keepalive
         .idle_timeout_ms
-        .map_or(IDLE, Duration::from_millis);
+        .map_or(Duration::ZERO, Duration::from_millis);
     let max_time = Duration::from_millis(keepalive.max_time_ms);
     let started = std::time::Instant::now();
     let mut requests: u64 = 0;
@@ -198,7 +198,9 @@ async fn drive<IO>(
         let wake_at = if going_away {
             Some(now + Duration::from_millis(50))
         } else if streams.active.get() == 0 {
-            Some(if !keepalive.allow && requests > 0 {
+            Some(if requests == 0 {
+                first_stream_by
+            } else if !keepalive.allow {
                 now
             } else {
                 idle_since + idle
@@ -323,7 +325,11 @@ async fn drive<IO>(
         // after its streams), as nginx (http2_idle_timeout is obsolete); a
         // shutdown or reload sends GOAWAY and lets the open streams finish.
         let idle_expired = streams.active.get() == 0
-            && ((!keepalive.allow && requests > 0) || now.duration_since(idle_since) >= idle);
+            && if requests == 0 {
+                now >= first_stream_by
+            } else {
+                !keepalive.allow || now.duration_since(idle_since) >= idle
+            };
         if ctx.state.is_shutting_down() || idle_expired {
             conn.graceful_shutdown();
             going_away = true;

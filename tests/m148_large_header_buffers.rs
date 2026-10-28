@@ -146,6 +146,109 @@ fn default_buffers_are_nginx_4_8k() {
     );
 }
 
+/// The whole answer to `request` (written whole), up to the close, and
+/// whether the close was clean.
+fn answer(port: u16, request: &[u8]) -> (String, bool) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let written = s.write_all(request).is_ok();
+    let mut out = Vec::new();
+    let clean = s.read_to_end(&mut out).is_ok() && written;
+    (String::from_utf8_lossy(&out).into_owned(), clean)
+}
+
+/// A head refused for its size (#779, #780, #783): the server's
+/// `add_header … always`, no body for HEAD, and a close without a reset
+/// while the client is still sending.
+#[test]
+fn refused_heads_answer_as_nginx() {
+    let server = start("refused", "add_header X-Srv s always;");
+    let long = "a".repeat(60_000);
+    let (r, clean) = answer(
+        server.port,
+        format!("GET /?{long} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+    );
+    assert!(r.starts_with("HTTP/1.1 414 "), "{r}");
+    assert!(r.contains("\r\nX-Srv: s\r\n"), "{r}");
+    assert!(clean, "{r}");
+    let (r, clean) = answer(
+        server.port,
+        format!("GET / HTTP/1.1\r\nHost: x\r\nX-Long: {long}\r\n\r\n").as_bytes(),
+    );
+    assert!(r.starts_with("HTTP/1.1 400 "), "{r}");
+    assert!(r.contains("\r\nX-Srv: s\r\n"), "{r}");
+    assert!(clean, "{r}");
+    let (r, _) = answer(
+        server.port,
+        format!("HEAD /?{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(9000)).as_bytes(),
+    );
+    assert!(r.starts_with("HTTP/1.1 414 "), "{r}");
+    assert!(r.ends_with("\r\n\r\n"), "a body: {r}");
+    // Refused for its line or a header, before routing.
+    for req in [
+        "GET /%4 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
+        "GET / HTTP/2.0\r\nHost: x\r\n\r\n",
+        "HEAD /a\x01 HTTP/1.1\r\nHost: x\r\n\r\n",
+    ] {
+        let (r, _) = answer(server.port, req.as_bytes());
+        assert!(r.contains("\r\nX-Srv: s\r\n"), "{req:?}: {r}");
+        assert_eq!(req.starts_with("HEAD"), r.ends_with("\r\n\r\n"), "{r}");
+    }
+}
+
+/// A request bad in its line and in a header gets the line's answer, as
+/// nginx checks the line before it reads a header (#807).
+#[test]
+fn the_request_line_is_refused_before_a_header() {
+    let server = start("line-first", "add_header X \"$request_method\" always;");
+    let long = "a".repeat(9000);
+    for (req, status, method) in [
+        (
+            format!("GET /?{long} HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n"),
+            "414",
+            None,
+        ),
+        (
+            "GET /x%4 HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n".to_string(),
+            "400",
+            Some("GET"),
+        ),
+        (
+            format!("OPTIONS /x%00 HTTP/1.1\r\nHost: x\r\nX-Long: {long}\r\n\r\n"),
+            "400",
+            Some("OPTIONS"),
+        ),
+        (
+            "GET * HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n".to_string(),
+            "400",
+            None,
+        ),
+        ("GET /x%4 HTTP/1.1\r\n\r\n".to_string(), "400", Some("GET")),
+    ] {
+        let (r, _) = answer(server.port, req.as_bytes());
+        assert!(
+            r.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{}: {r}",
+            &req[..40]
+        );
+        assert!(
+            !r.contains("Too Large</title>") || status == "414",
+            "{}: {r}",
+            &req[..40]
+        );
+        if let Some(method) = method {
+            assert!(
+                r.contains(&format!("\r\nX: {method}\r\n")),
+                "{}: {r}",
+                &req[..40]
+            );
+        } else {
+            assert!(!r.contains("\r\nX: G"), "{}: {r}", &req[..40]);
+        }
+    }
+}
+
 #[test]
 fn smaller_buffers_limit_lines_and_the_head() {
     let server = start("small", "large_client_header_buffers 2 1k;");

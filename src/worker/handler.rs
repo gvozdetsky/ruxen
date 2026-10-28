@@ -556,7 +556,8 @@ fn cache_plan(
     }
     // ngx_http_upstream_cache_check_range: a range from too far into the
     // response isn't worth fetching it whole for the cache; it goes
-    // upstream as asked, and nothing is stored.
+    // upstream as asked, and nothing is stored. A `proxy_cache_lock` taken
+    // stays with the request, released when it ends, as nginx's (#864).
     if hit.is_none()
         && cacheable
         && let Some(max) = conf.max_range_offset
@@ -565,7 +566,6 @@ fn cache_plan(
     {
         cacheable = false;
         store = false;
-        token = None;
     }
     Ok(Some(Box::new(CachePlan {
         conf,
@@ -971,8 +971,8 @@ pub(crate) fn run_location_handler(
         } else if request_path.is_empty() {
             if rewrite_state.unparsed_uri && current_args.is_none() && req.path.starts_with(b"/") {
                 // Unchanged: the client's own request target (nginx's
-                // `r->unparsed_uri`).
-                req.path
+                // `r->unparsed_uri`), `#fragment` included.
+                phase::unparsed_uri(req.path, req.request_line)
             } else {
                 let mut buf = Vec::with_capacity(url_path.len() + 1 + args.len());
                 write_upstream_path(url_path, escape(), &mut buf);
@@ -1305,10 +1305,6 @@ pub(crate) fn run_location_handler(
             error_page_status,
             intercept,
             upgrade: client_upgrade,
-            // A response the range filter may cut is read whole (#370).
-            stream: cache.is_none()
-                && loc.add_trailers.is_empty()
-                && !(force_ranges && req.range.is_some()),
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
             cache,
@@ -1355,6 +1351,19 @@ pub(crate) fn run_location_handler(
             )),
             _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
         },
+        // As `stub_status`: GET and HEAD.
+        PreparedHandler::Metrics => match (req.method, http.metrics) {
+            (Method::Get | Method::Head, Some(m)) => {
+                Response::Owned(http::build_response_bytes_with_content_type(
+                    200,
+                    super::metrics::render(m).as_bytes(),
+                    b"text/plain; version=0.0.4; charset=utf-8",
+                    req.method,
+                    server_bytes,
+                ))
+            }
+            _ => Response::Owned(crate::file::method_not_allowed(req.method, server_bytes)),
+        },
         // Static-file mapping follows the configured path mode:
         // `root` appends the whole normalized URI, while `alias` strips the
         // matched location prefix first. `PreparedRoot` carries that choice.
@@ -1378,10 +1387,21 @@ pub(crate) fn run_location_handler(
             }
             let last_modified_override =
                 last_modified_override_for_conditionals(loc.add_headers, &render_ctx_base);
-            match fs_resolve::resolve(root, url_path, &render_ctx_base) {
+            match fs_resolve::resolve(root, url_path, &render_ctx_base, req.http_11) {
                 fs_resolve::Outcome::Serve(_) if !get_or_head => {
                     Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
+                fs_resolve::Outcome::ServeGzipStatic { opened, gzip, vary } => serve_gzip_static(
+                    opened,
+                    gzip,
+                    vary,
+                    &loc,
+                    root,
+                    req,
+                    error_page_status,
+                    last_modified_override.as_deref(),
+                    server_bytes,
+                ),
                 fs_resolve::Outcome::Serve(opened) => {
                     // An error page that goes out with another status than
                     // 200 is sent whole: nginx's not_modified and range
@@ -1577,61 +1597,49 @@ pub(crate) fn run_location_handler(
                             ))
                         }
                     },
-                    AutoindexFormat::Json => {
-                        match autoindex::render_json(&dir_path, autoindex::JsonMode::Json) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"application/json",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex json render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                        }
-                    }
-                    AutoindexFormat::Jsonp => {
-                        match autoindex::render_json(
-                            &dir_path,
-                            autoindex::JsonMode::Jsonp {
-                                args: render_ctx_base.args,
+                    AutoindexFormat::Json | AutoindexFormat::Jsonp => {
+                        let callback = if format == AutoindexFormat::Jsonp {
+                            autoindex::jsonp_callback(render_ctx_base.args)
+                        } else {
+                            Ok(&[][..])
+                        };
+                        match callback {
+                            Err(()) => Response::Owned(http::error_response_for_method(
+                                400,
+                                "Bad Request\n",
+                                req.method,
+                                server_bytes,
+                            )),
+                            Ok(callback) => match autoindex::render_json(&dir_path, callback) {
+                                // ngx_http_autoindex_handler: JSONP only with a callback.
+                                Ok(body) => {
+                                    let content_type: &[u8] = if callback.is_empty() {
+                                        b"application/json"
+                                    } else {
+                                        b"application/javascript"
+                                    };
+                                    Response::Owned(http::build_response_bytes_with_content_type(
+                                        200,
+                                        &body,
+                                        content_type,
+                                        req.method,
+                                        server_bytes,
+                                    ))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ruxen: autoindex json render failed for {} (uri={}): {e}",
+                                        dir_path.display(),
+                                        String::from_utf8_lossy(&uri)
+                                    );
+                                    Response::Owned(http::error_response_for_method(
+                                        500,
+                                        "Internal Server Error\n",
+                                        req.method,
+                                        server_bytes,
+                                    ))
+                                }
                             },
-                        ) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"application/json",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex jsonp render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
                         }
                     }
                 },
@@ -1672,6 +1680,94 @@ pub(crate) fn run_location_handler(
         preserved_www_authenticate,
         loc.expires,
     )
+}
+
+/// A file under `gzip_static` (#760), as the `Serve` arm sends a file:
+/// `file.gz` with `Content-Encoding: gzip` (`gzip`), or the file itself,
+/// and `Vary: Accept-Encoding` with `vary` unless the gzip filter adds it.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn serve_gzip_static(
+    opened: fs_resolve::Opened,
+    gzip: bool,
+    vary: bool,
+    loc: &MatchedLocation<'static>,
+    root: &PreparedRoot,
+    req: &phase::RequestCtx<'_>,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    last_modified_override: Option<&[u8]>,
+    server_bytes: &[u8],
+) -> Response {
+    let (mime, size) = (opened.mime, opened.size);
+    // The filter leaves a precompressed body alone, so its ranges stay.
+    let filter = if gzip { None } else { loc.gzip };
+    let error_status = match error_page_status {
+        Some(phase::ErrorPageStatus::Preserve(s) | phase::ErrorPageStatus::Override(s))
+            if s != 200 =>
+        {
+            Some(s)
+        }
+        _ => None,
+    };
+    let accept_ranges = loc.max_ranges != Some(0) && error_status.is_none();
+    let range = match (req.range.filter(|_| accept_ranges), filter) {
+        (Some(_), Some(gz))
+            if super::gzip::would_compress(
+                gz,
+                &super::gzip::GzipRequest::from_headers(req.http_11, req.headers_raw),
+                mime,
+                size,
+            ) =>
+        {
+            None
+        }
+        (range, _) => range,
+    };
+    let conditionals = |on: bool| file::Conditionals {
+        if_modified_since: req.if_modified_since.filter(|_| on),
+        if_unmodified_since: req.if_unmodified_since.filter(|_| on),
+        if_none_match: req.if_none_match.filter(|_| on),
+        if_match: req.if_match.filter(|_| on),
+        range,
+        if_range: req.if_range.filter(|_| on),
+        last_modified_override,
+        max_ranges: if on { loc.max_ranges } else { Some(0) },
+        ims_mode: root.if_modified_since,
+        etag: root.etag,
+    };
+    let mut response = file::serve_path(
+        opened,
+        req.method,
+        conditionals(error_status.is_none()),
+        server_bytes,
+        loc.sendfile,
+    );
+    if let (Some(_), Some(gz)) = (range, filter)
+        && gz.vary
+    {
+        response = super::gzip::vary_cut_file(gz, mime, size, response);
+    }
+    let headers = match &mut response {
+        Response::Owned(bytes) => bytes,
+        Response::File { headers, .. } => headers,
+        _ => return response,
+    };
+    let status = super::response_status(headers);
+    let filter_varies = matches!(status, 200 | 206 | 403 | 404 | 416)
+        && filter.is_some_and(|gz| super::gzip::file_varies(gz, mime, size));
+    let mut lines: Vec<u8> = Vec::new();
+    // nginx's not_modified filter drops Content-Encoding from a 304.
+    if gzip && matches!(status, 200 | 206 | 416) {
+        lines.extend_from_slice(b"Content-Encoding: gzip\r\n");
+    }
+    if vary && !filter_varies {
+        lines.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    }
+    if let Some(end) = headers.windows(4).position(|w| w == b"\r\n\r\n") {
+        headers.splice(end + 2..end + 2, lines);
+    }
+    response
 }
 
 /// The 413 for a body over the location's `client_max_body_size`, sent as
