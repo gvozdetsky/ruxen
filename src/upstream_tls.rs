@@ -804,9 +804,9 @@ mod tests {
         // it is.
         assert_eq!(get(&mut cache, &a, 100, false, true), 4);
         assert_eq!(get(&mut cache, &a, 100, true, true), 5);
-        // A changed file is read again once `valid` is over.
-        std::fs::remove_file(&a).unwrap();
-        file("a");
+        // A changed file is read again once `valid` is over. Renamed over
+        // it, so it can't get the old inode back.
+        std::fs::rename(file("a.new"), &a).unwrap();
         assert_eq!(get(&mut cache, &a, 101, false, true), 5);
         assert_eq!(get(&mut cache, &a, 200, false, true), 6);
         // What can't be cached (an encrypted key) takes its entry out.
