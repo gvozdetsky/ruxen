@@ -955,9 +955,8 @@ pub(crate) fn run_location_handler(
         // escaped (NGX_ESCAPE_URI) when the client's path had a `%` (nginx's
         // `r->quoted_uri`: a `%0D%0A` would otherwise split the line) or
         // the request is internal (`r->internal`: a rewrite of the URI or
-        // an internal redirect cleared `unparsed_uri`); otherwise nginx
-        // copies it as it is (#575).
-        let escape = || !rewrite_state.unparsed_uri || path_is_quoted(req.path);
+        // an internal redirect); otherwise nginx copies it as it is (#575).
+        let escape = || rewrite_state.internal || path_is_quoted(req.path);
         let rewritten_uri: Vec<u8>;
         let request_uri: &[u8] = if let Some(uri) = variable.as_ref().and_then(|v| v.uri.as_deref())
         {

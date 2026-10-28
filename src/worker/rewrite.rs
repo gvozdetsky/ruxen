@@ -527,6 +527,7 @@ pub(crate) fn execute_rewrite_ops(
                 // otherwise the URI changed, and the locations are searched
                 // again (#682).
                 rewrite_state.unparsed_uri = false;
+                rewrite_state.internal = true;
                 match flag {
                     // The location is searched again: find_config clears
                     // `uri_changed` (#682).
