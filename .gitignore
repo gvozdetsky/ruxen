@@ -11,3 +11,4 @@ __pycache__/
 /bench/proxy2/html/
 /bench/tls2/html/
 /bench/proxy_ext/html/
+/difftest-out/

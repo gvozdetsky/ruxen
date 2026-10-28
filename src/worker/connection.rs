@@ -121,6 +121,27 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent {
     /// path, which writes to the fd directly.
     async fn wait_writable(&self) -> std::io::Result<()>;
 
+    /// `read` for request body bytes, which go on at once: plain TCP reads
+    /// them now (`recv_now`).
+    async fn read_now<T: IoBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        self.read(buf).await
+    }
+
+    /// Drop up to `len` bytes of a discarded body already in the socket,
+    /// before the response, as ngx_http_discard_request_body reads what has
+    /// arrived. Returns what is left to discard after it.
+    fn discard_queued(&mut self, len: u64) -> u64 {
+        len
+    }
+
+    /// A read of what the socket already holds, without waiting; `None`
+    /// when it holds nothing or the transport can't tell (then
+    /// `idle_read`). Only io_uring needs it: epoll's next read runs at once
+    /// after a read that didn't drain the socket.
+    fn read_queued(&mut self, _buf: &mut [u8]) -> Option<std::io::Result<usize>> {
+        None
+    }
+
     /// The connection is about to carry a tunnel (#87), where one read and
     /// one write are in flight at once; after this, `read` must not write
     /// to the socket itself.
@@ -251,6 +272,42 @@ impl ConnIo for TcpStream {
 
     async fn wait_writable(&self) -> std::io::Result<()> {
         self.writable(false).await
+    }
+
+    async fn read_now<T: IoBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        recv_now(self, buf).await
+    }
+
+    fn discard_queued(&mut self, len: u64) -> u64 {
+        use std::os::unix::io::AsRawFd;
+        discard_queued_on(self.as_raw_fd(), len)
+    }
+
+    fn read_queued(&mut self, buf: &mut [u8]) -> Option<std::io::Result<usize>> {
+        use std::os::unix::io::AsRawFd;
+        if driver() == Driver::Epoll {
+            return None;
+        }
+        loop {
+            // SAFETY: recv writes at most `buf.len()` bytes into `buf`.
+            let n = unsafe {
+                libc::recv(
+                    self.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n >= 0 {
+                return Some(Ok(n as usize));
+            }
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                std::io::ErrorKind::WouldBlock => return None,
+                std::io::ErrorKind::Interrupted => {}
+                _ => return Some(Err(e)),
+            }
+        }
     }
 
     async fn peer_closed(&self) {
@@ -769,6 +826,72 @@ where
     }
 }
 
+/// A socket read for bytes that go on at once (a relayed or request body):
+/// under io_uring a `recv(MSG_DONTWAIT)` now, waiting for readability only
+/// when the socket is empty (#757). An io_uring read copies in the kernel
+/// among the other connections' ops, and the bytes are out of the cache
+/// when they are written on: a 1 MiB proxied response took 14k LLC misses
+/// instead of 1.5k. epoll's read already runs at once.
+pub(crate) async fn recv_now<T: IoBufMut>(
+    sock: &mut TcpStream,
+    mut buf: T,
+) -> monoio::BufResult<usize, T> {
+    use std::os::unix::io::AsRawFd;
+    if driver() == Driver::Epoll {
+        return sock.read(buf).await;
+    }
+    loop {
+        // SAFETY: recv writes at most `bytes_total` bytes at `write_ptr`.
+        let n = unsafe {
+            libc::recv(
+                sock.as_raw_fd(),
+                buf.write_ptr().cast(),
+                buf.bytes_total(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n >= 0 {
+            // SAFETY: recv initialized the first `n` bytes.
+            unsafe { buf.set_init(n as usize) };
+            return (Ok(n as usize), buf);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if let Err(e) = sock.readable(false).await {
+                    return (Err(e), buf);
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return (Err(e), buf),
+        }
+    }
+}
+
+/// `ConnIo::discard_queued` on a socket: `recv(MSG_DONTWAIT)` until `len`
+/// bytes are gone or the socket is empty; an EOF or error is left to the
+/// discard after the response. Read now, while they are fresh, they cost
+/// less than after the response (#757: on io_uring, a trip through the ring).
+#[inline(never)]
+fn discard_queued_on(fd: std::os::unix::io::RawFd, mut len: u64) -> u64 {
+    let mut buf = super::take_body_buffer(DISCARD_CHUNK);
+    while len > 0 {
+        let want = len.min(buf.capacity() as u64) as usize;
+        // SAFETY: recv writes at most `want` <= capacity bytes into `buf`.
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), want, libc::MSG_DONTWAIT) };
+        if n > 0 {
+            len -= n as u64;
+        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            break;
+        }
+    }
+    drop(super::PooledBody(buf));
+    len
+}
+
 /// `write_all_timed`, but on plain TCP the bytes go out at once with
 /// `send(MSG_DONTWAIT)`, while they are still in the cache from being
 /// read; it waits for writability only when the socket is full (#247).
@@ -1209,6 +1332,9 @@ pub(crate) const MAX_CHUNK_LINE_BYTES: usize = 8192;
 /// Maximum trailer block size in bytes. Bounds total trailer-line growth.
 pub(crate) const MAX_TRAILER_BLOCK_BYTES: usize = 16 * 1024;
 
+/// The buffer a discarded body is read into and dropped.
+const DISCARD_CHUNK: usize = 16 * 1024;
+
 /// Read `len` more bytes of a body nothing will read and drop them, through
 /// one small pooled buffer (nginx's ngx_http_read_discarded_request_body):
 /// no body-sized buffer is held per request (#289). `false` on EOF, an
@@ -1220,7 +1346,6 @@ pub(crate) async fn discard_request_body<S: ConnIo>(
     read_timeout: Duration,
 ) -> bool {
     use monoio::buf::IoBufMut;
-    const DISCARD_CHUNK: usize = 16 * 1024;
     if len == 0 {
         return true;
     }
@@ -1230,7 +1355,7 @@ pub(crate) async fn discard_request_body<S: ConnIo>(
         let want = len.min(DISCARD_CHUNK as u64) as usize;
         let slice = std::mem::take(&mut buf).slice_mut(0..want);
         let Some((res, returned)) =
-            with_timeout(timer.as_mut(), read_timeout, stream.read(slice)).await
+            with_timeout(timer.as_mut(), read_timeout, stream.read_now(slice)).await
         else {
             break false;
         };
@@ -1277,7 +1402,7 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
         let want = (cl - sink.len()).min(chunk_size as u64) as usize;
         chunk.clear();
         let slice = std::mem::take(&mut chunk).slice_mut(0..want);
-        let mut read = std::pin::pin!(stream.read(slice));
+        let mut read = std::pin::pin!(stream.read_now(slice));
         let mut done = None;
         if sink.past_buffer() {
             monoio::select! {

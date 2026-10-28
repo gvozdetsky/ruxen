@@ -445,6 +445,20 @@ fn real_main() -> Result<(), Failure> {
     {
         startup_error = Some(e);
     }
+    // A reload reads these as the user; nginx's master reads them as root.
+    let unreadable = privileges::unreadable_startup_files();
+    if startup_error.is_none()
+        && let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0)
+    {
+        let user = creds.name.to_string_lossy();
+        for path in unreadable {
+            eprintln!(
+                "ruxen: [warn] user \"{user}\" can't read \"{}\": a reload will fail \
+                 to read it (docs/migrating.md)",
+                path.display()
+            );
+        }
+    }
     if let Some(e) = startup_error {
         eprintln!("ruxen: [emerg] {e}");
         if let Ok(generation) = generation {
@@ -1079,7 +1093,11 @@ impl Master {
         for w in &warnings {
             log(old_http, config::ErrorLogLevel::Warn, w);
         }
-        let worker_listeners = match self.listeners.open(http, settings.workers) {
+        // After the switch to `user`, ports below 1024 bind with the one
+        // capability kept for it (#344).
+        let worker_listeners = match privileges::with_bind_capability(|| {
+            self.listeners.open(http, settings.workers)
+        }) {
             Ok(l) => l,
             Err(e) => {
                 http.close_root_fds();
@@ -1354,6 +1372,7 @@ fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
         .canonicalize()
         .map_err(|e| failed(&cli.config_path, e))?;
     let src = std::fs::read_to_string(&abs).map_err(|e| failed(&abs, e))?;
+    privileges::note_read(&abs);
     Ok((abs, src))
 }
 
