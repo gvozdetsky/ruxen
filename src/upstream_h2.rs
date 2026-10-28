@@ -78,6 +78,31 @@ pub async fn handshake(
     https: bool,
     identity: Option<TlsIdentity>,
 ) -> io::Result<H2Conn> {
+    let (send, closed) = match io {
+        UpstreamIo::Plain(s) => start(s).await?,
+        UpstreamIo::Tls(t) => start(t.stream).await?,
+        UpstreamIo::H2(_) => unreachable!("ruxen: HTTP/2 over an HTTP/2 stream"),
+    };
+    Ok(H2Conn {
+        send,
+        closed,
+        https,
+        identity,
+        phase: Phase::Idle,
+        response: None,
+        early: None,
+        head: Vec::new(),
+        head_request: false,
+        out: Vec::new(),
+        out_pos: 0,
+    })
+}
+
+/// The preface on `io`, and the task that drives the connection; the flag
+/// is set once it ends.
+async fn start<S: crate::duplex::Duplex>(
+    io: S,
+) -> io::Result<(SendRequest<Bytes>, Rc<Cell<bool>>)> {
     // nginx's preface: no dynamic table, no push (ngx_http_proxy_v2_module.c,
     // ngx_http_proxy_v2_connection_start).
     let (send, conn) = h2::client::Builder::new()
@@ -95,19 +120,7 @@ pub async fn handshake(
         let _ = conn.await;
         done.set(true);
     });
-    Ok(H2Conn {
-        send,
-        closed,
-        https,
-        identity,
-        phase: Phase::Idle,
-        response: None,
-        early: None,
-        head: Vec::new(),
-        head_request: false,
-        out: Vec::new(),
-        out_pos: 0,
-    })
+    Ok((send, closed))
 }
 
 fn h2_io(e: h2::Error) -> io::Error {
