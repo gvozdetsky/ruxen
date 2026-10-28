@@ -13,6 +13,7 @@
 use std::time::Duration;
 use std::time::Instant;
 
+use monoio::io::AsyncReadRent;
 use monoio::time::timeout;
 
 use crate::proxy::{AttemptFailure, Stage, UpstreamError};
