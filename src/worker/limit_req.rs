@@ -116,6 +116,8 @@ pub struct LimitReqZone {
     /// Requests per second × 1000.
     pub rate: u64,
     shards: &'static [Mutex<Shard>],
+    /// Requests by `$limit_req_status` (less one), kept with the shards.
+    pub counters: &'static super::metrics::ZoneCounters<5>,
 }
 
 /// The zones' state, by name, for the next configuration: a reload that
@@ -129,6 +131,7 @@ struct Kept {
     size: u64,
     key_text: String,
     shards: &'static [Mutex<Shard>],
+    counters: &'static super::metrics::ZoneCounters<5>,
 }
 
 impl LimitReqZone {
@@ -160,6 +163,7 @@ impl LimitReqZone {
                 key,
                 rate,
                 shards: k.shards,
+                counters: k.counters,
             });
         }
         let zone = LimitReqZone::new(name, key, size, rate);
@@ -169,6 +173,7 @@ impl LimitReqZone {
             size,
             key_text: key_text.to_string(),
             shards: zone.shards,
+            counters: zone.counters,
         });
         Ok(zone)
     }
@@ -200,6 +205,7 @@ impl LimitReqZone {
             key,
             rate,
             shards: Box::leak(shards),
+            counters: Box::leak(Box::default()),
         }
     }
 
@@ -392,7 +398,7 @@ pub(crate) fn check(
             }
             Lookup::Error => {
                 unlock(lr, &held);
-                return reject(lr, None, 0);
+                return counted(lr, n, reject(lr, None, 0));
             }
         }
     }
@@ -406,7 +412,7 @@ pub(crate) fn check(
     };
     if !passed {
         unlock(lr, &held);
-        return reject(lr, Some(n), excess);
+        return counted(lr, n, reject(lr, Some(n), excess));
     }
     // ngx_http_limit_req_account: commit the held entries and take the
     // longest delay any limit asks for.
@@ -434,12 +440,16 @@ pub(crate) fn check(
         }
     }
     if max_delay == 0 {
-        return Verdict {
-            status: status::PASSED,
-            reject: false,
-            delay_ms: 0,
-            log: None,
-        };
+        return counted(
+            lr,
+            n,
+            Verdict {
+                status: status::PASSED,
+                reject: false,
+                delay_ms: 0,
+                log: None,
+            },
+        );
     }
     let line = format!(
         "delaying request{}, excess: {}.{:03}, by zone \"{}\"",
@@ -448,16 +458,26 @@ pub(crate) fn check(
         excess % 1000,
         lr.limits[limit_n].zone.name
     );
-    Verdict {
-        status: if lr.dry_run {
-            status::DELAYED_DRY_RUN
-        } else {
-            status::DELAYED
+    counted(
+        lr,
+        limit_n,
+        Verdict {
+            status: if lr.dry_run {
+                status::DELAYED_DRY_RUN
+            } else {
+                status::DELAYED
+            },
+            reject: false,
+            delay_ms: if lr.dry_run { 0 } else { max_delay },
+            log: Some((lr.delay_log_level, line)),
         },
-        reject: false,
-        delay_ms: if lr.dry_run { 0 } else { max_delay },
-        log: Some((lr.delay_log_level, line)),
-    }
+    )
+}
+
+/// `verdict`, counted for limit `n`'s zone, the one that decided it.
+fn counted(lr: &PreparedLimitReq, n: usize, verdict: Verdict) -> Verdict {
+    lr.limits[n].zone.counters.add(verdict.status as usize - 1);
+    verdict
 }
 
 fn delay_for(limit: &PreparedLimit, excess: i64) -> u64 {
@@ -633,6 +653,8 @@ mod tests {
         assert_eq!(check(&lr, |_| b"other".to_vec()).status, status::PASSED);
         // An empty key isn't counted at all.
         assert_eq!(check(&lr, |_| Vec::new()).status, 0);
+        let counted = |s: u8| lr.limits[0].zone.counters.total(s as usize - 1);
+        assert_eq!((counted(status::PASSED), counted(status::REJECTED)), (4, 2));
     }
 
     #[test]

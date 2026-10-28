@@ -375,6 +375,12 @@ async fn write_request_parts(
     send_timeout: Duration,
 ) -> Option<std::io::Result<()>> {
     let mut parts = RequestParts::new(head, body);
+    if parts.body.len() >= SEND_NOW_FROM
+        && let UpstreamIo::Plain(sock) = stream
+        && crate::worker::driver() == crate::worker::Driver::IoUring
+    {
+        return send_parts_now(sock, parts, send_timeout).await;
+    }
     while parts.len() > 0 {
         let (res, returned) = timeout(
             send_timeout,
@@ -388,6 +394,54 @@ async fn write_request_parts(
             Ok(n) => parts.advance(n),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(()))
+}
+
+/// A request body this large goes to the upstream with `send_parts_now`;
+/// smaller requests are cheaper batched in the ring (a syscall each cost
+/// `proxy_hello` 0.5–0.9%).
+const SEND_NOW_FROM: usize = 16 * 1024;
+
+/// `write_request_parts` on plain TCP under io_uring: `sendmsg` now, while
+/// a body just read is in the cache, waiting only when the socket is full
+/// (#757, as `write_all_now`).
+async fn send_parts_now(
+    sock: &monoio::net::TcpStream,
+    mut parts: RequestParts,
+    send_timeout: Duration,
+) -> Option<std::io::Result<()>> {
+    use std::os::unix::io::AsRawFd;
+    while parts.len() > 0 {
+        // SAFETY: a msghdr over `parts`' iovecs, which point into its live
+        // `head` and `body`.
+        let n = unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = parts.iov.as_mut_ptr();
+            msg.msg_iovlen = 2;
+            libc::sendmsg(
+                sock.as_raw_fd(),
+                &msg,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n > 0 {
+            parts.advance(n as usize);
+            continue;
+        }
+        if n == 0 {
+            return Some(Err(std::io::ErrorKind::WriteZero.into()));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if let Err(e) = timeout(send_timeout, sock.writable(false)).await.ok()? {
+                    return Some(Err(e));
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return Some(Err(e)),
         }
     }
     Some(Ok(()))
@@ -648,6 +702,7 @@ pub async fn run_proxy(
             Box::pin(wait_for_lock(cache)).await;
         }
         report.cache_status = Some(cache.status);
+        cache.zone.counters.add(cache.status.index());
         if let Some(hit) = cache.hit.take() {
             let response = cached_response(&plan, hit, report);
             if plan.cache.as_ref().is_some_and(|c| c.background) {
@@ -801,7 +856,12 @@ pub async fn run_proxy(
             )
             .await
         };
-        state.response_ms = Some(elapsed_ms(started));
+        let elapsed = started.elapsed();
+        state.response_ms = Some(elapsed.as_millis() as u64);
+        // A request's own peers (`adhoc`) have none.
+        if let Some(slots) = upstream.metrics {
+            crate::worker::metrics::peer_attempt(slots, current.peer_idx, elapsed);
+        }
         if let AttemptOutcome::Failed(_, kind, _) = &outcome {
             state.status = if matches!(kind, FailKind::Timeout) {
                 504
@@ -867,7 +927,12 @@ pub async fn run_proxy(
                     && let Some(stale) = cache.stale.take()
                 {
                     revalidate(cache, &stale, storable.take());
-                    report.cache_status = Some(crate::proxy_cache::CacheStatus::Revalidated);
+                    let revalidated = crate::proxy_cache::CacheStatus::Revalidated;
+                    cache
+                        .zone
+                        .counters
+                        .moved(cache.status.index(), revalidated.index());
+                    report.cache_status = Some(revalidated);
                     return cached_response(&plan, CacheHit::Entry(stale), report);
                 }
                 let intercepted = plan
@@ -2360,9 +2425,9 @@ async fn attempt(
                 vary: Vec::new(),
                 client_head_len,
             })
-        } else if cache.store && !upstream_head {
-            // A HEAD's answer has no body to store (proxy_cache_convert_head
-            // off): a GET hitting it would get none.
+        } else if cache.store {
+            // A HEAD's answer (proxy_cache_convert_head off) is stored
+            // without a body, as nginx stores it (`cached_response`).
             storable_response(plan, &accum[..head_end], status_code, client_head_len)
         } else {
             None
@@ -2812,7 +2877,10 @@ fn stale_answer(
         if !wanted {
             return None;
         }
-        cache.stale.take()?
+        let stale = cache.stale.take()?;
+        let to = crate::proxy_cache::CacheStatus::Stale;
+        cache.zone.counters.moved(cache.status.index(), to.index());
+        stale
     };
     report.cache_status = Some(crate::proxy_cache::CacheStatus::Stale);
     Some(cached_response(plan, CacheHit::Entry(stale), report))
@@ -2984,6 +3052,9 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         &mut report.range_allow,
     );
     if !body_has_content || matches!(plan.method, Method::Head) || entry.body_len() == 0 {
+        if body_has_content && entry.body_len() == 0 && !matches!(plan.method, Method::Head) {
+            short_cached_body(&mut out);
+        }
         return Response::Owned(out);
     }
     // A small body came with the header; a larger one is sent from the
@@ -2995,6 +3066,22 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
     Response::File {
         headers: out,
         body: entry.into_file_body(),
+    }
+}
+
+/// A HEAD's answer stored without its body (`proxy_cache_convert_head
+/// off`), hit by another method: nginx sends its `Content-Length` and no
+/// body. So does ruxen, then closes, so the client doesn't take the next
+/// response for the body.
+#[cold]
+#[inline(never)]
+fn short_cached_body(head: &mut Vec<u8>) {
+    let short = crate::proxy_cache::header_lines(head).any(|(name, value)| {
+        name.eq_ignore_ascii_case(b"content-length") && value.trim_ascii() != b"0"
+    });
+    if short && head.ends_with(b"\r\n\r\n") {
+        head.truncate(head.len() - 2);
+        head.extend_from_slice(b"Connection: close\r\n\r\n");
     }
 }
 
