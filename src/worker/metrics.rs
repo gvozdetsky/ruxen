@@ -7,12 +7,16 @@
 //! only writer: an update is a relaxed load and store. The handler sums
 //! the workers' slots. Slots belong to a configuration generation, so a
 //! reload starts the counters again at zero.
+//!
+//! `limit_req`, `limit_conn` and cache zones that a reload keeps keep their
+//! counters too (`ZoneCounters`); those are counted whether or not a
+//! location shows them.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use super::{PreparedPeer, PreparedUpstream};
 
@@ -65,6 +69,61 @@ pub struct Metrics {
     servers: Box<[ServerLabels]>,
     peers: Box<[PeerLabels]>,
     workers: Mutex<Vec<&'static WorkerSlots>>,
+    limit_req: Box<[(String, &'static ZoneCounters<5>)]>,
+    limit_conn: Box<[(String, &'static ZoneCounters<3>)]>,
+    caches: Box<[(String, &'static ZoneCounters<7>)]>,
+}
+
+/// Slots per `ZoneCounters`.
+const ZONE_SLOTS: usize = 64;
+
+#[repr(align(64))]
+struct ZoneSlot<const N: usize>([AtomicU64; N]);
+
+/// The counters of a zone a reload keeps, which outlive any generation's
+/// workers. A slot per worker thread by thread number, so threads rarely
+/// share a line; `fetch_add`, since numbers wrap past `ZONE_SLOTS`.
+pub struct ZoneCounters<const N: usize> {
+    slots: Box<[ZoneSlot<N>]>,
+}
+
+impl<const N: usize> Default for ZoneCounters<N> {
+    fn default() -> Self {
+        ZoneCounters {
+            slots: (0..ZONE_SLOTS)
+                .map(|_| ZoneSlot(std::array::from_fn(|_| AtomicU64::new(0))))
+                .collect(),
+        }
+    }
+}
+
+thread_local! {
+    /// This thread's slot in every `ZoneCounters`.
+    static ZONE_SLOT: usize = {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Relaxed) % ZONE_SLOTS
+    };
+}
+
+impl<const N: usize> ZoneCounters<N> {
+    /// Count one in `i`.
+    pub(crate) fn add(&self, i: usize) {
+        let slot = ZONE_SLOT.with(|s| *s);
+        self.slots[slot].0[i].fetch_add(1, Relaxed);
+    }
+
+    /// Move one count from `from` to `i`: `from` was premature.
+    pub(crate) fn moved(&self, from: usize, i: usize) {
+        let slot = &self.slots[ZONE_SLOT.with(|s| *s)];
+        slot.0[from].fetch_sub(1, Relaxed);
+        slot.0[i].fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn total(&self, i: usize) -> u64 {
+        self.slots
+            .iter()
+            .fold(0u64, |n, s| n.wrapping_add(s.0[i].load(Relaxed)))
+    }
 }
 
 impl std::fmt::Debug for Metrics {
@@ -100,6 +159,9 @@ struct Builder {
     server_index: HashMap<(String, String), u32>,
     peers: Vec<PeerLabels>,
     peer_index: HashMap<(String, String), u32>,
+    limit_req: Vec<(String, &'static ZoneCounters<5>)>,
+    limit_conn: Vec<(String, &'static ZoneCounters<3>)>,
+    caches: Vec<(String, &'static ZoneCounters<7>)>,
 }
 
 /// Start preparing a configuration; `on` when a location uses the handler.
@@ -172,6 +234,33 @@ pub(crate) fn note_upstream(upstream: &'static PreparedUpstream) {
     });
 }
 
+/// The configuration's `limit_req_zone` `name` counts in `counters`.
+pub(crate) fn note_limit_req_zone(name: &str, counters: &'static ZoneCounters<5>) {
+    BUILD.with(|b| {
+        if let Some(b) = b.borrow_mut().as_mut() {
+            b.limit_req.push((name.to_string(), counters));
+        }
+    });
+}
+
+/// The configuration's `limit_conn_zone` `name` counts in `counters`.
+pub(crate) fn note_limit_conn_zone(name: &str, counters: &'static ZoneCounters<3>) {
+    BUILD.with(|b| {
+        if let Some(b) = b.borrow_mut().as_mut() {
+            b.limit_conn.push((name.to_string(), counters));
+        }
+    });
+}
+
+/// The configuration's cache zone `name` counts in `counters`.
+pub(crate) fn note_cache_zone(name: &str, counters: &'static ZoneCounters<7>) {
+    BUILD.with(|b| {
+        if let Some(b) = b.borrow_mut().as_mut() {
+            b.caches.push((name.to_string(), counters));
+        }
+    });
+}
+
 /// The configuration's metrics, or `None` when no location reads them.
 pub(crate) fn finish() -> Option<&'static Metrics> {
     let b = BUILD.with(|b| b.borrow_mut().take())?;
@@ -179,6 +268,9 @@ pub(crate) fn finish() -> Option<&'static Metrics> {
         servers: b.servers.into_boxed_slice(),
         peers: b.peers.into_boxed_slice(),
         workers: Mutex::new(Vec::new()),
+        limit_req: b.limit_req.into_boxed_slice(),
+        limit_conn: b.limit_conn.into_boxed_slice(),
+        caches: b.caches.into_boxed_slice(),
     })))
 }
 
@@ -462,7 +554,56 @@ pub(crate) fn render(m: &Metrics) -> String {
             let _ = writeln!(out, "ruxen_upstream_peer_up{{{l}}} {}", up as u8);
         }
     }
+
+    zone_family(
+        &mut out,
+        "ruxen_limit_req_requests_total",
+        "Requests by limit_req zone (the one that decided) and $limit_req_status.",
+        &m.limit_req,
+        |i| super::limit_req::status::text(i as u8 + 1),
+    );
+    zone_family(
+        &mut out,
+        "ruxen_limit_conn_requests_total",
+        "Requests by limit_conn zone and $limit_conn_status.",
+        &m.limit_conn,
+        |i| super::limit_conn::status::text(i as u8 + 1),
+    );
+    zone_family(
+        &mut out,
+        "ruxen_cache_requests_total",
+        "Requests by proxy_cache zone and $upstream_cache_status.",
+        &m.caches,
+        |i| crate::proxy_cache::CacheStatus::ALL[i].as_bytes(),
+    );
     out
+}
+
+/// A counter family over zones, `status` naming each counter.
+fn zone_family<const N: usize>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    zones: &[(String, &'static ZoneCounters<N>)],
+    status: impl Fn(usize) -> &'static [u8],
+) {
+    if zones.is_empty() {
+        return;
+    }
+    header(out, name, "counter", help);
+    for (zone, counters) in zones {
+        let mut l = String::from("zone=\"");
+        escape(zone, &mut l);
+        l.push('"');
+        for i in 0..N {
+            let status = String::from_utf8_lossy(status(i));
+            let _ = writeln!(
+                out,
+                "{name}{{{l},status=\"{status}\"}} {}",
+                counters.total(i)
+            );
+        }
+    }
 }
 
 #[cfg(test)]

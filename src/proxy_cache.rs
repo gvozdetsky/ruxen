@@ -37,6 +37,22 @@ pub enum CacheStatus {
 }
 
 impl CacheStatus {
+    /// Every status, in the order of `index`.
+    pub const ALL: [CacheStatus; 7] = [
+        CacheStatus::Miss,
+        CacheStatus::Bypass,
+        CacheStatus::Expired,
+        CacheStatus::Stale,
+        CacheStatus::Updating,
+        CacheStatus::Revalidated,
+        CacheStatus::Hit,
+    ];
+
+    /// The status's place in `ALL`.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
     pub fn as_bytes(self) -> &'static [u8] {
         match self {
             CacheStatus::Miss => b"MISS",
@@ -246,6 +262,9 @@ pub struct CacheZone {
     /// No configuration uses the zone any more after a reload: its
     /// manager stops.
     retired: AtomicBool,
+    /// Requests by `$upstream_cache_status` (`CacheStatus::ALL` order), for
+    /// `ruxen_metrics` (#481).
+    pub counters: crate::worker::metrics::ZoneCounters<7>,
 }
 
 /// The zones of the configurations workers serve. A reload that declares a
@@ -329,6 +348,7 @@ impl CacheZone {
             zone_size: conf.size,
             managed: AtomicBool::new(false),
             retired: AtomicBool::new(false),
+            counters: Default::default(),
         }
     }
 

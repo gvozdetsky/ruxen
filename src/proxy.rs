@@ -696,6 +696,7 @@ pub async fn run_proxy(
             Box::pin(wait_for_lock(cache)).await;
         }
         report.cache_status = Some(cache.status);
+        cache.zone.counters.add(cache.status.index());
         if let Some(hit) = cache.hit.take() {
             let response = cached_response(&plan, hit, report);
             if plan.cache.as_ref().is_some_and(|c| c.background) {
@@ -920,7 +921,12 @@ pub async fn run_proxy(
                     && let Some(stale) = cache.stale.take()
                 {
                     revalidate(cache, &stale, storable.take());
-                    report.cache_status = Some(crate::proxy_cache::CacheStatus::Revalidated);
+                    let revalidated = crate::proxy_cache::CacheStatus::Revalidated;
+                    cache
+                        .zone
+                        .counters
+                        .moved(cache.status.index(), revalidated.index());
+                    report.cache_status = Some(revalidated);
                     return cached_response(&plan, CacheHit::Entry(stale), report);
                 }
                 let intercepted = plan
@@ -2823,7 +2829,10 @@ fn stale_answer(
         if !wanted {
             return None;
         }
-        cache.stale.take()?
+        let stale = cache.stale.take()?;
+        let to = crate::proxy_cache::CacheStatus::Stale;
+        cache.zone.counters.moved(cache.status.index(), to.index());
+        stale
     };
     report.cache_status = Some(crate::proxy_cache::CacheStatus::Stale);
     Some(cached_response(plan, CacheHit::Entry(stale), report))
