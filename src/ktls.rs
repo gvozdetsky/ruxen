@@ -11,6 +11,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use monoio::io::{AsyncReadRent, AsyncWriteRent};
 use monoio::net::TcpStream;
 use rustls::{ConnectionTrafficSecrets, ProtocolVersion, SupportedCipherSuite};
 
+use crate::duplex::Duplex;
 use crate::tls_stream::{IntoKtls, TlsStream};
 
 /// Where a stream of TLS records stands: in a header, in a body, or
@@ -584,6 +586,66 @@ impl AsyncWriteRent for KtlsStream {
             }
         }
         self.io.shutdown().await
+    }
+}
+
+impl KtlsStream {
+    /// The socket, projected without a reference to `*this`.
+    fn io_ptr(this: NonNull<Self>) -> NonNull<TcpStream> {
+        // SAFETY: a field of a valid pointer.
+        unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).io) }
+    }
+}
+
+/// The tunnel after a 101 (#501): references to the stream only between
+/// the socket's operations, which are `TcpStream`'s on `io_ptr`.
+// SAFETY: as just said.
+unsafe impl Duplex for KtlsStream {
+    async unsafe fn read_raw<T: IoBufMut>(this: NonNull<Self>, mut buf: T) -> BufResult<usize, T> {
+        {
+            // SAFETY: valid, no other reference live (the caller's); this
+            // one ends before the await.
+            let s = unsafe { &mut *this.as_ptr() };
+            if s.pos < s.read.len() {
+                // SAFETY: as in `read`.
+                unsafe {
+                    let n = s.take_into(buf.write_ptr(), buf.bytes_total());
+                    buf.set_init(n);
+                    return (Ok(n), buf);
+                }
+            }
+            if s.closed {
+                return (Ok(0), buf);
+            }
+        }
+        // SAFETY: as above.
+        let (res, buf) = unsafe { TcpStream::read_raw(Self::io_ptr(this), buf) }.await;
+        // SAFETY: as above.
+        (unsafe { &mut *this.as_ptr() }.check_read(res), buf)
+    }
+
+    async unsafe fn write_raw<T: IoBuf>(this: NonNull<Self>, buf: T) -> BufResult<usize, T> {
+        // SAFETY: as in `read_raw`, here and below.
+        if !unsafe { &mut *this.as_ptr() }.within_limit() {
+            return (Err(limit_reached()), buf);
+        }
+        unsafe { TcpStream::write_raw(Self::io_ptr(this), buf) }.await
+    }
+
+    async unsafe fn shutdown_raw(this: NonNull<Self>) -> io::Result<()> {
+        // SAFETY: as in `read_raw`, here and below.
+        if std::mem::replace(unsafe { &mut (*this.as_ptr()).shut }, true) {
+            return Ok(());
+        }
+        // A full send buffer: polled, as `writable` would hold a reference
+        // across the wait. Rare, and only at the end.
+        while let Err(e) = unsafe { &*this.as_ptr() }.send_close_notify() {
+            if e.kind() != io::ErrorKind::WouldBlock {
+                return Err(e);
+            }
+            monoio::time::sleep(Duration::from_millis(5)).await;
+        }
+        unsafe { TcpStream::shutdown_raw(Self::io_ptr(this)) }.await
     }
 }
 

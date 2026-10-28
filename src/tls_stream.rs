@@ -22,6 +22,7 @@
 
 use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::mem;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use monoio::BufResult;
@@ -30,6 +31,8 @@ use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, ServerConfig, ServerConnection, SideData,
 };
+
+use crate::duplex::Duplex;
 
 /// Socket read size: one maximum-size TLS record (16 KiB of plaintext plus
 /// record overhead) fits in a single read.
@@ -321,7 +324,6 @@ impl TlsAcceptor {
             rpos: 0,
             wbuf: Vec::new(),
             session_id,
-            tunnel: false,
             records,
         };
         stream.handshake().await?;
@@ -342,9 +344,6 @@ pub struct TlsStream<IO, C = ServerConnection> {
     wbuf: Vec<u8>,
     /// The session's `$ssl_session_id` bytes, with `with_session_ids`.
     session_id: Option<[u8; 32]>,
-    /// Carrying a tunnel: a read and a write may be in flight at once, so
-    /// only writes put records on the socket (`begin_tunnel`).
-    tunnel: bool,
     /// Where the records of what rustls was given end, with kTLS on
     /// (#673): the kernel can take over only at a record boundary.
     records: Option<crate::ktls::RecordCursor>,
@@ -472,7 +471,6 @@ pub async fn connect<IO: AsyncReadRent + AsyncWriteRent + 'static>(
         rpos: 0,
         wbuf: Vec::new(),
         session_id: None,
-        tunnel: false,
         records: None,
     };
     loop {
@@ -491,16 +489,6 @@ where
     C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
     D: SideData,
 {
-    /// From now on a read may run while a write is in flight (the tunnel
-    /// after a proxied 101). Both touch the session only between awaits;
-    /// the socket write is the one thing that can't happen twice at once.
-    /// So a read no longer flushes what rustls queued in answer (an alert,
-    /// a KeyUpdate): the next write sends it, as `write_tls` drains the
-    /// queue until it is empty.
-    pub fn begin_tunnel(&mut self) {
-        self.tunnel = true;
-    }
-
     /// The underlying transport, for waiting on the socket directly.
     pub fn io(&self) -> &IO {
         &self.io
@@ -527,6 +515,114 @@ where
     pub(crate) fn put_read_buf(&mut self, buf: Vec<u8>) {
         self.rbuf = buf;
         self.rpos = 0;
+    }
+
+    /// `take_read_buf`, when the socket is to be read: everything read so
+    /// far went to rustls.
+    #[inline]
+    fn read_buf_if_drained(&mut self) -> Option<Vec<u8>> {
+        (self.rpos == self.rbuf.len()).then(|| self.take_read_buf())
+    }
+
+    /// Hand rustls the ciphertext read and not yet handed, and process it.
+    /// At EOF the slice is empty: rustls records the TCP EOF, so its
+    /// plaintext reader reports `UnexpectedEof` instead of `WouldBlock`.
+    #[inline]
+    fn process_read(&mut self) -> io::Result<usize> {
+        let mut pending = &self.rbuf[self.rpos..];
+        let n = self.conn.read_tls(&mut pending)?;
+        self.rpos += n;
+        self.conn
+            .process_new_packets()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(n)
+    }
+
+    /// What rustls has queued for the peer, as ciphertext for the socket;
+    /// `None` when nothing is queued.
+    // Inline, as it was in `write_tls`: out of line it cost ~90
+    // instructions per TLS response (callgrind).
+    #[inline(always)]
+    fn take_ciphertext(&mut self) -> io::Result<Option<Vec<u8>>>
+    where
+        IO: 'static,
+    {
+        if !self.conn.wants_write() {
+            return Ok(None);
+        }
+        let mut buf = mem::take(&mut self.wbuf);
+        buf.clear();
+        // A `Vec` sink never pushes back, so this drains the whole queue.
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut buf)?;
+        }
+        // A large run of records over plain TCP goes out at once, while
+        // it is still in the cache from being encrypted (#247); what
+        // the socket doesn't take goes through io_uring.
+        if buf.len() >= DIRECT_SEND_MIN
+            && let Some(tcp) =
+                (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = tcp.as_raw_fd();
+            let mut sent = 0usize;
+            while sent < buf.len() {
+                // SAFETY: the pointer/len pair stays within `buf`.
+                let r = unsafe {
+                    libc::send(
+                        fd,
+                        buf[sent..].as_ptr().cast(),
+                        buf.len() - sent,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if r > 0 {
+                    sent += r as usize;
+                    continue;
+                }
+                if r < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            buf.drain(..sent);
+        }
+        Ok(Some(buf))
+    }
+
+    /// Copy decrypted bytes out of rustls into `dst`. `Ok(0)` for an empty
+    /// `dst` or after the peer's close_notify; `WouldBlock` when rustls
+    /// needs more ciphertext; `UnexpectedEof` after a TCP FIN without
+    /// close_notify.
+    fn read_plaintext(&mut self, dst: *mut u8, cap: usize) -> io::Result<usize> {
+        let mut reader = self.conn.reader();
+        let mut n = 0;
+        while n < cap {
+            let chunk = match reader.fill_buf() {
+                Ok(chunk) => chunk,
+                // Return what we have; the condition resurfaces next call.
+                Err(_) if n > 0 => break,
+                Err(e) => return Err(e),
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let k = chunk.len().min(cap - n);
+            // SAFETY: `dst` is valid for `cap` bytes (the caller's
+            // `IoBufMut`) and `n + k <= cap`.
+            unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst.add(n), k) };
+            reader.consume(k);
+            n += k;
+        }
+        Ok(n)
+    }
+
+    /// Back from the socket write of `take_ciphertext`'s buffer.
+    #[inline]
+    fn put_write_buf(&mut self, buf: Vec<u8>) {
+        if buf.capacity() <= WRITE_BUF_KEEP {
+            self.wbuf = buf;
+        }
     }
 
     /// Whether the next `read` can make progress without new bytes from
@@ -583,91 +679,36 @@ where
     /// first when nothing is buffered, and process it. Returns 0 at EOF:
     /// TCP FIN, or a close_notify already received.
     async fn read_tls(&mut self) -> io::Result<usize> {
-        if self.rpos == self.rbuf.len() {
-            let mut buf = mem::take(&mut self.rbuf);
-            self.rpos = 0;
-            buf.clear();
-            buf.reserve(READ_BUF_SIZE);
+        if let Some(buf) = self.read_buf_if_drained() {
             let (res, buf) = self.io.read(buf).await;
             self.rbuf = buf;
             res?;
         }
-        // At EOF the slice is empty: rustls records the TCP EOF, so its
-        // plaintext reader reports `UnexpectedEof` instead of `WouldBlock`.
-        let mut pending = &self.rbuf[self.rpos..];
-        let n = self.conn.read_tls(&mut pending)?;
-        self.rpos += n;
-        if let Err(e) = self.conn.process_new_packets() {
-            // Best effort: get the alert rustls queued out to the peer.
-            if !self.tunnel {
-                let _ = self.write_tls().await;
-            }
-            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-        }
-        // What rustls queued in answer (the `no_renegotiation` alert for a
-        // TLS 1.2 ClientHello after the handshake, the KeyUpdate a TLS 1.3
-        // `update_requested` asks for) goes out now: the server may be
-        // waiting for request bytes and not write anything else. OpenSSL
-        // writes these from inside SSL_read. The handshake loop flushes on
-        // its own.
-        if self.conn.wants_write() && !self.conn.is_handshaking() && !self.tunnel {
+        let res = self.process_read();
+        // What rustls queued in answer goes out now: the alert for an
+        // error (best effort), the `no_renegotiation` alert for a TLS 1.2
+        // ClientHello after the handshake, the KeyUpdate a TLS 1.3
+        // `update_requested` asks for. The server may be waiting for
+        // request bytes and not write anything else. OpenSSL writes these
+        // from inside SSL_read. The handshake loop flushes on its own.
+        if res.is_err() {
+            let _ = self.write_tls().await;
+        } else if self.conn.wants_write() && !self.conn.is_handshaking() {
             self.write_tls().await?;
         }
-        Ok(n)
+        res
     }
 
     /// Move everything rustls has queued for the peer onto the socket.
     async fn write_tls(&mut self) -> io::Result<()> {
-        // Again after each write: in a tunnel, a read may queue records
-        // while the write is in flight.
-        while self.conn.wants_write() {
-            let mut buf = mem::take(&mut self.wbuf);
-            buf.clear();
-            // A `Vec` sink never pushes back, so this drains the whole queue.
-            while self.conn.wants_write() {
-                self.conn.write_tls(&mut buf)?;
-            }
-            // A large run of records over plain TCP goes out at once, while
-            // it is still in the cache from being encrypted (#247); what
-            // the socket doesn't take goes through io_uring.
-            if buf.len() >= DIRECT_SEND_MIN
-                && let Some(tcp) =
-                    (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = tcp.as_raw_fd();
-                let mut sent = 0usize;
-                while sent < buf.len() {
-                    // SAFETY: the pointer/len pair stays within `buf`.
-                    let r = unsafe {
-                        libc::send(
-                            fd,
-                            buf[sent..].as_ptr().cast(),
-                            buf.len() - sent,
-                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                        )
-                    };
-                    if r > 0 {
-                        sent += r as usize;
-                        continue;
-                    }
-                    if r < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-                    {
-                        continue;
-                    }
-                    break;
-                }
-                buf.drain(..sent);
-            }
+        while let Some(buf) = self.take_ciphertext()? {
             let (res, buf) = if buf.is_empty() {
                 (Ok(()), buf)
             } else {
                 let (res, buf) = self.io.write_all(buf).await;
                 (res.map(|_| ()), buf)
             };
-            if buf.capacity() <= WRITE_BUF_KEEP {
-                self.wbuf = buf;
-            }
+            self.put_write_buf(buf);
             res?;
         }
         Ok(())
@@ -684,32 +725,108 @@ where
         self.write_tls().await?;
         Ok(n)
     }
+}
 
-    /// Copy decrypted bytes out of rustls into `dst`. `Ok(0)` for an empty
-    /// `dst` or after the peer's close_notify; `WouldBlock` when rustls
-    /// needs more ciphertext; `UnexpectedEof` after a TCP FIN without
-    /// close_notify.
-    fn read_plaintext(&mut self, dst: *mut u8, cap: usize) -> io::Result<usize> {
-        let mut reader = self.conn.reader();
-        let mut n = 0;
-        while n < cap {
-            let chunk = match reader.fill_buf() {
-                Ok(chunk) => chunk,
-                // Return what we have; the condition resurfaces next call.
-                Err(_) if n > 0 => break,
-                Err(e) => return Err(e),
+/// For the `Duplex` side, as `write_tls` and its socket.
+impl<IO, C, D> TlsStream<IO, C>
+where
+    IO: Duplex,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>> + 'static,
+    D: SideData + 'static,
+{
+    /// The transport, projected without a reference to the stream.
+    fn io_ptr(this: NonNull<Self>) -> NonNull<IO> {
+        // SAFETY: a field of a valid pointer.
+        unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).io) }
+    }
+
+    /// # Safety
+    ///
+    /// As `Duplex::write_raw`.
+    async unsafe fn duplex_write_tls(this: NonNull<Self>) -> io::Result<()> {
+        // Again after each write: the read side may queue records (an
+        // alert, a KeyUpdate) while one is in flight.
+        // SAFETY: as in `read_raw`, here and below.
+        while let Some(buf) = unsafe { &mut *this.as_ptr() }.take_ciphertext()? {
+            let (res, buf) = if buf.is_empty() {
+                (Ok(0), buf)
+            } else {
+                unsafe { crate::duplex::write_all_raw(Self::io_ptr(this), buf) }.await
             };
-            if chunk.is_empty() {
-                break;
-            }
-            let k = chunk.len().min(cap - n);
-            // SAFETY: `dst` is valid for `cap` bytes (the caller's
-            // `IoBufMut`) and `n + k <= cap`.
-            unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst.add(n), k) };
-            reader.consume(k);
-            n += k;
+            unsafe { &mut *this.as_ptr() }.put_write_buf(buf);
+            res?;
         }
-        Ok(n)
+        Ok(())
+    }
+}
+
+/// An HTTP/2 connection, a tunnel (#501): a read and a write in flight at
+/// once, each with a reference to the stream only between awaits. A read
+/// doesn't write to the socket: what rustls queues in answer goes with the
+/// next write.
+// SAFETY: as just said; `io` is reached through `io_ptr`.
+unsafe impl<IO, C, D> Duplex for TlsStream<IO, C>
+where
+    IO: Duplex,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>> + 'static,
+    D: SideData + 'static,
+{
+    async unsafe fn read_raw<T: IoBufMut>(this: NonNull<Self>, mut buf: T) -> BufResult<usize, T> {
+        let (dst, cap) = (buf.write_ptr(), buf.bytes_total());
+        loop {
+            let socket_read = {
+                // SAFETY: valid, and no other reference to it is live (the
+                // caller's); this one ends before the await.
+                let s = unsafe { &mut *this.as_ptr() };
+                match s.read_plaintext(dst, cap) {
+                    Ok(n) => {
+                        // SAFETY: `read_plaintext` initialized the first `n` bytes.
+                        unsafe { buf.set_init(n) };
+                        return (Ok(n), buf);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return (Err(e), buf),
+                }
+                s.read_buf_if_drained()
+            };
+            if let Some(rbuf) = socket_read {
+                // SAFETY: valid; the other operation on `io` is at most the
+                // write side's.
+                let (res, rbuf) = unsafe { IO::read_raw(Self::io_ptr(this), rbuf) }.await;
+                // SAFETY: as above, here and below.
+                unsafe { (*this.as_ptr()).rbuf = rbuf };
+                if let Err(e) = res {
+                    return (Err(e), buf);
+                }
+            }
+            if let Err(e) = unsafe { &mut *this.as_ptr() }.process_read() {
+                return (Err(e), buf);
+            }
+        }
+    }
+
+    /// As `write_plaintext`.
+    async unsafe fn write_raw<T: IoBuf>(this: NonNull<Self>, buf: T) -> BufResult<usize, T> {
+        // SAFETY: `IoBuf` guarantees `bytes_init` initialized bytes at
+        // `read_ptr`, and `buf` is owned here until we return it.
+        let src = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
+        // SAFETY: as in `read_raw`, here and below.
+        if let Err(e) = unsafe { Self::duplex_write_tls(this) }.await {
+            return (Err(e), buf);
+        }
+        let n = match unsafe { &mut *this.as_ptr() }.conn.writer().write(src) {
+            Ok(n) => n,
+            Err(e) => return (Err(e), buf),
+        };
+        let res = unsafe { Self::duplex_write_tls(this) }.await;
+        (res.map(|()| n), buf)
+    }
+
+    async unsafe fn shutdown_raw(this: NonNull<Self>) -> io::Result<()> {
+        // SAFETY: as in `read_raw`, here and below.
+        unsafe { (*this.as_ptr()).conn.send_close_notify() };
+        unsafe { Self::duplex_write_tls(this) }.await?;
+        unsafe { IO::shutdown_raw(Self::io_ptr(this)) }.await
     }
 }
 
@@ -919,6 +1036,40 @@ mod tests {
                 c.write_all(&buf).unwrap();
                 c.flush().unwrap();
                 c.sock.shutdown(std::net::Shutdown::Both).unwrap();
+            },
+        );
+    }
+
+    /// A read in flight while a large write goes out, on the `Duplex`
+    /// halves (an HTTP/2 connection, a tunnel, #501).
+    #[test]
+    fn halves_read_while_writing() {
+        const LEN: usize = 200 * 1024;
+        run(
+            |acceptor, sock| async move {
+                let s = tls(acceptor.accept(sock).await.unwrap());
+                let (mut r, mut w, _) = crate::duplex::into_split(s);
+                let read = async {
+                    let (res, buf) = r.read(Vec::with_capacity(64)).await;
+                    assert_eq!(res.unwrap(), 4);
+                    assert_eq!(buf, b"done");
+                };
+                let write = async {
+                    let (res, _) = w.write_all(vec![7u8; LEN]).await;
+                    assert_eq!(res.unwrap(), LEN);
+                };
+                monoio::join!(read, write);
+                w.shutdown().await.unwrap();
+            },
+            |mut c| {
+                let mut buf = vec![0; LEN];
+                c.read_exact(&mut buf).unwrap();
+                assert!(buf.iter().all(|&b| b == 7));
+                c.write_all(b"done").unwrap();
+                let mut rest = Vec::new();
+                // `read_to_end` only succeeds on a clean close_notify.
+                c.read_to_end(&mut rest).unwrap();
+                assert!(rest.is_empty());
             },
         );
     }
