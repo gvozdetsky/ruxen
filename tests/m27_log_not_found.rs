@@ -218,7 +218,7 @@ fn lookup_errors_name_the_path_like_nginx() {
     );
     assert!(
         lines[1].contains(&format!(
-            "\"{root}/nodir/\" is not found (2: No such file or directory)"
+            "\"{root}/nodir/index.html\" is not found (2: No such file or directory)"
         )),
         "{log}"
     );
