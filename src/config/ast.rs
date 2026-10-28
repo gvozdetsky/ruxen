@@ -889,7 +889,8 @@ pub enum VerifyClient {
 }
 
 /// `ssl_verify_client`, `ssl_client_certificate`, `ssl_trusted_certificate`,
-/// `ssl_verify_depth` and `ssl_crl` of one level (#113); paths resolved
+/// `ssl_verify_depth` and `ssl_crl` of one level (#113), and `ssl_ocsp`,
+/// `ssl_ocsp_responder` and `ssl_ocsp_cache` (#142); paths resolved
 /// against the config directory. `None` until set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientVerifyConf {
@@ -898,6 +899,26 @@ pub struct ClientVerifyConf {
     pub trusted_certificate: Option<PathBuf>,
     pub depth: Option<u32>,
     pub crl: Option<PathBuf>,
+    pub ocsp: Option<OcspMode>,
+    pub ocsp_responder: Option<String>,
+    /// `Some(None)`: `ssl_ocsp_cache off`.
+    pub ocsp_cache: Option<Option<OcspCacheZone>>,
+}
+
+/// `ssl_ocsp`'s values (ngx_http_ssl_ocsp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcspMode {
+    Off,
+    /// Every certificate of the chain but the last.
+    On,
+    Leaf,
+}
+
+/// `ssl_ocsp_cache shared:NAME:SIZE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcspCacheZone {
+    pub name: String,
+    pub size: u64,
 }
 
 impl ClientVerifyConf {
@@ -909,6 +930,9 @@ impl ClientVerifyConf {
                 | "ssl_trusted_certificate"
                 | "ssl_verify_depth"
                 | "ssl_crl"
+                | "ssl_ocsp"
+                | "ssl_ocsp_responder"
+                | "ssl_ocsp_cache"
         )
     }
 
@@ -924,6 +948,9 @@ impl ClientVerifyConf {
             "ssl_client_certificate" => "ssl_client_certificate",
             "ssl_trusted_certificate" => "ssl_trusted_certificate",
             "ssl_verify_depth" => "ssl_verify_depth",
+            "ssl_ocsp" => "ssl_ocsp",
+            "ssl_ocsp_responder" => "ssl_ocsp_responder",
+            "ssl_ocsp_cache" => "ssl_ocsp_cache",
             _ => "ssl_crl",
         };
         let [_, value] = args else {
@@ -958,6 +985,28 @@ impl ClientVerifyConf {
                 })?;
                 self.depth.replace(depth).is_some()
             }
+            "ssl_ocsp" => {
+                let mode = match value.as_str() {
+                    "off" => OcspMode::Off,
+                    "on" => OcspMode::On,
+                    "leaf" => OcspMode::Leaf,
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: name,
+                            got: value.clone(),
+                        });
+                    }
+                };
+                self.ocsp.replace(mode).is_some()
+            }
+            "ssl_ocsp_responder" => self.ocsp_responder.replace(value.clone()).is_some(),
+            "ssl_ocsp_cache" => {
+                if self.ocsp_cache.is_some() {
+                    return Err(Error::Duplicate(name));
+                }
+                self.ocsp_cache = Some(parse_ocsp_cache(value)?);
+                false
+            }
             _ => self.crl.replace(path()).is_some(),
         };
         if duplicate {
@@ -979,8 +1028,38 @@ impl ClientVerifyConf {
                 .or_else(|| parent.trusted_certificate.clone()),
             depth: self.depth.or(parent.depth),
             crl: self.crl.or_else(|| parent.crl.clone()),
+            ocsp: self.ocsp.or(parent.ocsp),
+            ocsp_responder: self
+                .ocsp_responder
+                .or_else(|| parent.ocsp_responder.clone()),
+            ocsp_cache: self.ocsp_cache.or_else(|| parent.ocsp_cache.clone()),
         }
     }
+}
+
+/// `ssl_ocsp_cache`'s value, as ngx_http_ssl_ocsp_cache reads it: `off`,
+/// or `shared:NAME:SIZE` of at least 8 pages.
+fn parse_ocsp_cache(value: &str) -> Result<Option<OcspCacheZone>, super::error::Error> {
+    use super::error::Error;
+    if value == "off" {
+        return Ok(None);
+    }
+    // Error::Message is static; a configuration error is made once.
+    let message = |text: String| Error::Message(Box::leak(text.into_boxed_str()));
+    let invalid = || message(format!("invalid OCSP cache \"{value}\""));
+    let rest = value.strip_prefix("shared:").ok_or_else(invalid)?;
+    let (name, size) = rest.split_once(':').ok_or_else(invalid)?;
+    if name.is_empty() {
+        return Err(invalid());
+    }
+    let size = super::parse_location::parse_size(size.as_bytes()).ok_or_else(invalid)?;
+    if size < 8 * 4096 {
+        return Err(message(format!("OCSP cache \"{value}\" is too small")));
+    }
+    Ok(Some(OcspCacheZone {
+        name: name.to_string(),
+        size,
+    }))
 }
 
 /// `ssl_stapling`, `ssl_stapling_file`, `ssl_stapling_responder` and

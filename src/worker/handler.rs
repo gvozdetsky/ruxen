@@ -791,7 +791,10 @@ pub(crate) fn finish_access_denial(
             preserved_www_authenticate,
         );
     }
-    let intercepted = if takes_error_page {
+    let mut response = response;
+    let precondition_failed =
+        generated_preconditions(&mut response, req, error_page_status, loc.server_header);
+    let intercepted = if takes_error_page || precondition_failed {
         maybe_intercept_error_page(
             response,
             loc.error_pages,
@@ -817,6 +820,72 @@ pub(crate) fn finish_access_denial(
         preserved_www_authenticate,
         loc.expires,
     )
+}
+
+/// nginx's not-modified filter on a 200 ruxen makes itself (`return`,
+/// autoindex, `stub_status`), which has no `Last-Modified` and no `ETag`:
+/// `If-Unmodified-Since` or an `If-Match` other than `*` turn it into a
+/// 412, `If-None-Match: *` without `If-Modified-Since` into a 304
+/// (ngx_http_not_modified_header_filter). Static files and cached
+/// responses check their own validators. True for a 412.
+#[inline]
+pub(crate) fn generated_preconditions(
+    response: &mut Response,
+    req: &phase::RequestCtx<'_>,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    server: &[u8],
+) -> bool {
+    if req.if_unmodified_since.is_none() && req.if_match.is_none() && req.if_none_match.is_none() {
+        return false;
+    }
+    generated_preconditions_slow(response, req, error_page_status, server)
+}
+
+#[cold]
+#[inline(never)]
+fn generated_preconditions_slow(
+    response: &mut Response,
+    req: &phase::RequestCtx<'_>,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    server: &[u8],
+) -> bool {
+    // The filter sees the status an error page goes out with.
+    if let Some(phase::ErrorPageStatus::Preserve(status) | phase::ErrorPageStatus::Override(status)) =
+        error_page_status
+        && status != 200
+    {
+        return false;
+    }
+    let bytes: &[u8] = match response {
+        Response::Prebuilt(b) => b,
+        Response::Owned(b) => b,
+        _ => return false,
+    };
+    if response_status(bytes) != 200 {
+        return false;
+    }
+    if req.if_unmodified_since.is_some()
+        || req
+            .if_match
+            .is_some_and(|v| !file::etag_list_matches_strong(v, None))
+    {
+        *response = Response::Owned(http::error_response_for_method(
+            412,
+            "Precondition Failed\n",
+            req.method,
+            server,
+        ));
+        return true;
+    }
+    if req.if_modified_since.is_none()
+        && req
+            .if_none_match
+            .is_some_and(|v| file::etag_list_matches(v, None))
+        && let Some((end, _)) = crate::proxy::find_head_end(bytes, 0)
+    {
+        *response = Response::Owned(crate::proxy::conditional_head(&bytes[..end], 304));
+    }
+    false
 }
 
 /// ngx_http_upstream_cache_check_range: `Range` starts at or past `max`
@@ -955,9 +1024,8 @@ pub(crate) fn run_location_handler(
         // escaped (NGX_ESCAPE_URI) when the client's path had a `%` (nginx's
         // `r->quoted_uri`: a `%0D%0A` would otherwise split the line) or
         // the request is internal (`r->internal`: a rewrite of the URI or
-        // an internal redirect cleared `unparsed_uri`); otherwise nginx
-        // copies it as it is (#575).
-        let escape = || !rewrite_state.unparsed_uri || path_is_quoted(req.path);
+        // an internal redirect); otherwise nginx copies it as it is (#575).
+        let escape = || rewrite_state.internal || path_is_quoted(req.path);
         let rewritten_uri: Vec<u8>;
         let request_uri: &[u8] = if let Some(uri) = variable.as_ref().and_then(|v| v.uri.as_deref())
         {
@@ -1548,87 +1616,22 @@ pub(crate) fn run_location_handler(
                     exact_size,
                     localtime,
                     format,
-                } => match format {
-                    AutoindexFormat::Html => {
-                        match autoindex::render_html(&dir_path, &uri, exact_size, localtime) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"text/html",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                        }
-                    }
-                    AutoindexFormat::Xml => match autoindex::render_xml(&dir_path) {
-                        Ok(body) => Response::Owned(http::build_response_bytes_with_content_type(
-                            200,
-                            &body,
-                            b"text/xml; charset=utf-8",
-                            req.method,
-                            server_bytes,
-                        )),
-                        Err(e) => {
-                            eprintln!(
-                                "ruxen: autoindex xml render failed for {} (uri={}): {e}",
-                                dir_path.display(),
-                                String::from_utf8_lossy(&uri)
-                            );
-                            Response::Owned(http::error_response_for_method(
-                                500,
-                                "Internal Server Error\n",
-                                req.method,
-                                server_bytes,
-                            ))
-                        }
-                    },
-                    AutoindexFormat::Json | AutoindexFormat::Jsonp => {
-                        let callback = if format == AutoindexFormat::Jsonp {
-                            autoindex::jsonp_callback(render_ctx_base.args)
-                        } else {
-                            Ok(&[][..])
-                        };
-                        match callback {
-                            Err(()) => Response::Owned(http::error_response_for_method(
-                                400,
-                                "Bad Request\n",
-                                req.method,
-                                server_bytes,
-                            )),
-                            Ok(callback) => match autoindex::render_json(&dir_path, callback) {
-                                // ngx_http_autoindex_handler: JSONP only with a callback.
+                } => {
+                    let mut response = match format {
+                        AutoindexFormat::Html => {
+                            match autoindex::render_html(&dir_path, &uri, exact_size, localtime) {
                                 Ok(body) => {
-                                    let content_type: &[u8] = if callback.is_empty() {
-                                        b"application/json"
-                                    } else {
-                                        b"application/javascript"
-                                    };
                                     Response::Owned(http::build_response_bytes_with_content_type(
                                         200,
                                         &body,
-                                        content_type,
+                                        b"text/html",
                                         req.method,
                                         server_bytes,
                                     ))
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                        "ruxen: autoindex json render failed for {} (uri={}): {e}",
+                                        "ruxen: autoindex render failed for {} (uri={}): {e}",
                                         dir_path.display(),
                                         String::from_utf8_lossy(&uri)
                                     );
@@ -1639,10 +1642,83 @@ pub(crate) fn run_location_handler(
                                         server_bytes,
                                     ))
                                 }
-                            },
+                            }
                         }
-                    }
-                },
+                        AutoindexFormat::Xml => match autoindex::render_xml(&dir_path) {
+                            Ok(body) => {
+                                Response::Owned(http::build_response_bytes_with_content_type(
+                                    200,
+                                    &body,
+                                    b"text/xml; charset=utf-8",
+                                    req.method,
+                                    server_bytes,
+                                ))
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "ruxen: autoindex xml render failed for {} (uri={}): {e}",
+                                    dir_path.display(),
+                                    String::from_utf8_lossy(&uri)
+                                );
+                                Response::Owned(http::error_response_for_method(
+                                    500,
+                                    "Internal Server Error\n",
+                                    req.method,
+                                    server_bytes,
+                                ))
+                            }
+                        },
+                        AutoindexFormat::Json | AutoindexFormat::Jsonp => {
+                            let callback = if format == AutoindexFormat::Jsonp {
+                                autoindex::jsonp_callback(render_ctx_base.args)
+                            } else {
+                                Ok(&[][..])
+                            };
+                            match callback {
+                                Err(()) => Response::Owned(http::error_response_for_method(
+                                    400,
+                                    "Bad Request\n",
+                                    req.method,
+                                    server_bytes,
+                                )),
+                                Ok(callback) => match autoindex::render_json(&dir_path, callback) {
+                                    // ngx_http_autoindex_handler: JSONP only with a callback.
+                                    Ok(body) => {
+                                        let content_type: &[u8] = if callback.is_empty() {
+                                            b"application/json"
+                                        } else {
+                                            b"application/javascript"
+                                        };
+                                        Response::Owned(
+                                            http::build_response_bytes_with_content_type(
+                                                200,
+                                                &body,
+                                                content_type,
+                                                req.method,
+                                                server_bytes,
+                                            ),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "ruxen: autoindex json render failed for {} (uri={}): {e}",
+                                            dir_path.display(),
+                                            String::from_utf8_lossy(&uri)
+                                        );
+                                        Response::Owned(http::error_response_for_method(
+                                            500,
+                                            "Internal Server Error\n",
+                                            req.method,
+                                            server_bytes,
+                                        ))
+                                    }
+                                },
+                            }
+                        }
+                    };
+                    generated_preconditions(&mut response, req, error_page_status, server_bytes);
+                    response
+                }
                 fs_resolve::Outcome::InternalServerError => {
                     Response::Owned(http::error_response_for_method(
                         500,
@@ -1654,19 +1730,28 @@ pub(crate) fn run_location_handler(
             }
         }
     };
-    let intercepted = if matches!(loc.handler, PreparedHandler::Return(_, false)) {
-        inner
-    } else {
-        maybe_intercept_error_page(
-            inner,
-            loc.error_pages,
-            req,
-            &render_ctx_base,
-            in_error_page,
-            loc.recursive_error_pages,
-            server_bytes,
-        )
-    };
+    let mut inner = inner;
+    let precondition_failed =
+        matches!(
+            loc.handler,
+            PreparedHandler::Return(..) | PreparedHandler::StubStatus
+        ) && generated_preconditions(&mut inner, req, error_page_status, server_bytes);
+    // nginx's not-modified filter finalizes its 412 as an error, which
+    // `error_page` takes even after a `return` with text.
+    let intercepted =
+        if matches!(loc.handler, PreparedHandler::Return(_, false)) && !precondition_failed {
+            inner
+        } else {
+            maybe_intercept_error_page(
+                inner,
+                loc.error_pages,
+                req,
+                &render_ctx_base,
+                in_error_page,
+                loc.recursive_error_pages,
+                server_bytes,
+            )
+        };
     let trailers_allowed =
         req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
     finalize_location_response(
