@@ -1172,19 +1172,7 @@ pub struct PreparedUpstream {
     pub shared: Option<&'static [crate::upstream::PeerShared]>,
     /// `resolve` servers (#597): the peers change at run time, and
     /// requests use `current()`'s list.
-    pub dynamic: Option<&'static crate::upstream_resolve::Dynamic>,
-}
-
-impl PreparedUpstream {
-    /// The peer list a request starts with: this one, or the latest
-    /// version of an upstream with `resolve` servers.
-    #[inline]
-    pub fn current(&'static self) -> &'static PreparedUpstream {
-        match self.dynamic {
-            None => self,
-            Some(dynamic) => dynamic.current(),
-        }
-    }
+    pub dynamic: Option<&'static crate::upstream_resolve::Version>,
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in

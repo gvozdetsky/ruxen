@@ -4,29 +4,33 @@
 //! - One worker asks the upstream's resolver for each name, again when the
 //!   answer's TTL (or `valid=`) ends, plus a second
 //!   (ngx_http_upstream_zone_resolve_handler). Peers whose address is no
-//!   longer in the answer go; new addresses are added at the end of the
-//!   list with the `server` line's parameters and port. An error keeps the
-//!   peers and asks again after `resolver_timeout` (1 s at least); a name
-//!   that doesn't exist (or has no address) leaves no peers.
+//!   longer in the answer go; new ones come with the `server` line's
+//!   parameters and port. An error keeps the peers and asks again after
+//!   `resolver_timeout` (1 s at least); a name that doesn't exist (or has
+//!   no address) leaves no peers.
 //! - With `service=`, the SRV records give the targets and ports: the
 //!   lowest priority's addresses are the server's peers, the others backup
 //!   peers (dropped where the balancer has no backup tier), each with the
 //!   record's weight unless the line sets one, named after its target.
 //! - The peer list is a whole `PreparedUpstream` (a version) that requests
-//!   take when they start (`PreparedUpstream::current`), so the request
-//!   path keeps indexing a fixed slice; a request keeps the version it
-//!   started with. Peers that stay keep their failure state; keep-alive
+//!   take when they start (`UpstreamRef::current`), so the request path
+//!   keeps indexing a fixed slice; a request keeps the version it started
+//!   with. Peers that stay keep their failure state; keep-alive
 //!   connections move to the new version in each worker.
-//! - A version is kept until the configuration is freed, and reused when
-//!   its peer list comes back: the memory grows with the number of
-//!   distinct lists seen, not with the number of answers.
+//! - A version is freed once no worker holds it. A worker holds the one
+//!   it last took (its keep-alive pool and balancer state are keyed by
+//!   it) and those its requests still use; the holds are counted per
+//!   worker, and in the version per worker. Each name's peers are kept
+//!   sorted, so an answer in another order is the same list.
 //! - A reload starts from the peers the last generation had for the same
 //!   zone, upstream, name and service (ngx_http_upstream_zone_preresolve),
 //!   with the new `server` line's port and parameters.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::resolver::{Failure, SrvAddr};
@@ -44,6 +48,36 @@ struct Host {
     template: PreparedPeer,
 }
 
+/// `PreparedUpstream::dynamic`: the upstream a peer list (a version) is
+/// of, and how many workers hold it. The configured upstream has one too,
+/// held for good.
+pub struct Version {
+    dynamic: &'static Dynamic,
+    holds: AtomicUsize,
+}
+
+impl std::fmt::Debug for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.dynamic.fmt(f)
+    }
+}
+
+impl Version {
+    /// The version requests take now, held by this worker.
+    pub(crate) fn current(&self) -> &'static PreparedUpstream {
+        self.dynamic.current()
+    }
+
+    /// The version this worker took last.
+    pub(crate) fn seen(&self) -> &'static PreparedUpstream {
+        self.dynamic.seen()
+    }
+}
+
+fn holds(version: &PreparedUpstream) -> &AtomicUsize {
+    &version.dynamic.expect("a version").holds
+}
+
 /// An upstream with `resolve` servers: its peer list changes at run time.
 pub struct Dynamic {
     zone: &'static str,
@@ -57,6 +91,8 @@ pub struct Dynamic {
     first: Box<[Instant]>,
     /// The version requests take now.
     current: AtomicPtr<PreparedUpstream>,
+    /// Workers between loading `current` and holding it.
+    loading: AtomicUsize,
     /// Whether a worker resolves for it already (nginx: worker 0).
     claimed: AtomicBool,
     state: Mutex<State>,
@@ -71,14 +107,27 @@ impl std::fmt::Debug for Dynamic {
 }
 
 /// A peer a name resolved to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Resolved {
     host: usize,
     addr: SocketAddr,
     backup: bool,
     weight: u32,
     /// An SRV target: the peer's `server` name.
-    server: Option<&'static [u8]>,
+    server: Option<Box<[u8]>>,
+}
+
+impl Resolved {
+    /// The order each name's peers are kept in.
+    fn order(&self) -> (usize, bool, SocketAddr, Option<&[u8]>, u32) {
+        (
+            self.host,
+            self.backup,
+            self.addr,
+            self.server.as_deref(),
+            self.weight,
+        )
+    }
 }
 
 /// A peer an answer gives.
@@ -90,23 +139,11 @@ struct Candidate<'a> {
 }
 
 struct State {
-    /// The resolved peers in nginx's list order.
+    /// The resolved peers, each name's sorted.
     resolved: Vec<Resolved>,
-    /// SRV targets, each kept once.
-    names: Vec<&'static [u8]>,
-    versions: Vec<&'static PreparedUpstream>,
+    /// The versions not freed yet, each with what it owns.
+    versions: Vec<(&'static PreparedUpstream, crate::arena::Owner)>,
     owner: crate::arena::Owner,
-}
-
-impl State {
-    fn intern(&mut self, name: &[u8]) -> &'static [u8] {
-        if let Some(kept) = self.names.iter().find(|n| ***n == *name) {
-            return kept;
-        }
-        let kept: &'static [u8] = self.owner.leak(name.into());
-        self.names.push(kept);
-        kept
-    }
 }
 
 /// A server line of the configuration being prepared.
@@ -138,15 +175,8 @@ impl Dynamic {
                 template: h.template,
             })
             .collect();
-        let mut state = State {
-            resolved: Vec::new(),
-            names: Vec::new(),
-            versions: Vec::new(),
-            // SAFETY: inside the `Dynamic` below, which the generation's
-            // arena frees with the rest of its configuration.
-            owner: unsafe { crate::arena::Owner::new() },
-        };
         let backup_tier = has_backup_tier(&template);
+        let mut resolved = Vec::new();
         let mut first = Vec::with_capacity(hosts.len());
         for (i, host) in hosts.iter().enumerate() {
             let Some((peers, valid)) = kept(zone, template.name, host) else {
@@ -156,7 +186,7 @@ impl Dynamic {
             first.push(valid.max(now));
             let t = &host.template;
             for p in peers {
-                let resolved = match &p.server {
+                resolved.push(match p.server {
                     None => Resolved {
                         host: i,
                         addr: SocketAddr::new(p.addr.ip(), host.port),
@@ -170,12 +200,12 @@ impl Dynamic {
                         addr: p.addr,
                         backup: p.backup,
                         weight: if t.weight != 1 { t.weight } else { p.weight },
-                        server: Some(state.intern(server)),
+                        server: Some(server),
                     },
-                };
-                state.resolved.push(resolved);
+                });
             }
         }
+        resolved.sort_by(|a, b| a.order().cmp(&b.order()));
         let dynamic: &'static Dynamic = crate::arena::leak(Box::new(Dynamic {
             zone,
             template,
@@ -184,27 +214,82 @@ impl Dynamic {
             timeout,
             first: first.into(),
             current: AtomicPtr::new(std::ptr::null_mut()),
+            loading: AtomicUsize::new(0),
             claimed: AtomicBool::new(false),
-            state: Mutex::new(state),
+            state: Mutex::new(State {
+                resolved,
+                versions: Vec::new(),
+                // SAFETY: inside `dynamic`, which the generation's arena
+                // frees with the rest of its configuration.
+                owner: unsafe { crate::arena::Owner::new() },
+            }),
         }));
-        dynamic.publish(&mut dynamic.lock());
-        crate::arena::leak(Box::new(PreparedUpstream {
-            dynamic: Some(dynamic),
+        let mut state = dynamic.lock();
+        dynamic.publish(&mut state);
+        // Held for good: it never goes.
+        let version = state.owner.leak(Box::new(Version {
+            dynamic,
+            holds: AtomicUsize::new(1),
+        }));
+        state.owner.leak(Box::new(PreparedUpstream {
+            dynamic: Some(version),
             ..dynamic.template
         }))
     }
 
-    /// The version requests take now; the worker notices a change.
+    /// The version requests take now, held by this worker; the worker
+    /// moves to it if it is new.
     #[inline(never)]
     pub(crate) fn current(&'static self) -> &'static PreparedUpstream {
-        let version = self.version();
-        crate::upstream::notice_version(self, version);
+        let now = self.current.load(Ordering::Acquire);
+        let seen = SEEN.with(|seen| seen.borrow().get(&key(self)).copied());
+        let version = match seen {
+            Some(seen) if std::ptr::eq(seen, now) => seen,
+            _ => self.switch(),
+        };
+        hold(version);
         version
     }
 
-    pub(crate) fn version(&self) -> &'static PreparedUpstream {
-        // SAFETY: set by `publish` before the upstream is handed out, to a
-        // version `state` keeps for as long as `self` lives.
+    /// The version this worker took last (its pool's), or the current one.
+    pub(crate) fn seen(&'static self) -> &'static PreparedUpstream {
+        match SEEN.with(|seen| seen.borrow().get(&key(self)).copied()) {
+            Some(seen) => seen,
+            None => self.switch(),
+        }
+    }
+
+    /// This worker takes the current version.
+    #[cold]
+    #[inline(never)]
+    fn switch(&'static self) -> &'static PreparedUpstream {
+        // Loaded and held under `loading`, so that `sweep` doesn't free
+        // it in between.
+        self.loading.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: set by `publish` before the upstream is handed out, and
+        // not freed while `loading` counts this worker.
+        let version = unsafe { &*self.current.load(Ordering::SeqCst) };
+        let first = HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            let n = held.entry(key(version)).or_insert(0);
+            *n += 1;
+            *n == 1
+        });
+        if first {
+            holds(version).fetch_add(1, Ordering::SeqCst);
+        }
+        self.loading.fetch_sub(1, Ordering::SeqCst);
+        let old = SEEN.with(|seen| seen.borrow_mut().insert(key(self), version));
+        if let Some(old) = old {
+            crate::upstream::switch_version(old, version);
+            release(old);
+        }
+        version
+    }
+
+    fn version(&self) -> &'static PreparedUpstream {
+        // SAFETY: set by `publish` before the upstream is handed out; the
+        // current version isn't freed.
         unsafe { &*self.current.load(Ordering::Acquire) }
     }
 
@@ -215,37 +300,57 @@ impl Dynamic {
     /// Make the version for the current peers current: the one that has
     /// them already, or a new one.
     fn publish(&'static self, state: &mut State) {
-        let mut peers = Vec::with_capacity(self.template.peers.len() + state.resolved.len());
+        // The peers, and the SRV target each is named after.
+        let mut wanted = Vec::with_capacity(self.template.peers.len() + state.resolved.len());
         for backup in [false, true] {
-            peers.extend(
+            wanted.extend(
                 self.template
                     .peers
                     .iter()
                     .filter(|p| p.backup == backup)
-                    .copied(),
+                    .map(|p| (*p, None)),
             );
-            peers.extend(
+            wanted.extend(
                 state
                     .resolved
                     .iter()
                     .filter(|r| r.backup == backup)
                     .map(|r| {
-                        let template = &self.hosts[r.host].template;
-                        PreparedPeer {
+                        let peer = PreparedPeer {
                             addr: PeerAddr::Inet(r.addr),
-                            display: r.server.unwrap_or(template.display),
                             weight: r.weight,
                             backup: r.backup,
-                            ..*template
-                        }
+                            ..self.hosts[r.host].template
+                        };
+                        (peer, r.server.as_deref())
                     }),
             );
         }
-        if let Some(version) = state.versions.iter().find(|v| same_peers(v.peers, &peers)) {
+        if let Some((version, _)) = state.versions.iter().find(|(v, _)| {
+            v.peers.len() == wanted.len()
+                && v.peers
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(a, (b, name))| same_peer(a, b, *name))
+        }) {
             self.current
-                .store(std::ptr::from_ref(*version).cast_mut(), Ordering::Release);
+                .store(std::ptr::from_ref(*version).cast_mut(), Ordering::SeqCst);
+            self.sweep(state);
             return;
         }
+        // SAFETY: kept in `state.versions` until the version is freed,
+        // when nothing uses it (`sweep`), or with `self`.
+        let mut owner = unsafe { crate::arena::Owner::new() };
+        let peers: Vec<PreparedPeer> = wanted
+            .into_iter()
+            .map(|(peer, name)| match name {
+                None => peer,
+                Some(name) => PreparedPeer {
+                    display: owner.leak(name.into()),
+                    ..peer
+                },
+            })
+            .collect();
         let before = (!self.current.load(Ordering::Acquire).is_null()).then(|| self.version());
         let shared: Box<[PeerShared]> = peers
             .iter()
@@ -253,7 +358,7 @@ impl Dynamic {
                 let slot = PeerShared::default();
                 // A peer that stays keeps its failures.
                 if let Some(before) = before
-                    && let Some(i) = before.peers.iter().position(|b| same_peer(b, p))
+                    && let Some(i) = before.peers.iter().position(|b| same_peer(b, p, None))
                     && let Some(old) = before.shared
                 {
                     slot.carry(&old[i]);
@@ -261,7 +366,6 @@ impl Dynamic {
                 slot
             })
             .collect();
-        let owner = &mut state.owner;
         let peers: &'static [PreparedPeer] = owner.leak(peers.into_boxed_slice());
         let lb = match self.template.lb {
             Lb::Hash(h) if h.ring.is_some() => Lb::Hash(owner.leak(Box::new(HashLb {
@@ -271,16 +375,39 @@ impl Dynamic {
             lb => lb,
         };
         let shared: &'static [PeerShared] = owner.leak(shared);
+        let tag: &'static Version = owner.leak(Box::new(Version {
+            dynamic: self,
+            holds: AtomicUsize::new(0),
+        }));
         let version: &'static PreparedUpstream = owner.leak(Box::new(PreparedUpstream {
             peers,
             lb,
             shared: Some(shared),
-            dynamic: Some(self),
+            dynamic: Some(tag),
             ..self.template
         }));
-        state.versions.push(version);
+        state.versions.push((version, owner));
         self.current
-            .store(std::ptr::from_ref(version).cast_mut(), Ordering::Release);
+            .store(std::ptr::from_ref(version).cast_mut(), Ordering::SeqCst);
+        self.sweep(state);
+    }
+
+    /// Free the versions no worker holds or is about to.
+    fn sweep(&self, state: &mut State) {
+        let current = self.current.load(Ordering::SeqCst);
+        if self.loading.load(Ordering::SeqCst) != 0 {
+            // The next sweep frees them.
+            return;
+        }
+        state
+            .versions
+            .retain(|(v, _)| std::ptr::eq(*v, current) || holds(v).load(Ordering::SeqCst) != 0);
+    }
+
+    /// The number of versions not freed, for tests.
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.lock().versions.len()
     }
 
     /// Host `h`'s new addresses.
@@ -330,7 +457,7 @@ impl Dynamic {
     /// Match host `h`'s peers against an answer as
     /// ngx_http_upstream_zone_resolve_handler does: a peer stays for a
     /// peer of the answer not taken yet, goes otherwise; the rest of the
-    /// answer is added at the end.
+    /// answer is added, and the name's peers sorted.
     fn update(&'static self, h: usize, candidates: Vec<Candidate<'_>>, valid: Instant) {
         let host = &self.hosts[h];
         // A record's weight counts only when the line doesn't set one.
@@ -345,7 +472,7 @@ impl Dynamic {
                 !taken[i]
                     && c.addr == r.addr
                     && c.backup == r.backup
-                    && c.server == r.server
+                    && c.server == r.server.as_deref()
                     && (!weighted || c.weight == r.weight)
             });
             match found {
@@ -360,15 +487,15 @@ impl Dynamic {
             if taken {
                 continue;
             }
-            let server = c.server.map(|name| state.intern(name));
             state.resolved.push(Resolved {
                 host: h,
                 addr: c.addr,
                 backup: c.backup,
                 weight: c.weight,
-                server,
+                server: c.server.map(Box::from),
             });
         }
+        state.resolved.sort_by(|a, b| a.order().cmp(&b.order()));
         self.publish(&mut state);
         let peers: Vec<KeptPeer> = state
             .resolved
@@ -378,7 +505,7 @@ impl Dynamic {
                 addr: r.addr,
                 backup: r.backup,
                 weight: r.weight,
-                server: r.server.map(Box::from),
+                server: r.server.clone(),
             })
             .collect();
         drop(state);
@@ -386,15 +513,70 @@ impl Dynamic {
     }
 }
 
-/// Whether the balancer keeps backup peers, where the lower priorities of
-/// a service go (nginx's `peers->next`).
-fn has_backup_tier(upstream: &PreparedUpstream) -> bool {
-    matches!(upstream.lb, Lb::RoundRobin | Lb::LeastConn) || upstream.peers.iter().any(|p| p.backup)
+fn key<T>(p: &T) -> usize {
+    std::ptr::from_ref(p) as usize
 }
 
-fn same_peer(a: &PreparedPeer, b: &PreparedPeer) -> bool {
+thread_local! {
+    /// The version of each resolved upstream this worker took last.
+    static SEEN: RefCell<HashMap<usize, &'static PreparedUpstream, crate::upstream::FxBuild>> =
+        RefCell::new(HashMap::default());
+    /// This worker's holds of each version: its requests', and one for
+    /// the version in `SEEN`.
+    static HELD: RefCell<HashMap<usize, u32, crate::upstream::FxBuild>> =
+        RefCell::new(HashMap::default());
+}
+
+/// One more hold of `version`, which this worker holds already.
+pub(crate) fn hold(version: &PreparedUpstream) {
+    let _ = HELD.try_with(|held| {
+        if let Some(n) = held.borrow_mut().get_mut(&key(version)) {
+            *n += 1;
+        }
+    });
+}
+
+/// One hold of `version` less; the last of this worker's lets it go: its
+/// pool moves to the version the worker took last.
+pub(crate) fn release(version: &PreparedUpstream) {
+    let last = HELD
+        .try_with(|held| {
+            let mut held = held.borrow_mut();
+            let Some(n) = held.get_mut(&key(version)) else {
+                return false;
+            };
+            *n -= 1;
+            if *n != 0 {
+                return false;
+            }
+            held.remove(&key(version));
+            true
+        })
+        .unwrap_or(false);
+    if last {
+        let_go(version);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn let_go(version: &PreparedUpstream) {
+    let Some(tag) = version.dynamic else {
+        return;
+    };
+    let dynamic = tag.dynamic;
+    if let Ok(Some(seen)) = SEEN.try_with(|seen| seen.borrow().get(&key(dynamic)).copied()) {
+        crate::upstream::switch_version(version, seen);
+    }
+    if tag.holds.fetch_sub(1, Ordering::SeqCst) == 1 {
+        dynamic.sweep(&mut dynamic.lock());
+    }
+}
+
+/// Whether `a` is `b` (named `name` instead, an SRV target).
+fn same_peer(a: &PreparedPeer, b: &PreparedPeer, name: Option<&[u8]>) -> bool {
     a.addr == b.addr
-        && std::ptr::eq(a.display, b.display)
+        && a.display == name.unwrap_or(b.display)
         && a.weight == b.weight
         && a.max_fails == b.max_fails
         && a.fail_timeout_ms == b.fail_timeout_ms
@@ -403,8 +585,10 @@ fn same_peer(a: &PreparedPeer, b: &PreparedPeer) -> bool {
         && a.backup == b.backup
 }
 
-fn same_peers(a: &[PreparedPeer], b: &[PreparedPeer]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_peer(a, b))
+/// Whether the balancer keeps backup peers, where the lower priorities of
+/// a service go (nginx's `peers->next`).
+fn has_backup_tier(upstream: &PreparedUpstream) -> bool {
+    matches!(upstream.lb, Lb::RoundRobin | Lb::LeastConn) || upstream.peers.iter().any(|p| p.backup)
 }
 
 /// The peers a generation last had for a name, for the next one.
@@ -473,7 +657,7 @@ fn keep(zone: &str, upstream: &[u8], host: &Host, peers: Vec<KeptPeer>, valid: I
 /// no other worker of the generation looks after yet.
 pub(crate) fn start(http: &'static PreparedHttp, state: &'static RuntimeState) {
     for upstream in http.upstreams.values() {
-        let Some(dynamic) = upstream.dynamic else {
+        let Some(dynamic) = upstream.dynamic.map(|v| v.dynamic) else {
             continue;
         };
         if dynamic.claimed.swap(true, Ordering::AcqRel) {
@@ -646,65 +830,100 @@ mod tests {
         list.iter().map(|a| (a.to_string(), false)).collect()
     }
 
+    fn version(d: &'static Dynamic) -> &'static PreparedUpstream {
+        d.version()
+    }
+
     #[test]
     fn answers_change_the_peers_as_nginx() {
         let base = upstream("t1", 8080);
-        let d = base.dynamic.unwrap();
-        assert_eq!(addrs(d.version()), primary(&["127.0.0.9:80"]));
+        let d = base.dynamic.unwrap().dynamic;
+        assert_eq!(addrs(version(d)), primary(&["127.0.0.9:80"]));
         let later = Instant::now() + Duration::from_secs(5);
-        d.apply(0, &ips(&["10.0.0.1", "10.0.0.2"]), later);
+        // Each name's peers in address order.
+        d.apply(0, &ips(&["10.0.0.2", "10.0.0.1"]), later);
         assert_eq!(
-            addrs(d.version()),
+            addrs(version(d)),
             primary(&["127.0.0.9:80", "10.0.0.1:8080", "10.0.0.2:8080"])
         );
-        let first = d.version();
-        // Staying peers keep their place; new ones go last.
         d.apply(0, &ips(&["10.0.0.3", "10.0.0.2"]), later);
         assert_eq!(
-            addrs(d.version()),
+            addrs(version(d)),
             primary(&["127.0.0.9:80", "10.0.0.2:8080", "10.0.0.3:8080"])
         );
-        let second = d.version();
+        let second = version(d);
         assert!(second.shared.is_some_and(|s| s.len() == 3));
         // The same list in another order is no change.
-        d.apply(0, &ips(&["10.0.0.3", "10.0.0.2"]), later);
-        assert!(std::ptr::eq(d.version(), second));
-        // A list seen before takes its version again.
-        d.apply(0, &ips(&["10.0.0.1", "10.0.0.2"]), later);
-        d.apply(0, &ips(&["10.0.0.3"]), later);
-        d.apply(0, &ips(&["10.0.0.1", "10.0.0.2"]), later);
-        assert!(std::ptr::eq(d.version(), first));
+        d.apply(0, &ips(&["10.0.0.2", "10.0.0.3"]), later);
+        assert!(std::ptr::eq(version(d), second));
         // A backup server's peers stay in the backup tier; an address
         // twice is two peers, as in nginx.
         d.apply(1, &ips(&["10.0.1.1", "10.0.1.1"]), later);
-        let mut want = primary(&["127.0.0.9:80", "10.0.0.1:8080", "10.0.0.2:8080"]);
+        let mut want = primary(&["127.0.0.9:80", "10.0.0.2:8080", "10.0.0.3:8080"]);
         want.push(("10.0.1.1:8080".into(), true));
         want.push(("10.0.1.1:8080".into(), true));
-        assert_eq!(addrs(d.version()), want);
-        assert!(std::ptr::eq(d.version().dynamic.unwrap(), d));
-        assert!(std::ptr::eq(base.current(), d.version()));
+        assert_eq!(addrs(version(d)), want);
+        assert!(std::ptr::eq(version(d).dynamic.unwrap().dynamic, d));
+        let taken = crate::upstream::UpstreamRef::current(base);
+        assert!(std::ptr::eq(&*taken, version(d)));
+        drop(taken);
         // No address: the server has no peers.
         d.apply(0, &[], later);
         d.apply(1, &[], later);
-        assert_eq!(addrs(d.version()), primary(&["127.0.0.9:80"]));
+        assert_eq!(addrs(version(d)), primary(&["127.0.0.9:80"]));
+    }
+
+    #[test]
+    fn versions_nothing_holds_are_freed() {
+        let base = upstream("t4", 8080);
+        let d = base.dynamic.unwrap().dynamic;
+        let later = Instant::now() + Duration::from_secs(5);
+        let churn = |round: u32| {
+            for i in 0..500u32 {
+                let a = format!("10.{round}.{}.{}", i / 250, i % 250);
+                d.apply(0, &ips(&[&a, "10.255.0.1"]), later);
+            }
+        };
+        churn(0);
+        assert_eq!(d.live(), 1);
+        // A request keeps its version through the changes; the ones
+        // between go.
+        let held = crate::upstream::UpstreamRef::current(base);
+        let peers = addrs(&held);
+        churn(1);
+        assert_eq!(d.live(), 2);
+        let copy = held.clone();
+        drop(held);
+        churn(2);
+        assert_eq!(addrs(&copy), peers);
+        drop(copy);
+        // The worker still holds the version it took last, until it
+        // takes another.
+        assert_eq!(d.live(), 2);
+        let now = crate::upstream::UpstreamRef::current(base);
+        assert!(std::ptr::eq(&*now, version(d)));
+        assert_eq!(d.live(), 1);
+        drop(now);
+        churn(3);
+        assert_eq!(d.live(), 2);
     }
 
     #[test]
     fn the_next_generation_starts_from_the_last_answers() {
-        let d = upstream("t2", 8080).dynamic.unwrap();
+        let d = upstream("t2", 8080).dynamic.unwrap().dynamic;
         let later = Instant::now() + Duration::from_secs(60);
         d.apply(0, &ips(&["10.0.0.1", "10.0.0.2"]), later);
         // Same zone, upstream and name; the new line's port.
-        let next = upstream("t2", 9090).dynamic.unwrap();
+        let next = upstream("t2", 9090).dynamic.unwrap().dynamic;
         assert_eq!(
-            addrs(next.version()),
+            addrs(version(next)),
             primary(&["127.0.0.9:80", "10.0.0.1:9090", "10.0.0.2:9090"])
         );
         assert_eq!(next.first[0], later);
         assert!(next.first[1] <= Instant::now());
         // Another zone starts empty.
-        let other = upstream("t3", 8080).dynamic.unwrap();
-        assert_eq!(addrs(other.version()), primary(&["127.0.0.9:80"]));
+        let other = upstream("t3", 8080).dynamic.unwrap().dynamic;
+        assert_eq!(addrs(version(other)), primary(&["127.0.0.9:80"]));
     }
 
     fn srv(addr: &str, name: &str, priority: u16, weight: u16) -> SrvAddr {
@@ -732,7 +951,10 @@ mod tests {
 
     #[test]
     fn services_give_ports_weights_and_backups() {
-        let d = upstream_with("s1", 80, Some("http"), 1).dynamic.unwrap();
+        let d = upstream_with("s1", 80, Some("http"), 1)
+            .dynamic
+            .unwrap()
+            .dynamic;
         let later = Instant::now() + Duration::from_secs(5);
         let answer = [
             srv("10.0.0.1:8081", "a.example", 1, 5),
@@ -743,7 +965,7 @@ mod tests {
         // port, weight and target.
         let statics = row("127.0.0.9:80", "x", 1, false);
         assert_eq!(
-            peers(d.version()),
+            peers(version(d)),
             [
                 statics.clone(),
                 row("10.0.0.1:8081", "a.example", 5, false),
@@ -754,14 +976,14 @@ mod tests {
         let answer = [srv("10.0.0.1:8081", "a.example", 1, 3)];
         d.apply_service(0, &answer, later);
         assert_eq!(
-            peers(d.version()),
+            peers(version(d)),
             [statics.clone(), row("10.0.0.1:8081", "a.example", 3, false)]
         );
         // A backup server has no lower tier to put them in.
         let answer = [srv("10.0.1.1:1", "c", 1, 1), srv("10.0.1.2:2", "d", 9, 1)];
         d.apply_service(1, &answer, later);
         assert_eq!(
-            peers(d.version()),
+            peers(version(d)),
             [
                 statics.clone(),
                 row("10.0.0.1:8081", "a.example", 3, false),
@@ -769,14 +991,34 @@ mod tests {
             ]
         );
         // The line's weight wins over the record's.
-        let w = upstream_with("s2", 80, Some("http"), 7).dynamic.unwrap();
+        let w = upstream_with("s2", 80, Some("http"), 7)
+            .dynamic
+            .unwrap()
+            .dynamic;
         w.apply_service(0, &[srv("10.0.0.1:8081", "a.example", 1, 5)], later);
         assert_eq!(
-            peers(w.version()),
+            peers(version(w)),
             [statics, row("10.0.0.1:8081", "a.example", 7, false)]
         );
         // The next generation starts from the same peers.
-        let next = upstream_with("s1", 80, Some("http"), 1).dynamic.unwrap();
-        assert_eq!(peers(next.version()), peers(d.version()));
+        let next = upstream_with("s1", 80, Some("http"), 1)
+            .dynamic
+            .unwrap()
+            .dynamic;
+        assert_eq!(peers(version(next)), peers(version(d)));
+        // Targets named anew each time: their names go with the versions.
+        for i in 0..500 {
+            let name = format!("pod-{i}.example");
+            d.apply_service(0, &[srv("10.0.0.1:8081", &name, 1, 1)], later);
+        }
+        assert_eq!(d.live(), 1);
+        assert_eq!(
+            peers(version(d)),
+            [
+                row("127.0.0.9:80", "x", 1, false),
+                row("10.0.0.1:8081", "pod-499.example", 1, false),
+                row("10.0.1.1:1", "c", 1, true)
+            ]
+        );
     }
 }

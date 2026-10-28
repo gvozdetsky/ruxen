@@ -33,7 +33,6 @@ use crate::phase::Response;
 use crate::upstream;
 use crate::upstream::LeasedPeer;
 use crate::worker::PeerAddr;
-use crate::worker::PreparedUpstream;
 use crate::worker::range::RangeAllow;
 
 // Per-worker reusable scratch buffers for proxy::attempt. The proxy hot path
@@ -79,8 +78,9 @@ pub(crate) fn return_proxy_buf(mut v: Vec<u8>) {
 /// Per-request upstream attempt plan. Built synchronously inside the
 /// location handler; consumed by `run_proxy` on the worker async task.
 pub struct ProxyPlan {
-    /// Pointer to the prepared upstream (owns peers + keepalive config).
-    pub upstream: &'static PreparedUpstream,
+    /// The prepared upstream (owns peers + keepalive config), the version
+    /// of its peers this request uses.
+    pub upstream: upstream::UpstreamRef,
     /// `proxy_pass` with variables naming an address (#100) or a host
     /// name to resolve (#133): the peers to use instead of `upstream`'s,
     /// which is then a placeholder. Boxed: only a `proxy_pass` with
@@ -567,8 +567,8 @@ impl ProxyPlan {
         match self.adhoc.as_deref() {
             Some(adhoc) if adhoc.peers.len() > 1 => (0..adhoc.peers.len())
                 .find(|&i| !tried.contains(i))
-                .map(|i| LeasedPeer::adhoc(self.upstream, i)),
-            _ => upstream::pick_peer(self.upstream, tried, self.hash.as_deref_mut()),
+                .map(|i| LeasedPeer::adhoc(&self.upstream, i)),
+            _ => upstream::pick_peer(&self.upstream, tried, self.hash.as_deref_mut()),
         }
     }
 }
@@ -666,7 +666,7 @@ pub async fn run_proxy(
     let accel = &mut report.accel;
     let states = &mut report.states;
     let attempt_started = &mut report.attempt_started;
-    let upstream = plan.upstream;
+    let upstream = plan.upstream.clone();
     if plan.adhoc.as_ref().is_some_and(|a| a.resolve.is_some())
         && let Err(response) = Box::pin(resolve_peers(&mut plan, failures)).await
     {
@@ -729,7 +729,7 @@ pub async fn run_proxy(
         //    a fresh connect — the pooled conn was likely stale. The
         //    stale-retry counts as part of the same `attempt` budget.
         let pooled = upstream::pool_take(
-            upstream,
+            &upstream,
             current.peer_idx,
             plan.tls.as_deref(),
             plan.pool_tag,
@@ -829,9 +829,9 @@ pub async fn run_proxy(
                     // max_fails (NGX_PEER_NEXT, ngx_http_upstream_next);
                     // 5xx and 429 are failures.
                     if matches!(status, 403 | 404) {
-                        upstream::report_success(upstream, current.peer_idx);
+                        upstream::report_success(&upstream, current.peer_idx);
                     } else {
-                        upstream::report_failure(upstream, current.peer_idx);
+                        upstream::report_failure(&upstream, current.peer_idx);
                     }
                     let Some(next) = plan.next_peer(&tried) else {
                         // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
@@ -853,7 +853,7 @@ pub async fn run_proxy(
                 // check `proxy_intercept_errors`: an upstream status that
                 // matches a configured `error_page` rule turns into a
                 // Reroute instead of being forwarded.
-                upstream::report_success(upstream, current.peer_idx);
+                upstream::report_success(&upstream, current.peer_idx);
                 // ngx_http_upstream_test_next: a status
                 // proxy_cache_use_stale lists is answered from the cache.
                 if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Status(status)) {
@@ -917,7 +917,7 @@ pub async fn run_proxy(
                 return crate::worker::internal_error_response(plan.method);
             }
             AttemptOutcome::TooBig => {
-                upstream::report_success(upstream, current.peer_idx);
+                upstream::report_success(&upstream, current.peer_idx);
                 record_failure(
                     failures,
                     &plan,
@@ -932,7 +932,7 @@ pub async fn run_proxy(
                 unreachable!("ruxen: pooled-stale outcome leaked past stale-retry collapse");
             }
             AttemptOutcome::Failed(resp, kind, error) => {
-                upstream::report_failure(upstream, current.peer_idx);
+                upstream::report_failure(&upstream, current.peer_idx);
                 let sent = !matches!(
                     *error,
                     UpstreamError::ConnectFailed(_)
@@ -2267,7 +2267,7 @@ async fn attempt(
         let pool =
             (plan.keepalive_eligible && status_code != 101 && !upstream_close && upstream_is_11)
                 .then_some(crate::proxy_stream::StreamPool {
-                    upstream: plan.upstream,
+                    upstream: plan.upstream.clone(),
                     peer_idx,
                     tag: plan.pool_tag,
                     opened_at,
@@ -2507,7 +2507,7 @@ async fn attempt(
         && response_framed
     {
         upstream::pool_release(
-            plan.upstream,
+            &plan.upstream,
             peer_idx,
             plan.pool_tag,
             upstream::PooledConn {

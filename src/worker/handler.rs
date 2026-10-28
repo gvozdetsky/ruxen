@@ -929,10 +929,9 @@ pub(crate) fn run_location_handler(
                 }
             },
         };
-        let upstream = variable
-            .as_ref()
-            .map_or(proxy.upstream, |v| v.upstream)
-            .current();
+        let upstream = crate::upstream::UpstreamRef::current(
+            variable.as_ref().map_or(proxy.upstream, |v| v.upstream),
+        );
         let host_header: &[u8] = variable
             .as_ref()
             .map_or(proxy.host_header, |v| &v.host_header);
@@ -1026,7 +1025,7 @@ pub(crate) fn run_location_handler(
         // 502 and reports `no live upstreams` for the error log. A cache
         // hit needs none.
         let mut hash = crate::upstream::HashPick::for_request(
-            upstream,
+            &upstream,
             |key| {
                 let mut out = Vec::new();
                 render_parts(key, &render_ctx_base, &mut out);
@@ -1040,7 +1039,7 @@ pub(crate) fn run_location_handler(
         {
             None
         } else {
-            crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+            crate::upstream::pick_peer(&upstream, &Default::default(), hash.as_deref_mut())
         };
 
         // Build the final header set: proxy_set_header overrides first
@@ -1277,6 +1276,7 @@ pub(crate) fn run_location_handler(
                 Some(Box::new(crate::upstream_tls::TlsPlan { config, name }))
             }
         };
+        let pool_tag = proxy.pool_tag(&upstream);
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             tls,
@@ -1294,7 +1294,7 @@ pub(crate) fn run_location_handler(
             bad_gateway: &http.bad_gateway,
             gateway_timeout: &http.gateway_timeout,
             keepalive_eligible: pool_eligible,
-            pool_tag: proxy.pool_tag(upstream),
+            pool_tag,
             next_upstream: proxy.next_upstream,
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
