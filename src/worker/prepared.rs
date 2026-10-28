@@ -647,10 +647,12 @@ pub enum PreparedHandler {
     /// for one with text (other than a redirect URL), which nginx's
     /// `ngx_http_script_return_code` sends as it is (#372).
     Return(PreparedReturn, bool),
-    Root(PreparedRoot),
+    Root(PreparedRoot<'static>),
     Proxy(PreparedProxy),
     /// `stub_status` (#96).
     StubStatus,
+    /// `ruxen_metrics` (#481).
+    Metrics,
 }
 
 /// Per-location rules for an upstream's response headers, behind one
@@ -1173,6 +1175,8 @@ pub struct PreparedUpstream {
     /// all workers (one slot per peer). `None`: per worker, as nginx's
     /// without a zone.
     pub shared: Option<&'static [crate::upstream::PeerShared]>,
+    /// Each peer's metrics slot (#481); `None` without `ruxen_metrics`.
+    pub metrics: Option<&'static [u32]>,
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in
@@ -1291,8 +1295,11 @@ impl PreparedTypes {
     }
 }
 
-pub struct PreparedRoot {
-    pub root: &'static Path,
+/// `'a` is `'static` but for a root rendered per request (`template`),
+/// which `fs_resolve` copies with the rendered path.
+#[derive(Clone, Copy)]
+pub struct PreparedRoot<'a> {
+    pub root: &'a Path,
     /// `types {}` / `default_type` (#38).
     pub types: &'static PreparedTypes,
     /// Open dirfd for the canonicalized root, or -1 if it didn't exist at
@@ -1301,8 +1308,12 @@ pub struct PreparedRoot {
     /// enforces symlink-escape containment in a single syscall — replaces
     /// the old stat + canonicalize + `starts_with` guard. Opened at prepare
     /// time if possible, else on first use; leaked for process lifetime
-    /// (closed at exit only).
+    /// (closed at exit only). In a rendered copy, the fd opened for the
+    /// request, or `-1 - errno` when that failed.
     pub root_fd: std::os::unix::io::RawFd,
+    /// `root` / `alias` with variables (#232): rendered per request, and
+    /// `root` is then the path as written.
+    pub template: Option<&'static RootTemplate>,
     /// Effective `disable_symlinks` (`fs_resolve::open_and_stat`).
     pub symlinks: PreparedSymlinks,
     /// `root` appends the whole URI.
@@ -1324,6 +1335,17 @@ pub struct PreparedRoot {
     pub if_modified_since: crate::config::IfModifiedSince,
     pub etag: bool,
     pub try_files: Option<&'static PreparedTryFiles>,
+    /// `gzip_static on|always` (#760).
+    pub gzip_static: Option<&'static PreparedGzipStatic>,
+}
+
+/// A location's `gzip_static on|always` (#760).
+#[derive(Debug)]
+pub struct PreparedGzipStatic {
+    pub always: bool,
+    /// The location's `gzip_vary`, `gzip_http_version`, `gzip_proxied` and
+    /// `gzip_disable`: they apply with `gzip off` too.
+    pub checks: &'static PreparedGzip,
 }
 
 /// Where a location's URIs map on disk, whatever its handler: its `root`
@@ -1342,6 +1364,58 @@ pub struct DocRoot {
     pub charset: Option<&'static PreparedCharset>,
     /// The location's `disable_symlinks`, for `if -f` and the like.
     pub symlinks: PreparedSymlinks,
+    /// `path` with variables (#232), rendered per request (`path_for`).
+    pub template: Option<&'static RootTemplate>,
+}
+
+impl DocRoot {
+    /// The root or alias path for this request, as nginx's
+    /// ngx_http_variable_document_root.
+    #[inline]
+    pub(crate) fn path_for(&self, ctx: &RenderCtx<'_>) -> std::borrow::Cow<'static, Path> {
+        match self.template {
+            None => std::borrow::Cow::Borrowed(self.path),
+            Some(t) => std::borrow::Cow::Owned(t.render(ctx)),
+        }
+    }
+}
+
+/// A `root` or `alias` with variables (#232), nginx's `root_lengths` /
+/// `root_values`.
+#[derive(Debug)]
+pub struct RootTemplate {
+    pub parts: &'static [PreparedValuePart],
+    /// For a path that starts with a variable: the prefix a relative
+    /// result is taken under (ngx_get_full_name). Otherwise a relative
+    /// path got it at startup.
+    pub prefix: Option<&'static Path>,
+    /// A literal part has `..`, so one in the result may be the config's.
+    pub literal_dot_dot: bool,
+}
+
+impl RootTemplate {
+    #[cold]
+    pub(crate) fn render(&self, ctx: &RenderCtx<'_>) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = Vec::with_capacity(64);
+        render_parts(self.parts, ctx, &mut out);
+        let path = Path::new(std::ffi::OsStr::from_bytes(&out));
+        match self.prefix {
+            Some(prefix) if path.is_relative() => prefix.join(path),
+            _ => path.to_path_buf(),
+        }
+    }
+
+    /// A rendered path ruxen won't open: a NUL, which nginx's C string
+    /// would cut the path at, or a `..` component a variable brought in.
+    /// nginx follows such a `..`; ruxen refuses it, as it refuses one that
+    /// climbs out of a root (`fs_resolve::open_and_stat`).
+    pub(crate) fn is_unsafe(&self, path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        bytes.contains(&0)
+            || (!self.literal_dot_dot && bytes.split(|&b| b == b'/').any(|c| c == b".."))
+    }
 }
 
 /// Effective `disable_symlinks` of a location.
@@ -1415,14 +1489,14 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-impl PreparedRoot {
+impl PreparedRoot<'_> {
     /// The root's dirfd. Opened at startup when the path existed (before
     /// the workers split their fd tables, so it's valid everywhere);
     /// otherwise opened on first use in each worker and kept there, so it
     /// works once the directory appears, as with nginx. Until then this is
     /// the open error (a 404 for ENOENT).
     pub fn fd(&self) -> std::io::Result<std::os::unix::io::RawFd> {
-        if self.root_fd != -1 {
+        if self.root_fd >= 0 {
             return Ok(self.root_fd);
         }
         self.lazy_fd()
@@ -1430,6 +1504,10 @@ impl PreparedRoot {
 
     #[cold]
     fn lazy_fd(&self) -> std::io::Result<std::os::unix::io::RawFd> {
+        if self.root_fd < -1 {
+            // A rendered root that didn't open.
+            return Err(std::io::Error::from_raw_os_error(-1 - self.root_fd));
+        }
         let key = self as *const PreparedRoot as usize;
         LAZY_ROOT_FDS.with(|fds| {
             if let Some(&(_, fd)) = fds.borrow().iter().find(|(k, _)| *k == key) {
@@ -1901,6 +1979,8 @@ pub struct LocationLevel {
 /// server; cross-server selection happens in `phase::find_config` which
 /// walks the table priorities in nginx order.
 pub struct PreparedServer {
+    /// This server's metrics slot (#481); 0 without `ruxen_metrics`.
+    pub metrics_slot: u32,
     /// The server's `root` (else `html`), for `$request_filename` in its
     /// rewrite phase.
     pub doc_root: &'static DocRoot,
@@ -2180,6 +2260,8 @@ pub struct PreparedHttp {
     /// `stub_status` or `$connections_*` is used: keep the counters
     /// (`stats`).
     pub stats: bool,
+    /// `ruxen_metrics` is used: the counters it shows (#481).
+    pub metrics: Option<&'static super::metrics::Metrics>,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],
@@ -2364,5 +2446,5 @@ pub struct PreparedGzip {
     pub proxied: u16,
     pub disable_msie6: bool,
     /// `gzip_disable` User-Agent patterns, case-insensitive.
-    pub disable: Option<regex::RegexSet>,
+    pub disable: Option<regex::bytes::RegexSet>,
 }
