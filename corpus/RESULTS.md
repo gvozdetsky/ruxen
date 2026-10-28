@@ -8,7 +8,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
 **ruxen loads 218 of 238 configurations nginx accepts (92%).** 92 more cases were not valid for nginx either and don't count.
 
-**171 of them (72% of 238) load with nothing that behaves differently from nginx**, by `ruxen --compat` (#278): no "differs" finding. Upstream names point at 127.0.0.1 here, so `resolver` and DNS-dependent behaviour are not measured.
+**183 of them (77% of 238) load with nothing that behaves differently from nginx**, by `ruxen --compat` (#278): no "differs" finding. Upstream names point at 127.0.0.1 here, so `resolver` and DNS-dependent behaviour are not measured.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
@@ -39,27 +39,23 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | configurations | differs | examples |
 |---:|---|---|
 | 25 | proxy_buffering off | mastodon, gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example, gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in, gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/prod-nginx.conf … |
-| 15 | ssl_ciphers | mastodon, certbot-options, gh:decred/dcrstakepool/sample-nginx.conf, gh:wednesday-solutions/react-template/app/.nginx.conf … |
-| 6 | ssl_prefer_server_ciphers off | certbot-options, gitlab-ssl, gh:yashab-cyber/metasploit-ai/docker/nginx.conf, gh:hatanaca/quick-filler-test/nginx.conf … |
 | 5 | ssl_protocols | gh:decred/dcrstakepool/sample-nginx.conf, gh:eubr-bigsea/citrus/custom_nginx.conf, gh:TetAlius/GoSyncMyCalendars/.nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf … |
 | 4 | gzip_static on | mastodon, gh:decred/dcrstakepool/sample-nginx.conf, gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf, gh:dimaslz/local-ssl-management/packages/app/nginx.conf |
 | 4 | proxy_request_buffering off | immich#1, gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in, gh:inab/openEBench-nuxt/nginx.conf.devci, gh:inab/openEBench-nuxt-v3/nginx.conf.devci |
-| 2 | etag off | gh:deft1991/watchman/docker/proxy/nginx.conf, gh:devstroop/penpot/docker/devenv/files/nginx.conf |
+| 2 | alias and location: one ends with / | gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf, gh:devstroop/penpot/docker/devenv/files/nginx.conf |
 | 1 | $date_gmt | gh:deft1991/watchman/docker/proxy/nginx.conf |
-| 1 | if_modified_since off | gh:deft1991/watchman/docker/proxy/nginx.conf |
-| 1 | proxy_cookie_domain | gh:ocftw/OpenGovReport14-16/nginx.config |
-| 1 | server with ssl_* directives but no `listen … ssl;` on its address | certbot-options |
+| 1 | ssl_* without listen … ssl | certbot-options |
 
 ## Every case
 
 | case | use | nginx | ruxen | differs | ruxen's error |
 |---|---|---|---|---:|---|
 | nginx-default | static | ok | ok |  |  |
-| mastodon | proxy | ok | ok | 3 |  |
+| mastodon | proxy | ok | ok | 2 |  |
 | nextcloud-root | php | ok | FAIL |  | ruxen: [emerg] unknown directive `fastcgi_buffers` in a server block in <sandbox>/conf/nginx.conf:63 |
 | nextcloud-subdir | php | ok | FAIL |  | ruxen: [emerg] unknown directive `fastcgi_buffers` in a location block in <sandbox>/conf/nginx.conf:90 |
-| certbot-options | proxy | ok | ok | 3 |  |
-| gitlab-ssl | proxy | ok | ok | 1 |  |
+| certbot-options | proxy | ok | ok | 1 |  |
+| gitlab-ssl | proxy | ok | ok |  |  |
 | gitlab | proxy | ok | ok |  |  |
 | sentry | proxy | ok | ok |  |  |
 | gunicorn | proxy | ok | ok |  |  |
@@ -102,7 +98,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:yunzhu-li/blupig-gomoku/docker-nginx.conf | github | ok | ok |  |  |
 | gh:healthlocker/healthlocker/nginx.config | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:35) |
 | gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `uwsgi_pass` in a location block in <sandbox>/conf/nginx.conf:39 |
-| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | ok | 3 |  |
+| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | ok | 2 |  |
 | gh:ericbarch/socket-tunnel/nginx.conf.sample | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:17) |
 | gh:runzhliu/welink/dev-nginx.conf | github | ok | ok |  |  |
 | gh:TaitoUnited/full-stack-template/docker-nginx.conf | github | ok | ok |  |  |
@@ -110,7 +106,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:refluxdb/influxdb3-community/iox-nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `grpc_pass` in a if block in <sandbox>/conf/nginx.conf:17 |
 | gh:luckylykkk/nnscholar-search/cloud-nginx.conf | github | ok | ok |  |  |
 | gh:jataware/beaker-notebook/docs/nginx.conf.txt | github | ok | ok |  |  |
-| gh:wednesday-solutions/react-template/app/.nginx.conf | github | ok | ok | 1 |  |
+| gh:wednesday-solutions/react-template/app/.nginx.conf | github | ok | ok |  |  |
 | gh:react-boilerplate/site/app/.nginx.conf | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
 | gh:ansari-project/ansari-frontend/nginx.conf.sample | github | — | — |  | (nginx: [emerg] directive "server_name" is not terminated by ";" in <sandbox>/con) |
 | gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in | github | ok | ok | 2 |  |
@@ -147,7 +143,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:yunzhu-li/multiplayer-snake/docker-nginx.conf | github | ok | ok |  |  |
 | gh:legendsort/TackleAI/nginx.conf.txt | github | ok | ok |  |  |
 | gh:jsjfai/AgentDNS-Node/nginx.conf.example | github | ok | ok | 1 |  |
-| gh:nocomp/scribe/nginx.conf.example | github | ok | ok | 1 |  |
+| gh:nocomp/scribe/nginx.conf.example | github | ok | ok |  |  |
 | gh:Apress/adv-microservices/ch4-nginx.conf | github | ok | ok |  |  |
 | gh:gsw945/wechat-demo4dev/app-nginx.conf | github | ok | ok |  |  |
 | gh:backupify/yard-server/yard-nginx.conf | github | ok | ok |  |  |
@@ -164,7 +160,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:brick-family/brick/nginx.config | github | ok | ok |  |  |
 | gh:bakery/openmic/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:O-C-R/intotheokavango/nginx.conf.smp | github | ok | ok |  |  |
-| gh:ocftw/OpenGovReport14-16/nginx.config | github | ok | ok | 1 |  |
+| gh:ocftw/OpenGovReport14-16/nginx.config | github | ok | ok |  |  |
 | gh:TortugaPower/bookplayer-api/nginx.config | github | ok | ok |  |  |
 | gh:amoeba/treestats.net/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf | github | ok | ok | 2 |  |
@@ -205,7 +201,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:limingxinleo/phalcon-unit-test/swoole.nginx.conf | github | ok | ok |  |  |
 | gh:TautvydasDerzinskas/Thingport/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:nicholas-b-carter/progressive-react/app/.nginx.conf | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
-| gh:yashab-cyber/metasploit-ai/docker/nginx.conf | github | ok | ok | 2 |  |
+| gh:yashab-cyber/metasploit-ai/docker/nginx.conf | github | ok | ok |  |  |
 | gh:Ngugi1/wallacepos/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:bleemeo/squirreldb/examples/squirreldb_ha/nginx.conf | github | ok | ok |  |  |
 | gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt | github | ok | FAIL |  | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
@@ -232,17 +228,17 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:haziqq247/django/nginx.conf.micro | github | ok | ok |  |  |
 | gh:redpower5x5/gomoku/docker-nginx.conf | github | ok | ok |  |  |
 | gh:YunoHost-Apps/rspamdui_ynh/conf/nginx.conf | github | ok | ok |  |  |
-| gh:deft1991/watchman/docker/proxy/nginx.conf | github | ok | ok | 3 |  |
-| gh:SiddOnKeys/react-temp-wednesday/app/.nginx.conf | github | ok | ok | 1 |  |
-| gh:tusharanekardev/react-template/app/.nginx.conf | github | ok | ok | 1 |  |
-| gh:apurv-wednesday/react-template/app/.nginx.conf | github | ok | ok | 1 |  |
+| gh:deft1991/watchman/docker/proxy/nginx.conf | github | ok | ok | 1 |  |
+| gh:SiddOnKeys/react-temp-wednesday/app/.nginx.conf | github | ok | ok |  |  |
+| gh:tusharanekardev/react-template/app/.nginx.conf | github | ok | ok |  |  |
+| gh:apurv-wednesday/react-template/app/.nginx.conf | github | ok | ok |  |  |
 | gh:notTanveer/sp-cli/dev/nginx.conf.in | github | — | — |  | (nginx: [emerg] directive "root" is not terminated by ";" in <sandbox>/conf/nginx) |
 | gh:josuemontano/minio-dokku/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:guilhermewebdev/stock/server/proxy/prod/nginx.conf | github | ok | ok |  |  |
-| gh:vkresch/pdftoxrechnung/nginx/nginx.conf | github | ok | ok | 1 |  |
+| gh:vkresch/pdftoxrechnung/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:thuongtruong109/flashot/nginx.conf | github | ok | ok |  |  |
 | gh:betarixm/poka-roulette/nginx.conf | github | ok | ok |  |  |
-| gh:hatanaca/quick-filler-test/nginx.conf | github | ok | ok | 2 |  |
+| gh:hatanaca/quick-filler-test/nginx.conf | github | ok | ok |  |  |
 | gh:Ecalose/ocr/nginx.conf | github | ok | ok |  |  |
 | gh:chelebyy/link-manager/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:sepep-pmsp/api_observasampa/nginx/nginx.conf | github | ok | ok | 1 |  |
@@ -269,7 +265,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | ok | 1 |  |
 | gh:Amitkushwaha328/CivicSense-AI/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:zumassh/foodgram-st/infra/nginx.conf | github | ok | ok |  |  |
-| gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | ok | 2 |  |
+| gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:Kwon9302/LetsGoToWork/nginx/nginx.conf | github | ok | ok | 1 |  |
 | gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:c2-07/postOffice/nginx/nginx.conf | github | ok | ok |  |  |
@@ -318,7 +314,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:SangHyunGil/KonerFrontEnd/nginx.conf | github | ok | ok |  |  |
 | gh:vicaqu/gp1f5a14/nginx.conf | github | ok | ok |  |  |
 | gh:rizkikasim/HelloProject-Muhamad-Rizki-Kasim_1303220030/nginx.conf | github | ok | ok |  |  |
-| gh:kayab23/Base_Costos_PWA/nginx.conf | github | ok | ok | 1 |  |
+| gh:kayab23/Base_Costos_PWA/nginx.conf | github | ok | ok |  |  |
 | gh:NikMassV/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:Ermuk-code/arenda-site/nginx.conf | github | ok | ok |  |  |
 | gh:ksanyok/mailforge/docker/web/nginx.conf | github | ok | ok |  |  |
@@ -337,7 +333,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:mesanyaa/finance_manager/client/nginx.conf | github | ok | ok |  |  |
 | gh:ABCall-Project/abcall-payment-api/docker/nginx.conf | github | ok | ok |  |  |
 | gh:rahualrai/howard-safe/nginx.conf | github | ok | ok |  |  |
-| gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf | github | ok | ok | 3 |  |
+| gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf | github | ok | ok | 1 |  |
 | gh:franjavi-upct-es/SafeStream-AI/services/dashboard/nginx.conf | github | ok | ok |  |  |
 | gh:Lucasgarciamdz/reminders_app/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:tesfandiari1/LLM-txt/frontend/nginx.conf | github | ok | ok | 1 |  |
