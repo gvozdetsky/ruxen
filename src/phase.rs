@@ -1035,9 +1035,14 @@ fn process_with_meta_inner(
         let req = req_now.as_ref().unwrap_or(req_in);
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
+        // A jump to a named location keeps `valid_unparsed_uri`
+        // (ngx_http_named_location); a redirect to a URI clears it.
         let internal_request = !refusing || hop > 0;
         if internal_request {
-            rewrite_state.unparsed_uri = false;
+            rewrite_state.internal = true;
+            if named_target.is_none() {
+                rewrite_state.unparsed_uri = false;
+            }
         }
         let mut loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
