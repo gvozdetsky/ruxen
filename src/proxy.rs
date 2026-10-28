@@ -374,6 +374,11 @@ async fn write_request_parts(
     send_timeout: Duration,
 ) -> Option<std::io::Result<()>> {
     let mut parts = RequestParts::new(head, body);
+    if let UpstreamIo::Plain(sock) = stream
+        && crate::worker::driver() == crate::worker::Driver::IoUring
+    {
+        return send_parts_now(sock, parts, send_timeout).await;
+    }
     while parts.len() > 0 {
         let (res, returned) = timeout(
             send_timeout,
@@ -387,6 +392,49 @@ async fn write_request_parts(
             Ok(n) => parts.advance(n),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(()))
+}
+
+/// `write_request_parts` on plain TCP under io_uring: `sendmsg` now, while
+/// a body just read is in the cache, waiting only when the socket is full
+/// (#757, as `write_all_now`).
+async fn send_parts_now(
+    sock: &monoio::net::TcpStream,
+    mut parts: RequestParts,
+    send_timeout: Duration,
+) -> Option<std::io::Result<()>> {
+    use std::os::unix::io::AsRawFd;
+    while parts.len() > 0 {
+        // SAFETY: a msghdr over `parts`' iovecs, which point into its live
+        // `head` and `body`.
+        let n = unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = parts.iov.as_mut_ptr();
+            msg.msg_iovlen = 2;
+            libc::sendmsg(
+                sock.as_raw_fd(),
+                &msg,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n > 0 {
+            parts.advance(n as usize);
+            continue;
+        }
+        if n == 0 {
+            return Some(Err(std::io::ErrorKind::WriteZero.into()));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if let Err(e) = timeout(send_timeout, sock.writable(false)).await.ok()? {
+                    return Some(Err(e));
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return Some(Err(e)),
         }
     }
     Some(Ok(()))

@@ -629,6 +629,26 @@ async fn write_response_paced<S: ConnIo>(
     }
 }
 
+/// The next request's first bytes if they are already in the socket after
+/// a body read up to its end, as nginx's keep-alive handler reads at once
+/// when the last read filled its buffer (`rev->ready`). A request queued
+/// there is read while it is in the cache, not after a trip through the
+/// ring (#757). `None`: wait in `idle_read`.
+#[inline(never)]
+fn read_queued<S: ConnIo>(
+    stream: &mut S,
+    buf: &mut [u8],
+    state: &RuntimeState,
+) -> Option<IdleRead> {
+    if state.is_shutting_down() {
+        return None;
+    }
+    match stream.read_queued(buf)? {
+        Ok(n) if n > 0 => Some(IdleRead::Read(n)),
+        _ => Some(IdleRead::Close),
+    }
+}
+
 /// A read returns its `Vec` with the length set to the bytes it holds
 /// (monoio's `IoBufMut::set_init` on a `Vec`), so after a 27-byte request
 /// `buf` was 27 bytes long, and the next, longer head on the connection
@@ -4067,6 +4087,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // keep-alive ones; client_header_timeout bounds the wait. A connection
     // an old worker accepted just before it stopped is served, not reset.
     let mut fresh = true;
+    // The last request's body was read from the socket, up to its end: the
+    // next request may be queued behind it (`read_queued`).
+    let mut body_read = false;
 
     // Per-connection scratch buffers — allocated once and reused across
     // every request on this connection. `mem::take` during `write_all`
@@ -4117,16 +4140,26 @@ pub(crate) async fn handle<S: ConnIo>(
     'idle: loop {
         conn_stats.set(super::stats::Phase::Waiting);
         let (buf_ptr, buf_len) = (buf.as_ptr(), buf.len());
-        let (next, returned) = stream
-            .idle_read(
-                std::mem::take(&mut *buf),
-                state,
-                keepalive_idle_timeout,
-                std::mem::take(&mut fresh),
-                &mut timers,
-            )
-            .await;
-        *buf = returned;
+        let next = match std::mem::take(&mut body_read) {
+            true => read_queued(stream, buf, state),
+            false => None,
+        };
+        let next = match next {
+            Some(next) => next,
+            None => {
+                let (next, returned) = stream
+                    .idle_read(
+                        std::mem::take(&mut *buf),
+                        state,
+                        keepalive_idle_timeout,
+                        std::mem::take(&mut fresh),
+                        &mut timers,
+                    )
+                    .await;
+                *buf = returned;
+                next
+            }
+        };
         let mut filled: usize = match next {
             IdleRead::Close => return,
             IdleRead::Ready => 0,
@@ -4668,8 +4701,10 @@ pub(crate) async fn handle<S: ConnIo>(
                                 let take = (already as u64).min(cl) as usize;
                                 if discard_body {
                                     if cl > take as u64 {
-                                        pending_discard =
-                                            Some(PendingDiscard::Length(cl - take as u64));
+                                        let rest = stream.discard_queued(cl - take as u64);
+                                        if rest > 0 {
+                                            pending_discard = Some(PendingDiscard::Length(rest));
+                                        }
                                     }
                                     break 'read (take, cl);
                                 }
@@ -4714,7 +4749,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         let Some((res, returned)) = with_timeout(
                                             timers.io.as_mut(),
                                             body_timeout,
-                                            stream.read(slice),
+                                            stream.read_now(slice),
                                         )
                                         .await
                                         else {
@@ -4796,6 +4831,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         } else {
                             (0, 0)
                         };
+                        body_read = request_body_len > body_in_buf as u64;
                         // Over the limit: big enough for the location's check.
                         let body_len = if body_too_large {
                             request_body_len.max(max_body.saturating_add(1))
