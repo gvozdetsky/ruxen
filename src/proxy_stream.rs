@@ -425,10 +425,9 @@ fn finish(
     }
     let s = *s;
     return_read_buf(s.read_buf);
-    if end.complete
-        && !extra
-        && let Some(pool) = s.pool
-    {
+    if !end.complete || extra {
+        // Closed as it is.
+    } else if let Some(pool) = s.pool {
         upstream::pool_release(
             pool.upstream,
             pool.peer_idx,
@@ -441,6 +440,9 @@ fn finish(
                 slot: s.slot,
             },
         );
+    } else if !matches!(s.framing, StreamFraming::Close) {
+        // A close-delimited body ended at the upstream's close already.
+        upstream::close_after_peer(s.upstream, s.slot);
     }
     (end, head)
 }

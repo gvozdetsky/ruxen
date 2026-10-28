@@ -867,6 +867,46 @@ impl Drop for LeasedPeer {
     }
 }
 
+/// How long a finished upstream connection waits for the upstream's close.
+const PEER_CLOSE_WAIT: Duration = Duration::from_millis(200);
+
+/// Close an upstream connection whose response was read in full and that
+/// isn't kept, after the upstream closes its end (#249): the side that
+/// closes first holds the TIME_WAIT, and on ours it holds an ephemeral
+/// port. A loopback upstream answering ~30k new connections a second
+/// then runs the port range out, and every connect() searches it. Under
+/// io_uring the response is often read before the upstream's FIN is out.
+pub(crate) fn close_after_peer(
+    stream: crate::upstream_io::UpstreamIo,
+    slot: crate::worker::UpstreamSlot,
+) {
+    // TLS ends with close_notify; it isn't worth waiting for.
+    let crate::upstream_io::UpstreamIo::Plain(mut stream) = stream else {
+        return;
+    };
+    // Mostly the FIN is in already: then no task.
+    let mut byte = 0u8;
+    // SAFETY: a one-byte read into `byte` from the stream's own fd.
+    let n = unsafe {
+        libc::recv(
+            std::os::fd::AsRawFd::as_raw_fd(&stream),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+        return;
+    }
+    monoio::spawn(async move {
+        use monoio::io::AsyncReadRent;
+        let read = stream.read(Vec::with_capacity(1));
+        let _ = crate::worker::lazy_timeout(PEER_CLOSE_WAIT, read).await;
+        drop(stream);
+        drop(slot);
+    });
+}
+
 /// One pooled upstream connection awaiting reuse. The stream is the raw
 /// monoio handle; the metadata fields drive eviction at take-time.
 pub struct PooledConn {
