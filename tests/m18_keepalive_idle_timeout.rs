@@ -42,32 +42,31 @@ fn unique_dir() -> PathBuf {
 }
 
 fn spawn_server() -> (ServerGuard, u16) {
+    spawn_with(
+        r#"
+  server {
+    listen 127.0.0.1:PORT;
+
+    location = /short {
+      keepalive_timeout 100ms;
+      return 200 "short";
+    }
+
+    location = /none {
+      return 200 "none";
+    }
+  }
+"#,
+    )
+}
+
+/// ruxen with this `http` block body, `PORT` its port.
+fn spawn_with(http: &str) -> (ServerGuard, u16) {
     let (port, _lock) = pick_port();
     let dir = unique_dir();
     let conf_path = dir.join("ruxen.conf");
-    std::fs::write(
-        &conf_path,
-        format!(
-            r#"
-events {{ }}
-http {{
-  server {{
-    listen 127.0.0.1:{port};
-
-    location = /short {{
-      keepalive_timeout 100ms;
-      return 200 "short";
-    }}
-
-    location = /none {{
-      return 200 "none";
-    }}
-  }}
-}}
-"#
-        ),
-    )
-    .unwrap();
+    let http = http.replace("PORT", &port.to_string());
+    std::fs::write(&conf_path, format!("events {{ }}\nhttp {{\n{http}\n}}\n")).unwrap();
 
     let pid_file = dir.join("ruxen.pid");
     let child = Command::new(env!("CARGO_BIN_EXE_ruxen"))
@@ -191,4 +190,81 @@ fn no_keepalive_timeout_still_allows_connection_reuse() {
     let second = read_one_response(&mut s);
     assert_eq!(status_line(&second), "HTTP/1.1 200 OK");
     assert_eq!(header_value(&second, "Connection"), Some("close"));
+}
+
+/// Seconds until the server closes `s`, at most `limit`.
+fn closed_within(s: &mut TcpStream, limit: Duration) -> Option<Duration> {
+    let start = std::time::Instant::now();
+    s.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut tmp = [0u8; 4096];
+    while start.elapsed() < limit {
+        match s.read(&mut tmp) {
+            Ok(0) => return Some(start.elapsed()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Some(start.elapsed());
+            }
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+/// A server-level `return` answers before any location: the server's
+/// keepalive_timeout bounds the wait after it, 0 closes (#773).
+#[test]
+fn server_level_return_uses_the_servers_keepalive_timeout() {
+    let (_guard, port) = spawn_with(
+        r#"
+  server { listen 127.0.0.1:PORT; keepalive_timeout 300ms; return 200 "srv"; }
+"#,
+    );
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let first = read_one_response(&mut s);
+    assert_eq!(status_line(&first), "HTTP/1.1 200 OK");
+    let closed = closed_within(&mut s, Duration::from_secs(5));
+    assert!(closed.is_some(), "idle connection still open after 5 s");
+
+    let (_guard, port) = spawn_with(
+        r#"
+  server {
+    listen 127.0.0.1:PORT;
+    keepalive_timeout 0;
+    return 200 "srv";
+    location / { keepalive_timeout 10s; }
+  }
+"#,
+    );
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let first = read_one_response(&mut s);
+    assert_eq!(status_line(&first), "HTTP/1.1 200 OK");
+    let closed = closed_within(&mut s, Duration::from_secs(2));
+    assert!(closed.is_some(), "keepalive_timeout 0 kept the connection");
+}
+
+/// HTTP/2: until its first stream, a connection gets client_header_timeout,
+/// however long keepalive_timeout is (ngx_http_v2_init).
+#[test]
+fn http2_without_streams_is_closed_after_client_header_timeout() {
+    let (_guard, port) = spawn_with(
+        r#"
+  http2 on;
+  client_header_timeout 500ms;
+  keepalive_timeout 1h;
+  server { listen 127.0.0.1:PORT; return 200 "srv"; }
+"#,
+    );
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // The preface and an empty SETTINGS frame.
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+        .unwrap();
+    let closed = closed_within(&mut s, Duration::from_secs(10));
+    assert!(closed.is_some(), "h2 connection without streams still open");
 }
