@@ -105,6 +105,9 @@ fn setup(name: &str) -> Setup {
                location /vary/ {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
                  proxy_cache_valid 1m; }}\n\
                location @fallback {{ return 403; }}\n\
+               location /nch/ {{ proxy_pass http://127.0.0.1:{backend}/; proxy_cache one;\n\
+                 proxy_cache_valid 1m; proxy_cache_convert_head off;\n\
+                 proxy_cache_key $request_uri; }}\n\
              }}\n\
              server {{ listen 127.0.0.1:{backend}; root {d}/html;\n\
                location /cc {{ add_header Cache-Control no-store; }}\n\
@@ -177,6 +180,34 @@ fn m116_store_hit_bypass_and_errors() {
     assert_eq!((status_of(&r), body_of(&r)), ("", "TWO"), "{r}");
     let r = get(s.port, "/var/t.txt?c=nope");
     assert!(r.starts_with("HTTP/1.1 500"), "{r}");
+}
+
+/// `proxy_cache_convert_head off`: a HEAD goes up as a HEAD and its answer
+/// is stored, as nginx stores it. A GET then hits the head without its
+/// body, and the connection closes rather than leave the client waiting
+/// for it (nginx keeps it; proxy_cache_convert_head.t 3–4).
+#[test]
+fn m116_head_answer_is_stored_without_convert_head() {
+    let s = setup("convert-head-off");
+    std::fs::write(s.dir.join("html/t.html"), "SEE-THIS").unwrap();
+    let _server = start(&s.dir.join("nginx.conf"));
+    let head = "HEAD /nch/t.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let r = request(s.port, head);
+    assert_eq!(status_of(&r), "MISS", "{r}");
+    let r = request(s.port, head);
+    assert_eq!(status_of(&r), "HIT", "{r}");
+    assert!(r.contains("\r\nContent-Length: 8\r\n"), "{r}");
+    // A keep-alive GET: the head, no body, then the close.
+    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(b"GET /nch/t.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).unwrap();
+    let r = String::from_utf8_lossy(&out);
+    assert_eq!(status_of(&r), "HIT", "{r}");
+    assert!(r.contains("\r\nConnection: close\r\n"), "{r}");
+    assert_eq!(body_of(&r), "", "{r}");
 }
 
 #[test]

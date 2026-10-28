@@ -2344,9 +2344,9 @@ async fn attempt(
                 vary: Vec::new(),
                 client_head_len,
             })
-        } else if cache.store && !upstream_head {
-            // A HEAD's answer has no body to store (proxy_cache_convert_head
-            // off): a GET hitting it would get none.
+        } else if cache.store {
+            // A HEAD's answer (proxy_cache_convert_head off) is stored
+            // without a body, as nginx stores it (`cached_response`).
             storable_response(plan, &accum[..head_end], status_code, client_head_len)
         } else {
             None
@@ -2936,6 +2936,9 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
         &mut report.range_allow,
     );
     if !body_has_content || matches!(plan.method, Method::Head) || entry.body_len() == 0 {
+        if body_has_content && entry.body_len() == 0 && !matches!(plan.method, Method::Head) {
+            short_cached_body(&mut out);
+        }
         return Response::Owned(out);
     }
     // A small body came with the header; a larger one is sent from the
@@ -2947,6 +2950,22 @@ fn cached_response(plan: &ProxyPlan, hit: CacheHit, report: &mut ProxyReport) ->
     Response::File {
         headers: out,
         body: entry.into_file_body(),
+    }
+}
+
+/// A HEAD's answer stored without its body (`proxy_cache_convert_head
+/// off`), hit by another method: nginx sends its `Content-Length` and no
+/// body. So does ruxen, then closes, so the client doesn't take the next
+/// response for the body.
+#[cold]
+#[inline(never)]
+fn short_cached_body(head: &mut Vec<u8>) {
+    let short = crate::proxy_cache::header_lines(head).any(|(name, value)| {
+        name.eq_ignore_ascii_case(b"content-length") && value.trim_ascii() != b"0"
+    });
+    if short && head.ends_with(b"\r\n\r\n") {
+        head.truncate(head.len() - 2);
+        head.extend_from_slice(b"Connection: close\r\n\r\n");
     }
 }
 
