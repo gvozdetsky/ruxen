@@ -27,6 +27,7 @@ mod file;
 mod fs_resolve;
 mod http;
 mod http_date;
+mod ktls;
 mod ocsp;
 mod phase;
 mod privileges;

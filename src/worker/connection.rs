@@ -400,28 +400,112 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     /// `EPOLLRDHUP` does. What the stream and the socket hold stays for
     /// the next read.
     async fn peer_closed(&self) {
-        use std::os::unix::io::AsRawFd;
-        let io = self.io();
-        loop {
-            if io.readable(false).await.is_err() {
-                return;
-            }
-            let mut fd = libc::pollfd {
-                fd: io.as_raw_fd(),
-                events: libc::POLLIN | libc::POLLRDHUP,
-                revents: 0,
+        fin_behind_records(self.io()).await
+    }
+}
+
+/// `peer_closed` of a TLS connection: the FIN on its socket.
+async fn fin_behind_records(io: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        if io.readable(false).await.is_err() {
+            return;
+        }
+        let mut fd = libc::pollfd {
+            fd: io.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: one pollfd of our own; a zero timeout doesn't wait.
+        let n = unsafe { libc::poll(&mut fd, 1, 0) };
+        if n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+            return;
+        }
+        if n != 0 {
+            // Bytes and no FIN yet: the readiness wait would complete
+            // at once again, so look again a while later.
+            monoio::time::sleep(PEER_RECHECK).await;
+        }
+    }
+}
+
+/// A connection on kernel TLS (#673): the socket takes plaintext and
+/// `sendfile`, as plain TCP does; what rustls decrypted before the switch
+/// is read first.
+impl ConnIo for crate::ktls::KtlsStream {
+    async fn idle_read(
+        &mut self,
+        mut buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: IdleLimits,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        if self.has_buffered_input() {
+            // As `read_first_or_shutdown`: into `buf[..buf.len()]`.
+            // SAFETY: `buf` holds `len` initialized bytes to overwrite.
+            let n = unsafe { self.take_into(buf.as_mut_ptr(), buf.len()) };
+            let next = if n == 0 {
+                IdleRead::Close
+            } else {
+                IdleRead::Read(n)
             };
-            // SAFETY: one pollfd of our own; a zero timeout doesn't wait.
-            let n = unsafe { libc::poll(&mut fd, 1, 0) };
-            if n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
-                return;
-            }
-            if n != 0 {
-                // Bytes and no FIN yet: the readiness wait would complete
-                // at once again, so look again a while later.
-                monoio::time::sleep(PEER_RECHECK).await;
+            return (next, buf);
+        }
+        // Our KeyUpdate when due; at the record limit without one, closed.
+        if let Err(e) = self.ready_to_write()
+            && e.kind() != std::io::ErrorKind::WouldBlock
+        {
+            return (IdleRead::Close, buf);
+        }
+        use monoio::buf::IoBufMut;
+        loop {
+            let len = buf.len();
+            // A record other than data fails the read: a close_notify
+            // closes, a KeyUpdate is taken and the wait goes on.
+            let (next, returned) = read_first_or_shutdown(
+                self.io_mut(),
+                buf.slice_mut(0..len),
+                state,
+                idle,
+                fresh,
+                timers,
+            )
+            .await;
+            let Some(returned) = returned else {
+                return (next, Vec::new());
+            };
+            buf = returned.into_inner();
+            if !matches!(next, IdleRead::Close) || !self.idle_control_record() {
+                return (next, buf);
             }
         }
+    }
+
+    async fn idle_wait(
+        &self,
+        state: &RuntimeState,
+        idle: IdleLimits,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> bool {
+        if self.has_buffered_input() {
+            return fresh || !state.is_shutting_down();
+        }
+        wait_readable_or_shutdown(self.io(), state, idle, fresh, timers).await
+    }
+
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.io().as_raw_fd())
+    }
+
+    async fn wait_writable(&self) -> std::io::Result<()> {
+        self.io().writable(false).await
+    }
+
+    async fn peer_closed(&self) {
+        fin_behind_records(self.io()).await
     }
 }
 
@@ -632,7 +716,7 @@ const SENDFILE_MAX_CHUNK: usize = 2 * 1024 * 1024;
 ///
 /// `aio`: each `sendfile` runs on that pool (`sendfile_on_pool`).
 pub(crate) async fn send_head_and_file<S: ConnIo>(
-    stream: &S,
+    stream: &mut S,
     nonblocking: &mut bool,
     head: &[u8],
     body: phase::FileBody,
@@ -641,6 +725,18 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
     aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<(), u64> {
     use std::os::unix::io::AsRawFd;
+    if body.parts.is_some() {
+        return Box::pin(send_head_and_parts(
+            stream,
+            nonblocking,
+            head,
+            body,
+            timer,
+            send_timeout,
+            aio,
+        ))
+        .await;
+    }
     let Some(sock) = stream.sendfile_fd() else {
         return Err(0);
     };
@@ -846,6 +942,58 @@ async fn read_at_on_pool(
     .await?;
     *buf = returned;
     res
+}
+
+/// `send_head_and_file` for a multipart body (#414): each part's header
+/// and range as one head and file, the response head before the first,
+/// then the closing boundary, sent without `MSG_MORE` so it isn't held.
+/// Each part gets a `dup` of the fd, which `send_head_and_file` closes.
+#[cold]
+async fn send_head_and_parts<S: ConnIo>(
+    stream: &mut S,
+    nonblocking: &mut bool,
+    head: &[u8],
+    body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+    aio: Option<&'static crate::aio::ThreadPool>,
+) -> Result<(), u64> {
+    let phase::FileParts { parts, trailer } = *body.parts.expect("multipart body");
+    let mut sent = 0u64;
+    let mut first = Some(head);
+    for (part, offset, len) in parts {
+        let lead = match first.take() {
+            Some(head) => [head, &part].concat(),
+            None => part,
+        };
+        let fd = body.fd.try_clone().map_err(|_| sent)?;
+        let range = phase::FileBody {
+            fd,
+            offset,
+            len,
+            parts: None,
+        };
+        send_head_and_file(
+            stream,
+            nonblocking,
+            &lead,
+            range,
+            timer.as_mut(),
+            send_timeout,
+            aio,
+        )
+        .await
+        .map_err(|n| sent + n)?;
+        sent += lead.len() as u64 + len;
+    }
+    let len = trailer.len();
+    match write_all_now(stream, trailer, len, timer, send_timeout)
+        .await
+        .0
+    {
+        Ok(()) => Ok(()),
+        Err(n) => Err(sent + n as u64),
+    }
 }
 
 /// A keep-alive wait's limits: `timeout` ends it (`None`: no limit), and
@@ -1329,6 +1477,9 @@ pub(crate) async fn stream_file<S: ConnIo>(
     mut pacer: Option<&mut Pacer>,
     aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<(), u64> {
+    if body.parts.is_some() {
+        return Box::pin(stream_parts(stream, body, timer, send_timeout, pacer, aio)).await;
+    }
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
     // duplicating the fd. Dropping `file` at the end closes the fd.
@@ -1383,6 +1534,64 @@ pub(crate) async fn stream_file<S: ConnIo>(
             return Err(body.len - remaining + n as u64);
         }
         remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// `stream_file` for a multipart body (#414): each part's header, its
+/// range (through `stream_file`, on a `dup` of the fd), then the closing
+/// boundary.
+#[cold]
+async fn stream_parts<S: ConnIo>(
+    stream: &mut S,
+    body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+    mut pacer: Option<&mut Pacer>,
+    aio: Option<&'static crate::aio::ThreadPool>,
+) -> Result<(), u64> {
+    let phase::FileParts { parts, trailer } = *body.parts.expect("multipart body");
+    let mut sent = 0u64;
+    let pieces = parts
+        .into_iter()
+        .map(|(part, offset, len)| (part, Some((offset, len))))
+        .chain(std::iter::once((trailer, None)));
+    for (bytes, range) in pieces {
+        let n = bytes.len();
+        let res = match pacer.as_deref_mut() {
+            Some(pacer) => {
+                write_all_paced(stream, bytes, n, pacer, timer.as_mut(), send_timeout)
+                    .await
+                    .0
+            }
+            None => {
+                write_all_now(stream, bytes, n, timer.as_mut(), send_timeout)
+                    .await
+                    .0
+            }
+        };
+        res.map_err(|k| sent + k as u64)?;
+        sent += n as u64;
+        let Some((offset, len)) = range else {
+            continue;
+        };
+        let range = phase::FileBody {
+            fd: body.fd.try_clone().map_err(|_| sent)?,
+            offset,
+            len,
+            parts: None,
+        };
+        stream_file(
+            stream,
+            range,
+            timer.as_mut(),
+            send_timeout,
+            pacer.as_deref_mut(),
+            aio,
+        )
+        .await
+        .map_err(|k| sent + k)?;
+        sent += len;
     }
     Ok(())
 }

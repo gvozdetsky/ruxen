@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 201 implemented, 19 accepted with a difference, 68 accepted with no effect, 0 refused, 276 unknown.
+Of 564 directives: 202 implemented, 18 accepted with a difference, 68 accepted with no effect, 0 refused, 276 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -623,7 +623,7 @@ Not supported: `slice`.
 | `ssl_stapling_responder` | yes | http, server |  |
 | `ssl_stapling_verify` | yes | http, server |  |
 | `ssl_early_data` | accepted, differs | http, server | TLS 1.3 early data is not accepted |
-| `ssl_conf_command` | accepted, differs | http, server | OpenSSL commands are not applied: ruxen's TLS is rustls |
+| `ssl_conf_command` | yes | http, server |  |
 | `ssl_reject_handshake` | yes | http, server |  |
 
 ## http_stub_status

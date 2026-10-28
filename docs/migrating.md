@@ -258,10 +258,15 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
 
 ### `ssl_conf_command`
 
-- **ruxen:** its TLS is rustls; OpenSSL commands aren't applied.
-- **Do:** check what the command set. `Options KTLS`: kernel TLS is [#673]
-  (open). `Ciphersuites`: rustls's TLS 1.3 suites are AES-GCM and
-  ChaCha20-Poly1305.
+- **ruxen:** its TLS is rustls; OpenSSL commands aren't applied, except
+  `Options KTLS` (and `-KTLS`): as in nginx, the kernel then encrypts the
+  records after the handshake, and `sendfile` works over TLS. It needs the
+  `tls` kernel module (`modprobe tls`; ruxen started as root loads it);
+  without it ruxen warns at startup and serves TLS in userspace. TLS 1.3
+  key updates need Linux 6.14 or later; on older kernels a client's
+  KeyUpdate closes a kTLS connection.
+- **Do:** check what the other commands set. `Ciphersuites`: rustls's
+  TLS 1.3 suites are AES-GCM and ChaCha20-Poly1305.
 
 ### `ssi`
 
@@ -454,7 +459,6 @@ start without it.
 [#596]: https://github.com/gvozdetsky/ruxen/issues/596
 [#597]: https://github.com/gvozdetsky/ruxen/issues/597
 [#599]: https://github.com/gvozdetsky/ruxen/issues/599
-[#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
 [#764]: https://github.com/gvozdetsky/ruxen/issues/764
 [#774]: https://github.com/gvozdetsky/ruxen/issues/774
