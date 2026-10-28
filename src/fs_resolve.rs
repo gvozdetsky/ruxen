@@ -275,6 +275,30 @@ fn open_failed(root: &PreparedRoot, rel: &[u8], e: std::io::Error) -> Outcome {
     io_to_outcome(e)
 }
 
+/// nginx's index module, testing the directory: the line names the first
+/// index file (ngx_http_index_test_dir restores the cut path). Only the
+/// first entry can have got here: an absolute one redirects.
+#[cold]
+fn index_dir_failed(
+    root: &PreparedRoot,
+    fs_path: &Path,
+    render_ctx: &RenderCtx<'_>,
+    e: &std::io::Error,
+) {
+    let mut path = fs_path.to_path_buf();
+    if let Some(name) = root.index.first() {
+        path.push(std::ffi::OsStr::from_bytes(&render_index(name, render_ctx)));
+    }
+    note_failed_lookup(
+        format!(
+            "\"{}\" is not found ({})",
+            path.display(),
+            crate::worker::errno_text(e)
+        ),
+        is_not_found(e),
+    );
+}
+
 /// The static+index half. Looks up `<root><url>`, deals with the four
 /// shapes a request can take: file, directory-with-slash, directory-no-
 /// slash, missing.
@@ -347,15 +371,7 @@ fn resolve_static(
             }
             Ok(_) => return Outcome::NotFound,
             Err(e) => {
-                // nginx's index module, testing the directory.
-                note_failed_lookup(
-                    format!(
-                        "\"{}\" is not found ({})",
-                        fs_path.display(),
-                        crate::worker::errno_text(&e)
-                    ),
-                    is_not_found(&e),
-                );
+                index_dir_failed(root, &fs_path, render_ctx, &e);
                 return io_to_outcome(e);
             }
         }

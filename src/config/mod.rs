@@ -33,6 +33,7 @@ mod parse_map;
 mod parse_rewrite;
 mod parse_server;
 mod parse_upstream;
+pub(crate) mod pcre;
 mod values;
 
 pub use ast::*;
