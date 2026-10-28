@@ -192,7 +192,7 @@ impl RenderCtx<'_> {
         match var {
             Variable::Uri => out.extend_from_slice(self.uri),
             Variable::RequestUri => {
-                out.extend_from_slice(phase::unparsed_uri(self.request_uri, self.request_line))
+                out.extend_from_slice(phase::request_uri(self.request_uri, self.request_line))
             }
             Variable::RequestMethod => out.extend_from_slice(self.request_method),
             Variable::Request => out.extend_from_slice(self.request_line),
