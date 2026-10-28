@@ -208,14 +208,25 @@ fn m114_no_tunnel_unless_the_client_asked() {
 /// 256 KiB each way, echoed while they are still being sent.
 #[test]
 fn m114_websocket_tunnel_over_tls() {
+    tunnel_over_tls("tls", "");
+}
+
+/// The same with kernel TLS (#673), which is userspace TLS where the `tls`
+/// module isn't loaded.
+#[test]
+fn m114_websocket_tunnel_over_ktls() {
+    tunnel_over_tls("ktls", "ssl_conf_command Options KTLS;");
+}
+
+fn tunnel_over_tls(label: &str, extra: &str) {
     use std::sync::Arc;
     let certs = common::tls::make_ca_and_leaf("localhost");
     let server_extra = format!(
-        "ssl_certificate {}; ssl_certificate_key {};",
+        "ssl_certificate {}; ssl_certificate_key {}; {extra}",
         certs.cert_path().display(),
         certs.key_path().display()
     );
-    let (_server, port) = start_with(backend(), "tls", " ssl", &server_extra);
+    let (_server, port) = start_with(backend(), label, " ssl", &server_extra);
 
     let mut roots = rustls::RootCertStore::empty();
     let ca = std::fs::read(certs.ca_path().unwrap()).unwrap();
@@ -252,7 +263,7 @@ fn m114_websocket_tunnel_over_tls() {
         s.write_all(&chunk).unwrap();
         let mut echoed = vec![0u8; chunk.len()];
         s.read_exact(&mut echoed).unwrap();
-        assert!(echoed == chunk, "round {round}");
+        assert!(echoed == chunk, "{label}: round {round}");
     }
 }
 
