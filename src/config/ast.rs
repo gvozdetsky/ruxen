@@ -384,6 +384,11 @@ pub struct ProxyCachePath {
     pub inactive_secs: u64,
     pub max_size: Option<u64>,
     pub min_free: Option<u64>,
+    /// `manager_files`, `manager_sleep`, `manager_threshold` (nginx's
+    /// 100, 50ms, 200ms when unset).
+    pub manager_files: u64,
+    pub manager_sleep_ms: u64,
+    pub manager_threshold_ms: u64,
 }
 
 /// `proxy_bind address [transparent] | off`.
@@ -579,6 +584,8 @@ pub struct HttpConfig {
     /// `stub_status` or a `$connections_*` variable appears in the config:
     /// the counters are kept.
     pub uses_stats: bool,
+    /// A location uses `ruxen_metrics` (#481).
+    pub uses_metrics: bool,
     /// http-scope `client_body_temp_path`. `None`: a private directory per
     /// process.
     pub client_body_temp_path: Option<TempPath>,
@@ -2908,6 +2915,8 @@ pub enum Handler {
     Proxy(ProxyPass),
     /// `stub_status;` — the connection and request counters (#96).
     StubStatus,
+    /// `ruxen_metrics;` — the counters in Prometheus text format (#481).
+    Metrics,
 }
 
 /// Parsed `proxy_pass` argument. nginx allows two forms:

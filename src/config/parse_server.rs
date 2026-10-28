@@ -407,7 +407,7 @@ pub(crate) fn parse_server_block(
             }
             ("root", Terminator::Semi) => {
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some(PathBuf::from(path));
+                root = Some(parse_root_path(false, path)?);
             }
             ("return", Terminator::Semi) => {
                 let (status, body) = parse_return_args(&args[1..])?;
@@ -852,13 +852,12 @@ pub(crate) fn classify_server_name(raw: &str) -> Result<Vec<ServerNameSpec>, Err
         let pattern = pcre::translate(&raw_pattern).into_owned();
         // Validate at parse time so a typo fails `nginx -t` instead of
         // crashing a worker.
-        let _ = regex::bytes::RegexBuilder::new(&pattern)
-            .case_insensitive(case_insensitive)
-            .build()
-            .map_err(|_| Error::BadValue {
+        let _ = crate::config::pcre::regex(&pattern, case_insensitive).map_err(|_| {
+            Error::BadValue {
                 what: "server_name regex",
                 got: raw.to_string(),
-            })?;
+            }
+        })?;
         return Ok(vec![ServerNameSpec::Regex {
             display: raw.to_string(),
             pattern,
@@ -1341,13 +1340,10 @@ pub(crate) fn parse_proxy_redirect(
                     None => (regex, false),
                 };
                 let translated = pcre::translate(regex);
-                regex::bytes::RegexBuilder::new(&translated)
-                    .case_insensitive(case_insensitive)
-                    .build()
-                    .map_err(|e| Error::InvalidRegex {
-                        pattern: regex.to_string(),
-                        msg: e.to_string(),
-                    })?;
+                pcre::regex(&translated, case_insensitive).map_err(|e| Error::InvalidRegex {
+                    pattern: regex.to_string(),
+                    msg: e.to_string(),
+                })?;
                 ProxyRedirectRule::Regex {
                     pattern: translated.into_owned(),
                     case_insensitive,
@@ -1405,13 +1401,10 @@ pub(crate) fn parse_proxy_cookie(
                     _ => (regex, domain),
                 };
                 let translated = pcre::translate(regex);
-                regex::bytes::RegexBuilder::new(&translated)
-                    .case_insensitive(case_insensitive)
-                    .build()
-                    .map_err(|e| Error::InvalidRegex {
-                        pattern: regex.to_string(),
-                        msg: e.to_string(),
-                    })?;
+                pcre::regex(&translated, case_insensitive).map_err(|e| Error::InvalidRegex {
+                    pattern: regex.to_string(),
+                    msg: e.to_string(),
+                })?;
                 ProxyRedirectRule::Regex {
                     pattern: translated.into_owned(),
                     case_insensitive,
@@ -1469,13 +1462,10 @@ pub(crate) fn parse_proxy_cookie_flags(
             let cookie = match cookie.strip_prefix('~') {
                 Some(regex) => {
                     let translated = pcre::translate(regex);
-                    regex::bytes::RegexBuilder::new(&translated)
-                        .case_insensitive(true)
-                        .build()
-                        .map_err(|e| Error::InvalidRegex {
-                            pattern: regex.to_string(),
-                            msg: e.to_string(),
-                        })?;
+                    pcre::regex(&translated, true).map_err(|e| Error::InvalidRegex {
+                        pattern: regex.to_string(),
+                        msg: e.to_string(),
+                    })?;
                     CookieName::Regex(translated.into_owned())
                 }
                 None => CookieName::Name(crate::config::parse_value_with_vars(cookie)?),
