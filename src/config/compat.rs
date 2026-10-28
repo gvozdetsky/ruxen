@@ -263,11 +263,6 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
         "not applied at this level (ruxen reads it in location only)",
     ),
     (
-        "proxy_buffering",
-        Some("on"),
-        "ruxen relays a response as it arrives either way (#88, #463)",
-    ),
-    (
         "proxy_request_buffering",
         Some("on"),
         "request bodies are still read whole before they are proxied (#134)",

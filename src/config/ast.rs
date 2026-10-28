@@ -274,6 +274,36 @@ pub struct ProxyConf {
     /// only `proxy_pass` with variables uses them here.
     pub resolver: Option<ResolverConf>,
     pub resolver_timeout_ms: Option<u64>,
+    /// `proxy_buffering` and its sizes (#764).
+    pub buffering: ProxyBufferingConf,
+    /// `proxy_temp_path`; unset means the http level's
+    /// `client_body_temp_path` directory.
+    pub temp_path: Option<TempPath>,
+}
+
+/// `proxy_buffering` and the sizes that go with it, each `None` until set.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProxyBufferingConf {
+    pub on: Option<bool>,
+    /// `proxy_buffers number size`.
+    pub buffers: Option<(u64, u64)>,
+    pub buffer_size: Option<u64>,
+    pub busy_buffers_size: Option<u64>,
+    pub temp_file_write_size: Option<u64>,
+    pub max_temp_file_size: Option<u64>,
+}
+
+impl ProxyBufferingConf {
+    pub(crate) fn inherit(self, parent: ProxyBufferingConf) -> ProxyBufferingConf {
+        ProxyBufferingConf {
+            on: self.on.or(parent.on),
+            buffers: self.buffers.or(parent.buffers),
+            buffer_size: self.buffer_size.or(parent.buffer_size),
+            busy_buffers_size: self.busy_buffers_size.or(parent.busy_buffers_size),
+            temp_file_write_size: self.temp_file_write_size.or(parent.temp_file_write_size),
+            max_temp_file_size: self.max_temp_file_size.or(parent.max_temp_file_size),
+        }
+    }
 }
 
 /// The `proxy_cache*` directives of one level, each `None` until set.
@@ -451,7 +481,59 @@ impl ProxyConf {
                 .or_else(|| parent.ssl_password_file.clone()),
             resolver: self.resolver.or_else(|| parent.resolver.clone()),
             resolver_timeout_ms: self.resolver_timeout_ms.or(parent.resolver_timeout_ms),
+            buffering: self.buffering.inherit(parent.buffering),
+            temp_path: self.temp_path.or_else(|| parent.temp_path.clone()),
         }
+    }
+}
+
+/// `proxy_buffering` and its sizes as a location uses them (#764).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyBuffering {
+    pub on: bool,
+    /// All of `proxy_buffers`.
+    pub buffers: u64,
+    /// `proxy_max_temp_file_size`; `0`: no temp file.
+    pub max_temp_file_size: u64,
+}
+
+impl ProxyBufferingConf {
+    /// The buffering settings, checked as ngx_http_proxy_merge_loc_conf
+    /// does (sizes default to a 4k page).
+    pub(crate) fn buffering_checked(&self) -> Result<ProxyBuffering, &'static str> {
+        const PAGE: u64 = 4096;
+        let (num, size) = self.buffers.unwrap_or((8, PAGE));
+        if num < 2 {
+            return Err("there must be at least 2 \"proxy_buffers\"");
+        }
+        let one = self.buffer_size.unwrap_or(PAGE).max(size);
+        let busy = self.busy_buffers_size.unwrap_or(2 * one);
+        if busy < one {
+            return Err(
+                "\"proxy_busy_buffers_size\" must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"",
+            );
+        }
+        if busy > (num - 1).saturating_mul(size) {
+            return Err(
+                "\"proxy_busy_buffers_size\" must be less than the size of all \"proxy_buffers\" minus one buffer",
+            );
+        }
+        if self.temp_file_write_size.unwrap_or(2 * one) < one {
+            return Err(
+                "\"proxy_temp_file_write_size\" must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"",
+            );
+        }
+        let max_temp_file_size = self.max_temp_file_size.unwrap_or(1 << 30);
+        if max_temp_file_size != 0 && max_temp_file_size < one {
+            return Err(
+                "\"proxy_max_temp_file_size\" must be equal to zero to disable temporary files usage or must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"",
+            );
+        }
+        Ok(ProxyBuffering {
+            on: self.on.unwrap_or(true),
+            buffers: num.saturating_mul(size),
+            max_temp_file_size,
+        })
     }
 }
 

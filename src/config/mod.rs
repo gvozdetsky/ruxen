@@ -1119,19 +1119,9 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "underscores_in_headers",
     "msie_padding",
     "msie_refresh",
-    // Proxy tuning knobs we don't implement yet but accept as no-ops so
-    // upstream nginx-tests configs (which inject these via TEST_GLOBALS_HTTP)
-    // load.
-    "proxy_temp_path",
     // rustls offers only strong suites, so ignoring the upstream cipher
     // list can't enable a weak one, as with ssl_ciphers (#116).
     "proxy_ssl_ciphers",
-    "proxy_temp_file_write_size",
-    "proxy_max_temp_file_size",
-    "proxy_buffering",
-    "proxy_buffers",
-    "proxy_buffer_size",
-    "proxy_busy_buffers_size",
     "proxy_request_buffering",
     // Temp directories of modules ruxen doesn't have (`fastcgi_pass` and
     // friends stay unknown), so never used. Container images' default
@@ -1561,7 +1551,6 @@ pub(crate) fn is_ignored_stmt(name: &str) -> bool {
 pub(crate) fn check_ignored_args(lx: &Lexer, args: &[String]) -> Result<(), Error> {
     compat::ignored(lx, args);
     let what = match args[0].as_str() {
-        "proxy_temp_path" => "proxy_temp_path",
         "fastcgi_temp_path" => "fastcgi_temp_path",
         "uwsgi_temp_path" => "uwsgi_temp_path",
         "scgi_temp_path" => "scgi_temp_path",

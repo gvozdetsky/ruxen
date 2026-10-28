@@ -1710,12 +1710,16 @@ fn prepare_response_rules(
             flags,
         }))
     });
+    let buffering = eff.buffering.buffering_checked()?;
     Ok(crate::arena::leak(Box::new(ProxyResponseRules {
         redirects,
         error_pages: eff.error_pages,
         recursive_error_pages: eff.recursive_error_pages,
         ignore_accel_redirect: eff.ignore_accel_redirect,
         ignore_accel_limit_rate: eff.ignore_accel_limit_rate,
+        ignore_accel_buffering: eff.ignore_accel_buffering,
+        buffering,
+        temp: eff.temp,
         limit_rate: eff
             .limit_rate
             .filter(|parts| literal_limit_rate(Some(parts)).is_none()),
@@ -1898,6 +1902,9 @@ pub(crate) struct ServerProxyDefaults {
     pub resolver: Option<&'static crate::resolver::Resolver>,
     pub resolver_timeout_ms: u64,
     pub tls: super::prepared::UpstreamTlsSettings,
+    pub buffering: crate::config::ProxyBufferingConf,
+    pub ignore_accel_buffering: bool,
+    pub temp: Option<&'static BodyTempDir>,
 }
 
 /// The cache fields of `proxy_ignore_headers` at one scope, the unset ones
@@ -1996,6 +2003,10 @@ impl ServerProxyDefaults {
             resolver_timeout_ms: conf
                 .resolver_timeout_ms
                 .unwrap_or(defaults.resolver_timeout_ms),
+            buffering: conf.buffering,
+            ignore_accel_buffering: ignores(conf.ignore_headers.as_deref(), "x-accel-buffering")
+                .unwrap_or(false),
+            temp: conf.temp_path.map(BodyTempDir::leak),
         }
     }
 }
@@ -2145,6 +2156,13 @@ pub(crate) fn resolve_proxy_effective(
         resolver_timeout_ms: location
             .resolver_timeout_ms
             .unwrap_or(server_defaults.resolver_timeout_ms),
+        buffering: location.buffering.inherit(server_defaults.buffering),
+        ignore_accel_buffering: ignores(location.ignore_headers.as_deref(), "x-accel-buffering")
+            .unwrap_or(server_defaults.ignore_accel_buffering),
+        temp: match location.temp_path {
+            Some(path) => Some(BodyTempDir::leak(path)),
+            None => server_defaults.temp,
+        },
         // Filled in by the location once its error_page list is resolved.
         error_pages: &[],
         recursive_error_pages: false,
