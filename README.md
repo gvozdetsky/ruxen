@@ -153,16 +153,20 @@ ruxen --compat -c /etc/nginx/nginx.conf
 
 ```text
 ruxen 0.2.2: checking /etc/nginx/nginx.conf
-/etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
+/etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block (FastCGI isn't in ruxen: README, Limitations)
 /etc/nginx/nginx.conf:41: differs: ssl_early_data on — TLS 1.3 early data is not accepted
 -: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#fastcgi-uwsgi-scgi-memcached
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#ssl_early_data-on
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#ssl_protocols
 ruxen does not start with this configuration: 1 unsupported, 2 behaving differently
 ```
 
 - **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
 - **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `ssi off`, is not listed.
 - **ignored:** tuning knobs with no visible effect.
+- **what to do:** the section of the migration guide, [`docs/migrating.md`](docs/migrating.md), for each kind of finding: what ruxen does instead, when it matters, what to do, and the issue that tracks it. The guide also covers running ruxen in nginx's place (systemd, `user`, reload, log rotation, containers).
 
 With nothing unsupported, the configuration is then loaded the way `-t` does it (certificates, roots, log files). The exit status is 0 when ruxen starts with the configuration. A `#N` refers to the GitHub issue that tracks the gap. `-t` errors also carry nginx's ` in file:line`.
 
@@ -432,7 +436,7 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 
 Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. `ssl_ciphers` is evaluated as OpenSSL would over the TLS 1.2 suites rustls has (all ECDHE with AES-GCM or ChaCha20-Poly1305; the weaker ones a list names don't exist here), and `ssl_prefer_server_ciphers` picks whose order counts. Accepted with a warning: `ssl_ecdh_curve` (rustls's modern groups are used).
 
-Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently. Anything else that behaves unlike nginx is a bug; please report it.
+Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently, and [`docs/migrating.md`](docs/migrating.md) says what to do about each. Anything else that behaves unlike nginx is a bug; please report it.
 
 ## Contributing
 
