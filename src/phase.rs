@@ -265,6 +265,7 @@ impl KeepaliveMeta {
             header_timeout_secs: k.header_timeout_secs,
             max_requests: k.max_requests,
             max_time_ms: k.max_time_ms,
+            min_timeout_ms: u32::try_from(k.min_timeout_ms).unwrap_or(u32::MAX),
             disable_msie6: k.disable_msie6,
             disable_safari: k.disable_safari,
         }
