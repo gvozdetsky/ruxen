@@ -208,9 +208,10 @@ fn m165_reload_starts_again_at_zero() {
     let [front, back] = common::ports::free_ports::<2>();
     let http = |extra: &str| {
         format!(
-            "server {{ listen 127.0.0.1:{back}; location / {{ return 200 \"ok\\n\"; }} }}\n\
+            "{extra}\n\
+             server {{ listen 127.0.0.1:{back}; location / {{ return 200 \"ok\\n\"; }} }}\n\
              server {{ listen 127.0.0.1:{front};\n\
-             location /metrics {{ ruxen_metrics; }}\n{extra}\n\
+             location /metrics {{ ruxen_metrics; }}\n\
              location / {{ proxy_pass http://127.0.0.1:{back}; }} }}"
         )
     };
@@ -230,23 +231,29 @@ fn m165_reload_starts_again_at_zero() {
     );
     let requests_before = value(&page, "ruxen_http_requests_total");
 
-    server.write_conf(&http("location /gen2 { return 200 \"2\\n\"; }"));
+    // An upstream only the new configuration has marks its page: for a
+    // while both generations accept, so any request may reach the old one.
+    server.write_conf(&http(&format!(
+        "upstream gen2 {{ server 127.0.0.1:{back}; }}"
+    )));
     server.hup();
-    // The first answer from the new workers
     let deadline = Instant::now() + Duration::from_secs(5);
-    // (The old ones proxy it.)
-    while !request(front, "GET", "/gen2").ends_with("\r\n\r\n2\n") {
+    let page = loop {
+        let page = scrape(front);
+        if page.contains("upstream=\"gen2\"") {
+            break page;
+        }
         assert!(Instant::now() < deadline, "the reload didn't take");
         sleep(Duration::from_millis(20));
-    }
-    let page = scrape(front);
+    };
+    // Its own response counts after the page is rendered.
     let front_labels = format!("server=\"\",listen=\"127.0.0.1:{front}\"");
     assert_eq!(
         value(
             &page,
             &format!("ruxen_server_responses_total{{{front_labels},code=\"2xx\"}}")
         ),
-        1,
+        0,
         "{page}"
     );
     assert_eq!(
