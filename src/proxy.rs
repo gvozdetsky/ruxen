@@ -3338,6 +3338,9 @@ async fn send_body_feed(
 #[cold]
 #[inline(never)]
 fn client_body_error(plan: &ProxyPlan, status: u16) -> Response {
+    if status == 408 {
+        return Response::Prebuilt(crate::worker::BODY_TIMED_OUT);
+    }
     let body = format!("{}\n", crate::http::reason_phrase(status));
     Response::Owned(crate::http::error_response_for_method(
         status,

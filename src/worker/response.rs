@@ -185,12 +185,22 @@ pub(crate) fn response_header_values_all(response: &[u8], name: &[u8]) -> Vec<Ve
 }
 
 /// A 444 without a body: nginx's NGX_HTTP_CLOSE, which closes the
-/// connection instead of answering (#397); and the 499 of a client that
-/// went away while the upstream was awaited (#136).
+/// connection instead of answering (#397); the 499 of a client that
+/// went away while the upstream was awaited (#136); and `BODY_TIMED_OUT`.
 #[inline]
 pub(crate) fn closes_unanswered(bytes: &[u8]) -> bool {
-    matches!(bytes.get(9..12), Some(b"444" | b"499")) && bytes.ends_with(b"\r\n\r\n")
+    match bytes.get(9..12) {
+        Some(b"444" | b"499") => bytes.ends_with(b"\r\n\r\n"),
+        Some(b"408") => bytes.starts_with(&BODY_TIMED_OUT[..BODY_TIMED_OUT.len() - 2]),
+        _ => false,
+    }
 }
+
+/// A body sent upstream as it came (#134) that stopped coming: nginx
+/// terminates the request on 408 (ngx_http_finalize_request), so it is
+/// never sent, logged as 408. The reason phrase tells it from an
+/// upstream's 408.
+pub(crate) const BODY_TIMED_OUT: &[u8] = b"HTTP/1.1 408 Client Body Timed Out\r\n\r\n";
 
 /// What `settle_proxy_response` hands back when the client closed while
 /// the upstream was awaited: never sent, logged as 499 (#136).

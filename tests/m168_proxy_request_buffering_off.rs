@@ -201,7 +201,8 @@ fn m168_chunked_body_is_rechunked() {
     assert!(resp.ends_with("\r\n\r\nret\n"), "{resp}");
 }
 
-/// A body that stops coming: `client_body_timeout`, a 408.
+/// A body that stops coming: `client_body_timeout`, a 408 that nginx
+/// doesn't send: the connection closes.
 #[test]
 fn m168_stalled_body_times_out() {
     let s = setup("stall");
@@ -213,8 +214,9 @@ fn m168_stalled_body_times_out() {
     let mut out = Vec::new();
     let _ = c.read_to_end(&mut out);
     let resp = String::from_utf8_lossy(&out);
-    assert!(resp.starts_with("HTTP/1.1 408 "), "{resp}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(resp, "");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(2) && waited < Duration::from_secs(6));
 }
 
 /// `proxy_request_buffering on` (the default) still reads it first.
