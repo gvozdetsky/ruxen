@@ -26,6 +26,8 @@ pub struct LimitConnZone {
     /// Keys a shard may hold at once (from the zone size).
     capacity: usize,
     shards: &'static [Shard],
+    /// Requests by `$limit_conn_status` (less one), kept with the shards.
+    pub counters: &'static super::metrics::ZoneCounters<3>,
 }
 
 /// The zones' counts, by name, for the next configuration, as for
@@ -40,6 +42,7 @@ struct Kept {
     key_text: String,
     capacity: usize,
     shards: &'static [Shard],
+    counters: &'static super::metrics::ZoneCounters<3>,
 }
 
 impl std::fmt::Debug for LimitConnZone {
@@ -76,6 +79,7 @@ impl LimitConnZone {
                 key_text,
                 capacity: k.capacity,
                 shards: k.shards,
+                counters: k.counters,
             });
         }
         let zone = LimitConnZone::new(name, key, key_text, size);
@@ -86,6 +90,7 @@ impl LimitConnZone {
             key_text: key_text.to_string(),
             capacity: zone.capacity,
             shards: zone.shards,
+            counters: zone.counters,
         });
         Ok(zone)
     }
@@ -104,6 +109,7 @@ impl LimitConnZone {
             key_text,
             capacity: entries.div_ceil(SHARDS),
             shards: Box::leak((0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect()),
+            counters: Box::leak(Box::default()),
         }
     }
 
@@ -245,18 +251,23 @@ pub(crate) fn check(
                 // ngx_http_limit_conn_cleanup_all: the counts taken so far
                 // go back now.
                 drop(held);
+                let status = if lc.dry_run {
+                    status::REJECTED_DRY_RUN
+                } else {
+                    status::REJECTED
+                };
+                limit.zone.counters.add(status as usize - 1);
                 return Verdict {
-                    status: if lc.dry_run {
-                        status::REJECTED_DRY_RUN
-                    } else {
-                        status::REJECTED
-                    },
+                    status,
                     reject: !lc.dry_run,
                     log,
                     held: Held::default(),
                 };
             }
         }
+    }
+    for (zone, _) in &held.0 {
+        zone.counters.add(status::PASSED as usize - 1);
     }
     Verdict {
         status,
@@ -367,6 +378,8 @@ mod tests {
         drop(b);
         // An empty key isn't counted.
         assert_eq!(check(&lc, |_| Vec::new()).status, 0);
+        let counted = |s: u8| lc.limits[0].zone.counters.total(s as usize - 1);
+        assert_eq!((counted(status::PASSED), counted(status::REJECTED)), (4, 1));
     }
 
     #[test]

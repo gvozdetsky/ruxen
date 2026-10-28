@@ -168,6 +168,38 @@ fn m100_dropped_body_keeps_the_connection_in_step() {
     assert!(lines[1].starts_with("/b "), "{lines:?}");
 }
 
+/// A body that came whole is dropped before the response, as nginx reads
+/// what has arrived, and the requests queued behind it are read from the
+/// socket at once (#757); with the body dropped by the read instead.
+#[test]
+fn m100_a_body_already_there_and_requests_behind_it() {
+    let (server, port) = start("there");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let body = vec![b'y'; 100 * 1024];
+    let mut all = Vec::new();
+    for path in ["/a", "/b"] {
+        all.extend_from_slice(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        all.extend_from_slice(&body);
+    }
+    all.extend_from_slice(b"GET /c HTTP/1.1\r\nHost: x\r\n\r\n");
+    s.write_all(&all).unwrap();
+    let ok = format!("HTTP/1.1 200 OK | ok {}\n", body.len());
+    assert_eq!(
+        responses(&mut s, 3),
+        [ok.clone(), ok, "HTTP/1.1 200 OK | ok \n".to_string()]
+    );
+    let lines = log_lines(&server.1.join("access.log"), 3);
+    assert!(lines[1].starts_with("/b "), "{lines:?}");
+    assert!(lines[2].starts_with("/c "), "{lines:?}");
+}
+
 #[test]
 fn m100_client_stopping_mid_body_closes_the_connection() {
     let (_server, port) = start("stop");
