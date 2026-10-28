@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 193 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 278 unknown.
+Of 564 directives: 199 implemented, 18 accepted with a difference, 71 accepted with no effect, 0 refused, 276 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -106,7 +106,7 @@ Not supported: `ssl_engine`.
 | `connection_pool_size` | accepted, no effect | any |  |
 | `request_pool_size` | accepted, no effect | any |  |
 | `client_header_timeout` | yes | any |  |
-| `client_header_buffer_size` | accepted, no effect | any |  |
+| `client_header_buffer_size` | yes | http, server |  |
 | `large_client_header_buffers` | yes | http, server |  |
 | `max_headers` | yes | http, server |  |
 | `ignore_invalid_headers` | yes | any |  |
@@ -145,7 +145,7 @@ Not supported: `ssl_engine`.
 | `limit_rate_after` | yes | http, server, location |  |
 | `keepalive_time` | yes | http, server, location, upstream |  |
 | `keepalive_timeout` | yes | http, server, location, upstream |  |
-| `keepalive_min_timeout` | no |  |  |
+| `keepalive_min_timeout` | yes | http, server, location |  |
 | `keepalive_requests` | yes | http, server, location, upstream |  |
 | `keepalive_disable` | yes | http, server, location |  |
 | `satisfy` | yes | http, server, location |  |
@@ -164,10 +164,10 @@ Not supported: `ssl_engine`.
 | `log_subrequest` | accepted, no effect | any |  |
 | `recursive_error_pages` | yes | http, server, location |  |
 | `server_tokens` | yes | http, server, location |  |
-| `if_modified_since` | accepted, differs | any | If-Modified-Since is still compared exactly |
+| `if_modified_since` | yes | http, server, location |  |
 | `max_ranges` | yes | http, server, location |  |
-| `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in location only) |
-| `etag` | accepted, differs | any | static responses still carry an ETag |
+| `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in server and location only) |
+| `etag` | yes | http, server, location |  |
 | `early_hints` | no |  |  |
 | `error_page` | yes | http, server, location |  |
 | `post_action` | yes | http, server, location |  |
@@ -342,7 +342,7 @@ Not supported: `gunzip`, `gunzip_buffers`.
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `gzip_static` | accepted, differs | any | precompressed .gz files are not served (#93) |
+| `gzip_static` | yes | http, server, location |  |
 
 ## http_headers_filter
 
@@ -423,7 +423,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_cookie_flags` | yes | http, server, location |  |
 | `proxy_store` | accepted, differs | any | proxied responses are not stored |
 | `proxy_store_access` | accepted, no effect | any |  |
-| `proxy_buffering` | accepted, differs | any | ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #88) |
+| `proxy_buffering` | accepted, differs | any | ruxen relays a response as it arrives either way (#88, #463) |
 | `proxy_request_buffering` | accepted, differs | any | request bodies are still read whole before they are proxied (#134) |
 | `proxy_ignore_client_abort` | yes | http, server, location |  |
 | `proxy_bind` | yes | http, server, location |  |
@@ -483,7 +483,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_ssl_crl` | yes | http, server, location |  |
 | `proxy_ssl_certificate` | yes | http, server, location |  |
 | `proxy_ssl_certificate_key` | yes | http, server, location |  |
-| `proxy_ssl_certificate_cache` | no |  |  |
+| `proxy_ssl_certificate_cache` | yes | http, server, location |  |
 | `proxy_ssl_password_file` | yes | http, server, location |  |
 | `proxy_ssl_conf_command` | no |  |  |
 

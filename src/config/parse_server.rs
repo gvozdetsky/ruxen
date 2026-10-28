@@ -51,6 +51,7 @@ pub(crate) fn parse_server_block(
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
+    let mut keepalive_min_timeout_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
     let mut merge_slashes: Option<bool> = None;
     let mut ignore_invalid_headers: Option<bool> = None;
@@ -154,6 +155,7 @@ pub(crate) fn parse_server_block(
                         keepalive_timeout,
                         keepalive_requests,
                         keepalive_time_ms,
+                        keepalive_min_timeout_ms,
                         keepalive_disable,
                         ssl_directives,
                         client_timeouts,
@@ -407,7 +409,7 @@ pub(crate) fn parse_server_block(
             }
             ("root", Terminator::Semi) => {
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some(PathBuf::from(path));
+                root = Some(parse_root_path(false, path)?);
             }
             ("return", Terminator::Semi) => {
                 let (status, body) = parse_return_args(&args[1..])?;
@@ -442,6 +444,12 @@ pub(crate) fn parse_server_block(
                     return Err(Error::Duplicate("keepalive_time"));
                 }
                 keepalive_time_ms = Some(parse_keepalive_time_args(&args[1..])?);
+            }
+            ("keepalive_min_timeout", Terminator::Semi) => {
+                if keepalive_min_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("keepalive_min_timeout"));
+                }
+                keepalive_min_timeout_ms = Some(parse_keepalive_min_timeout_args(&args[1..])?);
             }
             ("keepalive_disable", Terminator::Semi) => {
                 if keepalive_disable.is_some() {
@@ -726,6 +734,7 @@ pub(crate) fn parse_server_block(
                 | "keepalive_timeout"
                 | "keepalive_requests"
                 | "keepalive_time"
+                | "keepalive_min_timeout"
                 | "keepalive_disable"
                 | "ignore_invalid_headers"
                 | "underscores_in_headers"
@@ -825,41 +834,6 @@ pub(crate) fn parse_server_block(
     }
 }
 
-/// Translate PCRE `\Q...\E` literal escapes into per-character regex
-/// escapes that the `regex` crate accepts. Untouched outside the `\Q\E`
-/// blocks; an unterminated `\Q` runs to end-of-string. Mirrors the way
-/// nginx forwards `server_name ~^...$` patterns to PCRE — production
-/// configs (and `http_server_name.t`) commonly bracket literal hostnames
-/// with `\Q\E` so dots aren't misread as metacharacters.
-pub(crate) fn expand_pcre_quote_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'Q' {
-            i += 2;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'E' {
-                    i += 2;
-                    break;
-                }
-                let c = bytes[i] as char;
-                if c.is_ascii_alphanumeric() {
-                    out.push(c);
-                } else {
-                    out.push('\\');
-                    out.push(c);
-                }
-                i += 1;
-            }
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
-}
-
 /// Classify one `server_name` argument into one or more `ServerNameSpec`
 /// entries. Most names produce a single entry; `.foo.example.com` (leading
 /// dot) is shorthand for two entries — `Exact("foo.example.com")` and
@@ -886,20 +860,16 @@ pub(crate) fn classify_server_name(raw: &str) -> Result<Vec<ServerNameSpec>, Err
         if !case_insensitive && raw_pattern.bytes().any(|b| b.is_ascii_uppercase()) {
             case_insensitive = true;
         }
-        // PCRE allows `\Q...\E` literal escapes; nginx forwards regexes to
-        // PCRE so test configs use the form. Rust's `regex` crate doesn't
-        // recognize `\Q\E`, so translate to per-character escapes before
-        // compile.
-        let pattern = expand_pcre_quote_escapes(&raw_pattern);
+        // PCRE syntax `regex` reads differently (`\Q…\E`, literal `{`).
+        let pattern = pcre::translate(&raw_pattern).into_owned();
         // Validate at parse time so a typo fails `nginx -t` instead of
         // crashing a worker.
-        let _ = regex::bytes::RegexBuilder::new(&pattern)
-            .case_insensitive(case_insensitive)
-            .build()
-            .map_err(|_| Error::BadValue {
+        let _ = crate::config::pcre::regex(&pattern, case_insensitive).map_err(|_| {
+            Error::BadValue {
                 what: "server_name regex",
                 got: raw.to_string(),
-            })?;
+            }
+        })?;
         return Ok(vec![ServerNameSpec::Regex {
             display: raw.to_string(),
             pattern,
@@ -971,38 +941,62 @@ pub(crate) fn resolve_ssl_file_arg(conf_prefix: Option<&Path>, raw: &str) -> Pat
 /// ruxen doesn't load, so it has nothing to keep: the directive does
 /// nothing else, as in nginx with fixed certificate names.
 pub(crate) fn check_ssl_certificate_cache(args: &[String]) -> Result<(), Error> {
+    parse_ssl_cache_args(args, "ssl_certificate_cache").map(|_| ())
+}
+
+/// The arguments of `ssl_certificate_cache` / `proxy_ssl_certificate_cache`
+/// (`ngx_http_ssl_certificate_cache`): `None` for `off`, which wins
+/// wherever it is, as in nginx.
+pub(crate) fn parse_ssl_cache_args(
+    args: &[String],
+    name: &'static str,
+) -> Result<Option<SslCertificateCache>, Error> {
     if args.is_empty() || args.len() > 3 {
-        return Err(Error::MissingArg("ssl_certificate_cache"));
+        return Err(Error::MissingArg(name));
     }
     let invalid = |arg: &String| Error::Directive {
-        name: "ssl_certificate_cache",
+        name,
         msg: format!("has an invalid parameter \"{arg}\""),
     };
-    let (mut max, mut off) = (false, false);
+    let (mut max, mut off) = (0, false);
+    let mut cache = SslCertificateCache {
+        id: 0,
+        max: 0,
+        inactive_secs: 10,
+        valid_secs: 60,
+    };
     for arg in args {
         if let Some(n) = arg.strip_prefix("max=") {
-            if n.parse::<u64>().map_or(true, |n| n == 0) {
-                return Err(invalid(arg));
-            }
-            max = true;
-        } else if let Some(t) = arg
-            .strip_prefix("inactive=")
-            .or_else(|| arg.strip_prefix("valid="))
-        {
-            parse_duration_ms(t, "ssl_certificate_cache").map_err(|_| invalid(arg))?;
+            // ngx_atoi: digits only.
+            max = Some(n)
+                .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .ok_or_else(|| invalid(arg))?;
+        } else if let Some(t) = arg.strip_prefix("inactive=") {
+            cache.inactive_secs = parse_duration_secs(t, name).map_err(|_| invalid(arg))?;
+        } else if let Some(t) = arg.strip_prefix("valid=") {
+            cache.valid_secs = parse_duration_secs(t, name).map_err(|_| invalid(arg))?;
         } else if arg == "off" {
             off = true;
         } else {
             return Err(invalid(arg));
         }
     }
-    if !off && !max {
+    if off {
+        return Ok(None);
+    }
+    if max == 0 {
         return Err(Error::Directive {
-            name: "ssl_certificate_cache",
+            name,
             msg: "must have the \"max\" parameter".into(),
         });
     }
-    Ok(())
+    // Tells declarations apart: the levels that inherit one share its cache.
+    static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    cache.max = max;
+    cache.id = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some(cache))
 }
 
 /// `ssl_protocols` values: TLS 1.2 and 1.3, which rustls speaks. The old
@@ -1381,15 +1375,13 @@ pub(crate) fn parse_proxy_redirect(
                     Some(r) => (r, true),
                     None => (regex, false),
                 };
-                regex::bytes::RegexBuilder::new(regex)
-                    .case_insensitive(case_insensitive)
-                    .build()
-                    .map_err(|e| Error::InvalidRegex {
-                        pattern: regex.to_string(),
-                        msg: e.to_string(),
-                    })?;
-                ProxyRedirectRule::Regex {
+                let translated = pcre::translate(regex);
+                pcre::regex(&translated, case_insensitive).map_err(|e| Error::InvalidRegex {
                     pattern: regex.to_string(),
+                    msg: e.to_string(),
+                })?;
+                ProxyRedirectRule::Regex {
+                    pattern: translated.into_owned(),
                     case_insensitive,
                     replacement,
                 }
@@ -1444,15 +1436,13 @@ pub(crate) fn parse_proxy_cookie(
                     Some(r) if !domain => (r, true),
                     _ => (regex, domain),
                 };
-                regex::bytes::RegexBuilder::new(regex)
-                    .case_insensitive(case_insensitive)
-                    .build()
-                    .map_err(|e| Error::InvalidRegex {
-                        pattern: regex.to_string(),
-                        msg: e.to_string(),
-                    })?;
-                ProxyRedirectRule::Regex {
+                let translated = pcre::translate(regex);
+                pcre::regex(&translated, case_insensitive).map_err(|e| Error::InvalidRegex {
                     pattern: regex.to_string(),
+                    msg: e.to_string(),
+                })?;
+                ProxyRedirectRule::Regex {
+                    pattern: translated.into_owned(),
                     case_insensitive,
                     // Its captures, $1…$9.
                     replacement: super::values::parse_value_with_vars_rewrite(replacement)?,
@@ -1507,14 +1497,12 @@ pub(crate) fn parse_proxy_cookie_flags(
         [cookie, flags @ ..] if (1..=3).contains(&flags.len()) => {
             let cookie = match cookie.strip_prefix('~') {
                 Some(regex) => {
-                    regex::bytes::RegexBuilder::new(regex)
-                        .case_insensitive(true)
-                        .build()
-                        .map_err(|e| Error::InvalidRegex {
-                            pattern: regex.to_string(),
-                            msg: e.to_string(),
-                        })?;
-                    CookieName::Regex(regex.to_string())
+                    let translated = pcre::translate(regex);
+                    pcre::regex(&translated, true).map_err(|e| Error::InvalidRegex {
+                        pattern: regex.to_string(),
+                        msg: e.to_string(),
+                    })?;
+                    CookieName::Regex(translated.into_owned())
                 }
                 None => CookieName::Name(crate::config::parse_value_with_vars(cookie)?),
             };
@@ -1694,6 +1682,17 @@ pub(crate) fn parse_keepalive_time_args(args: &[String]) -> Result<u64, Error> {
         });
     }
     parse_duration_ms(&args[0], "keepalive_time")
+}
+
+/// `keepalive_min_timeout` (nginx 1.27.4), an msec slot.
+pub(crate) fn parse_keepalive_min_timeout_args(args: &[String]) -> Result<u64, Error> {
+    if args.len() != 1 {
+        return Err(Error::BadValue {
+            what: "keepalive_min_timeout",
+            got: args.join(" "),
+        });
+    }
+    parse_duration_ms(&args[0], "keepalive_min_timeout")
 }
 
 pub(crate) fn parse_keepalive_disable_args(args: &[String]) -> Result<KeepaliveDisable, Error> {

@@ -904,6 +904,7 @@ fn read_response_file(path: &Path) -> Result<Vec<u8>, String> {
             crate::worker::errno_text(&e)
         )
     })?;
+    crate::privileges::note_read(path);
     unsafe {
         let mut p = bytes.as_ptr();
         let ocsp = ffi::d2i_OCSP_RESPONSE(ptr::null_mut(), &mut p, bytes.len() as c_long);
