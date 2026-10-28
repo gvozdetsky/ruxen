@@ -37,7 +37,7 @@ mod values;
 
 pub use ast::*;
 pub use error::*;
-pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_gzip::{GzipConf, GzipStatic, proxied as gzip_proxied};
 pub use parse_http2::Http2Conf;
 pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
 pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
@@ -1163,7 +1163,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "gzip_min_length",
     "gzip_buffers",
     "gzip_disable",
-    "gzip_static",
     "ssi",
     "ssi_silent_errors",
     "ssi_types",

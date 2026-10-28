@@ -1,7 +1,7 @@
 //! The gzip filter's directives (`ngx_http_gzip_filter_module` and the
 //! `gzip_*` ones of `ngx_http_core_module`), at http, server and location
-//! level. Unset ones inherit from the level above, as nginx's merge does.
-//! `gzip_static` and `gzip_buffers` stay on the ignore list.
+//! level, and `gzip_static` (#760). Unset ones inherit from the level
+//! above, as nginx's merge does. `gzip_buffers` stays on the ignore list.
 
 use super::*;
 
@@ -16,6 +16,16 @@ pub mod proxied {
     pub const NO_ETAG: u16 = 0x0080;
     pub const AUTH: u16 = 0x0100;
     pub const ANY: u16 = 0x0200;
+}
+
+/// `gzip_static` (ngx_http_gzip_static_module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GzipStatic {
+    Off,
+    /// `file.gz` to a client `ngx_http_gzip_ok` lets have it.
+    On,
+    /// `file.gz` to any client.
+    Always,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,6 +46,8 @@ pub struct GzipConf {
     pub proxied: Option<u16>,
     /// `gzip_disable`: User-Agent regexes; `msie6` is nginx's shortcut.
     pub disable: Option<Vec<String>>,
+    /// `gzip_static`, default off.
+    pub static_mode: Option<GzipStatic>,
 }
 
 impl GzipConf {
@@ -48,6 +60,7 @@ impl GzipConf {
         "gzip_http_version",
         "gzip_proxied",
         "gzip_disable",
+        "gzip_static",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -65,6 +78,7 @@ impl GzipConf {
             http_version: self.http_version.or(parent.http_version),
             proxied: self.proxied.or(parent.proxied),
             disable: self.disable.or_else(|| parent.disable.clone()),
+            static_mode: self.static_mode.or(parent.static_mode),
         }
     }
 
@@ -180,6 +194,21 @@ impl GzipConf {
                     .get_or_insert_with(Vec::new)
                     .extend(values.iter().cloned());
             }
+            "gzip_static" => {
+                dup(&self.static_mode, "gzip_static")?;
+                let v = one("gzip_static")?;
+                self.static_mode = Some(match v.as_str() {
+                    "off" => GzipStatic::Off,
+                    "on" => GzipStatic::On,
+                    "always" => GzipStatic::Always,
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: "gzip_static",
+                            got: v.clone(),
+                        });
+                    }
+                });
+            }
             other => unreachable!("not a gzip directive: {other}"),
         }
         Ok(())
@@ -219,6 +248,7 @@ mod tests {
             "gzip_proxied expired no-cache auth",
             "gzip_disable msie6",
             "gzip_disable ^curl",
+            "gzip_static always",
         ])
         .unwrap();
         assert_eq!(g.enable, Some(true));
@@ -238,6 +268,7 @@ mod tests {
             g.disable,
             Some(vec!["msie6".to_string(), "^curl".to_string()])
         );
+        assert_eq!(g.static_mode, Some(GzipStatic::Always));
     }
 
     #[test]
@@ -248,6 +279,8 @@ mod tests {
         assert!(conf(&["gzip_proxied sometimes"]).is_err());
         assert!(conf(&["gzip_disable ("]).is_err());
         assert!(conf(&["gzip on", "gzip off"]).is_err());
+        assert!(conf(&["gzip_static yes"]).is_err());
+        assert!(conf(&["gzip_static on", "gzip_static off"]).is_err());
     }
 
     #[test]
