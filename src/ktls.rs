@@ -9,12 +9,14 @@
 //! no `KernelConnection`, so the next keys are derived here (RFC 8446,
 //! 7.2), and the kernel takes them again (`TLS_RX` / `TLS_TX`, Linux 6.14
 //! and later; on older kernels the connection closes). A client's
-//! KeyUpdate rekeys RX, and answers with our own when asked; near the
-//! AES-GCM record limit the server updates its keys itself.
+//! KeyUpdate rekeys RX, and our own goes before the next write when it
+//! asks (so a reader never writes, as a tunnel needs); near the AES-GCM
+//! record limit the server updates its keys itself.
 
 use std::cell::RefCell;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,7 @@ use monoio::net::TcpStream;
 use rustls::crypto::tls13::{Hkdf, OkmBlock};
 use rustls::{ConnectionTrafficSecrets, ProtocolVersion, SupportedCipherSuite};
 
+use crate::duplex::Duplex;
 use crate::tls_stream::{IntoKtls, TlsStream};
 
 /// Where a stream of TLS records stands: in a header, in a body, or
@@ -602,6 +605,7 @@ pub(crate) fn switch(stream: TlsStream<TcpStream>) -> Switch {
                 closed,
                 cipher,
                 rekey: rekey.map(Box::new),
+                tx_update_due: false,
                 next_check: Instant::now() + LIMIT_CHECK,
                 shut: false,
             }))
@@ -627,6 +631,9 @@ pub(crate) struct KtlsStream {
     /// TLS 1.3 with the secrets for key updates, else `None`: a KeyUpdate
     /// closes then.
     rekey: Option<Box<Rekey>>,
+    /// Our KeyUpdate goes before the next write: the client asked, or the
+    /// record limit is near.
+    tx_update_due: bool,
     next_check: Instant,
     /// close_notify went out (a lingering close shuts down first).
     shut: bool,
@@ -670,9 +677,9 @@ impl KtlsStream {
         n
     }
 
-    /// Whether the connection may go on sealing records: an AES-GCM key
-    /// stops near `RECORD_LIMIT`, looked at once per `LIMIT_CHECK`.
-    pub(crate) fn within_limit(&mut self) -> bool {
+    /// Whether the key may go on sealing records: an AES-GCM key stops
+    /// near `RECORD_LIMIT`, looked at once per `LIMIT_CHECK`.
+    fn within_limit(&mut self) -> bool {
         if self.cipher == Cipher::Chacha20Poly1305 {
             return true;
         }
@@ -681,18 +688,29 @@ impl KtlsStream {
             return true;
         }
         self.next_check = now + LIMIT_CHECK;
-        if tx_records(self.io.as_raw_fd(), self.cipher).is_none_or(|n| n < RECORD_LIMIT) {
-            return true;
+        tx_records(self.io.as_raw_fd(), self.cipher).is_none_or(|n| n < RECORD_LIMIT)
+    }
+
+    /// Before a write: our KeyUpdate when one is due. `WouldBlock`: the
+    /// socket is full, try again once it isn't; other errors end the
+    /// connection (the record limit without a key update).
+    #[inline]
+    pub(crate) fn ready_to_write(&mut self) -> io::Result<()> {
+        if !self.tx_update_due && self.within_limit() {
+            return Ok(());
         }
-        match self.update_tx() {
-            Ok(()) => true,
-            // The socket is full: again on the next write.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.next_check = now;
-                true
-            }
-            Err(_) => false,
+        self.send_tx_update()
+    }
+
+    #[cold]
+    fn send_tx_update(&mut self) -> io::Result<()> {
+        if self.rekey.is_none() {
+            return Err(limit_reached());
         }
+        self.tx_update_due = true;
+        self.update_tx()?;
+        self.tx_update_due = false;
+        Ok(())
     }
 
     /// Our KeyUpdate, with the old key, then the new key for what follows.
@@ -710,17 +728,17 @@ impl KtlsStream {
     /// A read failed: `EIO` is a record that isn't data, which the kernel
     /// gives with a control buffer only. `None`: a KeyUpdate, handled;
     /// read again.
-    async fn check_read(&mut self, res: io::Result<usize>) -> Option<io::Result<usize>> {
+    fn check_read(&mut self, res: io::Result<usize>) -> Option<io::Result<usize>> {
         match res {
-            Err(e) if e.raw_os_error() == Some(libc::EIO) => self.control_record().await,
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => self.control_record(),
             other => Some(other),
         }
     }
 
     #[cold]
-    async fn control_record(&mut self) -> Option<io::Result<usize>> {
+    fn control_record(&mut self) -> Option<io::Result<usize>> {
         match self.recv_control() {
-            Ok(Some(request_update)) => match self.key_update(request_update).await {
+            Ok(Some(request_update)) => match self.key_update(request_update) {
                 Ok(()) => None,
                 Err(e) => Some(Err(e)),
             },
@@ -729,9 +747,9 @@ impl KtlsStream {
         }
     }
 
-    /// The client's KeyUpdate: its new keys for RX, and ours for TX when
-    /// it asks (before any more data from us, RFC 8446, 4.6.3).
-    async fn key_update(&mut self, request_update: bool) -> io::Result<()> {
+    /// The client's KeyUpdate: its new keys for RX, and ours for TX before
+    /// our next data when it asks (RFC 8446, 4.6.3).
+    fn key_update(&mut self, request_update: bool) -> io::Result<()> {
         let fd = self.io.as_raw_fd();
         let Some(rekey) = &mut self.rekey else {
             return Err(io::Error::new(
@@ -745,17 +763,7 @@ impl KtlsStream {
                 format!("KeyUpdate: setsockopt(TLS_RX) failed ({e})"),
             )
         })?;
-        if request_update {
-            loop {
-                match self.update_tx() {
-                    Ok(()) => break,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        self.io.writable(false).await?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
+        self.tx_update_due |= request_update;
         Ok(())
     }
 
@@ -815,8 +823,21 @@ impl KtlsStream {
 
     /// A read in a keep-alive wait failed or saw EOF: a KeyUpdate is
     /// handled there too (`Some(true)`: wait again).
-    pub(crate) async fn idle_control_record(&mut self) -> bool {
-        self.control_record().await.is_none()
+    pub(crate) fn idle_control_record(&mut self) -> bool {
+        self.control_record().is_none()
+    }
+
+    /// `ready_to_write`, waiting for room in the socket.
+    #[inline]
+    async fn write_ready(&mut self) -> io::Result<()> {
+        loop {
+            match self.ready_to_write() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.io.writable(false).await?;
+                }
+                other => return other,
+            }
+        }
     }
 }
 
@@ -895,7 +916,7 @@ impl AsyncReadRent for KtlsStream {
             }
             let (res, returned) = self.io.read(buf).await;
             buf = returned;
-            if let Some(res) = self.check_read(res).await {
+            if let Some(res) = self.check_read(res) {
                 return (res, buf);
             }
         }
@@ -921,7 +942,7 @@ impl AsyncReadRent for KtlsStream {
             }
             let (res, returned) = self.io.readv(buf).await;
             buf = returned;
-            if let Some(res) = self.check_read(res).await {
+            if let Some(res) = self.check_read(res) {
                 return (res, buf);
             }
         }
@@ -934,15 +955,15 @@ fn limit_reached() -> io::Error {
 
 impl AsyncWriteRent for KtlsStream {
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-        if !self.within_limit() {
-            return (Err(limit_reached()), buf);
+        if let Err(e) = self.write_ready().await {
+            return (Err(e), buf);
         }
         self.io.write(buf).await
     }
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-        if !self.within_limit() {
-            return (Err(limit_reached()), buf);
+        if let Err(e) = self.write_ready().await {
+            return (Err(e), buf);
         }
         self.io.writev(buf).await
     }
@@ -966,6 +987,75 @@ impl AsyncWriteRent for KtlsStream {
             }
         }
         self.io.shutdown().await
+    }
+}
+
+impl KtlsStream {
+    /// The socket, projected without a reference to `*this`.
+    fn io_ptr(this: NonNull<Self>) -> NonNull<TcpStream> {
+        // SAFETY: a field of a valid pointer.
+        unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).io) }
+    }
+}
+
+/// The tunnel after a 101 (#501): references to the stream only between
+/// the socket's operations, which are `TcpStream`'s on `io_ptr`.
+// SAFETY: as just said.
+unsafe impl Duplex for KtlsStream {
+    async unsafe fn read_raw<T: IoBufMut>(this: NonNull<Self>, mut buf: T) -> BufResult<usize, T> {
+        // SAFETY: valid, no other reference live (the caller's); each
+        // ends before an await.
+        let s = unsafe { &mut *this.as_ptr() };
+        if s.pos < s.read.len() {
+            // SAFETY: as in `read`.
+            unsafe {
+                let n = s.take_into(buf.write_ptr(), buf.bytes_total());
+                buf.set_init(n);
+                return (Ok(n), buf);
+            }
+        }
+        loop {
+            // SAFETY: as above, here and below.
+            if unsafe { (*this.as_ptr()).closed } {
+                return (Ok(0), buf);
+            }
+            let (res, returned) = unsafe { TcpStream::read_raw(Self::io_ptr(this), buf) }.await;
+            buf = returned;
+            if let Some(res) = unsafe { &mut *this.as_ptr() }.check_read(res) {
+                return (res, buf);
+            }
+        }
+    }
+
+    async unsafe fn write_raw<T: IoBuf>(this: NonNull<Self>, buf: T) -> BufResult<usize, T> {
+        // SAFETY: as in `read_raw`, here and below.
+        loop {
+            match unsafe { &mut *this.as_ptr() }.ready_to_write() {
+                Ok(()) => break,
+                // Polled, as in `shutdown_raw`.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    monoio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => return (Err(e), buf),
+            }
+        }
+        unsafe { TcpStream::write_raw(Self::io_ptr(this), buf) }.await
+    }
+
+    async unsafe fn shutdown_raw(this: NonNull<Self>) -> io::Result<()> {
+        // SAFETY: as in `read_raw`, here and below.
+        if std::mem::replace(unsafe { &mut (*this.as_ptr()).shut }, true) {
+            return Ok(());
+        }
+        // A full send buffer: polled, as `writable` would hold a reference
+        // across the wait. Rare, and only at the end.
+        while let Err(e) = unsafe { &*this.as_ptr() }.send_close_notify() {
+            if e.kind() != io::ErrorKind::WouldBlock {
+                return Err(e);
+            }
+            monoio::time::sleep(Duration::from_millis(5)).await;
+        }
+        unsafe { TcpStream::shutdown_raw(Self::io_ptr(this)) }.await
     }
 }
 

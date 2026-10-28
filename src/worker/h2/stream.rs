@@ -637,11 +637,36 @@ impl AsyncWriteRent for StreamIo {
     }
 }
 
+// SAFETY: never touches the stream. An HTTP/2 stream carries no tunnel:
+// the `h2` crate refuses a request with an `Upgrade` field (RFC 9113,
+// 8.2.2), so no upstream 101 is relayed on one.
+unsafe impl crate::duplex::Duplex for StreamIo {
+    unsafe fn read_raw<T: IoBufMut>(
+        _: std::ptr::NonNull<Self>,
+        buf: T,
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> + 'static {
+        std::future::ready((Err(io::ErrorKind::Unsupported.into()), buf))
+    }
+
+    unsafe fn write_raw<T: IoBuf>(
+        _: std::ptr::NonNull<Self>,
+        buf: T,
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> + 'static {
+        std::future::ready((Err(io::ErrorKind::Unsupported.into()), buf))
+    }
+
+    unsafe fn shutdown_raw(
+        _: std::ptr::NonNull<Self>,
+    ) -> impl std::future::Future<Output = io::Result<()>> + 'static {
+        std::future::ready(Ok(()))
+    }
+}
+
 impl super::super::ConnIo for StreamIo {
     async fn idle_wait(
         &self,
         _state: &RuntimeState,
-        _idle: Option<std::time::Duration>,
+        _idle: super::super::IdleLimits,
         _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> bool {
@@ -653,7 +678,7 @@ impl super::super::ConnIo for StreamIo {
         &mut self,
         mut buf: Vec<u8>,
         _state: &RuntimeState,
-        _idle: Option<std::time::Duration>,
+        _idle: super::super::IdleLimits,
         _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
