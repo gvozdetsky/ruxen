@@ -254,11 +254,28 @@ pub struct KeepaliveMeta {
     pub disable_safari: bool,
 }
 
+impl KeepaliveMeta {
+    /// A server's settings, for a response before any location (a
+    /// server-level `return`, a refused URI).
+    fn of_server(server: &PreparedServer) -> Self {
+        let k = &server.keepalive;
+        KeepaliveMeta {
+            allow: k.allow,
+            idle_timeout_ms: k.idle_timeout_ms,
+            header_timeout_secs: k.header_timeout_secs,
+            max_requests: k.max_requests,
+            max_time_ms: k.max_time_ms,
+            disable_msie6: k.disable_msie6,
+            disable_safari: k.disable_safari,
+        }
+    }
+}
+
 impl Default for KeepaliveMeta {
     fn default() -> Self {
         KeepaliveMeta {
             allow: true,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(crate::worker::DEFAULT_KEEPALIVE_TIMEOUT_MS),
             header_timeout_secs: None,
             max_requests: 1_000,
             max_time_ms: 3_600_000,
@@ -466,6 +483,7 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
+        keepalive: KeepaliveMeta::of_server(server),
         ..ProcessMeta::default()
     }
 }
@@ -986,9 +1004,15 @@ fn process_with_meta_inner(
         server_port: server.listen_port,
         metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
+        // `allow` is the client's until a location's applies: its
+        // keepalive_timeout decides, not the server's (nginx's
+        // ngx_http_update_location_config).
+        keepalive: KeepaliveMeta {
+            allow: !closes,
+            ..KeepaliveMeta::of_server(server)
+        },
         ..ProcessMeta::default()
     };
-    meta.keepalive.allow = !closes;
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);

@@ -3329,7 +3329,7 @@ pub(crate) fn prepare_keepalive(
         },
         None => PreparedKeepalive {
             allow: true,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(DEFAULT_KEEPALIVE_TIMEOUT_MS),
             header_timeout_secs: None,
             max_requests,
             max_time_ms,
@@ -4626,6 +4626,30 @@ mod tests {
             .iter()
             .find(|l| l.pattern == pattern)
             .unwrap()
+    }
+
+    #[test]
+    fn keepalive_timeout_defaults_to_75s() {
+        let http = prepare_src(
+            r#"
+            http {
+                server {
+                    listen 127.0.0.1:8080;
+                    location /a { return 200; }
+                    location /off { keepalive_timeout 0; return 200; }
+                }
+            }
+            "#,
+        );
+        let server = &http.listens[0].servers[0];
+        assert!(server.keepalive.allow);
+        assert_eq!(server.keepalive.idle_timeout_ms, Some(75_000));
+        let a = prefix(http, 0, b"/a").keepalive;
+        assert!(a.allow);
+        assert_eq!(a.idle_timeout_ms, Some(75_000));
+        let off = prefix(http, 0, b"/off").keepalive;
+        assert!(!off.allow);
+        assert_eq!(off.idle_timeout_ms, None);
     }
 
     #[test]
