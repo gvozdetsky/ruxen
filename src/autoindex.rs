@@ -48,77 +48,63 @@ fn local_utc_offset() -> i64 {
 
 pub fn render_xml(dir_path: &Path) -> std::io::Result<Vec<u8>> {
     let entries = read_sorted_entries(dir_path)?;
-    let mut out = Vec::with_capacity(2048);
-    out.extend_from_slice(br#"<?xml version="1.0"?>"#);
-    out.extend_from_slice(b"\n<list>");
-    for entry in entries {
-        let raw_name = entry.file_name.as_os_str().as_bytes();
-        let name = String::from_utf8_lossy(raw_name);
-        let name_escaped = escape_html(&name);
-        let mtime = format_xml_timestamp(entry.mtime);
-        if entry.is_dir {
-            out.extend_from_slice(br#"<directory mtime=""#);
-            out.extend_from_slice(mtime.as_bytes());
-            out.extend_from_slice(br#"">"#);
-            out.extend_from_slice(name_escaped.as_bytes());
-            out.extend_from_slice(b"</directory>");
-        } else {
-            out.extend_from_slice(br#"<file mtime=""#);
-            out.extend_from_slice(mtime.as_bytes());
-            out.extend_from_slice(br#"" size=""#);
+    // ngx_http_autoindex_xml: one entry per line, the name as it is on
+    // disk, HTML-escaped.
+    let mut out = Vec::with_capacity(64 + entries.len() * 96);
+    out.extend_from_slice(b"<?xml version=\"1.0\"?>\r\n<list>\r\n");
+    for entry in &entries {
+        let kind = entry.kind();
+        out.push(b'<');
+        out.extend_from_slice(kind);
+        out.extend_from_slice(b" mtime=\"");
+        out.extend_from_slice(format_xml_timestamp(entry.mtime).as_bytes());
+        if entry.is_file {
+            out.extend_from_slice(b"\" size=\"");
             out.extend_from_slice(entry.size.to_string().as_bytes());
-            out.extend_from_slice(br#"">"#);
-            out.extend_from_slice(name_escaped.as_bytes());
-            out.extend_from_slice(b"</file>");
         }
+        out.extend_from_slice(b"\">");
+        escape_html_into(&mut out, entry.file_name.as_os_str().as_bytes());
+        out.extend_from_slice(b"</");
+        out.extend_from_slice(kind);
+        out.extend_from_slice(b">\r\n");
     }
-    out.extend_from_slice(b"</list>\n");
+    out.extend_from_slice(b"</list>\r\n");
     Ok(out)
 }
 
-/// A non-empty `callback` wraps the array in `callback(…);` (JSONP).
+/// ngx_http_autoindex_json: one entry per line; a non-empty `callback`
+/// makes it JSONP.
 pub fn render_json(dir_path: &Path, callback: &[u8]) -> std::io::Result<Vec<u8>> {
     let entries = read_sorted_entries(dir_path)?;
-    let mut array = Vec::with_capacity(2048);
-    array.extend_from_slice(b"[");
-    for (i, entry) in entries.iter().enumerate() {
-        if i > 0 {
-            array.extend_from_slice(b",");
-        }
-        let raw_name = entry.file_name.as_os_str().as_bytes();
-        let name = String::from_utf8_lossy(raw_name);
-        let mut name_json = Vec::with_capacity(name.len() + 8);
-        write_json_string(&mut name_json, &name);
-        let mtime = format_httpdate(entry.mtime);
-        let mut mtime_json = Vec::with_capacity(mtime.len() + 8);
-        write_json_string(&mut mtime_json, &mtime);
-
-        array.extend_from_slice(b"{\"name\":");
-        array.extend_from_slice(&name_json);
-        array.extend_from_slice(b",\"type\":\"");
-        if entry.is_dir {
-            array.extend_from_slice(b"directory");
+    let mut out = Vec::with_capacity(32 + callback.len() + entries.len() * 112);
+    if !callback.is_empty() {
+        out.extend_from_slice(b"/* callback */\r\n");
+        out.extend_from_slice(callback);
+        out.push(b'(');
+    }
+    out.push(b'[');
+    for entry in &entries {
+        out.extend_from_slice(b"\r\n{ \"name\":\"");
+        escape_json_into(&mut out, entry.file_name.as_os_str().as_bytes());
+        out.extend_from_slice(b"\", \"type\":\"");
+        out.extend_from_slice(entry.kind());
+        out.extend_from_slice(b"\", \"mtime\":\"");
+        out.extend_from_slice(format_httpdate(entry.mtime).as_bytes());
+        if entry.is_file {
+            out.extend_from_slice(b"\", \"size\":");
+            out.extend_from_slice(entry.size.to_string().as_bytes());
         } else {
-            array.extend_from_slice(b"file");
+            out.push(b'"');
         }
-        array.extend_from_slice(b"\",\"mtime\":");
-        array.extend_from_slice(&mtime_json);
-        if !entry.is_dir {
-            array.extend_from_slice(b",\"size\":");
-            array.extend_from_slice(entry.size.to_string().as_bytes());
-        }
-        array.extend_from_slice(b"}");
+        out.extend_from_slice(b" },");
     }
-    array.extend_from_slice(b"]");
-
-    if callback.is_empty() {
-        return Ok(array);
+    if !entries.is_empty() {
+        out.pop();
     }
-    let mut out = Vec::with_capacity(callback.len() + array.len() + 3);
-    out.extend_from_slice(callback);
-    out.extend_from_slice(b"(");
-    out.extend_from_slice(&array);
-    out.extend_from_slice(b");");
+    out.extend_from_slice(b"\r\n]");
+    if !callback.is_empty() {
+        out.extend_from_slice(b");");
+    }
     Ok(out)
 }
 
@@ -141,8 +127,22 @@ pub fn jsonp_callback(args: &[u8]) -> Result<&[u8], ()> {
 struct Entry {
     file_name: OsString,
     is_dir: bool,
+    /// A regular file; neither this nor `is_dir` is nginx's "other".
+    is_file: bool,
     size: u64,
     mtime: u64,
+}
+
+impl Entry {
+    fn kind(&self) -> &'static [u8] {
+        if self.is_dir {
+            b"directory"
+        } else if self.is_file {
+            b"file"
+        } else {
+            b"other"
+        }
+    }
 }
 
 fn read_sorted_entries(dir_path: &Path) -> std::io::Result<Vec<Entry>> {
@@ -163,12 +163,24 @@ fn read_sorted_entries(dir_path: &Path) -> std::io::Result<Vec<Entry>> {
         // which does not). nginx's autoindex follows symlinks too —
         // `ngx_http_autoindex_module.c` calls `ngx_de_info` which is
         // `stat(2)`, not `lstat(2)`.
+        // A dangling or looping link is listed as itself (ngx_de_link_info
+        // after ENOENT / ELOOP).
         let metadata = match std::fs::metadata(item.path()) {
             Ok(v) => v,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                match std::fs::symlink_metadata(item.path()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
+            }
             Err(_) => continue,
         };
 
         let is_dir = metadata.is_dir();
+        let is_file = metadata.is_file();
         let size = metadata.len();
         let mtime = metadata
             .modified()
@@ -180,6 +192,7 @@ fn read_sorted_entries(dir_path: &Path) -> std::io::Result<Vec<Entry>> {
         entries.push(Entry {
             file_name,
             is_dir,
+            is_file,
             size,
             mtime,
         });
@@ -340,12 +353,6 @@ fn escape_html_into(out: &mut Vec<u8>, input: &[u8]) {
     }
 }
 
-fn escape_html(input: &str) -> String {
-    let mut out = Vec::with_capacity(input.len());
-    escape_html_into(&mut out, input.as_bytes());
-    String::from_utf8(out).unwrap_or_default()
-}
-
 fn percent_encode_into(out: &mut Vec<u8>, input: &[u8]) {
     for &b in input {
         if is_unreserved(b) {
@@ -376,35 +383,23 @@ fn hex(n: u8) -> u8 {
     }
 }
 
-fn write_json_string(out: &mut Vec<u8>, s: &str) {
-    out.push(b'"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.extend_from_slice(b"\\\""),
-            '\\' => out.extend_from_slice(b"\\\\"),
-            '\u{08}' => out.extend_from_slice(b"\\b"),
-            '\u{0C}' => out.extend_from_slice(b"\\f"),
-            '\n' => out.extend_from_slice(b"\\n"),
-            '\r' => out.extend_from_slice(b"\\r"),
-            '\t' => out.extend_from_slice(b"\\t"),
-            c if c <= '\u{1F}' => {
-                let mut buf = [0u8; 6];
-                let code = c as u32;
-                buf[0] = b'\\';
-                buf[1] = b'u';
-                buf[2] = hex(((code >> 12) & 0x0f) as u8);
-                buf[3] = hex(((code >> 8) & 0x0f) as u8);
-                buf[4] = hex(((code >> 4) & 0x0f) as u8);
-                buf[5] = hex((code & 0x0f) as u8);
-                out.extend_from_slice(&buf);
+/// ngx_escape_json: `"` and `\\` escaped, control bytes as `\\n`-style or
+/// `\\u00XX`, any other byte as it is.
+fn escape_json_into(out: &mut Vec<u8>, input: &[u8]) {
+    for &b in input {
+        match b {
+            b'"' | b'\\' => out.extend_from_slice(&[b'\\', b]),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0..=0x1f => {
+                out.extend_from_slice(&[b'\\', b'u', b'0', b'0', b'0' + (b >> 4), hex(b & 0x0f)])
             }
-            c => {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
+            _ => out.push(b),
         }
     }
-    out.push(b'"');
 }
 
 fn query_arg<'a>(args: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
@@ -434,6 +429,7 @@ mod tests {
         let entry = Entry {
             file_name: OsString::from(name),
             is_dir,
+            is_file: !is_dir,
             size,
             mtime: 1_709_622_489, // 2024-03-05 07:08:09 UTC
         };
@@ -476,5 +472,74 @@ mod tests {
         assert_eq!(size(15_000), "    15K");
         assert_eq!(size(1_048_576), "     1M");
         assert_eq!(size(3_000_000), "     3M");
+    }
+
+    /// Byte for byte what nginx 1.30 sends for the same directory (#802):
+    /// names as on disk, escaped as ngx_escape_json / ngx_escape_html,
+    /// a dangling link as "other".
+    #[test]
+    fn json_and_xml_are_laid_out_like_nginx() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("ruxen-autoindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(
+            dir.join(std::ffi::OsStr::from_bytes(b"a\"\\\x01<\xe9")),
+            b"12345",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/nonexistent", dir.join("b")).unwrap();
+        let t = std::fs::FileTimes::new()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000));
+        for name in [&b"sub"[..], b"a\"\\\x01<\xe9"] {
+            std::fs::File::open(dir.join(std::ffi::OsStr::from_bytes(name)))
+                .unwrap()
+                .set_times(t)
+                .unwrap();
+        }
+        let link_mtime = format_httpdate(
+            std::fs::symlink_metadata(dir.join("b"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+        let date = "Tue, 14 Nov 2023 22:13:20 GMT";
+        let entries = format!(
+            "[\r\n{{ \"name\":\"sub\", \"type\":\"directory\", \"mtime\":\"{date}\" }},\r\n\
+             {{ \"name\":\"a\\\"\\\\\\u0001<\u{e9}\", \"type\":\"file\", \"mtime\":\"{date}\", \"size\":5 }},\r\n\
+             {{ \"name\":\"b\", \"type\":\"other\", \"mtime\":\"{link_mtime}\" }}\r\n]"
+        )
+        .replace('\u{e9}', "\u{fffd}");
+        let lossy = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+        let json = render_json(&dir, b"").unwrap();
+        assert!(json.contains(&0xe9), "the raw name");
+        assert_eq!(lossy(json), entries);
+        assert_eq!(
+            lossy(render_json(&dir, b"cb").unwrap()),
+            format!("/* callback */\r\ncb({entries});")
+        );
+        let xml = lossy(render_xml(&dir).unwrap());
+        assert!(
+            xml.starts_with(
+                "<?xml version=\"1.0\"?>\r\n<list>\r\n\
+                 <directory mtime=\"2023-11-14T22:13:20Z\">sub</directory>\r\n\
+                 <file mtime=\"2023-11-14T22:13:20Z\" size=\"5\">a&quot;\\\u{1}&lt;\u{fffd}</file>\r\n\
+                 <other mtime=\""
+            ),
+            "{xml}"
+        );
+        assert!(xml.ends_with("\">b</other>\r\n</list>\r\n"), "{xml}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(render_json(&empty, b"").unwrap(), b"[\r\n]");
+        assert_eq!(
+            render_xml(&empty).unwrap(),
+            b"<?xml version=\"1.0\"?>\r\n<list>\r\n</list>\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
