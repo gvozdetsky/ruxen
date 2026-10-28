@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 190 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 281 unknown.
+Of 564 directives: 192 implemented, 22 accepted with a difference, 69 accepted with no effect, 0 refused, 281 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -58,7 +58,7 @@ Of 564 directives: 190 implemented, 21 accepted with a difference, 72 accepted w
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `thread_pool` | accepted, no effect | any |  |
+| `thread_pool` | yes | main |  |
 
 ## event
 
@@ -131,8 +131,8 @@ Not supported: `ssl_engine`.
 | `sendfile` | yes | any |  |
 | `sendfile_max_chunk` | accepted, no effect | any |  |
 | `subrequest_output_buffer_size` | no |  |  |
-| `aio` | accepted, no effect | any |  |
-| `aio_write` | accepted, no effect | any |  |
+| `aio` | yes | http, server, location |  |
+| `aio_write` | accepted, differs | any | proxy_cache files are still written on the worker (#526) |
 | `read_ahead` | accepted, no effect | any |  |
 | `directio` | accepted, no effect | any |  |
 | `directio_alignment` | accepted, no effect | any |  |

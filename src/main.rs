@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod aio;
 mod arena;
 mod auth;
 mod autoindex;
@@ -1404,6 +1405,8 @@ const VERSION_BODY: &str = concat!(
     "\n",
     "TLS SNI support enabled\n",
     "configure arguments:",
+    // `aio threads` (#526).
+    " --with-threads",
     " --with-http_ssl_module",
     " --with-http_realip_module",
     " --with-http_stub_status_module",
@@ -1692,6 +1695,7 @@ mod tests {
                 "\n",
                 "TLS SNI support enabled\n",
                 "configure arguments:",
+                " --with-threads",
                 " --with-http_ssl_module",
                 " --with-http_realip_module",
                 " --with-http_stub_status_module",

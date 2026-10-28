@@ -360,6 +360,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
         &parent.client_body_buffer_size,
     );
     or(&mut child.sendfile, &parent.sendfile);
+    or(&mut child.aio, &parent.aio);
     or(
         &mut child.client_body_temp_path,
         &parent.client_body_temp_path,
@@ -522,6 +523,7 @@ pub(crate) struct Inherited {
     pub(crate) post_action: Option<String>,
     pub(crate) expires: Option<ExpiresDirective>,
     pub(crate) sendfile: Option<bool>,
+    pub(crate) aio: Option<Aio>,
     pub(crate) client_body_temp_path: Option<TempPath>,
     pub(crate) disable_symlinks: Option<DisableSymlinks>,
 }
@@ -602,6 +604,7 @@ pub(crate) fn parse_location_block(
     let mut mime = MimeConf::default();
     let mut charset = CharsetConf::default();
     let mut sendfile: Option<bool> = None;
+    let mut aio: Option<Aio> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
@@ -711,6 +714,7 @@ pub(crate) fn parse_location_block(
                     let effective_post_action = post_action.or(inherited.post_action);
                     let effective_expires = expires.or(inherited.expires);
                     let effective_sendfile = sendfile.or(inherited.sendfile);
+                    let effective_aio = aio.clone().or_else(|| inherited.aio.clone());
                     let effective_client_body_temp_path = client_body_temp_path
                         .clone()
                         .or_else(|| inherited.client_body_temp_path.clone());
@@ -757,6 +761,7 @@ pub(crate) fn parse_location_block(
                         max_ranges,
                         client_body_buffer_size: effective_client_body_buffer_size,
                         sendfile: effective_sendfile,
+                        aio: effective_aio,
                         document_root,
                         client_body_temp_path: effective_client_body_temp_path,
                         disable_symlinks: effective_disable_symlinks,
@@ -1178,6 +1183,12 @@ pub(crate) fn parse_location_block(
                 }
                 sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
             }
+            ("aio", Terminator::Semi) => {
+                if aio.is_some() {
+                    return Err(Error::Duplicate("aio"));
+                }
+                aio = Some(parse_aio_args(lx, &args)?);
+            }
             (name, Terminator::Semi) if RedirectConf::takes(name) => redirect.parse(&args)?,
             ("chunked_transfer_encoding", Terminator::Semi) => {
                 if chunked_transfer_encoding.is_some() {
@@ -1213,6 +1224,7 @@ pub(crate) fn parse_location_block(
                 let pass_post_action = post_action.clone().or(inherited.post_action.clone());
                 let pass_expires = expires.clone().or(inherited.expires.clone());
                 let pass_sendfile = sendfile.or(inherited.sendfile);
+                let pass_aio = aio.clone().or_else(|| inherited.aio.clone());
                 let pass_client_body_temp_path = client_body_temp_path
                     .clone()
                     .or_else(|| inherited.client_body_temp_path.clone());
@@ -1258,6 +1270,7 @@ pub(crate) fn parse_location_block(
                         post_action: pass_post_action,
                         expires: pass_expires,
                         sendfile: pass_sendfile,
+                        aio: pass_aio,
                         client_body_temp_path: pass_client_body_temp_path,
                         disable_symlinks: pass_disable_symlinks,
                     },

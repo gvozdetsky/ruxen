@@ -91,6 +91,21 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The `thread_pool`s of the configuration being prepared.
+    static THREAD_POOLS: std::cell::RefCell<Vec<&'static crate::aio::ThreadPool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The pool an `aio threads` uses; `None` for `aio off` and `on`. The
+/// parser checked that it is defined.
+fn thread_pool_for(aio: Option<&crate::config::Aio>) -> Option<&'static crate::aio::ThreadPool> {
+    let Some(crate::config::Aio::Threads(name)) = aio else {
+        return None;
+    };
+    THREAD_POOLS.with(|p| p.borrow().iter().copied().find(|p| p.name == *name))
+}
+
 /// The `[warn]` lines `prepare` had, taken: the caller logs them.
 pub fn take_prepare_warnings() -> Vec<String> {
     PREPARE_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
@@ -142,6 +157,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         client_body_buffer_size,
         client_body_temp_path,
         sendfile,
+        aio,
         http2,
         http2_conf,
         disable_symlinks,
@@ -196,6 +212,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     let http_max_ranges = max_ranges;
     let http_client_body_buffer_size = client_body_buffer_size;
     let http_sendfile = sendfile;
+    let http_aio = aio;
     let http_http2 = http2;
     let http_disable_symlinks = disable_symlinks;
     let http_limit_rate =
@@ -219,6 +236,19 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     // error_log inheritance, as nginx: server ← http ← top level; with
     // none anywhere, lines go to stderr (`write_error_log`).
     let main_error_logs = prepare_error_logs(runtime.error_logs)?;
+    let thread_pools = runtime
+        .thread_pools
+        .into_iter()
+        .map(|def| {
+            &*crate::arena::leak(Box::new(crate::aio::ThreadPool {
+                name: def.name,
+                threads: def.threads,
+                max_queue: def.max_queue,
+                log: main_error_logs,
+            }))
+        })
+        .collect();
+    THREAD_POOLS.with(|p| *p.borrow_mut() = thread_pools);
     let http_error_logs = match http_error_logs {
         Some(list) => prepare_error_logs(list)?,
         None => main_error_logs,
@@ -250,6 +280,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         max_ranges: http_max_ranges,
         client_body_buffer_size: http_client_body_buffer_size,
         sendfile: http_sendfile,
+        aio: http_aio,
         disable_symlinks: http_disable_symlinks,
         limit_rate: http_limit_rate,
         post_action: http_post_action,
@@ -2171,6 +2202,7 @@ pub(crate) struct HttpScope {
     pub(crate) max_ranges: Option<u32>,
     pub(crate) client_body_buffer_size: Option<u64>,
     pub(crate) sendfile: Option<bool>,
+    pub(crate) aio: Option<crate::config::Aio>,
     pub(crate) disable_symlinks: Option<crate::config::DisableSymlinks>,
     pub(crate) limit_rate: PreparedLimitRate,
     pub(crate) post_action: Option<&'static [u8]>,
@@ -2314,6 +2346,7 @@ pub(crate) fn prepare_server(
         .client_body_buffer_size
         .or(http.client_body_buffer_size);
     let server_sendfile = server.sendfile.or(http.sendfile).unwrap_or(false);
+    let server_aio = thread_pool_for(server.aio.as_ref().or(http.aio.as_ref()));
     // A server's own `client_body_temp_path`; without one its locations
     // use the http-level directory (`PreparedHttp::body_temp`).
     let server_body_temp = server.client_body_temp_path.clone().map(BodyTempDir::leak);
@@ -2407,6 +2440,7 @@ pub(crate) fn prepare_server(
         max_ranges: server_max_ranges,
         client_body_buffer_size: server_client_body_buffer_size,
         sendfile: server_sendfile,
+        aio: server_aio,
         body_temp: server_body_temp,
         disable_symlinks: server_disable_symlinks.clone(),
         limit_rate: server_limit_rate,
@@ -2573,6 +2607,7 @@ pub(crate) fn prepare_server(
             max_ranges: server_max_ranges,
             client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
+            aio: server_aio,
             gzip: prepare_gzip(server_gzip.clone())?,
             limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
@@ -3867,6 +3902,7 @@ pub(crate) struct ServerScope<'a> {
     pub(crate) max_ranges: Option<u32>,
     pub(crate) client_body_buffer_size: Option<u64>,
     pub(crate) sendfile: bool,
+    pub(crate) aio: Option<&'static crate::aio::ThreadPool>,
     pub(crate) body_temp: Option<&'static BodyTempDir>,
     pub(crate) disable_symlinks: Option<crate::config::DisableSymlinks>,
     pub(crate) limit_rate: PreparedLimitRate,
@@ -3924,6 +3960,7 @@ pub(crate) fn build_prefix_or_exact(
         max_ranges: location_max_ranges,
         client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
+        aio: location_aio,
         document_root,
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
@@ -4048,6 +4085,10 @@ pub(crate) fn build_prefix_or_exact(
     let client_body_buffer_size =
         location_client_body_buffer_size.or(server.client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server.sendfile);
+    let aio = match location_aio {
+        Some(aio) => thread_pool_for(Some(&aio)),
+        None => server.aio,
+    };
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
         .or(server.body_temp);
@@ -4086,6 +4127,7 @@ pub(crate) fn build_prefix_or_exact(
         max_ranges,
         client_body_buffer_size,
         sendfile,
+        aio,
         gzip,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only
@@ -4149,6 +4191,7 @@ pub(crate) fn build_regex_location(
         max_ranges: location_max_ranges,
         client_body_buffer_size: location_client_body_buffer_size,
         sendfile: location_sendfile,
+        aio: location_aio,
         document_root,
         client_body_temp_path: location_client_body_temp_path,
         disable_symlinks: location_disable_symlinks,
@@ -4281,6 +4324,10 @@ pub(crate) fn build_regex_location(
     let client_body_buffer_size =
         location_client_body_buffer_size.or(server.client_body_buffer_size);
     let sendfile = location_sendfile.unwrap_or(server.sendfile);
+    let aio = match location_aio {
+        Some(aio) => thread_pool_for(Some(&aio)),
+        None => server.aio,
+    };
     let body_temp = location_client_body_temp_path
         .map(BodyTempDir::leak)
         .or(server.body_temp);
@@ -4318,6 +4365,7 @@ pub(crate) fn build_regex_location(
         max_ranges,
         client_body_buffer_size,
         sendfile,
+        aio,
         gzip,
         limit_rate: limit_rate.for_location(),
         client_body_in_file_only: location_client_body_in_file_only

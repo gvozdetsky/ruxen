@@ -27,6 +27,9 @@ pub(crate) struct GzipRequest<'a> {
     pub user_agent: Option<&'a [u8]>,
     pub via: bool,
     pub authorization: bool,
+    /// `aio threads`: a file is streamed, its reads on the pool, never
+    /// read whole here on the worker.
+    pub aio: bool,
 }
 
 impl<'a> GzipRequest<'a> {
@@ -39,6 +42,7 @@ impl<'a> GzipRequest<'a> {
             user_agent: h(headers_raw, b"user-agent"),
             via: h(headers_raw, b"via").is_some(),
             authorization: h(headers_raw, b"authorization").is_some(),
+            aio: false,
         }
     }
 }
@@ -398,7 +402,7 @@ pub(crate) fn filter(
                     let out = rewrite_head(&headers, gz.vary, None);
                     (Response::File { headers: out, body }, None)
                 }
-                Decision::Compress if body.len <= WHOLE_FILE_MAX => {
+                Decision::Compress if body.len <= WHOLE_FILE_MAX && !req.aio => {
                     match compress_file(gz, req.http_11, &headers, body) {
                         Ok(out) => (Response::Owned(out), None),
                         // A read error: the plain path reports it.
@@ -848,6 +852,7 @@ mod tests {
             user_agent: None,
             via: false,
             authorization: false,
+            aio: false,
         }
     }
 

@@ -609,6 +609,7 @@ async fn write_response_paced<S: ConnIo>(
     request_start: Instant,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<(), u64> {
     let Some(mut pacer) = Pacer::new(rate, after, request_start) else {
         return Err(0);
@@ -622,7 +623,7 @@ async fn write_response_paced<S: ConnIo>(
         return Err(n as u64);
     }
     match file_body {
-        Some(body) => stream_file(stream, body, timer, send_timeout, Some(&mut pacer))
+        Some(body) => stream_file(stream, body, timer, send_timeout, Some(&mut pacer), aio)
             .await
             .map_err(|n| len as u64 + n),
         None => Ok(()),
@@ -5076,6 +5077,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 gz,
                                 &super::gzip::GzipRequest {
                                     head_only: method_bytes == b"HEAD",
+                                    aio: process_meta.aio.is_some(),
                                     ..super::gzip::GzipRequest::from_headers(
                                         req.http_11,
                                         headers_raw,
@@ -5274,6 +5276,24 @@ pub(crate) async fn handle<S: ConnIo>(
                         {
                             close_after = true;
                         }
+                        // `aio threads`: a body small enough to go with
+                        // the head, as `file::serve_path` sends it without
+                        // aio, is read on the pool. Failed, the request
+                        // ends without a response (nginx's copy filter
+                        // error after the header).
+                        let mut aio_failed = false;
+                        if let Some(pool) = process_meta.aio
+                            && gzip_stream.is_none()
+                            && file_body.as_ref().is_some_and(|b| {
+                                b.len <= crate::file::aio_inline_limit(process_meta.sendfile)
+                            })
+                        {
+                            let body = file_body.take().expect("checked is_some");
+                            match Box::pin(super::read_file_on_pool(pool, body)).await {
+                                Ok(bytes) => scratch.extend_from_slice(&bytes),
+                                Err(_) => aio_failed = true,
+                            }
+                        }
                         // Capture file body length before `stream_file`
                         // consumes the value — `$bytes_sent` and
                         // `$body_bytes_sent` need it after the write
@@ -5336,7 +5356,10 @@ pub(crate) async fn handle<S: ConnIo>(
                             // For the log, should a timed-out write take the
                             // head with it.
                             let status = response_status(scratch);
-                            if let Some(body) = proxy_body.take() {
+                            if aio_failed {
+                                cut_short = true;
+                                cut_sent = Some(0);
+                            } else if let Some(body) = proxy_body.take() {
                                 let pacer = process_meta.limit_rate.as_deref().and_then(|l| {
                                     super::Pacer::new(l.rate, l.after, request_start)
                                 });
@@ -5386,6 +5409,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     request_start,
                                     timers.io.as_mut(),
                                     send_timeout,
+                                    process_meta.aio,
                                 ))
                                 .await
                                 {
@@ -5405,6 +5429,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     body,
                                     timers.io.as_mut(),
                                     send_timeout,
+                                    process_meta.aio,
                                 )
                                 .await
                                 {
@@ -5445,23 +5470,25 @@ pub(crate) async fn handle<S: ConnIo>(
                                             gz,
                                             timers.io.as_mut(),
                                             send_timeout,
+                                            process_meta.aio,
                                         )
                                         .await
                                     }
                                     None => match if stream.sends_file_bodies() {
-                                        stream.send_file_body(&body).await
+                                        stream.send_file_body(body, process_meta.aio).await
                                     } else {
-                                        None
+                                        Err(body)
                                     } {
                                         // HTTP/2 doesn't say how much of
                                         // its DATA went out: none, then.
-                                        Some(sent) => sent.then_some(streamed_body_len).ok_or(0),
-                                        None => stream_file(
+                                        Ok(sent) => sent.then_some(streamed_body_len).ok_or(0),
+                                        Err(body) => stream_file(
                                             stream,
                                             body,
                                             timers.io.as_mut(),
                                             send_timeout,
                                             None,
+                                            process_meta.aio,
                                         )
                                         .await
                                         .map(|()| streamed_body_len),

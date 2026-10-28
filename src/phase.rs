@@ -352,6 +352,9 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// The location's `aio threads` pool: file bodies are read (and sent
+    /// with `sendfile`) on it, off the worker (#526).
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// A proxied response under `proxy_pass_header Date`: its `Date` is
     /// the upstream's, or there is none, and the worker doesn't stamp one
     /// (#360).
@@ -418,6 +421,7 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            aio: None,
             keep_upstream_date: false,
             gzip: None,
             max_ranges: None,
@@ -1225,6 +1229,7 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
+        meta.aio = loc.aio;
         meta.gzip = loc.gzip;
         meta.max_ranges = loc.max_ranges;
         // `set $limit_rate` wins over the directive, as nginx's

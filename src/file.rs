@@ -117,12 +117,10 @@ pub fn serve_path(
     cond: Conditionals<'_>,
     server: &[u8],
     sendfile: bool,
+    aio: bool,
 ) -> Response {
-    let inline_limit = if sendfile {
-        SENDFILE_MIN_BODY - 1
-    } else {
-        INLINE_BODY_LIMIT
-    };
+    // `aio threads`: the worker reads even small bodies on the pool.
+    let inline_limit = inline_limit(sendfile, aio);
     if !matches!(method, Method::Get | Method::Head) {
         // Caller should already have 405'd the method, but handle the
         // defensive case here too. Drop the fd on return.
@@ -203,6 +201,25 @@ pub fn serve_path(
             Response::Owned(error_response(412, "Precondition Failed\n", method, server))
         }
     }
+}
+
+/// Bodies up to this many bytes are read into the response buffer; larger
+/// ones go out as `Response::File`. 0 with `aio threads`, whose reads the
+/// worker does on the pool (`worker::read_file_inline`).
+pub(crate) fn inline_limit(sendfile: bool, aio: bool) -> u64 {
+    if aio {
+        0
+    } else if sendfile {
+        SENDFILE_MIN_BODY - 1
+    } else {
+        INLINE_BODY_LIMIT
+    }
+}
+
+/// The `inline_limit` without `aio threads`: what the worker reads into the
+/// response buffer on the pool when it is on.
+pub(crate) fn aio_inline_limit(sendfile: bool) -> u64 {
+    inline_limit(sendfile, false)
 }
 
 pub fn method_not_allowed(method: Method, server: &[u8]) -> Vec<u8> {
@@ -1038,6 +1055,7 @@ mod tests {
             no_cond(),
             b"nginx/1.30.6",
             false,
+            false,
         );
         match r {
             Response::File { headers, body } => {
@@ -1073,6 +1091,7 @@ mod tests {
             no_cond(),
             b"nginx/1.30.6",
             false,
+            false,
         );
         match r {
             Response::Owned(bytes) => {
@@ -1106,6 +1125,7 @@ mod tests {
             no_cond(),
             b"nginx/1.30.6",
             false,
+            false,
         );
         match r {
             Response::Owned(bytes) => {
@@ -1138,6 +1158,7 @@ mod tests {
             Method::Get,
             no_cond(),
             b"nginx/1.30.6",
+            false,
             false,
         );
         match r {
@@ -1712,6 +1733,7 @@ mod tests {
                 },
                 b"nginx/1.30.6",
                 false,
+                false,
             );
             let Response::Owned(bytes) = r else {
                 panic!("expected an inline response");
@@ -1958,6 +1980,7 @@ mod tests {
                 },
                 b"nginx/1.30.6",
                 false,
+                false,
             );
             let Response::Owned(bytes) = r else {
                 panic!("expected an inline response");
@@ -2015,6 +2038,7 @@ mod tests {
                 no_cond(),
                 b"nginx/1.30.6",
                 sendfile,
+                false,
             )
         };
         assert!(matches!(serve(&small, true), Response::Owned(_)));

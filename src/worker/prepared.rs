@@ -1580,6 +1580,9 @@ pub struct PreparedLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1640,6 +1643,9 @@ pub struct PreparedRegexLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1687,6 +1693,9 @@ pub struct MatchedLocation<'a> {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1729,6 +1738,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            aio: loc.aio,
             gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
@@ -1783,6 +1793,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            aio: loc.aio,
             gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
