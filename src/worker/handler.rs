@@ -1305,9 +1305,7 @@ pub(crate) fn run_location_handler(
             error_page_status,
             intercept,
             upgrade: client_upgrade,
-            // A response the range filter may cut is read whole (#370).
-            stream: loc.add_trailers.is_empty()
-                && !(req.range.is_some() && (force_ranges || cache.is_some())),
+            stream: loc.add_trailers.is_empty(),
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
             cache,

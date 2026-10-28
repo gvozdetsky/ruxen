@@ -1144,7 +1144,7 @@ fn finish_proxy_response(
     // with no body, then goes back with the upstream connection.
     // A body in the cache file (#515) likewise: the head is filtered,
     // the ranges cut the file.
-    let (upstream_resp, relayed, file) = match upstream_resp {
+    let (upstream_resp, mut relayed, file) = match upstream_resp {
         Response::ProxyStream(mut body) => (
             Response::Owned(std::mem::take(&mut body.head)),
             Some(body),
@@ -1212,7 +1212,7 @@ fn finish_proxy_response(
                 }
             }
             (upstream_resp, file) => (
-                range_filter(upstream_resp, relayed.is_some(), &process_meta, ctx),
+                range_filter(upstream_resp, &mut relayed, &process_meta, ctx),
                 file,
             ),
         }
@@ -1283,23 +1283,41 @@ fn may_cut_ranges(
 }
 
 /// nginx's range filter over a proxied or cached response (#370): an
-/// in-memory one is cut, a relayed one only says it could be.
+/// in-memory one is cut, a relayed one cut as it passes (#463).
 #[cold]
 #[inline(never)]
 fn range_filter(
     response: Response,
-    relayed: bool,
+    relayed: &mut Option<Box<crate::proxy_stream::ProxyStream>>,
     meta: &phase::ProcessMeta,
     ctx: &phase::RequestCtx<'_>,
 ) -> Response {
+    use super::range::RelayedCut;
     let req = super::range::RangeRequest {
         range: ctx.range,
         if_range: ctx.if_range,
         head_only: matches!(ctx.method, Method::Head),
     };
     match response {
-        Response::Owned(head) if relayed => {
-            Response::Owned(super::range::relayed_head(head, meta.max_ranges))
+        Response::Owned(head) if relayed.is_some() => {
+            match super::range::filter_relayed(head, meta.max_ranges, req, |len, server| {
+                super::range::not_satisfiable(len, req.head_only, server)
+            }) {
+                RelayedCut::Head(head) => Response::Owned(head),
+                RelayedCut::Window(head, start, end) => {
+                    if let Some(body) = relayed.as_deref_mut() {
+                        body.window = Some(crate::proxy_stream::Window::new(start, end));
+                    }
+                    Response::Owned(head)
+                }
+                // The body isn't the client's: only a cache reads on.
+                RelayedCut::Answer(answer) => {
+                    if let Some(body) = relayed.take() {
+                        crate::proxy_stream::fill_detached(body);
+                    }
+                    Response::Owned(answer)
+                }
+            }
         }
         Response::Owned(bytes) => Response::Owned(super::range::filter(
             bytes,

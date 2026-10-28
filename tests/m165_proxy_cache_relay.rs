@@ -59,7 +59,7 @@ fn spawn_backend(listener: TcpListener, plain: bool) -> Hits {
                         let framing = if path == "/slow" {
                             "Transfer-Encoding: chunked".to_string()
                         } else {
-                            format!("Content-Length: {}", body.len())
+                            format!("Content-Length: {}\r\nAccept-Ranges: bytes", body.len())
                         };
                         let _ = conn.write_all(
                             format!(
@@ -185,6 +185,7 @@ fn setup(name: &str) -> Setup {
                  error_page 404 = @e; }}\n\
                location @e {{ return 200 \"intercepted\\n\"; }}\n\
                location /x/ {{ proxy_pass http://127.0.0.1:{b}/; }}\n\
+               location /fr/ {{ proxy_pass http://127.0.0.1:{b}/; proxy_force_ranges on; }}\n\
                location /in/ {{ internal; proxy_pass http://127.0.0.1:{b}/; }}\n\
              }} }}\n"
         ),
@@ -400,6 +401,71 @@ fn m165_lock_is_held_until_the_file_is_stored() {
         second.head
     );
     assert_eq!(s.hits("/slow?lock"), 1);
+}
+
+fn ranged(port: u16, target: &str, range: &str) -> Reply {
+    send(
+        port,
+        &format!("GET {target} HTTP/1.1\r\nHost: x\r\nRange: {range}\r\nConnection: close\r\n\r\n"),
+    )
+}
+
+/// The range filter cuts one range from a relayed body: under
+/// `proxy_force_ranges`, and from a cacheable miss, whose whole body
+/// still goes into the cache.
+#[test]
+fn m165_ranges_are_cut_from_the_relay() {
+    let s = setup("range");
+    let whole = pattern(CHUNK * CHUNKS);
+    let len = whole.len();
+    for (target, range, start, end) in [
+        ("/fr/slowlen", "bytes=100000-199999", 100_000, 200_000),
+        ("/fr/slowlen", "bytes=-10", len - 10, len),
+        ("/fr/slowlen", "bytes=0-0", 0, 1),
+        ("/slowlen?r", "bytes=70000-", 70_000, len),
+    ] {
+        let r = ranged(s.port, target, range);
+        assert!(r.head.starts_with("HTTP/1.1 206 "), "{range}: {}", r.head);
+        assert!(
+            r.head.contains(&format!(
+                "\r\nContent-Range: bytes {start}-{}/{len}\r\n",
+                end - 1
+            )),
+            "{range}: {}",
+            r.head
+        );
+        assert!(
+            r.head
+                .contains(&format!("\r\nContent-Length: {}\r\n", end - start)),
+            "{range}: {}",
+            r.head
+        );
+        assert!(
+            r.body == whole[start..end],
+            "{range}: {} bytes",
+            r.body.len()
+        );
+        // Relayed: the first byte doesn't wait for the rest.
+        if end == 1 {
+            assert!(r.total < Duration::from_millis(1000), "{:?}", r.total);
+        }
+    }
+    // Not satisfiable, and several ranges where one is allowed.
+    let r = ranged(s.port, "/fr/slowlen", "bytes=999999-");
+    assert!(r.head.starts_with("HTTP/1.1 416 "), "{}", r.head);
+    let r = ranged(s.port, "/fr/slowlen", "bytes=0-9,20-29");
+    assert!(r.head.starts_with("HTTP/1.1 200 "), "{}", r.head);
+    assert!(
+        r.head.contains("\r\nAccept-Ranges: bytes\r\n"),
+        "{}",
+        r.head
+    );
+    assert!(r.body == whole);
+    // The miss cut for the client stored the whole body.
+    let r = hit(s.port, "/slowlen?r");
+    assert!(r.head.contains("\r\nX-Cache: HIT\r\n"), "{}", r.head);
+    assert!(r.body == whole, "{} bytes", r.body.len());
+    assert_eq!(s.hits("/slowlen?r"), 1);
 }
 
 /// Failover and interception are decided on the status line: the body

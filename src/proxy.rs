@@ -183,7 +183,7 @@ pub struct ProxyPlan {
     pub bind: Option<LocalBind>,
     /// A body that doesn't arrive with the header may be relayed as it
     /// comes (#88): nothing on this location needs it whole (no
-    /// `add_trailer`, no range to cut).
+    /// `add_trailer`).
     pub stream: bool,
     /// `proxy_force_ranges`: the range filter may cut the response whatever
     /// the upstream says (#370).
@@ -2294,6 +2294,7 @@ async fn attempt(
                 lease: None,
                 gzip: None,
                 cache: None,
+                window: None,
             },
         )));
     }
