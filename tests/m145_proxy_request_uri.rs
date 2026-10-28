@@ -91,6 +91,7 @@ fn start(up: u16) -> Server {
                  proxy_pass http://127.0.0.1:{up}; }}\n\
                location /sr/ {{ set $args \"a=1\";\n\
                  return 200 \"$args|$arg_a|$arg_b|$is_args|$query_string|$request_uri\"; }}\n\
+               location /ru {{ return 200 \"$request_uri|$uri|$args|$is_args\"; }}\n\
              }} }}\n"
         ),
     )
@@ -202,4 +203,41 @@ fn set_args_replaces_the_arguments() {
     }
     let resp = get(server.port, "/sr/x?b=2");
     assert!(resp.ends_with("\r\n\r\na=1|1||?|a=1|/sr/x?b=2"), "{resp}");
+}
+
+/// #748: a `#fragment` stays in the client's target, as nginx keeps it in
+/// `r->unparsed_uri`: `$request_uri` and an unchanged upstream target have
+/// it; `$uri`, `$args` and a URI part stop at the `#`.
+#[test]
+fn fragment_stays_in_the_unparsed_uri() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, upstream_gets) in [
+        ("/a?b=1#frag", "/a?b=1#frag"),
+        ("/a#f?x", "/a#f?x"),
+        ("/a%61#f", "/a%61#f"),
+        ("http://h/a#f", "/a#f"),
+        ("/p/x?y#frag", "/x/x?y"),
+        ("/r/x#frag", "/n/x"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
+    for (target, body) in [
+        ("/ru?b=1#frag", "/ru?b=1#frag|/ru|b=1|?"),
+        ("/ru#f?x", "/ru#f?x|/ru||"),
+        ("/ru#", "/ru#|/ru||"),
+        ("/ru?a=1#f#g", "/ru?a=1#f#g|/ru|a=1|?"),
+        ("http://h/ru#f", "/ru#f|/ru||"),
+        ("/ru?a", "/ru?a|/ru|a|?"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("\r\n\r\n{body}")),
+            "{target}: {resp}"
+        );
+    }
 }
