@@ -231,7 +231,7 @@ Supported functionality includes:
 - conditional requests
 - byte ranges (one range per request; `max_ranges 0` turns them off)
 - streamed large files
-- zero-copy `sendfile on|off` (plain TCP)
+- zero-copy `sendfile on|off` (plain TCP, and TLS with `ssl_conf_command Options KTLS`)
 - URI decoding and normalization
 - trailing-slash redirects
 - `autoindex`

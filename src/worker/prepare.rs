@@ -700,12 +700,28 @@ pub(crate) fn build_listen_tls(
                 policies.len() - 1
             })
     };
-    type ContextKey = (Option<usize>, crate::config::TlsVersionSet, bool, usize);
+    if inputs.iter().any(|i| i.ssl.ktls())
+        && let Err(e) = crate::ktls::probe()
+    {
+        prepare_warning_once(format!(
+            "\"ssl_conf_command Options KTLS\" has no effect: kernel TLS is not available \
+             ({e}); load the \"tls\" kernel module"
+        ));
+    }
+    // The last: `ssl_conf_command Options KTLS` (#673).
+    type ContextKey = (
+        Option<usize>,
+        crate::config::TlsVersionSet,
+        bool,
+        usize,
+        bool,
+    );
     let default_key: ContextKey = (
         auth_of(default)?,
         protocols,
         compress(default),
         policy_of(default),
+        default.ssl.ktls(),
     );
     let mut server_keys: Vec<ContextKey> = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -717,14 +733,17 @@ pub(crate) fn build_listen_tls(
                 versions_of(input)?,
                 compress(input),
                 policy_of(input),
+                input.ssl.ktls(),
             )
         });
     }
     // The address's config is the default server's context; the others
     // are configs of their own, indexed in `contexts`.
-    let context_config = |(auth, versions, compressed, policy): ContextKey|
+    let context_config = |(auth, versions, compressed, policy, ktls): ContextKey|
      -> Result<Arc<rustls::ServerConfig>, String> {
-            if (auth, versions, compressed, policy) == (None, protocols, compress(default), 0) {
+            if (auth, versions, compressed, policy, ktls)
+                == (None, protocols, compress(default), 0, false)
+            {
                 return Ok(cfg.clone());
             }
             let mut config = crate::tls_certs::with_context(
@@ -736,6 +755,8 @@ pub(crate) fn build_listen_tls(
             .map_err(|e| format!("listen {addr}: cannot build TLS config: {e}"))?;
             if let Some(config) = Arc::get_mut(&mut config) {
                 crate::tls_certs::compress_certificates(config, compressed);
+                // The traffic keys go to the kernel after the handshake.
+                config.enable_secret_extraction = ktls;
             }
             Ok(config)
         };
