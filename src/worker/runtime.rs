@@ -533,6 +533,51 @@ async fn log_before_routing(
     .await;
 }
 
+/// A request cut while its body was read (#866), as nginx's
+/// ngx_http_terminate_request ends it: nothing sent, 408 in the access log
+/// on `client_body_timeout`, else 400 and an `[info]` line. The location's
+/// logs, found again as before the read; `None`: nothing to log.
+#[cold]
+#[inline(never)]
+fn cut_body_logs(
+    http: &'static PreparedHttp,
+    probe: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    cut: BodyCut,
+) -> Option<(&'static [PreparedAccessLog], u16, &'static [u8])> {
+    if cut == BodyCut::Failed {
+        return None;
+    }
+    let first = phase::first_body_limit(http, probe, url_scratch, false);
+    let (error_logs, access_logs, server_port, server_name) = match &first {
+        Some(f) => (f.error_logs, f.access_logs, f.server_port, f.server_name),
+        None => {
+            let listen = &http.listens[probe.listen_index];
+            let server = &listen.servers[listen.default_server];
+            (
+                server.error_logs,
+                server.access_logs,
+                server.listen_port,
+                server.primary_server_name,
+            )
+        }
+    };
+    if cut == BodyCut::Closed {
+        write_error_log(
+            error_logs,
+            ErrorLogLevel::Info,
+            &ErrorLogRequest::new(probe, server_name),
+            b"client prematurely closed connection",
+            None,
+        );
+    }
+    let status: &'static [u8] = match cut {
+        BodyCut::TimedOut => b"HTTP/1.1 408 \r\n\r\n",
+        _ => b"HTTP/1.1 400 \r\n\r\n",
+    };
+    (!access_logs.is_empty()).then_some((access_logs, server_port, status))
+}
+
 /// How a request head ended before it was complete (#509).
 #[derive(Clone, Copy)]
 enum HeadCut<'e> {
@@ -4807,6 +4852,62 @@ pub(crate) async fn handle<S: ConnIo>(
                                 }
                             };
                         }
+                        // A request cut while its body is read (#866):
+                        // logged, nothing sent, the connection closed.
+                        macro_rules! cut_body {
+                            ($cut:expr, $request_length:expr) => {{
+                                let request_length: u64 = $request_length;
+                                let logs = {
+                                    let probe = request_ctx!(
+                                        &phase::NO_BODY,
+                                        0,
+                                        None,
+                                        None,
+                                        request_length,
+                                        0,
+                                        0
+                                    );
+                                    cut_body_logs(http, &probe, &mut *url_scratch, $cut)
+                                };
+                                if let Some((logs, server_port, status)) = logs {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default();
+                                    Box::pin(write_access_logs(
+                                        logs,
+                                        path,
+                                        method_bytes,
+                                        request_line,
+                                        host,
+                                        remote_addr,
+                                        remote_port,
+                                        None,
+                                        headers_raw,
+                                        status,
+                                        connection_id,
+                                        request_count,
+                                        request_id,
+                                        connection_time_us,
+                                        request_start.elapsed().as_micros() as u64,
+                                        server_port,
+                                        request_port,
+                                        pipe_byte,
+                                        request_length,
+                                        0,
+                                        0,
+                                        now.as_secs(),
+                                        now.subsec_millis() as u16,
+                                        tls,
+                                        conn,
+                                        http,
+                                        None,
+                                        None,
+                                    ))
+                                    .await;
+                                }
+                                return;
+                            }};
+                        }
                         // The read is bounded by the client_max_body_size
                         // of the location the request is routed to first,
                         // and a Content-Length over it is refused unread,
@@ -5017,7 +5118,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                             // Boxed: its timer and select!
                                             // stay out of every request's
                                             // future.
-                                            if !Box::pin(read_body_past_buffer(
+                                            if let Err(cut) = Box::pin(read_body_past_buffer(
                                                 stream,
                                                 &mut sink,
                                                 cl,
@@ -5028,7 +5129,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                             ))
                                             .await
                                             {
-                                                return;
+                                                cut_body!(cut, req.consumed as u64 + sink.len());
                                             }
                                             break;
                                         };
@@ -5045,10 +5146,16 @@ pub(crate) async fn handle<S: ConnIo>(
                                         )
                                         .await
                                         else {
-                                            return;
+                                            cut_body!(
+                                                BodyCut::TimedOut,
+                                                req.consumed as u64 + sink.len()
+                                            );
                                         };
                                         match res {
-                                            Ok(0) | Err(_) => return,
+                                            Ok(0) | Err(_) => cut_body!(
+                                                BodyCut::Closed,
+                                                req.consumed as u64 + sink.len()
+                                            ),
                                             Ok(n) => sink.put_read_buf(returned.into_inner(), n),
                                         }
                                     }
@@ -5125,8 +5232,14 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // Timed out or gone: nginx terminates the
                                 // request unanswered, as for a Content-Length
                                 // body above (#858).
-                                Err(ChunkedBodyError::TimedOut | ChunkedBodyError::Ended) => {
-                                    return;
+                                Err(e @ (ChunkedBodyError::TimedOut | ChunkedBodyError::Ended)) => {
+                                    let cut = match e {
+                                        ChunkedBodyError::TimedOut => BodyCut::TimedOut,
+                                        _ => BodyCut::Closed,
+                                    };
+                                    // What came with the head: the reads
+                                    // after it aren't counted back.
+                                    cut_body!(cut, (filled - base) as u64);
                                 }
                                 Err(_) => {
                                     reject_request(

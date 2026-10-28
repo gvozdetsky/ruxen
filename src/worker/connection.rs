@@ -1280,13 +1280,23 @@ pub(crate) async fn discard_request_body<S: ConnIo>(
     ok
 }
 
+/// Why a request body stopped coming before its end (#866).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyCut {
+    /// `client_body_timeout`: nginx logs 408.
+    TimedOut,
+    /// The client closed, or the read failed: 400 and an `[info]` line.
+    Closed,
+    /// The temp file failed (logged where it did).
+    Failed,
+}
+
 /// The rest of a body that has grown past `client_body_buffer_size`
 /// (`buffer`), through a pooled read buffer of that size, as nginx reuses
 /// its body buffer (#289). It stays in memory while it arrives within
 /// `BODY_IN_MEMORY_FOR` of `started`, and moves to the temp file when that
 /// passes. Apart from `handle`'s in-place reads, and boxed there, so this
-/// timer and `select!` don't weigh on every request's future. `false` on
-/// EOF, an error, `client_body_timeout`, or a temp file that fails.
+/// timer and `select!` don't weigh on every request's future.
 #[cold]
 pub(crate) async fn read_body_past_buffer<S: ConnIo>(
     stream: &mut S,
@@ -1296,14 +1306,14 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
     started: monoio::time::Instant,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
-) -> bool {
+) -> Result<(), BodyCut> {
     use monoio::buf::IoBufMut;
     let chunk_size = (buffer as usize).clamp(4096, 64 * 1024);
     let mut spill_timer = std::pin::pin!(monoio::time::sleep_until(started + BODY_IN_MEMORY_FOR));
     let mut chunk = super::take_body_buffer(chunk_size);
     let ok = loop {
         if sink.len() >= cl {
-            break true;
+            break Ok(());
         }
         let want = (cl - sink.len()).min(chunk_size as u64) as usize;
         chunk.clear();
@@ -1315,7 +1325,7 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
                 r = &mut read => done = Some(r),
                 _ = spill_timer.as_mut() => {
                     if !sink.spill() {
-                        break false;
+                        break Err(BodyCut::Failed);
                     }
                 }
             }
@@ -1325,15 +1335,15 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
             Some(r) => r,
             None => match with_timeout(timer.as_mut(), read_timeout, read).await {
                 Some(r) => r,
-                None => break false,
+                None => break Err(BodyCut::TimedOut),
             },
         };
         chunk = returned.into_inner();
         match res {
-            Ok(0) | Err(_) => break false,
+            Ok(0) | Err(_) => break Err(BodyCut::Closed),
             Ok(n) => {
                 if !sink.extend(&chunk[..n]) {
-                    break false;
+                    break Err(BodyCut::Failed);
                 }
             }
         }
