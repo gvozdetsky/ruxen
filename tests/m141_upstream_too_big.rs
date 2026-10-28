@@ -3,7 +3,7 @@
 //! would answer the same, and nothing counted against `max_fails`, so one
 //! request for a large object can't take the upstream group down.
 //!
-//! `proxy_cache` keeps the response on the buffered path. A
+//! `add_trailer` keeps the response on the buffered path. A
 //! `Content-Length` over the cap is refused before the body is read, so
 //! the backends only send the head.
 
@@ -80,11 +80,9 @@ fn too_big_is_a_502_without_blaming_the_peers() {
         format!(
             "worker_processes 1;\npid {d}/ruxen.pid;\nerror_log {d}/error.log;\n\
              events {{}}\nhttp {{\naccess_log off;\n\
-             proxy_cache_path {d}/cache keys_zone=z:1m;\n\
              upstream u {{ server 127.0.0.1:{a}; server 127.0.0.1:{b}; }}\n\
              server {{ listen 127.0.0.1:{port};\n\
-             location / {{ proxy_pass http://u; proxy_cache z; \
-             proxy_cache_valid 200 10m; }} }}\n}}\n",
+             location / {{ proxy_pass http://u; add_trailer X-T 1; }} }}\n}}\n",
             d = dir.display()
         ),
     )
@@ -114,7 +112,7 @@ fn too_big_is_a_502_without_blaming_the_peers() {
     for path in ["/s1", "/s2", "/s3", "/s4"] {
         let raw = get(port, path);
         assert!(
-            raw.starts_with("HTTP/1.1 200 ") && raw.ends_with("small"),
+            raw.starts_with("HTTP/1.1 200 ") && raw.contains("\r\nsmall\r\n"),
             "{path}: {raw}"
         );
     }
