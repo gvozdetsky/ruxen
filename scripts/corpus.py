@@ -452,6 +452,11 @@ def difference(finding, at_directive):
     variable = re.match(r'variable "(\$[^"]+)"', finding)
     if variable:
         return variable.group(1)
+    # Warnings that carry a sandbox path, or start with no directive.
+    if finding.startswith('"alias '):
+        return "alias and location: one ends with /"
+    if finding.startswith("server with ssl_* directives"):
+        return "ssl_* without listen … ssl"
     named = re.match(r'^"?([a-z0-9_]+)"?( on| off)?(?::| is | —)', finding)
     if named:
         return named.group(1) + (named.group(2) or "")

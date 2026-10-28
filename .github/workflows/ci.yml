@@ -28,6 +28,9 @@ jobs:
       - name: Test on the epoll driver
         # monoio's legacy driver, used where io_uring is unavailable (#215).
         run: RUXEN_DRIVER=epoll cargo test --release --locked
+      - name: Package as a release does
+        # A README link the tarball can't resolve fails here, not on the tag.
+        run: scripts/package.sh target/release/ruxen "$RUNNER_TEMP/dist" "$GITHUB_SHA"
       - name: Keep the binary for nginx-tests
         uses: actions/upload-artifact@v4
         with:
