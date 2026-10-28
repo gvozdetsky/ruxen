@@ -332,7 +332,7 @@ and one option nginx doesn't have: `--compat`, the configuration check described
 
 Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.30.6` instead, because the upstream tests assert nginx's header, and puts `nginx version: nginx/1.30.6` at the top of `-V`, which the harness needs too.
 
-ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) log reopening via `SIGUSR1`, and configuration reload via `SIGHUP`. `-s stop|quit|reopen|reload` send `SIGTERM`/`SIGQUIT`/`SIGUSR1`/`SIGHUP` to the PID in the config's `pid` file, as nginx does. A reload starts new workers with the new configuration (certificates included) on the same listening sockets, so connections aren't refused or reset in the handover, and the old workers finish their requests, within `worker_shutdown_timeout` if set; a configuration that fails to load is logged and the running one stays. After a switch to `user`, a reload reads the configuration as that user and can't bind new ports below 1024.
+ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) log reopening via `SIGUSR1`, and configuration reload via `SIGHUP`. `-s stop|quit|reopen|reload` send `SIGTERM`/`SIGQUIT`/`SIGUSR1`/`SIGHUP` to the PID in the config's `pid` file, as nginx does. A reload starts new workers with the new configuration (certificates included) on the same listening sockets, so connections aren't refused or reset in the handover, and the old workers finish their requests, within `worker_shutdown_timeout` if set; a configuration that fails to load is logged and the running one stays. After a switch to `user`, a reload reads the configuration (certificates and keys too) as that user; new ports below 1024 bind with `CAP_NET_BIND_SERVICE`, the one capability the process keeps after the switch.
 
 ## Compatibility philosophy
 
@@ -433,7 +433,7 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 - a proxied response is still read whole before it is sent in a few cases: a cache store, `add_trailer`, failover and interception (#463)
 - OCSP checks of client certificates (#142), 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
-- nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
+- nginx's binary upgrade (`SIGUSR2`)
 - variables in `root` and `alias` (#232)
 
 Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. `ssl_ciphers` is evaluated as OpenSSL would over the TLS 1.2 suites rustls has (all ECDHE with AES-GCM or ChaCha20-Poly1305; the weaker ones a list names don't exist here), and `ssl_prefer_server_ciphers` picks whose order counts. Accepted with a warning: `ssl_ecdh_curve` (rustls's modern groups are used).
