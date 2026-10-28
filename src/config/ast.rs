@@ -384,6 +384,11 @@ pub struct ProxyCachePath {
     pub inactive_secs: u64,
     pub max_size: Option<u64>,
     pub min_free: Option<u64>,
+    /// `manager_files`, `manager_sleep`, `manager_threshold` (nginx's
+    /// 100, 50ms, 200ms when unset).
+    pub manager_files: u64,
+    pub manager_sleep_ms: u64,
+    pub manager_threshold_ms: u64,
 }
 
 /// `proxy_bind address [transparent] | off`.
