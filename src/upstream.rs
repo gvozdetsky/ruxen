@@ -696,6 +696,32 @@ fn rr_pick_sticky(
     st
 }
 
+/// Whether peer `i` can be picked: not `down`, and not cooling off after
+/// `max_fails` (without a zone, as this worker sees it). For metrics.
+pub(crate) fn peer_up(up: &'static PreparedUpstream, i: usize) -> bool {
+    let Some(p) = up.peers.get(i) else {
+        return false;
+    };
+    if p.down {
+        return false;
+    }
+    if is_single(up) || p.max_fails == 0 {
+        return true;
+    }
+    let (fails, opened) = match up.shared {
+        Some(_) => fail_state(&UpstreamRt { peers: Vec::new() }, up, i),
+        None => LB_STATE.with(|state| {
+            let map = state.borrow();
+            match map.get(&(up as *const PreparedUpstream)) {
+                Some(rt) => fail_state(rt, up, i),
+                None => (0, None),
+            }
+        }),
+    };
+    !matches!(opened, Some(opened) if fails >= p.max_fails
+        && opened.elapsed() < Duration::from_millis(p.fail_timeout_ms))
+}
+
 fn peer_eligible(
     rt: &UpstreamRt,
     up: &PreparedUpstream,
@@ -851,6 +877,9 @@ fn least_conn_pick(
 /// `weight / max_fails` from `effective_weight` (floor at 0). Failures are
 /// counted within a `fail_timeout` window measured from the most recent fail.
 pub fn report_failure(upstream: &'static PreparedUpstream, peer_idx: usize) {
+    if let Some(slots) = upstream.metrics {
+        crate::worker::metrics::peer_failure(slots, peer_idx);
+    }
     // nginx never marks a lone server unavailable: with one peer and no
     // backups (`peers->single`), max_fails and fail_timeout are ignored and
     // failures aren't even counted (ngx_http_upstream_free_round_robin_peer
@@ -1296,6 +1325,7 @@ mod tests {
             lb,
             shared: None,
             sticky: None,
+            metrics: None,
         }))
     }
 
@@ -1497,6 +1527,7 @@ mod tests {
             lb: Lb::prepare(lb, peers),
             shared: None,
             sticky: None,
+            metrics: None,
         }))
     }
 
@@ -1622,6 +1653,7 @@ mod tests {
             lb: Lb::RoundRobin,
             shared: zone.then(|| PeerShared::for_peers(peers.len())),
             sticky: None,
+            metrics: None,
         }))
     }
 
@@ -1710,6 +1742,7 @@ mod tests {
             lb: Lb::RoundRobin,
             shared: None,
             sticky: Some(sticky),
+            metrics: None,
         }))
     }
 
