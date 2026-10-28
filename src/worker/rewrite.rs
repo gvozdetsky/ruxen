@@ -148,10 +148,6 @@ fn eval_guard_plain(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> bool {
     }
 }
 
-pub(crate) fn rewrite_target_is_external(rendered: &[u8]) -> bool {
-    rendered.starts_with(b"http://") || rendered.starts_with(b"https://")
-}
-
 /// `ngx_unescape_uri(…, NGX_UNESCAPE_REDIRECT)`, which a `rewrite …
 /// redirect` target goes through before the request's arguments are
 /// added: `%XX` turns into the byte when it is printable and above `%`,
@@ -467,11 +463,12 @@ pub(crate) fn execute_rewrite_ops(
                     buf
                 });
 
+                // A replacement starting with a scheme is a `Redirect` since
+                // the parser (#798).
                 let external_redirect = matches!(
                     flag,
                     PreparedRewriteFlag::Redirect | PreparedRewriteFlag::Permanent
-                ) || matches!(flag, PreparedRewriteFlag::None)
-                    && rewrite_target_is_external(&new_uri);
+                );
 
                 if external_redirect {
                     if quoted {

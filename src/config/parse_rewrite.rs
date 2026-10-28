@@ -51,6 +51,18 @@ pub(crate) fn parse_rewrite_op(args: &[String]) -> Result<RewriteOp, Error> {
             });
         }
     };
+    // A redirect is decided on the replacement as written, whatever `last`
+    // or `break` say (ngx_http_rewrite); never on the rendered target, which
+    // a capture can make look like a URL (#798).
+    let external = ["http://", "https://", "$scheme"]
+        .iter()
+        .any(|p| raw_replacement.starts_with(p));
+    let flag = match flag {
+        RewriteFlag::None | RewriteFlag::Last | RewriteFlag::Break if external => {
+            RewriteFlag::Redirect
+        }
+        flag => flag,
+    };
 
     Ok(RewriteOp::Rewrite(RewriteRule {
         regex: pattern,
