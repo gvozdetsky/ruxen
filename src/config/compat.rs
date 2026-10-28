@@ -308,12 +308,6 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "chunked_transfer_encoding",
     ),
     (
-        "proxy_buffering",
-        Some("on"),
-        "ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #463)",
-        "proxy_buffering-off",
-    ),
-    (
         "proxy_request_buffering",
         Some("on"),
         "request bodies are still read whole before they are proxied (#134)",
@@ -667,7 +661,7 @@ mod tests {
     #[test]
     fn the_report_links_each_section_once() {
         let (found, _) = findings(
-            "http { server { location / { proxy_buffering off; fastcgi_pass x; \
+            "http { server { location / { proxy_request_buffering off; fastcgi_pass x; \
              uwsgi_pass y; } } }",
         );
         let out = report(
@@ -684,7 +678,7 @@ mod tests {
             links,
             [
                 format!("{GUIDE}#fastcgi-uwsgi-scgi-memcached"),
-                format!("{GUIDE}#proxy_buffering-off"),
+                format!("{GUIDE}#proxy_request_buffering-off"),
                 format!("{GUIDE}#variables-that-are-always-empty"),
             ],
             "{out}"

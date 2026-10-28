@@ -30,11 +30,9 @@ Checked against ruxen 0.2.2 and nginx 1.30.6.
 $ ruxen --compat -c /etc/nginx/nginx.conf
 ruxen 0.2.2: checking /etc/nginx/nginx.conf
 /etc/nginx/sites-enabled/mastodon:74: differs: gzip_static on — precompressed .gz files are not served (#760)
-/etc/nginx/sites-enabled/mastodon:141: differs: proxy_buffering off — ruxen relays a response as it arrives either way, except where it still reads it whole (…: #463)
-ignored: 4 tuning directives with no effect in ruxen: gzip_buffers, proxy_buffering, tcp_nodelay
+ignored: 3 tuning directives with no effect in ruxen: gzip_buffers, tcp_nodelay
 what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#gzip_static-on
-what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#proxy_buffering-off
-ruxen starts with this configuration; 2 directives behave differently from nginx
+ruxen starts with this configuration; 1 directive behaves differently from nginx
 ```
 
 - **unsupported**: ruxen refuses to start with it.
@@ -160,25 +158,6 @@ configuration was read: a certificate, a root or a log file that can't be
 opened, a port that can't be bound. Run `--compat` where ruxen will run.
 
 ## What ruxen does differently (`differs`)
-
-### `proxy_buffering off`
-
-- **ruxen:** relays every proxied response as it arrives, whatever
-  `proxy_buffering` says. It still reads a response whole first where
-  something needs all of it: a `proxy_cache` store, `add_trailer`, a status
-  `proxy_next_upstream` may fail over on or `proxy_intercept_errors`
-  intercepts, a range under `proxy_force_ranges`.
-- **Matters:** for long-lived responses (server-sent events, long polling)
-  in a location with one of those. With `proxy_buffering on`, nginx's
-  default, the difference goes the other way: a slow client keeps the
-  upstream busy until it has read the response (beyond what the socket
-  buffers hold), where nginx reads the response into its buffers and frees
-  the upstream. That counts for application servers with a few synchronous
-  workers.
-- **Do:** usually nothing. Keep streamed responses away from caching,
-  `add_trailer` and failover on their status.
-- **Issue:** [#463] (open: the cases still read whole), [#764] (open: buffering
-  for slow clients).
 
 ### `ssl_protocols`
 
@@ -470,7 +449,6 @@ start without it.
 [#134]: https://github.com/gvozdetsky/ruxen/issues/134
 [#232]: https://github.com/gvozdetsky/ruxen/issues/232
 [#337]: https://github.com/gvozdetsky/ruxen/issues/337
-[#463]: https://github.com/gvozdetsky/ruxen/issues/463
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
 [#526]: https://github.com/gvozdetsky/ruxen/issues/526
 [#596]: https://github.com/gvozdetsky/ruxen/issues/596
@@ -479,5 +457,4 @@ start without it.
 [#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
 [#760]: https://github.com/gvozdetsky/ruxen/issues/760
-[#764]: https://github.com/gvozdetsky/ruxen/issues/764
 [#774]: https://github.com/gvozdetsky/ruxen/issues/774
