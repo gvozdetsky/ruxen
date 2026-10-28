@@ -64,6 +64,8 @@ pub fn prepare(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
     ERROR_LOG_FILES.with(|f| f.borrow_mut().clear());
     let inheritable = cfg.runtime.ssl_object_cache_inheritable.unwrap_or(true);
     let prepared = prepare_http(cfg);
+    // Whatever `prepare_http` left: `finish` took it unless it failed.
+    super::metrics::begin(false);
     if prepared.is_ok() {
         crate::tls_certs::keep_files(inheritable);
     }
@@ -119,6 +121,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         uses_request_id,
         uses_stderr_log,
         uses_stats,
+        uses_metrics,
         runtime,
         error_logs: http_error_logs,
         log_formats,
@@ -159,6 +162,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         conf_prefix,
     } = cfg;
 
+    super::metrics::begin(uses_metrics);
     // No `server` blocks is valid, as in nginx: workers start with nothing
     // to listen on and idle until shutdown.
     // Group server blocks by listen address while preserving declaration
@@ -410,6 +414,7 @@ fn prepare_http(cfg: HttpConfig) -> Result<&'static PreparedHttp, String> {
         uses_request_id,
         uses_stderr_log,
         stats: uses_stats,
+        metrics: super::metrics::finish(),
         body_temp: BodyTempDir::new(client_body_temp_path),
         listens,
         access_logs: canonical_access_logs,
@@ -1015,7 +1020,9 @@ pub(crate) fn prepare_upstreams(
             shared: u
                 .zone
                 .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
+            metrics: super::metrics::peer_slots(name_static.as_bytes(), peers),
         }));
+        super::metrics::note_upstream(prepared);
         out.insert(name_static, &*prepared);
     }
     out
@@ -1396,7 +1403,9 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    metrics: super::metrics::peer_slots(host_header_static, peers),
                 }));
+            super::metrics::note_upstream(upstream);
             if inet && let Ok(authority) = std::str::from_utf8(host_header_static) {
                 note_implicit_upstream(authority, upstream);
             }
@@ -1508,6 +1517,8 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    // A request's own peers: not counted.
+                    metrics: None,
                 }));
             PreparedProxy {
                 upstream,
@@ -2593,6 +2604,13 @@ pub(crate) fn prepare_server(
     };
 
     Ok(PreparedServer {
+        metrics_slot: super::metrics::server_slot(
+            primary_server_name,
+            match &server.listen.unix {
+                Some(path) => format!("unix:{}", path.display()),
+                None => server.listen.addr.to_string(),
+            },
+        ),
         doc_root: server_doc_root,
         charset: prepare_charset(&server.charset),
         // Set by the caller, which knows the http scope.
@@ -3584,7 +3602,7 @@ fn resolve_access(
 /// the static handler, or with the location's `proxy_pass`.
 fn limit_except_rebuilds_handler(handler: &Handler, try_files: &Option<TryFiles>) -> bool {
     match handler {
-        Handler::Proxy(_) | Handler::StubStatus => false,
+        Handler::Proxy(_) | Handler::StubStatus | Handler::Metrics => false,
         Handler::Root { .. } => try_files.is_some(),
         Handler::Return { .. } => true,
     }
@@ -3694,6 +3712,7 @@ pub(crate) fn build_handler(
             )
         }
         Handler::StubStatus => PreparedHandler::StubStatus,
+        Handler::Metrics => PreparedHandler::Metrics,
         Handler::Proxy(pp) => PreparedHandler::Proxy(build_proxy(
             pp,
             site.upstreams,

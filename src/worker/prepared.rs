@@ -648,6 +648,8 @@ pub enum PreparedHandler {
     Proxy(PreparedProxy),
     /// `stub_status` (#96).
     StubStatus,
+    /// `ruxen_metrics` (#481).
+    Metrics,
 }
 
 /// Per-location rules for an upstream's response headers, behind one
@@ -1170,6 +1172,8 @@ pub struct PreparedUpstream {
     /// all workers (one slot per peer). `None`: per worker, as nginx's
     /// without a zone.
     pub shared: Option<&'static [crate::upstream::PeerShared]>,
+    /// Each peer's metrics slot (#481); `None` without `ruxen_metrics`.
+    pub metrics: Option<&'static [u32]>,
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in
@@ -1898,6 +1902,8 @@ pub struct LocationLevel {
 /// server; cross-server selection happens in `phase::find_config` which
 /// walks the table priorities in nginx order.
 pub struct PreparedServer {
+    /// This server's metrics slot (#481); 0 without `ruxen_metrics`.
+    pub metrics_slot: u32,
     /// The server's `root` (else `html`), for `$request_filename` in its
     /// rewrite phase.
     pub doc_root: &'static DocRoot,
@@ -2177,6 +2183,8 @@ pub struct PreparedHttp {
     /// `stub_status` or `$connections_*` is used: keep the counters
     /// (`stats`).
     pub stats: bool,
+    /// `ruxen_metrics` is used: the counters it shows (#481).
+    pub metrics: Option<&'static super::metrics::Metrics>,
     /// Where request bodies too large for memory go.
     pub body_temp: BodyTempDir,
     pub access_logs: &'static [PreparedAccessLog],

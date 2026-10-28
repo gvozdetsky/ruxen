@@ -1,0 +1,490 @@
+//! `ruxen_metrics;` (#481): the `stub_status` counters, per server and per
+//! upstream peer counters, in Prometheus text format 0.0.4.
+//!
+//! Kept only when a location uses the handler: `PreparedHttp::metrics` is
+//! `None` otherwise, and every update site checks that first. As in
+//! `stats`, each worker owns its slots (cache-line aligned) and is their
+//! only writer: an update is a relaxed load and store. The handler sums
+//! the workers' slots. Slots belong to a configuration generation, so a
+//! reload starts the counters again at zero.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+use super::{PreparedPeer, PreparedUpstream};
+
+/// Upper bounds of the response-time histogram, in µs (Prometheus's
+/// default buckets).
+const BUCKETS_US: [u64; 11] = [
+    5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
+    10_000_000,
+];
+
+#[repr(align(64))]
+#[derive(Default)]
+struct ServerSlot {
+    /// Responses by status class, 1xx to 5xx (anything else counts as 5xx).
+    by_class: [AtomicU64; 5],
+    bytes: AtomicU64,
+}
+
+#[repr(align(64))]
+#[derive(Default)]
+struct PeerSlot {
+    requests: AtomicU64,
+    failures: AtomicU64,
+    /// Per bucket (not cumulative), the last one past the largest bound.
+    buckets: [AtomicU64; BUCKETS_US.len() + 1],
+    sum_us: AtomicU64,
+}
+
+/// One worker's counters.
+struct WorkerSlots {
+    servers: Box<[ServerSlot]>,
+    peers: Box<[PeerSlot]>,
+}
+
+struct ServerLabels {
+    server: String,
+    listen: String,
+}
+
+struct PeerLabels {
+    upstream: String,
+    peer: String,
+    /// The peer whose state the scrape shows.
+    of: Option<(&'static PreparedUpstream, usize)>,
+}
+
+/// A configuration's metrics: what the slots stand for, and every
+/// worker's slots.
+pub struct Metrics {
+    servers: Box<[ServerLabels]>,
+    peers: Box<[PeerLabels]>,
+    workers: Mutex<Vec<&'static WorkerSlots>>,
+}
+
+impl std::fmt::Debug for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metrics")
+            .field("servers", &self.servers.len())
+            .field("peers", &self.peers.len())
+            .finish()
+    }
+}
+
+impl Drop for Metrics {
+    fn drop(&mut self) {
+        let workers = self.workers.get_mut().unwrap_or_else(|e| e.into_inner());
+        for slots in workers.drain(..) {
+            // SAFETY: leaked by `attach`; the generation's workers, the
+            // only other holders, are gone once its configuration drops.
+            drop(unsafe { Box::from_raw(slots as *const WorkerSlots as *mut WorkerSlots) });
+        }
+    }
+}
+
+thread_local! {
+    /// This worker's slots, set by `attach`.
+    static MINE: Cell<Option<&'static WorkerSlots>> = const { Cell::new(None) };
+    /// The labels of the configuration being prepared.
+    static BUILD: RefCell<Option<Builder>> = const { RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct Builder {
+    servers: Vec<ServerLabels>,
+    server_index: HashMap<(String, String), u32>,
+    peers: Vec<PeerLabels>,
+    peer_index: HashMap<(String, String), u32>,
+}
+
+/// Start preparing a configuration; `on` when a location uses the handler.
+pub(crate) fn begin(on: bool) {
+    BUILD.with(|b| *b.borrow_mut() = on.then(Builder::default));
+}
+
+/// The slot of a server on `listen` (0 when metrics are off). Servers with
+/// the same name on the same address share one, so no series repeats.
+pub(crate) fn server_slot(name: &[u8], listen: String) -> u32 {
+    BUILD.with(|b| {
+        let mut b = b.borrow_mut();
+        let Some(b) = b.as_mut() else { return 0 };
+        let key = (String::from_utf8_lossy(name).into_owned(), listen);
+        if let Some(&i) = b.server_index.get(&key) {
+            return i;
+        }
+        let i = b.servers.len() as u32;
+        b.servers.push(ServerLabels {
+            server: key.0.clone(),
+            listen: key.1.clone(),
+        });
+        b.server_index.insert(key, i);
+        i
+    })
+}
+
+/// The slot of each of an upstream's peers, by upstream name and peer
+/// address (two `server` lines with one address share one); `None` when
+/// metrics are off.
+pub(crate) fn peer_slots(upstream: &[u8], peers: &[PreparedPeer]) -> Option<&'static [u32]> {
+    BUILD.with(|b| {
+        let mut b = b.borrow_mut();
+        let b = b.as_mut()?;
+        let name = String::from_utf8_lossy(upstream).into_owned();
+        let slots: Vec<u32> = peers
+            .iter()
+            .map(|p| {
+                let key = (name.clone(), p.addr.to_string());
+                if let Some(&i) = b.peer_index.get(&key) {
+                    return i;
+                }
+                let i = b.peers.len() as u32;
+                b.peers.push(PeerLabels {
+                    upstream: key.0.clone(),
+                    peer: key.1.clone(),
+                    of: None,
+                });
+                b.peer_index.insert(key, i);
+                i
+            })
+            .collect();
+        Some(&*crate::arena::leak(slots.into_boxed_slice()))
+    })
+}
+
+/// `upstream`, now prepared, shows its peers' state, unless another one
+/// with the same slots came first.
+pub(crate) fn note_upstream(upstream: &'static PreparedUpstream) {
+    let Some(slots) = upstream.metrics else {
+        return;
+    };
+    BUILD.with(|b| {
+        if let Some(b) = b.borrow_mut().as_mut() {
+            for (i, &slot) in slots.iter().enumerate() {
+                let labels = &mut b.peers[slot as usize];
+                labels.of.get_or_insert((upstream, i));
+            }
+        }
+    });
+}
+
+/// The configuration's metrics, or `None` when no location reads them.
+pub(crate) fn finish() -> Option<&'static Metrics> {
+    let b = BUILD.with(|b| b.borrow_mut().take())?;
+    Some(crate::arena::leak(Box::new(Metrics {
+        servers: b.servers.into_boxed_slice(),
+        peers: b.peers.into_boxed_slice(),
+        workers: Mutex::new(Vec::new()),
+    })))
+}
+
+impl Metrics {
+    /// Give the calling worker its slots, until `detach`.
+    pub(crate) fn attach(&'static self) {
+        let slots: &'static WorkerSlots = Box::leak(Box::new(WorkerSlots {
+            servers: (0..self.servers.len())
+                .map(|_| Default::default())
+                .collect(),
+            peers: (0..self.peers.len()).map(|_| Default::default()).collect(),
+        }));
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(slots);
+        MINE.with(|m| m.set(Some(slots)));
+    }
+}
+
+/// The worker is done with its configuration's slots.
+pub(crate) fn detach() {
+    MINE.with(|m| m.set(None));
+}
+
+/// Owner-only update: a load and a store, both relaxed.
+fn add(counter: &AtomicU64, n: u64) {
+    counter.store(counter.load(Relaxed).wrapping_add(n), Relaxed);
+}
+
+/// A response (`head` the head it had) went out from server slot
+/// `server`.
+#[cold]
+#[inline(never)]
+pub(crate) fn response(server: u32, head: &[u8], bytes: u64) {
+    let status = super::response::response_status(head);
+    MINE.with(|m| {
+        let Some(slot) = m.get().and_then(|s| s.servers.get(server as usize)) else {
+            return;
+        };
+        let class = (status / 100).clamp(1, 5) as usize - 1;
+        add(&slot.by_class[class], 1);
+        add(&slot.bytes, bytes);
+    });
+}
+
+/// An attempt on peer `peer` of an upstream with slots `slots` ended
+/// after `took`.
+#[cold]
+#[inline(never)]
+pub(crate) fn peer_attempt(slots: &[u32], peer: usize, took: std::time::Duration) {
+    let us = took.as_micros() as u64;
+    with_peer(slots, peer, |slot| {
+        add(&slot.requests, 1);
+        let bucket = BUCKETS_US
+            .iter()
+            .position(|&le| us <= le)
+            .unwrap_or(BUCKETS_US.len());
+        add(&slot.buckets[bucket], 1);
+        add(&slot.sum_us, us);
+    });
+}
+
+/// An attempt failed, as `max_fails` counts failures.
+#[cold]
+#[inline(never)]
+pub(crate) fn peer_failure(slots: &[u32], peer: usize) {
+    with_peer(slots, peer, |slot| add(&slot.failures, 1));
+}
+
+fn with_peer(slots: &[u32], peer: usize, f: impl FnOnce(&PeerSlot)) {
+    MINE.with(|m| {
+        if let Some(slot) = m
+            .get()
+            .zip(slots.get(peer))
+            .and_then(|(s, &i)| s.peers.get(i as usize))
+        {
+            f(slot);
+        }
+    });
+}
+
+/// A label value, escaped as the text format wants.
+fn escape(value: &str, out: &mut String) {
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+}
+
+fn header(out: &mut String, name: &str, kind: &str, help: &str) {
+    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
+}
+
+/// Seconds from µs, as text.
+fn seconds(us: u64) -> String {
+    format!("{}.{:06}", us / 1_000_000, us % 1_000_000)
+}
+
+/// A bucket bound: `0.005`, `1`, `10`.
+fn bound(us: u64) -> String {
+    let s = seconds(us);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The page: the `stub_status` counters, then the configuration's.
+pub(crate) fn render(m: &Metrics) -> String {
+    let mut out = String::with_capacity(4096);
+    let t = super::stats::totals();
+    for (name, kind, help, value) in [
+        (
+            "ruxen_connections_active",
+            "gauge",
+            "Client connections open, waiting ones included.",
+            t.active,
+        ),
+        (
+            "ruxen_connections_reading",
+            "gauge",
+            "Connections reading a request head.",
+            t.reading,
+        ),
+        (
+            "ruxen_connections_writing",
+            "gauge",
+            "Connections processing a request or writing its response.",
+            t.writing,
+        ),
+        (
+            "ruxen_connections_waiting",
+            "gauge",
+            "Idle keep-alive connections.",
+            t.waiting,
+        ),
+        (
+            "ruxen_connections_accepted_total",
+            "counter",
+            "Client connections accepted.",
+            t.accepted,
+        ),
+        (
+            "ruxen_connections_handled_total",
+            "counter",
+            "Client connections handled (not refused at worker_connections).",
+            t.handled,
+        ),
+        (
+            "ruxen_http_requests_total",
+            "counter",
+            "Client requests.",
+            t.requests,
+        ),
+    ] {
+        header(&mut out, name, kind, help);
+        let _ = writeln!(out, "{name} {value}");
+    }
+
+    let workers: Vec<&'static WorkerSlots> =
+        m.workers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let sum = |f: &dyn Fn(&WorkerSlots) -> u64| workers.iter().map(|w| f(w)).sum::<u64>();
+    let mut labels = String::new();
+
+    if !m.servers.is_empty() {
+        header(
+            &mut out,
+            "ruxen_server_responses_total",
+            "counter",
+            "Responses by server block and status class.",
+        );
+        for (i, s) in m.servers.iter().enumerate() {
+            labels.clear();
+            labels.push_str("server=\"");
+            escape(&s.server, &mut labels);
+            labels.push_str("\",listen=\"");
+            escape(&s.listen, &mut labels);
+            labels.push('"');
+            for class in 0..5 {
+                let n = sum(&|w| w.servers[i].by_class[class].load(Relaxed));
+                let _ = writeln!(
+                    out,
+                    "ruxen_server_responses_total{{{labels},code=\"{}xx\"}} {n}",
+                    class + 1
+                );
+            }
+        }
+        header(
+            &mut out,
+            "ruxen_server_sent_bytes_total",
+            "counter",
+            "Bytes sent to clients by server block, heads included.",
+        );
+        for (i, s) in m.servers.iter().enumerate() {
+            labels.clear();
+            labels.push_str("server=\"");
+            escape(&s.server, &mut labels);
+            labels.push_str("\",listen=\"");
+            escape(&s.listen, &mut labels);
+            labels.push('"');
+            let n = sum(&|w| w.servers[i].bytes.load(Relaxed));
+            let _ = writeln!(out, "ruxen_server_sent_bytes_total{{{labels}}} {n}");
+        }
+    }
+
+    if !m.peers.is_empty() {
+        let peer_labels: Vec<String> = m
+            .peers
+            .iter()
+            .map(|p| {
+                let mut l = String::from("upstream=\"");
+                escape(&p.upstream, &mut l);
+                l.push_str("\",peer=\"");
+                escape(&p.peer, &mut l);
+                l.push('"');
+                l
+            })
+            .collect();
+        header(
+            &mut out,
+            "ruxen_upstream_peer_requests_total",
+            "counter",
+            "Attempts on an upstream peer.",
+        );
+        for (i, l) in peer_labels.iter().enumerate() {
+            let n = sum(&|w| w.peers[i].requests.load(Relaxed));
+            let _ = writeln!(out, "ruxen_upstream_peer_requests_total{{{l}}} {n}");
+        }
+        header(
+            &mut out,
+            "ruxen_upstream_peer_failures_total",
+            "counter",
+            "Failed attempts on an upstream peer, as max_fails counts them.",
+        );
+        for (i, l) in peer_labels.iter().enumerate() {
+            let n = sum(&|w| w.peers[i].failures.load(Relaxed));
+            let _ = writeln!(out, "ruxen_upstream_peer_failures_total{{{l}}} {n}");
+        }
+        header(
+            &mut out,
+            "ruxen_upstream_peer_response_seconds",
+            "histogram",
+            "Time from the start of an attempt until the upstream's response \
+             was in (its head, for a streamed body).",
+        );
+        for (i, l) in peer_labels.iter().enumerate() {
+            let mut cumulative = 0;
+            for (b, le) in BUCKETS_US.iter().enumerate() {
+                cumulative += sum(&|w| w.peers[i].buckets[b].load(Relaxed));
+                let _ = writeln!(
+                    out,
+                    "ruxen_upstream_peer_response_seconds_bucket{{{l},le=\"{}\"}} {cumulative}",
+                    bound(*le)
+                );
+            }
+            cumulative += sum(&|w| w.peers[i].buckets[BUCKETS_US.len()].load(Relaxed));
+            let _ = writeln!(
+                out,
+                "ruxen_upstream_peer_response_seconds_bucket{{{l},le=\"+Inf\"}} {cumulative}"
+            );
+            let total_us = sum(&|w| w.peers[i].sum_us.load(Relaxed));
+            let _ = writeln!(
+                out,
+                "ruxen_upstream_peer_response_seconds_sum{{{l}}} {}\n\
+                 ruxen_upstream_peer_response_seconds_count{{{l}}} {cumulative}",
+                seconds(total_us)
+            );
+        }
+        header(
+            &mut out,
+            "ruxen_upstream_peer_up",
+            "gauge",
+            "1 if the peer can be picked, 0 if it is down or cooling off after \
+             max_fails (without a zone, as the scraping worker sees it).",
+        );
+        for (p, l) in m.peers.iter().zip(&peer_labels) {
+            let up =
+                p.of.is_none_or(|(upstream, i)| crate::upstream::peer_up(upstream, i));
+            let _ = writeln!(out, "ruxen_upstream_peer_up{{{l}}} {}", up as u8);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_values_are_escaped() {
+        let mut out = String::new();
+        escape("a\"b\\c\nd", &mut out);
+        assert_eq!(out, r#"a\"b\\c\nd"#);
+    }
+
+    #[test]
+    fn bucket_bounds_print_as_seconds() {
+        let shown: Vec<String> = BUCKETS_US.iter().map(|&us| bound(us)).collect();
+        assert_eq!(
+            shown,
+            [
+                "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10"
+            ]
+        );
+        assert_eq!(seconds(1_234_567), "1.234567");
+    }
+}

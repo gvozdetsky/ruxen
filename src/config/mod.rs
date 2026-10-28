@@ -266,6 +266,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     http.uses_request_id = values::request_id_used();
     http.uses_stderr_log = values::stderr_log_used();
     http.uses_stats = values::stats_used();
+    http.uses_metrics = values::metrics_used();
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -479,6 +480,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         uses_request_id: false,
                         uses_stderr_log: false,
                         uses_stats: false,
+                        uses_metrics: false,
                         client_body_temp_path,
                         sendfile,
                         http2,

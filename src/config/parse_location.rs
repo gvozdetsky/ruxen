@@ -479,8 +479,10 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
                     location.alias_prefix_override = parent.alias_prefix_override.clone();
                     location.inherits_root = parent.inherits_root;
                 }
-                let static_parent =
-                    !matches!(parent.handler, Handler::Proxy(_) | Handler::StubStatus);
+                let static_parent = !matches!(
+                    parent.handler,
+                    Handler::Proxy(_) | Handler::StubStatus | Handler::Metrics
+                );
                 let keeps_own =
                     !parent.explicit_return && (*own_handler || (*own_root && static_parent));
                 if keeps_own && *own_handler {
@@ -593,6 +595,7 @@ pub(crate) fn parse_location_block(
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
     let mut stub_status = false;
+    let mut metrics = false;
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
     let mut limit_req = LimitReqConf::default();
@@ -668,6 +671,8 @@ pub(crate) fn parse_location_block(
                         Handler::Return { status, body }
                     } else if stub_status {
                         Handler::StubStatus
+                    } else if metrics {
+                        Handler::Metrics
                     } else if let Some(pp) = proxy_pass {
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
@@ -1134,6 +1139,17 @@ pub(crate) fn parse_location_block(
             ("stub_status", Terminator::Semi) if args.len() <= 2 => {
                 stub_status = true;
                 crate::config::values::note_stats_used();
+            }
+            // ruxen's own (#481), where `stub_status` goes.
+            ("ruxen_metrics", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::Directive {
+                        name: "ruxen_metrics",
+                        msg: "takes no arguments".to_string(),
+                    });
+                }
+                metrics = true;
+                crate::config::values::note_metrics_used();
             }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {

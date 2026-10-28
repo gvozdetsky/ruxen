@@ -486,6 +486,9 @@ async fn log_before_routing(
 ) {
     let listen = &http.listens[conn.listen_index];
     let server = &listen.servers[listen.default_server];
+    if http.metrics.is_some() {
+        super::metrics::response(server.metrics_slot, response, sent);
+    }
     if server.access_logs.is_empty() {
         return;
     }
@@ -1961,6 +1964,9 @@ pub fn run(
     let ready_on_failure = ready.clone();
     let body = async move {
         WORKER_CONNS.with(|w| w.http.set(Some(http)));
+        if let Some(m) = http.metrics {
+            m.attach();
+        }
         // Open one fd per configured access_log for this worker. Kept in a
         // thread-local so `write_access_logs` can do io_uring writes without
         // re-opening the file per request.
@@ -2141,6 +2147,7 @@ pub fn run(
         },
         Driver::Epoll => run_epoll(body),
     }
+    super::metrics::detach();
 }
 
 /// nginx's notice lines for a worker's end, from its own thread
@@ -5017,13 +5024,20 @@ pub(crate) async fn handle<S: ConnIo>(
                                 last.bytes_received += tunnelled.from_upstream;
                                 last.bytes_sent += tunnelled.to_upstream;
                             }
+                            let bytes_sent = if head_sent {
+                                head_len as u64 + tunnelled.to_client
+                            } else {
+                                head_cut_at
+                            };
+                            if http.metrics.is_some() {
+                                super::metrics::response(
+                                    process_meta.metrics_server,
+                                    &head,
+                                    bytes_sent,
+                                );
+                            }
                             if !process_meta.access_logs.is_empty() {
                                 let request_time_us = request_start.elapsed().as_micros() as u64;
-                                let bytes_sent = if head_sent {
-                                    head_len as u64 + tunnelled.to_client
-                                } else {
-                                    head_cut_at
-                                };
                                 write_access_logs(
                                     process_meta.access_logs,
                                     path,
@@ -5100,6 +5114,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             _ => false,
                         };
                         if closes {
+                            if http.metrics.is_some() {
+                                let head: &[u8] = match &response {
+                                    Response::Prebuilt(b) => b,
+                                    Response::Owned(b) => b,
+                                    _ => &[],
+                                };
+                                super::metrics::response(process_meta.metrics_server, head, 0);
+                            }
                             if !process_meta.access_logs.is_empty() {
                                 let logged: &[u8] = match &response {
                                     Response::Prebuilt(b) => b,
@@ -5479,6 +5501,14 @@ pub(crate) async fn handle<S: ConnIo>(
                             }
                         }
 
+                        if http.metrics.is_some() {
+                            super::metrics::response(
+                                process_meta.metrics_server,
+                                response_for_logs,
+                                cut_sent
+                                    .unwrap_or(response_for_logs.len() as u64 + streamed_body_len),
+                            );
+                        }
                         if !process_meta.access_logs.is_empty() {
                             let request_time_us = request_start.elapsed().as_micros() as u64;
                             // Body bytes = total minus header block. The header

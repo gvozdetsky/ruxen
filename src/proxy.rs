@@ -799,7 +799,12 @@ pub async fn run_proxy(
             )
             .await
         };
-        state.response_ms = Some(elapsed_ms(started));
+        let elapsed = started.elapsed();
+        state.response_ms = Some(elapsed.as_millis() as u64);
+        // A request's own peers (`adhoc`) have none.
+        if let Some(slots) = upstream.metrics {
+            crate::worker::metrics::peer_attempt(slots, current.peer_idx, elapsed);
+        }
         if let AttemptOutcome::Failed(_, kind, _) = &outcome {
             state.status = if matches!(kind, FailKind::Timeout) {
                 504
