@@ -155,11 +155,8 @@ pub(crate) fn unenforced(lx: &Lexer, args: &[String], err: Error) -> Result<(), 
         }
         other => other.to_string(),
     };
-    let section = match args[0].as_str() {
-        "location" => "location-var",
-        _ => "root-or-alias-with-variables",
-    };
-    record(lx, Severity::Unsupported, args, note, section);
+    // `location $var` is the only one left (#596).
+    record(lx, Severity::Unsupported, args, note, "location-var");
     Ok(())
 }
 
@@ -272,12 +269,6 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "gzip-in-if",
     ),
     (
-        "gzip_static",
-        Some("off"),
-        "precompressed .gz files are not served (#760)",
-        "gzip_static-on",
-    ),
-    (
         "ssi",
         Some("off"),
         "server-side includes are not processed",
@@ -310,7 +301,7 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
     (
         "proxy_buffering",
         Some("on"),
-        "ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #463)",
+        "ruxen relays a response as it arrives either way (#88, #463)",
         "proxy_buffering-off",
     ),
     (
@@ -610,10 +601,10 @@ mod tests {
 
     #[test]
     fn unenforced_restrictions_are_unsupported() {
-        let (found, _) = findings("http { server { root /srv/$host; } }");
+        let (found, _) = findings("http { server { location $arg_x { return 403; } } }");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].severity, Severity::Unsupported);
-        assert_eq!(found[0].directive, "root /srv/$host");
+        assert_eq!(found[0].directive, "location $arg_x");
     }
 
     #[test]
@@ -720,11 +711,11 @@ mod tests {
         // The other findings, as the parser records them.
         let (found, _) = findings(
             "http { ssl_protocols TLSv1; include /nonexistent/x.conf; server { \
-             root /srv/$host; location $x { } location /a { alias /srv/$1; } \
+             location $x { } \
              no_such_directive; fastcgi_pass a; grpc_pass b; sub_filter c d; ssi_value_length 9; \
              mirror /m; } } stream { } mail { }",
         );
-        assert_eq!(found.len(), 13, "{found:?}");
+        assert_eq!(found.len(), 11, "{found:?}");
         sections.extend(found.iter().map(|f| f.section));
         for s in sections {
             assert!(
