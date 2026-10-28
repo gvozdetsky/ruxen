@@ -3559,12 +3559,20 @@ impl AcceptTick {
 pub(crate) async fn wait_readable_or_shutdown(
     stream: &TcpStream,
     state: &RuntimeState,
-    idle_timeout: Option<Duration>,
+    limits: IdleLimits,
     fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> bool {
     use std::task::Poll;
 
+    let mut idle_timeout = limits.timeout;
+    if let Some(min) = limits.min {
+        match hold_keepalive(stream, state, min, idle_timeout, timers).await {
+            Held::Readable => return true,
+            Held::Close => return false,
+            Held::Idle(rest) => idle_timeout = rest,
+        }
+    }
     let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
     if let Some(due) = due {
         arm_idle(timers.idle.as_mut(), due);
@@ -3607,12 +3615,20 @@ pub(crate) async fn read_first_or_shutdown<T: monoio::buf::IoBufMut>(
     stream: &mut TcpStream,
     buf: T,
     state: &RuntimeState,
-    idle_timeout: Option<Duration>,
+    limits: IdleLimits,
     fresh: bool,
     timers: &mut ConnTimers<'_>,
 ) -> (IdleRead, Option<T>) {
     use std::task::Poll;
 
+    let mut idle_timeout = limits.timeout;
+    if let Some(min) = limits.min {
+        match hold_keepalive(stream, state, min, idle_timeout, timers).await {
+            Held::Readable => return (IdleRead::Ready, Some(buf)),
+            Held::Close => return (IdleRead::Close, Some(buf)),
+            Held::Idle(rest) => idle_timeout = rest,
+        }
+    }
     let due = idle_timeout.map(|t| monoio::time::Instant::now() + t);
     if let Some(due) = due {
         arm_idle(timers.idle.as_mut(), due);
@@ -3643,6 +3659,56 @@ pub(crate) async fn read_first_or_shutdown<T: monoio::buf::IoBufMut>(
         // The read is dropped with this frame, and cancelled with it.
         None => (IdleRead::Close, None),
     }
+}
+
+/// How the first part of a keep-alive wait under `keepalive_min_timeout`
+/// ended.
+enum Held {
+    Readable,
+    Close,
+    /// Idle from now on, for this much longer (`None`: no limit).
+    Idle(Option<Duration>),
+}
+
+/// The first `min` of a keep-alive wait (`keepalive_min_timeout`, #601):
+/// not idle yet, so shutdown, a reload and a drain leave the connection
+/// open (ngx_http_set_keepalive leaves it out of the reusable ones). At its
+/// end the connection closes when shutting down or when `timeout` (no
+/// longer than `min`) is over, as ngx_http_keepalive_handler does.
+#[cold]
+async fn hold_keepalive(
+    stream: &TcpStream,
+    state: &RuntimeState,
+    min: Duration,
+    timeout: Option<Duration>,
+    timers: &mut ConnTimers<'_>,
+) -> Held {
+    use std::task::Poll;
+
+    let hold = timeout.map_or(min, |t| t.min(min));
+    let end = monoio::time::Instant::now() + hold;
+    arm_idle(timers.idle.as_mut(), end);
+    let mut readable = std::pin::pin!(stream.readable(false));
+    let ready = std::future::poll_fn(|cx| {
+        if let Poll::Ready(res) = readable.as_mut().poll(cx) {
+            return Poll::Ready(Some(res.is_ok()));
+        }
+        if idle_expired(timers.idle.as_mut(), end, cx) {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await;
+    match ready {
+        Some(true) => return Held::Readable,
+        Some(false) => return Held::Close,
+        None => {}
+    }
+    let rest = timeout.map(|t| t.saturating_sub(min));
+    if rest == Some(Duration::ZERO) || state.is_shutting_down() {
+        return Held::Close;
+    }
+    Held::Idle(rest)
 }
 
 /// A connection's read buffer and scratch buffers (see `handle`).
@@ -4514,10 +4580,12 @@ pub(crate) async fn handle<S: ConnIo>(
         .accepted_at
         .filter(|_| !stream.h2())
         .map(|at| at + timeouts.header);
-    let mut keepalive_idle_timeout: Option<Duration> =
-        Some(first_head_due.map_or(timeouts.header, |due| {
+    let mut keepalive_idle = IdleLimits {
+        timeout: Some(first_head_due.map_or(timeouts.header, |due| {
             due.saturating_duration_since(Instant::now())
-        }));
+        })),
+        min: None,
+    };
     // When the current request's header must be complete; set on the first
     // read for it, cleared once the request is handled.
     let mut header_deadline: Option<monoio::time::Instant>;
@@ -4599,7 +4667,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     .idle_read(
                         std::mem::take(&mut *buf),
                         state,
-                        keepalive_idle_timeout,
+                        keepalive_idle,
                         std::mem::take(&mut fresh),
                         &mut timers,
                     )
@@ -4615,7 +4683,10 @@ pub(crate) async fn handle<S: ConnIo>(
         };
         restore_read_len(buf, buf_ptr, buf_len);
         conn_stats.set(super::stats::Phase::Reading);
-        keepalive_idle_timeout = None;
+        keepalive_idle = IdleLimits {
+            timeout: None,
+            min: None,
+        };
         // The header's time starts with its first bytes, as nginx's
         // client_header_timeout after the keep-alive read; the first
         // request's runs from the accept.
@@ -6206,10 +6277,12 @@ pub(crate) async fn handle<S: ConnIo>(
                             return;
                         }
 
-                        keepalive_idle_timeout = process_meta
-                            .keepalive
-                            .idle_timeout_ms
-                            .map(Duration::from_millis);
+                        let keepalive = &process_meta.keepalive;
+                        keepalive_idle = IdleLimits {
+                            timeout: keepalive.idle_timeout_ms.map(Duration::from_millis),
+                            min: (keepalive.min_timeout_ms > 0)
+                                .then(|| Duration::from_millis(keepalive.min_timeout_ms.into())),
+                        };
                     }
                     Parse::Incomplete => break,
                     Parse::Invalid => {
