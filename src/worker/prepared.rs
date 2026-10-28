@@ -542,6 +542,9 @@ pub struct PreparedKeepalive {
     pub header_timeout_secs: Option<u64>,
     pub max_requests: u64,
     pub max_time_ms: u64,
+    /// `keepalive_min_timeout` (#601): for this long after a response the
+    /// connection isn't closed by shutdown, a reload or a drain; 0: off.
+    pub min_timeout_ms: u64,
     pub disable_msie6: bool,
     pub disable_safari: bool,
 }
@@ -631,6 +634,9 @@ pub enum PreparedAuthBasic {
 pub(crate) const DEFAULT_KEEPALIVE_REQUESTS: u64 = 1_000;
 
 pub(crate) const DEFAULT_KEEPALIVE_TIME_MS: u64 = 3_600_000;
+
+/// nginx's `keepalive_timeout` when none is set (#773).
+pub(crate) const DEFAULT_KEEPALIVE_TIMEOUT_MS: u64 = 75_000;
 
 #[derive(Debug, Copy, Clone)]
 pub struct PreparedErrorPage {
@@ -1014,6 +1020,8 @@ pub(crate) struct UpstreamTlsSettings {
     pub certificate_key: Option<PreparedCertPath>,
     /// `proxy_ssl_password_file` (#139).
     pub password_file: Option<&'static std::path::Path>,
+    /// `proxy_ssl_certificate_cache` (#601); `None`: off.
+    pub certificate_cache: Option<crate::config::SslCertificateCache>,
 }
 
 impl UpstreamTlsSettings {
@@ -1034,6 +1042,7 @@ impl UpstreamTlsSettings {
         certificate: None,
         certificate_key: None,
         password_file: None,
+        certificate_cache: None,
     };
 
     /// `conf`'s values over `self`.
@@ -1068,6 +1077,7 @@ impl UpstreamTlsSettings {
                 Some(path) => path.as_ref().map(PreparedCertPath::new),
                 None => self.certificate_key,
             },
+            certificate_cache: conf.ssl_certificate_cache.unwrap_or(self.certificate_cache),
         }
     }
 }
@@ -1332,6 +1342,17 @@ pub struct PreparedRoot<'a> {
     pub if_modified_since: crate::config::IfModifiedSince,
     pub etag: bool,
     pub try_files: Option<&'static PreparedTryFiles>,
+    /// `gzip_static on|always` (#760).
+    pub gzip_static: Option<&'static PreparedGzipStatic>,
+}
+
+/// A location's `gzip_static on|always` (#760).
+#[derive(Debug)]
+pub struct PreparedGzipStatic {
+    pub always: bool,
+    /// The location's `gzip_vary`, `gzip_http_version`, `gzip_proxied` and
+    /// `gzip_disable`: they apply with `gzip off` too.
+    pub checks: &'static PreparedGzip,
 }
 
 /// Where a location's URIs map on disk, whatever its handler: its `root`

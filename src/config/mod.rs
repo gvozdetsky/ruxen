@@ -38,7 +38,7 @@ mod values;
 
 pub use ast::*;
 pub use error::*;
-pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_gzip::{GzipConf, GzipStatic, proxied as gzip_proxied};
 pub use parse_http2::Http2Conf;
 pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
 pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
@@ -313,6 +313,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
+    let mut keepalive_min_timeout_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
     let mut client_timeouts = ClientTimeouts::default();
     let mut error_logs: Option<Vec<ErrorLog>> = None;
@@ -425,6 +426,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         server.keepalive_requests =
                             server.keepalive_requests.or(keepalive_requests);
                         server.keepalive_time_ms = server.keepalive_time_ms.or(keepalive_time_ms);
+                        server.keepalive_min_timeout_ms =
+                            server.keepalive_min_timeout_ms.or(keepalive_min_timeout_ms);
                         server.keepalive_disable = server.keepalive_disable.or(keepalive_disable);
                         server.client_timeouts = server.client_timeouts.inherit(client_timeouts);
                         server.client_timeouts.check_large_header_buffers()?;
@@ -987,6 +990,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 keepalive_time_ms = Some(parse_keepalive_time_args(&args[1..])?);
             }
+            ("keepalive_min_timeout", Terminator::Semi) => {
+                if keepalive_min_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("keepalive_min_timeout"));
+                }
+                keepalive_min_timeout_ms = Some(parse_keepalive_min_timeout_args(&args[1..])?);
+            }
             ("keepalive_disable", Terminator::Semi) => {
                 if keepalive_disable.is_some() {
                     return Err(Error::Duplicate("keepalive_disable"));
@@ -1166,7 +1175,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "gzip_min_length",
     "gzip_buffers",
     "gzip_disable",
-    "gzip_static",
     "ssi",
     "ssi_silent_errors",
     "ssi_types",
@@ -2504,6 +2512,50 @@ mod tests {
             "http { ssl_certificate_cache off; ssl_certificate_cache off; }",
             "http { server { listen 80; location / { ssl_certificate_cache off; } } }",
             "http { ssl_certificate_compression yes; }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// `proxy_ssl_certificate_cache` (#601), parsed as nginx's
+    /// ngx_http_proxy_ssl_certificate_cache: seconds, `off` winning.
+    #[test]
+    fn proxy_ssl_certificate_cache_directive() {
+        let cfg = parse(
+            "http { server { listen 80; proxy_ssl_certificate_cache max=4 valid=2s;\n\
+             location /a { proxy_ssl_certificate_cache max=1 inactive=1m; }\n\
+             location /b { proxy_ssl_certificate_cache max=1 off; } } }",
+        )
+        .unwrap();
+        let server = &cfg.servers[0];
+        let Some(Some(cache)) = server.proxy.ssl_certificate_cache else {
+            panic!("{:?}", server.proxy.ssl_certificate_cache);
+        };
+        assert_eq!(
+            (cache.max, cache.inactive_secs, cache.valid_secs),
+            (4, 10, 2)
+        );
+        let loc = |p: &str| {
+            server
+                .locations
+                .iter()
+                .find(|l| l.pattern == p)
+                .unwrap()
+                .proxy
+                .ssl_certificate_cache
+        };
+        let Some(Some(a)) = loc("/a") else { panic!() };
+        assert_eq!((a.max, a.inactive_secs, a.valid_secs), (1, 60, 60));
+        assert_ne!(a.id, cache.id);
+        assert_eq!(loc("/b"), Some(None));
+        for bad in [
+            "http { proxy_ssl_certificate_cache inactive=20s; }",
+            "http { proxy_ssl_certificate_cache max=0; }",
+            "http { proxy_ssl_certificate_cache max=-1; }",
+            "http { proxy_ssl_certificate_cache max=1 valid=500ms; }",
+            "http { proxy_ssl_certificate_cache max=1 foo; }",
+            "http { proxy_ssl_certificate_cache; }",
+            "http { proxy_ssl_certificate_cache off; proxy_ssl_certificate_cache off; }",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
@@ -4507,6 +4559,49 @@ mod tests {
             .find(|l| l.pattern == "/loc")
             .expect("location /loc");
         assert_eq!(loc.keepalive_time_ms, Some(100));
+    }
+
+    /// `keepalive_min_timeout` (#601): http, server and location.
+    #[test]
+    fn keepalive_min_timeout_parses_and_inherits() {
+        let src = r#"
+            http {
+                keepalive_min_timeout 2s;
+                server {
+                    listen 80;
+                    location / { return 200 "ok"; }
+                    location = /loc {
+                        keepalive_min_timeout 100ms;
+                        return 200 "l";
+                    }
+                }
+                server { listen 81; keepalive_min_timeout 0; }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let server = &cfg.servers[0];
+        assert_eq!(server.keepalive_min_timeout_ms, Some(2_000));
+        let loc = |pattern: &str| {
+            server
+                .locations
+                .iter()
+                .find(|l| l.pattern == pattern)
+                .unwrap()
+                .keepalive_min_timeout_ms
+        };
+        // The server's applies to its locations in `resolve_keepalive`.
+        assert_eq!(loc("/"), None);
+        assert_eq!(loc("/loc"), Some(100));
+        assert_eq!(cfg.servers[1].keepalive_min_timeout_ms, Some(0));
+        for bad in [
+            "http { keepalive_min_timeout 1s; keepalive_min_timeout 2s; }",
+            "http { keepalive_min_timeout; }",
+            "http { keepalive_min_timeout 1s 2s; }",
+            "http { keepalive_min_timeout x; }",
+            "keepalive_min_timeout 1s; http { }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod auth;
 mod autoindex;
 mod client_verify;
 mod config;
+mod duplex;
 mod file;
 mod fs_resolve;
 mod http;

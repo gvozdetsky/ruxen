@@ -23,9 +23,9 @@ use crate::config::AutoindexFormat;
 use crate::config::{ErrorLogLevel, SymlinkMode};
 use crate::phase::RerouteTarget;
 use crate::worker::{
-    Prebuilt, PreparedFallback, PreparedIndexEntry, PreparedPathMapping, PreparedProbe,
-    PreparedRoot, PreparedSymlinkFrom, PreparedSymlinks, PreparedTryFiles, RenderCtx, RootTemplate,
-    render_parts,
+    Prebuilt, PreparedFallback, PreparedGzipStatic, PreparedIndexEntry, PreparedPathMapping,
+    PreparedProbe, PreparedRoot, PreparedSymlinkFrom, PreparedSymlinks, PreparedTryFiles,
+    RenderCtx, RootTemplate, render_parts,
 };
 
 /// A file successfully opened under the server root, with its metadata
@@ -48,6 +48,13 @@ pub enum Outcome {
     /// `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`; the fd inside
     /// `Opened` is owned by the caller and must be consumed or dropped.
     Serve(Opened),
+    /// Under `gzip_static` (#760): `file.gz` (`gzip`) or the file itself,
+    /// `Vary: Accept-Encoding` with `vary`.
+    ServeGzipStatic {
+        opened: Opened,
+        gzip: bool,
+        vary: bool,
+    },
     /// 301 redirect. Value is the `Location:` header bytes (absolute path).
     /// Used only for the trailing-slash-on-directory case.
     Redirect(Vec<u8>),
@@ -77,15 +84,17 @@ pub enum Outcome {
 /// PRECONTENT_PHASE, before static/index). On a probe hit we continue
 /// into the static/index pass with the rewritten URL; on full miss we
 /// apply the configured fallback.
+/// `http_11`: for `gzip_http_version` under `gzip_static`.
 pub fn resolve(
     root: &'static PreparedRoot<'static>,
     url_path: &[u8],
     render_ctx: &RenderCtx<'_>,
+    http_11: bool,
 ) -> Outcome {
     if let Some(template) = root.template {
-        return resolve_rendered(root, template, url_path, render_ctx);
+        return resolve_rendered(root, template, url_path, render_ctx, http_11);
     }
-    resolve_under(root, url_path, render_ctx)
+    resolve_under(root, url_path, render_ctx, http_11)
 }
 
 /// `resolve` for a `root` / `alias` with variables (#232): rendered as
@@ -98,6 +107,7 @@ fn resolve_rendered(
     template: &RootTemplate,
     url_path: &[u8],
     render_ctx: &RenderCtx<'_>,
+    http_11: bool,
 ) -> Outcome {
     let path = template.render(render_ctx);
     if template.is_unsafe(&path) {
@@ -131,20 +141,25 @@ fn resolve_rendered(
         root_fd,
         ..*root
     };
-    resolve_under(&rendered, url_path, render_ctx)
+    resolve_under(&rendered, url_path, render_ctx, http_11)
 }
 
-fn resolve_under(root: &PreparedRoot<'_>, url_path: &[u8], render_ctx: &RenderCtx<'_>) -> Outcome {
+fn resolve_under(
+    root: &PreparedRoot<'_>,
+    url_path: &[u8],
+    render_ctx: &RenderCtx<'_>,
+    http_11: bool,
+) -> Outcome {
     if let Some(tf) = root.try_files {
         match run_try_files(root, tf, url_path, render_ctx) {
             TryFilesResult::Hit {
                 new_url,
                 add_uri_to_alias,
-            } => return resolve_static(root, &new_url, render_ctx, add_uri_to_alias),
+            } => return resolve_static(root, &new_url, render_ctx, add_uri_to_alias, http_11),
             TryFilesResult::Miss => return apply_fallback(&tf.fallback, render_ctx),
         }
     }
-    resolve_static(root, url_path, render_ctx, false)
+    resolve_static(root, url_path, render_ctx, false, http_11)
 }
 
 enum TryFilesResult {
@@ -361,6 +376,7 @@ fn resolve_static(
     url_path: &[u8],
     render_ctx: &RenderCtx<'_>,
     add_uri_to_alias: bool,
+    http_11: bool,
 ) -> Outcome {
     if url_path.ends_with(b"/") {
         // Index handling runs on trailing-slash URIs. Absolute entries
@@ -437,7 +453,125 @@ fn resolve_static(
     // benchmark traffic). `open_and_stat` now handles the dir branch
     // itself by issuing the 301 redirect after fstat — same observable
     // behavior, one fewer syscall for files and misses.
+    if let Some(gs) = root.gzip_static {
+        return gzip_static(root, gs, url_path, add_uri_to_alias, render_ctx, http_11);
+    }
     open_and_stat(root, url_path, add_uri_to_alias)
+}
+
+/// ngx_http_gzip_static_handler, which runs before the static module:
+/// `<file>.gz` for a GET or HEAD whose client may have gzip (`on`, by
+/// `ngx_http_gzip_ok`) or any client (`always`), else the file itself.
+/// Under `on`, a `.gz` that exists makes the response `Vary` (shown with
+/// `gzip_vary`), whoever gets it.
+#[cold]
+#[inline(never)]
+fn gzip_static(
+    root: &PreparedRoot,
+    gs: &PreparedGzipStatic,
+    url_path: &[u8],
+    add_uri_to_alias: bool,
+    render_ctx: &RenderCtx<'_>,
+    http_11: bool,
+) -> Outcome {
+    let plain = |vary: bool| match open_and_stat(root, url_path, add_uri_to_alias) {
+        Outcome::Serve(opened) if vary => Outcome::ServeGzipStatic {
+            opened,
+            gzip: false,
+            vary: true,
+        },
+        other => other,
+    };
+    if !matches!(render_ctx.request_method, b"GET" | b"HEAD") {
+        return plain(false);
+    }
+    let ok = gs.always
+        || crate::worker::gzip::static_ok(
+            gs.checks,
+            &crate::worker::gzip::GzipRequest::from_headers(http_11, render_ctx.headers_raw),
+        );
+    if !ok && !gs.checks.vary {
+        return plain(false);
+    }
+    let rel = relative_uri_path_for_static(root, url_path, add_uri_to_alias);
+    let mut gz_rel = Vec::with_capacity(rel.len() + 3);
+    gz_rel.extend_from_slice(rel);
+    gz_rel.extend_from_slice(b".gz");
+    let gz_path = || {
+        if rel.is_empty() {
+            let mut path = root.root.as_os_str().to_owned();
+            path.push(".gz");
+            PathBuf::from(path)
+        } else {
+            join(root.root, &gz_rel)
+        }
+    };
+    let fd = if !rel.is_empty() {
+        open_rel(root, &gz_rel)
+    } else if matches!(root.symlinks.mode, SymlinkMode::Off) {
+        // An `alias` naming a file: its `.gz` is beside the root.
+        std::fs::File::open(gz_path()).map(OwnedFd::from)
+    } else {
+        return plain(false);
+    };
+    let stat = fd.and_then(|fd| Ok((fstat(fd.as_raw_fd())?, fd)));
+    let (stat, fd) = match stat {
+        Ok(found) => found,
+        Err(e) => {
+            gzip_static_open_failed(root, &gz_path(), &e);
+            return plain(false);
+        }
+    };
+    let vary = !gs.always && gs.checks.vary;
+    let mode = stat.st_mode & libc::S_IFMT;
+    if !ok || mode == libc::S_IFDIR {
+        return plain(vary);
+    }
+    if mode != libc::S_IFREG {
+        note_failed_lookup_at(
+            format!("\"{}\" is not a regular file", gz_path().display()),
+            false,
+            ErrorLogLevel::Crit,
+        );
+        return Outcome::NotFound;
+    }
+    Outcome::ServeGzipStatic {
+        opened: Opened {
+            fd,
+            size: stat.st_size as u64,
+            mtime: stat.st_mtime.max(0) as u64,
+            mime: root.types.for_url(url_path),
+        },
+        gzip: true,
+        vary,
+    }
+}
+
+/// nginx logs a `.gz` it can't open unless it's missing, and goes on
+/// with the file itself.
+fn gzip_static_open_failed(root: &PreparedRoot, path: &Path, e: &std::io::Error) {
+    let level = match e.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ENAMETOOLONG) => return,
+        // Outside the root (RESOLVE_BENEATH): ruxen's own policy, as in
+        // `open_failed`.
+        Some(libc::EXDEV) => return,
+        Some(libc::EACCES | libc::EMLINK | libc::ELOOP) => ErrorLogLevel::Error,
+        _ => ErrorLogLevel::Crit,
+    };
+    let call = if matches!(root.symlinks.mode, SymlinkMode::Off) {
+        "open()"
+    } else {
+        "openat()"
+    };
+    note_failed_lookup_at(
+        format!(
+            "{call} \"{}\" failed ({})",
+            path.display(),
+            crate::worker::errno_text(e)
+        ),
+        false,
+        level,
+    );
 }
 
 /// Open the request's target file under `root.root_fd` with kernel-enforced
@@ -450,38 +584,9 @@ fn resolve_static(
 /// serving path doesn't re-stat.
 fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -> Outcome {
     let rel = relative_uri_path_for_static(root, url_path, add_uri_to_alias);
-
-    // A direct file alias (`alias /some/file;`) and regex-location alias
-    // without `add_uri_to_alias` both legitimately produce an empty rel —
-    // the caller is asking for the aliased path verbatim. `openat2`
-    // requires a non-empty pathname (there's no `AT_EMPTY_PATH` knob in
-    // `open_how.resolve`), so we `dup(2)` the cached root fd instead:
-    // one syscall, no path walk, no race between stat and open.
-    let root_fd = match root.fd() {
+    let fd = match open_rel(root, rel) {
         Ok(fd) => fd,
         Err(e) => return open_failed(root, rel, e),
-    };
-    let fd = if !matches!(root.symlinks.mode, SymlinkMode::Off) {
-        match open_refusing_symlinks(root, root_fd, rel) {
-            Ok(fd) => fd,
-            Err(e) => return open_failed(root, rel, e),
-        }
-    } else if rel.is_empty() {
-        match dup_fd(root_fd) {
-            Ok(fd) => fd,
-            Err(e) => return open_failed(root, rel, e),
-        }
-    } else {
-        match openat2_beneath(root_fd, rel) {
-            Ok(fd) => fd,
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) && !has_dot_dot(rel) => {
-                match open_following_symlinks(root_fd, rel) {
-                    Ok(fd) => fd,
-                    Err(e) => return open_failed(root, rel, e),
-                }
-            }
-            Err(e) => return open_failed(root, rel, e),
-        }
     };
 
     let stat = match fstat(fd.as_raw_fd()) {
@@ -522,6 +627,30 @@ fn open_and_stat(root: &PreparedRoot, url_path: &[u8], add_uri_to_alias: bool) -
         mtime,
         mime: root.types.for_url(url_path),
     })
+}
+
+/// `rel` opened beneath the root, by the location's symlink policy.
+/// A direct file alias (`alias /some/file;`) and regex-location alias
+/// without `add_uri_to_alias` both legitimately produce an empty rel —
+/// the caller is asking for the aliased path verbatim. `openat2`
+/// requires a non-empty pathname (there's no `AT_EMPTY_PATH` knob in
+/// `open_how.resolve`), so we `dup(2)` the cached root fd instead:
+/// one syscall, no path walk, no race between stat and open.
+#[inline(always)]
+fn open_rel(root: &PreparedRoot, rel: &[u8]) -> std::io::Result<OwnedFd> {
+    let root_fd = root.fd()?;
+    if !matches!(root.symlinks.mode, SymlinkMode::Off) {
+        open_refusing_symlinks(root, root_fd, rel)
+    } else if rel.is_empty() {
+        dup_fd(root_fd)
+    } else {
+        match openat2_beneath(root_fd, rel) {
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) && !has_dot_dot(rel) => {
+                open_following_symlinks(root_fd, rel)
+            }
+            result => result,
+        }
+    }
 }
 
 /// `open_and_stat` under `disable_symlinks on|if_not_owner`, nginx's
@@ -1051,6 +1180,7 @@ mod tests {
             if_modified_since: crate::config::IfModifiedSince::Exact,
             etag: true,
             try_files: None,
+            gzip_static: None,
         }
     }
 

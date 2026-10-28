@@ -269,12 +269,6 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "gzip-in-if",
     ),
     (
-        "gzip_static",
-        Some("off"),
-        "precompressed .gz files are not served (#760)",
-        "gzip_static-on",
-    ),
-    (
         "ssi",
         Some("off"),
         "server-side includes are not processed",

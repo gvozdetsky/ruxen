@@ -1076,6 +1076,9 @@ fn prepare_cache_zones(paths: Vec<crate::config::ProxyCachePath>) -> Result<(), 
             inactive_secs: p.inactive_secs,
             max_size: p.max_size,
             min_free: p.min_free,
+            manager_files: p.manager_files,
+            manager_sleep_ms: p.manager_sleep_ms,
+            manager_threshold_ms: p.manager_threshold_ms,
         }));
     }
     for zone in &zones {
@@ -1613,6 +1616,7 @@ fn prepare_upstream_tls(
                 settings.server_name,
                 settings.session_reuse,
                 store.clone(),
+                settings.certificate_cache,
             ));
             None
         }
@@ -2298,6 +2302,7 @@ pub(crate) fn prepare_server(
         server.keepalive_timeout,
         server.keepalive_requests,
         server.keepalive_time_ms,
+        server.keepalive_min_timeout_ms,
         server.keepalive_disable,
     );
     let server_error_logs: &'static [PreparedErrorLog] = match server.error_logs {
@@ -2529,6 +2534,7 @@ pub(crate) fn prepare_server(
     );
     let server_default = if !have_root_catchall {
         let root_path = server.root.clone().unwrap_or_else(|| "html".into());
+        let (gzip, gzip_static) = prepare_gzip_and_static(server_gzip.clone())?;
         let pattern: &'static [u8] = b"/";
         let site = HandlerSite {
             pattern,
@@ -2545,6 +2551,7 @@ pub(crate) fn prepare_server(
             mime: &server.mime,
             tokens: server_tokens_value,
             upstreams,
+            gzip_static,
         };
         let handler = build_handler(
             Handler::Root {
@@ -2578,7 +2585,7 @@ pub(crate) fn prepare_server(
             max_ranges: server_max_ranges,
             client_body_buffer_size: server_client_body_buffer_size,
             sendfile: server_sendfile,
-            gzip: prepare_gzip(server_gzip.clone())?,
+            gzip,
             limit_rate: server_limit_rate.for_location(),
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             body_temp: server_body_temp,
@@ -3291,10 +3298,12 @@ pub(crate) fn prepare_keepalive(
     timeout: Option<KeepaliveTimeout>,
     keepalive_requests: Option<u64>,
     keepalive_time_ms: Option<u64>,
+    keepalive_min_timeout_ms: Option<u64>,
     keepalive_disable: Option<KeepaliveDisable>,
 ) -> PreparedKeepalive {
     let max_requests = keepalive_requests.unwrap_or(DEFAULT_KEEPALIVE_REQUESTS);
     let max_time_ms = keepalive_time_ms.unwrap_or(DEFAULT_KEEPALIVE_TIME_MS);
+    let min_timeout_ms = keepalive_min_timeout_ms.unwrap_or(0);
     let keepalive_disable = keepalive_disable.unwrap_or(KeepaliveDisable {
         msie6: true,
         safari: false,
@@ -3314,15 +3323,17 @@ pub(crate) fn prepare_keepalive(
             },
             max_requests,
             max_time_ms,
+            min_timeout_ms,
             disable_msie6: keepalive_disable.msie6,
             disable_safari: keepalive_disable.safari,
         },
         None => PreparedKeepalive {
             allow: true,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(DEFAULT_KEEPALIVE_TIMEOUT_MS),
             header_timeout_secs: None,
             max_requests,
             max_time_ms,
+            min_timeout_ms,
             disable_msie6: keepalive_disable.msie6,
             disable_safari: keepalive_disable.safari,
         },
@@ -3346,6 +3357,7 @@ pub(crate) fn resolve_keepalive(
     location_keepalive: Option<KeepaliveTimeout>,
     location_keepalive_requests: Option<u64>,
     location_keepalive_time_ms: Option<u64>,
+    location_keepalive_min_timeout_ms: Option<u64>,
     location_keepalive_disable: Option<KeepaliveDisable>,
     server_keepalive: PreparedKeepalive,
 ) -> PreparedKeepalive {
@@ -3368,6 +3380,9 @@ pub(crate) fn resolve_keepalive(
     }
     if let Some(max_time_ms) = location_keepalive_time_ms {
         resolved.max_time_ms = max_time_ms;
+    }
+    if let Some(min_timeout_ms) = location_keepalive_min_timeout_ms {
+        resolved.min_timeout_ms = min_timeout_ms;
     }
     if let Some(disable) = location_keepalive_disable {
         resolved.disable_msie6 = disable.msie6;
@@ -3722,6 +3737,7 @@ pub(crate) struct HandlerSite<'a> {
     pub(crate) mime: &'a crate::config::MimeConf,
     pub(crate) tokens: crate::config::ServerTokens,
     pub(crate) upstreams: &'a UpstreamMap,
+    pub(crate) gzip_static: Option<&'static PreparedGzipStatic>,
 }
 
 pub(crate) fn build_handler(
@@ -3800,6 +3816,7 @@ pub(crate) fn build_handler(
                 if_modified_since: site.if_modified_since,
                 etag: site.etag,
                 try_files,
+                gzip_static: site.gzip_static,
             })
         }
     })
@@ -3954,6 +3971,7 @@ pub(crate) fn build_prefix_or_exact(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         error_logs: location_error_logs,
         log_not_found: location_log_not_found,
@@ -4002,7 +4020,7 @@ pub(crate) fn build_prefix_or_exact(
         charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
-    let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let (gzip, gzip_static) = prepare_gzip_and_static(location_gzip.inherit(server.gzip))?;
     let charset = prepare_charset(&location_charset);
     // Only an `if` block's anonymous location in a regex location is
     // built here with a regex mode (#137): its alias takes the captures.
@@ -4014,6 +4032,7 @@ pub(crate) fn build_prefix_or_exact(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         server.keepalive,
     );
@@ -4043,6 +4062,7 @@ pub(crate) fn build_prefix_or_exact(
         mime: &mime,
         tokens,
         upstreams,
+        gzip_static,
     };
     let limited_handler = match &limit_except {
         // `proxy_pass` in the block: the other methods are proxied there,
@@ -4179,6 +4199,7 @@ pub(crate) fn build_regex_location(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         error_logs: location_error_logs,
         log_not_found: location_log_not_found,
@@ -4227,7 +4248,7 @@ pub(crate) fn build_regex_location(
         charset: location_charset,
     } = l;
     let proxy_effective = resolve_proxy_effective(location_proxy, server.proxy_defaults);
-    let gzip = prepare_gzip(location_gzip.inherit(server.gzip))?;
+    let (gzip, gzip_static) = prepare_gzip_and_static(location_gzip.inherit(server.gzip))?;
     let charset = prepare_charset(&location_charset);
     // The parser already validated it; the compiled `Regex` doesn't
     // survive the AST.
@@ -4244,6 +4265,7 @@ pub(crate) fn build_regex_location(
         keepalive_timeout,
         keepalive_requests,
         keepalive_time_ms,
+        keepalive_min_timeout_ms,
         keepalive_disable,
         server.keepalive,
     );
@@ -4273,6 +4295,7 @@ pub(crate) fn build_regex_location(
         mime: &mime,
         tokens,
         upstreams,
+        gzip_static,
     };
     let limited_handler = match &limit_except {
         // `proxy_pass` in the block: the other methods are proxied there,
@@ -4473,12 +4496,34 @@ pub(crate) fn prepare_charset(
     })))
 }
 
-pub(crate) fn prepare_gzip(
+/// The gzip filter (`gzip on`) and `gzip_static`, sharing one
+/// `PreparedGzip`.
+pub(crate) fn prepare_gzip_and_static(
     conf: crate::config::GzipConf,
-) -> Result<Option<&'static PreparedGzip>, String> {
-    if conf.enable != Some(true) {
-        return Ok(None);
+) -> Result<
+    (
+        Option<&'static PreparedGzip>,
+        Option<&'static PreparedGzipStatic>,
+    ),
+    String,
+> {
+    use crate::config::GzipStatic;
+    let enable = conf.enable == Some(true);
+    let mode = conf.static_mode.unwrap_or(GzipStatic::Off);
+    if !enable && mode == GzipStatic::Off {
+        return Ok((None, None));
     }
+    let gz = build_gzip(conf)?;
+    let gzip_static = (mode != GzipStatic::Off).then(|| {
+        &*crate::arena::leak(Box::new(PreparedGzipStatic {
+            always: mode == GzipStatic::Always,
+            checks: gz,
+        }))
+    });
+    Ok((enable.then_some(gz), gzip_static))
+}
+
+fn build_gzip(conf: crate::config::GzipConf) -> Result<&'static PreparedGzip, String> {
     let mut any_type = false;
     // nginx always compresses text/html (ngx_http_html_default_types).
     let mut types: Vec<&'static str> = vec!["text/html"];
@@ -4506,7 +4551,7 @@ pub(crate) fn prepare_gzip(
                 .map_err(|e| format!("gzip_disable: {e}"))?,
         )
     };
-    Ok(Some(crate::arena::leak(Box::new(PreparedGzip {
+    Ok(crate::arena::leak(Box::new(PreparedGzip {
         any_type,
         types: crate::arena::leak(types.into_boxed_slice()),
         min_length: conf.min_length.unwrap_or(20),
@@ -4516,7 +4561,7 @@ pub(crate) fn prepare_gzip(
         proxied: conf.proxied.unwrap_or(crate::config::gzip_proxied::OFF),
         disable_msie6,
         disable,
-    }))))
+    })))
 }
 
 /// `pattern` as a `RegexSet` member, with the case flag its own `Regex`
@@ -4581,6 +4626,30 @@ mod tests {
             .iter()
             .find(|l| l.pattern == pattern)
             .unwrap()
+    }
+
+    #[test]
+    fn keepalive_timeout_defaults_to_75s() {
+        let http = prepare_src(
+            r#"
+            http {
+                server {
+                    listen 127.0.0.1:8080;
+                    location /a { return 200; }
+                    location /off { keepalive_timeout 0; return 200; }
+                }
+            }
+            "#,
+        );
+        let server = &http.listens[0].servers[0];
+        assert!(server.keepalive.allow);
+        assert_eq!(server.keepalive.idle_timeout_ms, Some(75_000));
+        let a = prefix(http, 0, b"/a").keepalive;
+        assert!(a.allow);
+        assert_eq!(a.idle_timeout_ms, Some(75_000));
+        let off = prefix(http, 0, b"/off").keepalive;
+        assert!(!off.allow);
+        assert_eq!(off.idle_timeout_ms, None);
     }
 
     #[test]

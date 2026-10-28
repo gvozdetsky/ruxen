@@ -270,6 +270,8 @@ pub struct ProxyConf {
     pub ssl_certificate_key: Option<Option<CertPath>>,
     /// `proxy_ssl_password_file` (#139).
     pub ssl_password_file: Option<std::path::PathBuf>,
+    /// `proxy_ssl_certificate_cache` (#601); `Some(None)` is `off`.
+    pub ssl_certificate_cache: Option<Option<SslCertificateCache>>,
     /// `resolver` and `resolver_timeout` (#133), core directives in nginx;
     /// only `proxy_pass` with variables uses them here.
     pub resolver: Option<ResolverConf>,
@@ -384,6 +386,11 @@ pub struct ProxyCachePath {
     pub inactive_secs: u64,
     pub max_size: Option<u64>,
     pub min_free: Option<u64>,
+    /// `manager_files`, `manager_sleep`, `manager_threshold` (nginx's
+    /// 100, 50ms, 200ms when unset).
+    pub manager_files: u64,
+    pub manager_sleep_ms: u64,
+    pub manager_threshold_ms: u64,
 }
 
 /// `proxy_bind address [transparent] | off`.
@@ -449,6 +456,7 @@ impl ProxyConf {
             ssl_password_file: self
                 .ssl_password_file
                 .or_else(|| parent.ssl_password_file.clone()),
+            ssl_certificate_cache: self.ssl_certificate_cache.or(parent.ssl_certificate_cache),
             resolver: self.resolver.or_else(|| parent.resolver.clone()),
             resolver_timeout_ms: self.resolver_timeout_ms.or(parent.resolver_timeout_ms),
         }
@@ -1190,6 +1198,8 @@ pub struct Server {
     pub keepalive_requests: Option<u64>,
     /// Server-scope maximum keepalive connection lifetime.
     pub keepalive_time_ms: Option<u64>,
+    /// Server-scope `keepalive_min_timeout` (#601).
+    pub keepalive_min_timeout_ms: Option<u64>,
     /// Server-scope `keepalive_disable` policy.
     pub keepalive_disable: Option<KeepaliveDisable>,
     /// `client_header_timeout` / `client_body_timeout` / `send_timeout`,
@@ -1487,6 +1497,8 @@ pub struct Location {
     pub keepalive_requests: Option<u64>,
     /// Location-scope keepalive lifetime cap. `None` inherits from server.
     pub keepalive_time_ms: Option<u64>,
+    /// Location-scope `keepalive_min_timeout`. `None` inherits from server.
+    pub keepalive_min_timeout_ms: Option<u64>,
     /// Location-scope keepalive-disable policy. `None` inherits from server.
     pub keepalive_disable: Option<KeepaliveDisable>,
     /// Location-scope `error_log` sinks. `None` inherits from server.
@@ -2446,6 +2458,17 @@ pub enum FileTestKind {
     Dir,
     Exists,
     Exec,
+}
+
+/// `ssl_certificate_cache` / `proxy_ssl_certificate_cache max=N
+/// [inactive=time] [valid=time]` (#601); times in seconds, as nginx's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SslCertificateCache {
+    /// The declaration's: levels that inherit it share one cache.
+    pub id: u64,
+    pub max: usize,
+    pub inactive_secs: u64,
+    pub valid_secs: u64,
 }
 
 /// A `proxy_ssl_certificate` / `_key` value: a file, resolved against the

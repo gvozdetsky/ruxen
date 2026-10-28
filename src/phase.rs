@@ -248,18 +248,39 @@ pub struct KeepaliveMeta {
     pub header_timeout_secs: Option<u64>,
     pub max_requests: u64,
     pub max_time_ms: u64,
+    /// `keepalive_min_timeout`, saturated: a u32 fits the padding.
+    pub min_timeout_ms: u32,
     pub disable_msie6: bool,
     pub disable_safari: bool,
+}
+
+impl KeepaliveMeta {
+    /// A server's settings, for a response before any location (a
+    /// server-level `return`, a refused URI).
+    fn of_server(server: &PreparedServer) -> Self {
+        let k = &server.keepalive;
+        KeepaliveMeta {
+            allow: k.allow,
+            idle_timeout_ms: k.idle_timeout_ms,
+            header_timeout_secs: k.header_timeout_secs,
+            max_requests: k.max_requests,
+            max_time_ms: k.max_time_ms,
+            min_timeout_ms: u32::try_from(k.min_timeout_ms).unwrap_or(u32::MAX),
+            disable_msie6: k.disable_msie6,
+            disable_safari: k.disable_safari,
+        }
+    }
 }
 
 impl Default for KeepaliveMeta {
     fn default() -> Self {
         KeepaliveMeta {
             allow: true,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(crate::worker::DEFAULT_KEEPALIVE_TIMEOUT_MS),
             header_timeout_secs: None,
             max_requests: 1_000,
             max_time_ms: 3_600_000,
+            min_timeout_ms: 0,
             disable_msie6: true,
             disable_safari: false,
         }
@@ -463,6 +484,7 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
+        keepalive: KeepaliveMeta::of_server(server),
         ..ProcessMeta::default()
     }
 }
@@ -983,9 +1005,15 @@ fn process_with_meta_inner(
         server_port: server.listen_port,
         metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
+        // `allow` is the client's until a location's applies: its
+        // keepalive_timeout decides, not the server's (nginx's
+        // ngx_http_update_location_config).
+        keepalive: KeepaliveMeta {
+            allow: !closes,
+            ..KeepaliveMeta::of_server(server)
+        },
         ..ProcessMeta::default()
     };
-    meta.keepalive.allow = !closes;
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
@@ -2488,6 +2516,7 @@ fn apply_location_meta(
         header_timeout_secs: loc.keepalive.header_timeout_secs,
         max_requests: loc.keepalive.max_requests,
         max_time_ms: loc.keepalive.max_time_ms,
+        min_timeout_ms: u32::try_from(loc.keepalive.min_timeout_ms).unwrap_or(u32::MAX),
         disable_msie6: loc.keepalive.disable_msie6,
         disable_safari: loc.keepalive.disable_safari,
     };
