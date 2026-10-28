@@ -374,7 +374,8 @@ async fn write_request_parts(
     send_timeout: Duration,
 ) -> Option<std::io::Result<()>> {
     let mut parts = RequestParts::new(head, body);
-    if let UpstreamIo::Plain(sock) = stream
+    if parts.body.len() >= SEND_NOW_FROM
+        && let UpstreamIo::Plain(sock) = stream
         && crate::worker::driver() == crate::worker::Driver::IoUring
     {
         return send_parts_now(sock, parts, send_timeout).await;
@@ -396,6 +397,11 @@ async fn write_request_parts(
     }
     Some(Ok(()))
 }
+
+/// A request body this large goes to the upstream with `send_parts_now`;
+/// smaller requests are cheaper batched in the ring (a syscall each cost
+/// `proxy_hello` 0.9%).
+const SEND_NOW_FROM: usize = 16 * 1024;
 
 /// `write_request_parts` on plain TCP under io_uring: `sendmsg` now, while
 /// a body just read is in the cache, waiting only when the socket is full
