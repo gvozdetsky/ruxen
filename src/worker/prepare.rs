@@ -979,6 +979,9 @@ pub(crate) fn prepare_upstreams(
     let mut out = std::collections::HashMap::new();
     for u in upstreams {
         let name_static: &'static str = crate::arena::leak(u.name.into_boxed_str());
+        let sticky = u
+            .sticky
+            .map(|conf| crate::upstream_sticky::Sticky::prepare(conf, &u.servers, name_static));
         let mut peers_vec: Vec<PreparedPeer> = Vec::with_capacity(u.servers.len());
         for s in u.servers {
             let display: &'static [u8] =
@@ -1015,6 +1018,7 @@ pub(crate) fn prepare_upstreams(
             shared: u
                 .zone
                 .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
+            sticky,
         }));
         out.insert(name_static, &*prepared);
     }
@@ -1396,6 +1400,7 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    sticky: None,
                 }));
             if inet && let Ok(authority) = std::str::from_utf8(host_header_static) {
                 note_implicit_upstream(authority, upstream);
@@ -1508,6 +1513,7 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    sticky: None,
                 }));
             PreparedProxy {
                 upstream,

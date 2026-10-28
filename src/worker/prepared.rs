@@ -1170,6 +1170,8 @@ pub struct PreparedUpstream {
     /// all workers (one slot per peer). `None`: per worker, as nginx's
     /// without a zone.
     pub shared: Option<&'static [crate::upstream::PeerShared]>,
+    /// `sticky` (#600).
+    pub sticky: Option<&'static crate::upstream_sticky::Sticky>,
 }
 
 /// Where a peer listens. A UNIX-domain socket prints as `unix:/path`, as in

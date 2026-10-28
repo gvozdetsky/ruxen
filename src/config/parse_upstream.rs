@@ -28,6 +28,19 @@ pub(crate) fn validate_proxy_upstream_refs(http: &HttpConfig) -> Result<(), Erro
         }
         Ok(())
     }
+    // ngx_http_upstream_sticky_learn: a zone serves one upstream.
+    let mut zones: Vec<(&str, &str)> = Vec::new();
+    for u in &http.upstreams {
+        if let Some(StickyConf::Learn(learn)) = &u.sticky {
+            if let Some((_, first)) = zones.iter().find(|(z, _)| *z == learn.zone) {
+                return Err(sticky_message(format!(
+                    "sticky zone \"{}\" is already used in upstream \"{first}\"",
+                    learn.zone
+                )));
+            }
+            zones.push((&learn.zone, &u.name));
+        }
+    }
     let names: Vec<&str> = http.upstreams.iter().map(|u| u.name.as_str()).collect();
     for s in &http.servers {
         for loc in &s.locations {
@@ -62,6 +75,7 @@ pub(crate) fn parse_upstream_block(
     let mut keepalive_max_lifetime_ms: Option<u64> = None;
     let mut lb: LbAlgorithm = LbAlgorithm::RoundRobin;
     let mut zone: Option<String> = None;
+    let mut sticky: Option<StickyConf> = None;
     loop {
         let (args, term) = lx.read_directive()?;
         if args.is_empty() {
@@ -80,6 +94,7 @@ pub(crate) fn parse_upstream_block(
                         keepalive_max_lifetime_ms,
                         lb,
                         zone,
+                        sticky,
                     })
                 }
                 Terminator::Eof => Err(Error::UnclosedBlock),
@@ -111,9 +126,7 @@ pub(crate) fn parse_upstream_block(
                         got: args[1..].join(" "),
                     });
                 }
-                if !matches!(lb, LbAlgorithm::RoundRobin) {
-                    lx.warn("load balancing method redefined".into());
-                }
+                warn_lb_redefined(lx, &lb, &mut sticky);
                 lb = LbAlgorithm::LeastConn;
             }
             // ngx_http_upstream_hash / ngx_http_upstream_ip_hash: a method
@@ -138,9 +151,7 @@ pub(crate) fn parse_upstream_block(
                         });
                     }
                 };
-                if !matches!(lb, LbAlgorithm::RoundRobin) {
-                    lx.warn("load balancing method redefined".into());
-                }
+                warn_lb_redefined(lx, &lb, &mut sticky);
                 lb = LbAlgorithm::Hash {
                     key: parse_value_with_vars(&args[1])?,
                     consistent,
@@ -153,9 +164,7 @@ pub(crate) fn parse_upstream_block(
                         got: args[1..].join(" "),
                     });
                 }
-                if !matches!(lb, LbAlgorithm::RoundRobin) {
-                    lx.warn("load balancing method redefined".into());
-                }
+                warn_lb_redefined(lx, &lb, &mut sticky);
                 lb = LbAlgorithm::IpHash;
             }
             // ngx_http_upstream_zone: `zone name [size]`. Workers are
@@ -194,6 +203,12 @@ pub(crate) fn parse_upstream_block(
                     }
                 }
                 zone = Some(name.clone());
+            }
+            ("sticky", Terminator::Semi) => {
+                if sticky.is_some() {
+                    return Err(sticky_error("is duplicate"));
+                }
+                sticky = Some(parse_sticky_args(&args[1..])?);
             }
             // ngx_http_upstream_keepalive: `keepalive N [local];`, where 0
             // turns off the pool that 1.29.7 gives every upstream block.
@@ -255,6 +270,202 @@ pub(crate) fn parse_upstream_block(
     }
 }
 
+/// A balancing method after another, or after `sticky`, replaces it with
+/// a warning: nginx's `sticky` hooks the method set before it.
+fn warn_lb_redefined(lx: &mut Lexer, lb: &LbAlgorithm, sticky: &mut Option<StickyConf>) {
+    if !matches!(lb, LbAlgorithm::RoundRobin) || sticky.is_some() {
+        lx.warn("load balancing method redefined".into());
+    }
+    *sticky = None;
+}
+
+fn sticky_error(msg: &str) -> Error {
+    Error::Directive {
+        name: "sticky",
+        msg: msg.to_string(),
+    }
+}
+
+/// A message nginx logs as it is (ngx_conf_log_error).
+fn sticky_message(msg: String) -> Error {
+    Error::Message(crate::arena::leak(msg.into_boxed_str()))
+}
+
+/// `$name` as one variable, the way ngx_http_get_variable_index takes it.
+fn sticky_var(arg: &str) -> Result<Vec<ValuePart>, Error> {
+    let parts = parse_value_with_vars(arg)?;
+    match parts.as_slice() {
+        [ValuePart::Var(_)] => Ok(parts),
+        _ => Err(sticky_message(format!("invalid variable name \"{arg}\""))),
+    }
+}
+
+/// `sticky cookie | route | learn ...` (ngx_http_upstream_sticky).
+fn parse_sticky_args(args: &[String]) -> Result<StickyConf, Error> {
+    if args.len() < 2 {
+        return Err(sticky_message(
+            "invalid number of arguments in \"sticky\" directive".into(),
+        ));
+    }
+    match args[0].as_str() {
+        "cookie" => parse_sticky_cookie(&args[1..]).map(StickyConf::Cookie),
+        "route" => {
+            let mut lookup = Vec::new();
+            for a in &args[1..] {
+                if !a.starts_with('$') {
+                    return Err(sticky_message(format!("invalid variable name \"{a}\"")));
+                }
+                lookup.push(sticky_var(a)?);
+            }
+            Ok(StickyConf::Route { lookup })
+        }
+        "learn" => parse_sticky_learn(&args[1..]).map(StickyConf::Learn),
+        other => Err(sticky_message(format!("unknown parameter \"{other}\""))),
+    }
+}
+
+fn parse_sticky_cookie(args: &[String]) -> Result<StickyCookie, Error> {
+    if args[0].is_empty() {
+        return Err(sticky_error("empty cookie name"));
+    }
+    let mut c = StickyCookie {
+        name: args[0].clone(),
+        domain: None,
+        path: None,
+        expires: None,
+        httponly: false,
+        secure: false,
+        samesite: None,
+    };
+    for a in &args[1..] {
+        if let Some(v) = a.strip_prefix("domain=") {
+            if c.domain.is_some() {
+                return Err(sticky_error("parameter \"domain\" is duplicate"));
+            }
+            if v.is_empty() {
+                return Err(sticky_error("no value for \"domain\""));
+            }
+            c.domain = Some(parse_value_with_vars(v)?);
+        } else if let Some(v) = a.strip_prefix("path=") {
+            if c.path.is_some() {
+                return Err(sticky_error("parameter \"path\" is duplicate"));
+            }
+            if v.is_empty() {
+                return Err(sticky_error("no value for \"path\""));
+            }
+            c.path = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("expires=") {
+            if c.expires.is_some() {
+                return Err(sticky_error("parameter \"expires\" is duplicate"));
+            }
+            c.expires = Some(if v == "max" {
+                StickyExpires::Max
+            } else {
+                match parse_time(v, true) {
+                    Some(secs) if secs >= 0 => StickyExpires::Secs(secs as u64),
+                    _ => return Err(sticky_error("invalid \"expires\" parameter value")),
+                }
+            });
+        } else if a == "httponly" {
+            if c.httponly {
+                return Err(sticky_error("parameter \"httponly\" is duplicate"));
+            }
+            c.httponly = true;
+        } else if a == "secure" {
+            if c.secure {
+                return Err(sticky_error("parameter \"secure\" is duplicate"));
+            }
+            c.secure = true;
+        } else if let Some(v) = a.strip_prefix("samesite=") {
+            if c.samesite.is_some() {
+                return Err(sticky_error("parameter \"samesite\" is duplicate"));
+            }
+            let parts = parse_value_with_vars(v)?;
+            let is_static = parts.iter().all(|p| matches!(p, ValuePart::Literal(_)));
+            if is_static && !is_samesite(v.as_bytes()) {
+                return Err(sticky_error("invalid \"samesite\" parameter value"));
+            }
+            c.samesite = Some(parts);
+        } else {
+            return Err(sticky_message(format!("unknown parameter \"{a}\"")));
+        }
+    }
+    Ok(c)
+}
+
+/// `strict`, `lax` or `none`, any case (ngx_http_upstream_sticky_samesite).
+pub(crate) fn is_samesite(v: &[u8]) -> bool {
+    [&b"strict"[..], b"lax", b"none"]
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(v))
+}
+
+fn parse_sticky_learn(args: &[String]) -> Result<StickyLearn, Error> {
+    let mut zone: Option<(String, u64)> = None;
+    let mut timeout_ms: Option<u64> = None;
+    let mut lookup = Vec::new();
+    let mut create = Vec::new();
+    let mut header = false;
+    for a in args {
+        if let Some(v) = a.strip_prefix("zone=") {
+            if zone.is_some() {
+                return Err(sticky_error("duplicate zone"));
+            }
+            let Some((name, size)) = v.split_once(':') else {
+                return Err(sticky_error("zone size is not specified"));
+            };
+            if name.is_empty() {
+                return Err(sticky_error("zone name is not specified"));
+            }
+            let size = parse_size_bytes(size).ok_or_else(|| sticky_error("invalid zone size"))?;
+            // 32k ~ 200 sessions, as nginx says.
+            if size < 8 * 4096 {
+                return Err(sticky_error("zone is too small"));
+            }
+            zone = Some((name.to_string(), size));
+        } else if let Some(v) = a.strip_prefix("timeout=") {
+            if timeout_ms.is_some() {
+                return Err(sticky_error("duplicate timeout"));
+            }
+            match parse_time(v, false) {
+                Some(ms) if ms > 0 => timeout_ms = Some(ms as u64),
+                _ => return Err(sticky_error("invalid timeout")),
+            }
+        } else if let Some(v) = a.strip_prefix("create=") {
+            if !v.starts_with('$') {
+                return Err(sticky_error("missing variable in the \"create\" parameter"));
+            }
+            create.push(sticky_var(v)?);
+        } else if let Some(v) = a.strip_prefix("lookup=") {
+            if !v.starts_with('$') {
+                return Err(sticky_error("missing variable in the \"lookup\" parameter"));
+            }
+            lookup.push(sticky_var(v)?);
+        } else if a == "header" {
+            header = true;
+        } else {
+            return Err(sticky_message(format!("unknown parameter \"{a}\"")));
+        }
+    }
+    if lookup.is_empty() {
+        return Err(sticky_error("\"lookup\" parameter is not specified"));
+    }
+    if create.is_empty() {
+        return Err(sticky_error("\"create\" parameter is not specified"));
+    }
+    let Some((zone, zone_size)) = zone else {
+        return Err(sticky_error("\"zone\" parameter is not specified"));
+    };
+    Ok(StickyLearn {
+        lookup,
+        create,
+        zone,
+        zone_size,
+        timeout_ms: timeout_ms.unwrap_or(600_000),
+        header,
+    })
+}
+
 /// One `server` line: a server per address its name resolves to, all with
 /// the line's parameters (ngx_http_upstream_init_round_robin counts
 /// `server[i].naddrs` peers).
@@ -276,7 +487,9 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
     let mut fail_timeout_secs: u32 = 10;
     let mut max_conns: u32 = 0;
     let mut down = false;
+    let mut drain = false;
     let mut backup = false;
+    let mut route: Option<String> = None;
     for tok in &args[1..] {
         if let Some(v) = tok.strip_prefix("weight=") {
             weight = v.parse::<u32>().map_err(|_| Error::BadValue {
@@ -306,6 +519,19 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
             })?;
         } else if tok == "down" {
             down = true;
+            drain = false;
+        } else if tok == "drain" {
+            // ngx_http_upstream_server: the last of `down` / `drain` wins.
+            down = true;
+            drain = true;
+        } else if let Some(v) = tok.strip_prefix("route=") {
+            if v.is_empty() {
+                return Err(Error::Message("route is empty"));
+            }
+            if v.len() > 32 {
+                return Err(Error::Message("route is longer than 32"));
+            }
+            route = Some(v.to_string());
         } else if tok == "backup" {
             backup = true;
         } else {
@@ -326,6 +552,8 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
             max_conns,
             down,
             backup,
+            drain,
+            route: route.clone(),
         })
         .collect())
 }
@@ -1526,6 +1754,90 @@ mod tests {
         assert!(keepalive("keepalive 8 local local;").is_err());
         assert!(keepalive("keepalive -1;").is_err());
         assert!(keepalive("keepalive 8; keepalive 0;").is_err());
+    }
+
+    /// `sticky` and `server … route= drain` (#600), with nginx's errors.
+    #[test]
+    fn sticky_directive() {
+        let parse = |body: &str| {
+            crate::config::parse(&format!(
+                "http {{ upstream u {{ server 127.0.0.1:1; {body} }} server {{ listen 80; }} }}"
+            ))
+            .map(|c| c.upstreams[0].clone())
+        };
+        let err = |body: &str| parse(body).unwrap_err().to_string();
+        let u =
+            parse("sticky cookie srv expires=1h domain=$host path=/ httponly secure samesite=lax;")
+                .unwrap();
+        let Some(StickyConf::Cookie(c)) = u.sticky else {
+            panic!("{u:?}");
+        };
+        assert_eq!(
+            (c.name.as_str(), c.expires, c.path.as_deref()),
+            ("srv", Some(StickyExpires::Secs(3600)), Some("/"))
+        );
+        assert!(c.httponly && c.secure && c.domain.is_some() && c.samesite.is_some());
+        assert!(matches!(
+            parse("sticky route $arg_a $cookie_b;").unwrap().sticky,
+            Some(StickyConf::Route { lookup }) if lookup.len() == 2
+        ));
+        let Some(StickyConf::Learn(l)) =
+            parse("sticky learn create=$upstream_cookie_s lookup=$cookie_s zone=z:1m header;")
+                .unwrap()
+                .sticky
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (l.zone.as_str(), l.timeout_ms, l.header),
+            ("z", 600_000, true)
+        );
+        let s = parse("server 127.0.0.1:2 route=r2 drain;").unwrap().servers[1].clone();
+        assert_eq!(
+            (s.route.as_deref(), s.down, s.drain),
+            (Some("r2"), true, true)
+        );
+        // A balancing method after `sticky` replaces it, as in nginx.
+        assert_eq!(parse("sticky cookie s; least_conn;").unwrap().sticky, None);
+        assert!(
+            parse("least_conn; sticky cookie s;")
+                .unwrap()
+                .sticky
+                .is_some()
+        );
+
+        assert_eq!(
+            err("sticky cookie a; sticky cookie b;"),
+            "\"sticky\" directive is duplicate"
+        );
+        assert_eq!(
+            err("sticky cookie a samesite=bogus;"),
+            "\"sticky\" directive invalid \"samesite\" parameter value"
+        );
+        assert_eq!(err("sticky route arg;"), "invalid variable name \"arg\"");
+        assert_eq!(err("sticky bogus x;"), "unknown parameter \"bogus\"");
+        assert_eq!(
+            err("sticky learn lookup=$cookie_s zone=z:1m;"),
+            "\"sticky\" directive \"create\" parameter is not specified"
+        );
+        assert_eq!(
+            err("sticky learn create=$a lookup=$b zone=z:4k;"),
+            "\"sticky\" directive zone is too small"
+        );
+        assert_eq!(
+            err("server 127.0.0.1:2 route=123456789012345678901234567890123;"),
+            "route is longer than 32"
+        );
+        assert!(
+            crate::config::parse(
+                "http { upstream a { server 127.0.0.1:1; sticky learn create=$a lookup=$b zone=z:1m; }
+                        upstream b { server 127.0.0.1:1; sticky learn create=$a lookup=$b zone=z:1m; }
+                        server { listen 80; } }"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("sticky zone \"z\" is already used in upstream \"a\"")
+        );
     }
 
     #[test]
