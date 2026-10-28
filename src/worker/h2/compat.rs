@@ -199,6 +199,14 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
         }
     }
 
+    /// For a connection to an upstream (#599): the server's frames aren't
+    /// scanned for header blocks.
+    pub(crate) fn client(stream: S) -> Self {
+        let mut io = Self::new(stream);
+        io.scan.skip = usize::MAX;
+        io
+    }
+
     /// The stream, for after `self` is dropped: no operation borrows it
     /// any more then.
     pub(crate) fn stream_handle(&self) -> Rc<UnsafeCell<S>> {

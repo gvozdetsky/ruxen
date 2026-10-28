@@ -918,6 +918,8 @@ fn idle_conn_open(stream: &crate::upstream_io::UpstreamIo) -> bool {
     let fd = match stream {
         crate::upstream_io::UpstreamIo::Plain(s) => s.as_raw_fd(),
         crate::upstream_io::UpstreamIo::Tls(t) => t.stream.io().as_raw_fd(),
+        // Its task reads the socket all along.
+        crate::upstream_io::UpstreamIo::H2(c) => return c.is_open(),
     };
     let mut byte = 0u8;
     // SAFETY: `fd` is the open socket `stream` owns; one byte is peeked

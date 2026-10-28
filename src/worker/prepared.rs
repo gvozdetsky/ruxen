@@ -763,9 +763,9 @@ pub struct PreparedProxy {
     /// unlimited, and so is one with variables here: it is read when the
     /// upstream's header is in (`ProxyResponseRules::limit_rate`).
     pub limit_rate: u64,
-    /// 0 = HTTP/1.0, 1 = HTTP/1.1 (the default since nginx 1.29.7).
-    /// Drives the upstream request-line version and gates pool
-    /// eligibility (HTTP/1.0 always closes after the response).
+    /// 0 = HTTP/1.0, 1 = HTTP/1.1 (the default since nginx 1.29.7), 2 =
+    /// HTTP/2 (#599). Drives the upstream request-line version and gates
+    /// pool eligibility (HTTP/1.0 always closes after the response).
     pub http_version: u8,
     /// `proxy_next_upstream` mask. Default `error timeout`.
     pub next_upstream: crate::config::ProxyNextUpstream,
@@ -863,10 +863,12 @@ impl PreparedProxy {
     /// 0 when the pool is shared by every location.
     #[inline]
     pub fn pool_tag(&self, upstream: &PreparedUpstream) -> usize {
+        // Bit 0 keeps HTTP/2 connections apart (`response` is aligned).
+        let h2 = usize::from(self.http_version == 2);
         if upstream.keepalive_local {
-            std::ptr::from_ref(self.response) as usize
+            std::ptr::from_ref(self.response) as usize | h2
         } else {
-            0
+            h2
         }
     }
 }
@@ -919,7 +921,7 @@ pub(crate) struct ProxyEffective {
     /// `proxy_limit_rate`, a size that may hold variables; `None`
     /// means unlimited.
     pub limit_rate: Option<&'static [PreparedValuePart]>,
-    /// 0 = HTTP/1.0, 1 = HTTP/1.1. Matches nginx's default of 1.1 (1.29.7).
+    /// 0 = HTTP/1.0, 1 = HTTP/1.1, 2 = HTTP/2. nginx's default is 1.1 (1.29.7).
     pub http_version: u8,
     pub next_upstream: crate::config::ProxyNextUpstream,
     pub next_upstream_tries: u32,

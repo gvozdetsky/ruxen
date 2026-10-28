@@ -1430,7 +1430,9 @@ pub(crate) fn build_proxy(
                 resolver: eff.resolver,
                 resolver_timeout_ms: eff.resolver_timeout_ms,
                 tls: tls
-                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .then(|| {
+                        prepare_upstream_tls(eff.tls, host_header_static, eff.http_version == 2)
+                    })
                     .transpose()?,
             }
         }
@@ -1478,7 +1480,9 @@ pub(crate) fn build_proxy(
                 resolver: eff.resolver,
                 resolver_timeout_ms: eff.resolver_timeout_ms,
                 tls: tls
-                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .then(|| {
+                        prepare_upstream_tls(eff.tls, host_header_static, eff.http_version == 2)
+                    })
                     .transpose()?,
             }
         }
@@ -1537,7 +1541,7 @@ pub(crate) fn build_proxy(
                 bind: eff.bind,
                 resolver: eff.resolver,
                 resolver_timeout_ms: eff.resolver_timeout_ms,
-                tls: Some(prepare_upstream_tls(eff.tls, b"")?),
+                tls: Some(prepare_upstream_tls(eff.tls, b"", eff.http_version == 2)?),
                 proxy_method: eff.proxy_method,
             }
         }
@@ -1551,9 +1555,11 @@ pub(crate) fn build_proxy(
 /// `proxy_ssl_*` for a location that proxies over TLS: the shared client
 /// config, and the name (`proxy_ssl_name`, else `host`, the host of
 /// `proxy_pass`; empty for a URL with variables, whose host is rendered).
+/// `h2`: ALPN offers `h2` (`proxy_http_version 2`, #599).
 fn prepare_upstream_tls(
     settings: super::prepared::UpstreamTlsSettings,
     host: &[u8],
+    h2: bool,
 ) -> Result<&'static crate::upstream_tls::PreparedUpstreamTls, String> {
     // `proxy_ssl_verify on` needs the certificates to trust, as nginx's
     // ngx_http_proxy_set_ssl refuses it without them.
@@ -1598,6 +1604,7 @@ fn prepare_upstream_tls(
                 settings.server_name,
                 settings.session_reuse,
                 store.clone(),
+                h2,
             ));
             None
         }
@@ -1608,6 +1615,7 @@ fn prepare_upstream_tls(
         settings.session_reuse,
         store,
         client_cert,
+        h2,
     )?;
     let literal = |parts: &[PreparedValuePart]| -> Option<Vec<u8>> {
         let mut out = Vec::new();

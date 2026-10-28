@@ -14,7 +14,7 @@ We are not doing:
 ## Scope
 
 - Linux only (x86_64, aarch64).
-- HTTP/1.1 with a hand-written parser, and HTTP/2 for clients through the `h2` crate (#144). No HTTP/2 or HTTPS to upstreams yet.
+- HTTP/1.1 with a hand-written parser, and HTTP/2 for clients through the `h2` crate (#144); HTTPS (#116) and HTTP/2 (#599) to upstreams too.
 - TLS termination via rustls, server side.
 - **Thread-per-core** workers, each with its own `SO_REUSEPORT` listening sockets, as nginx's worker processes.
 - No dynamic modules: what nginx does in modules is compiled in, and an unknown directive fails at startup (see the unknown-directive policy below).
@@ -253,7 +253,7 @@ The last arg is the fallback:
 - **`create_request`** (1176) builds the upstream wire bytes: `METHOD URI HTTP/<version>\r\nHost: ...\r\n[custom headers]\r\n\r\n[body]`. The Host header is computed from `proxy_pass`, **not** the client's Host (this is the canonical surprise — `$proxy_host` is the upstream's host:port, not the request's).
 - **Default headers always overridden** (747–757): `Connection`, `Proxy-Connection`, `TE`, `Keep-Alive`, `Expect`, `Upgrade` are blanked (hop-by-hop; never forwarded). `Content-Length`/`Transfer-Encoding` recomputed from request body length / chunked flag. RFC 7230 §6.1 enumerates the canonical hop-by-hop set.
 - **`process_status_line`** (1742) parses the response status; HTTP/1.0 response sets `headers_in.connection_close = 1`. **`process_header`** (1828) reuses the request-header parser in response mode and dispatches each header to handlers that mark semantically important ones (Content-Length, Connection, Transfer-Encoding).
-- Directives → location conf: `proxy_pass` (parsed at config time, stored as upstream-block reference or literal host:port; with variables it is evaluated per request, and a host name then needs the resolver), `proxy_set_header` (compiled into a script, evaluated per-request), `proxy_pass_request_headers/body` (booleans), `proxy_http_version` (1.0/1.1), `proxy_*_timeout` (ms).
+- Directives → location conf: `proxy_pass` (parsed at config time, stored as upstream-block reference or literal host:port; with variables it is evaluated per request, and a host name then needs the resolver), `proxy_set_header` (compiled into a script, evaluated per-request), `proxy_pass_request_headers/body` (booleans), `proxy_http_version` (1.0/1.1/2), `proxy_*_timeout` (ms).
 
 **Keepalive pool** (`ngx_http_upstream_keepalive_module.c`). Per-upstream-block queue of `{ connection, sockaddr }` items. Linear search by sockaddr (240–248). Lifecycle:
 
@@ -305,6 +305,16 @@ The last arg is the fallback:
 - **Where it differs from nginx, on purpose** (decided 2026-10-21, #347): ruxen keeps the crate's RFC 9113 / RFC 7541 behaviour where nginx is more lenient or answers otherwise. A malformed request (an invalid or empty `:authority` or `:method`, a connection-specific field, a regular field before a pseudo-header, a field name with characters the RFC forbids, a value with control characters (the `http` crate's `HeaderValue` refuses all but tab, where RFC 9113 forbids only NUL, CR and LF), a body longer or shorter than its Content-Length) is a stream error (RST_STREAM PROTOCOL_ERROR), where nginx answers some with 400 and serves others; HPACK errors get the RFC's GOAWAY codes (PROTOCOL_ERROR where nginx says COMPRESSION_ERROR or FRAME_SIZE_ERROR); Huffman padding longer than 7 bits is refused (RFC 7541 §5.2; nginx takes up to 29 bits); response fields are always Huffman-coded; a graceful GOAWAY first carries the last stream id 2^31−1 and a PING, the final one after the client's PONG, where nginx sends one with the last stream id; priorities are ignored; WINDOW_UPDATEs for request bodies come at half the window. ruxen is a drop-in replacement, and real clients don't depend on any of these; the nginx-tests checks of them are marked in `NGINX_TEST_PROGRESS.md` (`scripts/_render_test_progress.py`, `NOTES`). Server push isn't implemented (nginx removed it in 1.25.1).
 - **`-V`** claims `--with-http_v2_module` (#395), so nginx-tests' HTTP/2 files run.
 - **Performance:** against nginx 1.24.0 with `h2load` (ABBA on the i7): `h2c_hello` 165.5%, `h2_tls_hello` 150.1%, `h2c_static_8k` 108.3%. The writes that got there: `PollIo` writes vectored and double-buffers, so a response's frames leave in one write, and file bodies on a stream are read straight into DATA frames (`ConnIo::send_file_body`). HTTP/1.1 pays a flag check per connection on addresses with HTTP/2 (a `MSG_PEEK` on plain ones) and nothing elsewhere; `handle` gets a third instance for `StreamIo`.
+
+### HTTP/2 to upstreams (#599)
+
+`proxy_http_version 2` (nginx 1.29.4, ngx_http_proxy_v2_module.c) runs through the same crate as a client. `upstream_h2::H2Conn` is a third `UpstreamIo`: the proxy writes it the HTTP/1.1 request it writes any upstream and reads an HTTP/1.1 response back, so framing, header rules, the relay, failover and the keep-alive pool stay one implementation, and HTTP/1.1 upstreams pay one enum arm (the H2 operations are boxed).
+
+- **As nginx:** h2c by prior knowledge for `http://`; ALPN `h2` offered for `https://`, and HTTP/2 spoken whatever the server picks. One stream at a time per connection; `keepalive` pools the connection and the next request opens the next stream on it (`pool_tag` bit 0 keeps HTTP/2 connections apart from HTTP/1.1 ones). `:authority` is the proxy_pass host unless `proxy_set_header Host` sets one, which then goes as a `host` field (`host_set`). No upgrade (101) over HTTP/2.
+- **Request:** the head is parsed back into HEADERS (connection-specific fields dropped, `te` only as `trailers`); the Content-Length bytes after it go as DATA, as the stream window allows, END_STREAM on the last.
+- **Response:** an HTTP/1.1 head; a body without `content-length` is chunked for the proxy. A Content-Length body's last bytes are handed over once END_STREAM is in, so the pooled connection has no stream open. Trailers are dropped (`proxy_pass_trailers` isn't implemented), and so are 103s.
+- **Settings:** no dynamic table and no push, as nginx's preface; a 1 MiB window per stream and connection (nginx opens 2^31−1: the relay reads at the client's pace, and the crate buffers what the window lets in); 64 KiB of response header, the proxy's own bound.
+- **Where it differs:** the crate's RFC behaviour (#347): a RST_STREAM after a complete response is ignored where nginx fails the request (`proxy_h2_body_discard.t`).
 
 ## gzip (#93)
 
