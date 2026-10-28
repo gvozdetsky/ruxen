@@ -361,9 +361,10 @@ fn cache_plan(
     ctx: &RenderCtx<'_>,
     request_uri: &[u8],
     host_header: &[u8],
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<Option<Box<crate::proxy::CachePlan>>, ()> {
-    use crate::proxy::{CacheHit, CachePlan};
-    use crate::proxy_cache::{CacheStatus, Entry, Lookup};
+    use crate::proxy::CachePlan;
+    use crate::proxy_cache::CacheStatus;
     // proxy_cache_methods: GET and HEAD always.
     if !matches!(req.method, Method::Get | Method::Head)
         && !(conf.methods_post && req.method_bytes == b"POST")
@@ -406,8 +407,6 @@ fn cache_plan(
         }
     }
     let main = crate::proxy_cache::hash_key(&key);
-    let mut hash = main;
-    let mut secondary = false;
     // ngx_http_test_predicates: a condition holds when it renders
     // non-empty and not "0".
     let holds = |conditions: &[&[PreparedValuePart]]| {
@@ -418,186 +417,66 @@ fn cache_plan(
         })
     };
     let no_cache = holds(conf.no_cache);
-    let mut status = CacheStatus::Miss;
-    let mut hit = None;
-    let mut stale = None;
-    let mut store = !no_cache;
-    // nginx's NGX_HTTP_CACHE_SCARCE: below proxy_cache_min_uses.
-    let mut cacheable = true;
-    let mut token = None;
-    let mut wait_until = None;
-    let mut background = false;
-    let mut stale_error = false;
-    if holds(conf.bypass) {
-        // The response still refreshes the cache.
-        status = CacheStatus::Bypass;
-    } else {
-        let now = crate::proxy_cache::now_secs();
-        let headers = req.headers_raw;
-        // ngx_http_file_cache_reopen: the main key holds a response stored
-        // for another variant (its `Vary` names headers this request has
-        // other values of), so the lookup goes on at the request's own
-        // variant's key, once.
-        loop {
-            let path = || zone.file_path(&hash);
-            let mut other = None;
-            match zone.lookup(&hash, conf.min_uses, now) {
-                Lookup::Error(code) => {
-                    status = CacheStatus::Hit;
-                    hit = Some(CacheHit::Error(code));
-                }
-                Lookup::Hit => match Entry::read(&path(), &key) {
-                    Some(entry) => match entry.other_variant(&main, headers) {
-                        None => {
-                            status = CacheStatus::Hit;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                        variant => other = variant,
-                    },
-                    None => zone.forget_file(&hash),
-                },
-                Lookup::Stale {
-                    token: updater,
-                    stale_updating,
-                    stale_error: covered,
-                } => {
-                    // ngx_http_upstream_cache: STALE (this request updates)
-                    // or UPDATING (another one does).
-                    token = updater;
-                    stale_error = covered;
-                    let serve_stale = conf.use_stale.updating || stale_updating;
-                    // Read only when something may answer with it; else
-                    // only its header, for the variant.
-                    let entry = if serve_stale || covered || conf.revalidate || conf.use_stale.any()
-                    {
-                        Entry::read(&path(), &key)
-                    } else {
-                        other =
-                            crate::proxy_cache::stored_other_variant(&path(), &key, &main, headers);
-                        None
-                    };
-                    if let Some(e) = &entry {
-                        other = e.other_variant(&main, headers);
-                    }
-                    match entry {
-                        _ if other.is_some() => {}
-                        Some(entry)
-                            if serve_stale && updater.is_some() && conf.background_update =>
-                        {
-                            status = CacheStatus::Stale;
-                            hit = Some(CacheHit::Entry(entry));
-                            background = true;
-                        }
-                        Some(entry) if serve_stale && updater.is_none() => {
-                            status = CacheStatus::Updating;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                        // Fetched again; kept to revalidate with, or to
-                        // answer with if the upstream fails
-                        // (proxy_cache_use_stale).
-                        entry => {
-                            status = CacheStatus::Expired;
-                            stale = entry;
-                        }
-                    }
-                }
-                Lookup::Miss {
-                    store: enough,
-                    probe,
-                } => {
-                    store &= enough;
-                    cacheable = enough;
-                    // A file from before a restart (nginx's cold cache).
-                    if probe && let Some(entry) = Entry::read(&path(), &key) {
-                        zone.adopt(&hash, &entry);
-                        store = !no_cache;
-                        cacheable = true;
-                        other = entry.other_variant(&main, headers);
-                        if other.is_some() {
-                        } else if entry.valid_sec < now {
-                            status = CacheStatus::Expired;
-                            stale = Some(entry);
-                        } else {
-                            status = CacheStatus::Hit;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                    }
-                    // proxy_cache_lock: one request fetches a missing
-                    // response, the others wait for it.
-                    if other.is_none() && status == CacheStatus::Miss && store && conf.lock {
-                        match zone.try_lock(&hash, conf.lock_age_ms) {
-                            Some(lock) => token = Some(lock),
-                            None if conf.lock_timeout_ms == 0 => store = false,
-                            None => {
-                                wait_until = Some(
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_millis(conf.lock_timeout_ms),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            // A variant's key holding yet another variant is a miss, as
-            // nginx's "incorrect vary hash".
-            let Some(variant) = other.filter(|_| !secondary) else {
-                break;
-            };
-            if let Some(t) = token.take() {
-                zone.release(&hash, t);
-            }
-            hash = variant;
-            secondary = true;
-            status = CacheStatus::Miss;
-            store = !no_cache;
-            cacheable = true;
-            stale_error = false;
-        }
-    }
-    // ngx_http_upstream_cache_check_range: a range from too far into the
-    // response isn't worth fetching it whole for the cache; it goes
-    // upstream as asked, and nothing is stored. A `proxy_cache_lock` taken
-    // stays with the request, released when it ends, as nginx's (#864).
-    if hit.is_none()
-        && cacheable
-        && let Some(max) = conf.max_range_offset
-        && let Some(range) = req.range
-        && range_too_far(range, max)
-    {
-        cacheable = false;
-        store = false;
-    }
-    Ok(Some(Box::new(CachePlan {
+    let mut plan = Box::new(CachePlan {
         conf,
         zone,
         main,
-        hash,
-        secondary,
-        status,
-        store,
-        cacheable,
-        // A hit needs neither, unless it is updated in the background, or
-        // the request is conditional (the not-modified check, #349).
-        request_headers: if hit.is_some()
-            && !background
-            && req.if_none_match.is_none()
-            && req.if_modified_since.is_none()
-            && req.if_match.is_none()
-            && req.if_unmodified_since.is_none()
-        {
-            Vec::new()
-        } else {
-            req.headers_raw.to_vec()
-        },
+        hash: main,
+        secondary: false,
+        status: CacheStatus::Miss,
+        store: !no_cache,
+        // nginx's NGX_HTTP_CACHE_SCARCE: below proxy_cache_min_uses.
+        cacheable: true,
+        request_headers: Vec::new(),
         key,
-        hit,
-        stale,
+        hit: None,
+        stale: None,
         head_as_get: conf.convert_head && matches!(req.method, Method::Head),
-        token,
-        wait_until,
-        background,
-        stale_error,
-    })))
+        token: None,
+        wait_until: None,
+        background: false,
+        stale_error: false,
+        aio,
+        unread: false,
+        unread_stale: None,
+    });
+    // ngx_http_upstream_cache_check_range: a range from too far into the
+    // response isn't worth fetching it whole for the cache; it goes
+    // upstream as asked, and nothing is stored.
+    let far = conf
+        .max_range_offset
+        .zip(req.range)
+        .is_some_and(|(max, range)| range_too_far(range, max));
+    if holds(conf.bypass) {
+        // The response still refreshes the cache.
+        plan.status = CacheStatus::Bypass;
+    } else {
+        // `aio threads`: the file is read in `run_proxy`, after the request
+        // is built, unless the lookup may still shape it: a stale entry's
+        // validators, a variant below `min_uses` (not cacheable: the
+        // client's conditions and range go upstream), a far range.
+        let defer = aio.is_some() && !far && !conf.revalidate && conf.min_uses <= 1;
+        plan.lookup(req.headers_raw, no_cache, defer);
+    }
+    // A `proxy_cache_lock` taken stays with the request, released when it
+    // ends, as nginx's (#864).
+    if far && plan.hit.is_none() && plan.cacheable {
+        plan.cacheable = false;
+        plan.store = false;
+    }
+    // A hit needs them only if it is updated in the background, or the
+    // request is conditional (the not-modified check, #349); an unread
+    // one, for its variant.
+    if !(plan.hit.is_some()
+        && !plan.background
+        && req.if_none_match.is_none()
+        && req.if_modified_since.is_none()
+        && req.if_match.is_none()
+        && req.if_unmodified_since.is_none())
+    {
+        plan.request_headers = req.headers_raw.to_vec();
+    }
+    Ok(Some(plan))
 }
 
 pub(crate) fn forward_client_headers<'a>(
@@ -1079,7 +958,14 @@ pub(crate) fn run_location_handler(
         // `proxy_cache` (#233): what the cache has for this request.
         let cache = match proxy.cache {
             Some(conf) => {
-                match cache_plan(conf, req, &proxy_render_ctx, request_uri, host_header) {
+                match cache_plan(
+                    conf,
+                    req,
+                    &proxy_render_ctx,
+                    request_uri,
+                    host_header,
+                    loc.aio,
+                ) {
                     Ok(cache) => cache,
                     Err(()) => return crate::worker::internal_error_response(req.method),
                 }
@@ -1101,7 +987,7 @@ pub(crate) fn run_location_handler(
         );
         let initial_peer = if cache
             .as_ref()
-            .is_some_and(|c| c.hit.is_some() && !c.background)
+            .is_some_and(|c| (c.hit.is_some() && !c.background) || c.unread)
         {
             None
         } else {

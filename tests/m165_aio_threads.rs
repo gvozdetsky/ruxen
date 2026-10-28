@@ -317,3 +317,187 @@ fn an_undefined_pool_is_refused_with_its_place() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One request on its own connection: the head and the body.
+fn fetch(port: u16, raw: &str) -> (String, Vec<u8>) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let end = out.windows(4).position(|w| w == b"\r\n\r\n").expect("head") + 4;
+    (
+        String::from_utf8_lossy(&out[..end]).into_owned(),
+        out[end..].to_vec(),
+    )
+}
+
+fn x_cache(head: &str) -> &str {
+    head.split("\r\nX-Cache: ")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+        .unwrap_or("")
+}
+
+/// The same `proxy_cache` sequence with and without `aio threads`: a hit's
+/// file is then read on the pool, falls back to a miss when it is gone,
+/// goes on to its variant, and a `proxy_cache_lock` waiter reads it there.
+fn cache_sequence(aio: &str, driver: Option<&str>) -> Vec<String> {
+    let setup_lock = common::ports::setup_lock();
+    let [port, backend] = common::ports::free_ports();
+    let dir = unique_dir();
+    let d = dir.display();
+    std::fs::create_dir_all(dir.join("html/vary")).unwrap();
+    std::fs::create_dir_all(dir.join("html/slow")).unwrap();
+    std::fs::write(dir.join("html/small"), pattern(100, 1)).unwrap();
+    std::fs::write(dir.join("html/large"), pattern(300_000, 2)).unwrap();
+    std::fs::write(dir.join("html/vary/v"), "V").unwrap();
+    std::fs::write(dir.join("html/slow/s"), pattern(60_000, 3)).unwrap();
+    for stale in ["bg", "st", "short", "reval", "rv"] {
+        std::fs::create_dir_all(dir.join("html").join(stale)).unwrap();
+        std::fs::write(dir.join(format!("html/{stale}/x")), "OLD").unwrap();
+    }
+    let conf = dir.join("ruxen.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{ access_log off; {aio}\n\
+             proxy_cache_path {d}/cache levels=1:2 keys_zone=one:1m;\n\
+             server {{ listen 127.0.0.1:{port};\n\
+               add_header X-Cache $upstream_cache_status;\n\
+               location / {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 1m; proxy_cache_lock on; }}\n\
+               location /bg/ {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 1s; proxy_cache_use_stale updating;\n\
+                 proxy_cache_background_update on; }}\n\
+               location /st/ {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 200 1s; proxy_cache_use_stale http_404; }}\n\
+               location /short/ {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 1s; }}\n\
+               location /reval/ {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 1s; proxy_cache_revalidate on; }}\n\
+               location /rv/ {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 1s; proxy_cache_revalidate on; }}\n\
+             }}\n\
+             server {{ listen 127.0.0.1:{backend}; root {d}/html;\n\
+               location /vary/ {{ add_header Vary Accept-Encoding; }}\n\
+               location /rv/ {{ add_header Vary Accept-Encoding; }}\n\
+               location /slow/ {{ limit_rate 40k; }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ruxen"));
+    cmd.args(["-c", conf.to_str().unwrap()])
+        .env("RUXEN_WORKERS", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(driver) = driver {
+        cmd.env("RUXEN_DRIVER", driver);
+    }
+    let mut guard = ServerGuard {
+        child: cmd.spawn().expect("spawn ruxen"),
+        dir: dir.clone(),
+    };
+    common::ports::wait_for_pid_file(
+        &mut guard.child,
+        &dir.join("ruxen.pid"),
+        Duration::from_secs(5),
+    );
+    drop(setup_lock);
+
+    let seen = std::cell::RefCell::new(Vec::new());
+    let get = |path: &str, extra: &str| {
+        let (h, b) = fetch(
+            port,
+            &format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n{extra}\r\n"),
+        );
+        assert!(h.starts_with("HTTP/1.1 200"), "{path}: {h}");
+        seen.borrow_mut()
+            .push(format!("{path} {extra:?} {}", x_cache(&h)));
+        b
+    };
+    for _ in 0..2 {
+        assert_eq!(get("/small", ""), pattern(100, 1));
+        assert_eq!(get("/large", ""), pattern(300_000, 2));
+    }
+    let (h, b) = fetch(port, "HEAD /large HTTP/1.0\r\nHost: localhost\r\n\r\n");
+    assert!(
+        h.contains("Content-Length: 300000\r\n") && b.is_empty(),
+        "{h}"
+    );
+    seen.borrow_mut().push(format!("HEAD {}", x_cache(&h)));
+
+    // The files go behind the zone's back: the hit finds none, the
+    // request goes upstream after all (and stores it again).
+    std::fs::remove_dir_all(dir.join("cache")).unwrap();
+    std::fs::create_dir_all(dir.join("cache")).unwrap();
+    assert_eq!(get("/small", ""), pattern(100, 1));
+    assert_eq!(get("/small", ""), pattern(100, 1));
+
+    // Vary: the main key holds the gzip variant; the plain one is a miss
+    // at its own key, then a hit there.
+    let gz = "Accept-Encoding: gzip\r\n";
+    for extra in [gz, gz, "", "", gz] {
+        assert_eq!(get("/vary/v", extra), b"V");
+    }
+
+    // proxy_cache_lock: the second request waits for the first's file.
+    let first =
+        std::thread::spawn(move || fetch(port, "GET /slow/s HTTP/1.0\r\nHost: localhost\r\n\r\n"));
+    sleep(Duration::from_millis(300));
+    let (h2, b2) = fetch(port, "GET /slow/s HTTP/1.0\r\nHost: localhost\r\n\r\n");
+    let (h1, b1) = first.join().unwrap();
+    assert_eq!(b1, pattern(60_000, 3), "{h1}");
+    assert_eq!(b2, pattern(60_000, 3), "{h2}");
+    seen.borrow_mut()
+        .push(format!("lock {} {}", x_cache(&h1), x_cache(&h2)));
+
+    // Stale entries: read on the pool too, but for revalidation.
+    for stale in ["/bg/x", "/st/x", "/short/x", "/reval/x"] {
+        assert_eq!(get(stale, ""), b"OLD");
+    }
+    // Two variants under revalidation (proxy_cache_vary.t): the second is
+    // found through the first's file, fresh again, and is stale.
+    assert_eq!(get("/rv/x", gz), b"OLD");
+    assert_eq!(get("/rv/x", ""), b"OLD");
+    std::fs::write(dir.join("html/bg/x"), "NEW").unwrap();
+    std::fs::write(dir.join("html/short/x"), "NEW").unwrap();
+    std::fs::remove_file(dir.join("html/st/x")).unwrap();
+    sleep(Duration::from_millis(2100));
+    assert_eq!(get("/bg/x", ""), b"OLD");
+    assert_eq!(get("/st/x", ""), b"OLD");
+    assert_eq!(get("/short/x", ""), b"NEW");
+    assert_eq!(get("/reval/x", ""), b"OLD");
+    assert_eq!(get("/rv/x", gz), b"OLD");
+    assert_eq!(get("/rv/x", ""), b"OLD");
+    sleep(Duration::from_millis(300));
+    assert_eq!(get("/bg/x", ""), b"NEW");
+    seen.into_inner()
+}
+
+#[test]
+fn proxy_cache_reads_on_the_pool_as_without() {
+    let without = cache_sequence("", None);
+    assert!(without.iter().any(|s| s.ends_with(" HIT")), "{without:?}");
+    let statuses: Vec<&str> = without
+        .iter()
+        .map(|s| s.rsplit(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        statuses[statuses.len() - 7..],
+        [
+            "STALE",
+            "STALE",
+            "EXPIRED",
+            "REVALIDATED",
+            "REVALIDATED",
+            "REVALIDATED",
+            "HIT"
+        ],
+        "{without:?}"
+    );
+    assert!(without.iter().any(|s| s == "lock MISS HIT"), "{without:?}");
+    assert_eq!(cache_sequence("aio threads;", None), without);
+    assert_eq!(cache_sequence("aio threads;", Some("epoll")), without);
+}
