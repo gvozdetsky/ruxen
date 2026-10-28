@@ -307,7 +307,7 @@ pub struct ServerNameResolver {
     /// Lowercased head (without trailing `.*`) of `www.example.*` names.
     wildcard_trailing: Vec<(String, Vec<ServerKey>)>,
     /// `~regex` names, in declaration order.
-    regex: Vec<(regex::Regex, Vec<ServerKey>)>,
+    regex: Vec<(regex::bytes::Regex, Vec<ServerKey>)>,
     default: Vec<ServerKey>,
 }
 
@@ -403,7 +403,7 @@ impl ServerNameResolver {
 
     /// Register `key` under a `~regex` server name. A regex registered
     /// again (same server, RSA + ECDSA) adds to its slot.
-    pub fn add_regex(&mut self, regex: &regex::Regex, key: impl Into<ServerKey>) {
+    pub fn add_regex(&mut self, regex: &regex::bytes::Regex, key: impl Into<ServerKey>) {
         let key = key.into();
         if let Some((_, slot)) = self
             .regex
@@ -482,7 +482,7 @@ impl ServerNameResolver {
             return Self::select(slot, schemes);
         }
         for (regex, slot) in &self.regex {
-            if regex.is_match(&normalized) {
+            if regex.is_match(normalized.as_bytes()) {
                 return Self::select(slot, schemes);
             }
         }
