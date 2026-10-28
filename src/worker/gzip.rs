@@ -353,11 +353,32 @@ fn gzip_ok(gz: &PreparedGzip, req: &GzipRequest<'_>, head: &Head<'_>) -> bool {
         return false;
     }
     if let (Some(set), Some(ua)) = (&gz.disable, req.user_agent)
-        && set.is_match(&String::from_utf8_lossy(ua))
+        && set.is_match(ua)
     {
         return false;
     }
     true
+}
+
+/// `ngx_http_gzip_ok` as `gzip_static` calls it, in the content phase:
+/// the response has no headers yet.
+pub(crate) fn static_ok(gz: &PreparedGzip, req: &GzipRequest<'_>) -> bool {
+    gzip_ok(gz, req, &Head::default())
+}
+
+/// The filter adds `Vary` to a static file's response of this type and
+/// size (a 200, 403 or 404 here, a 206 or 416 in `vary_cut_file`).
+pub(crate) fn file_varies(gz: &PreparedGzip, content_type: &[u8], size: u64) -> bool {
+    gz.vary
+        && candidate(
+            gz,
+            &Head {
+                status: 200,
+                content_type: Some(content_type),
+                content_length: Some(size),
+                ..Head::default()
+            },
+        )
 }
 
 /// nginx's `ngx_http_gzip_filter_memory`: a smaller window for a short

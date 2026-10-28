@@ -454,7 +454,8 @@ fn if_range_matches(value: &[u8], meta: &FileMeta, conditional_last_modified: Op
 
 /// The whole of `body` appended to `out`: its range of the file, or each
 /// part's header and range and the closing boundary.
-pub(crate) fn read_body_into(body: &FileBody, out: &mut Vec<u8>) -> std::io::Result<()> {
+#[cfg(test)]
+fn read_body_into(body: &FileBody, out: &mut Vec<u8>) -> std::io::Result<()> {
     let fd = body.fd.as_raw_fd();
     let Some(parts) = &body.parts else {
         return read_at_into(fd, body.offset, body.len, out);

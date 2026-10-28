@@ -33,11 +33,12 @@ mod parse_map;
 mod parse_rewrite;
 mod parse_server;
 mod parse_upstream;
+pub(crate) mod pcre;
 mod values;
 
 pub use ast::*;
 pub use error::*;
-pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_gzip::{GzipConf, GzipStatic, proxied as gzip_proxied};
 pub use parse_http2::Http2Conf;
 pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
 pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
@@ -266,6 +267,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     http.uses_request_id = values::request_id_used();
     http.uses_stderr_log = values::stderr_log_used();
     http.uses_stats = values::stats_used();
+    http.uses_metrics = values::metrics_used();
     http.warnings.extend(check_variable_references()?);
     http.runtime = runtime;
     http.dump_files = lx.take_dump_files();
@@ -479,6 +481,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         uses_request_id: false,
                         uses_stderr_log: false,
                         uses_stats: false,
+                        uses_metrics: false,
                         client_body_temp_path,
                         sendfile,
                         http2,
@@ -522,7 +525,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             ("root", Terminator::Semi) => {
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some(PathBuf::from(path));
+                root = Some(parse_root_path(false, path)?);
             }
             ("root", _) => {
                 return Err(Error::WrongTerminator {
@@ -1163,7 +1166,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "gzip_min_length",
     "gzip_buffers",
     "gzip_disable",
-    "gzip_static",
     "ssi",
     "ssi_silent_errors",
     "ssi_types",
@@ -1436,6 +1438,29 @@ pub(crate) fn parse_mime(
     }
 }
 
+/// A `root` or `alias` path. With variables it is rendered per request
+/// (#232), but it may not read `$document_root` or `$realpath_root`, its
+/// own value (ngx_http_core_root).
+pub(crate) fn parse_root_path(alias: bool, path: &str) -> Result<PathBuf, Error> {
+    let has =
+        |name: &str| path.contains(&format!("${name}")) || path.contains(&format!("${{{name}}}"));
+    let refused = match (has("document_root"), has("realpath_root"), alias) {
+        (true, _, false) => "the $document_root variable cannot be used in the \"root\" directive",
+        (true, _, true) => "the $document_root variable cannot be used in the \"alias\" directive",
+        (_, true, false) => "the $realpath_root variable cannot be used in the \"root\" directive",
+        (_, true, true) => "the $realpath_root variable cannot be used in the \"alias\" directive",
+        _ => "",
+    };
+    if !refused.is_empty() {
+        return Err(Error::Message(refused));
+    }
+    if path.contains('$') {
+        // Notes the references for the unknown-variable check.
+        parse_value_with_vars(path)?;
+    }
+    Ok(PathBuf::from(path))
+}
+
 /// Fail closed on directives that restrict access, when ruxen can't
 /// enforce them yet. The allowlist above is for tuning knobs; silently
 /// dropping one of these would serve what the config says to protect.
@@ -1444,14 +1469,6 @@ pub(crate) fn parse_mime(
 pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
-        // Taken literally, `root /var/www/$host` or `alias /srv/$1` looks
-        // for a directory named `$host` (#232). Until the path is rendered
-        // per request, such a configuration is refused rather than served
-        // from the wrong place. nginx refuses a `$` that doesn't start a
-        // variable, so any `$` here is one.
-        Some("root" | "alias") if value.is_some_and(|v| v.contains('$')) => {
-            "variables in the path aren't expanded yet (#232), so other files would be served than nginx serves"
-        }
         // `location $var` (one argument, a leading `$`) is a predicate
         // location since nginx 1.31.5: it matches when the variable is
         // non-empty and not "0" (ngx_http_core_location). Read as a prefix,
@@ -1469,10 +1486,10 @@ pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<()
         }
         _ => return Ok(()),
     };
-    // For a path or a location, the whole directive: "root" alone isn't
-    // what's missing.
+    // For a location, the whole directive: "location" alone isn't what's
+    // missing.
     let name = match args.first().map(String::as_str) {
-        Some("root" | "alias" | "location") => args.join(" "),
+        Some("location") => args.join(" "),
         _ => args[0].clone(),
     };
     Err(Error::Unenforced { name, consequence })
@@ -2580,24 +2597,34 @@ mod tests {
     }
 
     #[test]
-    fn variables_in_root_and_alias_are_refused() {
-        // #232: taken literally they serve other files than nginx does.
+    fn variables_in_root_and_alias() {
+        // #232: rendered per request.
         for src in [
             "http { root /var/www/$host; server { listen 80; } }",
             "http { server { listen 80; root /srv/$server_name; } }",
-            "http { server { listen 80; location / { root $document_root/x; } } }",
             "http { server { listen 80; location ~ ^/i/(.+)$ { alias /srv/img/$1; } } }",
+            "http { server { listen 80; location /a/ { alias /srv/${host}/; } } }",
         ] {
-            let e = unenforced_err(src);
-            assert!(e.contains("(#232)"), "{src}: {e}");
+            parse(src).unwrap();
         }
-        let e = unenforced_err("http { server { listen 80; root /var/www/$host; } }");
-        assert!(
-            e.starts_with("\"root /var/www/$host\" is not supported yet"),
-            "{e}"
-        );
-        // Without variables, as before.
-        parse("http { server { listen 80; root /srv; location /a/ { alias /srv/a/; } } }").unwrap();
+        // Not their own value (ngx_http_core_root), nor an unknown one.
+        for (src, want) in [
+            (
+                "http { server { listen 80; location / { root $document_root/x; } } }",
+                "the $document_root variable cannot be used in the \"root\" directive",
+            ),
+            (
+                "http { server { listen 80; location / { alias /x/${realpath_root}; } } }",
+                "the $realpath_root variable cannot be used in the \"alias\" directive",
+            ),
+            (
+                "http { server { listen 80; root /srv/$nosuch; } }",
+                "unknown \"nosuch\" variable",
+            ),
+        ] {
+            let e = parse(src).unwrap_err().to_string();
+            assert!(e.starts_with(want), "{src}: {e}");
+        }
     }
 
     #[test]
