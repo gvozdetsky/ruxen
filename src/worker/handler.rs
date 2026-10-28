@@ -199,10 +199,8 @@ pub(crate) fn finalize_location_response(
                 };
                 out = inject_add_headers(out, add_headers, &ctx);
             }
-            // `add_trailer` against a streamed file body would require the
-            // worker to wrap the body in chunked encoding on the way out;
-            // the static-file path doesn't support that today. Quietly skip
-            // — the directive is rare on static content anyway.
+            // `add_trailer`: the worker sends the file chunked, the
+            // trailers after it (`phase`, #844).
             if status == 204 {
                 // `error_page … =204`: header-only, the file isn't sent.
                 return Response::Owned(out);
