@@ -590,7 +590,7 @@ pub(crate) async fn fill_cache(mut s: Box<ProxyStream>) {
         }
         let mut buf = std::mem::take(&mut s.read_buf);
         buf.clear();
-        let Ok((res, returned)) = timeout(s.read_timeout, s.upstream.read(buf)).await else {
+        let Ok((res, returned)) = timeout(s.read_timeout, s.upstream.read_now(buf)).await else {
             return;
         };
         s.read_buf = returned;
