@@ -2452,6 +2452,9 @@ async fn attempt(
                 slot,
             },
         );
+    } else if response_framed {
+        // An unframed body ended at the upstream's close already.
+        upstream::close_after_peer(stream, slot);
     }
 
     // Return scratch to the per-worker pool only on the success path. Error
