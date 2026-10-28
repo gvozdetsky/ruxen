@@ -38,6 +38,14 @@ impl UpstreamIo {
         }
     }
 
+    /// `read` for a relayed body: on plain TCP, `recv_now` (#757).
+    pub async fn read_now<T: IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
+        match self {
+            UpstreamIo::Plain(s) => crate::worker::recv_now(s, buf).await,
+            UpstreamIo::Tls(s) => s.stream.read(buf).await,
+        }
+    }
+
     /// The two directions of a tunnel after a 101 (#87), each a half of
     /// the stream (`crate::duplex`).
     pub fn into_tunnel(self) -> (UpstreamRead, UpstreamWrite) {

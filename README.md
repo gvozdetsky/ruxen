@@ -63,6 +63,8 @@ cd ruxen-v*-x86_64-linux-gnu
 ./ruxen -V
 ```
 
+The tarball also holds this README, `examples/`, and the systemd unit, logrotate file and seccomp profile from [Run as a service](#run-as-a-service) under `contrib/`.
+
 On a glibc older than 2.35 the gnu builds fail with ``version `GLIBC_2.34' not found``: use the musl build, or build from source. Each release also has the tarballs under versioned names (`ruxen-v<version>-<target>.tar.gz`), a CycloneDX SBOM per target (`ruxen-v<version>-<target>.cdx.json`) and a `SHA256SUMS` file. The tarballs carry build-provenance and SBOM attestations, signed with the release workflow's identity: `gh attestation verify ruxen-x86_64-linux-gnu.tar.gz -R gvozdetsky/ruxen`. The binaries embed their crate list (`cargo audit bin ruxen`, Trivy and Syft read it).
 
 **Container image** (amd64 and arm64, so also Docker Desktop on Apple Silicon), published with every release after 0.1.2:
@@ -153,16 +155,20 @@ ruxen --compat -c /etc/nginx/nginx.conf
 
 ```text
 ruxen 0.2.2: checking /etc/nginx/nginx.conf
-/etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block
+/etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block (FastCGI isn't in ruxen: README, Limitations)
 /etc/nginx/nginx.conf:41: differs: ssl_early_data on — TLS 1.3 early data is not accepted
 -: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#fastcgi-uwsgi-scgi-memcached
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#ssl_early_data-on
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#ssl_protocols
 ruxen does not start with this configuration: 1 unsupported, 2 behaving differently
 ```
 
 - **unsupported:** ruxen refuses to start with it. This covers unknown directives and access restrictions ruxen can't enforce yet.
 - **differs:** ruxen starts, but does something other than nginx would. The directive is accepted and ignored where its value matters. A directive set to nginx's default, such as `ssi off`, is not listed.
 - **ignored:** tuning knobs with no visible effect.
+- **what to do:** the section of the migration guide, [`docs/migrating.md`](docs/migrating.md), for each kind of finding: what ruxen does instead, when it matters, what to do, and the issue that tracks it. The guide also covers running ruxen in nginx's place (systemd, `user`, reload, log rotation, containers).
 
 With nothing unsupported, the configuration is then loaded the way `-t` does it (certificates, roots, log files). The exit status is 0 when ruxen starts with the configuration. A `#N` refers to the GitHub issue that tracks the gap. `-t` errors also carry nginx's ` in file:line`.
 
@@ -211,6 +217,7 @@ docker run --rm -p 8080:8080 \
 - `limit_rate`, `limit_rate_after` and `$limit_rate`
 - `limit_req` and `limit_conn` on zones shared by the workers and kept across a reload
 - `stub_status` and the `$connections_*` variables
+- `ruxen_metrics` (ruxen's own): the same counters, per server, upstream peer, limit zone and cache zone counters in Prometheus text format ([`docs/metrics.md`](docs/metrics.md))
 - gzip compression (`gzip`, `gzip_types`, `gzip_min_length`, `gzip_comp_level`, `gzip_vary`, `gzip_http_version`, `gzip_proxied`, `gzip_disable`) of static files, `return`, error pages and proxied responses, as nginx decides it: the same statuses, types, `Accept-Encoding` q-values, weak `ETag`, no `Accept-Ranges`. A file gzip compresses is sent whole even for a `Range` request, as from nginx. Not yet: `gzip_static`, `gunzip`, `$gzip_ratio`, and gzip under `limit_rate` (such a response goes out unpaced).
 
 ### Static files
@@ -326,7 +333,7 @@ and one option nginx doesn't have: `--compat`, the configuration check described
 
 Responses identify ruxen itself: `Server: ruxen/<version>` (plain `ruxen` with `server_tokens off`), and the same name in the footer of built-in error pages. `scripts/run_nginx_tests.sh` sets `RUXEN_NGINX_IDENTITY=1`, which makes them say `nginx/1.30.6` instead, because the upstream tests assert nginx's header, and puts `nginx version: nginx/1.30.6` at the top of `-V`, which the harness needs too.
 
-ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) log reopening via `SIGUSR1`, and configuration reload via `SIGHUP`. `-s stop|quit|reopen|reload` send `SIGTERM`/`SIGQUIT`/`SIGUSR1`/`SIGHUP` to the PID in the config's `pid` file, as nginx does. A reload starts new workers with the new configuration (certificates included) on the same listening sockets, so connections aren't refused or reset in the handover, and the old workers finish their requests, within `worker_shutdown_timeout` if set; a configuration that fails to load is logged and the running one stays. After a switch to `user`, a reload reads the configuration as that user and can't bind new ports below 1024.
+ruxen also supports pid files, graceful shutdown via `SIGQUIT` (waits for in-flight requests), fast shutdown via `SIGTERM` or `SIGINT` (does not wait; the pid file is removed either way) log reopening via `SIGUSR1`, and configuration reload via `SIGHUP`. `-s stop|quit|reopen|reload` send `SIGTERM`/`SIGQUIT`/`SIGUSR1`/`SIGHUP` to the PID in the config's `pid` file, as nginx does. A reload starts new workers with the new configuration (certificates included) on the same listening sockets, so connections aren't refused or reset in the handover, and the old workers finish their requests, within `worker_shutdown_timeout` if set; a configuration that fails to load is logged and the running one stays. After a switch to `user`, a reload reads the configuration (certificates and keys too) as that user, so ruxen warns at startup about each file it read as root that the user can't read (see [`docs/migrating.md`](docs/migrating.md#user-and-ports-below-1024): a certbot key at `0600 root` fails the reload after a renewal; `LoadCredential=` under systemd); new ports below 1024 bind with `CAP_NET_BIND_SERVICE`, the one capability the process keeps after the switch.
 
 ## Compatibility philosophy
 
@@ -424,15 +431,13 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 - HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
-- a proxied response is still read whole before it is sent in a few cases: a cache store, `add_trailer`, failover and interception (#463)
 - OCSP checks of client certificates (#142), 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
-- nginx's binary upgrade (`SIGUSR2`); a reload can't bind new ports below 1024 once ruxen runs as `user`
-- variables in `root` and `alias` (#232)
+- nginx's binary upgrade (`SIGUSR2`)
 
-Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. `ssl_ciphers` is evaluated as OpenSSL would over the TLS 1.2 suites rustls has (all ECDHE with AES-GCM or ChaCha20-Poly1305; the weaker ones a list names don't exist here), and `ssl_prefer_server_ciphers` picks whose order counts. Accepted with a warning: `ssl_ecdh_curve` (rustls's modern groups are used).
+Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. `ssl_ciphers` is evaluated as OpenSSL would over the TLS 1.2 suites rustls has (all ECDHE with AES-GCM or ChaCha20-Poly1305; the weaker ones a list names don't exist here), and `ssl_prefer_server_ciphers` picks whose order counts. Accepted with a warning: `ssl_ecdh_curve` (rustls's modern groups are used).
 
-Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently. Anything else that behaves unlike nginx is a bug; please report it.
+Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently, and [`docs/migrating.md`](docs/migrating.md) says what to do about each. Anything else that behaves unlike nginx is a bug; please report it.
 
 ## Contributing
 
