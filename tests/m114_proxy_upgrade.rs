@@ -258,7 +258,14 @@ fn tunnel_over_tls(label: &str, extra: &str) {
         got.extend_from_slice(&buf[..n]);
     }
     assert!(got.starts_with(b"HTTP/1.1 101 "));
+    // Key updates asking for ours mid-tunnel (#852), where the keys can
+    // change: in userspace, or a kernel that takes new ones (Linux 6.14).
+    let rekeys = std::fs::read_to_string("/proc/net/tls_stat")
+        .map_or(true, |stat| stat.contains("TlsRxRekeyOk"));
     for round in 0..4u8 {
+        if rekeys && round % 2 == 1 {
+            s.conn.refresh_traffic_keys().unwrap();
+        }
         let chunk: Vec<u8> = (0..256 * 1024).map(|i| (i as u8) ^ round).collect();
         s.write_all(&chunk).unwrap();
         let mut echoed = vec![0u8; chunk.len()];
