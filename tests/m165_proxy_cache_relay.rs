@@ -53,13 +53,20 @@ fn spawn_backend(listener: TcpListener, plain: bool) -> Hits {
                 let body = pattern(CHUNK * CHUNKS);
                 let _ = match path {
                     _ if plain => conn.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n\
+                          Connection: close\r\n\r\nok\n",
                     ),
                     "/slow" | "/slowlen" => {
                         let framing = if path == "/slow" {
                             "Transfer-Encoding: chunked".to_string()
                         } else {
                             format!("Content-Length: {}\r\nAccept-Ranges: bytes", body.len())
+                        };
+                        // `?z`: a type gzip compresses.
+                        let framing = if target.ends_with("?z") {
+                            framing + "\r\nContent-Type: text/plain"
+                        } else {
+                            framing
                         };
                         let _ = conn.write_all(
                             format!(
@@ -189,6 +196,12 @@ fn setup(name: &str) -> Setup {
                location /tr/ {{ proxy_pass http://127.0.0.1:{b}/; add_trailer X-Length $upstream_response_length;\n\
                  add_trailer X-Sent $sent_http_transfer_encoding; }}\n\
                location /in/ {{ internal; proxy_pass http://127.0.0.1:{b}/; }}\n\
+               location /ct/ {{ proxy_pass http://127.0.0.1:{b}/; proxy_cache z; proxy_cache_valid 200 10m;\n\
+                 add_trailer X-C $upstream_cache_status; }}\n\
+               location /cz/ {{ proxy_pass http://127.0.0.1:{b}/; proxy_cache z; proxy_cache_valid 200 10m;\n\
+                 gzip on; gzip_types text/plain; gzip_min_length 1; add_trailer X-C $upstream_cache_status; }}\n\
+               location /czs/ {{ proxy_pass http://127.0.0.1:{p}/; proxy_cache z; proxy_cache_valid 200 10m;\n\
+                 gzip on; gzip_types text/plain; gzip_min_length 1; add_trailer X-C $upstream_cache_status; }}\n\
              }} }}\n"
         ),
     )
@@ -462,6 +475,71 @@ fn m165_trailers_follow_a_relayed_body() {
         r.head
     );
     assert!(r.body == whole);
+}
+
+fn gunzip(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(data)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+/// A cache hit with `add_trailer` is sent from its file, chunked, with the
+/// trailers after it, also compressed (#793): the worker's memory doesn't
+/// hold the body.
+#[test]
+fn m165_cached_body_keeps_its_trailers() {
+    let s = setup("hittrailers");
+    let whole = pattern(CHUNK * CHUNKS);
+    for (target, plain) in [
+        ("/ct/slowlen", true),
+        ("/cz/slowlen?z", false),
+        ("/czs/x", false),
+    ] {
+        let req = format!(
+            "GET {target} HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"
+        );
+        for status in ["MISS", "HIT"] {
+            let r = send(s.port, &req);
+            assert!(r.head.starts_with("HTTP/1.1 200 "), "{}", r.head);
+            assert!(
+                r.head.contains(&format!("\r\nX-Cache: {status}\r\n")),
+                "{}",
+                r.head
+            );
+            assert!(
+                r.head.contains("\r\nTransfer-Encoding: chunked\r\n"),
+                "{}",
+                r.head
+            );
+            assert!(!r.head.contains("Content-Length"), "{}", r.head);
+            assert_eq!(
+                !plain,
+                r.head.contains("Content-Encoding: gzip"),
+                "{}",
+                r.head
+            );
+            let (body, trailers) = dechunk(&r.body);
+            let body = if plain { body } else { gunzip(&body) };
+            let want: &[u8] = if target == "/czs/x" { b"ok\n" } else { &whole };
+            assert!(body == want, "{target} {status}: {} bytes", body.len());
+            assert_eq!(trailers, format!("X-C: {status}\r\n\r\n"), "{target}");
+        }
+    }
+    let pid = s.child.0.id();
+    let r = get(s.port, "/ct/big");
+    assert!(r.head.contains("\r\nX-Cache: MISS\r\n"), "{}", r.head);
+    let before = vm_hwm(pid);
+    let r = hit(s.port, "/ct/big");
+    let (body, trailers) = dechunk(&r.body);
+    assert!(body == pattern(BIG), "{} bytes", body.len());
+    assert_eq!(trailers, "X-C: HIT\r\n\r\n");
+    let after = vm_hwm(pid);
+    assert!(
+        after < before + 32 * 1024,
+        "VmHWM {before} kB before the hit, {after} kB after"
+    );
 }
 
 fn ranged(port: u16, target: &str, range: &str) -> Reply {

@@ -1159,13 +1159,14 @@ pub(crate) async fn stream_file<S: ConnIo>(
 /// blocks, compressed, and sent as HTTP/1.1 chunks (or raw for HTTP/1.0,
 /// where the connection closes after). Returns the bytes written, or
 /// those that went out before an error or a file shorter than its stat
-/// said.
+/// said. `last_chunk`: end the chunks (off when trailers follow).
 pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
     stream: &mut S,
     body: phase::FileBody,
     gzip: super::gzip::GzipStream,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
+    last_chunk: bool,
 ) -> Result<u64, u64> {
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::from(body.fd);
@@ -1213,7 +1214,7 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
         } else {
             PREFIX
         };
-        if remaining == 0 && gzip.chunked {
+        if remaining == 0 && gzip.chunked && last_chunk {
             out.extend_from_slice(b"0\r\n\r\n");
         }
         if out.len() > start {

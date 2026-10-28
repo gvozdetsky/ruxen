@@ -1424,11 +1424,7 @@ fn finish_proxy_response(
             Some(body),
             None,
         ),
-        Response::File { headers, body } if process_meta.proxy_add_trailers.is_empty() => {
-            (Response::Owned(headers), None, Some(body))
-        }
-        // Trailers go after a chunked body built in memory.
-        Response::File { headers, body } => (read_file_body(headers, body, ctx), None, None),
+        Response::File { headers, body } => (Response::Owned(headers), None, Some(body)),
         other => (other, None, None),
     };
     // Reached through an `error_page` without `=`: the error's status
@@ -1495,7 +1491,6 @@ fn finish_proxy_response(
     };
     let response = apply_proxy_add_headers(
         upstream_resp,
-        relayed.is_some(),
         http,
         ctx,
         &process_meta,
@@ -1511,7 +1506,18 @@ fn finish_proxy_response(
             };
             Response::ProxyStream(body)
         }
-        (Response::Owned(headers), _, Some(body)) => Response::File { headers, body },
+        (Response::Owned(headers), _, Some(body)) => Response::File {
+            headers: if process_meta.proxy_add_trailers.is_empty() {
+                headers
+            } else {
+                expect_file_trailers(headers, ctx, &mut process_meta)
+            },
+            body,
+        },
+        (Response::Owned(bytes), None, None) if !process_meta.proxy_add_trailers.is_empty() => {
+            process_meta.trailers_due = trailers_due(&bytes, ctx, &process_meta);
+            Response::Owned(bytes)
+        }
         (response, ..) => response,
     };
     // The header is filtered. A buffered body is already read, so the
@@ -1545,6 +1551,117 @@ async fn send_relay_trailers<S: ConnIo>(
     res.ok().map(|()| len as u64)
 }
 
+/// What the trailers render with.
+struct TrailerCtx<'a, 'r> {
+    http: &'static PreparedHttp,
+    ctx: &'a phase::RequestCtx<'r>,
+    meta: &'a phase::ProcessMeta,
+    uri: Option<&'a [u8]>,
+}
+
+/// A cached body with trailers (#793): the head, the file as one chunk
+/// (gzip: its chunks), then the last chunk with the trailers, rendered
+/// once the body is out. Plain writes, no sendfile: HTTP/2 decodes the
+/// chunks. Returns all bytes written, head included.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn send_file_trailers<S: ConnIo>(
+    stream: &mut S,
+    head: &mut Vec<u8>,
+    body: phase::FileBody,
+    gzip: Option<super::gzip::GzipStream>,
+    limit: Option<&phase::ResponseLimit>,
+    request_start: Instant,
+    tc: TrailerCtx<'_, '_>,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Result<u64, u64> {
+    let head_len = head.len();
+    let len = body.len;
+    let plain_chunk = gzip.is_none() && len > 0;
+    if plain_chunk {
+        head.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+    }
+    let out = std::mem::take(head);
+    let n = out.len();
+    let (res, mut returned) = write_all_timed(stream, out, n, timer.as_mut(), send_timeout).await;
+    returned.truncate(head_len);
+    *head = returned;
+    res.map_err(|n| n as u64)?;
+    let mut sent = n as u64;
+    match gzip {
+        Some(gz) => {
+            sent += stream_file_gzip(stream, body, gz, timer.as_mut(), send_timeout, false)
+                .await
+                .map_err(|n| sent + n)?;
+        }
+        None => {
+            let mut pacer = limit
+                .filter(|l| l.rate > 0)
+                .and_then(|l| super::Pacer::new(l.rate, l.after, request_start));
+            stream_file(stream, body, timer.as_mut(), send_timeout, pacer.as_mut())
+                .await
+                .map_err(|n| sent + n)?;
+            sent += len;
+        }
+    }
+    let mut out = if plain_chunk {
+        b"\r\n".to_vec()
+    } else {
+        Vec::new()
+    };
+    out.extend_from_slice(&super::response::relay_trailers(
+        tc.http, tc.ctx, tc.meta, tc.uri, head,
+    ));
+    let n = out.len();
+    let (res, _) = write_all_timed(stream, out, n, timer, send_timeout).await;
+    res.map_err(|n| sent + n as u64)?;
+    Ok(sent + n as u64)
+}
+
+/// `add_trailer` on a proxied body in memory (#793): one chunk, then the
+/// trailers. gzip already made it chunked (`compressed_response`): the
+/// trailers go in its last chunk.
+#[cold]
+#[inline(never)]
+fn trailers_in_memory(
+    bytes: Vec<u8>,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    uri: Option<&[u8]>,
+) -> Vec<u8> {
+    let Some(sep) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return bytes;
+    };
+    let chunked = super::response::response_header_value(&bytes, b"transfer-encoding")
+        .is_some_and(|v| v.eq_ignore_ascii_case(b"chunked"));
+    let (mut out, body) = if chunked {
+        let mut bytes = bytes;
+        if !bytes.ends_with(b"0\r\n\r\n") {
+            return bytes;
+        }
+        bytes.truncate(bytes.len() - 5);
+        (bytes, Vec::new())
+    } else {
+        let body = bytes[sep + 4..].to_vec();
+        let mut head = strip_header_lines(bytes, b"content-length");
+        let end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+        head.truncate(end + 2);
+        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        (head, body)
+    };
+    let head_end = out
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(0, |p| p + 4);
+    let trailers = super::response::relay_trailers(http, ctx, meta, uri, &out[..head_end]);
+    out.extend_from_slice(&super::response::build_single_chunk_body(&body));
+    out.extend_from_slice(&trailers);
+    out
+}
+
 /// `add_trailer` on a relayed body (#463): it goes chunked, without its
 /// length, and the worker writes the trailers after it.
 #[cold]
@@ -1561,6 +1678,30 @@ fn expect_relay_trailers(
         return head;
     }
     body.trailers = true;
+    strip_header_lines(head, b"content-length")
+}
+
+/// nginx's `r->expect_trailers` for a response with `add_trailer`.
+#[cold]
+#[inline(never)]
+fn trailers_due(head: &[u8], ctx: &phase::RequestCtx<'_>, meta: &phase::ProcessMeta) -> bool {
+    super::response::trailers_allowed(ctx, meta)
+        && super::response::expects_trailers(meta.proxy_add_trailers, response_status(head))
+}
+
+/// `add_trailer` on a cached body sent from its file (#793): it goes
+/// chunked, without its length, the trailers after it.
+#[cold]
+#[inline(never)]
+fn expect_file_trailers(
+    head: Vec<u8>,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &mut phase::ProcessMeta,
+) -> Vec<u8> {
+    if !trailers_due(&head, ctx, meta) {
+        return head;
+    }
+    meta.trailers_due = true;
     strip_header_lines(head, b"content-length")
 }
 
@@ -1672,22 +1813,6 @@ fn range_filter_file(
         |len, server| super::range::not_satisfiable(len, req.head_only, server),
     )
     .unwrap_or_else(|_| internal_error_response(ctx.method))
-}
-
-/// A cached response's body read from its file after `head`, for the
-/// filters that need it in memory (`add_trailer`).
-#[cold]
-#[inline(never)]
-fn read_file_body(
-    mut head: Vec<u8>,
-    body: phase::FileBody,
-    ctx: &phase::RequestCtx<'_>,
-) -> Response {
-    use std::os::fd::AsRawFd;
-    match crate::file::read_at_into(body.fd.as_raw_fd(), body.offset, body.len, &mut head) {
-        Ok(()) => Response::Owned(head),
-        Err(_) => internal_error_response(ctx.method),
-    }
 }
 
 #[allow(clippy::large_enum_variant)] // per request: boxing waits for #467's measurements
@@ -5488,6 +5613,19 @@ pub(crate) async fn handle<S: ConnIo>(
                             ),
                             None => (response, None),
                         };
+                        // `add_trailer` on a body in memory: after gzip.
+                        if process_meta.trailers_due
+                            && let Response::Owned(bytes) = &mut response
+                        {
+                            *bytes = trailers_in_memory(
+                                std::mem::take(bytes),
+                                http,
+                                &ctx,
+                                &process_meta,
+                                final_uri(&process_meta, url_scratch),
+                            );
+                            process_meta.trailers_due = false;
+                        }
                         // `charset` (#464): the label on Content-Type, from
                         // the location's DocRoot, in place.
                         if let Some(charset) = process_meta.doc_root.and_then(|d| d.charset) {
@@ -5650,6 +5788,12 @@ pub(crate) async fn handle<S: ConnIo>(
                             } else {
                                 close_after = true;
                             }
+                        } else if process_meta.trailers_due && gzip_stream.is_none() {
+                            insert_header_at(
+                                &mut *scratch,
+                                &mut scan.head_end,
+                                b"Transfer-Encoding: chunked\r\n",
+                            );
                         }
                         // The client stopped taking the response: it is
                         // logged with what is known to have gone out, then
@@ -5790,6 +5934,34 @@ pub(crate) async fn handle<S: ConnIo>(
                                         None => cut_short = true,
                                     }
                                 }
+                            } else if process_meta.trailers_due
+                                && let Some(body) = file_body.take()
+                            {
+                                let head_len = scratch.len() as u64;
+                                match Box::pin(send_file_trailers(
+                                    stream,
+                                    scratch,
+                                    body,
+                                    gzip_stream,
+                                    process_meta.limit_rate.as_deref(),
+                                    request_start,
+                                    TrailerCtx {
+                                        http,
+                                        ctx: &ctx,
+                                        meta: &process_meta,
+                                        uri: final_uri(&process_meta, url_scratch),
+                                    },
+                                    timers.io.as_mut(),
+                                    send_timeout,
+                                ))
+                                .await
+                                {
+                                    Ok(sent) => streamed_body_len = sent - head_len,
+                                    Err(n) => {
+                                        cut_short = true;
+                                        cut_sent = Some(n);
+                                    }
+                                }
                             } else if let Some(limit) = process_meta.limit_rate.as_deref()
                                 && limit.rate > 0
                                 && gzip_stream.is_none()
@@ -5865,6 +6037,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                             gz,
                                             timers.io.as_mut(),
                                             send_timeout,
+                                            true,
                                         )
                                         .await
                                     }
