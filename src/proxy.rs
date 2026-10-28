@@ -181,10 +181,6 @@ pub struct ProxyPlan {
     /// `proxy_bind` for this request: the local address new upstream
     /// connections are bound to. Pooled ones are reused as they are.
     pub bind: Option<LocalBind>,
-    /// A body that doesn't arrive with the header may be relayed as it
-    /// comes (#88): nothing on this location needs it whole (no
-    /// `add_trailer`).
-    pub stream: bool,
     /// `proxy_force_ranges`: the range filter may cut the response whatever
     /// the upstream says (#370).
     pub force_ranges: bool,
@@ -916,16 +912,6 @@ pub async fn run_proxy(
                 record_failure(failures, &plan, current.peer_idx, error);
                 return crate::worker::internal_error_response(plan.method);
             }
-            AttemptOutcome::TooBig => {
-                upstream::report_success(upstream, current.peer_idx);
-                record_failure(
-                    failures,
-                    &plan,
-                    current.peer_idx,
-                    Box::new(UpstreamError::TooBigBody),
-                );
-                return Response::Prebuilt(plan.bad_gateway.pick(plan.method));
-            }
             AttemptOutcome::PooledStale => {
                 // The pre-match collapses PooledStale into either a fresh
                 // retry or a Failed; reaching here is a logic bug.
@@ -1196,7 +1182,6 @@ pub enum UpstreamError {
     EarlyHintsHttp10,
     Status444,
     InvalidChunked,
-    TooBigBody,
     /// Bytes past `Content-Length` or past the final chunk: the response
     /// is served, the connection not reused (a warning, not a failure).
     ExtraAfterLength,
@@ -1355,11 +1340,6 @@ impl std::fmt::Display for UpstreamError {
                 "upstream sent invalid chunked response while {}",
                 Stage::ReadingBody.as_str()
             ),
-            TooBigBody => write!(
-                f,
-                "upstream response is too big to buffer while {}",
-                Stage::ReadingBody.as_str()
-            ),
             ExtraAfterLength => write!(
                 f,
                 "upstream sent more data than specified in \"Content-Length\" header while {}",
@@ -1510,7 +1490,7 @@ pub struct UpstreamState {
     /// The try whose response is being sent, while its header is filtered:
     /// `$upstream_response_time` is `-` then, as nginx's response_time is
     /// -1 until the upstream request is finalized. `response_ms` already
-    /// holds the time (the body is read whole before the header filter).
+    /// holds the time (a relayed body's is set once it is out).
     pub in_flight: bool,
     /// Milliseconds from the start of the attempt; `None` until reached.
     pub connect_ms: Option<u64>,
@@ -1579,11 +1559,6 @@ enum AttemptOutcome {
     /// (`proxy_bind`): the request ends with a 500, the peer not blamed
     /// (ngx_http_upstream_connect on NGX_ERROR).
     LocalError(Box<UpstreamError>),
-    /// The body is over `MAX_BUFFERED_BODY`: a limit of ours, not a
-    /// failure of the peer, which answered (#513). A 502, without failing
-    /// over (the next peer would answer the same) or counting against
-    /// the peer's `max_fails`.
-    TooBig,
 }
 
 /// A `proxy_bind` address, resolved for one request.
@@ -2150,15 +2125,8 @@ async fn attempt(
         }
     }
 
-    // 6. Pull the rest of the body. HEAD / 204 / 304 have no body even if
-    //    a Content-Length header is present.
-    //
-    // For non-chunked framings the body is grown directly inside `accum`
-    // so the response bytes — header block + body — live in one buffer.
-    // The stitch step (step 7) slices the body out of `accum` instead of
-    // copying through an intermediate `body_owned`. For chunked, we still
-    // need a separate decoded buffer because the wire bytes carry chunk
-    // sizes that would otherwise leak into the forwarded body.
+    // 6. The body: relayed unless it came whole with the header. HEAD /
+    //    204 / 304 have no body even if a Content-Length header is present.
     // `X-Accel-Redirect` (unless ignored): nginx redirects as soon as it
     // has the header and never reads the body, so a response that may have
     // one leaves the connection unusable for the pool. A bodiless one (204,
@@ -2194,23 +2162,6 @@ async fn attempt(
     // connection is not reused (nginx clears u->keepalive), since what
     // followed may still be in the socket for the next request.
     let mut overrun: Option<UpstreamError> = None;
-    // proxy_limit_rate pacer state — anchors at the moment body collection
-    // begins. `paced_bytes` counts body bytes received from the upstream so
-    // far; we sleep when bytes/elapsed would exceed `plan.limit_rate`. Bytes
-    // already pulled in with the header read are counted as received.
-    let body_pacer_start = Instant::now();
-    let intercepted = plan
-        .intercept
-        .as_ref()
-        .is_some_and(|rules| rules.iter().any(|r| r.status == status_code));
-    let limit_rate = match late_limit_rate {
-        // An answer `proxy_intercept_errors` sends to an error_page isn't
-        // the client's: nginx doesn't read its body at all.
-        _ if intercepted => 0,
-        Some(late) => late_limit_rate_of(late, status_code, &accum[..head_end], first_line_end),
-        None => plan.limit_rate,
-    };
-    let mut paced_body_bytes: u64 = body_len_in_accum as u64;
     // The client asked with HEAD and the upstream got another method
     // (`proxy_method`): the header goes alone and the body isn't read, as
     // nginx's header_only request finalizes the upstream after the header,
@@ -2236,12 +2187,11 @@ async fn attempt(
         return_proxy_buf(accum);
         return AttemptOutcome::Ok(Response::Owned(head));
     }
-    // A body that hasn't all arrived goes to the client as it comes (#88),
-    // unless the plan needs it whole. A status that fails over or is
-    // intercepted drops it unread, as nginx decides both on the header;
-    // a cacheable one goes into the cache file on the way (#463).
-    if plan.stream
-        && body_has_content
+    // A body that hasn't all arrived goes to the client as it comes (#88).
+    // A status that fails over or is intercepted drops it unread, as nginx
+    // decides both on the header; a cacheable one goes into the cache file
+    // on the way (#463).
+    if body_has_content
         && let Some(framing) = stream_framing(
             &accum[body_start..],
             chunked,
@@ -2249,6 +2199,20 @@ async fn attempt(
             upstream_close,
         )
     {
+        // proxy_limit_rate paces from here, the bytes that came with the
+        // header counted as read.
+        let pacer_start = Instant::now();
+        let intercepted = plan
+            .intercept
+            .as_ref()
+            .is_some_and(|rules| rules.iter().any(|r| r.status == status_code));
+        let limit_rate = match late_limit_rate {
+            // An answer `proxy_intercept_errors` sends to an error_page
+            // isn't the client's: nginx doesn't read its body at all.
+            _ if intercepted => 0,
+            Some(late) => late_limit_rate_of(late, status_code, &accum[..head_end], first_line_end),
+            None => plan.limit_rate,
+        };
         state.response_length = body_len_in_accum as u64;
         let head = client_head(
             plan,
@@ -2285,8 +2249,8 @@ async fn attempt(
                 read_buf,
                 read_timeout: plan.read_timeout,
                 limit_rate,
-                pacer_start: body_pacer_start,
-                paced: paced_body_bytes,
+                pacer_start,
+                paced: body_len_in_accum as u64,
                 started,
                 pool,
                 slot,
@@ -2295,6 +2259,7 @@ async fn attempt(
                 gzip: None,
                 cache: None,
                 window: None,
+                trailers: false,
             },
         )));
     }
@@ -2307,134 +2272,35 @@ async fn attempt(
         }
         body_len_in_accum = 0;
     } else if chunked {
-        let mut body = Vec::with_capacity(body_len_in_accum + 4096);
-        body.extend_from_slice(&accum[body_start..]);
-        // Truncate accum to just the header block — the chunked-encoded
-        // bytes after `body_start` are not what we'll forward.
-        accum.truncate(body_start);
-        body_len_in_accum = 0;
-        match read_chunked_body_with_buf(
-            &mut stream,
-            &mut body,
-            &mut read_buf,
-            plan.read_timeout,
-            (limit_rate, body_pacer_start),
-        )
-        .await
-        {
-            Ok((read, extra)) => {
-                state.bytes_received += read;
-                if extra {
+        // Whole with the header (else relayed), or malformed. The wire
+        // bytes after `body_start` aren't what goes out.
+        let mut body = Vec::with_capacity(body_len_in_accum);
+        let mut decoder = crate::proxy_stream::ChunkedDecoder::default();
+        match decoder.feed(&accum[body_start..], &mut body) {
+            Ok((true, used)) => {
+                if used < body_len_in_accum {
                     overrun = Some(UpstreamError::ExtraAfterFinalChunk);
                 }
             }
-            Err((_, UpstreamError::TooBigBody)) => return AttemptOutcome::TooBig,
-            Err((stale, error)) => {
-                if stale && from_pool && body.is_empty() {
-                    return AttemptOutcome::PooledStale;
-                }
+            _ => {
                 return AttemptOutcome::Failed(
                     Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
                     FailKind::Error,
-                    Box::new(error),
+                    Box::new(UpstreamError::InvalidChunked),
                 );
             }
         }
+        accum.truncate(body_start);
+        body_len_in_accum = 0;
         decoded_chunked_body = Some(body);
     } else if let Some(cl) = content_length {
-        // Refused before reading, like the chunked and close-delimited
-        // bodies once they pass the cap.
-        if cl > MAX_BUFFERED_BODY as u64 {
-            return AttemptOutcome::TooBig;
-        }
+        // Whole with the header (else relayed). Past `cl`: only `cl` bytes
+        // go to the client, and the connection isn't pooled.
         let cl_usize = cl as usize;
-        // More than cl_usize bytes in the header pull: only cl_usize go to
-        // the client, and the connection isn't pooled.
         if body_len_in_accum > cl_usize {
             accum.truncate(body_start + cl_usize);
             body_len_in_accum = cl_usize;
             overrun = Some(UpstreamError::ExtraAfterLength);
-        }
-        // Reserve for what is likely to arrive, not for what the upstream
-        // claims: a bogus `Content-Length: 1000000000000` must not abort
-        // the process on allocation. Bigger bodies grow as bytes come in.
-        accum.reserve((cl_usize - body_len_in_accum).min(MAX_UPFRONT_RESERVE));
-        while body_len_in_accum < cl_usize {
-            let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
-                Ok(pair) => pair,
-                Err(_) => {
-                    return AttemptOutcome::Failed(
-                        Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
-                        FailKind::Timeout,
-                        Box::new(UpstreamError::TimedOut(Stage::ReadingBody)),
-                    );
-                }
-            };
-            read_buf = returned;
-            match res {
-                Ok(0) => {
-                    return AttemptOutcome::Failed(
-                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                        FailKind::Error,
-                        Box::new(UpstreamError::PrematurelyClosed(Stage::ReadingBody)),
-                    );
-                }
-                Ok(n) => {
-                    state.bytes_received += n as u64;
-                    let need = cl_usize - body_len_in_accum;
-                    let take = n.min(need);
-                    if n > take {
-                        overrun = Some(UpstreamError::ExtraAfterLength);
-                    }
-                    accum.extend_from_slice(&read_buf[..take]);
-                    body_len_in_accum += take;
-                    paced_body_bytes += take as u64;
-                    pace_body_read(limit_rate, paced_body_bytes, body_pacer_start).await;
-                }
-                Err(e) => {
-                    return AttemptOutcome::Failed(
-                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                        FailKind::Error,
-                        Box::new(UpstreamError::RecvFailed(e, Stage::ReadingBody)),
-                    );
-                }
-            }
-        }
-    } else {
-        // No length, no chunked, "close" semantics — read until EOF
-        // straight into `accum`.
-        loop {
-            let (res, returned) = match timeout(plan.read_timeout, stream.read(read_buf)).await {
-                Ok(pair) => pair,
-                Err(_) => {
-                    return AttemptOutcome::Failed(
-                        Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
-                        FailKind::Timeout,
-                        Box::new(UpstreamError::TimedOut(Stage::ReadingBody)),
-                    );
-                }
-            };
-            read_buf = returned;
-            match res {
-                Ok(0) => break,
-                Ok(n) => {
-                    state.bytes_received += n as u64;
-                    accum.extend_from_slice(&read_buf[..n]);
-                    body_len_in_accum += n;
-                    paced_body_bytes += n as u64;
-                    pace_body_read(limit_rate, paced_body_bytes, body_pacer_start).await;
-                }
-                Err(e) => {
-                    return AttemptOutcome::Failed(
-                        Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
-                        FailKind::Error,
-                        Box::new(UpstreamError::RecvFailed(e, Stage::ReadingBody)),
-                    );
-                }
-            }
-            if body_len_in_accum > MAX_BUFFERED_BODY {
-                return AttemptOutcome::TooBig;
-            }
         }
     }
 
@@ -3404,101 +3270,6 @@ pub(crate) async fn pace_body_read(limit_rate: u64, paced_bytes: u64, started: I
         monoio::time::sleep(allowed - elapsed).await;
     }
 }
-
-/// Read a chunked transfer-encoding body, decoding it into `body`: it comes
-/// in holding the wire bytes that arrived with the header and leaves
-/// holding the dechunked payload. Stops at the terminating zero-length
-/// chunk.
-///
-/// The decoding is the streaming path's `ChunkedDecoder`, so a size or
-/// trailer line is bounded the same way there, and wire bytes are dropped
-/// as soon as they are decoded: only the payload counts against
-/// `MAX_BUFFERED_BODY`.
-///
-/// `read_buf` is a caller-owned scratch passed through from `attempt`'s
-/// header-pull loop and reused for every read here too — `attempt` does
-/// one allocation for it per request and threads it through both phases.
-///
-/// Returns the bytes read here and whether the last read went on past the
-/// final chunk. On failure returns the reason, paired with `true` if no
-/// bytes were read at all (a stale pooled connection) and `false`
-/// otherwise.
-async fn read_chunked_body_with_buf(
-    stream: &mut UpstreamIo,
-    body: &mut Vec<u8>,
-    read_buf: &mut Vec<u8>,
-    read_timeout: Duration,
-    // `proxy_limit_rate`: the rate, and when the body started.
-    (limit_rate, pacer_start): (u64, Instant),
-) -> Result<(u64, bool), (bool, UpstreamError)> {
-    let mut paced = body.len() as u64;
-    let leftover = std::mem::take(body);
-    let mut nothing_read = leftover.is_empty();
-    let mut decoder = crate::proxy_stream::ChunkedDecoder::default();
-    let mut decoded: Vec<u8> = Vec::with_capacity(leftover.len() + 4096);
-    let (mut done, mut extra) = decode_chunked(&mut decoder, &leftover, &mut decoded)?;
-    drop(leftover);
-    let mut received = 0u64;
-    while !done {
-        let scratch = std::mem::take(read_buf);
-        let (res, returned) = match timeout(read_timeout, stream.read(scratch)).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                *read_buf = vec![0u8; 4096];
-                return Err((false, UpstreamError::TimedOut(Stage::ReadingBody)));
-            }
-        };
-        *read_buf = returned;
-        match res {
-            Ok(0) => {
-                return Err((
-                    nothing_read,
-                    UpstreamError::PrematurelyClosed(Stage::ReadingBody),
-                ));
-            }
-            Ok(n) => {
-                nothing_read = false;
-                received += n as u64;
-                (done, extra) = decode_chunked(&mut decoder, &read_buf[..n], &mut decoded)?;
-                paced += n as u64;
-                pace_body_read(limit_rate, paced, pacer_start).await;
-            }
-            Err(e) => {
-                return Err((
-                    nothing_read,
-                    UpstreamError::RecvFailed(e, Stage::ReadingBody),
-                ));
-            }
-        }
-    }
-    *body = decoded;
-    Ok((received, extra))
-}
-
-/// One step of `read_chunked_body_with_buf`: whether the body ended, and
-/// whether `input` went on past its end (those bytes are dropped).
-fn decode_chunked(
-    decoder: &mut crate::proxy_stream::ChunkedDecoder,
-    input: &[u8],
-    decoded: &mut Vec<u8>,
-) -> Result<(bool, bool), (bool, UpstreamError)> {
-    let (done, used) = decoder
-        .feed(input, decoded)
-        .map_err(|()| (false, UpstreamError::InvalidChunked))?;
-    if decoded.len() > MAX_BUFFERED_BODY {
-        return Err((false, UpstreamError::TooBigBody));
-    }
-    Ok((done, done && used < input.len()))
-}
-
-/// Largest upstream body we buffer, however it is framed: past it the
-/// answer is a 502, the peer not blamed (`AttemptOutcome::TooBig`).
-/// Responses are buffered whole until they stream (#88), so without this
-/// one response could take a worker's memory.
-const MAX_BUFFERED_BODY: usize = 64 * 1024 * 1024;
-
-/// Upper bound on the up-front reservation for a `Content-Length` body.
-const MAX_UPFRONT_RESERVE: usize = 1024 * 1024;
 
 /// How the response stitch treats one upstream header.
 #[derive(Debug, PartialEq, Eq)]

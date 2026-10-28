@@ -1305,7 +1305,6 @@ pub(crate) fn run_location_handler(
             error_page_status,
             intercept,
             upgrade: client_upgrade,
-            stream: loc.add_trailers.is_empty(),
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
             cache,

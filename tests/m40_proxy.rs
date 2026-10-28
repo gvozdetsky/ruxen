@@ -558,10 +558,11 @@ fn m40_invalid_upstream_framing_is_502() {
 }
 
 /// A chunk-size line that never ends is refused once it passes the line
-/// cap, also when the body is buffered (`add_trailer`): it used to be
-/// read into memory for as long as the upstream kept sending it.
+/// cap: it used to be read into memory for as long as the upstream kept
+/// sending it. The head is out by then (the body is relayed), so the
+/// client connection closes without the last chunk.
 #[test]
-fn m40_endless_chunk_size_line_is_502() {
+fn m40_endless_chunk_size_line_is_cut() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let backend_port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
@@ -589,13 +590,16 @@ http {{
 "#
     );
     let (_guard, port, _dir) = spawn_ruxen(&conf);
+    let started = Instant::now();
     let resp = http_get_close(port, "/up/");
     assert_eq!(
         status_code(&resp),
-        502,
+        404,
         "{}",
         String::from_utf8_lossy(&resp)
     );
+    assert!(!resp.ends_with(b"0\r\n\r\n"));
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 /// An HTTP/1.1 response with neither a length nor chunked, and no

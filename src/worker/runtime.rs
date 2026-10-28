@@ -1221,6 +1221,7 @@ fn finish_proxy_response(
     };
     let response = apply_proxy_add_headers(
         upstream_resp,
+        relayed.is_some(),
         http,
         ctx,
         &process_meta,
@@ -1229,7 +1230,11 @@ fn finish_proxy_response(
     );
     let response = match (response, relayed, file) {
         (Response::Owned(head), Some(mut body), _) => {
-            body.head = head;
+            body.head = if process_meta.proxy_add_trailers.is_empty() {
+                head
+            } else {
+                expect_relay_trailers(head, &mut body, ctx, &process_meta)
+            };
             Response::ProxyStream(body)
         }
         (Response::Owned(headers), _, Some(body)) => Response::File { headers, body },
@@ -1243,6 +1248,46 @@ fn finish_proxy_response(
     }
     process_meta.upstream_headers = report.upstream_headers;
     (response, process_meta)
+}
+
+/// The last chunk with the trailers, after a relayed body. Returns the
+/// bytes written, `None` when the write failed.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn send_relay_trailers<S: ConnIo>(
+    stream: &mut S,
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    uri: Option<&[u8]>,
+    head: &[u8],
+    timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Option<u64> {
+    let out = super::response::relay_trailers(http, ctx, meta, uri, head);
+    let len = out.len();
+    let (res, _) = write_all_timed(stream, out, len, timer, send_timeout).await;
+    res.ok().map(|()| len as u64)
+}
+
+/// `add_trailer` on a relayed body (#463): it goes chunked, without its
+/// length, and the worker writes the trailers after it.
+#[cold]
+#[inline(never)]
+fn expect_relay_trailers(
+    head: Vec<u8>,
+    body: &mut crate::proxy_stream::ProxyStream,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+) -> Vec<u8> {
+    if !super::response::trailers_allowed(ctx, meta)
+        || !super::response::expects_trailers(meta.proxy_add_trailers, response_status(&head))
+    {
+        return head;
+    }
+    body.trailers = true;
+    strip_header_lines(head, b"content-length")
 }
 
 /// A proxied response's head with the status of the `error_page` that led
@@ -5389,6 +5434,23 @@ pub(crate) async fn handle<S: ConnIo>(
                                 // Cut short: the client can't tell, so the
                                 // connection closes (nginx closes it too).
                                 cut_short = !end.complete;
+                                if end.trailers_due && chunked_out {
+                                    match Box::pin(send_relay_trailers(
+                                        stream,
+                                        http,
+                                        &ctx,
+                                        &process_meta,
+                                        final_uri(&process_meta, url_scratch),
+                                        scratch,
+                                        timers.io.as_mut(),
+                                        send_timeout,
+                                    ))
+                                    .await
+                                    {
+                                        Some(sent) => streamed_body_len += sent,
+                                        None => cut_short = true,
+                                    }
+                                }
                             } else if let Some(limit) = process_meta.limit_rate.as_deref()
                                 && limit.rate > 0
                                 && gzip_stream.is_none()

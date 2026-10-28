@@ -186,6 +186,8 @@ fn setup(name: &str) -> Setup {
                location @e {{ return 200 \"intercepted\\n\"; }}\n\
                location /x/ {{ proxy_pass http://127.0.0.1:{b}/; }}\n\
                location /fr/ {{ proxy_pass http://127.0.0.1:{b}/; proxy_force_ranges on; }}\n\
+               location /tr/ {{ proxy_pass http://127.0.0.1:{b}/; add_trailer X-Length $upstream_response_length;\n\
+                 add_trailer X-Sent $sent_http_transfer_encoding; }}\n\
                location /in/ {{ internal; proxy_pass http://127.0.0.1:{b}/; }}\n\
              }} }}\n"
         ),
@@ -401,6 +403,65 @@ fn m165_lock_is_held_until_the_file_is_stored() {
         second.head
     );
     assert_eq!(s.hits("/slow?lock"), 1);
+}
+
+/// A chunked body: its data, and the trailer section.
+fn dechunk(mut wire: &[u8]) -> (Vec<u8>, String) {
+    let mut body = Vec::new();
+    loop {
+        let nl = wire.windows(2).position(|w| w == b"\r\n").unwrap();
+        let size = usize::from_str_radix(std::str::from_utf8(&wire[..nl]).unwrap(), 16).unwrap();
+        wire = &wire[nl + 2..];
+        if size == 0 {
+            return (body, String::from_utf8_lossy(wire).into_owned());
+        }
+        body.extend_from_slice(&wire[..size]);
+        assert_eq!(&wire[size..size + 2], b"\r\n");
+        wire = &wire[size + 2..];
+    }
+}
+
+/// `add_trailer` on a relayed body: chunked, the trailers rendered once
+/// the body is out.
+#[test]
+fn m165_trailers_follow_a_relayed_body() {
+    let s = setup("trailers");
+    let whole = pattern(CHUNK * CHUNKS);
+    for target in ["/tr/slowlen", "/tr/slow"] {
+        let r = get(s.port, target);
+        assert!(r.head.starts_with("HTTP/1.1 200 "), "{}", r.head);
+        assert!(
+            r.head.contains("\r\nTransfer-Encoding: chunked\r\n"),
+            "{}",
+            r.head
+        );
+        assert!(!r.head.contains("Content-Length"), "{}", r.head);
+        assert!(r.ttfb < Duration::from_millis(1000), "ttfb {:?}", r.ttfb);
+        let (body, trailers) = dechunk(&r.body);
+        assert!(body == whole, "{target}: {} bytes", body.len());
+        assert_eq!(
+            trailers,
+            format!(
+                "X-Length: {}\r\nX-Sent: chunked\r\n\r\n",
+                if target.ends_with("len") {
+                    whole.len()
+                } else {
+                    // The wire bytes, chunk framing included.
+                    whole.len() + CHUNKS * 9 + 5
+                }
+            ),
+            "{target}"
+        );
+    }
+    // HTTP/1.0: no trailers, the body as it is.
+    let r = send(s.port, "GET /tr/slowlen HTTP/1.0\r\nHost: x\r\n\r\n");
+    assert!(
+        r.head
+            .contains(&format!("\r\nContent-Length: {}\r\n", whole.len())),
+        "{}",
+        r.head
+    );
+    assert!(r.body == whole);
 }
 
 fn ranged(port: u16, target: &str, range: &str) -> Reply {

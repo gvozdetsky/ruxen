@@ -265,7 +265,7 @@ const DIFFERS: &[(&str, Option<&str>, &str)] = &[
     (
         "proxy_buffering",
         Some("on"),
-        "ruxen relays a response as it arrives either way, except where it still reads it whole (the cache store, add_trailer, statuses that may fail over or be intercepted, proxy_force_ranges: #88)",
+        "ruxen relays a response as it arrives either way (#88, #463)",
     ),
     (
         "proxy_request_buffering",
