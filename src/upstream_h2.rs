@@ -277,6 +277,7 @@ impl H2Conn {
             return Ok(());
         };
         let chunked = left.is_none();
+        let mut ended = false;
         loop {
             match poll_fn(|cx| recv.poll_data(cx)).await {
                 Some(Ok(data)) => {
@@ -298,17 +299,27 @@ impl H2Conn {
                             // The last bytes go once the stream has ended,
                             // so the connection is reusable when they're read.
                             drain(recv).await?;
+                            ended = true;
                         }
                     }
                     break;
                 }
                 Some(Err(e)) => return Err(h2_io(e)),
-                None => break,
+                None => {
+                    ended = true;
+                    break;
+                }
             }
         }
-        if recv.is_end_stream() {
+        if ended || recv.is_end_stream() {
+            // Trailers keep the stream open until polled.
+            let trailers = poll_fn(|cx| recv.poll_trailers(cx)).await.map_err(h2_io)?;
             if chunked {
-                self.out.extend_from_slice(b"0\r\n\r\n");
+                self.out.extend_from_slice(b"0\r\n");
+                if let Some(fields) = trailers {
+                    write_fields(&fields, &mut self.out);
+                }
+                self.out.extend_from_slice(b"\r\n");
             }
             self.phase = Phase::Idle;
         }
@@ -523,18 +534,23 @@ fn request_from_head(head: &[u8], https: bool) -> io::Result<(http::Request<()>,
 }
 
 /// The response head as HTTP/1.1, chunked when the body has no length.
+/// Header or trailer lines, CRLF each.
+fn write_fields(fields: &http::HeaderMap, out: &mut Vec<u8>) {
+    for (name, value) in fields {
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
 fn write_response_head(parts: &http::response::Parts, chunked: bool, out: &mut Vec<u8>) {
     out.extend_from_slice(b"HTTP/1.1 ");
     out.extend_from_slice(parts.status.as_str().as_bytes());
     out.push(b' ');
     out.extend_from_slice(parts.status.canonical_reason().unwrap_or("").as_bytes());
     out.extend_from_slice(b"\r\n");
-    for (name, value) in &parts.headers {
-        out.extend_from_slice(name.as_str().as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
+    write_fields(&parts.headers, out);
     if chunked {
         out.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }

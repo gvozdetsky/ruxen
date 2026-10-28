@@ -167,7 +167,8 @@ fn proxy_http_version_2() {
          server {{ listen 127.0.0.1:{h2c}; http2 on;\n\
            location /info {{ return 200 \"$server_protocol|$connection_requests|$host|$http_te\"; }}\n\
            location /echo {{ proxy_pass http://127.0.0.1:{echo_port}; }}\n\
-           location /stream {{ proxy_pass http://127.0.0.1:{echo_port}; }} }}\n\
+           location /stream {{ proxy_pass http://127.0.0.1:{echo_port}; }}\n\
+           location /trailers {{ add_trailer X-T foo; return 200 tbody; }} }}\n\
          server {{ listen 127.0.0.1:{h2tls} ssl; http2 on;\n\
            ssl_certificate {cert}; ssl_certificate_key {key};\n\
            location / {{ return 200 \"$server_protocol|$ssl_protocol\"; }} }}\n\
@@ -227,6 +228,14 @@ fn proxy_http_version_2() {
             "{path}: {head}"
         );
         assert_eq!(dechunk(&body), "GET|||end", "{path}");
+    }
+
+    // Trailers after the body: the stream ends there (they're dropped).
+    for path in ["/trailers", "/nobuf/trailers"] {
+        let (status, _, body) = get(front, path);
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(dechunk(&body), "tbody", "{path}");
+        assert!(body.ends_with(b"0\r\n\r\n"), "{path}: {}", text(&body));
     }
 
     // A body over the flow-control windows, buffered and relayed.
