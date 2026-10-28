@@ -640,6 +640,7 @@ pub(crate) fn build_listen_tls(
                 let buf = std::fs::read(path).map_err(|e| {
                     format!("open() \"{}\" failed ({})", path.display(), errno_text(&e))
                 })?;
+                crate::privileges::note_read(path);
                 keys.push(
                     crate::tls_ticket::TicketKey::from_file_bytes(&buf)
                         .ok_or_else(|| format!("\"{}\" must be 48 or 80 bytes", path.display()))?,

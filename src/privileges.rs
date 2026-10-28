@@ -151,6 +151,41 @@ fn default_group() -> String {
     }
 }
 
+/// Files the startup's configuration load read, while it may run as root:
+/// a reload reads them again as the user (#774).
+static STARTUP_READS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static NOTING_READS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// A file the configuration load read (the configuration, includes,
+/// certificates, keys, password and ticket key files).
+pub(crate) fn note_read(path: &Path) {
+    if NOTING_READS.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut reads = STARTUP_READS.lock().unwrap_or_else(|e| e.into_inner());
+        if !reads.iter().any(|p| p == path) {
+            reads.push(path.to_path_buf());
+        }
+    }
+}
+
+/// Once the process runs as the user: the files the startup read that it
+/// can't open now, so a reload would fail on them (#774). Ends the noting.
+pub(crate) fn unreadable_startup_files() -> Vec<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    NOTING_READS.store(false, std::sync::atomic::Ordering::Relaxed);
+    let reads = std::mem::take(&mut *STARTUP_READS.lock().unwrap_or_else(|e| e.into_inner()));
+    reads
+        .into_iter()
+        .filter(|path| {
+            // Non-blocking: a FIFO opens at once and nothing is read.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        })
+        .collect()
+}
+
 /// Hands the noted files and directories to the user, then switches the
 /// whole process to it for good. Any failure is an `[emerg]`: the caller
 /// stops instead of serving as root.
