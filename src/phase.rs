@@ -356,6 +356,10 @@ pub struct ProcessMeta {
     /// the upstream's, or there is none, and the worker doesn't stamp one
     /// (#360).
     pub keep_upstream_date: bool,
+    /// `add_trailer`'s trailers go after a proxied body in memory or in
+    /// its cache file, added by the worker after gzip, as nginx's chunked
+    /// filter runs after its gzip filter (#793).
+    pub trailers_due: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
@@ -419,6 +423,7 @@ impl Default for ProcessMeta {
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
             keep_upstream_date: false,
+            trailers_due: false,
             gzip: None,
             max_ranges: None,
             range_allow: crate::worker::range::RangeAllow::No,
