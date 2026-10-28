@@ -1161,12 +1161,15 @@ pub(crate) struct ChunkedBody {
 pub(crate) enum ChunkedBodyError {
     /// Over the size limit: 413, as nginx.
     TooLarge,
-    /// Malformed framing, a line or trailer block too long, a read error
-    /// or timeout, or a failed temp-file write: 400.
+    /// Malformed framing, a line or trailer block too long, or a failed
+    /// temp-file write: 400.
     Invalid,
-    /// The input ended before the body did: 400 from a connection, and
-    /// from `chunked_in_buffer` a body still to come.
+    /// The input ended (or the read failed) before the body did: from a
+    /// connection, a client gone; from `chunked_in_buffer`, a body still
+    /// to come.
     Ended,
+    /// `client_body_timeout` between reads (#858).
+    TimedOut,
 }
 
 /// A connection with nothing more to read, for `chunked_in_buffer`.
@@ -1370,7 +1373,7 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent, K: ChunkSink>(
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
 ) -> Result<ChunkedBody, ChunkedBodyError> {
-    use ChunkedBodyError::{Ended, Invalid, TooLarge};
+    use ChunkedBodyError::{Ended, Invalid, TimedOut, TooLarge};
 
     // `raw[cursor..]` is unread input; `raw_base` is how many stream bytes
     // (counted from `initial[0]`) were dropped from the front of `raw`.
@@ -1391,10 +1394,9 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent, K: ChunkSink>(
             let chunk: Vec<u8> = vec![0u8; $cap];
             let (res, returned) = with_timeout(timer.as_mut(), read_timeout, stream.read(chunk))
                 .await
-                .ok_or(Invalid)?;
+                .ok_or(TimedOut)?;
             match res {
-                Ok(0) => return Err(Ended),
-                Err(_) => return Err(Invalid),
+                Ok(0) | Err(_) => return Err(Ended),
                 Ok(n) => raw.extend_from_slice(&returned[..n]),
             }
         }};
