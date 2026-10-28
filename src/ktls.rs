@@ -13,10 +13,9 @@
 //! AES-GCM record limit the server updates its keys itself.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use monoio::BufResult;
@@ -96,20 +95,55 @@ impl RecordCursor {
 
 const CLIENT_SECRET: &str = "CLIENT_TRAFFIC_SECRET_0";
 const SERVER_SECRET: &str = "SERVER_TRAFFIC_SECRET_0";
-/// Logged secrets a worker keeps for handshakes not switched yet; the
-/// oldest go first, and their connections close on a KeyUpdate.
+/// Logged secrets a worker keeps for handshakes not switched yet; past
+/// that the oldest go first, and their connections close on a KeyUpdate.
 const LOGGED_KEEP: usize = 256;
+
+/// The longest handshake a kTLS listen allows (its default server's
+/// `client_header_timeout`), in ms; 0 until one is prepared. A logged
+/// secret older than that has no handshake left to take it.
+static HANDSHAKE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A kTLS listen's handshake budget, for `HANDSHAKE_TIMEOUT_MS`.
+pub(crate) fn note_handshake_timeout(timeout: Duration) {
+    let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    HANDSHAKE_TIMEOUT_MS.fetch_max(ms, Ordering::Relaxed);
+}
+
+fn handshake_timeout() -> Duration {
+    match HANDSHAKE_TIMEOUT_MS.load(Ordering::Relaxed) {
+        0 => Duration::from_secs(60),
+        ms => Duration::from_millis(ms),
+    }
+}
 
 struct Logged {
     random: [u8; 32],
     client: bool,
+    /// Zeroed when dropped, which every way out of a slot does in place.
     secret: OkmBlock,
+    at: Instant,
 }
 
 thread_local! {
     /// What `SecretLog` got on this worker: rustls logs from inside the
-    /// handshake calls, on the connection's thread.
-    static LOGGED: RefCell<VecDeque<Logged>> = const { RefCell::new(VecDeque::new()) };
+    /// handshake calls, on the connection's thread. `LOGGED_KEEP` slots,
+    /// allocated once: an entry never moves (a move would leave a copy of
+    /// the secret behind), it is dropped in its slot.
+    static LOGGED: RefCell<Vec<Option<Logged>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drop what no handshake can take any more.
+fn expire(slots: &mut [Option<Logged>], now: Instant) {
+    let timeout = handshake_timeout();
+    for slot in slots {
+        if slot
+            .as_ref()
+            .is_some_and(|l| now.duration_since(l.at) > timeout)
+        {
+            *slot = None;
+        }
+    }
 }
 
 /// The `KeyLog` of kTLS configs: keeps the TLS 1.3 application traffic
@@ -127,26 +161,39 @@ impl rustls::KeyLog for SecretLog {
         else {
             return;
         };
-        LOGGED.with_borrow_mut(|logged| {
-            if logged.len() == LOGGED_KEEP {
-                logged.pop_front();
+        let now = Instant::now();
+        LOGGED.with_borrow_mut(|slots| {
+            if slots.is_empty() {
+                slots.reserve_exact(LOGGED_KEEP);
+                slots.resize_with(LOGGED_KEEP, || None);
             }
-            logged.push_back(Logged {
+            expire(slots, now);
+            let slot = match slots.iter().position(Option::is_none) {
+                Some(free) => free,
+                None => (0..slots.len())
+                    .min_by_key(|&i| slots[i].as_ref().map(|l| l.at))
+                    .unwrap_or(0),
+            };
+            slots[slot] = Some(Logged {
                 random,
                 client: label == CLIENT_SECRET,
                 secret: OkmBlock::new(secret),
+                at: now,
             });
         });
     }
 }
 
-/// The client's and the server's secrets logged for `random`, taken.
+/// The client's and the server's secrets logged for `random`, taken: as
+/// copies, the logged ones zeroed in their slots.
 fn take_logged(random: &[u8; 32]) -> (Option<OkmBlock>, Option<OkmBlock>) {
-    LOGGED.with_borrow_mut(|logged| {
+    LOGGED.with_borrow_mut(|slots| {
+        expire(slots, Instant::now());
         let (mut client, mut server) = (None, None);
-        logged.retain_mut(|l| {
+        for slot in slots.iter_mut() {
+            let Some(l) = slot else { continue };
             if l.random != *random {
-                return true;
+                continue;
             }
             let secret = OkmBlock::new(l.secret.as_ref());
             if l.client {
@@ -154,10 +201,15 @@ fn take_logged(random: &[u8; 32]) -> (Option<OkmBlock>, Option<OkmBlock>) {
             } else {
                 server = Some(secret);
             }
-            false
-        });
+            *slot = None;
+        }
         (client, server)
     })
+}
+
+/// Forget the secrets of a handshake that stays in userspace.
+pub(crate) fn forget_logged(random: &[u8; 32]) {
+    drop(take_logged(random));
 }
 
 /// HKDF-Expand-Label with an empty context (RFC 8446, 7.1).
@@ -507,9 +559,20 @@ pub(crate) fn switch(stream: TlsStream<TcpStream>) -> Switch {
         chosen = Some((version, cipher, suite));
         true
     };
+    let random = stream.client_random();
     match stream.into_ktls(attach) {
-        IntoKtls::Userspace(stream) => Switch::Userspace(stream),
-        IntoKtls::Failed(e) => Switch::Failed(e),
+        IntoKtls::Userspace(stream) => {
+            if let Some(random) = random {
+                forget_logged(&random);
+            }
+            Switch::Userspace(stream)
+        }
+        IntoKtls::Failed(e) => {
+            if let Some(random) = random {
+                forget_logged(&random);
+            }
+            Switch::Failed(e)
+        }
         IntoKtls::Kernel {
             io,
             secrets,
@@ -518,6 +581,9 @@ pub(crate) fn switch(stream: TlsStream<TcpStream>) -> Switch {
             random,
         } => {
             let Some((version, cipher, suite)) = chosen else {
+                if let Some(random) = random {
+                    forget_logged(&random);
+                }
                 return Switch::Failed(io::Error::other("kTLS: no cipher"));
             };
             let fd = io.as_raw_fd();
@@ -942,6 +1008,33 @@ mod tests {
         );
         assert_eq!(iv[..], unhex("cf 78 2b 88 dd 83 54 9a ad f1 e9 84")[..]);
         assert_eq!(next_secret(suite.hkdf_provider, &secret).as_ref().len(), 32);
+    }
+
+    #[test]
+    fn logged_secrets_are_taken_once_and_expire() {
+        use rustls::KeyLog;
+        let log = SecretLog;
+        log.log(CLIENT_SECRET, &[1; 32], &[7; 32]);
+        log.log(SERVER_SECRET, &[1; 32], &[8; 32]);
+        log.log(CLIENT_SECRET, &[2; 32], &[9; 32]);
+        let (c, s) = take_logged(&[1; 32]);
+        assert_eq!(c.unwrap().as_ref(), &[7; 32]);
+        assert_eq!(s.unwrap().as_ref(), &[8; 32]);
+        assert!(matches!(take_logged(&[1; 32]), (None, None)));
+        // The slots are never reallocated: past LOGGED_KEEP the oldest go.
+        for i in 0..LOGGED_KEEP {
+            log.log(CLIENT_SECRET, &[3; 32], &[i as u8; 32]);
+        }
+        LOGGED.with_borrow(|slots| assert_eq!(slots.len(), LOGGED_KEEP));
+        assert!(take_logged(&[2; 32]).0.is_none());
+        // Older than any handshake: gone at the next look.
+        LOGGED.with_borrow_mut(|slots| {
+            for l in slots.iter_mut().flatten() {
+                l.at -= handshake_timeout() + Duration::from_secs(1);
+            }
+        });
+        assert!(take_logged(&[3; 32]).0.is_none());
+        LOGGED.with_borrow(|slots| assert!(slots.iter().all(Option::is_none)));
     }
 
     #[test]

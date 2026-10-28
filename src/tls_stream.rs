@@ -394,6 +394,11 @@ impl<IO> TlsStream<IO> {
         self.records.is_some()
     }
 
+    /// The ClientHello's random, with kTLS on (#852).
+    pub(crate) fn client_random(&self) -> Option<[u8; 32]> {
+        self.records.and_then(|r| r.client_random())
+    }
+
     /// Hand the session to the kernel (#673), after the handshake.
     /// `attach` checks the cipher suite and sets the TLS ULP on the
     /// socket; `false` keeps the stream in userspace, as does ciphertext
