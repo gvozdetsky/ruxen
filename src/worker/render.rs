@@ -494,10 +494,8 @@ impl RenderCtx<'_> {
             Variable::TimeLocal => write_time_local(out, self.epoch_secs),
             Variable::Msec => write_msec(out, self.epoch_secs, self.epoch_ms),
             Variable::Capture(n) => {
-                if let Some(state) = self.rewrite_state
-                    && let Some(value) = state.numbered_capture(*n)
-                {
-                    out.extend_from_slice(value);
+                if let Some(state) = self.rewrite_state {
+                    state.write_numbered_capture(*n, out);
                 }
             }
             Variable::ProxyHost => out.extend_from_slice(self.proxy_host),
@@ -527,6 +525,11 @@ impl RenderCtx<'_> {
                     && let Some(value) = state.user_var(name)
                 {
                     out.extend_from_slice(value);
+                    return;
+                }
+                if let Some(state) = self.rewrite_state
+                    && state.write_map_named_capture(name, out)
+                {
                     return;
                 }
                 if let Some(split_clients) = self.split_clients
@@ -978,10 +981,14 @@ fn render_map(program: &PreparedMap, ctx: &RenderCtx<'_>, out: &mut Vec<u8>) {
         None => program.regex.iter().find(|e| e.regex.is_match(&key)),
     };
     if let Some(entry) = matched {
-        if entry.captures.is_empty() {
-            render_parts(entry.value, ctx, out);
-        } else {
+        if entry.groups {
             render_map_captures(entry, &key, ctx, out);
+        } else {
+            // nginx's match leaves no `$1`…`$9` (r->ncaptures = 2).
+            if let Some(state) = ctx.rewrite_state {
+                state.clear_map_numbered();
+            }
+            render_parts(entry.value, ctx, out);
         }
         return;
     }
@@ -990,7 +997,8 @@ fn render_map(program: &PreparedMap, ctx: &RenderCtx<'_>, out: &mut Vec<u8>) {
     }
 }
 
-/// A map regex entry's value with the regex's captures of `key` (#800).
+/// A map regex entry with groups: they become the request's captures
+/// (#832), and its value is rendered with them (#800).
 #[cold]
 #[inline(never)]
 fn render_map_captures(
@@ -1000,6 +1008,9 @@ fn render_map_captures(
     out: &mut Vec<u8>,
 ) {
     let caps = entry.regex.captures(key);
+    if let (Some(state), Some(caps)) = (ctx.rewrite_state, &caps) {
+        state.set_map_captures(&entry.regex, caps);
+    }
     for (i, part) in entry.value.iter().enumerate() {
         match entry.captures.iter().find(|(p, _)| *p == i) {
             Some(&(_, group)) => {

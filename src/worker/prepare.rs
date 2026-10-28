@@ -2984,6 +2984,7 @@ pub(crate) fn prepare_maps(
                 .expect("map regex validated at parse time");
             let captures = map_value_captures(&compiled, &value);
             regex_entries.push(PreparedMapRegex {
+                groups: compiled.captures_len() > 1,
                 regex: compiled,
                 value: prepare_value_parts(value),
                 captures,

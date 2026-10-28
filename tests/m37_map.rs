@@ -401,3 +401,39 @@ http {
         );
     }
 }
+
+#[test]
+fn map_regex_match_sets_request_captures() {
+    // A matching map regex sets the request's `$1` and named captures once
+    // the map is read (#832); one without groups clears `$1`. Answers
+    // checked against nginx 1.30.6 (`$1` before `$m` in one value is an
+    // nginx 500: its length pass runs before the map).
+    let conf = r#"
+events {}
+http {
+  map $uri $m {
+    ~^/m/(?<name>\w+)/(\w+)$  "$2";
+    ~^/l/                     plain;
+    default                   -;
+  }
+
+  server {
+    listen 127.0.0.1:%%PORT%%;
+    location ~ ^/(l)/ { set $a $1; return 200 "1=$a m:$m 1=$1"; }
+    location / { return 200 "m:$m 1=$1 name=$name"; }
+  }
+}
+"#;
+    let (_g, port) = spawn_server(conf);
+    for (path, want) in [
+        ("/m/ab/cd", "m:cd 1=ab name=ab"),
+        ("/l/z", "1=l m:plain 1="),
+        ("/other", "m:- 1= name="),
+    ] {
+        assert_eq!(
+            String::from_utf8_lossy(body(&http_get(port, path))),
+            want,
+            "{path}"
+        );
+    }
+}
