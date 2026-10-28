@@ -16,4 +16,3 @@ status	^status: nginx 400, ruxen		absolute-uri.* 400$		#781: an absolute-form HT
 status	^status: nginx (412|304), ruxen 200$		(im-|ius-|inm-star|rand)		#782: `return 200` ignores If-Match, If-Unmodified-Since, `If-None-Match: *`
 connection	nginx closed, ruxen extra bytes$		HEAD		#783: the 414 for a too-long HEAD line has a body
 			version:0\.9		#784: an HTTP/0.9 request waits for client_header_timeout
-header	^content-type: value differs$			application/javascript -> application/json	#785: autoindex JSONP content type
