@@ -1,10 +1,11 @@
 //! A proxied response whose body is relayed to the client as it arrives
 //! (#88), instead of being read whole first. `proxy::attempt` hands one
 //! over when the body didn't come in with the header and nothing needs it
-//! whole (no `add_trailer`, no range to cut); the worker writes the head
-//! and calls [`relay`]. gzip compresses it on the way
-//! (`ProxyStream::gzip`), and a cacheable one goes into the cache file
-//! as well (`ProxyStream::cache`, #463). As in nginx
+//! whole (no `add_trailer`); the worker writes the head and calls
+//! [`relay`]. gzip compresses it on the way (`ProxyStream::gzip`), the
+//! range filter cuts one range from it (`ProxyStream::window`), and a
+//! cacheable one goes into the cache file as well (`ProxyStream::cache`,
+//! #463). As in nginx
 //! (`ngx_http_upstream_process_non_buffered_*`), once the head is out an
 //! upstream error can't become a 502 or a retry: the client connection is
 //! closed.
@@ -51,6 +52,41 @@ pub struct ProxyStream {
     /// `proxy_cache`: the body is written to this file as it goes, and
     /// stored once complete (nginx's `p->cacheable`).
     pub(crate) cache: Option<Box<crate::proxy_cache::CacheFill<'static>>>,
+    /// The range filter's one range: the client gets these body bytes
+    /// only.
+    pub(crate) window: Option<Window>,
+}
+
+/// The part of the body still to skip, then to send.
+#[derive(Clone, Copy)]
+pub(crate) struct Window {
+    skip: u64,
+    left: u64,
+}
+
+impl Window {
+    /// Body bytes `[start, end)`.
+    pub(crate) fn new(start: u64, end: u64) -> Self {
+        Window {
+            skip: start,
+            left: end - start,
+        }
+    }
+
+    /// The part of the next `body` bytes inside the window.
+    fn cut<'a>(&mut self, body: &'a [u8]) -> &'a [u8] {
+        let skip = (self.skip.min(body.len() as u64)) as usize;
+        self.skip -= skip as u64;
+        let rest = &body[skip..];
+        let take = (self.left.min(rest.len() as u64)) as usize;
+        self.left -= take as u64;
+        &rest[..take]
+    }
+}
+
+/// The client has the whole window.
+fn window_sent(window: Option<&Window>) -> bool {
+    window.is_some_and(|w| w.left == 0)
 }
 
 pub(crate) enum StreamFraming {
@@ -177,6 +213,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         &mut decoded,
         deflater.as_mut().map(|d| (d, &mut plain, &mut compressed)),
         s.cache.as_deref_mut(),
+        s.window.as_mut(),
         &mut head,
     ) {
         Ok((done, _, more)) => {
@@ -200,7 +237,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         return finish(s, end, extra, head);
     }
     end.body_sent += body_len as u64;
-    if done {
+    if done || window_sent(s.window.as_ref()) {
         end.complete = true;
         return finish(s, end, extra, head);
     }
@@ -282,6 +319,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         // out of the read buffer itself.
         if !chunked_out
             && deflater.is_none()
+            && s.window.is_none()
             && let StreamFraming::Length(left) = &mut s.framing
         {
             let take = n.min(*left as usize);
@@ -315,6 +353,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
             &mut decoded,
             deflater.as_mut().map(|d| (d, &mut plain, &mut compressed)),
             s.cache.as_deref_mut(),
+            s.window.as_mut(),
             &mut framed,
         ) {
             Ok((done, used, more)) => {
@@ -344,7 +383,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
             }
             end.body_sent += len as u64;
         }
-        if done {
+        if done || window_sent(s.window.as_ref()) {
             end.complete = true;
             break;
         }
@@ -361,6 +400,7 @@ fn consume(
     chunked_out: bool,
     decoded: &mut Vec<u8>,
     cache: Option<&mut crate::proxy_cache::CacheFill<'static>>,
+    window: Option<&mut Window>,
     out: &mut Vec<u8>,
 ) -> Result<(bool, usize, bool), ()> {
     let chunked_in = matches!(framing, StreamFraming::Chunked(_));
@@ -368,6 +408,10 @@ fn consume(
     if let Some(fill) = cache {
         fill.write(body);
     }
+    let body = match window {
+        Some(w) => w.cut(body),
+        None => body,
+    };
     push_body(out, body, chunked_out);
     if done && chunked_out && chunked_in {
         out.extend_from_slice(b"0\r\n\r\n");
@@ -401,6 +445,7 @@ fn body_of<'a>(
 /// `consume`, through the compressor when gzip is on: the body's bytes
 /// are decoded into `plain`, compressed into `compressed`, and those go
 /// out (chunked when `chunked_out`), the end of the member with the last.
+#[allow(clippy::too_many_arguments)]
 fn consume_out(
     framing: &mut StreamFraming,
     input: &[u8],
@@ -412,13 +457,15 @@ fn consume_out(
         &mut Vec<u8>,
     )>,
     cache: Option<&mut crate::proxy_cache::CacheFill<'static>>,
+    window: Option<&mut Window>,
     out: &mut Vec<u8>,
 ) -> Result<(bool, usize, bool), ()> {
     let Some((deflater, plain, compressed)) = gzip else {
-        return consume(framing, input, chunked_out, decoded, cache, out);
+        return consume(framing, input, chunked_out, decoded, cache, window, out);
     };
     plain.clear();
-    let (done, used, more) = consume(framing, input, false, decoded, cache, plain)?;
+    // The range filter leaves a compressed response alone: no window.
+    let (done, used, more) = consume(framing, input, false, decoded, cache, None, plain)?;
     compressed.clear();
     deflater.push(plain, compressed, done);
     push_body(out, compressed, chunked_out);
@@ -437,8 +484,14 @@ fn finish(
     head: Vec<u8>,
 ) -> (RelayEnd, Vec<u8>) {
     end.response_ms = s.started.elapsed().as_millis() as u64;
+    // The client may be done before the body: a range's window.
+    let body_done = match &s.framing {
+        StreamFraming::Length(left) => *left == 0,
+        StreamFraming::Chunked(dec) => dec.done(),
+        StreamFraming::Close => end.complete,
+    };
     // nginx warns, and doesn't keep the connection (#512).
-    if end.complete && extra && end.failure.is_none() {
+    if body_done && extra && end.failure.is_none() {
         let error = match s.framing {
             StreamFraming::Chunked(_) => UpstreamError::ExtraAfterFinalChunk,
             _ => UpstreamError::ExtraAfterLength,
@@ -446,17 +499,17 @@ fn finish(
         end.failure = Some(failure(&s, error));
     }
     if s.cache.is_some() {
-        // The client went away: the cache reads on (nginx's downstream
-        // error on a cacheable pipe).
-        if !end.complete && end.failure.is_none() {
+        // The client went away, or has its range: the cache reads on
+        // (nginx's downstream error on a cacheable pipe).
+        if !body_done && end.failure.is_none() {
             fill_detached(s);
             return (end, head);
         }
-        if end.complete {
+        if body_done {
             store(&mut s);
         }
     }
-    close(s, end.complete, extra);
+    close(s, body_done, extra);
     (end, head)
 }
 
