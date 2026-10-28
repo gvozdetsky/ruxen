@@ -1116,6 +1116,7 @@ fn prepare_proxy_cache(
         min_uses: conf.min_uses.unwrap_or(1),
         bypass: conditions(&conf.bypass),
         no_cache: conditions(&conf.no_cache),
+        no_cache_late: conf.no_cache.iter().flatten().flatten().any(reads_response),
         convert_head: conf.convert_head.unwrap_or(true),
         revalidate: conf.revalidate.unwrap_or(false),
         // ngx_http_proxy_merge_loc_conf: `error` covers "no live upstreams".
@@ -1127,6 +1128,28 @@ fn prepare_proxy_cache(
         ignore,
         max_range_offset: conf.max_range_offset,
     }))))
+}
+
+/// A value part that may read the upstream's response: an `$upstream_*`
+/// variable, or a `map` / `set` one, which may read them in turn.
+fn reads_response(part: &crate::config::ValuePart) -> bool {
+    use crate::config::Variable::*;
+    matches!(
+        part,
+        crate::config::ValuePart::Var(
+            UpstreamHttp(_)
+                | UpstreamCookie(_)
+                | UpstreamAddr
+                | UpstreamStatus
+                | UpstreamConnectTime
+                | UpstreamHeaderTime
+                | UpstreamBytesReceived
+                | UpstreamBytesSent
+                | UpstreamResponseLength
+                | UpstreamResponseTime
+                | Unknown(_)
+        )
+    )
 }
 
 /// Build the zones of `limit_req_zone` (#94).

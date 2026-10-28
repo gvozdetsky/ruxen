@@ -941,16 +941,16 @@ async fn settle_proxy_response(
     // closes ends the exchange, and with it the upstream connection (the
     // proxy future is dropped).
     let client = client.filter(|_| !plan.ignore_client_abort);
-    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+    let late_render = late_render_needed(&plan).then(|| {
         let meta = &process_meta;
-        move |status: u16, headers: &[u8]| {
-            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        move |parts: &[PreparedValuePart], status: u16, headers: &[u8], out: &mut Vec<u8>| {
+            super::render_proxy_late(parts, http, ctx, meta, status, headers, uri, out)
         }
     });
     let upstream_resp = {
-        let late = late_limit_rate
+        let late = late_render
             .as_ref()
-            .map(|late| late as crate::proxy::LateLimitRate<'_>);
+            .map(|late| late as crate::proxy::LateRender<'_>);
         let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
         let watched = if process_meta.limit_conn_held.is_some() {
             super::client_watch::Watched::at_once(proxy, client)
@@ -1457,15 +1457,15 @@ async fn run_proxy_pass(
     };
     let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
-    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+    let late_render = late_render_needed(&plan).then(|| {
         let meta = &process_meta;
-        move |status: u16, headers: &[u8]| {
-            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        move |parts: &[PreparedValuePart], status: u16, headers: &[u8], out: &mut Vec<u8>| {
+            super::render_proxy_late(parts, http, ctx, meta, status, headers, uri, out)
         }
     });
-    let late = late_limit_rate
+    let late = late_render
         .as_ref()
-        .map(|late| late as crate::proxy::LateLimitRate<'_>);
+        .map(|late| late as crate::proxy::LateRender<'_>);
     let upstream_resp = crate::proxy::run_proxy(plan, &mut report, late).await;
     if !report.failures.is_empty() {
         write_upstream_error_log(
@@ -3382,6 +3382,12 @@ thread_local! {
 /// An upstream connection's slot in `worker_connections`, held as long as
 /// the socket lives (in the pool too). Outside a worker (unit tests)
 /// nothing is counted.
+/// The proxy renders something once the upstream's header is in: a
+/// `proxy_limit_rate` or a `proxy_no_cache` with variables (#826).
+fn late_render_needed(plan: &crate::proxy::ProxyPlan) -> bool {
+    plan.response.limit_rate.is_some() || plan.cache.as_ref().is_some_and(|c| c.conf.no_cache_late)
+}
+
 pub(crate) struct UpstreamSlot {
     counted: bool,
 }

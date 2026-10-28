@@ -608,10 +608,12 @@ async fn resolve_peers(
     }
 }
 
-/// A `proxy_limit_rate` with variables (`ProxyResponseRules::limit_rate`),
-/// rendered by the caller, who has the request: from the upstream's status
-/// and header lines (`Name: value` CRLF each) to bytes/sec.
-pub type LateLimitRate<'a> = &'a dyn Fn(u16, &[u8]) -> u64;
+/// Renders values that read the upstream's response once its header is in
+/// (`proxy_limit_rate` with variables, `proxy_no_cache` with
+/// `$upstream_*`): the caller has the request. Takes the parts, the
+/// upstream's status and header lines (`Name: value` CRLF each), and the
+/// output.
+pub type LateRender<'a> = &'a dyn Fn(&[crate::worker::PreparedValuePart], u16, &[u8], &mut Vec<u8>);
 
 /// Run the upstream exchange, with `proxy_next_upstream` failover. Each
 /// failed attempt is appended to `failures` so the worker can log it with
@@ -634,7 +636,7 @@ pub type LateLimitRate<'a> = &'a dyn Fn(u16, &[u8]) -> u64;
 pub async fn run_proxy(
     mut plan: Box<ProxyPlan>,
     report: &mut ProxyReport,
-    late_limit_rate: Option<LateLimitRate<'_>>,
+    late: Option<LateRender<'_>>,
 ) -> Response {
     report.passes_date = plan.response.passes_date;
     if let Some(cache) = plan.cache.as_deref_mut() {
@@ -743,7 +745,7 @@ pub async fn run_proxy(
                 started,
                 &mut storable,
                 failures,
-                late_limit_rate,
+                late,
             )
             .await
             {
@@ -765,7 +767,7 @@ pub async fn run_proxy(
                             started,
                             &mut storable,
                             failures,
-                            late_limit_rate,
+                            late,
                         )
                         .await
                     } else {
@@ -791,7 +793,7 @@ pub async fn run_proxy(
                 started,
                 &mut storable,
                 failures,
-                late_limit_rate,
+                late,
             )
             .await
         };
@@ -1680,7 +1682,7 @@ async fn attempt(
     started: Instant,
     storable: &mut Option<Storable>,
     failures: &mut Vec<AttemptFailure>,
-    late_limit_rate: Option<LateLimitRate<'_>>,
+    late: Option<LateRender<'_>>,
 ) -> AttemptOutcome {
     let from_pool = pooled.is_some();
     // Only the answering attempt's X-Accel headers count.
@@ -1874,7 +1876,7 @@ async fn attempt(
     // safe — the kernel writes before we read.
     let mut accum: Vec<u8> = take_proxy_buf();
     let mut read_buf: Vec<u8> = take_proxy_buf();
-    if plan.limit_rate != 0 || late_limit_rate.is_some() {
+    if plan.limit_rate != 0 || plan.response.limit_rate.is_some() {
         read_buf = paced_head_buf(read_buf);
     }
     let mut head_end_terminator: (usize, usize); // (head_end, terminator_len)
@@ -2220,12 +2222,14 @@ async fn attempt(
             .intercept
             .as_ref()
             .is_some_and(|rules| rules.iter().any(|r| r.status == status_code));
-        let limit_rate = match late_limit_rate {
+        let limit_rate = match (late, plan.response.limit_rate) {
             // An answer `proxy_intercept_errors` sends to an error_page
             // isn't the client's: nginx doesn't read its body at all.
             _ if intercepted => 0,
-            Some(late) => late_limit_rate_of(late, status_code, &accum[..head_end], first_line_end),
-            None => plan.limit_rate,
+            (Some(late), Some(parts)) => {
+                late_limit_rate_of(late, parts, status_code, &accum[..head_end], first_line_end)
+            }
+            _ => plan.limit_rate,
         };
         state.response_length = body_len_in_accum as u64;
         let head = client_head(
@@ -2250,7 +2254,7 @@ async fn attempt(
                     requests_served,
                 });
         if plan.cache.as_ref().is_some_and(|c| c.store) {
-            *storable = storable_response(plan, &accum[..head_end], status_code, 0);
+            *storable = storable_response(plan, &accum[..head_end], status_code, 0, late);
         }
         let pending = accum[body_start..].to_vec();
         return_proxy_buf(accum);
@@ -2366,7 +2370,7 @@ async fn attempt(
         } else if cache.store && !upstream_head {
             // A HEAD's answer has no body to store (proxy_cache_convert_head
             // off): a GET hitting it would get none.
-            storable_response(plan, &accum[..head_end], status_code, client_head_len)
+            storable_response(plan, &accum[..head_end], status_code, client_head_len, late)
         } else {
             None
         };
@@ -2636,11 +2640,29 @@ fn storable_response(
     head: &[u8],
     status: u16,
     client_head_len: usize,
+    late: Option<LateRender<'_>>,
 ) -> Option<Storable> {
     let cache = plan.cache.as_deref()?;
     // A 1xx (a 101 included) answers nothing to keep.
     if status < 200 {
         return None;
+    }
+    // `proxy_no_cache` reading the response, tested now as nginx tests
+    // them all (ngx_http_upstream_send_response).
+    if cache.conf.no_cache_late
+        && let Some(late) = late
+    {
+        let first_line_end = find_line_end(head).map_or(head.len(), |(len, _)| len);
+        let lines = upstream_header_lines(head, first_line_end);
+        let mut value = Vec::new();
+        let holds = cache.conf.no_cache.iter().any(|parts| {
+            value.clear();
+            late(parts, status, &lines, &mut value);
+            !value.is_empty() && value != b"0"
+        });
+        if holds {
+            return None;
+        }
     }
     let now = crate::proxy_cache::now_secs();
     let fresh = crate::proxy_cache::freshness(
@@ -3241,11 +3263,20 @@ async fn send_body_file(
 #[cold]
 #[inline(never)]
 fn late_limit_rate_of(
-    late: LateLimitRate<'_>,
+    late: LateRender<'_>,
+    parts: &[crate::worker::PreparedValuePart],
     status: u16,
     head: &[u8],
     first_line_end: usize,
 ) -> u64 {
+    let lines = upstream_header_lines(head, first_line_end);
+    let mut value = Vec::with_capacity(16);
+    late(parts, status, &lines, &mut value);
+    crate::config::parse_size(&value).unwrap_or(0)
+}
+
+/// The upstream's header lines, as `$upstream_http_*` reads them.
+fn upstream_header_lines(head: &[u8], first_line_end: usize) -> Vec<u8> {
     let mut lines = Vec::with_capacity(head.len());
     let mut cursor = headers_start(head, first_line_end, head.len());
     while cursor < head.len() {
@@ -3258,7 +3289,7 @@ fn late_limit_rate_of(
         lines.extend_from_slice(line);
         lines.extend_from_slice(b"\r\n");
     }
-    late(status, &lines)
+    lines
 }
 
 /// Under `proxy_limit_rate`, the head is read as nginx reads it, into a

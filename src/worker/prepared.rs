@@ -835,6 +835,9 @@ pub struct PreparedProxyCache {
     pub min_uses: u32,
     pub bypass: &'static [&'static [PreparedValuePart]],
     pub no_cache: &'static [&'static [PreparedValuePart]],
+    /// `proxy_no_cache` reads the response (`$upstream_*`, or a variable
+    /// that may): tested once its header is in, not before (#826).
+    pub no_cache_late: bool,
     pub convert_head: bool,
     pub revalidate: bool,
     pub use_stale: crate::config::UseStale,
