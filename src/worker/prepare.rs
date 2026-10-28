@@ -1079,6 +1079,9 @@ fn prepare_cache_zones(paths: Vec<crate::config::ProxyCachePath>) -> Result<(), 
             min_free: p.min_free,
         }));
     }
+    for zone in &zones {
+        super::metrics::note_cache_zone(zone.name, &zone.counters);
+    }
     CACHE_ZONES.with(|z| *z.borrow_mut() = zones);
     Ok(())
 }
@@ -1150,6 +1153,7 @@ fn prepare_limit_req_zones(zones: Vec<crate::config::LimitReqZoneDef>) -> Result
                     z.size,
                     z.rate,
                 )?));
+            super::metrics::note_limit_req_zone(name, zone.counters);
             Ok((name.to_string(), zone))
         })
         .collect::<Result<_, String>>()?;
@@ -1216,6 +1220,7 @@ fn prepare_limit_conn_zones(zones: Vec<crate::config::LimitConnZoneDef>) -> Resu
                     crate::arena::leak(z.key_text.into_boxed_str()),
                     z.size,
                 )?));
+            super::metrics::note_limit_conn_zone(name, zone.counters);
             Ok((name.to_string(), zone))
         })
         .collect::<Result<_, String>>()?;

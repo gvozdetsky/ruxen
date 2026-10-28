@@ -261,6 +261,82 @@ fn m165_reload_starts_again_at_zero() {
 }
 
 #[test]
+fn m165_zones_and_their_counts_across_a_reload() {
+    let setup = common::ports::setup_lock();
+    let [front, back] = common::ports::free_ports::<2>();
+    let cache = std::env::temp_dir().join(format!("ruxen-m165-zones-{}/cache", std::process::id()));
+    let http = |extra: &str| {
+        format!(
+            "limit_req_zone $arg_k zone=lr:1m rate=1r/m;\n\
+             limit_conn_zone $arg_c zone=lc:1m;\n\
+             proxy_cache_path {} keys_zone=pc:1m;\n\
+             server {{ listen 127.0.0.1:{back}; location / {{ return 200 \"ok\\n\"; }} }}\n\
+             server {{ listen 127.0.0.1:{front};\n\
+             location /metrics {{ ruxen_metrics; }}\n\
+             location /lr {{ limit_req zone=lr; proxy_pass http://127.0.0.1:{back}; }}\n\
+             location /lc {{ limit_conn lc 1; proxy_pass http://127.0.0.1:{back}; }}\n\
+             location /c {{ proxy_pass http://127.0.0.1:{back}; proxy_cache pc;\n\
+             proxy_cache_valid 200 1m; }}\n{extra} }}",
+            cache.display()
+        )
+    };
+    let server = start("zones", &http(""));
+    drop(setup);
+    for _ in 0..3 {
+        request(front, "GET", "/lr?k=a");
+    }
+    for _ in 0..2 {
+        request(front, "GET", "/lc?c=a");
+        request(front, "GET", "/c");
+    }
+    let lr = |page: &str, status: &str| {
+        value(
+            page,
+            &format!("ruxen_limit_req_requests_total{{zone=\"lr\",status=\"{status}\"}}"),
+        )
+    };
+    let lc = |page: &str, status: &str| {
+        value(
+            page,
+            &format!("ruxen_limit_conn_requests_total{{zone=\"lc\",status=\"{status}\"}}"),
+        )
+    };
+    let pc = |page: &str, status: &str| {
+        value(
+            page,
+            &format!("ruxen_cache_requests_total{{zone=\"pc\",status=\"{status}\"}}"),
+        )
+    };
+    let page = scrape(front);
+    assert_eq!(
+        (lr(&page, "PASSED"), lr(&page, "REJECTED")),
+        (1, 2),
+        "{page}"
+    );
+    assert_eq!(lr(&page, "DELAYED"), 0);
+    assert_eq!((lc(&page, "PASSED"), lc(&page, "REJECTED")), (2, 0));
+    assert_eq!((pc(&page, "MISS"), pc(&page, "HIT")), (1, 1));
+
+    // The zones are kept, and so are their counts.
+    server.write_conf(&http("location /gen2 { return 200 \"2\\n\"; }"));
+    server.hup();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !request(front, "GET", "/gen2").ends_with("\r\n\r\n2\n") {
+        assert!(Instant::now() < deadline, "the reload didn't take");
+        sleep(Duration::from_millis(20));
+    }
+    request(front, "GET", "/c");
+    let page = scrape(front);
+    assert_eq!(
+        (lr(&page, "PASSED"), lr(&page, "REJECTED")),
+        (1, 2),
+        "{page}"
+    );
+    assert_eq!(lc(&page, "PASSED"), 2);
+    assert_eq!((pc(&page, "MISS"), pc(&page, "HIT")), (1, 2));
+}
+
+#[test]
 fn m165_takes_no_arguments() {
     let dir = std::env::temp_dir().join(format!("ruxen-m165-args-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
