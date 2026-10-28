@@ -748,6 +748,7 @@ impl ProxyConf {
         "proxy_intercept_errors",
         "proxy_force_ranges",
         "proxy_ignore_client_abort",
+        "early_hints",
         "proxy_bind",
         "proxy_redirect",
         "proxy_cookie_domain",
@@ -1117,6 +1118,15 @@ impl ProxyConf {
                         });
                     }
                 });
+            }
+            "early_hints" => {
+                if args.len() < 2 {
+                    return Err(Error::MissingArg("early_hints"));
+                }
+                let list = self.early_hints.get_or_insert_with(Vec::new);
+                for value in &args[1..] {
+                    list.push(parse_value_with_vars(value)?);
+                }
             }
             "proxy_ignore_client_abort" => {
                 if self.ignore_client_abort.is_some() {

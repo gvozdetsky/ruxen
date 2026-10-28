@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 190 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 281 unknown.
+Of 564 directives: 191 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 280 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -168,7 +168,7 @@ Not supported: `ssl_engine`.
 | `max_ranges` | yes | http, server, location |  |
 | `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in location only) |
 | `etag` | accepted, differs | any | static responses still carry an ETag |
-| `early_hints` | no |  |  |
+| `early_hints` | yes | http, server, location |  |
 | `error_page` | yes | http, server, location |  |
 | `post_action` | yes | http, server, location |  |
 | `open_file_cache` | accepted, no effect | any |  |

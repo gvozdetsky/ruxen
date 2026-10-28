@@ -191,6 +191,8 @@ pub struct ProxyPlan {
     /// `proxy_ignore_client_abort`: when off, a client that closes while
     /// the upstream is awaited ends the exchange with 499 (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` held (#848): the upstream's 103s for the client.
+    pub early_hints: Option<std::rc::Rc<EarlyHints>>,
     /// `proxy_http_version 2` (#599): a new connection speaks HTTP/2.
     pub h2: bool,
 }
@@ -553,6 +555,53 @@ fn upstream_uri(plan: &ProxyPlan) -> &[u8] {
     let request_line = plan.request.split(|&b| b == b'\n').next().unwrap_or(&[]);
     request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/")
 }
+
+/// The 103 heads for the client (#848), filled by the attempt and written
+/// while the upstream is awaited (`settle_proxy_response`).
+#[derive(Default)]
+pub struct EarlyHints {
+    heads: std::cell::RefCell<Vec<u8>>,
+}
+
+impl EarlyHints {
+    pub fn pending(&self) -> bool {
+        !self.heads.borrow().is_empty()
+    }
+
+    pub fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.heads.borrow_mut())
+    }
+
+    /// A 103 with the upstream's `fields` less the hidden ones; none
+    /// without fields (ngx_http_early_hints_filter).
+    fn push(&self, rules: &crate::worker::ProxyResponseRules, fields: &[u8]) {
+        let mut head = b"HTTP/1.1 103 Early Hints\r\n".to_vec();
+        let start = head.len();
+        for line in fields.split(|&b| b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                continue;
+            };
+            let name = trim_ascii(&line[..colon]);
+            let hidden = match classify_upstream_header(name) {
+                UpstreamHeader::HopByHop => true,
+                UpstreamHeader::Hidden(bit) => rules.pass_mask & bit == 0,
+                _ => false,
+            } || rules.hide.iter().any(|h| h.eq_ignore_ascii_case(name));
+            if !hidden {
+                head.extend_from_slice(line);
+                head.extend_from_slice(b"\r\n");
+            }
+        }
+        if head.len() > start {
+            head.extend_from_slice(b"\r\n");
+            self.heads.borrow_mut().extend_from_slice(&head);
+        }
+    }
+}
+
+/// nginx's default `proxy_buffer_size` (a page), its bound on the 103s.
+const EARLY_HINTS_MAX: usize = 4096;
 
 impl ProxyPlan {
     /// The address of `upstream.peers[peer_idx]`, or the request's own peer.
@@ -1987,6 +2036,9 @@ async fn attempt(
                 head_end_terminator,
                 first_line_end,
                 upstream_is_11,
+                plan.early_hints
+                    .as_deref()
+                    .map(|h| (h, plan.response, interim_len)),
             ) {
                 Err(error) => {
                     return AttemptOutcome::Failed(
@@ -3206,9 +3258,11 @@ type HeadEnd = (usize, usize);
 /// line (ngx_http_proxy_process_header, ngx_http_proxy_module.c:1911,
 /// :1938; ngx_http_upstream_process_early_hints, ngx_http_upstream.c:2631,
 /// which with `early_hints` unset sends none). A 103 in an HTTP/1.0
-/// response is an invalid header (ngx_http_proxy_module.c:1840). Returns
-/// the bytes dropped and where the next head ends, when it is already in
-/// `accum`.
+/// response is an invalid header (ngx_http_proxy_module.c:1840). With
+/// `early_hints` (#848), its fields less the hidden ones go to `hints`
+/// (the 103s so far within `proxy_buffer_size`, as nginx bounds them).
+/// Returns the bytes dropped and where the next head ends, when it is
+/// already in `accum`.
 #[cold]
 #[inline(never)]
 fn drop_early_hints(
@@ -3216,6 +3270,7 @@ fn drop_early_hints(
     (head_end, term_len): HeadEnd,
     first_line_end: usize,
     upstream_is_11: bool,
+    hints: Option<(&EarlyHints, &crate::worker::ProxyResponseRules, usize)>,
 ) -> Result<(usize, Option<HeadEnd>), Box<UpstreamError>> {
     if !upstream_is_11 {
         return Err(Box::new(UpstreamError::EarlyHintsHttp10));
@@ -3244,6 +3299,11 @@ fn drop_early_hints(
         }
     }
     let dropped = head_end + term_len;
+    if let Some((hints, rules, before)) = hints
+        && before + dropped <= EARLY_HINTS_MAX
+    {
+        hints.push(rules, fields);
+    }
     accum.drain(..dropped);
     Ok((dropped, find_head_end(accum, 0)))
 }

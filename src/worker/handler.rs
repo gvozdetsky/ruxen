@@ -286,6 +286,23 @@ fn dynamic_client_config(
         .map_err(|e| crate::fs_resolve::note_failed_lookup(e, false))
 }
 
+/// `early_hints` (#848): a condition holds (ngx_http_test_predicates) and
+/// the client takes a 103 (ngx_http_early_hints_filter: HTTP/1.1 on).
+#[cold]
+#[inline(never)]
+fn early_hints(
+    conditions: &[&[PreparedValuePart]],
+    req: &phase::RequestCtx<'_>,
+    ctx: &RenderCtx<'_>,
+) -> Option<std::rc::Rc<crate::proxy::EarlyHints>> {
+    let holds = conditions.iter().any(|parts| {
+        let mut value = Vec::new();
+        render_parts(parts, ctx, &mut value);
+        !value.is_empty() && value != b"0"
+    });
+    (holds && req.http_11).then(std::rc::Rc::default)
+}
+
 /// The client framed a body (even an empty one): it sent Content-Length
 /// or Transfer-Encoding. nginx's `content_length_n` is -1 otherwise. A
 /// proxied GET without a body asks, so the scan is cheap: line starts by
@@ -1280,6 +1297,11 @@ pub(crate) fn run_location_handler(
                 Some(Box::new(crate::upstream_tls::TlsPlan { config, name }))
             }
         };
+        let early_hints = if proxy.early_hints.is_empty() {
+            None
+        } else {
+            early_hints(proxy.early_hints, req, &proxy_render_ctx)
+        };
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             tls,
@@ -1318,6 +1340,7 @@ pub(crate) fn run_location_handler(
                 && !(force_ranges && req.range.is_some()),
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
+            early_hints,
             h2: proxy.http_version == 2,
             cache,
             hash,

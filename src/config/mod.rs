@@ -1794,6 +1794,35 @@ mod tests {
     }
 
     #[test]
+    fn early_hints_parses_and_inherits() {
+        let cfg = parse(
+            "http { early_hints 1; server { listen 80; early_hints $arg_a $arg_b; early_hints $arg_c; \
+             location /off { early_hints 0; proxy_pass http://127.0.0.1:81; } } }",
+        )
+        .unwrap();
+        // Repeated lines add conditions, as ngx_http_set_predicate_slot.
+        assert_eq!(
+            cfg.servers[0].proxy.early_hints.as_ref().map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            cfg.servers[0].locations[0]
+                .proxy
+                .early_hints
+                .as_ref()
+                .map(Vec::len),
+            Some(1)
+        );
+        for bad in [
+            "http { early_hints; }",
+            "http { server { listen 80; location / { if ($arg_a) { early_hints 1; } } } }",
+            "early_hints 1; http { }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn max_ranges_parses_at_every_scope_and_inherits_into_nested_blocks() {
         let cfg = parse(
             r#"

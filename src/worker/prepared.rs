@@ -784,6 +784,8 @@ pub struct PreparedProxy {
     /// `proxy_ignore_client_abort`: keep the upstream exchange when the
     /// client goes away (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` conditions (#848); empty: off.
+    pub early_hints: &'static [&'static [PreparedValuePart]],
     /// Effective `ignore_invalid_headers` policy from the matched server.
     /// When true, headers with non-fatal invalid names are dropped before
     /// forwarding upstream.
@@ -930,6 +932,8 @@ pub(crate) struct ProxyEffective {
     pub force_ranges: bool,
     /// `proxy_ignore_client_abort` (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` (#848).
+    pub early_hints: &'static [&'static [PreparedValuePart]],
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     /// The nearest scope's `proxy_redirect` lines; `None` = nginx's
@@ -1114,6 +1118,7 @@ impl ProxyEffective {
             intercept_errors: false,
             force_ranges: false,
             ignore_client_abort: false,
+            early_hints: &[],
             ignore_invalid_headers: true,
             underscores_in_headers: false,
             redirect: None,

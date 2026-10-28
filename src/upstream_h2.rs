@@ -244,7 +244,16 @@ impl H2Conn {
                 Some(r) => r,
                 None => {
                     let future = self.response.as_mut().expect("checked");
-                    poll_fn(|cx| Pin::new(&mut *future).poll(cx)).await
+                    match poll_fn(|cx| poll_head(future, cx)).await {
+                        Head::Final(r) => r,
+                        // The proxy reads it as an HTTP/1.1 upstream's (#848).
+                        Head::Hints(fields) => {
+                            self.out.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
+                            write_fields(&fields, &mut self.out);
+                            self.out.extend_from_slice(b"\r\n");
+                            return Ok(());
+                        }
+                    }
                 }
             }
             .map_err(h2_io)?;
@@ -429,6 +438,27 @@ impl H2Conn {
 }
 
 /// Wait for the end of a response stream, dropping what still comes.
+enum Head {
+    /// A 103's fields.
+    Hints(http::HeaderMap),
+    Final(Result<http::Response<RecvStream>, h2::Error>),
+}
+
+/// The next head: a 103, or the final one. Other 1xx are dropped.
+fn poll_head(future: &mut ResponseFuture, cx: &mut std::task::Context<'_>) -> Poll<Head> {
+    loop {
+        match future.poll_informational(cx) {
+            Poll::Ready(Some(Ok(r))) if r.status() == http::StatusCode::EARLY_HINTS => {
+                return Poll::Ready(Head::Hints(r.into_parts().0.headers));
+            }
+            Poll::Ready(Some(Ok(_))) => {}
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Head::Final(Err(e))),
+            Poll::Ready(None) | Poll::Pending => break,
+        }
+    }
+    Pin::new(future).poll(cx).map(Head::Final)
+}
+
 async fn drain(recv: &mut RecvStream) -> io::Result<()> {
     while let Some(data) = poll_fn(|cx| recv.poll_data(cx)).await {
         let data = data.map_err(h2_io)?;

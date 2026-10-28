@@ -1418,6 +1418,7 @@ pub(crate) fn build_proxy(
                 intercept_errors: eff.intercept_errors,
                 force_ranges: eff.force_ranges,
                 ignore_client_abort: eff.ignore_client_abort,
+                early_hints: eff.early_hints,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -1468,6 +1469,7 @@ pub(crate) fn build_proxy(
                 intercept_errors: eff.intercept_errors,
                 force_ranges: eff.force_ranges,
                 ignore_client_abort: eff.ignore_client_abort,
+                early_hints: eff.early_hints,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -1531,6 +1533,7 @@ pub(crate) fn build_proxy(
                 intercept_errors: eff.intercept_errors,
                 force_ranges: eff.force_ranges,
                 ignore_client_abort: eff.ignore_client_abort,
+                early_hints: eff.early_hints,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix: b"",
@@ -1891,6 +1894,7 @@ pub(crate) struct ServerProxyDefaults {
     pub intercept_errors: bool,
     pub force_ranges: bool,
     pub ignore_client_abort: bool,
+    pub early_hints: &'static [&'static [PreparedValuePart]],
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
@@ -1938,6 +1942,15 @@ fn leak_list(list: Option<Vec<String>>) -> Option<&'static [String]> {
     list.map(|l| &*crate::arena::leak(l.into_boxed_slice()))
 }
 
+/// Predicates (`ngx_http_set_predicate_slot`), each value rendered.
+fn prepare_conditions(
+    list: Vec<Vec<crate::config::ValuePart>>,
+) -> &'static [&'static [PreparedValuePart]] {
+    let list: Vec<&'static [PreparedValuePart]> =
+        list.into_iter().map(prepare_value_parts).collect();
+    &*crate::arena::leak(list.into_boxed_slice())
+}
+
 impl ServerProxyDefaults {
     pub(crate) fn build(
         conf: ProxyConf,
@@ -1983,6 +1996,9 @@ impl ServerProxyDefaults {
             ignore_client_abort: conf
                 .ignore_client_abort
                 .unwrap_or(defaults.ignore_client_abort),
+            early_hints: conf
+                .early_hints
+                .map_or(defaults.early_hints, prepare_conditions),
             ignore_invalid_headers,
             underscores_in_headers,
             redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
@@ -2116,6 +2132,9 @@ pub(crate) fn resolve_proxy_effective(
         ignore_client_abort: location
             .ignore_client_abort
             .unwrap_or(server_defaults.ignore_client_abort),
+        early_hints: location
+            .early_hints
+            .map_or(server_defaults.early_hints, prepare_conditions),
         ignore_invalid_headers: server_defaults.ignore_invalid_headers,
         underscores_in_headers: server_defaults.underscores_in_headers,
         redirect: match location.redirect {
