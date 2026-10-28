@@ -148,9 +148,6 @@ too, the line only differs.
 (`error: … the check stopped here`), as `-t` does. The ones real
 configurations hit:
 
-- `bad value for upstream server param: service=…`: SRV records for an
-  upstream `server` (nginx 1.27.3). `server … resolve` without `service=`
-  works. [#597] (open).
 - `invalid location regex … repetition quantifier expects a valid decimal`:
   a `{` that doesn't start a quantifier, often a template variable that was
   never substituted (`^${PREFIX}/`). nginx's PCRE reads it as a literal.
@@ -450,7 +447,6 @@ start without it.
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
 [#526]: https://github.com/gvozdetsky/ruxen/issues/526
 [#596]: https://github.com/gvozdetsky/ruxen/issues/596
-[#597]: https://github.com/gvozdetsky/ruxen/issues/597
 [#599]: https://github.com/gvozdetsky/ruxen/issues/599
 [#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757

@@ -998,6 +998,7 @@ pub(crate) fn prepare_upstreams(
                 (Some(name), PeerAddr::Inet(addr)) => {
                     hosts.push(crate::upstream_resolve::HostConf {
                         name,
+                        service: s.service,
                         port: addr.port(),
                         template: peer,
                     })

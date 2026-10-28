@@ -1,5 +1,5 @@
-//! `server NAME resolve` in an upstream with a `zone` (#597), as nginx
-//! 1.27.3+ re-resolves such names (ngx_http_upstream_zone_module.c):
+//! `server NAME resolve [service=…]` in an upstream with a `zone` (#597),
+//! as nginx 1.27.3+ re-resolves such names (ngx_http_upstream_zone_module.c):
 //!
 //! - One worker asks the upstream's resolver for each name, again when the
 //!   answer's TTL (or `valid=`) ends, plus a second
@@ -8,6 +8,10 @@
 //!   list with the `server` line's parameters and port. An error keeps the
 //!   peers and asks again after `resolver_timeout` (1 s at least); a name
 //!   that doesn't exist (or has no address) leaves no peers.
+//! - With `service=`, the SRV records give the targets and ports: the
+//!   lowest priority's addresses are the server's peers, the others backup
+//!   peers (dropped where the balancer has no backup tier), each with the
+//!   record's weight unless the line sets one, named after its target.
 //! - The peer list is a whole `PreparedUpstream` (a version) that requests
 //!   take when they start (`PreparedUpstream::current`), so the request
 //!   path keeps indexing a fixed slice; a request keeps the version it
@@ -16,15 +20,16 @@
 //! - A version is kept until the configuration is freed, and reused when
 //!   its peer list comes back: the memory grows with the number of
 //!   distinct lists seen, not with the number of answers.
-//! - A reload starts from the addresses the last generation had for the
-//!   same zone, upstream and name (ngx_http_upstream_zone_preresolve),
-//!   with the new `server` line's port.
+//! - A reload starts from the peers the last generation had for the same
+//!   zone, upstream, name and service (ngx_http_upstream_zone_preresolve),
+//!   with the new `server` line's port and parameters.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::resolver::{Failure, SrvAddr};
 use crate::upstream::{HashLb, Lb, PeerShared};
 use crate::worker::{PeerAddr, PreparedHttp, PreparedPeer, PreparedUpstream, RuntimeState};
 
@@ -32,6 +37,8 @@ use crate::worker::{PeerAddr, PreparedHttp, PreparedPeer, PreparedUpstream, Runt
 struct Host {
     /// The name as the resolver asks it.
     name: Box<[u8]>,
+    /// `service=`, as written.
+    service: Option<Box<[u8]>>,
     port: u16,
     /// What each of its addresses becomes, but for the address.
     template: PreparedPeer,
@@ -63,16 +70,49 @@ impl std::fmt::Debug for Dynamic {
     }
 }
 
+/// A peer a name resolved to.
+#[derive(Debug, Clone, Copy)]
+struct Resolved {
+    host: usize,
+    addr: SocketAddr,
+    backup: bool,
+    weight: u32,
+    /// An SRV target: the peer's `server` name.
+    server: Option<&'static [u8]>,
+}
+
+/// A peer an answer gives.
+struct Candidate<'a> {
+    addr: SocketAddr,
+    backup: bool,
+    weight: u32,
+    server: Option<&'a [u8]>,
+}
+
 struct State {
-    /// The resolved peers in nginx's list order: host and address.
-    resolved: Vec<(usize, SocketAddr)>,
+    /// The resolved peers in nginx's list order.
+    resolved: Vec<Resolved>,
+    /// SRV targets, each kept once.
+    names: Vec<&'static [u8]>,
     versions: Vec<&'static PreparedUpstream>,
     owner: crate::arena::Owner,
+}
+
+impl State {
+    fn intern(&mut self, name: &[u8]) -> &'static [u8] {
+        if let Some(kept) = self.names.iter().find(|n| ***n == *name) {
+            return kept;
+        }
+        let kept: &'static [u8] = self.owner.leak(name.into());
+        self.names.push(kept);
+        kept
+    }
 }
 
 /// A server line of the configuration being prepared.
 pub(crate) struct HostConf {
     pub name: String,
+    pub service: Option<String>,
     pub port: u16,
     pub template: PreparedPeer,
 }
@@ -93,23 +133,47 @@ impl Dynamic {
             .into_iter()
             .map(|h| Host {
                 name: crate::resolver::normalize(h.name.as_bytes()),
+                service: h.service.map(|s| s.into_bytes().into_boxed_slice()),
                 port: h.port,
                 template: h.template,
             })
             .collect();
-        let mut resolved = Vec::new();
+        let mut state = State {
+            resolved: Vec::new(),
+            names: Vec::new(),
+            versions: Vec::new(),
+            // SAFETY: inside the `Dynamic` below, which the generation's
+            // arena frees with the rest of its configuration.
+            owner: unsafe { crate::arena::Owner::new() },
+        };
+        let backup_tier = has_backup_tier(&template);
         let mut first = Vec::with_capacity(hosts.len());
         for (i, host) in hosts.iter().enumerate() {
-            match kept(zone, template.name, host) {
-                Some((addrs, valid)) => {
-                    resolved.extend(
-                        addrs
-                            .into_iter()
-                            .map(|ip| (i, SocketAddr::new(ip, host.port))),
-                    );
-                    first.push(valid.max(now));
-                }
-                None => first.push(now),
+            let Some((peers, valid)) = kept(zone, template.name, host) else {
+                first.push(now);
+                continue;
+            };
+            first.push(valid.max(now));
+            let t = &host.template;
+            for p in peers {
+                let resolved = match &p.server {
+                    None => Resolved {
+                        host: i,
+                        addr: SocketAddr::new(p.addr.ip(), host.port),
+                        backup: t.backup,
+                        weight: t.weight,
+                        server: None,
+                    },
+                    Some(_) if p.backup && !t.backup && !backup_tier => continue,
+                    Some(server) => Resolved {
+                        host: i,
+                        addr: p.addr,
+                        backup: p.backup,
+                        weight: if t.weight != 1 { t.weight } else { p.weight },
+                        server: Some(state.intern(server)),
+                    },
+                };
+                state.resolved.push(resolved);
             }
         }
         let dynamic: &'static Dynamic = crate::arena::leak(Box::new(Dynamic {
@@ -121,13 +185,7 @@ impl Dynamic {
             first: first.into(),
             current: AtomicPtr::new(std::ptr::null_mut()),
             claimed: AtomicBool::new(false),
-            state: Mutex::new(State {
-                resolved,
-                versions: Vec::new(),
-                // SAFETY: inside `dynamic`, which the generation's arena
-                // frees with the rest of its configuration.
-                owner: unsafe { crate::arena::Owner::new() },
-            }),
+            state: Mutex::new(state),
         }));
         dynamic.publish(&mut dynamic.lock());
         crate::arena::leak(Box::new(PreparedUpstream {
@@ -170,10 +228,16 @@ impl Dynamic {
                 state
                     .resolved
                     .iter()
-                    .filter(|(h, _)| self.hosts[*h].template.backup == backup)
-                    .map(|&(h, addr)| PreparedPeer {
-                        addr: PeerAddr::Inet(addr),
-                        ..self.hosts[h].template
+                    .filter(|r| r.backup == backup)
+                    .map(|r| {
+                        let template = &self.hosts[r.host].template;
+                        PreparedPeer {
+                            addr: PeerAddr::Inet(r.addr),
+                            display: r.server.unwrap_or(template.display),
+                            weight: r.weight,
+                            backup: r.backup,
+                            ..*template
+                        }
                     }),
             );
         }
@@ -219,36 +283,113 @@ impl Dynamic {
             .store(std::ptr::from_ref(version).cast_mut(), Ordering::Release);
     }
 
-    /// Host `h`'s new addresses, matched against its peers as
-    /// ngx_http_upstream_zone_resolve_handler does: a peer stays for an
-    /// address of the answer not taken yet, goes otherwise; the rest of
-    /// the answer is added at the end.
+    /// Host `h`'s new addresses.
     fn apply(&'static self, h: usize, addrs: &[IpAddr], valid: Instant) {
         let host = &self.hosts[h];
-        let mut answer: Vec<Option<SocketAddr>> = addrs
+        let candidates = addrs
             .iter()
-            .map(|&ip| Some(SocketAddr::new(ip, host.port)))
+            .map(|&ip| Candidate {
+                addr: SocketAddr::new(ip, host.port),
+                backup: host.template.backup,
+                weight: host.template.weight,
+                server: None,
+            })
             .collect();
+        self.update(h, candidates, valid);
+    }
+
+    /// Host `h`'s service resolved to `addrs` (ngx_resolver_report_srv's
+    /// list): the lowest priority are its peers, the others backup ones.
+    fn apply_service(&'static self, h: usize, addrs: &[SrvAddr], valid: Instant) {
+        let host = &self.hosts[h];
+        let t = &host.template;
+        let lowest = addrs.iter().map(|a| a.priority).min();
+        let backup_tier = has_backup_tier(&self.template);
+        let candidates = addrs
+            .iter()
+            .filter_map(|a| {
+                let low = Some(a.priority) != lowest;
+                if low && (t.backup || !backup_tier) {
+                    return None;
+                }
+                Some(Candidate {
+                    addr: a.addr,
+                    backup: t.backup || low,
+                    weight: if t.weight != 1 {
+                        t.weight
+                    } else {
+                        u32::from(a.weight)
+                    },
+                    server: Some(&a.name),
+                })
+            })
+            .collect();
+        self.update(h, candidates, valid);
+    }
+
+    /// Match host `h`'s peers against an answer as
+    /// ngx_http_upstream_zone_resolve_handler does: a peer stays for a
+    /// peer of the answer not taken yet, goes otherwise; the rest of the
+    /// answer is added at the end.
+    fn update(&'static self, h: usize, candidates: Vec<Candidate<'_>>, valid: Instant) {
+        let host = &self.hosts[h];
+        // A record's weight counts only when the line doesn't set one.
+        let weighted = host.service.is_some() && host.template.weight == 1;
+        let mut taken = vec![false; candidates.len()];
         let mut state = self.lock();
-        state.resolved.retain(|&(owner, addr)| {
-            if owner != h {
+        state.resolved.retain(|r| {
+            if r.host != h {
                 return true;
             }
-            match answer.iter_mut().find(|a| **a == Some(addr)) {
-                Some(taken) => {
-                    *taken = None;
+            let found = candidates.iter().enumerate().position(|(i, c)| {
+                !taken[i]
+                    && c.addr == r.addr
+                    && c.backup == r.backup
+                    && c.server == r.server
+                    && (!weighted || c.weight == r.weight)
+            });
+            match found {
+                Some(i) => {
+                    taken[i] = true;
                     true
                 }
                 None => false,
             }
         });
-        state
-            .resolved
-            .extend(answer.into_iter().flatten().map(|addr| (h, addr)));
+        for (c, taken) in candidates.iter().zip(taken) {
+            if taken {
+                continue;
+            }
+            let server = c.server.map(|name| state.intern(name));
+            state.resolved.push(Resolved {
+                host: h,
+                addr: c.addr,
+                backup: c.backup,
+                weight: c.weight,
+                server,
+            });
+        }
         self.publish(&mut state);
+        let peers: Vec<KeptPeer> = state
+            .resolved
+            .iter()
+            .filter(|r| r.host == h)
+            .map(|r| KeptPeer {
+                addr: r.addr,
+                backup: r.backup,
+                weight: r.weight,
+                server: r.server.map(Box::from),
+            })
+            .collect();
         drop(state);
-        keep(self.zone, self.template.name, host, addrs, valid);
+        keep(self.zone, self.template.name, host, peers, valid);
     }
+}
+
+/// Whether the balancer keeps backup peers, where the lower priorities of
+/// a service go (nginx's `peers->next`).
+fn has_backup_tier(upstream: &PreparedUpstream) -> bool {
+    matches!(upstream.lb, Lb::RoundRobin | Lb::LeastConn) || upstream.peers.iter().any(|p| p.backup)
 }
 
 fn same_peer(a: &PreparedPeer, b: &PreparedPeer) -> bool {
@@ -266,14 +407,23 @@ fn same_peers(a: &[PreparedPeer], b: &[PreparedPeer]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_peer(a, b))
 }
 
-/// The addresses a generation last had for a name, for the next one.
+/// The peers a generation last had for a name, for the next one.
 struct Kept {
     zone: Box<str>,
     upstream: Box<[u8]>,
     name: Box<[u8]>,
+    service: Option<Box<[u8]>>,
     backup: bool,
-    addrs: Vec<IpAddr>,
+    peers: Vec<KeptPeer>,
     valid: Instant,
+}
+
+#[derive(Clone)]
+struct KeptPeer {
+    addr: SocketAddr,
+    backup: bool,
+    weight: u32,
+    server: Option<Box<[u8]>>,
 }
 
 static KEPT: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
@@ -286,32 +436,34 @@ fn kept_matches(k: &Kept, zone: &str, upstream: &[u8], host: &Host) -> bool {
     *k.zone == *zone
         && *k.upstream == *upstream
         && k.name == host.name
+        && k.service == host.service
         && k.backup == host.template.backup
 }
 
-fn kept(zone: &str, upstream: &[u8], host: &Host) -> Option<(Vec<IpAddr>, Instant)> {
+fn kept(zone: &str, upstream: &[u8], host: &Host) -> Option<(Vec<KeptPeer>, Instant)> {
     kept_list()
         .iter()
         .find(|k| kept_matches(k, zone, upstream, host))
-        .map(|k| (k.addrs.clone(), k.valid))
+        .map(|k| (k.peers.clone(), k.valid))
 }
 
-fn keep(zone: &str, upstream: &[u8], host: &Host, addrs: &[IpAddr], valid: Instant) {
+fn keep(zone: &str, upstream: &[u8], host: &Host, peers: Vec<KeptPeer>, valid: Instant) {
     let mut list = kept_list();
     match list
         .iter_mut()
         .find(|k| kept_matches(k, zone, upstream, host))
     {
         Some(k) => {
-            k.addrs = addrs.to_vec();
+            k.peers = peers;
             k.valid = valid;
         }
         None => list.push(Kept {
             zone: zone.into(),
             upstream: upstream.into(),
             name: host.name.clone(),
+            service: host.service.clone(),
             backup: host.template.backup,
-            addrs: addrs.to_vec(),
+            peers,
             valid,
         }),
     }
@@ -345,6 +497,7 @@ const ERROR_VALID: Duration = Duration::from_secs(10);
 
 async fn keep_resolving(dynamic: &'static Dynamic, h: usize, state: &'static RuntimeState) {
     let host = &dynamic.hosts[h];
+    let name = String::from_utf8_lossy(&host.name);
     let mut at = dynamic.first[h];
     loop {
         monoio::time::sleep(at.saturating_duration_since(Instant::now())).await;
@@ -352,26 +505,62 @@ async fn keep_resolving(dynamic: &'static Dynamic, h: usize, state: &'static Run
             return;
         }
         let now = Instant::now();
-        at = match crate::resolver::resolve_valid(dynamic.resolver, &host.name, dynamic.timeout)
-            .await
-        {
-            Ok((addrs, valid)) => {
-                dynamic.apply(h, &addrs, valid);
-                valid.max(now) + AFTER_VALID
-            }
-            Err(failure) => {
-                crate::resolver::log(&format!(
-                    "{} could not be resolved ({failure})",
-                    String::from_utf8_lossy(&host.name)
-                ));
-                if failure.0 == crate::resolver::NXDOMAIN {
-                    let valid = now + dynamic.resolver.valid.unwrap_or(ERROR_VALID);
-                    dynamic.apply(h, &[], valid);
-                    valid + AFTER_VALID
-                } else {
-                    now + dynamic.timeout.max(Duration::from_secs(1))
+        let resolver = dynamic.resolver;
+        let failure = match &host.service {
+            None => {
+                match crate::resolver::resolve_valid(resolver, &host.name, dynamic.timeout).await {
+                    Ok((addrs, valid)) => {
+                        dynamic.apply(h, &addrs, valid);
+                        at = valid.max(now) + AFTER_VALID;
+                        continue;
+                    }
+                    Err(failure) => {
+                        crate::resolver::log(&format!("{name} could not be resolved ({failure})"));
+                        failure
+                    }
                 }
             }
+            Some(service) => {
+                let service_text = String::from_utf8_lossy(service);
+                let resolved = crate::resolver::resolve_service(
+                    resolver,
+                    &host.name,
+                    service,
+                    dynamic.timeout,
+                )
+                .await;
+                let log_targets = |failed: &[(Box<[u8]>, Failure)]| {
+                    for (target, failure) in failed {
+                        crate::resolver::log(&format!(
+                            "{} could not be resolved ({failure}) while resolving service \
+                             {service_text} of {name}",
+                            String::from_utf8_lossy(target)
+                        ));
+                    }
+                };
+                match resolved {
+                    Ok(found) => {
+                        log_targets(&found.failed);
+                        dynamic.apply_service(h, &found.addrs, found.valid);
+                        at = found.valid.max(now) + AFTER_VALID;
+                        continue;
+                    }
+                    Err((failure, failed)) => {
+                        log_targets(&failed);
+                        crate::resolver::log(&format!(
+                            "service {service_text} of {name} could not be resolved ({failure})"
+                        ));
+                        failure
+                    }
+                }
+            }
+        };
+        at = if failure.0 == crate::resolver::NXDOMAIN {
+            let valid = now + resolver.valid.unwrap_or(ERROR_VALID);
+            dynamic.update(h, Vec::new(), valid);
+            valid + AFTER_VALID
+        } else {
+            now + dynamic.timeout.max(Duration::from_secs(1))
         };
     }
 }
@@ -394,6 +583,15 @@ mod tests {
     }
 
     fn upstream(zone: &str, port: u16) -> &'static PreparedUpstream {
+        upstream_with(zone, port, None, 1)
+    }
+
+    fn upstream_with(
+        zone: &str,
+        port: u16,
+        service: Option<&str>,
+        weight: u32,
+    ) -> &'static PreparedUpstream {
         let statics: &'static [PreparedPeer] =
             Box::leak(vec![peer("127.0.0.9:80", false)].into_boxed_slice());
         let template = PreparedUpstream {
@@ -416,9 +614,11 @@ mod tests {
         }));
         let host = |name: &str, backup: bool| HostConf {
             name: name.into(),
+            service: service.map(String::from),
             port,
             template: PreparedPeer {
                 display: b"a.test",
+                weight,
                 ..peer("0.0.0.0:0", backup)
             },
         };
@@ -505,5 +705,78 @@ mod tests {
         // Another zone starts empty.
         let other = upstream("t3", 8080).dynamic.unwrap();
         assert_eq!(addrs(other.version()), primary(&["127.0.0.9:80"]));
+    }
+
+    fn srv(addr: &str, name: &str, priority: u16, weight: u16) -> SrvAddr {
+        SrvAddr {
+            addr: addr.parse().unwrap(),
+            name: name.as_bytes().into(),
+            priority,
+            weight,
+        }
+    }
+
+    fn peers(v: &PreparedUpstream) -> Vec<(String, String, u32, bool)> {
+        v.peers
+            .iter()
+            .map(|p| {
+                let display = String::from_utf8_lossy(p.display).into_owned();
+                (p.addr.to_string(), display, p.weight, p.backup)
+            })
+            .collect()
+    }
+
+    fn row(addr: &str, name: &str, weight: u32, backup: bool) -> (String, String, u32, bool) {
+        (addr.into(), name.into(), weight, backup)
+    }
+
+    #[test]
+    fn services_give_ports_weights_and_backups() {
+        let d = upstream_with("s1", 80, Some("http"), 1).dynamic.unwrap();
+        let later = Instant::now() + Duration::from_secs(5);
+        let answer = [
+            srv("10.0.0.1:8081", "a.example", 1, 5),
+            srv("10.0.0.2:8082", "b.example", 2, 1),
+        ];
+        d.apply_service(0, &answer, later);
+        // The lowest priority is primary, the rest backup; the record's
+        // port, weight and target.
+        let statics = row("127.0.0.9:80", "x", 1, false);
+        assert_eq!(
+            peers(d.version()),
+            [
+                statics.clone(),
+                row("10.0.0.1:8081", "a.example", 5, false),
+                row("10.0.0.2:8082", "b.example", 1, true),
+            ]
+        );
+        // A new weight is a new peer.
+        let answer = [srv("10.0.0.1:8081", "a.example", 1, 3)];
+        d.apply_service(0, &answer, later);
+        assert_eq!(
+            peers(d.version()),
+            [statics.clone(), row("10.0.0.1:8081", "a.example", 3, false)]
+        );
+        // A backup server has no lower tier to put them in.
+        let answer = [srv("10.0.1.1:1", "c", 1, 1), srv("10.0.1.2:2", "d", 9, 1)];
+        d.apply_service(1, &answer, later);
+        assert_eq!(
+            peers(d.version()),
+            [
+                statics.clone(),
+                row("10.0.0.1:8081", "a.example", 3, false),
+                row("10.0.1.1:1", "c", 1, true),
+            ]
+        );
+        // The line's weight wins over the record's.
+        let w = upstream_with("s2", 80, Some("http"), 7).dynamic.unwrap();
+        w.apply_service(0, &[srv("10.0.0.1:8081", "a.example", 1, 5)], later);
+        assert_eq!(
+            peers(w.version()),
+            [statics, row("10.0.0.1:8081", "a.example", 7, false)]
+        );
+        // The next generation starts from the same peers.
+        let next = upstream_with("s1", 80, Some("http"), 1).dynamic.unwrap();
+        assert_eq!(peers(next.version()), peers(d.version()));
     }
 }
