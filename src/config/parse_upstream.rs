@@ -748,6 +748,7 @@ impl ProxyConf {
         "proxy_intercept_errors",
         "proxy_force_ranges",
         "proxy_ignore_client_abort",
+        "proxy_pass_trailers",
         "proxy_bind",
         "proxy_redirect",
         "proxy_cookie_domain",
@@ -1117,6 +1118,12 @@ impl ProxyConf {
                         });
                     }
                 });
+            }
+            "proxy_pass_trailers" => {
+                if self.pass_trailers.is_some() {
+                    return Err(Error::Duplicate("proxy_pass_trailers"));
+                }
+                self.pass_trailers = Some(parse_on_off_args(&args[1..], "proxy_pass_trailers")?);
             }
             "proxy_ignore_client_abort" => {
                 if self.ignore_client_abort.is_some() {

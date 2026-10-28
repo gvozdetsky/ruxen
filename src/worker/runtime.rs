@@ -1262,10 +1262,11 @@ async fn send_relay_trailers<S: ConnIo>(
     meta: &phase::ProcessMeta,
     uri: Option<&[u8]>,
     head: &[u8],
+    upstream: &[u8],
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
 ) -> Option<u64> {
-    let out = super::response::relay_trailers(http, ctx, meta, uri, head);
+    let out = super::response::relay_trailers(http, ctx, meta, uri, head, upstream);
     let len = out.len();
     let (res, _) = write_all_timed(stream, out, len, timer, send_timeout).await;
     res.ok().map(|()| len as u64)
@@ -5447,6 +5448,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         &process_meta,
                                         final_uri(&process_meta, url_scratch),
                                         scratch,
+                                        &end.upstream_trailers,
                                         timers.io.as_mut(),
                                         send_timeout,
                                     ))
