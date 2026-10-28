@@ -261,28 +261,50 @@ fn next_boundary() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The head of a response relayed as it comes (#88), which no range can
-/// cut (a request with `Range` reads it whole): `Accept-Ranges: bytes`
-/// where the filter would allow ranges.
-pub(crate) fn relayed_head(head: Vec<u8>, max_ranges: Option<u32>) -> Vec<u8> {
+/// What the filter makes of a response relayed as it comes (#88, #463).
+pub(crate) enum RelayedCut {
+    /// This head, and the body as it is.
+    Head(Vec<u8>),
+    /// The 206's head, and the body's bytes `[start, end)` only
+    /// (nginx's ngx_http_range_singlepart_body over the upstream's
+    /// buffers).
+    Window(Vec<u8>, u64, u64),
+    /// This response instead (the 416); the body isn't sent.
+    Answer(Vec<u8>),
+}
+
+/// `filter` for a relayed response: one range at most, cut from the body
+/// as it passes (several are a multipart response nginx builds only for
+/// a body it has whole: `Single` here).
+pub(crate) fn filter_relayed(
+    head: Vec<u8>,
+    max_ranges: Option<u32>,
+    req: RangeRequest<'_>,
+    not_satisfiable: impl FnOnce(u64, &[u8]) -> Vec<u8>,
+) -> RelayedCut {
+    if max_ranges == Some(0) {
+        return RelayedCut::Head(head);
+    }
     let Some(head_end) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return head;
+        return RelayedCut::Head(head);
     };
     let lines = &head[..head_end];
-    if max_ranges == Some(0)
-        || lines.get(9..12) != Some(b"200")
-        || header(lines, b"content-length").is_none()
-    {
-        return head;
+    let Some(len) = header(lines, b"content-length").and_then(crate::proxy::parse_content_length)
+    else {
+        return RelayedCut::Head(head);
+    };
+    match decide(lines, len, RangeAllow::Single, max_ranges, req) {
+        Cut::Pass => RelayedCut::Head(head),
+        Cut::Ranges(ranges, len) if ranges.len() == 1 => {
+            let (start, end) = ranges.first;
+            RelayedCut::Window(single_head(lines, start, end, len), start, end)
+        }
+        Cut::Whole | Cut::Ranges(..) => RelayedCut::Head(with_accept_ranges(lines)),
+        Cut::NotSatisfiable(len) => RelayedCut::Answer(not_satisfiable(
+            len,
+            header(lines, b"server").unwrap_or_default(),
+        )),
     }
-    let status_line = lines.split(|&b| b == b'\n').next().unwrap_or(lines);
-    let status_line = status_line.strip_suffix(b"\r").unwrap_or(status_line);
-    rebuild(
-        status_line,
-        lines,
-        &[b"accept-ranges"],
-        b"\r\nAccept-Ranges: bytes",
-    )
 }
 
 /// What the filter does to a response.
