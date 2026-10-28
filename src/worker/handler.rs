@@ -556,7 +556,8 @@ fn cache_plan(
     }
     // ngx_http_upstream_cache_check_range: a range from too far into the
     // response isn't worth fetching it whole for the cache; it goes
-    // upstream as asked, and nothing is stored.
+    // upstream as asked, and nothing is stored. A `proxy_cache_lock` taken
+    // stays with the request, released when it ends, as nginx's (#864).
     if hit.is_none()
         && cacheable
         && let Some(max) = conf.max_range_offset
@@ -565,7 +566,6 @@ fn cache_plan(
     {
         cacheable = false;
         store = false;
-        token = None;
     }
     Ok(Some(Box::new(CachePlan {
         conf,
