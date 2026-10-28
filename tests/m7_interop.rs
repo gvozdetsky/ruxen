@@ -407,3 +407,37 @@ fn return_body_expands_variables() {
     assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
     assert_eq!(body(&r), b"uri=/p/q host=example.com");
 }
+
+// #781: HTTP/1.1 needs `Host` whatever the target's form; HTTP/1.0 doesn't.
+#[test]
+fn absolute_form_without_host_is_a_400_on_http_11() {
+    let (_guard, port, _dir) = spawn_server(
+        r#"
+            events {}
+            http {
+                server {
+                    listen 127.0.0.1:%%PORT%%;
+                    location / { return 200 "ok\n"; }
+                }
+            }
+        "#,
+    );
+    for (req, status) in [
+        (
+            &b"GET http://localhost/ HTTP/1.1\r\n\r\n"[..],
+            "400 Bad Request",
+        ),
+        (
+            b"GET https://localhost/ HTTP/1.1\r\n\r\n",
+            "400 Bad Request",
+        ),
+        (b"GET http://localhost/ HTTP/1.0\r\n\r\n", "200 OK"),
+        (
+            b"GET http://localhost/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            "200 OK",
+        ),
+    ] {
+        let r = request(port, req);
+        assert_eq!(status_line(&r), format!("HTTP/1.1 {status}"), "{req:?}");
+    }
+}

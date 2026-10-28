@@ -12,7 +12,6 @@ connection	^response: nginx \d+ ok, ruxen - error: timeout$		cl-big		#776: ruxen
 			leading-crlf		#778: an empty line before the request line is a 400
 header	ruxen doesn't send it		 (400|414|505)$		#779: no `add_header … always` on a request rejected before routing
 connection	nginx closed, ruxen reset$				#780: no lingering close after rejecting a too-large head
-status	^status: nginx 400, ruxen		absolute-uri.* 400$		#781: an absolute-form HTTP/1.1 request without Host is served
 status	^status: nginx (412|304), ruxen 200$		(im-|ius-|inm-star|rand)		#782: `return 200` ignores If-Match, If-Unmodified-Since, `If-None-Match: *`
 connection	nginx closed, ruxen extra bytes$		HEAD		#783: the 414 for a too-long HEAD line has a body
 			version:0\.9		#784: an HTTP/0.9 request waits for client_header_timeout

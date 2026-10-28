@@ -669,6 +669,9 @@ fn rewrite_cycle_log(uri: &[u8]) {
 }
 
 /// nginx's `[info]` line for an HTTP/1.1 request without `Host` (#663).
+pub(crate) const MISSING_HOST: &str =
+    "client sent HTTP/1.1 request without \"Host\" header while reading client request headers";
+
 #[cold]
 #[inline(never)]
 fn missing_host_log(server: &PreparedServer, req: &RequestCtx<'_>) {
@@ -676,7 +679,7 @@ fn missing_host_log(server: &PreparedServer, req: &RequestCtx<'_>) {
         server.error_logs,
         crate::config::ErrorLogLevel::Info,
         &crate::worker::ErrorLogRequest::new(req, server.primary_server_name),
-        b"client sent HTTP/1.1 request without \"Host\" header while reading client request headers",
+        MISSING_HOST.as_bytes(),
         None,
     );
 }
