@@ -539,6 +539,13 @@ pub(crate) fn run(
         rewrite_state.limit_req_status = status::DELAYED;
         return (None, 0);
     }
+    // Counted on the pass before the body was read (#855).
+    if let Some(noted) = crate::phase::before_body_noted()
+        && noted.limit_req_status != 0
+    {
+        rewrite_state.limit_req_status = noted.limit_req_status;
+        return (None, 0);
+    }
     let verdict = {
         let args = current_args.unwrap_or_else(|| super::request_args(req.path));
         let captures_slice: &[(&'static str, Vec<u8>)] = match captures {

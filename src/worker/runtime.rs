@@ -2567,6 +2567,103 @@ async fn run_auth_subrequest(
     }
 }
 
+/// What the access phase did before the body was read (#855). Boxed
+/// where `handle` keeps it.
+#[allow(clippy::large_enum_variant)]
+enum AccessFirst {
+    /// It answered (a denial, a limit, or a handler that reads no body):
+    /// that is the response, and the body is discarded.
+    Answer(Response, phase::ProcessMeta),
+    /// It let the request on to a handler that may read the body: the pass
+    /// after the read doesn't count it again, nor redo the subrequests.
+    Continue {
+        noted: phase::BeforeBody,
+        auth: Vec<(&'static [u8], phase::AuthResume)>,
+        held: Option<std::rc::Rc<super::limit_conn::Held>>,
+    },
+}
+
+/// The access phase before the body is read, as nginx runs it (#855): a
+/// pass that stops before any handler that may read the body, with
+/// limit_req's delay and auth_request's subrequests as after the read.
+#[cold]
+#[inline(never)]
+async fn access_before_body(
+    http: &'static PreparedHttp,
+    ctx: &mut phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    request_start: Instant,
+) -> AccessFirst {
+    let pass = |ctx: &phase::RequestCtx<'_>, url_scratch: &mut Vec<u8>| {
+        phase::probe_before_body();
+        let (response, meta) = phase::process_with_meta(http, ctx, url_scratch);
+        (response, meta, phase::probe_result())
+    };
+    let (mut response, mut meta, mut noted) = pass(ctx, url_scratch);
+    if meta.limit_req_delay_ms > 0 {
+        monoio::time::sleep(Duration::from_millis(meta.limit_req_delay_ms)).await;
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        super::limit_req::resume_after_delay(true);
+        (response, meta, noted) = pass(ctx, url_scratch);
+        super::limit_req::resume_after_delay(false);
+    }
+    let held = meta.limit_conn_held.clone();
+    let mut auth: Vec<(&'static [u8], phase::AuthResume)> = Vec::new();
+    // As `auth_subrequest`.
+    for _ in 0..8 {
+        let Some(pending) = meta.auth_request.take() else {
+            break;
+        };
+        let outcome = run_auth_subrequest(http, ctx, url_scratch, &pending, request_start).await;
+        auth.push((pending.uri, outcome));
+        phase::resume_auth_request(auth.clone());
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        (response, meta, noted) = pass(ctx, url_scratch);
+        phase::resume_auth_request(Vec::new());
+        if meta.limit_conn_held.is_none() {
+            meta.limit_conn_held = held.clone();
+        }
+    }
+    if meta.auth_request.take().is_some() {
+        return AccessFirst::Answer(
+            Response::Prebuilt(http.internal_error.pick(ctx.method)),
+            meta,
+        );
+    }
+    match noted {
+        Some(noted) => AccessFirst::Continue {
+            noted,
+            auth,
+            held: meta.limit_conn_held,
+        },
+        None => AccessFirst::Answer(response, meta),
+    }
+}
+
+/// The pass after the body was read, when the access phase ran before it.
+#[cold]
+#[inline(never)]
+fn process_after_access(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    first: AccessFirst,
+) -> (Response, phase::ProcessMeta) {
+    let (noted, auth, held) = match first {
+        AccessFirst::Answer(response, meta) => return (response, meta),
+        AccessFirst::Continue { noted, auth, held } => (noted, auth, held),
+    };
+    phase::resume_before_body(Some(noted));
+    phase::resume_auth_request(auth);
+    let (response, mut meta) = phase::process_with_meta(http, ctx, url_scratch);
+    phase::resume_auth_request(Vec::new());
+    phase::resume_before_body(None);
+    if held.is_some() {
+        meta.limit_conn_held = held;
+    }
+    (response, meta)
+}
+
 async fn limit_req_delayed(
     http: &'static PreparedHttp,
     ctx: &mut phase::RequestCtx<'_>,
@@ -4524,6 +4621,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut continue_status = None;
                         // The routed location's client_body_timeout (#147).
                         let mut body_timeout = timeouts.body;
+                        // What the access phase did before the read (#855).
+                        let mut access_first: Option<Box<AccessFirst>> = None;
                         // A body is framed, even an empty one (`Content-Length:
                         // 0`, or chunked): nginx reads it, and with
                         // client_body_in_file_only writes its file (#628).
@@ -4566,6 +4665,19 @@ pub(crate) async fn handle<S: ConnIo>(
                                         .as_bytes(),
                                         None,
                                     );
+                                } else if first.access_first && !discard_body {
+                                    // The access phase answers before the
+                                    // body is read (#855).
+                                    let mut probe = probe;
+                                    let outcome = Box::pin(access_before_body(
+                                        http,
+                                        &mut probe,
+                                        &mut *url_scratch,
+                                        request_start,
+                                    ))
+                                    .await;
+                                    discard_body = matches!(outcome, AccessFirst::Answer(..));
+                                    access_first = Some(Box::new(outcome));
                                 }
                             }
                         }
@@ -4853,8 +4965,12 @@ pub(crate) async fn handle<S: ConnIo>(
                             epoch_secs,
                             epoch_ms
                         );
-                        let (mut response, mut process_meta) =
-                            phase::process_with_meta(http, &ctx, &mut *url_scratch);
+                        let (mut response, mut process_meta) = match access_first.take() {
+                            None => phase::process_with_meta(http, &ctx, &mut *url_scratch),
+                            Some(first) => {
+                                process_after_access(http, &ctx, &mut *url_scratch, *first)
+                            }
+                        };
                         if authority_mismatch {
                             authority_mismatch_log(&process_meta, &ctx);
                         }
