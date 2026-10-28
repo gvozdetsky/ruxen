@@ -1070,6 +1070,9 @@ fn prepare_cache_zones(paths: Vec<crate::config::ProxyCachePath>) -> Result<(), 
             inactive_secs: p.inactive_secs,
             max_size: p.max_size,
             min_free: p.min_free,
+            manager_files: p.manager_files,
+            manager_sleep_ms: p.manager_sleep_ms,
+            manager_threshold_ms: p.manager_threshold_ms,
         }));
     }
     CACHE_ZONES.with(|z| *z.borrow_mut() = zones);
