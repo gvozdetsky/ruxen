@@ -2975,6 +2975,7 @@ pub(crate) fn prepare_maps(
             value,
         } in regex
         {
+            let pattern = crate::config::pcre::translate(&pattern);
             regex_set_patterns.push(set_pattern(&pattern, case_insensitive));
             // Already validated at parse time; a failure here is a bug.
             let compiled = regex::bytes::RegexBuilder::new(&pattern)
@@ -4179,6 +4180,7 @@ pub(crate) fn build_regex_location(
     // The parser already validated this with the same flags + the same
     // `regex::bytes` builder; rebuild here because the compiled `Regex`
     // doesn't survive the AST.
+    let pattern = crate::config::pcre::translate(&pattern).into_owned();
     let regex = regex::bytes::RegexBuilder::new(&pattern)
         .case_insensitive(case_insensitive)
         .build()
@@ -4446,7 +4448,7 @@ pub(crate) fn prepare_gzip(
         match d.as_str() {
             "msie6" => disable_msie6 = true,
             "degradation" => {}
-            _ => patterns.push(format!("(?i){d}")),
+            _ => patterns.push(format!("(?i){}", crate::config::pcre::translate(&d))),
         }
     }
     let disable = if patterns.is_empty() {
