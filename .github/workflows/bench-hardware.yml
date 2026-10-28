@@ -12,9 +12,6 @@ on:
       pairs:
         description: Pairs per scenario (even)
         default: "6"
-  # TEMPORARY (development, removed before review)
-  pull_request:
-    paths: [.github/workflows/bench-hardware.yml]
 
 defaults:
   run:
@@ -24,8 +21,8 @@ defaults:
 env:
   CARGO_TERM_COLOR: always
   NGINX_VERSION: 1.30.6
-  SCENARIOS: ${{ inputs.scenarios || 'm1_hello m3_static_1k static_8k m5_conditional_304 m1_no_keepalive proxy_hello tls_hello' }}
-  PAIRS: ${{ inputs.pairs || '6' }}
+  SCENARIOS: ${{ inputs.scenarios }}
+  PAIRS: ${{ inputs.pairs }}
 
 jobs:
   bench:
@@ -76,10 +73,6 @@ jobs:
         run: |
           cargo build --release --locked
           echo "$HOME/nginx/sbin" >> "$GITHUB_PATH"
-      - name: Tests (TEMPORARY, portability check)
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        run: cargo test --release --locked 2>&1 | tail -80
       - name: System and driver
         # RUXEN_DRIVER=io_uring refuses to start without io_uring; pair.sh
         # runs ruxen on the automatic choice, which is then io_uring.
