@@ -162,12 +162,15 @@ impl RenderCtx<'_> {
                 {
                     return;
                 }
-                let path = crate::fs_resolve::request_filename(doc_root, self.uri);
+                let root = doc_root.path_for(self);
+                let path = crate::fs_resolve::request_filename(doc_root, &root, self.uri);
                 out.extend_from_slice(path.as_os_str().as_bytes());
             }
-            Variable::DocumentRoot => out.extend_from_slice(doc_root.path.as_os_str().as_bytes()),
+            Variable::DocumentRoot => {
+                out.extend_from_slice(doc_root.path_for(self).as_os_str().as_bytes())
+            }
             _ => {
-                if let Ok(real) = doc_root.path.canonicalize() {
+                if let Ok(real) = doc_root.path_for(self).canonicalize() {
                     out.extend_from_slice(real.as_os_str().as_bytes());
                 }
             }
@@ -191,7 +194,9 @@ impl RenderCtx<'_> {
     pub(crate) fn write_var(&self, var: &Variable, out: &mut Vec<u8>) {
         match var {
             Variable::Uri => out.extend_from_slice(self.uri),
-            Variable::RequestUri => out.extend_from_slice(self.request_uri),
+            Variable::RequestUri => {
+                out.extend_from_slice(phase::request_uri(self.request_uri, self.request_line))
+            }
             Variable::RequestMethod => out.extend_from_slice(self.request_method),
             Variable::Request => out.extend_from_slice(self.request_line),
             Variable::ProxyProtocolAddr
@@ -1165,12 +1170,10 @@ fn json_escape_into(value: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Render parts for the args side of a rewrite replacement. Numbered
-/// regex captures (`$1`..`$9`) get arg-escaped (nginx's `NGX_ESCAPE_ARGS`),
-/// since they were captured from the decoded URI and may contain bytes
-/// that need percent-encoding to be safe in args context (e.g. `%`).
-/// Literals and other variables pass through unchanged — nginx applies
-/// the escape only to capture variables in this context.
+/// Render a rewrite replacement with its numbered captures (`$1`..`$9`,
+/// from the decoded URI) escaped as nginx's `NGX_ESCAPE_ARGS`; literals
+/// and other variables pass through. When nginx escapes at all is the
+/// caller's (`execute_rewrite_ops`).
 pub(crate) fn render_parts_with_arg_escape(
     parts: &[PreparedValuePart],
     ctx: &RenderCtx<'_>,
@@ -1189,19 +1192,12 @@ pub(crate) fn render_parts_with_arg_escape(
     }
 }
 
-/// nginx's `ngx_escape_uri(... NGX_ESCAPE_ARGS)`: percent-encode bytes
-/// that aren't safe inside a URL query string. Conservative: covers
-/// control bytes, high bytes, space, and the args-meta characters
-/// (`#`, `%`, `&`, `+`, `?`) plus a handful of non-args-safe ASCII
-/// punctuation.
+/// nginx's `ngx_escape_uri(… NGX_ESCAPE_ARGS)` (ngx_string.c, `args`):
+/// control bytes, space, DEL and above, and ``"#%&+;<>?\^`{|}``.
 pub(crate) fn escape_args_into(input: &[u8], out: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in input {
-        let escape = !(0x21..0x7f).contains(&b)
-            || matches!(
-                b,
-                b'"' | b'#' | b'%' | b'&' | b'+' | b'<' | b'>' | b'?' | b'`'
-            );
+        let escape = !(0x21..0x7f).contains(&b) || b"\"#%&+;<>?\\^`{|}".contains(&b);
         if escape {
             out.push(b'%');
             out.push(HEX[(b >> 4) as usize]);
