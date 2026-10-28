@@ -13,6 +13,7 @@ mod auth;
 mod autoindex;
 mod client_verify;
 mod config;
+mod duplex;
 mod file;
 mod fs_resolve;
 mod http;
@@ -47,7 +48,19 @@ pub mod fuzzing {
     pub fn parse_request(data: &[u8]) -> Option<Result<usize, ()>> {
         let mut st = crate::http::ParseState::default();
         match crate::http::parse_request(data, &mut st) {
-            crate::http::Parse::Complete(req) => Some(Ok(req.consumed)),
+            crate::http::Parse::Complete(req) => {
+                // `$request_uri`: the path, and a `#fragment` from the line.
+                if !req.implicit_path {
+                    let path = &data[req.path_start..req.path_end];
+                    let line = &data[req.method_start..req.headers_start];
+                    let line = line.strip_suffix(b"\n").unwrap_or(line);
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    let uri = crate::phase::unparsed_uri(path, line);
+                    assert!(uri.starts_with(path) && !uri.contains(&b' '));
+                    assert!(uri.len() == path.len() || uri[path.len()] == b'#');
+                }
+                Some(Ok(req.consumed))
+            }
             crate::http::Parse::Incomplete => None,
             _ => {
                 // The log line for a refused request is found again from
