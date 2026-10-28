@@ -528,3 +528,55 @@ fn m100_the_access_phase_answers_before_the_body() {
     let out = refused("/req/", "");
     assert!(out.starts_with("HTTP/1.1 503 "), "{out}");
 }
+
+/// A chunked body with bad framing is the location's to answer, as nginx
+/// reads or discards it there (#806): a static file's 405 and an
+/// auth_basic 401 come first; otherwise the 400 carries the location's
+/// `add_header … always`. The connection closes after it.
+#[test]
+fn m100_a_bad_chunked_body_is_answered_by_the_location() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with("badchunk", |dir, _| {
+        let html = dir.join("html");
+        std::fs::create_dir_all(&html).unwrap();
+        std::fs::write(html.join("f.txt"), "file").unwrap();
+        let users = dir.join("htpasswd");
+        std::fs::write(&users, "u:{PLAIN}p\n").unwrap();
+        format!(
+            "location / {{ add_header X-Loc l always; return 200 \"ok\\n\"; }}\n\
+             location /s/ {{ alias {html}/; }}\n\
+             location /b/ {{ auth_basic x; auth_basic_user_file {users};\n\
+             proxy_pass http://127.0.0.1:{upstream}; }}\n\
+             location /p/ {{ add_header X-P p always;\n\
+             proxy_pass http://127.0.0.1:{upstream}; }}",
+            html = html.display(),
+            users = users.display()
+        )
+    });
+    let ask = |target: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(
+            format!(
+                "POST {target} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                 zz\r\nhello\r\n0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+    let out = ask("/");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    assert!(out.contains("\r\nX-Loc: l\r\n"), "{out}");
+    assert!(out.contains("\r\nConnection: close\r\n"), "{out}");
+    let out = ask("/s/f.txt");
+    assert!(out.starts_with("HTTP/1.1 405 "), "{out}");
+    let out = ask("/b/");
+    assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+    let out = ask("/p/");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    assert!(out.contains("\r\nX-P: p\r\n"), "{out}");
+}
