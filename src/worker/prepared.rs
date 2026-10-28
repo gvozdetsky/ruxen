@@ -644,7 +644,7 @@ pub enum PreparedHandler {
     /// for one with text (other than a redirect URL), which nginx's
     /// `ngx_http_script_return_code` sends as it is (#372).
     Return(PreparedReturn, bool),
-    Root(PreparedRoot),
+    Root(PreparedRoot<'static>),
     Proxy(PreparedProxy),
     /// `stub_status` (#96).
     StubStatus,
@@ -1292,8 +1292,11 @@ impl PreparedTypes {
     }
 }
 
-pub struct PreparedRoot {
-    pub root: &'static Path,
+/// `'a` is `'static` but for a root rendered per request (`template`),
+/// which `fs_resolve` copies with the rendered path.
+#[derive(Clone, Copy)]
+pub struct PreparedRoot<'a> {
+    pub root: &'a Path,
     /// `types {}` / `default_type` (#38).
     pub types: &'static PreparedTypes,
     /// Open dirfd for the canonicalized root, or -1 if it didn't exist at
@@ -1302,8 +1305,12 @@ pub struct PreparedRoot {
     /// enforces symlink-escape containment in a single syscall — replaces
     /// the old stat + canonicalize + `starts_with` guard. Opened at prepare
     /// time if possible, else on first use; leaked for process lifetime
-    /// (closed at exit only).
+    /// (closed at exit only). In a rendered copy, the fd opened for the
+    /// request, or `-1 - errno` when that failed.
     pub root_fd: std::os::unix::io::RawFd,
+    /// `root` / `alias` with variables (#232): rendered per request, and
+    /// `root` is then the path as written.
+    pub template: Option<&'static RootTemplate>,
     /// Effective `disable_symlinks` (`fs_resolve::open_and_stat`).
     pub symlinks: PreparedSymlinks,
     /// `root` appends the whole URI.
@@ -1343,6 +1350,58 @@ pub struct DocRoot {
     pub charset: Option<&'static PreparedCharset>,
     /// The location's `disable_symlinks`, for `if -f` and the like.
     pub symlinks: PreparedSymlinks,
+    /// `path` with variables (#232), rendered per request (`path_for`).
+    pub template: Option<&'static RootTemplate>,
+}
+
+impl DocRoot {
+    /// The root or alias path for this request, as nginx's
+    /// ngx_http_variable_document_root.
+    #[inline]
+    pub(crate) fn path_for(&self, ctx: &RenderCtx<'_>) -> std::borrow::Cow<'static, Path> {
+        match self.template {
+            None => std::borrow::Cow::Borrowed(self.path),
+            Some(t) => std::borrow::Cow::Owned(t.render(ctx)),
+        }
+    }
+}
+
+/// A `root` or `alias` with variables (#232), nginx's `root_lengths` /
+/// `root_values`.
+#[derive(Debug)]
+pub struct RootTemplate {
+    pub parts: &'static [PreparedValuePart],
+    /// For a path that starts with a variable: the prefix a relative
+    /// result is taken under (ngx_get_full_name). Otherwise a relative
+    /// path got it at startup.
+    pub prefix: Option<&'static Path>,
+    /// A literal part has `..`, so one in the result may be the config's.
+    pub literal_dot_dot: bool,
+}
+
+impl RootTemplate {
+    #[cold]
+    pub(crate) fn render(&self, ctx: &RenderCtx<'_>) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = Vec::with_capacity(64);
+        render_parts(self.parts, ctx, &mut out);
+        let path = Path::new(std::ffi::OsStr::from_bytes(&out));
+        match self.prefix {
+            Some(prefix) if path.is_relative() => prefix.join(path),
+            _ => path.to_path_buf(),
+        }
+    }
+
+    /// A rendered path ruxen won't open: a NUL, which nginx's C string
+    /// would cut the path at, or a `..` component a variable brought in.
+    /// nginx follows such a `..`; ruxen refuses it, as it refuses one that
+    /// climbs out of a root (`fs_resolve::open_and_stat`).
+    pub(crate) fn is_unsafe(&self, path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        bytes.contains(&0)
+            || (!self.literal_dot_dot && bytes.split(|&b| b == b'/').any(|c| c == b".."))
+    }
 }
 
 /// Effective `disable_symlinks` of a location.
@@ -1416,14 +1475,14 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-impl PreparedRoot {
+impl PreparedRoot<'_> {
     /// The root's dirfd. Opened at startup when the path existed (before
     /// the workers split their fd tables, so it's valid everywhere);
     /// otherwise opened on first use in each worker and kept there, so it
     /// works once the directory appears, as with nginx. Until then this is
     /// the open error (a 404 for ENOENT).
     pub fn fd(&self) -> std::io::Result<std::os::unix::io::RawFd> {
-        if self.root_fd != -1 {
+        if self.root_fd >= 0 {
             return Ok(self.root_fd);
         }
         self.lazy_fd()
@@ -1431,6 +1490,10 @@ impl PreparedRoot {
 
     #[cold]
     fn lazy_fd(&self) -> std::io::Result<std::os::unix::io::RawFd> {
+        if self.root_fd < -1 {
+            // A rendered root that didn't open.
+            return Err(std::io::Error::from_raw_os_error(-1 - self.root_fd));
+        }
         let key = self as *const PreparedRoot as usize;
         LAZY_ROOT_FDS.with(|fds| {
             if let Some(&(_, fd)) = fds.borrow().iter().find(|(k, _)| *k == key) {

@@ -257,15 +257,15 @@ async fn write_access_line_by_path(
     ctx: &RenderCtx<'_>,
     line: Vec<u8>,
 ) {
-    if let Some(root) = doc_root
-        && let Err(e) = std::fs::metadata(root.path)
+    if let Some(root) = doc_root.map(|d| d.path_for(ctx))
+        && let Err(e) = std::fs::metadata(&root)
     {
         write_worker_log(
             error_logs,
             ErrorLogLevel::Error,
             &format!(
                 "testing \"{}\" existence failed ({}) while logging request",
-                root.path.display(),
+                root.display(),
                 errno_text(&e)
             ),
         );

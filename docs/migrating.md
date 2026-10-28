@@ -70,24 +70,6 @@ directive of these modules (`fastcgi_param` from `fastcgi_params`, …).
   part. Both can read the same `include` files.
 - **Issue:** none; out of scope for now ([`ROADMAP.md`](../ROADMAP.md)).
 
-### `root` or `alias` with variables
-
-`root /var/www/$host;`, `alias /srv/$1;`.
-
-- **ruxen:** refuses them. Taken literally, the path would point at a
-  directory named `$host` and serve other files than nginx serves.
-- **Do:** a literal `root` and `try_files` with the variable:
-  ```nginx
-  root /var/www;
-  location / {
-      try_files /$host$uri /$host$uri/index.html =404;
-  }
-  ```
-  ruxen refuses a `Host` with `/`, `..` or a leading `.` (400), as nginx
-  does, so `$host` can't leave the root. For `alias` with captures, one
-  `location` per directory with a literal `alias`.
-- **Issue:** [#232] (open).
-
 ### `grpc_pass`
 
 - **ruxen:** no gRPC proxying: it needs HTTP/2 to the upstream and
@@ -468,7 +450,6 @@ start without it.
 
 [#36]: https://github.com/gvozdetsky/ruxen/issues/36
 [#134]: https://github.com/gvozdetsky/ruxen/issues/134
-[#232]: https://github.com/gvozdetsky/ruxen/issues/232
 [#337]: https://github.com/gvozdetsky/ruxen/issues/337
 [#463]: https://github.com/gvozdetsky/ruxen/issues/463
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
