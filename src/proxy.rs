@@ -400,7 +400,7 @@ async fn write_request_parts(
 
 /// A request body this large goes to the upstream with `send_parts_now`;
 /// smaller requests are cheaper batched in the ring (a syscall each cost
-/// `proxy_hello` 0.9%).
+/// `proxy_hello` 0.5–0.9%).
 const SEND_NOW_FROM: usize = 16 * 1024;
 
 /// `write_request_parts` on plain TCP under io_uring: `sendmsg` now, while
