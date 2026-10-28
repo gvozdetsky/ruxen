@@ -3133,7 +3133,7 @@ fn conditional_fresh(plan: &ProxyPlan, cache: &CachePlan, resp: &mut Response) {
 /// The cached head as the not-modified filter sends a 304: without
 /// `Content-Type`, `Content-Length` and `Accept-Ranges`
 /// (ngx_http_not_modified_header_filter clears them).
-fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
+pub(crate) fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(head.len());
     out.extend_from_slice(
         format!("HTTP/1.1 {status} {}", crate::http::reason_phrase(status)).as_bytes(),

@@ -950,6 +950,13 @@ fn process_with_meta_inner(
             {
                 // Answered before any location: the server's error_page,
                 // add_header and logs, and the realip address.
+                let mut response = response;
+                crate::worker::generated_preconditions(
+                    &mut response,
+                    req,
+                    error_page_status,
+                    server.server_header,
+                );
                 let (response, mut refused) = refuse(
                     http,
                     req,
