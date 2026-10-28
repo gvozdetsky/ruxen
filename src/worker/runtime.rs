@@ -1346,8 +1346,7 @@ fn read_file_body(
     body: phase::FileBody,
     ctx: &phase::RequestCtx<'_>,
 ) -> Response {
-    use std::os::fd::AsRawFd;
-    match crate::file::read_at_into(body.fd.as_raw_fd(), body.offset, body.len, &mut head) {
+    match crate::file::read_body_into(&body, &mut head) {
         Ok(()) => Response::Owned(head),
         Err(_) => internal_error_response(ctx.method),
     }
@@ -5399,7 +5398,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             {
                                 let body = file_body.take().expect("checked is_some");
                                 if let Err(n) = send_head_and_file(
-                                    &*stream,
+                                    stream,
                                     &mut sock_nonblocking,
                                     scratch,
                                     body,

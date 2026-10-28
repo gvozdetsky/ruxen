@@ -388,6 +388,11 @@ pub(crate) fn filter(
             Some(out) => (Response::Owned(out), None),
             None => (Response::Owned(bytes), None),
         },
+        // Multipart parts (a 206, or a status `error_page` set): never
+        // compressed, as nginx's range filter runs after gzip.
+        Response::File { headers, body } if body.parts.is_some() => {
+            (Response::File { headers, body }, None)
+        }
         Response::File { headers, body } => {
             let Some(head) = parse_head(&headers) else {
                 return (Response::File { headers, body }, None);
@@ -490,6 +495,7 @@ fn compress_file(
             fd: file.into(),
             offset: body.offset,
             len: body.len,
+            parts: None,
         })
     };
     BUFFER_POOL.with(|p| {

@@ -568,6 +568,18 @@ pub struct FileBody {
     pub fd: OwnedFd,
     pub offset: u64,
     pub len: u64,
+    /// A multipart/byteranges body (#414): `len` counts the parts'
+    /// headers and the closing boundary too, `offset` is unused.
+    pub parts: Option<Box<FileParts>>,
+}
+
+/// The parts of a multipart/byteranges body sent from its file, as
+/// nginx's range filter chains them (ngx_http_range_multipart_body).
+pub struct FileParts {
+    /// Each part's header, and its range of the file: offset, length.
+    pub parts: Vec<(Vec<u8>, u64, u64)>,
+    /// The closing boundary.
+    pub trailer: Vec<u8>,
 }
 
 /// Status handling requested by `error_page` after an internal redirect.

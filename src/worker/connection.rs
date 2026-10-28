@@ -530,7 +530,7 @@ const SENDFILE_MAX_CHUNK: usize = 2 * 1024 * 1024;
 /// `Content-Length` already promised, with the bytes that went out (head
 /// and file); the caller logs the request and drops the connection.
 pub(crate) async fn send_head_and_file<S: ConnIo>(
-    stream: &S,
+    stream: &mut S,
     nonblocking: &mut bool,
     head: &[u8],
     body: phase::FileBody,
@@ -538,6 +538,17 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
     send_timeout: Duration,
 ) -> Result<(), u64> {
     use std::os::unix::io::AsRawFd;
+    if body.parts.is_some() {
+        return Box::pin(send_head_and_parts(
+            stream,
+            nonblocking,
+            head,
+            body,
+            timer,
+            send_timeout,
+        ))
+        .await;
+    }
     let Some(sock) = stream.sendfile_fd() else {
         return Err(0);
     };
@@ -610,6 +621,56 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
         }
     }
     Ok(())
+}
+
+/// `send_head_and_file` for a multipart body (#414): each part's header
+/// and range as one head and file, the response head before the first,
+/// then the closing boundary, sent without `MSG_MORE` so it isn't held.
+/// Each part gets a `dup` of the fd, which `send_head_and_file` closes.
+#[cold]
+async fn send_head_and_parts<S: ConnIo>(
+    stream: &mut S,
+    nonblocking: &mut bool,
+    head: &[u8],
+    body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+) -> Result<(), u64> {
+    let phase::FileParts { parts, trailer } = *body.parts.expect("multipart body");
+    let mut sent = 0u64;
+    let mut first = Some(head);
+    for (part, offset, len) in parts {
+        let lead = match first.take() {
+            Some(head) => [head, &part].concat(),
+            None => part,
+        };
+        let fd = body.fd.try_clone().map_err(|_| sent)?;
+        let range = phase::FileBody {
+            fd,
+            offset,
+            len,
+            parts: None,
+        };
+        send_head_and_file(
+            stream,
+            nonblocking,
+            &lead,
+            range,
+            timer.as_mut(),
+            send_timeout,
+        )
+        .await
+        .map_err(|n| sent + n)?;
+        sent += lead.len() as u64 + len;
+    }
+    let len = trailer.len();
+    match write_all_now(stream, trailer, len, timer, send_timeout)
+        .await
+        .0
+    {
+        Ok(()) => Ok(()),
+        Err(n) => Err(sent + n as u64),
+    }
 }
 
 /// A connection's long-lived timers. monoio extends a registered timer
@@ -980,6 +1041,9 @@ pub(crate) async fn stream_file<S: ConnIo>(
     send_timeout: Duration,
     mut pacer: Option<&mut Pacer>,
 ) -> Result<(), u64> {
+    if body.parts.is_some() {
+        return Box::pin(stream_parts(stream, body, timer, send_timeout, pacer)).await;
+    }
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
     // duplicating the fd. Dropping `file` at the end closes the fd.
@@ -1028,6 +1092,62 @@ pub(crate) async fn stream_file<S: ConnIo>(
             return Err(body.len - remaining + n as u64);
         }
         remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// `stream_file` for a multipart body (#414): each part's header, its
+/// range (through `stream_file`, on a `dup` of the fd), then the closing
+/// boundary.
+#[cold]
+async fn stream_parts<S: ConnIo>(
+    stream: &mut S,
+    body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+    mut pacer: Option<&mut Pacer>,
+) -> Result<(), u64> {
+    let phase::FileParts { parts, trailer } = *body.parts.expect("multipart body");
+    let mut sent = 0u64;
+    let pieces = parts
+        .into_iter()
+        .map(|(part, offset, len)| (part, Some((offset, len))))
+        .chain(std::iter::once((trailer, None)));
+    for (bytes, range) in pieces {
+        let n = bytes.len();
+        let res = match pacer.as_deref_mut() {
+            Some(pacer) => {
+                write_all_paced(stream, bytes, n, pacer, timer.as_mut(), send_timeout)
+                    .await
+                    .0
+            }
+            None => {
+                write_all_now(stream, bytes, n, timer.as_mut(), send_timeout)
+                    .await
+                    .0
+            }
+        };
+        res.map_err(|k| sent + k as u64)?;
+        sent += n as u64;
+        let Some((offset, len)) = range else {
+            continue;
+        };
+        let range = phase::FileBody {
+            fd: body.fd.try_clone().map_err(|_| sent)?,
+            offset,
+            len,
+            parts: None,
+        };
+        stream_file(
+            stream,
+            range,
+            timer.as_mut(),
+            send_timeout,
+            pacer.as_deref_mut(),
+        )
+        .await
+        .map_err(|k| sent + k)?;
+        sent += len;
     }
     Ok(())
 }
