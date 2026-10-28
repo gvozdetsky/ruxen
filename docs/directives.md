@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 190 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 281 unknown.
+Of 564 directives: 193 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 278 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -615,9 +615,9 @@ Not supported: `slice`.
 | `ssl_session_ticket_key` | yes | http, server |  |
 | `ssl_session_timeout` | yes | http, server |  |
 | `ssl_crl` | yes | http, server |  |
-| `ssl_ocsp` | no |  |  |
-| `ssl_ocsp_responder` | no |  |  |
-| `ssl_ocsp_cache` | no |  |  |
+| `ssl_ocsp` | yes | http, server |  |
+| `ssl_ocsp_responder` | yes | http, server |  |
+| `ssl_ocsp_cache` | yes | http, server |  |
 | `ssl_stapling` | yes | http, server |  |
 | `ssl_stapling_file` | yes | http, server |  |
 | `ssl_stapling_responder` | yes | http, server |  |

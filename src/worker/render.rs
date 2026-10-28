@@ -349,6 +349,14 @@ impl RenderCtx<'_> {
                         out.extend_from_slice(b"FAILED:");
                         out.extend_from_slice(text.as_bytes());
                     }
+                    Some(ClientVerify::Revoked(text)) => {
+                        out.extend_from_slice(b"FAILED:");
+                        out.extend_from_slice(text.as_bytes());
+                    }
+                    Some(ClientVerify::OcspPending(_)) => {
+                        out.extend_from_slice(b"FAILED:");
+                        out.extend_from_slice(crate::ocsp::REQUEST_FAILED.as_bytes());
+                    }
                 }
             }
             // The client certificate, printed as nginx prints it (#114).
