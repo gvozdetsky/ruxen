@@ -775,6 +775,91 @@ fn read_queued<S: ConnIo>(
     }
 }
 
+/// A connection's active session (#467): its future in a block this worker
+/// reuses, built in place. Moving a future copies all of its size (8 KiB),
+/// where building it in place writes only its captures; a fresh 8 KiB,
+/// 128-byte aligned allocation per request cost glibc ~280 instructions.
+struct Session<F> {
+    ptr: std::ptr::NonNull<F>,
+    // Drops an `F` (drop check).
+    _owns: std::marker::PhantomData<F>,
+}
+
+/// Session blocks freed on this worker, for the next sessions.
+struct SessionBlocks(Vec<(std::alloc::Layout, std::ptr::NonNull<u8>)>);
+
+impl Drop for SessionBlocks {
+    fn drop(&mut self) {
+        for (layout, ptr) in self.0.drain(..) {
+            // SAFETY: allocated with this layout by `session`.
+            unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+thread_local! {
+    static SESSION_BLOCKS: RefCell<SessionBlocks> = const { RefCell::new(SessionBlocks(Vec::new())) };
+}
+
+/// Blocks kept per worker: as many sessions as are usually active at once.
+const SESSION_BLOCKS_KEPT: usize = 16;
+
+#[inline(always)]
+fn session<F>(make: impl FnOnce() -> F) -> Session<F> {
+    let layout = std::alloc::Layout::new::<F>();
+    assert!(layout.size() > 0);
+    let block = SESSION_BLOCKS.with(|blocks| {
+        let blocks = &mut blocks.borrow_mut().0;
+        let i = blocks.iter().rposition(|(l, _)| *l == layout)?;
+        Some(blocks.swap_remove(i).1)
+    });
+    let ptr = block.unwrap_or_else(|| {
+        // SAFETY: a non-zero size.
+        let p = unsafe { std::alloc::alloc(layout) };
+        std::ptr::NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+    });
+    let ptr = ptr.cast::<F>();
+    // SAFETY: a block of `F`'s layout, which nothing else uses.
+    unsafe { ptr.as_ptr().write(make()) };
+    Session {
+        ptr,
+        _owns: std::marker::PhantomData,
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for Session<F> {
+    type Output = F::Output;
+
+    #[inline(always)]
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // SAFETY: the future stays in its block until dropped there.
+        unsafe { std::pin::Pin::new_unchecked(&mut *self.ptr.as_ptr()) }.poll(cx)
+    }
+}
+
+impl<F> Drop for Session<F> {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::new::<F>();
+        // SAFETY: written by `session`, dropped once, here.
+        unsafe { std::ptr::drop_in_place(self.ptr.as_ptr()) };
+        let block = self.ptr.cast::<u8>();
+        let kept = SESSION_BLOCKS
+            .try_with(|blocks| {
+                let blocks = &mut blocks.borrow_mut().0;
+                (blocks.len() < SESSION_BLOCKS_KEPT).then(|| blocks.push((layout, block)))
+            })
+            .ok()
+            .flatten();
+        if kept.is_none() {
+            // SAFETY: allocated with this layout.
+            unsafe { std::alloc::dealloc(block.as_ptr(), layout) };
+        }
+    }
+}
+
 /// A read returns its `Vec` with the length set to the bytes it holds
 /// (monoio's `IoBufMut::set_init` on a `Vec`), so after a 27-byte request
 /// `buf` was 27 bytes long, and the next, longer head on the connection
@@ -2150,6 +2235,7 @@ fn accel_redirect_reroute(target: Vec<u8>) -> phase::Reroute {
         preserved_location: None,
         preserved_www_authenticate: Vec::new(),
         closes: false,
+        named_from: None,
     }
 }
 
@@ -2299,6 +2385,7 @@ async fn run_post_action(
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
                 closes: false,
+                named_from: None,
             },
         )
     };
@@ -2981,6 +3068,7 @@ async fn run_auth_subrequest(
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
                 closes: false,
+                named_from: None,
             }
         });
     // `auth_request_set` reads the upstream's header (`$upstream_http_*`):
@@ -3738,6 +3826,8 @@ thread_local! {
 const CONN_BUFS_KEPT: usize = 64;
 /// A scratch buffer that grew past this (a large response) isn't kept.
 const CONN_SCRATCH_KEEP: usize = 64 * 1024;
+/// What an idle connection keeps of its scratch buffer: room for a head.
+const CONN_SCRATCH_IDLE: usize = 1024;
 
 impl ConnBufs {
     /// `size`: `client_header_buffer_size` (#467). An idle keep-alive
@@ -4941,19 +5031,10 @@ pub(crate) async fn handle<S: ConnIo>(
     state: &'static RuntimeState,
     connection_id: u64,
 ) {
-    // Mirrors nginx's keepalive_handler ↔ wait_request_handler dance: no
-    // read buffer is held while the connection is idle. On idle-to-active
-    // transition we PollAdd for readability (one io_uring SQE, no buffer),
-    // then allocate the 8 KiB read buffer when data is actually arriving.
-    //
-    // Outer loop = idle ↔ active cycle; inner loop = within an active
-    // session, read more / parse / write until the session drains back to
-    // empty (→ idle) or the request-line overflows the buffer (→ close).
-    let mut parse_state = ParseState {
-        h2: stream.h2(),
-        ..ParseState::default()
-    };
-
+    // Outer loop = idle ↔ active cycle: the keep-alive wait here, with only
+    // the connection's state; the active session (read more / parse / write
+    // until it drains back to empty, or closes) in its own allocation, as
+    // nginx keeps a request only while it is active (#467).
     // Per-connection counters surfaced via `$connection*` variables.
     // `connection_id` is assigned once in the accept loop. `request_count` tracks
     // requests on this connection *including* the one being processed —
@@ -5000,9 +5081,6 @@ pub(crate) async fn handle<S: ConnIo>(
         })),
         min: None,
     };
-    // When the current request's header must be complete; set on the first
-    // read for it, cleared once the request is handled.
-    let mut header_deadline: Option<monoio::time::Instant>;
     // Long-lived timers for this connection (see `ConnTimers`).
     let far = Duration::from_secs(3600);
     let mut timers = ConnTimers {
@@ -5024,9 +5102,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // Per-connection scratch buffers — allocated once and reused across
     // every request on this connection. `mem::take` during `write_all`
     // briefly leaves these empty, monoio returns the Vec after the I/O
-    // completes, and we restore it. `buf` lives outside `'idle: loop`
+    // completes, and we restore it. `buf` lives outside the idle loop
     // because non-pipelining clients (wrk, curl) drain `buf` after each
-    // response and `continue 'idle`, so a per-iteration alloc here was
+    // response and go idle, so a per-iteration alloc here was
     // showing up as ~3% memset / ~1% calloc in the proxy bench profile.
     // Taken from this worker's pool and given back when the connection
     // ends: a connection per request doesn't allocate (and zero) them each
@@ -5067,7 +5145,7 @@ pub(crate) async fn handle<S: ConnIo>(
     // stub_status / $connections_* (#96); inert unless the config reads them.
     let mut conn_stats = super::stats::ConnStats::new(http.stats);
 
-    'idle: loop {
+    loop {
         conn_stats.set(super::stats::Phase::Waiting);
         let (buf_ptr, buf_len) = (buf.as_ptr(), buf.len());
         let next = match std::mem::take(&mut body_read) {
@@ -5090,11 +5168,22 @@ pub(crate) async fn handle<S: ConnIo>(
                 next
             }
         };
-        let mut filled: usize = match next {
+        let filled: usize = match next {
             IdleRead::Close => return,
             IdleRead::Ready => 0,
             IdleRead::Read(n) => n,
         };
+        // The request's state lives in its own allocation, freed when the
+        // connection goes idle again: a keep-alive connection holds only
+        // this loop's, as nginx frees the request between requests (#467).
+        let active = session(|| async {
+            let mut filled = filled;
+            let mut parse_state = ParseState {
+                h2: stream.h2(),
+                ..ParseState::default()
+            };
+            // client_header_timeout / client_body_timeout / send_timeout.
+            let mut io_timer = timers.io.as_mut();
         restore_read_len(buf, buf_ptr, buf_len);
         conn_stats.set(super::stats::Phase::Reading);
         keepalive_idle = IdleLimits {
@@ -5104,7 +5193,9 @@ pub(crate) async fn handle<S: ConnIo>(
         // The header's time starts with its first bytes, as nginx's
         // client_header_timeout after the keep-alive read; the first
         // request's runs from the accept.
-        header_deadline = match first_head_due.take() {
+            // When the current request's header must be complete; set on the
+            // first read for it, cleared once the request is handled.
+            let mut header_deadline = match first_head_due.take() {
             Some(due) => Some(monoio::time::Instant::from_std(due)),
             None => (filled > 0).then(|| monoio::time::Instant::now() + timeouts.header),
         };
@@ -5129,7 +5220,7 @@ pub(crate) async fn handle<S: ConnIo>(
                 let slice = taken.slice_mut(filled..end);
                 let deadline = *header_deadline
                     .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
-                let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
+                    let read = with_deadline(io_timer.as_mut(), deadline, stream.read(slice));
                 // client_header_timeout: nginx closes without a response,
                 // and logs the request if it had begun (#509).
                 let Some((res, returned)) = read.await else {
@@ -5143,7 +5234,7 @@ pub(crate) async fn handle<S: ConnIo>(
                         )
                         .await;
                     }
-                    return;
+                        return false;
                 };
                 *buf = returned.into_inner();
                 restore_read_len(buf, buf_ptr, end);
@@ -5152,8 +5243,15 @@ pub(crate) async fn handle<S: ConnIo>(
                     // What a TLS stream couldn't decrypt or rustls refused
                     // (#595); plain TCP never says InvalidData.
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                        tls_read_failed(http, listen_index, connection_id, peer_addr, filled, &e);
-                        return;
+                            tls_read_failed(
+                                http,
+                                listen_index,
+                                connection_id,
+                                peer_addr,
+                                filled,
+                                &e,
+                            );
+                            return false;
                     }
                     res => {
                         if filled > read_start {
@@ -5170,7 +5268,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             )
                             .await;
                         }
-                        return;
+                            return false;
                     }
                 }
             }
@@ -5205,7 +5303,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     conn_log!(),
                                 )
                                 .await;
-                                return;
+                                    return false;
                             }
                             head_too_large(
                                 stream,
@@ -5216,13 +5314,14 @@ pub(crate) async fn handle<S: ConnIo>(
                                 conn_log!(),
                             )
                             .await;
-                            return;
+                                return false;
                         }
                         // `max_headers` (#584): only a block long enough
                         // to hold more lines is counted.
                         if req.headers_end - req.headers_start >= timeouts.max_headers_span
                             && too_many_header_lines(
-                                &buf[read_start + req.headers_start..read_start + req.headers_end],
+                                    &buf[read_start + req.headers_start
+                                        ..read_start + req.headers_end],
                                 timeouts
                                     .max_headers
                                     .saturating_add(stream.h2_synthetic_lines()),
@@ -5241,10 +5340,11 @@ pub(crate) async fn handle<S: ConnIo>(
                                     conn_log!(),
                                 )
                                 .await;
-                                return;
+                                    return false;
                             }
-                            many_header_lines(stream, &mut *scratch, http, head, conn_log!()).await;
-                            return;
+                                many_header_lines(stream, &mut *scratch, http, head, conn_log!())
+                                    .await;
+                                return false;
                         }
                         conn_stats.request();
                         let request_start = Instant::now();
@@ -5421,7 +5521,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // front of the raw `?args…` so the rest of the
                         // pipeline (URI normalization, `$args`,
                         // `$request_uri`) sees a conventional origin-form.
-                        let synthesized_path: Option<Vec<u8>> = req.absolute_query.map(|(s, e)| {
+                            let synthesized_path: Option<Vec<u8>> =
+                                req.absolute_query.map(|(s, e)| {
                             let mut v = Vec::with_capacity(1 + (e - s));
                             v.push(b'/');
                             v.extend_from_slice(&buf[base + s..base + e]);
@@ -5459,7 +5560,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         if conn.plain_http && refuse.is_none() {
                             refuse = Some(497);
                         }
-                        let headers_raw = &buf[base + req.headers_start..base + req.headers_end];
+                            let headers_raw =
+                                &buf[base + req.headers_start..base + req.headers_end];
                         let keep_alive = req.keep_alive && refuse.is_none();
                         // `as u64` saturates only at ~584k years of uptime;
                         // the explicit clamp would be unreachable.
@@ -5627,12 +5729,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                 stream,
                                 resp,
                                 len,
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                                 timeouts.send,
                             )
                             .await;
                             if res.is_err() {
-                                return;
+                                    return false;
                             }
                         }
                         // Request bodies stay in memory up to the location's
@@ -5677,7 +5779,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // read from the client by `pump`.
                         let mut body_feed: Option<crate::request_feed::BodyFeed> = None;
                         let mut pump: Option<Box<BodyPump>> = None;
-                        let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
+                            let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some()
+                            {
                             (0, 0)
                         } else if let Some(cl) = req.content_length {
                             'read: {
@@ -5694,14 +5797,19 @@ pub(crate) async fn handle<S: ConnIo>(
                                     if cl > take as u64 {
                                         let rest = stream.discard_queued(cl - take as u64);
                                         if rest > 0 {
-                                            pending_discard = Some(PendingDiscard::Length(rest));
+                                                pending_discard =
+                                                    Some(PendingDiscard::Length(rest));
                                         }
                                     }
                                     break 'read (take, cl);
                                 }
                                 if unbuffered.is_some()
                                     && cl > take as u64
-                                    && !BodyPump::rest_ready(stream, cl - take as u64, body_buffer)
+                                        && !BodyPump::rest_ready(
+                                            stream,
+                                            cl - take as u64,
+                                            body_buffer,
+                                        )
                                 {
                                     let (feed, rest) = BodyPump::length(
                                         &buf[body_start..body_start + take],
@@ -5712,7 +5820,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     break 'read (take, cl);
                                 }
                                 if !sink.extend(&buf[body_start..body_start + take]) {
-                                    return;
+                                        return false;
                                 }
                                 // Each read stops at the body's end so a
                                 // pipelined next request isn't consumed. A body
@@ -5734,12 +5842,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                                 cl,
                                                 body_buffer,
                                                 started,
-                                                timers.io.as_mut(),
+                                                    io_timer.as_mut(),
                                                 body_timeout,
                                             ))
                                             .await
                                             {
-                                                return;
+                                                    return false;
                                             }
                                             break;
                                         };
@@ -5750,17 +5858,19 @@ pub(crate) async fn handle<S: ConnIo>(
                                         let slice = mem.slice_mut(start..end);
                                         // client_body_timeout between reads.
                                         let Some((res, returned)) = with_timeout(
-                                            timers.io.as_mut(),
+                                                io_timer.as_mut(),
                                             body_timeout,
                                             stream.read_now(slice),
                                         )
                                         .await
                                         else {
-                                            return;
+                                                return false;
                                         };
                                         match res {
-                                            Ok(0) | Err(_) => return,
-                                            Ok(n) => sink.put_read_buf(returned.into_inner(), n),
+                                                Ok(0) | Err(_) => return false,
+                                                Ok(n) => {
+                                                    sink.put_read_buf(returned.into_inner(), n)
+                                                }
                                         }
                                     }
                                 }
@@ -5773,7 +5883,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             let body_start = base + req.consumed;
                             match Box::pin(chunked_in_buffer(
                                 &buf[body_start..filled],
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                             ))
                             .await
                             {
@@ -5795,7 +5905,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         conn_log!(),
                                     )
                                     .await;
-                                    return;
+                                        return false;
                                 }
                             }
                         } else if req.transfer_encoding_chunked
@@ -5805,7 +5915,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 &buf[base + req.consumed..filled],
                                 max_body,
                                 body_buffer,
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                             ))
                             .await
                         {
@@ -5821,7 +5931,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 initial,
                                 max_body,
                                 Some(&mut sink),
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                                 body_timeout,
                             )
                             .await
@@ -5851,7 +5961,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         conn_log!(),
                                     )
                                     .await;
-                                    return;
+                                        return false;
                                 }
                             }
                         } else {
@@ -5861,7 +5971,9 @@ pub(crate) async fn handle<S: ConnIo>(
                         // Over the limit: big enough for the location's check.
                         let body_len = if body_too_large {
                             request_body_len.max(max_body.saturating_add(1))
-                        } else if (discard_body || pump.is_some()) && req.content_length.is_some() {
+                            } else if (discard_body || pump.is_some())
+                                && req.content_length.is_some()
+                            {
                             request_body_len
                         } else {
                             sink.len()
@@ -5875,7 +5987,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             && sink.len() == 0
                             && !sink.spill()
                         {
-                            return;
+                                return false;
                         }
                         let (body_vec, spooled) = sink.finish();
                         // Shared, so a proxied request sends it from here
@@ -6002,19 +6114,20 @@ pub(crate) async fn handle<S: ConnIo>(
                         // The location's send_timeout for this response (#147);
                         // the next request's header waits use the default
                         // server's values again, as in nginx.
-                        let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
+                            let send_timeout =
+                                process_meta.timeouts.map_or(timeouts.send, |t| t.send);
                         if expect_continue
                             && discard_body
                             && !Box::pin(continue_first(
                                 stream,
                                 &response,
                                 continue_status,
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                                 send_timeout,
                             ))
                             .await
                         {
-                            return;
+                                return false;
                         }
                         // And on an HTTP/2 stream, its http2_chunk_size (#594).
                         if let Some(t) = process_meta.timeouts {
@@ -6040,7 +6153,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 stream,
                                 head,
                                 head_len,
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                                 timeouts.send,
                             )
                             .await;
@@ -6125,7 +6238,8 @@ pub(crate) async fn handle<S: ConnIo>(
                                 );
                             }
                             if !process_meta.access_logs.is_empty() {
-                                let request_time_us = request_start.elapsed().as_micros() as u64;
+                                    let request_time_us =
+                                        request_start.elapsed().as_micros() as u64;
                                 write_access_logs(
                                     process_meta.access_logs,
                                     path,
@@ -6158,7 +6272,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 )
                                 .await;
                             }
-                            return;
+                                return false;
                         }
 
                         // Defer the response write per `auth_delay`. We
@@ -6262,7 +6376,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 ))
                                 .await;
                             }
-                            return;
+                                return false;
                         }
 
                         // Funnel the response bytes into `scratch`. Owned and
@@ -6276,7 +6390,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         scratch.clear();
                         let mut prebuilt_base: Option<&'static [u8]> = None;
                         // An upstream body relayed after the head (#88).
-                        let mut proxy_body: Option<Box<crate::proxy_stream::ProxyStream>> = None;
+                            let mut proxy_body: Option<Box<crate::proxy_stream::ProxyStream>> =
+                                None;
                         let mut file_body: Option<phase::FileBody> = match response {
                             Response::Prebuilt(bytes) => {
                                 prebuilt_base = Some(bytes);
@@ -6324,13 +6439,13 @@ pub(crate) async fn handle<S: ConnIo>(
                             // worker means the loop terminated without a
                             // terminal outcome, which `process` already
                             // guards against with a 500. Defensive only.
-                            Response::Reroute(_) => return,
+                                Response::Reroute(_) => return false,
                             // The Proxy variant is consumed above by
                             // `run_proxy` before this match runs; reaching
                             // here is a logic bug.
-                            Response::Proxy(_) => return,
+                                Response::Proxy(_) => return false,
                             // Tunnelled above.
-                            Response::Upgrade(_) => return,
+                                Response::Upgrade(_) => return false,
                         };
                         // Single walk over the response header block replaces
                         // what used to be three separate scans. For static
@@ -6339,7 +6454,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         let mut scan = match prebuilt_base {
                             Some(bytes) => cached_scan_response_headers(bytes),
                             None => {
-                                let mut scan = scan_response_headers(scratch).unwrap_or_default();
+                                    let mut scan =
+                                        scan_response_headers(scratch).unwrap_or_default();
                                 if !process_meta.keep_upstream_date {
                                     stamp_date(&mut *scratch, &mut scan);
                                 }
@@ -6429,7 +6545,8 @@ pub(crate) async fn handle<S: ConnIo>(
                         // consumes the value — `$bytes_sent` and
                         // `$body_bytes_sent` need it after the write
                         // completes.
-                        let mut streamed_body_len = file_body.as_ref().map(|b| b.len).unwrap_or(0);
+                            let mut streamed_body_len =
+                                file_body.as_ref().map(|b| b.len).unwrap_or(0);
                         let response_for_logs: &[u8];
                         if let Some(base) = prebuilt_base {
                             let variant = cached_prebuilt_variant(
@@ -6452,7 +6569,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 stream,
                                 taken,
                                 len,
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                                 send_timeout,
                                 body_read,
                             )
@@ -6502,7 +6619,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     head,
                                     chunked_out,
                                     pacer,
-                                    timers.io.as_mut(),
+                                        io_timer.as_mut(),
                                     send_timeout,
                                 ))
                                 .await;
@@ -6533,7 +6650,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         &process_meta,
                                         final_uri(&process_meta, url_scratch),
                                         scratch,
-                                        timers.io.as_mut(),
+                                            io_timer.as_mut(),
                                         send_timeout,
                                     ))
                                     .await
@@ -6559,7 +6676,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         meta: &process_meta,
                                         uri: final_uri(&process_meta, url_scratch),
                                     },
-                                    timers.io.as_mut(),
+                                        io_timer.as_mut(),
                                     send_timeout,
                                     process_meta.aio,
                                 ))
@@ -6585,7 +6702,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     limit.rate,
                                     limit.after,
                                     request_start,
-                                    timers.io.as_mut(),
+                                        io_timer.as_mut(),
                                     send_timeout,
                                     process_meta.aio,
                                 ))
@@ -6605,7 +6722,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     &mut sock_nonblocking,
                                     scratch,
                                     body,
-                                    timers.io.as_mut(),
+                                        io_timer.as_mut(),
                                     send_timeout,
                                     process_meta.aio,
                                 )
@@ -6625,7 +6742,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     stream,
                                     taken,
                                     len,
-                                    timers.io.as_mut(),
+                                        io_timer.as_mut(),
                                     send_timeout,
                                     body_read,
                                 )
@@ -6647,7 +6764,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                             stream,
                                             body,
                                             gz,
-                                            timers.io.as_mut(),
+                                                io_timer.as_mut(),
                                             send_timeout,
                                             true,
                                             process_meta.aio,
@@ -6665,7 +6782,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         Err(body) => stream_file(
                                             stream,
                                             body,
-                                            timers.io.as_mut(),
+                                                io_timer.as_mut(),
                                             send_timeout,
                                             None,
                                             process_meta.aio,
@@ -6690,8 +6807,9 @@ pub(crate) async fn handle<S: ConnIo>(
                             super::metrics::response(
                                 process_meta.metrics_server,
                                 response_for_logs,
-                                cut_sent
-                                    .unwrap_or(response_for_logs.len() as u64 + streamed_body_len),
+                                    cut_sent.unwrap_or(
+                                        response_for_logs.len() as u64 + streamed_body_len,
+                                    ),
                             );
                         }
                         if !process_meta.access_logs.is_empty() {
@@ -6741,11 +6859,17 @@ pub(crate) async fn handle<S: ConnIo>(
                         }
 
                         if let Some(target) = process_meta.post_action {
-                            run_post_action(http, &ctx, target, request_start, &mut *url_scratch)
+                                run_post_action(
+                                    http,
+                                    &ctx,
+                                    target,
+                                    request_start,
+                                    &mut *url_scratch,
+                                )
                                 .await;
                         }
                         if cut_short {
-                            return;
+                                return false;
                         }
                         if let Some(rest) = pending_discard {
                             let Some(tail) = Box::pin(discard_after_response(
@@ -6754,11 +6878,11 @@ pub(crate) async fn handle<S: ConnIo>(
                                 &buf[..filled],
                                 close_after,
                                 &mut *scratch,
-                                timers.io.as_mut(),
+                                    io_timer.as_mut(),
                             ))
                             .await
                             else {
-                                return;
+                                    return false;
                             };
                             pipelined_tail = tail;
                         }
@@ -6777,7 +6901,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             if pipelined_tail.len() > buf.len() {
                                 if pipelined_tail.len() > READ_BUF {
                                     // Larger than READ_BUF: can't resume keep-alive.
-                                    return;
+                                        return false;
                                 }
                                 grow_read_buffer(buf);
                             }
@@ -6791,17 +6915,18 @@ pub(crate) async fn handle<S: ConnIo>(
                             // let it, so it gets the 413 (nginx's lingering
                             // close; not for 400s, as nginx).
                             Box::pin(lingering_close(stream, &mut *scratch)).await;
-                            return;
+                                return false;
                         }
                         if close_after {
-                            return;
+                                return false;
                         }
 
                         let keepalive = &process_meta.keepalive;
                         keepalive_idle = IdleLimits {
                             timeout: keepalive.idle_timeout_ms.map(Duration::from_millis),
-                            min: (keepalive.min_timeout_ms > 0)
-                                .then(|| Duration::from_millis(keepalive.min_timeout_ms.into())),
+                                min: (keepalive.min_timeout_ms > 0).then(|| {
+                                    Duration::from_millis(keepalive.min_timeout_ms.into())
+                                }),
                         };
                     }
                     Parse::Incomplete => break,
@@ -6824,7 +6949,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 conn_log!(),
                             )
                             .await;
-                            return;
+                                return false;
                         }
                         let bad_version = invalid_head_log(
                             http,
@@ -6862,7 +6987,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             conn_log!(),
                         )
                         .await;
-                        return;
+                            return false;
                     }
                 }
             }
@@ -6879,7 +7004,7 @@ pub(crate) async fn handle<S: ConnIo>(
                     // `READ_BUF` and come in one read (#467).
                     grow_read_buffer(buf);
                 }
-                continue 'idle;
+                    return true;
             }
 
             if filled == buf.len() {
@@ -6919,7 +7044,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             conn_log!(),
                         )
                         .await;
-                        return;
+                            return false;
                     }
                     head_too_large(
                         stream,
@@ -6930,12 +7055,21 @@ pub(crate) async fn handle<S: ConnIo>(
                         conn_log!(),
                     )
                     .await;
-                    return;
+                        return false;
                 }
                 buf.copy_within(read_start..filled, 0);
                 filled -= read_start;
                 read_start = 0;
             }
+        }
+        });
+        if !active.await {
+            return;
+        }
+        // Idle: a response buffer bigger than a head goes back to the worker's
+        // pool (an inline body grew it), as nginx frees the request's (#467).
+        if scratch.capacity() > CONN_SCRATCH_IDLE {
+            super::response::give_buf(std::mem::take(&mut *scratch));
         }
     }
 }
