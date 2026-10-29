@@ -7,7 +7,8 @@
 //! connection stays usable: keep-alive and a pipelined request after the
 //! body work, and `$request_length` still counts the whole body. A static
 //! file discards it too, as nginx's static module does, unless an `index`
-//! or `error_page` can take the request to something that reads it.
+//! or `error_page` can take the request to something that reads it. The
+//! access phase answers before the body is read too (#855).
 
 mod common;
 
@@ -36,6 +37,15 @@ fn start(name: &str) -> (Server, u16) {
 /// A server whose locations `locations` gives, from the temp dir and the
 /// port.
 fn start_with(name: &str, locations: impl FnOnce(&Path, u16) -> String) -> (Server, u16) {
+    start_with_http(name, "", locations)
+}
+
+/// As `start_with`, with `http` at the http level.
+fn start_with_http(
+    name: &str,
+    http: &str,
+    locations: impl FnOnce(&Path, u16) -> String,
+) -> (Server, u16) {
     let dir = std::env::temp_dir().join(format!("ruxen-m100-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -53,6 +63,7 @@ fn start_with(name: &str, locations: impl FnOnce(&Path, u16) -> String) -> (Serv
         format!(
             "events {{}}\nhttp {{\n\
              log_format len '$request_uri $request_length';\n\
+             {http}\n\
              server {{ listen 127.0.0.1:{port};\n\
              access_log {d}/access.log len;\n\
              client_max_body_size 10m;\n\
@@ -467,4 +478,78 @@ fn m100_unrouted_answers_and_try_files_come_before_the_body() {
         .unwrap();
     let out = responses(&mut s, 1);
     assert!(out[0].ends_with("| got 5 of 5"), "{out:?}");
+}
+
+/// The access phase answers before the body is read, as nginx's (#855):
+/// auth_basic, deny, auth_request, limit_req and limit_conn refuse at once
+/// and the body is dropped; a request they let through still sends its
+/// body upstream, counted once by the limits.
+#[test]
+fn m100_the_access_phase_answers_before_the_body() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with_http(
+        "access",
+        "limit_req_zone $binary_remote_addr zone=one:1m rate=1r/m;\n\
+         limit_conn_zone $binary_remote_addr zone=c:1m;",
+        |dir, _| {
+            let users = dir.join("htpasswd");
+            std::fs::write(&users, "u:{PLAIN}p\n").unwrap();
+            format!(
+                "location /basic/ {{ auth_basic x; auth_basic_user_file {users};\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /deny/ {{ deny all; proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /req/ {{ limit_req zone=one;\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /conn/ {{ limit_conn c 1;\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /sub/ {{ auth_request /auth;\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location = /auth {{ internal;\n\
+                 if ($http_x_ok) {{ return 204; }} return 401; }}",
+                users = users.display()
+            )
+        },
+    );
+    // Head only: the answer comes without the body.
+    let refused = |target: &str, extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(
+            format!("POST {target} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: 10\r\n\r\nabc")
+                .as_bytes(),
+        )
+        .unwrap();
+        responses(&mut s, 1).remove(0)
+    };
+    let through = |target: &str, extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(
+            format!("POST {target} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: 5\r\n\r\nhello")
+                .as_bytes(),
+        )
+        .unwrap();
+        responses(&mut s, 1).remove(0)
+    };
+    let auth = "Authorization: Basic dTpw\r\n";
+    let out = refused("/basic/", "");
+    assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+    let out = through("/basic/", auth);
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    let out = refused("/deny/", "");
+    assert!(out.starts_with("HTTP/1.1 403 "), "{out}");
+    let out = refused("/sub/", "");
+    assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+    let out = through("/sub/", "X-Ok: 1\r\n");
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    // limit_conn 1: the request holds its count while the body goes up,
+    // without counting itself twice.
+    let out = through("/conn/", "");
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    // One a minute: the first goes through, counted once; the next is
+    // refused at once.
+    let out = through("/req/", "");
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    let out = refused("/req/", "");
+    assert!(out.starts_with("HTTP/1.1 503 "), "{out}");
 }

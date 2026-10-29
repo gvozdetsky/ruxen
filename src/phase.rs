@@ -134,6 +134,93 @@ pub(crate) fn resume_auth_request(resume: Vec<(&'static [u8], AuthResume)>) {
     AUTH_RESUME.with(|r| *r.borrow_mut() = resume);
 }
 
+/// What the access phase noted on the pass before the body is read
+/// (#855), for the pass after it: limit_req and limit_conn don't count
+/// the request again.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BeforeBody {
+    pub limit_req_status: u8,
+    pub limit_conn_status: u8,
+}
+
+#[derive(Clone, Copy)]
+enum BeforeBodyPass {
+    Off,
+    /// The pass before the body: stop before a handler that may read it.
+    Probe,
+    /// It stopped there, with what the access phase noted.
+    Stopped(BeforeBody),
+    /// The pass after the read.
+    Resume(BeforeBody),
+}
+
+thread_local! {
+    static BEFORE_BODY: std::cell::Cell<BeforeBodyPass> =
+        const { std::cell::Cell::new(BeforeBodyPass::Off) };
+}
+
+/// The worker runs the access phase before reading a body, as nginx does
+/// (#855): the next `process` stops before a handler that may read it.
+pub(crate) fn probe_before_body() {
+    BEFORE_BODY.with(|b| b.set(BeforeBodyPass::Probe));
+}
+
+/// After that pass: `Some` when it stopped before such a handler (the
+/// body is to be read), `None` when its response is the answer.
+pub(crate) fn probe_result() -> Option<BeforeBody> {
+    match BEFORE_BODY.with(|b| b.replace(BeforeBodyPass::Off)) {
+        BeforeBodyPass::Stopped(noted) => Some(noted),
+        _ => None,
+    }
+}
+
+/// Around the pass after the read: what the one before noted.
+pub(crate) fn resume_before_body(noted: Option<BeforeBody>) {
+    BEFORE_BODY.with(|b| b.set(noted.map_or(BeforeBodyPass::Off, BeforeBodyPass::Resume)));
+}
+
+/// limit_req's and limit_conn's statuses from the pass before the body.
+pub(crate) fn before_body_noted() -> Option<BeforeBody> {
+    match BEFORE_BODY.with(|b| b.get()) {
+        BeforeBodyPass::Resume(noted) => Some(noted),
+        _ => None,
+    }
+}
+
+/// On the pass before the body, a handler that may read it ends the pass.
+/// A static file doesn't read it, nor does a `return` unless a variable
+/// reads it (#289): that answer stands.
+#[inline]
+fn stops_before(
+    http: &PreparedHttp,
+    handler: &crate::worker::PreparedHandler,
+    state: &RewriteState,
+) -> bool {
+    use crate::worker::PreparedHandler;
+    match handler {
+        PreparedHandler::Root(_) => false,
+        PreparedHandler::Return(..) if !http.uses_request_body && !http.uses_request_body_file => {
+            false
+        }
+        _ => stops_before_slow(state),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn stops_before_slow(state: &RewriteState) -> bool {
+    BEFORE_BODY.with(|b| match b.get() {
+        BeforeBodyPass::Probe => {
+            b.set(BeforeBodyPass::Stopped(BeforeBody {
+                limit_req_status: state.limit_req_status,
+                limit_conn_status: state.limit_conn_status,
+            }));
+            true
+        }
+        _ => false,
+    })
+}
+
 /// The body of a request that has none.
 pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
 
@@ -1433,6 +1520,9 @@ fn process_with_meta_inner(
             defer_handler_trailers(&mut loc, &mut meta);
         }
         let response = match denied {
+            None if stops_before(http, loc.handler, &rewrite_state) => {
+                return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+            }
             None => run_location_handler(
                 http,
                 server,
@@ -2295,6 +2385,9 @@ pub(crate) struct FirstBodyLimit {
     pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
+    /// The location has access checks (or rewrites that may lead to some):
+    /// they answer before the body is read, as nginx's access phase (#855).
+    pub access_first: bool,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -2374,6 +2467,13 @@ pub(crate) fn first_body_limit(
         discard: discards_body(http, server, &loc, url_scratch, true, &[]),
         continue_status: if expect { discard_continue(&loc) } else { None },
         body_timeout: loc.timeouts.body,
+        access_first: !loc.access.rules.is_empty()
+            || !matches!(loc.access.auth_basic, PreparedAuthBasic::Off)
+            || loc.access.auth_request.is_some()
+            || loc.limit_req.is_some()
+            || loc.limit_conn.is_some()
+            || loc.limit_except.is_some()
+            || !loc.rewrite_program.is_empty(),
     })
 }
 
@@ -2392,6 +2492,7 @@ fn unrouted_discard(server: &PreparedServer, continue_status: Option<u16>) -> Fi
         discard: true,
         continue_status,
         body_timeout: server.timeouts.body,
+        access_first: false,
     }
 }
 
