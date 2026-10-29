@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 205 implemented, 18 accepted with a difference, 68 accepted with no effect, 0 refused, 273 unknown.
+Of 564 directives: 213 implemented, 16 accepted with a difference, 62 accepted with no effect, 0 refused, 273 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -423,7 +423,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_cookie_flags` | yes | http, server, location |  |
 | `proxy_store` | accepted, differs | any | proxied responses are not stored |
 | `proxy_store_access` | accepted, no effect | any |  |
-| `proxy_buffering` | accepted, differs | any | ruxen relays a response as it arrives either way (#88, #463) |
+| `proxy_buffering` | yes | http, server, location |  |
 | `proxy_request_buffering` | yes | http, server, location |  |
 | `proxy_ignore_client_abort` | yes | http, server, location |  |
 | `proxy_bind` | yes | http, server, location |  |
@@ -440,10 +440,10 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_pass_request_headers` | yes | http, server, location |  |
 | `proxy_pass_request_body` | yes | http, server, location |  |
 | `proxy_pass_trailers` | yes | http, server, location |  |
-| `proxy_buffer_size` | accepted, no effect | any |  |
+| `proxy_buffer_size` | yes | http, server, location |  |
 | `proxy_read_timeout` | yes | http, server, location |  |
-| `proxy_buffers` | accepted, no effect | any |  |
-| `proxy_busy_buffers_size` | accepted, no effect | any |  |
+| `proxy_buffers` | yes | http, server, location |  |
+| `proxy_busy_buffers_size` | yes | http, server, location |  |
 | `proxy_force_ranges` | yes | http, server, location |  |
 | `proxy_limit_rate` | yes | http, server, location |  |
 | `proxy_cache` | yes | http, server, location |  |
@@ -462,9 +462,9 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_cache_revalidate` | yes | http, server, location |  |
 | `proxy_cache_convert_head` | yes | http, server, location |  |
 | `proxy_cache_background_update` | yes | http, server, location |  |
-| `proxy_temp_path` | accepted, no effect | any |  |
-| `proxy_max_temp_file_size` | accepted, no effect | any |  |
-| `proxy_temp_file_write_size` | accepted, no effect | any |  |
+| `proxy_temp_path` | yes | http, server, location |  |
+| `proxy_max_temp_file_size` | yes | http, server, location |  |
+| `proxy_temp_file_write_size` | yes | http, server, location |  |
 | `proxy_next_upstream` | yes | http, server, location |  |
 | `proxy_next_upstream_tries` | yes | http, server, location |  |
 | `proxy_next_upstream_timeout` | yes | http, server, location |  |

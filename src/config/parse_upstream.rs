@@ -1102,6 +1102,13 @@ impl ProxyConf {
         "proxy_ssl_certificate_cache",
         "resolver",
         "resolver_timeout",
+        "proxy_buffering",
+        "proxy_buffers",
+        "proxy_buffer_size",
+        "proxy_busy_buffers_size",
+        "proxy_temp_file_write_size",
+        "proxy_max_temp_file_size",
+        "proxy_temp_path",
     ];
 
     pub(crate) fn takes(name: &str) -> bool {
@@ -1480,6 +1487,69 @@ impl ProxyConf {
                 }
                 self.intercept_errors =
                     Some(parse_on_off_args(&args[1..], "proxy_intercept_errors")?);
+            }
+            "proxy_buffering" => {
+                if self.buffering.on.is_some() {
+                    return Err(Error::Duplicate("proxy_buffering"));
+                }
+                self.buffering.on = Some(parse_on_off_args(&args[1..], "proxy_buffering")?);
+            }
+            "proxy_buffers" => {
+                if self.buffering.buffers.is_some() {
+                    return Err(Error::Duplicate("proxy_buffers"));
+                }
+                // ngx_conf_set_bufs_slot: neither may be 0.
+                let [_, num, size] = args else {
+                    return Err(Error::MissingArg("proxy_buffers"));
+                };
+                let parsed = num
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .zip(super::parse_location::parse_size(size.as_bytes()).filter(|s| *s > 0));
+                let Some(bufs) = parsed else {
+                    return Err(Error::BadValue {
+                        what: "proxy_buffers",
+                        got: args[1..].join(" "),
+                    });
+                };
+                self.buffering.buffers = Some(bufs);
+            }
+            "proxy_buffer_size"
+            | "proxy_busy_buffers_size"
+            | "proxy_temp_file_write_size"
+            | "proxy_max_temp_file_size" => {
+                let b = &mut self.buffering;
+                let (slot, what) = match args[0].as_str() {
+                    "proxy_buffer_size" => (&mut b.buffer_size, "proxy_buffer_size"),
+                    "proxy_busy_buffers_size" => {
+                        (&mut b.busy_buffers_size, "proxy_busy_buffers_size")
+                    }
+                    "proxy_temp_file_write_size" => {
+                        (&mut b.temp_file_write_size, "proxy_temp_file_write_size")
+                    }
+                    _ => (&mut b.max_temp_file_size, "proxy_max_temp_file_size"),
+                };
+                if slot.is_some() {
+                    return Err(Error::Duplicate(what));
+                }
+                let [_, value] = args else {
+                    return Err(Error::MissingArg(what));
+                };
+                *slot = Some(
+                    super::parse_location::parse_size(value.as_bytes()).ok_or_else(|| {
+                        Error::BadValue {
+                            what,
+                            got: value.clone(),
+                        }
+                    })?,
+                );
+            }
+            "proxy_temp_path" => {
+                if self.temp_path.is_some() {
+                    return Err(Error::Duplicate("proxy_temp_path"));
+                }
+                self.temp_path = Some(parse_temp_path_args(&args[1..], "proxy_temp_path")?);
             }
             "proxy_force_ranges" => {
                 if self.force_ranges.is_some() {

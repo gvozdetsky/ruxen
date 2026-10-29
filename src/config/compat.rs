@@ -298,12 +298,6 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "not applied at this level (ruxen reads it in server and location only)",
         "chunked_transfer_encoding",
     ),
-    (
-        "proxy_buffering",
-        Some("on"),
-        "ruxen relays a response as it arrives either way (#88, #463)",
-        "proxy_buffering-off",
-    ),
     // `aio threads` is implemented and not a finding.
     (
         "aio",
@@ -686,7 +680,7 @@ mod tests {
     #[test]
     fn the_report_links_each_section_once() {
         let (found, _) = findings(
-            "http { server { location / { proxy_buffering off; fastcgi_pass x; \
+            "http { server { location / { proxy_store on; fastcgi_pass x; \
              uwsgi_pass y; } } }",
         );
         let out = report(
@@ -703,7 +697,7 @@ mod tests {
             links,
             [
                 format!("{GUIDE}#fastcgi-uwsgi-scgi-memcached"),
-                format!("{GUIDE}#proxy_buffering-off"),
+                format!("{GUIDE}#proxy_store"),
                 format!("{GUIDE}#variables-that-are-always-empty"),
             ],
             "{out}"

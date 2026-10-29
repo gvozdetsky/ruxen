@@ -7013,6 +7013,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         pacer,
                                         io_timer.as_mut(),
                                         send_timeout,
+                                        &http.body_temp,
                                     ))
                                     .await;
                                     *scratch = head;

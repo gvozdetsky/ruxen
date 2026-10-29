@@ -348,6 +348,14 @@ pub(crate) struct BodyTempDir {
     made: std::sync::atomic::AtomicBool,
 }
 
+impl std::fmt::Debug for BodyTempDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BodyTempDir")
+            .field(&self.configured)
+            .finish()
+    }
+}
+
 impl BodyTempDir {
     pub(crate) fn new(configured: Option<crate::config::TempPath>) -> Self {
         if let Some(t) = &configured {
@@ -511,6 +519,12 @@ fn new_body_file(temp: &BodyTempDir, persistent: bool) -> Option<SpilledBody> {
         }
     }
     None
+}
+
+/// A temp file in `temp` for a proxied body the client is slow to take
+/// (#764): unlinked at once, as `new_body_file` makes them.
+pub(crate) fn new_temp_file(temp: &BodyTempDir) -> Option<std::fs::File> {
+    new_body_file(temp, false).map(|body| body.file)
 }
 
 /// A request body in a temp file. The file stays open: the proxy reads the

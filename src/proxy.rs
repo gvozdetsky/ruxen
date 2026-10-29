@@ -1888,7 +1888,7 @@ pub fn finish_answer(states: &mut [UpstreamState]) {
     }
 }
 
-/// Record an upstream `X-Accel-Redirect` / `X-Accel-Limit-Rate` unless
+/// Record an upstream `X-Accel-Redirect` / `-Limit-Rate` / `-Buffering` unless
 /// `proxy_ignore_headers` lists it. Cold: kept out of the attempt's code.
 #[cold]
 #[inline(never)]
@@ -1910,6 +1910,18 @@ fn note_accel_header(
         if rate.is_some() {
             accel.get_or_insert_default().limit_rate = rate;
         }
+    } else if name.eq_ignore_ascii_case(b"x-accel-buffering") && !rules.ignore_accel_buffering {
+        // ngx_http_upstream_process_buffering: `yes` or `no`, else as is.
+        let on = if value.eq_ignore_ascii_case(b"yes") {
+            Some(true)
+        } else if value.eq_ignore_ascii_case(b"no") {
+            Some(false)
+        } else {
+            None
+        };
+        if on.is_some() {
+            accel.get_or_insert_default().buffering = on;
+        }
     }
 }
 
@@ -1920,6 +1932,8 @@ pub struct AccelHeaders {
     pub redirect: Option<Vec<u8>>,
     /// `X-Accel-Limit-Rate`: the response's `limit_rate` (0 for `off`).
     pub limit_rate: Option<u64>,
+    /// `X-Accel-Buffering: yes|no`, over `proxy_buffering` (#764).
+    pub buffering: Option<bool>,
 }
 
 /// One upstream attempt, as nginx's `ngx_http_upstream_state_t`: what the
@@ -2756,6 +2770,11 @@ async fn attempt(
                 window: None,
                 trailers: plan.pass_trailers && chunked,
                 pass_trailers: (plan.pass_trailers && chunked).then_some(plan.response),
+                buffering: accel
+                    .as_ref()
+                    .and_then(|a| a.buffering)
+                    .unwrap_or(plan.response.buffering.on)
+                    .then(|| crate::proxy_stream::Buffering::of(plan.response)),
             },
         )));
     }

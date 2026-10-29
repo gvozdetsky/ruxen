@@ -21,11 +21,12 @@ impl Drop for Server {
 }
 
 const TRAILERS: &str = "X-Up: 1\r\nServer: up\r\nX-Hide: h\r\n";
+const BIG: usize = 300_000;
 
 /// A keep-alive HTTP/1.1 backend. Each answer is chunked with
 /// `TRAILERS` and says which connection it came on (`X-Conn`); `/slow`
 /// sends the trailers in a second write, `/huge` a trailer section over
-/// nginx's 4 KiB.
+/// nginx's 4 KiB, `/big` a `BIG`-byte chunk, then the trailers later.
 fn backend(listener: TcpListener) {
     std::thread::spawn(move || {
         for (id, conn) in listener.incoming().flatten().enumerate() {
@@ -59,7 +60,12 @@ fn serve(mut conn: TcpStream, id: usize) {
         } else {
             format!("0\r\n{TRAILERS}\r\n")
         };
-        if path == "/slow" {
+        if path == "/big" {
+            let chunk = format!("{BIG:x}\r\n{}\r\n", "b".repeat(BIG));
+            let _ = conn.write_all(format!("{start}{chunk}").as_bytes());
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = conn.write_all(rest.as_bytes());
+        } else if path == "/slow" {
             let _ = conn.write_all(start.as_bytes());
             std::thread::sleep(Duration::from_millis(200));
             let _ = conn.write_all(rest.as_bytes());
@@ -114,6 +120,20 @@ fn request(port: u16, path: &str, version: &str) -> (String, String) {
     (out[..at].to_string(), out[at + 4..].to_string())
 }
 
+/// The data of a chunked body, and what follows its last chunk.
+fn dechunk(mut wire: &str) -> (String, String) {
+    let mut data = String::new();
+    loop {
+        let (size, rest) = wire.split_once("\r\n").expect("a chunk size");
+        let n = usize::from_str_radix(size, 16).expect("hex");
+        if n == 0 {
+            return (data, rest.to_string());
+        }
+        data.push_str(&rest[..n]);
+        wire = &rest[n + 2..];
+    }
+}
+
 #[test]
 fn m166_proxy_pass_trailers() {
     let setup = common::ports::setup_lock();
@@ -154,6 +174,16 @@ fn m166_proxy_pass_trailers() {
         body,
         "5\r\nhello\r\n0\r\nX-Up: 1\r\nX-Hide: h\r\nX-Add: 1\r\n\r\n"
     );
+
+    // Over more than one read: through the relay's pipe (#764).
+    let (_, body) = request(front, "/on/big", "1.1");
+    let (data, after) = dechunk(&body);
+    assert!(
+        data == format!("hello{}", "b".repeat(BIG)),
+        "{}",
+        data.len()
+    );
+    assert_eq!(after, "X-Up: 1\r\n\r\n");
 
     // Off: dropped.
     let (_, body) = request(front, "/off/slow", "1.1");
