@@ -769,7 +769,8 @@ pub(crate) fn apply_proxy_add_headers(
 
 /// The last chunk and the trailers after a relayed body (#463), rendered
 /// once the body is out, as nginx's trailers filter does on the last
-/// buffer. `head`: the header block as sent.
+/// buffer: the upstream's (`proxy_pass_trailers`), then `add_trailer`'s.
+/// `head`: the header block as sent.
 #[cold]
 #[inline(never)]
 pub(crate) fn relay_trailers(
@@ -778,7 +779,14 @@ pub(crate) fn relay_trailers(
     meta: &phase::ProcessMeta,
     uri: Option<&[u8]>,
     head: &[u8],
+    upstream: &[u8],
 ) -> Vec<u8> {
+    let mut out = b"0\r\n".to_vec();
+    out.extend_from_slice(upstream);
+    if meta.proxy_add_trailers.is_empty() {
+        out.extend_from_slice(b"\r\n");
+        return out;
+    }
     let root_only = root_only_state(meta);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -800,12 +808,9 @@ pub(crate) fn relay_trailers(
         Some(p) => &head[..p + 2],
         None => head,
     };
-    let mut out = b"0\r\n".to_vec();
-    out.extend_from_slice(&render_trailers(
-        meta.proxy_add_trailers,
-        &render_ctx,
-        sent_view,
-    ));
+    let mut block = upstream.to_vec();
+    render_trailers_into(meta.proxy_add_trailers, &render_ctx, sent_view, &mut block);
+    out.extend_from_slice(&block[upstream.len()..]);
     out.extend_from_slice(b"\r\n");
     out
 }
@@ -1746,6 +1751,17 @@ pub(crate) fn render_trailers(
     sent_view: &[u8],
 ) -> Vec<u8> {
     let mut trailer_block: Vec<u8> = Vec::with_capacity(trailers.len() * 64);
+    render_trailers_into(trailers, ctx, sent_view, &mut trailer_block);
+    trailer_block
+}
+
+/// `render_trailers` after the trailer lines already in `trailer_block`.
+fn render_trailers_into(
+    trailers: &[PreparedAddHeader],
+    ctx: &RenderCtx<'_>,
+    sent_view: &[u8],
+    trailer_block: &mut Vec<u8>,
+) {
     for t in trailers {
         if !t.always && !add_header_status_eligible(ctx.status) {
             continue;
@@ -1766,7 +1782,6 @@ pub(crate) fn render_trailers(
         trailer_block.extend_from_slice(&rendered);
         trailer_block.extend_from_slice(b"\r\n");
     }
-    trailer_block
 }
 
 /// Wrap a body buffer as a single chunked-transfer chunk (`<hex-len>\r\n
