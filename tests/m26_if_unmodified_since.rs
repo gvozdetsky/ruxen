@@ -70,6 +70,14 @@ http {{
     location = /untagged.txt {{
       etag off;
     }}
+
+    location = /ret {{ add_header X-A a; return 200 "ok\n"; }}
+    location = /ret404 {{ return 404; }}
+    location = /if {{ if ($request_method) {{ return 200 "if\n"; }} }}
+    location = /ep {{ error_page 412 /handled; return 200 "ok\n"; }}
+    location = /handled {{ return 200 "handled\n"; }}
+    location = /stub {{ stub_status; }}
+    location /idx/ {{ alias {root}/; autoindex on; }}
   }}
 }}
 "#,
@@ -243,4 +251,62 @@ fn first_range_header_counts() {
     );
     assert_eq!(status_line(&r), "HTTP/1.1 206 Partial Content");
     assert_eq!(header_value(&r, "Content-Range"), Some("bytes 0-1/8"));
+}
+
+fn get_with(port: u16, path: &str, headers: &str) -> Vec<u8> {
+    request(
+        port,
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+}
+
+/// nginx's not-modified filter on a 200 with no validators (`return`,
+/// `stub_status`, autoindex): only `If-Unmodified-Since`, `If-Match` other
+/// than `*` (412) and `If-None-Match: *` (304) count (#782).
+#[test]
+fn generated_200_takes_preconditions() {
+    let (_guard, port) = spawn_server();
+    let ims = "If-Modified-Since: Thu, 01 Jan 1970 00:00:01 GMT";
+    let cases: &[(&str, &str, &str)] = &[
+        ("/ret", "If-None-Match: *", "304 Not Modified"),
+        ("/ret", "If-None-Match: \"x\"", "200 OK"),
+        ("/ret", &format!("If-None-Match: *\r\n{ims}"), "200 OK"),
+        ("/ret", "If-Match: *", "200 OK"),
+        ("/ret", "If-Match: \"a\"", "412 Precondition Failed"),
+        (
+            "/ret",
+            "If-Unmodified-Since: Thu, 01 Jan 2099 00:00:00 GMT",
+            "412 Precondition Failed",
+        ),
+        ("/ret404", "If-Match: \"a\"", "404 Not Found"),
+        ("/if", "If-Match: \"a\"", "412 Precondition Failed"),
+        ("/if", "If-None-Match: *", "304 Not Modified"),
+        ("/stub", "If-None-Match: *", "304 Not Modified"),
+        ("/idx/", "If-Match: \"a\"", "412 Precondition Failed"),
+        ("/idx/", "If-None-Match: *", "304 Not Modified"),
+    ];
+    for (path, headers, status) in cases {
+        let r = get_with(port, path, headers);
+        assert_eq!(
+            status_line(&r),
+            format!("HTTP/1.1 {status}"),
+            "{path} {headers}"
+        );
+        if status.starts_with("304") {
+            assert_eq!(header_value(&r, "content-length"), None, "{path}");
+            assert_eq!(header_value(&r, "content-type"), None, "{path}");
+            assert!(r.ends_with(b"\r\n\r\n"), "{path}: a body");
+        }
+    }
+    // `add_header` goes on the 304, not on the 412.
+    let r = get_with(port, "/ret", "If-None-Match: *");
+    assert_eq!(header_value(&r, "x-a"), Some("a"));
+    let r = get_with(port, "/ret", "If-Match: \"a\"");
+    assert_eq!(header_value(&r, "x-a"), None);
+    // The 412 is an error `error_page` takes, even after a `return` with
+    // text; it goes out as a 412.
+    let r = get_with(port, "/ep", "If-Match: \"a\"");
+    assert_eq!(status_line(&r), "HTTP/1.1 412 Precondition Failed");
+    assert!(r.ends_with(b"handled\n"), "{}", String::from_utf8_lossy(&r));
 }

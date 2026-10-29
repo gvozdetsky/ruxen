@@ -256,8 +256,11 @@ pub struct RewriteState {
     /// nginx's `r->valid_unparsed_uri`: the URI is still the one the client
     /// sent, so `proxy_pass` without a URI part forwards the client's own
     /// request target (#541). Cleared by a `rewrite` of the URI and by an
-    /// internal redirect.
+    /// internal redirect to a URI, not by a jump to a named location (#777).
     pub(crate) unparsed_uri: bool,
+    /// nginx's `r->internal`: a `rewrite` of the URI or any internal
+    /// redirect happened, so a URI built from `$uri` is escaped.
+    pub(crate) internal: bool,
     /// `map` results already computed for this request, by map slot: nginx
     /// caches a variable's value in `r->variables` for the rest of the
     /// request, internal redirects included, unless the map is `volatile`.
@@ -290,6 +293,7 @@ impl Default for RewriteState {
             valid_location: true,
             uri_changed: false,
             unparsed_uri: true,
+            internal: false,
             map_cache: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
             limit_req_status: 0,
@@ -1670,6 +1674,9 @@ pub struct PreparedLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1730,6 +1737,9 @@ pub struct PreparedRegexLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1777,6 +1787,9 @@ pub struct MatchedLocation<'a> {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1819,6 +1832,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            aio: loc.aio,
             gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
@@ -1873,6 +1887,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            aio: loc.aio,
             gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
