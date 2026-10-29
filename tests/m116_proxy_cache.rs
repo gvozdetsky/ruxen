@@ -434,8 +434,15 @@ fn m116_large_hits_come_from_the_file() {
     assert!(head.contains("\r\nX-Cache: HIT\r\n"), "{head}");
     assert!(body == mid, "{} bytes", body.len());
     let after = vm_hwm(server.0.id());
+    // musl's malloc doesn't reuse a freed slot at once: the first hit grows
+    // the heap by 4-5 MB there, still short of the 8 MiB body.
+    let limit = if cfg!(target_env = "musl") {
+        6144
+    } else {
+        4096
+    };
     assert!(
-        after < before + 4096,
+        after < before + limit,
         "VmHWM {before} kB before the hits, {after} kB after"
     );
 
