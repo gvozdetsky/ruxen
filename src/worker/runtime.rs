@@ -5365,7 +5365,21 @@ pub(crate) async fn handle<S: ConnIo>(
                             let header_host = req.host.map(|(s, e)| (base + s, base + e));
                             let request_line_host = match request_line_host {
                                 Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
-                                    Some(nh) => Some(nh),
+                                    Some(nh) => {
+                                        // HTTP/1.1 needs `Host` even with an
+                                        // absolute-form target (#781): nginx's
+                                        // 400, from the server the target names.
+                                        if req.http_11 && req.host.is_none() {
+                                            refuse = Some(400);
+                                            refused_parsed_head_log(
+                                                http,
+                                                conn_log!(),
+                                                &buf[base..base + req.headers_end],
+                                                phase::MISSING_HOST,
+                                            );
+                                        }
+                                        Some(nh)
+                                    }
                                     None => {
                                         // An invalid Host is refused by the
                                         // default server, before the checks
