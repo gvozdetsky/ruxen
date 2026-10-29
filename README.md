@@ -22,7 +22,7 @@ See [`DESIGN.md`](DESIGN.md) for the architecture notes and the reasoning behind
 
 ## Current status
 
-Version 0.2.2. In short:
+Version 0.2.3. In short:
 
 - Linux only, x86_64 and aarch64
 - HTTP/1.1, and HTTP/2 for clients (`http2 on`; over TLS through ALPN, and cleartext with prior knowledge)
@@ -34,7 +34,7 @@ Version 0.2.2. In short:
 - configuration reload without dropping connections (`SIGHUP`, `-s reload`)
 - no dynamic modules
 
-The upstream `nginx-tests` suite is used as a compatibility test. **182 of the 197 test files that ruxen currently opts into pass end-to-end** (v0.2.2; v0.2.1: 172 of 192).
+The upstream `nginx-tests` suite is used as a compatibility test. **212 of the 223 test files that ruxen currently opts into pass end-to-end** (v0.2.3; v0.2.2: 182 of 197).
 
 See [`NGINX_TEST_PROGRESS.md`](NGINX_TEST_PROGRESS.md) for the per-file status, and [`ROADMAP.md`](ROADMAP.md) for where ruxen is going: first a memory-safe edge server (TLS termination, reverse proxy, static files) that takes your nginx configuration.
 
@@ -154,14 +154,14 @@ ruxen --compat -c /etc/nginx/nginx.conf
 ```
 
 ```text
-ruxen 0.2.2: checking /etc/nginx/nginx.conf
+ruxen 0.2.3: checking /etc/nginx/nginx.conf
 /etc/nginx/sites-enabled/app:14: unsupported: fastcgi_pass unix:/run/php/php-fpm.sock — unknown directive in a location block (FastCGI isn't in ruxen: README, Limitations)
 /etc/nginx/nginx.conf:41: differs: ssl_early_data on — TLS 1.3 early data is not accepted
 -: differs: "ssl_protocols": TLSv1, TLSv1.1 not supported and ignored, rustls speaks TLSv1.2 and TLSv1.3 only
 ignored: 2 tuning directives with no effect in ruxen: tcp_nopush, types_hash_max_size
-what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#fastcgi-uwsgi-scgi-memcached
-what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#ssl_early_data-on
-what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#ssl_protocols
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.3/docs/migrating.md#fastcgi-uwsgi-scgi-memcached
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.3/docs/migrating.md#ssl_early_data-on
+what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.3/docs/migrating.md#ssl_protocols
 ruxen does not start with this configuration: 1 unsupported, 2 behaving differently
 ```
 
