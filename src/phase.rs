@@ -134,8 +134,99 @@ pub(crate) fn resume_auth_request(resume: Vec<(&'static [u8], AuthResume)>) {
     AUTH_RESUME.with(|r| *r.borrow_mut() = resume);
 }
 
+/// What the access phase noted on the pass before the body is read
+/// (#855), for the pass after it: limit_req and limit_conn don't count
+/// the request again.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BeforeBody {
+    pub limit_req_status: u8,
+    pub limit_conn_status: u8,
+}
+
+#[derive(Clone, Copy)]
+enum BeforeBodyPass {
+    Off,
+    /// The pass before the body: stop before a handler that may read it.
+    Probe,
+    /// It stopped there, with what the access phase noted.
+    Stopped(BeforeBody),
+    /// The pass after the read.
+    Resume(BeforeBody),
+}
+
+thread_local! {
+    static BEFORE_BODY: std::cell::Cell<BeforeBodyPass> =
+        const { std::cell::Cell::new(BeforeBodyPass::Off) };
+}
+
+/// The worker runs the access phase before reading a body, as nginx does
+/// (#855): the next `process` stops before a handler that may read it.
+pub(crate) fn probe_before_body() {
+    BEFORE_BODY.with(|b| b.set(BeforeBodyPass::Probe));
+}
+
+/// After that pass: `Some` when it stopped before such a handler (the
+/// body is to be read), `None` when its response is the answer.
+pub(crate) fn probe_result() -> Option<BeforeBody> {
+    match BEFORE_BODY.with(|b| b.replace(BeforeBodyPass::Off)) {
+        BeforeBodyPass::Stopped(noted) => Some(noted),
+        _ => None,
+    }
+}
+
+/// Around the pass after the read: what the one before noted.
+pub(crate) fn resume_before_body(noted: Option<BeforeBody>) {
+    BEFORE_BODY.with(|b| b.set(noted.map_or(BeforeBodyPass::Off, BeforeBodyPass::Resume)));
+}
+
+/// limit_req's and limit_conn's statuses from the pass before the body.
+pub(crate) fn before_body_noted() -> Option<BeforeBody> {
+    match BEFORE_BODY.with(|b| b.get()) {
+        BeforeBodyPass::Resume(noted) => Some(noted),
+        _ => None,
+    }
+}
+
+/// On the pass before the body, a handler that may read it ends the pass.
+/// A static file doesn't read it, nor does a `return` unless a variable
+/// reads it (#289): that answer stands.
+#[inline]
+fn stops_before(
+    http: &PreparedHttp,
+    handler: &crate::worker::PreparedHandler,
+    state: &RewriteState,
+) -> bool {
+    use crate::worker::PreparedHandler;
+    match handler {
+        PreparedHandler::Root(_) => false,
+        PreparedHandler::Return(..) if !http.uses_request_body && !http.uses_request_body_file => {
+            false
+        }
+        _ => stops_before_slow(state),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn stops_before_slow(state: &RewriteState) -> bool {
+    BEFORE_BODY.with(|b| match b.get() {
+        BeforeBodyPass::Probe => {
+            b.set(BeforeBodyPass::Stopped(BeforeBody {
+                limit_req_status: state.limit_req_status,
+                limit_conn_status: state.limit_conn_status,
+            }));
+            true
+        }
+        _ => false,
+    })
+}
+
 /// The body of a request that has none.
 pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
+
+/// `RequestCtx::body_len` of a body whose framing was bad: the location
+/// answers 400 where it would answer 413 (#806).
+pub const MALFORMED_BODY: u64 = u64::MAX;
 
 /// Per-request inputs the pipeline needs from the parser + connection.
 /// Narrow on purpose — each field added here is a new dependency between
@@ -386,6 +477,9 @@ pub struct ProcessMeta {
     /// its cache file, added by the worker after gzip, as nginx's chunked
     /// filter runs after its gzip filter (#793).
     pub trailers_due: bool,
+    /// A handler's `add_trailer` left to the worker, to go after gzip too
+    /// (#809): `proxy_add_trailers` holds them.
+    pub handler_trailers: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
@@ -452,6 +546,7 @@ impl Default for ProcessMeta {
             aio: None,
             keep_upstream_date: false,
             trailers_due: false,
+            handler_trailers: false,
             gzip: None,
             max_ranges: None,
             range_allow: crate::worker::range::RangeAllow::No,
@@ -1427,7 +1522,14 @@ fn process_with_meta_inner(
             meta.proxy_host = proxy.host_header;
             meta.proxy_tls = proxy.tls.is_some() && proxy.url.is_none();
         }
+        meta.handler_trailers = false;
+        if !loc_add_trailers.is_empty() && loc.gzip.is_some() {
+            defer_handler_trailers(&mut loc, &mut meta);
+        }
         let response = match denied {
+            None if stops_before(http, loc.handler, &rewrite_state) => {
+                return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+            }
             None => run_location_handler(
                 http,
                 server,
@@ -1528,6 +1630,18 @@ fn process_with_meta_inner(
                     keep_rewrite_state(&mut meta, rewrite_state);
                 }
                 return (Response::Proxy(plan), meta);
+            }
+            // `add_trailer` on a file too big to be read into the response
+            // (#844): the worker sends it chunked, the trailers after it,
+            // as for a cache hit.
+            Response::File { headers, body } if !loc_add_trailers.is_empty() => {
+                meta.proxy_add_trailers = loc_add_trailers;
+                meta.proxy_chunked_transfer_encoding = loc_chunked_te;
+                let headers = crate::worker::expect_file_trailers(headers, req, &mut meta);
+                if rewrite_state.worth_keeping() || rewrite_state.has_numbered_captures() {
+                    keep_rewrite_state(&mut meta, rewrite_state);
+                }
+                return (Response::File { headers, body }, meta);
             }
             other => {
                 if rewrite_state.worth_keeping() {
@@ -1756,6 +1870,21 @@ fn real_ip_trusted(from: &[AccessAddr], ip: IpAddr) -> bool {
         (AccessAddr::V6 { addr, mask }, IpAddr::V6(ip)) => u128::from(ip) & mask == addr,
         _ => false,
     })
+}
+
+/// `add_trailer` with gzip on (#809): the worker adds the trailers after
+/// gzip, as nginx's chunked filter runs after its gzip filter. A proxied
+/// response does that already.
+#[cold]
+#[inline(never)]
+fn defer_handler_trailers(loc: &mut MatchedLocation<'static>, meta: &mut ProcessMeta) {
+    if matches!(loc.handler, crate::worker::PreparedHandler::Proxy(_)) {
+        return;
+    }
+    meta.proxy_add_trailers = loc.add_trailers;
+    meta.proxy_chunked_transfer_encoding = loc.chunked_transfer_encoding;
+    meta.handler_trailers = true;
+    loc.add_trailers = &[];
 }
 
 /// `ngx_http_send_error_page`: an error_page that sends the request to a
@@ -2263,6 +2392,13 @@ pub(crate) struct FirstBodyLimit {
     pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
+    /// The request is processed up to a handler that may read the body
+    /// before the body is read: the location has access checks (or
+    /// rewrites that may lead to some), which answer first as nginx's
+    /// access phase does (#855), or is static, where a file `try_files` or
+    /// `index` finds is served without the body though another way may
+    /// lead to one that reads it (#836).
+    pub probe_first: bool,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -2342,6 +2478,14 @@ pub(crate) fn first_body_limit(
         discard: discards_body(http, server, &loc, url_scratch, true, &[]),
         continue_status: if expect { discard_continue(&loc) } else { None },
         body_timeout: loc.timeouts.body,
+        probe_first: matches!(loc.handler, crate::worker::PreparedHandler::Root(_))
+            || !loc.access.rules.is_empty()
+            || !matches!(loc.access.auth_basic, PreparedAuthBasic::Off)
+            || loc.access.auth_request.is_some()
+            || loc.limit_req.is_some()
+            || loc.limit_conn.is_some()
+            || loc.limit_except.is_some()
+            || !loc.rewrite_program.is_empty(),
     })
 }
 
@@ -2360,6 +2504,7 @@ fn unrouted_discard(server: &PreparedServer, continue_status: Option<u16>) -> Fi
         discard: true,
         continue_status,
         body_timeout: server.timeouts.body,
+        probe_first: false,
     }
 }
 

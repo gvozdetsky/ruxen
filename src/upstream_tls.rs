@@ -45,6 +45,7 @@ pub struct DynamicCert {
     sni: bool,
     reuse: bool,
     verify: Option<Arc<crate::x509_verify::Store>>,
+    h2: bool,
     /// `None`: `proxy_ssl_certificate_cache off`, nginx's default.
     cache: Option<Arc<Mutex<ObjectCache>>>,
     /// The configs handed out last, most recent first: `certified_pair`
@@ -65,6 +66,7 @@ impl DynamicCert {
         sni: bool,
         reuse: bool,
         verify: Option<Arc<crate::x509_verify::Store>>,
+        h2: bool,
         cache: Option<crate::config::SslCertificateCache>,
     ) -> Self {
         Self {
@@ -75,6 +77,7 @@ impl DynamicCert {
             sni,
             reuse,
             verify,
+            h2,
             cache: cache.map(ObjectCache::shared),
             recent: Mutex::new(Vec::new()),
         }
@@ -108,6 +111,7 @@ impl DynamicCert {
             self.reuse,
             self.verify.clone(),
             Some(certified),
+            self.h2,
         )?;
         let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
         match recent.iter().position(|c| Arc::ptr_eq(c, &config)) {
@@ -534,18 +538,20 @@ fn certificate_pair(
 /// location that has it, so they share the session cache too. `verify` is
 /// the trust store of `proxy_ssl_verify on`, `client_cert` the
 /// certificate of `proxy_ssl_certificate`: a session or a pooled
-/// connection (keyed by this config) never crosses either.
+/// connection (keyed by this config) never crosses either. `h2`: ALPN
+/// offers `h2` (#599).
 pub fn client_config(
     protocols: TlsVersionSet,
     sni: bool,
     reuse: bool,
     verify: Option<Arc<crate::x509_verify::Store>>,
     client_cert: Option<Arc<CertifiedKey>>,
+    h2: bool,
 ) -> Result<Arc<ClientConfig>, String> {
     // The store and the pair by address: an entry is used only while its
     // config is alive, which holds them, so an address can't be another's.
     // Weak, as the stores and pairs (#500).
-    type Key = (bool, bool, bool, bool, usize, usize);
+    type Key = (bool, bool, bool, bool, bool, usize, usize);
     static CONFIGS: Mutex<Vec<(Key, Weak<ClientConfig>)>> = Mutex::new(Vec::new());
     fn addr<T>(arc: &Option<Arc<T>>) -> usize {
         arc.as_ref().map_or(0, |a| Arc::as_ptr(a) as usize)
@@ -555,6 +561,7 @@ pub fn client_config(
         protocols.tlsv1_3,
         sni,
         reuse,
+        h2,
         addr(&verify),
         addr(&client_cert),
     );
@@ -600,6 +607,9 @@ pub fn client_config(
     config.cert_decompressors = Vec::new();
     if !reuse {
         config.resumption = rustls::client::Resumption::disabled();
+    }
+    if h2 {
+        config.alpn_protocols = vec![b"h2".to_vec()];
     }
     let config = Arc::new(config);
     configs.retain(|(_, config)| config.strong_count() > 0);
@@ -851,8 +861,8 @@ mod tests {
         let a = trust_store(settings()).unwrap();
         let b = trust_store(settings()).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
-        let config_a = client_config(protocols, true, true, Some(a.clone()), None).unwrap();
-        let config_b = client_config(protocols, true, true, Some(b.clone()), None).unwrap();
+        let config_a = client_config(protocols, true, true, Some(a.clone()), None, false).unwrap();
+        let config_b = client_config(protocols, true, true, Some(b.clone()), None, false).unwrap();
         assert!(Arc::ptr_eq(&config_a, &config_b));
         // The config holds its store: dropping the configs lets both go.
         let weak = Arc::downgrade(&a);

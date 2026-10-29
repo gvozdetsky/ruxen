@@ -199,10 +199,8 @@ pub(crate) fn finalize_location_response(
                 };
                 out = inject_add_headers(out, add_headers, &ctx);
             }
-            // `add_trailer` against a streamed file body would require the
-            // worker to wrap the body in chunked encoding on the way out;
-            // the static-file path doesn't support that today. Quietly skip
-            // — the directive is rare on static content anyway.
+            // `add_trailer`: the worker sends the file chunked, the
+            // trailers after it (`phase`, #844).
             if status == 204 {
                 // `error_page … =204`: header-only, the file isn't sent.
                 return Response::Owned(out);
@@ -671,11 +669,7 @@ pub(crate) fn finish_access_denial(
         rewrite_state,
         server_name_captures,
     );
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    if body_limit > 0 && req.body_len > body_limit && !in_error_page && error_page_status.is_none()
-    {
+    if req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none() {
         return entity_too_large(
             &loc,
             req,
@@ -825,13 +819,8 @@ pub(crate) fn run_location_handler(
     // nginx's default client_max_body_size is 1m; `0` turns the check off.
     // Not again on the way to an error page: nginx has discarded the body
     // by then (`!r->discard_body` in ngx_http_core_find_config_phase).
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    let too_large = body_limit > 0
-        && req.body_len > body_limit
-        && !in_error_page
-        && error_page_status.is_none();
+    let too_large =
+        req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none();
 
     let render_ctx_base = location_render_ctx(
         http,
@@ -1052,13 +1041,19 @@ pub(crate) fn run_location_handler(
         }
         if !have_host_override {
             overrides_buf.insert(0, (b"Host", host_header.to_vec()));
+            if proxy.http_version == 2 {
+                // Sent as `:authority` (`upstream_h2`); the empty `Host`
+                // still keeps the client's out.
+                let host = std::mem::take(&mut overrides_buf[0].1);
+                overrides_buf.insert(0, (b":authority", host));
+            }
         }
 
-        // Pool eligibility: HTTP/1.1 + the upstream block has a keepalive
-        // pool (every `upstream {}` block unless `keepalive 0;`). Drives
-        // both the Connection-header default below and `run_proxy`'s
+        // Pool eligibility: HTTP/1.1 or HTTP/2 + the upstream block has a
+        // keepalive pool (every `upstream {}` block unless `keepalive 0;`).
+        // Drives both the Connection-header default below and `run_proxy`'s
         // pool-release decision.
-        let pool_eligible = proxy.http_version == 1 && upstream.keepalive_max_idle.is_some();
+        let pool_eligible = proxy.http_version != 0 && upstream.keepalive_max_idle.is_some();
 
         // nginx 1.29.7 sends no Connection header by default
         // (ngx_http_proxy_headers). Over HTTP/1.1 with no pool to take the
@@ -1301,9 +1296,11 @@ pub(crate) fn run_location_handler(
             in_error_page,
             error_page_status,
             intercept,
-            upgrade: client_upgrade,
+            // No protocol switch over HTTP/2 (ngx_http_proxy_v2_module).
+            upgrade: client_upgrade && proxy.http_version != 2,
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
+            h2: proxy.http_version == 2,
             cache,
             hash,
             sticky,
@@ -1709,6 +1706,19 @@ pub(crate) fn run_location_handler(
     )
 }
 
+/// The body length past which the location refuses the request: its
+/// `client_max_body_size` (`0`: none), and always a malformed body.
+#[inline]
+fn body_threshold(loc: &MatchedLocation<'static>) -> u64 {
+    match loc
+        .client_max_body_size
+        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE)
+    {
+        0 => phase::MALFORMED_BODY - 1,
+        limit => limit.min(phase::MALFORMED_BODY - 1),
+    }
+}
+
 /// A file under `gzip_static` (#760), as the `Serve` arm sends a file:
 /// `file.gz` with `Content-Encoding: gzip` (`gzip`), or the file itself,
 /// and `Vary: Accept-Encoding` with `vary` unless the gzip filter adds it.
@@ -1801,7 +1811,8 @@ fn serve_gzip_static(
 /// The 413 for a body over the location's `client_max_body_size`, sent as
 /// nginx's special response: the location's `error_page` and `add_header
 /// … always` apply (ngx_http_finalize_request(r, 413) from the find_config
-/// phase). Cold.
+/// phase); or the 400 for a malformed body, as nginx finalizes it where the
+/// location reads or discards the body (#806).
 #[cold]
 #[inline(never)]
 fn entity_too_large(
@@ -1811,12 +1822,16 @@ fn entity_too_large(
     in_error_page: bool,
     preserved_www_authenticate: &[Vec<u8>],
 ) -> Response {
-    let response = http::error_response_for_method(
-        413,
-        "Request Entity Too Large\n",
-        req.method,
-        loc.server_header,
-    );
+    let response = if req.body_len == phase::MALFORMED_BODY {
+        http::error_response_for_method(400, "Bad Request\n", req.method, loc.server_header)
+    } else {
+        http::error_response_for_method(
+            413,
+            "Request Entity Too Large\n",
+            req.method,
+            loc.server_header,
+        )
+    };
     let intercepted = maybe_intercept_error_page(
         Response::Owned(response),
         loc.error_pages,

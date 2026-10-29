@@ -1804,8 +1804,7 @@ pub(crate) fn parse_proxy_timeout_args(args: &[String], what: &'static str) -> R
     parse_duration_ms(raw, what)
 }
 
-/// Parse `proxy_http_version 1.0|1.1;`. Stored as the minor digit so the
-/// hot-path emit picks `b"HTTP/1.0"` or `b"HTTP/1.1"` with one byte swap.
+/// Parse `proxy_http_version 1.0|1.1|2;`: 0, 1, or 2 for HTTP/2 (#599).
 pub(crate) fn parse_proxy_http_version_args(args: &[String]) -> Result<u8, Error> {
     let raw = args
         .first()
@@ -1819,6 +1818,7 @@ pub(crate) fn parse_proxy_http_version_args(args: &[String]) -> Result<u8, Error
     match raw.as_str() {
         "1.0" => Ok(0),
         "1.1" => Ok(1),
+        "2" => Ok(2),
         _ => Err(Error::BadValue {
             what: "proxy_http_version",
             got: raw.clone(),
