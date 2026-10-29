@@ -386,15 +386,12 @@ fn m165_configuration_errors() {
     assert!(ok, "{err}");
     let (ok, err) = check("upstream u { server 127.0.0.1:81 resolve; }");
     assert!(ok, "{err}");
-    // Fails closed until sticky follows resolved peers.
+    // Resolved peers have sticky IDs too (#883).
     let (ok, err) = check(
-        "upstream u { zone z; sticky cookie s; server svc.test resolve; }\n\
+        "upstream u { zone z; sticky cookie s; server svc.test resolve route=a drain; }\n\
          resolver 127.0.0.1;",
     );
-    assert!(
-        !ok && err.contains("\"sticky\" with \"resolve\" servers is not supported yet"),
-        "{err}"
-    );
+    assert!(ok, "{err}");
     for (line, problem) in [
         ("svc.test service=http", "requires \"resolve\" parameter"),
         ("svc.test:80 resolve service=http", "may not have port"),
@@ -456,6 +453,70 @@ fn m165_services_give_ports_and_backups() {
         log.contains("service http of svc.test could not be resolved (3: Host not found)"),
         "{log}"
     );
+}
+
+impl Server {
+    /// A request with cookie `s=<sid>`: the body and the `s` it set.
+    fn sticky_get(&self, sid: &str) -> (String, String) {
+        let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET / HTTP/1.0\r\nHost: front\r\nCookie: s={sid}\r\n\r\n"
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        let (head, body) = out.split_once("\r\n\r\n").unwrap();
+        let set = head
+            .split("\r\n")
+            .find_map(|l| l.strip_prefix("Set-Cookie: s="))
+            .unwrap_or_else(|| panic!("no cookie: {out}\n{}", self.error_log()));
+        (body.to_string(), set.to_string())
+    }
+}
+
+#[test]
+fn m165_sticky_ids_follow_the_answers() {
+    let dns = Dns::start(Reply::Addrs(vec![ONE, TWO]));
+    let (backend, _) = backends(false);
+    let server = start(&format!(
+        "resolver 127.0.0.1:{} valid=1s ipv6=off; resolver_timeout 1s;\n\
+         upstream u {{ zone z 64k; sticky cookie s; \
+         server svc.test:{backend} resolve max_fails=0; }}",
+        dns.port
+    ));
+    server.wait_for((200, "one"));
+    // Each address's ID, from the cookies set without one.
+    let mut ids = std::collections::HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ids.len() < 2 {
+        assert!(Instant::now() < deadline, "{ids:?}");
+        let (body, sid) = server.sticky_get("");
+        ids.insert(body, sid);
+    }
+    let (one, two) = (&ids["one"], &ids["two"]);
+    for _ in 0..6 {
+        assert_eq!(server.sticky_get(two), ("two".into(), two.clone()));
+        assert_eq!(server.sticky_get(one), ("one".into(), one.clone()));
+    }
+    // Without its peer, the ID gets another; back, it names it again.
+    dns.set(Reply::Addrs(vec![ONE]));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !server.bodies(6).iter().all(|b| b == "one") {
+        assert!(Instant::now() < deadline, "127.0.0.2 not gone");
+    }
+    assert_eq!(server.sticky_get(two), ("one".into(), one.clone()));
+    dns.set(Reply::Addrs(vec![TWO, ONE]));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.sticky_get(two).0 != "two" {
+        assert!(Instant::now() < deadline, "{}", server.error_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for _ in 0..6 {
+        assert_eq!(server.sticky_get(two), ("two".into(), two.clone()));
+        assert_eq!(server.sticky_get(one), ("one".into(), one.clone()));
+    }
 }
 
 #[test]

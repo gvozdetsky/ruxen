@@ -93,13 +93,6 @@ pub(crate) fn parse_upstream_block(
                              to be in shared memory"
                         )));
                     }
-                    // Peer IDs are per configured peer yet (#600, #597).
-                    if sticky.is_some() && servers.iter().any(|s| s.resolve.is_some()) {
-                        return Err(Error::Text(format!(
-                            "\"sticky\" with \"resolve\" servers is not supported yet \
-                             in upstream \"{name}\""
-                        )));
-                    }
                     Ok(UpstreamBlock {
                         name,
                         servers,
