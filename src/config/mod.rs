@@ -1981,6 +1981,24 @@ mod tests {
     }
 
     #[test]
+    fn proxy_pass_trailers_parses_and_inherits() {
+        let cfg = parse(
+            "http { proxy_pass_trailers on; server { listen 80; \
+             location /off { proxy_pass_trailers off; proxy_pass http://127.0.0.1:81; } } }",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers[0].proxy.pass_trailers, Some(true));
+        assert_eq!(cfg.servers[0].locations[0].proxy.pass_trailers, Some(false));
+        for bad in [
+            "http { proxy_pass_trailers on; proxy_pass_trailers on; }",
+            "http { proxy_pass_trailers yes; }",
+            "http { server { listen 80; location / { if ($arg_a) { proxy_pass_trailers on; } } } }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn max_ranges_parses_at_every_scope_and_inherits_into_nested_blocks() {
         let cfg = parse(
             r#"

@@ -1312,6 +1312,7 @@ pub(crate) fn run_location_handler(
             upgrade: client_upgrade && proxy.http_version != 2,
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
+            pass_trailers: proxy.pass_trailers,
             h2: proxy.http_version == 2,
             cache,
             hash,

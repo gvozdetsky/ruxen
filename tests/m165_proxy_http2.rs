@@ -176,6 +176,7 @@ fn proxy_http_version_2() {
            proxy_http_version 2;\n\
            location / {{ proxy_pass http://u; }}\n\
            location /nobuf/ {{ proxy_pass http://u/; proxy_buffering off; }}\n\
+           location /pt/ {{ proxy_pass http://u/; proxy_pass_trailers on; }}\n\
            location /host/ {{ proxy_pass http://u/; proxy_set_header Host example.org; }}\n\
            location /tls/ {{ proxy_pass https://127.0.0.1:{h2tls}/; }}\n\
            location /next/ {{ proxy_pass http://next/; proxy_next_upstream http_404; }} }}",
@@ -230,13 +231,16 @@ fn proxy_http_version_2() {
         assert_eq!(dechunk(&body), "GET|||end", "{path}");
     }
 
-    // Trailers after the body: the stream ends there (they're dropped).
+    // Trailers after the body: the stream ends there (dropped by default).
     for path in ["/trailers", "/nobuf/trailers"] {
         let (status, _, body) = get(front, path);
         assert_eq!(status, 200, "{path}");
         assert_eq!(dechunk(&body), "tbody", "{path}");
         assert!(body.ends_with(b"0\r\n\r\n"), "{path}: {}", text(&body));
     }
+    // proxy_pass_trailers (#823): passed.
+    let (_, _, body) = get(front, "/pt/trailers");
+    assert_eq!(text(&body), "5\r\ntbody\r\n0\r\nx-t: foo\r\n\r\n");
 
     // A body over the flow-control windows, buffered and relayed.
     let expect: Vec<u8> = (0..300_000u32).map(|i| b'a' + (i % 26) as u8).collect();
