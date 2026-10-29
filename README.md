@@ -224,13 +224,12 @@ docker run --rm -p 8080:8080 \
 
 Supported functionality includes:
 
-- `root`
-- `alias`
+- `root` and `alias`, with variables and regex captures
 - `index`
 - `try_files`
 - ETag and `Last-Modified`
 - conditional requests
-- byte ranges (one range per request; `max_ranges 0` turns them off)
+- byte ranges, several as a `multipart/byteranges` response (`max_ranges`; `0` turns them off)
 - streamed large files
 - zero-copy `sendfile on|off` (plain TCP, and TLS with `ssl_conf_command Options KTLS`)
 - `aio threads[=pool]` and `thread_pool`: file reads and `sendfile` on a per-worker thread pool, so a slow disk doesn't stall the worker
@@ -247,15 +246,17 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - named `upstream` blocks
 - path rewriting
 - weighted round-robin, `least_conn`, `hash` (including `consistent`) and `ip_hash`
+- session affinity: `sticky cookie|route|learn`, `server … route=` and `drain`
 - backup and down peers
 - `max_fails` / `fail_timeout`, `max_conns`, and `zone` for peer state shared by the workers
+- `server … resolve`: peers that follow DNS, through the upstream's `resolver`
 - per-worker upstream keep-alive pools
 - `proxy_bind` (including `transparent`)
 - WebSocket and other `Upgrade` connections, tunnelled after the upstream's 101
-- responses relayed as they arrive when nothing needs them whole (no cache or `add_trailer`), gzip-compressed on the way when gzip is on; otherwise buffered
+- responses relayed as they arrive (into the cache too, and gzip-compressed on the way when gzip is on); with `proxy_buffering` (the default) what a slow client hasn't read waits in `proxy_buffers`, then in a temp file (`proxy_temp_path`, `proxy_max_temp_file_size`), and the upstream is freed once the body is in
 - `proxy_http_version` (`2`: HTTP/2 to the upstream, h2c or ALPN `h2`), `proxy_method`, `proxy_pass_trailers`, `early_hints` (103 Early Hints passed on)
 - `proxy_set_header`
-- request-body forwarding and `proxy_set_body`
+- request-body forwarding and `proxy_set_body`; `proxy_request_buffering off` streams the body to the upstream as it arrives
 - `proxy_next_upstream` (including `_tries` / `_timeout`)
 - `proxy_intercept_errors`
 - client aborts: a client that closes while the upstream is awaited ends the exchange (499 in the access log), unless `proxy_ignore_client_abort on`
@@ -293,7 +294,8 @@ A growing nginx-compatible configuration surface is implemented. [`docs/directiv
 - `include`, with patterns (`include conf.d/*.conf;`: the matches sorted, none is fine, as nginx's glob)
 - `return`, including `return URL;` (a 302)
 - `add_header` and `add_trailer`, at http, server and location level, with `add_header_inherit` / `add_trailer_inherit` (`merge` keeps the inherited headers under a level's own)
-- `types {}` (`include mime.types`) and `default_type`, as nginx sets Content-Type: no charset is added, and without `types` only .html, .gif and .jpg have a type
+- `types {}` (`include mime.types`) and `default_type`, as nginx sets Content-Type: without `types` only .html, .gif and .jpg have a type
+- `charset` and `charset_types` (the charset is added to Content-Type; nothing is converted)
 - `expires`
 - `error_page` and `recursive_error_pages`
 - `post_action`
@@ -433,7 +435,7 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
 - gRPC upstreams (`grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
-- FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
+- FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, `mirror`, charset conversion (`source_charset`, `charset_map`), and third-party modules
 - 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
 - nginx's binary upgrade (`SIGUSR2`)
