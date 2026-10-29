@@ -336,6 +336,20 @@ fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// The request's `sticky` (#600). Out of line: only upstreams with one.
+#[cold]
+#[inline(never)]
+fn sticky_for_request(
+    conf: &'static crate::upstream_sticky::Sticky,
+    ctx: &RenderCtx<'_>,
+) -> Box<crate::upstream_sticky::StickyReq> {
+    crate::upstream_sticky::StickyReq::new(conf, |parts| {
+        let mut out = Vec::new();
+        render_parts(parts, ctx, &mut out);
+        out
+    })
+}
+
 /// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
 /// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
 /// a request line split in two (#541).
@@ -985,13 +999,26 @@ pub(crate) fn run_location_handler(
             },
             render_ctx_base.remote_addr,
         );
+        let sticky = upstream
+            .sticky
+            .map(|conf| sticky_for_request(conf, &render_ctx_base));
         let initial_peer = if cache
             .as_ref()
             .is_some_and(|c| (c.hit.is_some() && !c.background) || c.unread)
         {
             None
         } else {
-            crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+            match sticky.as_deref() {
+                None => {
+                    crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+                }
+                Some(st) => crate::upstream::pick_peer_sticky(
+                    upstream,
+                    &Default::default(),
+                    hash.as_deref_mut(),
+                    &st.hint,
+                ),
+            }
         };
 
         // Build the final header set: proxy_set_header overrides first
@@ -1261,7 +1288,11 @@ pub(crate) fn run_location_handler(
             body_file,
             keep_upstream_headers: !loc.add_headers.is_empty()
                 || !loc.add_trailers.is_empty()
-                || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
+                || loc.access_logs.iter().any(|l| l.reads_upstream_headers)
+                || sticky
+                    .as_ref()
+                    .and_then(|s| s.conf.learn())
+                    .is_some_and(|l| l.reads_upstream),
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
@@ -1272,6 +1303,7 @@ pub(crate) fn run_location_handler(
             ignore_client_abort: proxy.ignore_client_abort,
             cache,
             hash,
+            sticky,
             bind,
         }));
     }
