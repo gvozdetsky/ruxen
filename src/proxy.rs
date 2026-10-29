@@ -702,6 +702,8 @@ pub struct InterceptRule {
     pub status: u16,
     pub action: crate::worker::PreparedErrorPageAction,
     pub target: Vec<u8>,
+    /// For a named target: where the request was (#814).
+    pub named_from: Option<Box<crate::phase::NamedFrom>>,
 }
 
 #[allow(dead_code)] // direct callers without a plan still want hardcoded fallback constants
@@ -1394,17 +1396,19 @@ fn build_intercept_reroute(
             preserved_location: None,
             preserved_www_authenticate,
             closes: crate::http::closes_connection(upstream_status),
+            named_from: None,
         });
     }
     if rule.target[0] == b'@' {
         return Response::Reroute(Reroute {
             target: RerouteTarget::Named(rule.target.clone()),
-            args: None,
+            args: rule.named_from.as_ref().and_then(|from| from.args.clone()),
             error_page_status,
             enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
             closes: crate::http::closes_connection(upstream_status),
+            named_from: rule.named_from.clone(),
         });
     }
     // An absolute URL: a redirect to it, 302 unless `=301` etc. says
