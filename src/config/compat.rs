@@ -304,6 +304,19 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "ruxen relays a response as it arrives either way (#88, #463)",
         "proxy_buffering-off",
     ),
+    // `aio threads` is implemented and not a finding.
+    (
+        "aio",
+        Some("off"),
+        "no Linux native AIO: file reads block the worker, as with `aio off`; `aio threads` moves them off it",
+        "aio-on-and-aio_write-on",
+    ),
+    (
+        "aio_write",
+        Some("off"),
+        "proxy_cache files are still written on the worker (#526)",
+        "aio-on-and-aio_write-on",
+    ),
     (
         "proxy_store",
         Some("off"),
@@ -320,7 +333,7 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
     (
         "ssl_conf_command",
         None,
-        "OpenSSL commands are not applied: ruxen's TLS is rustls",
+        "OpenSSL commands are not applied, but for `Options KTLS`: ruxen's TLS is rustls",
         "ssl_conf_command",
     ),
     ("http3", None, NO_HTTP3, "http3-and-quic"),
@@ -589,6 +602,27 @@ mod tests {
                 (Severity::Differs, "ssi on"),
                 (Severity::Ignored, "override_charset off"),
                 (Severity::Ignored, "tcp_nopush on"),
+            ]
+        );
+    }
+
+    #[test]
+    fn aio_threads_is_honoured_and_aio_on_differs() {
+        let (found, res) = findings(
+            "thread_pool p threads=2; http { aio threads=p; aio_write on; server { aio on; \
+             location / { aio off; } } }",
+        );
+        assert!(res.is_ok(), "{res:?}");
+        let got: Vec<(Severity, &str)> = found
+            .iter()
+            .map(|f| (f.severity, f.directive.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Severity::Differs, "aio_write on"),
+                (Severity::Differs, "aio on"),
+                (Severity::Ignored, "aio off"),
             ]
         );
     }

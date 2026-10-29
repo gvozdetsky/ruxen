@@ -232,7 +232,8 @@ Supported functionality includes:
 - conditional requests
 - byte ranges (one range per request; `max_ranges 0` turns them off)
 - streamed large files
-- zero-copy `sendfile on|off` (plain TCP)
+- zero-copy `sendfile on|off` (plain TCP, and TLS with `ssl_conf_command Options KTLS`)
+- `aio threads[=pool]` and `thread_pool`: file reads and `sendfile` on a per-worker thread pool, so a slow disk doesn't stall the worker
 - URI decoding and normalization
 - trailing-slash redirects
 - `autoindex`
@@ -279,6 +280,7 @@ Currently supported:
 - SNI, and `ssl_reject_handshake`
 - client certificates: `ssl_verify_client on|optional|optional_no_ca`, `ssl_client_certificate`, `ssl_trusted_certificate`, `ssl_verify_depth`, `ssl_crl`, per server, checked by OpenSSL's rules (AWS-LC's X.509 code); refused requests get nginx's 400 pages (495 / 496, which `error_page` can take) and a Host naming another verifying server 421; `$ssl_client_verify` and the certificate's fields (`$ssl_client_cert`, `_raw_cert`, `_escaped_cert`, `_s_dn`, `_i_dn` and their `_legacy` forms, `_serial`, `_fingerprint`, `_v_start`, `_v_end`, `_v_remain`), printed as OpenSSL prints them
 - OCSP stapling: `ssl_stapling`, `ssl_stapling_file`, `ssl_stapling_responder`, `ssl_stapling_verify`; responses fetched from the responder (`http://`, resolved at startup) in the background, verified, and refreshed as nginx does, one fetch for all workers
+- OCSP checks of client certificates: `ssl_ocsp on|leaf`, `ssl_ocsp_responder`, `ssl_ocsp_cache`; the status is read before the first request, and a certificate that isn't `good`, or whose status can't be read, is refused with 495 (`$ssl_client_verify` says why)
 - `ssl_session_cache` (in memory, shared by the workers, kept across a reload), `ssl_session_tickets`, `ssl_session_ticket_key` in nginx's ticket layout, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 
@@ -430,7 +432,7 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 
 - HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
-- OCSP checks of client certificates (#142), 0-RTT / TLS early data
+- 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
 - nginx's binary upgrade (`SIGUSR2`)
 
