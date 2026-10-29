@@ -501,3 +501,56 @@ fn proxy_cache_reads_on_the_pool_as_without() {
     assert_eq!(cache_sequence("aio threads;", None), without);
     assert_eq!(cache_sequence("aio threads;", Some("epoll")), without);
 }
+
+/// `sticky` holds on a deferred hit that turns into a miss (its file is
+/// gone): the peer is picked in `run_proxy` then, by the route too.
+#[test]
+fn sticky_route_after_a_deferred_hit_misses() {
+    let setup_lock = common::ports::setup_lock();
+    let [port, a, b] = common::ports::free_ports();
+    let dir = unique_dir();
+    let d = dir.display();
+    let conf = dir.join("ruxen.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "pid {d}/ruxen.pid;\nevents {{}}\nhttp {{ access_log off; aio threads;\n\
+             proxy_cache_path {d}/cache levels=1:2 keys_zone=one:1m;\n\
+             upstream u {{ server 127.0.0.1:{a} route=a; server 127.0.0.1:{b} route=b;\n\
+               sticky route $cookie_r; }}\n\
+             server {{ listen 127.0.0.1:{port};\n\
+               location / {{ proxy_pass http://u; proxy_cache one; proxy_cache_valid 1m; }}\n\
+             }}\n\
+             server {{ listen 127.0.0.1:{a}; return 200 A; }}\n\
+             server {{ listen 127.0.0.1:{b}; return 200 B; }} }}\n"
+        ),
+    )
+    .unwrap();
+    let mut guard = ServerGuard {
+        child: Command::new(env!("CARGO_BIN_EXE_ruxen"))
+            .args(["-c", conf.to_str().unwrap()])
+            .env("RUXEN_WORKERS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ruxen"),
+        dir: dir.clone(),
+    };
+    common::ports::wait_for_pid_file(
+        &mut guard.child,
+        &dir.join("ruxen.pid"),
+        Duration::from_secs(5),
+    );
+    drop(setup_lock);
+
+    for _ in 0..4 {
+        let (h, body) = fetch(
+            port,
+            "GET /x HTTP/1.0\r\nHost: localhost\r\nCookie: r=b\r\n\r\n",
+        );
+        assert!(h.starts_with("HTTP/1.1 200"), "{h}");
+        assert_eq!(body, b"B");
+        std::fs::remove_dir_all(dir.join("cache")).unwrap();
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+    }
+}

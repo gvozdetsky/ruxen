@@ -270,6 +270,13 @@ fn crypt_to64(out: &mut Vec<u8>, mut v: u32, n: usize) {
     }
 }
 
+/// The MD5 of `data`.
+pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
+    let mut md5 = Md5::new();
+    md5.update(data);
+    md5.finish()
+}
+
 /// MD5 from the AWS-LC that rustls already links.
 struct Md5(aws_lc_sys::MD5_CTX);
 
