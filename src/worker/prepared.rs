@@ -867,6 +867,8 @@ pub struct PreparedProxy {
     /// `proxy_ignore_client_abort`: keep the upstream exchange when the
     /// client goes away (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` conditions (#848); empty: off.
+    pub early_hints: &'static [&'static [PreparedValuePart]],
     /// `proxy_pass_trailers` (#823).
     pub pass_trailers: bool,
     /// Effective `ignore_invalid_headers` policy from the matched server.
@@ -1016,6 +1018,8 @@ pub(crate) struct ProxyEffective {
     pub force_ranges: bool,
     /// `proxy_ignore_client_abort` (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` (#848).
+    pub early_hints: &'static [&'static [PreparedValuePart]],
     /// `proxy_pass_trailers` (#823).
     pub pass_trailers: bool,
     pub ignore_invalid_headers: bool,
@@ -1207,6 +1211,7 @@ impl ProxyEffective {
             intercept_errors: false,
             force_ranges: false,
             ignore_client_abort: false,
+            early_hints: &[],
             pass_trailers: false,
             ignore_invalid_headers: true,
             underscores_in_headers: false,

@@ -1370,6 +1370,7 @@ pub(crate) fn parse_location_block(
                 | "proxy_intercept_errors"
                 | "proxy_force_ranges"
                 | "proxy_ignore_client_abort"
+                | "early_hints"
                 | "proxy_pass_trailers"
                 | "proxy_redirect"
                 | "proxy_hide_header"

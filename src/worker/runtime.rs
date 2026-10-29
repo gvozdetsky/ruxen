@@ -1325,6 +1325,24 @@ fn authority_mismatch_log(meta: &phase::ProcessMeta, ctx: &phase::RequestCtx<'_>
     );
 }
 
+/// `run_proxy` with `early_hints` held (#848), out of line: the usual
+/// path keeps no state for it.
+#[cold]
+#[inline(never)]
+async fn proxy_with_early_hints(
+    plan: Box<crate::proxy::ProxyPlan>,
+    report: &mut crate::proxy::ProxyReport,
+    late: Option<crate::proxy::LateLimitRate<'_>>,
+    client: &mut dyn super::client_watch::WatchClient,
+    at_once: bool,
+    timeout: Duration,
+) -> Option<Response> {
+    let watch = !plan.ignore_client_abort;
+    let hints = plan.early_hints.clone()?;
+    let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, report, late));
+    super::client_watch::with_early_hints(proxy, client, watch, at_once, &hints, timeout).await
+}
+
 async fn settle_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
@@ -1333,7 +1351,7 @@ async fn settle_proxy_response(
     process_meta: phase::ProcessMeta,
     // The client, watched while the upstream is awaited (`None`: nobody
     // waits for the answer, as for post_action).
-    client: Option<&dyn super::client_watch::WatchClient>,
+    client: Option<&mut dyn super::client_watch::WatchClient>,
 ) -> (Response, phase::ProcessMeta) {
     let Response::Proxy(plan) = response else {
         return (response, process_meta);
@@ -1354,10 +1372,6 @@ async fn settle_proxy_response(
     };
     let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
-    // nginx's ngx_http_upstream_check_broken_connection: a client that
-    // closes ends the exchange, and with it the upstream connection (the
-    // proxy future is dropped).
-    let client = client.filter(|_| !plan.ignore_client_abort);
     let late_limit_rate = plan.response.limit_rate.map(|parts| {
         let meta = &process_meta;
         move |status: u16, headers: &[u8]| {
@@ -1368,13 +1382,36 @@ async fn settle_proxy_response(
         let late = late_limit_rate
             .as_ref()
             .map(|late| late as crate::proxy::LateLimitRate<'_>);
-        let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
-        let watched = if process_meta.limit_conn_held.is_some() {
-            super::client_watch::Watched::at_once(proxy, client)
-        } else {
-            super::client_watch::Watched::new(proxy, client)
-        };
-        watched.await
+        let at_once = process_meta.limit_conn_held.is_some();
+        match client {
+            Some(client) if plan.early_hints.is_some() => {
+                let timeout = process_meta
+                    .timeouts
+                    .map_or(Duration::from_secs(60), |t| t.send);
+                Box::pin(proxy_with_early_hints(
+                    plan,
+                    &mut report,
+                    late,
+                    client,
+                    at_once,
+                    timeout,
+                ))
+                .await
+            }
+            client => {
+                // nginx's ngx_http_upstream_check_broken_connection: a
+                // client that closes ends the exchange, and with it the
+                // upstream connection (the proxy future is dropped).
+                let client = client.map(|c| &*c).filter(|_| !plan.ignore_client_abort);
+                let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
+                let watched = if at_once {
+                    super::client_watch::Watched::at_once(proxy, client)
+                } else {
+                    super::client_watch::Watched::new(proxy, client)
+                };
+                watched.await
+            }
+        }
     };
     let Some(upstream_resp) = upstream_resp else {
         client_closed_log(&process_meta, ctx);
@@ -6455,7 +6492,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     &mut *url_scratch,
                                     response,
                                     process_meta,
-                                    Some(&*stream as &dyn super::client_watch::WatchClient),
+                                    Some(&mut *stream as &mut dyn super::client_watch::WatchClient),
                                 )
                                 .await;
                                 process_meta = settled_meta;

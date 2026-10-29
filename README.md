@@ -253,7 +253,7 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - `proxy_bind` (including `transparent`)
 - WebSocket and other `Upgrade` connections, tunnelled after the upstream's 101
 - responses relayed as they arrive when nothing needs them whole (no cache or `add_trailer`), gzip-compressed on the way when gzip is on; otherwise buffered
-- `proxy_http_version` (`2`: HTTP/2 to the upstream, h2c or ALPN `h2`), `proxy_method`, `proxy_pass_trailers`
+- `proxy_http_version` (`2`: HTTP/2 to the upstream, h2c or ALPN `h2`), `proxy_method`, `proxy_pass_trailers`, `early_hints` (103 Early Hints passed on)
 - `proxy_set_header`
 - request-body forwarding and `proxy_set_body`
 - `proxy_next_upstream` (including `_tries` / `_timeout`)

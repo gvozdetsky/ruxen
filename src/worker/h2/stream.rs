@@ -288,6 +288,9 @@ impl StreamIo {
         // An interim response (100 Continue): HTTP/2 has its own; the
         // final one follows.
         if (100..200).contains(&status) {
+            if status == 103 {
+                self.send_early_hints(fields)?;
+            }
             return Ok(());
         }
         let mut response = http::Response::new(());
@@ -340,6 +343,28 @@ impl StreamIo {
         }
         self.out = out;
         Ok(())
+    }
+
+    /// A 103 (`early_hints`, #848) as an informational HEADERS frame.
+    #[cold]
+    fn send_early_hints(&mut self, fields: Fields<'_>) -> io::Result<()> {
+        let mut response = http::Response::new(());
+        *response.status_mut() = http::StatusCode::EARLY_HINTS;
+        for (name, value) in fields {
+            let name = http::HeaderName::from_bytes(name).map_err(|_| invalid("header name"))?;
+            if HOP_BY_HOP.contains(&name.as_str()) {
+                continue;
+            }
+            let value =
+                http::HeaderValue::from_bytes(value).map_err(|_| invalid("header value"))?;
+            response.headers_mut().append(name, value);
+        }
+        self.respond
+            .get_mut()
+            .as_mut()
+            .ok_or_else(|| invalid("a second response"))?
+            .send_informational(response)
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
     }
 
     /// End the body: with a trailing HEADERS frame when `trailers` (lines
