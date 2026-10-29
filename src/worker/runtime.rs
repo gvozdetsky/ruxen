@@ -1795,11 +1795,29 @@ fn trailers_due(head: &[u8], ctx: &phase::RequestCtx<'_>, meta: &phase::ProcessM
         && super::response::expects_trailers(meta.proxy_add_trailers, response_status(head))
 }
 
-/// `add_trailer` on a cached body sent from its file (#793): it goes
-/// chunked, without its length, the trailers after it.
+/// `add_trailer` on a handler's response in memory, with gzip on (#809):
+/// due as for a proxied one, added after gzip (`trailers_in_memory`).
 #[cold]
 #[inline(never)]
-fn expect_file_trailers(
+fn handler_trailers_due(
+    response: &mut Response,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &mut phase::ProcessMeta,
+) {
+    meta.handler_trailers = false;
+    if let Response::Prebuilt(bytes) = *response {
+        *response = Response::Owned(bytes.to_vec());
+    }
+    if let Response::Owned(bytes) = response {
+        meta.trailers_due = trailers_due(bytes, ctx, meta);
+    }
+}
+
+/// `add_trailer` on a body sent from its file, cached (#793) or static
+/// (#844): it goes chunked, without its length, the trailers after it.
+#[cold]
+#[inline(never)]
+pub(crate) fn expect_file_trailers(
     head: Vec<u8>,
     ctx: &phase::RequestCtx<'_>,
     meta: &mut phase::ProcessMeta,
@@ -2908,6 +2926,11 @@ async fn drain(state: &RuntimeState, inherited: Option<&[std::os::fd::RawFd]>) {
         }
         monoio::time::sleep(Duration::from_millis(10)).await;
     }
+    // HTTP/2 upstream connections end in their own tasks (GOAWAY): a
+    // moment for them.
+    if crate::upstream::pool_clear() {
+        monoio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The accept loop of a `listen unix:` socket (#263). A connection is
@@ -3141,6 +3164,145 @@ async fn run_auth_subrequest(
         vars,
         limit_req_status: pending.limit_req_status,
         limit_conn_status: pending.limit_conn_status,
+    }
+}
+
+/// What the access phase did before the body was read (#855). Boxed
+/// where `handle` keeps it.
+#[allow(clippy::large_enum_variant)]
+enum AccessFirst {
+    /// It answered (a denial, a limit, or a handler that reads no body):
+    /// that is the response, and the body is discarded.
+    Answer(Response, phase::ProcessMeta),
+    /// It let the request on to a handler that may read the body: the pass
+    /// after the read doesn't count it again, nor redo the subrequests.
+    Continue {
+        noted: phase::BeforeBody,
+        auth: Vec<(&'static [u8], phase::AuthResume)>,
+        held: Option<std::rc::Rc<super::limit_conn::Held>>,
+    },
+}
+
+/// The access phase before the body is read, as nginx runs it (#855): a
+/// pass that stops before any handler that may read the body, with
+/// limit_req's delay and auth_request's subrequests as after the read.
+#[cold]
+#[inline(never)]
+async fn access_before_body(
+    http: &'static PreparedHttp,
+    ctx: &mut phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    request_start: Instant,
+) -> AccessFirst {
+    let pass = |ctx: &phase::RequestCtx<'_>, url_scratch: &mut Vec<u8>| {
+        phase::probe_before_body();
+        let (response, meta) = phase::process_with_meta(http, ctx, url_scratch);
+        (response, meta, phase::probe_result())
+    };
+    let (mut response, mut meta, mut noted) = pass(ctx, url_scratch);
+    if meta.limit_req_delay_ms > 0 {
+        monoio::time::sleep(Duration::from_millis(meta.limit_req_delay_ms)).await;
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        super::limit_req::resume_after_delay(true);
+        (response, meta, noted) = pass(ctx, url_scratch);
+        super::limit_req::resume_after_delay(false);
+    }
+    let held = meta.limit_conn_held.clone();
+    let mut auth: Vec<(&'static [u8], phase::AuthResume)> = Vec::new();
+    // As `auth_subrequest`.
+    for _ in 0..8 {
+        let Some(pending) = meta.auth_request.take() else {
+            break;
+        };
+        let outcome = run_auth_subrequest(http, ctx, url_scratch, &pending, request_start).await;
+        auth.push((pending.uri, outcome));
+        phase::resume_auth_request(auth.clone());
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        (response, meta, noted) = pass(ctx, url_scratch);
+        phase::resume_auth_request(Vec::new());
+        if meta.limit_conn_held.is_none() {
+            meta.limit_conn_held = held.clone();
+        }
+    }
+    if meta.auth_request.take().is_some() {
+        return AccessFirst::Answer(
+            Response::Prebuilt(http.internal_error.pick(ctx.method)),
+            meta,
+        );
+    }
+    match noted {
+        Some(noted) => AccessFirst::Continue {
+            noted,
+            auth,
+            held: meta.limit_conn_held,
+        },
+        None => AccessFirst::Answer(response, meta),
+    }
+}
+
+/// The pass after the body was read, when the access phase ran before it.
+#[cold]
+#[inline(never)]
+fn process_after_access(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    first: AccessFirst,
+    // The body's framing was bad (#806).
+    malformed: bool,
+) -> (Response, phase::ProcessMeta) {
+    let (noted, auth, held) = match first {
+        // An error stands, and the connection closes after it; any other
+        // answer would have discarded the body, which fails: the
+        // location's 400 (ngx_http_send_response, the static handler).
+        AccessFirst::Answer(response, mut meta) => {
+            if !malformed {
+                return (response, meta);
+            }
+            if response_head(&response).is_some_and(|head| response_status(head) >= 400) {
+                malformed_body(ctx, &mut meta);
+                return (response, meta);
+            }
+            let (response, mut meta) = phase::process_with_meta(http, ctx, url_scratch);
+            malformed_body(ctx, &mut meta);
+            return (response, meta);
+        }
+        AccessFirst::Continue { noted, auth, held } => (noted, auth, held),
+    };
+    phase::resume_before_body(Some(noted));
+    phase::resume_auth_request(auth);
+    let (response, mut meta) = phase::process_with_meta(http, ctx, url_scratch);
+    phase::resume_auth_request(Vec::new());
+    phase::resume_before_body(None);
+    if held.is_some() {
+        meta.limit_conn_held = held;
+    }
+    if malformed {
+        malformed_body(ctx, &mut meta);
+    }
+    (response, meta)
+}
+
+/// nginx's line for a bad chunked body, with the location's error log,
+/// and the connection closes after the response.
+fn malformed_body(ctx: &phase::RequestCtx<'_>, meta: &mut phase::ProcessMeta) {
+    meta.keepalive.allow = false;
+    write_error_log(
+        meta.log.error_logs,
+        ErrorLogLevel::Error,
+        &ErrorLogRequest::new(ctx, meta.server_name).with_realip(meta),
+        b"client sent invalid chunked body",
+        None,
+    );
+}
+
+/// A response's head, where it has one already.
+fn response_head(response: &Response) -> Option<&[u8]> {
+    match response {
+        Response::Prebuilt(bytes) => Some(bytes),
+        Response::Owned(bytes) => Some(bytes),
+        Response::File { headers, .. } => Some(headers),
+        _ => None,
     }
 }
 
@@ -5409,6 +5571,11 @@ pub(crate) async fn handle<S: ConnIo>(
                             let mut continue_status = None;
                             // The routed location's client_body_timeout (#147).
                             let mut body_timeout = timeouts.body;
+                            // What the access phase did before the read (#855).
+                            let mut access_first: Option<Box<AccessFirst>> = None;
+                            // A chunked body whose framing was bad, once the
+                            // location is known: it answers the 400 (#806).
+                            let mut body_malformed = false;
                             // A body is framed, even an empty one (`Content-Length:
                             // 0`, or chunked): nginx reads it, and with
                             // client_body_in_file_only writes its file (#628).
@@ -5451,6 +5618,24 @@ pub(crate) async fn handle<S: ConnIo>(
                                             .as_bytes(),
                                             None,
                                         );
+                                    } else if (first.probe_first && !discard_body)
+                                        || req.transfer_encoding_chunked
+                                    {
+                                        // The access phase answers before the
+                                        // body is read (#855), and a static
+                                        // file found then (#836); and where a
+                                        // chunked body can turn out bad, the
+                                        // location answers that (#806).
+                                        let mut probe = probe;
+                                        let outcome = Box::pin(access_before_body(
+                                            http,
+                                            &mut probe,
+                                            &mut *url_scratch,
+                                            request_start,
+                                        ))
+                                        .await;
+                                        discard_body = matches!(outcome, AccessFirst::Answer(..));
+                                        access_first = Some(Box::new(outcome));
                                     }
                                 }
                             }
@@ -5637,6 +5822,11 @@ pub(crate) async fn handle<S: ConnIo>(
                                         let came = filled - body_start;
                                         (came, came as u64)
                                     }
+                                    Err(_) if access_first.is_some() => {
+                                        body_malformed = true;
+                                        let came = filled - body_start;
+                                        (came, came as u64)
+                                    }
                                     Err(_) => {
                                         reject_request(
                                             stream,
@@ -5672,6 +5862,10 @@ pub(crate) async fn handle<S: ConnIo>(
                                         body_too_large = true;
                                         (0, 0)
                                     }
+                                    Err(_) if access_first.is_some() => {
+                                        body_malformed = true;
+                                        (0, 0)
+                                    }
                                     Err(_) => {
                                         reject_request(
                                             stream,
@@ -5693,6 +5887,8 @@ pub(crate) async fn handle<S: ConnIo>(
                             // Over the limit: big enough for the location's check.
                             let body_len = if body_too_large {
                                 request_body_len.max(max_body.saturating_add(1))
+                            } else if body_malformed {
+                                phase::MALFORMED_BODY
                             } else if discard_body && req.content_length.is_some() {
                                 request_body_len
                             } else {
@@ -5747,8 +5943,16 @@ pub(crate) async fn handle<S: ConnIo>(
                                 epoch_secs,
                                 epoch_ms
                             );
-                            let (mut response, mut process_meta) =
-                                phase::process_with_meta(http, &ctx, &mut *url_scratch);
+                            let (mut response, mut process_meta) = match access_first.take() {
+                                None => phase::process_with_meta(http, &ctx, &mut *url_scratch),
+                                Some(first) => process_after_access(
+                                    http,
+                                    &ctx,
+                                    &mut *url_scratch,
+                                    *first,
+                                    body_malformed,
+                                ),
+                            };
                             if authority_mismatch {
                                 authority_mismatch_log(&process_meta, &ctx);
                             }
@@ -5783,7 +5987,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             // Only a proxied response has anything to settle;
                             // the call would move `process_meta` (~1 KB) in
                             // and out for nothing.
-                            let response = if matches!(response, Response::Proxy(_)) {
+                            let mut response = if matches!(response, Response::Proxy(_)) {
                                 let (response, settled_meta) = settle_proxy_response(
                                     http,
                                     &ctx,
@@ -5974,6 +6178,9 @@ pub(crate) async fn handle<S: ConnIo>(
 
                             // gzip (`gzip on` in the location): a body in memory
                             // is compressed here, a file on its way out below.
+                            if process_meta.handler_trailers {
+                                handler_trailers_due(&mut response, &ctx, &mut process_meta);
+                            }
                             let (mut response, gzip_stream) = match process_meta.gzip {
                                 Some(gz) => super::gzip::filter(
                                     gz,

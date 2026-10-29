@@ -206,6 +206,14 @@ impl<S: Duplex> PollIo<S> {
         (io, reclaim)
     }
 
+    /// For a connection to an upstream (#599): the server's frames aren't
+    /// scanned for header blocks.
+    pub(crate) fn client(stream: S) -> Self {
+        let (mut io, _) = Self::new(stream);
+        io.scan.skip = usize::MAX;
+        io
+    }
+
     /// The header block sizes the frames read so far gave.
     pub(crate) fn header_blocks(&self) -> Rc<HeaderBlocks> {
         self.scan.blocks.clone()
