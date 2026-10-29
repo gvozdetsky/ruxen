@@ -1461,7 +1461,7 @@ pub(crate) fn utc_offset_minutes(secs: u64) -> i32 {
 #[cold]
 #[inline(never)]
 fn local_offset_minutes(secs: u64) -> i32 {
-    let t = secs as libc::time_t;
+    let t = secs as _;
     // SAFETY: `localtime_r` with pointers to locals.
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
