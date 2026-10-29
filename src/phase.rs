@@ -378,6 +378,9 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// The location's `aio threads` pool: file bodies are read (and sent
+    /// with `sendfile`) on it, off the worker (#526).
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// A proxied response under `proxy_pass_header Date`: its `Date` is
     /// the upstream's, or there is none, and the worker doesn't stamp one
     /// (#360).
@@ -449,6 +452,7 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            aio: None,
             keep_upstream_date: false,
             trailers_due: false,
             gzip: None,
@@ -670,6 +674,18 @@ pub struct FileBody {
     pub fd: OwnedFd,
     pub offset: u64,
     pub len: u64,
+    /// A multipart/byteranges body (#414): `len` counts the parts'
+    /// headers and the closing boundary too, `offset` is unused.
+    pub parts: Option<Box<FileParts>>,
+}
+
+/// The parts of a multipart/byteranges body sent from its file, as
+/// nginx's range filter chains them (ngx_http_range_multipart_body).
+pub struct FileParts {
+    /// Each part's header, and its range of the file: offset, length.
+    pub parts: Vec<(Vec<u8>, u64, u64)>,
+    /// The closing boundary.
+    pub trailer: Vec<u8>,
 }
 
 /// Status handling requested by `error_page` after an internal redirect.
@@ -1038,9 +1054,14 @@ fn process_with_meta_inner(
         let req = req_now.as_ref().unwrap_or(req_in);
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
+        // A jump to a named location keeps `valid_unparsed_uri`
+        // (ngx_http_named_location); a redirect to a URI clears it.
         let internal_request = !refusing || hop > 0;
         if internal_request {
-            rewrite_state.unparsed_uri = false;
+            rewrite_state.internal = true;
+            if named_target.is_none() {
+                rewrite_state.unparsed_uri = false;
+            }
         }
         let mut loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
@@ -1072,6 +1093,13 @@ fn process_with_meta_inner(
             {
                 // Answered before any location: the server's error_page,
                 // add_header and logs, and the realip address.
+                let mut response = response;
+                crate::worker::generated_preconditions(
+                    &mut response,
+                    req,
+                    error_page_status,
+                    server.server_header,
+                );
                 let (response, mut refused) = refuse(
                     http,
                     req,
@@ -1347,6 +1375,7 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
+        meta.aio = loc.aio;
         meta.gzip = loc.gzip;
         meta.max_ranges = loc.max_ranges;
         // `set $limit_rate` wins over the directive, as nginx's
@@ -2616,6 +2645,15 @@ fn client_certificate_refusal(
                 || !crate::x509_verify::error_is_optional(*code as std::ffi::c_long) =>
         {
             log(format!("client SSL certificate verify error: ({code}:{text})").as_bytes());
+            Some((495, true))
+        }
+        // `ssl_ocsp` (#142); a pending check fails closed.
+        (_, ClientVerify::Revoked(_) | ClientVerify::OcspPending(_)) => {
+            let text = match &tls.client_verify {
+                ClientVerify::Revoked(text) => text,
+                _ => crate::ocsp::REQUEST_FAILED,
+            };
+            log(format!("client SSL certificate verify error: {text}").as_bytes());
             Some((495, true))
         }
         (VerifyClient::On, ClientVerify::None) => {

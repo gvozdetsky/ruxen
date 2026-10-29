@@ -171,18 +171,6 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
   clients need TLS 1.0.
 - **Issue:** none; [#36] (closed) made the old names a warning.
 
-### `proxy_request_buffering off`
-
-- **ruxen:** reads the whole request body before it connects to the
-  upstream, spilling to `client_body_temp_path` beyond
-  `client_body_buffer_size`, as nginx does with the default `on`.
-- **Matters:** for large uploads: the upstream sees the body only once it
-  is complete, and the disk holds it meanwhile. Applications that read a
-  body as it streams in (progress, early rejection) wait.
-- **Do:** room in `client_body_temp_path` and a `client_max_body_size`
-  that fits; keep nginx for upload endpoints that need streaming.
-- **Issue:** [#134] (open).
-
 ### `alias` and the trailing slash
 
 `location /static { alias /srv/static/; }`: only one of them ends with `/`.
@@ -258,10 +246,15 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
 
 ### `ssl_conf_command`
 
-- **ruxen:** its TLS is rustls; OpenSSL commands aren't applied.
-- **Do:** check what the command set. `Options KTLS`: kernel TLS is [#673]
-  (open). `Ciphersuites`: rustls's TLS 1.3 suites are AES-GCM and
-  ChaCha20-Poly1305.
+- **ruxen:** its TLS is rustls; OpenSSL commands aren't applied, except
+  `Options KTLS` (and `-KTLS`): as in nginx, the kernel then encrypts the
+  records after the handshake, and `sendfile` works over TLS. It needs the
+  `tls` kernel module (`modprobe tls`; ruxen started as root loads it);
+  without it ruxen warns at startup and serves TLS in userspace. TLS 1.3
+  key updates need Linux 6.14 or later; on older kernels a client's
+  KeyUpdate closes a kTLS connection.
+- **Do:** check what the other commands set. `Ciphersuites`: rustls's
+  TLS 1.3 suites are AES-GCM and ChaCha20-Poly1305.
 
 ### `ssi`
 
@@ -293,6 +286,19 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
   nginx.
 - **Issue:** none.
 
+### `aio on` and `aio_write on`
+
+- **ruxen:** has no Linux native AIO: with `aio on`, file reads block the
+  worker as with `aio off`. `aio threads` (and `thread_pool`) works as in
+  nginx: file reads and `sendfile` run on a pool of threads, so a slow disk
+  stalls a pool thread, not every connection of the worker. `aio_write on`
+  doesn't move `proxy_cache` writes off the worker yet. Opening and
+  `stat`ing a file stay on the worker, as in nginx.
+- **Matters:** with files on slow or network storage (NFS, FUSE, a cold
+  volume).
+- **Do:** `aio threads;` instead of `aio on;`.
+- **Issue:** [#526] (open: `aio_write`).
+
 ### `gzip` in `if`
 
 - **ruxen:** applies `gzip` in a location's `if`, not in a server's.
@@ -314,14 +320,12 @@ among the `differs` lines, but nginx warns and behaves the same.
 
 `ignored: N tuning directives with no effect in ruxen: …`: accepted and
 ignored, since they tune nginx's own machinery (`tcp_nopush`,
-`types_hash_max_size`, `proxy_buffers`, `open_file_cache`, `aio`, `*_temp_path`
+`types_hash_max_size`, `proxy_buffers`, `open_file_cache`, `directio`, `*_temp_path`
 of modules ruxen doesn't have, …). Nothing to do. Some notes:
 
 - `daemon`, `master_process`: ruxen stays in the foreground, one process.
 - `worker_cpu_affinity`, `worker_priority`: use the service manager
   (`CPUAffinity=`, `Nice=` in systemd).
-- `aio`, `thread_pool`: file reads run on the worker; a slow disk stalls
-  its connections ([#526], open).
 - `env`: ruxen has no embedded languages to pass variables to.
 
 ## Running ruxen in place of nginx
@@ -435,7 +439,6 @@ start without it.
   `/etc/ruxen/ruxen.conf`.
 
 [#36]: https://github.com/gvozdetsky/ruxen/issues/36
-[#134]: https://github.com/gvozdetsky/ruxen/issues/134
 [#337]: https://github.com/gvozdetsky/ruxen/issues/337
 [#463]: https://github.com/gvozdetsky/ruxen/issues/463
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
@@ -443,7 +446,6 @@ start without it.
 [#596]: https://github.com/gvozdetsky/ruxen/issues/596
 [#597]: https://github.com/gvozdetsky/ruxen/issues/597
 [#599]: https://github.com/gvozdetsky/ruxen/issues/599
-[#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
 [#764]: https://github.com/gvozdetsky/ruxen/issues/764
 [#774]: https://github.com/gvozdetsky/ruxen/issues/774
