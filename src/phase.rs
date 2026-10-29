@@ -466,6 +466,9 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// The location's `aio threads` pool: file bodies are read (and sent
+    /// with `sendfile`) on it, off the worker (#526).
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// A proxied response under `proxy_pass_header Date`: its `Date` is
     /// the upstream's, or there is none, and the worker doesn't stamp one
     /// (#360).
@@ -537,6 +540,7 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            aio: None,
             keep_upstream_date: false,
             trailers_due: false,
             gzip: None,
@@ -758,6 +762,18 @@ pub struct FileBody {
     pub fd: OwnedFd,
     pub offset: u64,
     pub len: u64,
+    /// A multipart/byteranges body (#414): `len` counts the parts'
+    /// headers and the closing boundary too, `offset` is unused.
+    pub parts: Option<Box<FileParts>>,
+}
+
+/// The parts of a multipart/byteranges body sent from its file, as
+/// nginx's range filter chains them (ngx_http_range_multipart_body).
+pub struct FileParts {
+    /// Each part's header, and its range of the file: offset, length.
+    pub parts: Vec<(Vec<u8>, u64, u64)>,
+    /// The closing boundary.
+    pub trailer: Vec<u8>,
 }
 
 /// Status handling requested by `error_page` after an internal redirect.
@@ -801,6 +817,19 @@ pub struct Reroute {
     /// The error page answers a status after which nginx's special
     /// response handler ends the connection (`http::closes_connection`).
     pub closes: bool,
+    /// A named target reached from the proxy path: where the request was.
+    pub named_from: Option<Box<NamedFrom>>,
+}
+
+/// The URI, arguments and URI state a proxying location left, for a jump
+/// to a named location after `proxy_intercept_errors` (#814): nginx's
+/// ngx_http_named_location keeps `r->uri`, `r->args`, `valid_unparsed_uri`.
+#[derive(Clone)]
+pub struct NamedFrom {
+    pub uri: Vec<u8>,
+    pub args: Option<Vec<u8>>,
+    pub unparsed_uri: bool,
+    pub internal: bool,
 }
 
 /// Test-only helper: run the pipeline and return only the response,
@@ -1014,6 +1043,7 @@ fn process_with_meta_inner(
     let req_in = req;
     // An error page for a status that ends the connection (`Reroute::closes`).
     let mut closes = false;
+    let mut named_state: Option<(bool, bool)> = None;
     match initial_reroute {
         None => {
             // Normalize the URI once at FindConfig entry; Rewrite / internal
@@ -1032,6 +1062,10 @@ fn process_with_meta_inner(
         }
         Some(reroute) => {
             closes = reroute.closes;
+            named_state = reroute
+                .named_from
+                .as_ref()
+                .map(|from| (from.unparsed_uri, from.internal));
             if turns_into_get(req, &reroute) {
                 req_now = Some(error_page_request(req));
             }
@@ -1070,10 +1104,12 @@ fn process_with_meta_inner(
                     }
                 }
                 RerouteTarget::Named(name) => {
-                    // Named-location jumps preserve the current URI. Seed the
-                    // normalized request URI and start the loop with a named target.
+                    // Named-location jumps preserve the current URI: the
+                    // one the proxying location had, else the request's.
                     url_scratch.clear();
-                    if let Err(resp) =
+                    if let Some(from) = &reroute.named_from {
+                        url_scratch.extend_from_slice(&from.uri);
+                    } else if let Err(resp) =
                         normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
                     {
                         return (resp, refused_meta(server, true));
@@ -1085,6 +1121,10 @@ fn process_with_meta_inner(
     }
     let mut rewrite_state = RewriteState::default();
     rewrite_state.doc_root = Some(server.doc_root);
+    if let Some((unparsed_uri, internal)) = named_state {
+        rewrite_state.unparsed_uri = unparsed_uri;
+        rewrite_state.internal = internal;
+    }
     // A regex server_name's captures are `$1`…`$9` until another regex
     // matches (nginx's r->captures from ngx_http_find_virtual_server).
     if let Some(captures) = regex_captures.as_ref() {
@@ -1126,9 +1166,14 @@ fn process_with_meta_inner(
         let req = req_now.as_ref().unwrap_or(req_in);
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
+        // A jump to a named location keeps `valid_unparsed_uri`
+        // (ngx_http_named_location); a redirect to a URI clears it.
         let internal_request = !refusing || hop > 0;
         if internal_request {
-            rewrite_state.unparsed_uri = false;
+            rewrite_state.internal = true;
+            if named_target.is_none() {
+                rewrite_state.unparsed_uri = false;
+            }
         }
         let mut loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
@@ -1160,6 +1205,13 @@ fn process_with_meta_inner(
             {
                 // Answered before any location: the server's error_page,
                 // add_header and logs, and the realip address.
+                let mut response = response;
+                crate::worker::generated_preconditions(
+                    &mut response,
+                    req,
+                    error_page_status,
+                    server.server_header,
+                );
                 let (response, mut refused) = refuse(
                     http,
                     req,
@@ -1435,6 +1487,7 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
+        meta.aio = loc.aio;
         meta.gzip = loc.gzip;
         meta.max_ranges = loc.max_ranges;
         // `set $limit_rate` wins over the directive, as nginx's
@@ -2861,6 +2914,15 @@ fn client_certificate_refusal(
                 || !crate::x509_verify::error_is_optional(*code as std::ffi::c_long) =>
         {
             log(format!("client SSL certificate verify error: ({code}:{text})").as_bytes());
+            Some((495, true))
+        }
+        // `ssl_ocsp` (#142); a pending check fails closed.
+        (_, ClientVerify::Revoked(_) | ClientVerify::OcspPending(_)) => {
+            let text = match &tls.client_verify {
+                ClientVerify::Revoked(text) => text,
+                _ => crate::ocsp::REQUEST_FAILED,
+            };
+            log(format!("client SSL certificate verify error: {text}").as_bytes());
             Some((495, true))
         }
         (VerifyClient::On, ClientVerify::None) => {
