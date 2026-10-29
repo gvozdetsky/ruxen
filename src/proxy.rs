@@ -269,12 +269,258 @@ pub struct CachePlan {
     pub background: bool,
     /// The stale response's `stale-if-error` still covers it.
     pub stale_error: bool,
+    /// The location's `aio threads` pool: the cache file is read on it.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
+    /// A hit, or with `unread_stale` a stale entry, whose file `run_proxy`
+    /// reads on `aio` (`hit` is `None`).
+    pub unread: bool,
+    /// The stale entry's `stale_updating` (`Lookup::Stale`).
+    pub unread_stale: Option<bool>,
 }
 
 impl Drop for CachePlan {
     fn drop(&mut self) {
         if let Some(token) = self.token {
             self.zone.release(&self.hash, token);
+        }
+    }
+}
+
+impl CachePlan {
+    /// The lookup (ngx_http_file_cache_open) from `hash`. `defer`
+    /// (`aio threads`): a hit's or a stale entry's file isn't read here but
+    /// in `run_proxy`, on the pool (`unread`).
+    pub(crate) fn lookup(&mut self, headers: &[u8], no_cache: bool, defer: bool) {
+        use crate::proxy_cache::{CacheStatus, Entry, Lookup};
+        let (conf, zone) = (self.conf, self.zone);
+        let now = crate::proxy_cache::now_secs();
+        // ngx_http_file_cache_reopen: the main key holds a response stored
+        // for another variant (its `Vary` names headers this request has
+        // other values of), so the lookup goes on at the request's own
+        // variant's key, once.
+        loop {
+            let hash = self.hash;
+            let path = || zone.file_path(&hash);
+            let mut other = None;
+            match zone.lookup(&hash, conf.min_uses, now) {
+                Lookup::Error(code) => {
+                    self.status = CacheStatus::Hit;
+                    self.hit = Some(CacheHit::Error(code));
+                }
+                Lookup::Hit if defer => {
+                    self.status = CacheStatus::Hit;
+                    self.unread = true;
+                }
+                Lookup::Hit => match Entry::read(&path(), &self.key) {
+                    Some(entry) => match entry.other_variant(&self.main, headers) {
+                        None => {
+                            self.status = CacheStatus::Hit;
+                            self.hit = Some(CacheHit::Entry(entry));
+                        }
+                        variant => other = variant,
+                    },
+                    None => zone.forget_file(&hash),
+                },
+                Lookup::Stale {
+                    token: updater,
+                    stale_updating,
+                    stale_error: covered,
+                } => {
+                    // ngx_http_upstream_cache: STALE (this request updates)
+                    // or UPDATING (another one does).
+                    self.token = updater;
+                    self.stale_error = covered;
+                    if defer {
+                        self.unread = true;
+                        self.unread_stale = Some(stale_updating);
+                    } else if self.stale_wanted(stale_updating) {
+                        let entry = Entry::read(&path(), &self.key);
+                        other = self.take_stale(entry, None, stale_updating, headers);
+                    } else {
+                        // Only its header, for the variant.
+                        other = crate::proxy_cache::stored_other_variant(
+                            &path(),
+                            &self.key,
+                            &self.main,
+                            headers,
+                        );
+                        self.take_stale(None, other, stale_updating, headers);
+                    }
+                }
+                Lookup::Miss {
+                    store: enough,
+                    probe,
+                } => {
+                    self.store &= enough;
+                    self.cacheable = enough;
+                    // A file from before a restart (nginx's cold cache).
+                    if probe && let Some(entry) = Entry::read(&path(), &self.key) {
+                        zone.adopt(&hash, &entry);
+                        self.store = !no_cache;
+                        self.cacheable = true;
+                        other = entry.other_variant(&self.main, headers);
+                        if other.is_some() {
+                        } else if entry.valid_sec < now {
+                            self.status = CacheStatus::Expired;
+                            self.stale = Some(entry);
+                        } else {
+                            self.status = CacheStatus::Hit;
+                            self.hit = Some(CacheHit::Entry(entry));
+                        }
+                    }
+                    // proxy_cache_lock: one request fetches a missing
+                    // response, the others wait for it.
+                    if other.is_none()
+                        && self.status == CacheStatus::Miss
+                        && self.store
+                        && conf.lock
+                    {
+                        match zone.try_lock(&hash, conf.lock_age_ms) {
+                            Some(lock) => self.token = Some(lock),
+                            None if conf.lock_timeout_ms == 0 => self.store = false,
+                            None => {
+                                self.wait_until = Some(
+                                    Instant::now() + Duration::from_millis(conf.lock_timeout_ms),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // A variant's key holding yet another variant is a miss, as
+            // nginx's "incorrect vary hash".
+            let Some(variant) = other.filter(|_| !self.secondary) else {
+                break;
+            };
+            self.go_to_variant(variant, no_cache);
+        }
+    }
+
+    /// Something may answer with the stale entry: read it whole.
+    fn stale_wanted(&self, stale_updating: bool) -> bool {
+        let use_stale = self.conf.use_stale;
+        use_stale.updating
+            || stale_updating
+            || self.stale_error
+            || self.conf.revalidate
+            || use_stale.any()
+    }
+
+    /// What the stale entry answers with (ngx_http_upstream_cache: STALE,
+    /// this request updates, or UPDATING, another one does). Returns the
+    /// variant it holds instead, if any (`other`: known from its header).
+    fn take_stale(
+        &mut self,
+        entry: Option<crate::proxy_cache::Entry>,
+        other: Option<crate::proxy_cache::CacheHash>,
+        stale_updating: bool,
+        headers: &[u8],
+    ) -> Option<crate::proxy_cache::CacheHash> {
+        use crate::proxy_cache::CacheStatus;
+        let other = other.or_else(|| entry.as_ref()?.other_variant(&self.main, headers));
+        let serve_stale = self.conf.use_stale.updating || stale_updating;
+        match entry {
+            _ if other.is_some() => {}
+            Some(entry) if serve_stale && self.token.is_some() && self.conf.background_update => {
+                self.status = CacheStatus::Stale;
+                self.hit = Some(CacheHit::Entry(entry));
+                self.background = true;
+            }
+            Some(entry) if serve_stale && self.token.is_none() => {
+                self.status = CacheStatus::Updating;
+                self.hit = Some(CacheHit::Entry(entry));
+            }
+            // Fetched again; kept to revalidate with, or to answer with if
+            // the upstream fails (proxy_cache_use_stale).
+            entry => {
+                self.status = CacheStatus::Expired;
+                self.stale = entry;
+            }
+        }
+        other
+    }
+
+    /// The lookup goes on at the request's variant's key.
+    fn go_to_variant(&mut self, variant: crate::proxy_cache::CacheHash, no_cache: bool) {
+        if let Some(t) = self.token.take() {
+            self.zone.release(&self.hash, t);
+        }
+        self.hash = variant;
+        self.secondary = true;
+        self.status = crate::proxy_cache::CacheStatus::Miss;
+        self.store = !no_cache;
+        self.cacheable = true;
+        self.stale_error = false;
+    }
+}
+
+/// `aio threads`: the entry `cache_plan` left unread, read on the pool,
+/// then what the lookup would have done with it: a hit, a stale answer, a
+/// miss, or on to its variant. A request that goes upstream after all
+/// needs the peer the handler didn't pick.
+#[cold]
+#[inline(never)]
+async fn read_unread_hit(plan: &mut ProxyPlan) -> Result<(), Response> {
+    use crate::proxy_cache::CacheStatus;
+    let Some(cache) = plan.cache.as_deref_mut() else {
+        return Ok(());
+    };
+    let headers = std::mem::take(&mut cache.request_headers);
+    while cache.unread {
+        cache.unread = false;
+        // The lookup's Hit and Stale arms leave `store` at `!no_cache`.
+        let no_cache = !cache.store;
+        let Ok(entry) = read_entry(cache).await else {
+            // A full queue: nginx's NGX_ERROR from the cache read.
+            cache.request_headers = headers;
+            return Err(crate::worker::internal_error_response(plan.method));
+        };
+        let other = match cache.unread_stale.take() {
+            Some(stale_updating) => {
+                let other = entry
+                    .as_ref()
+                    .and_then(|e| e.other_variant(&cache.main, &headers));
+                let entry = entry.filter(|_| cache.stale_wanted(stale_updating));
+                cache.take_stale(entry, other, stale_updating, &headers)
+            }
+            None => match entry {
+                Some(entry) => {
+                    let other = entry.other_variant(&cache.main, &headers);
+                    if other.is_none() {
+                        cache.hit = Some(CacheHit::Entry(entry));
+                    } else {
+                        cache.status = CacheStatus::Miss;
+                    }
+                    other
+                }
+                None => {
+                    cache.zone.forget_file(&cache.hash);
+                    cache.status = CacheStatus::Miss;
+                    None
+                }
+            },
+        };
+        if let Some(variant) = other.filter(|_| !cache.secondary) {
+            cache.go_to_variant(variant, no_cache);
+            cache.lookup(&headers, no_cache, true);
+        }
+    }
+    cache.request_headers = headers;
+    if (cache.hit.is_none() || cache.background) && plan.initial_peer.is_none() {
+        plan.initial_peer =
+            upstream::pick_peer(plan.upstream, &Default::default(), plan.hash.as_deref_mut());
+    }
+    Ok(())
+}
+
+/// The entry at `cache.hash`, read on the location's pool if it has one.
+async fn read_entry(cache: &CachePlan) -> std::io::Result<Option<crate::proxy_cache::Entry>> {
+    let path = cache.zone.file_path(&cache.hash);
+    match cache.aio {
+        None => Ok(crate::proxy_cache::Entry::read(&path, &cache.key)),
+        Some(pool) => {
+            let key = cache.key.clone();
+            crate::aio::run(pool, move || crate::proxy_cache::Entry::read(&path, &key)).await
         }
     }
 }
@@ -725,6 +971,11 @@ pub async fn run_proxy(
     late_limit_rate: Option<LateLimitRate<'_>>,
 ) -> Response {
     report.passes_date = plan.response.passes_date;
+    if plan.cache.as_ref().is_some_and(|c| c.unread)
+        && let Err(response) = Box::pin(read_unread_hit(&mut plan)).await
+    {
+        return response;
+    }
     if let Some(cache) = plan.cache.as_deref_mut() {
         if cache.wait_until.is_some() {
             Box::pin(wait_for_lock(cache)).await;
@@ -2498,6 +2749,9 @@ async fn attempt(
                 slot,
             },
         );
+    } else if response_framed {
+        // An unframed body ended at the upstream's close already.
+        upstream::close_after_peer(stream, slot);
     }
 
     // Return scratch to the per-worker pool only on the success path. Error
@@ -2892,7 +3146,7 @@ fn stale_answer(
 /// cached, the lock is free or aged, or `proxy_cache_lock_timeout` ends;
 /// then the response isn't stored.
 async fn wait_for_lock(cache: &mut CachePlan) {
-    use crate::proxy_cache::{CacheStatus, Entry, now_ms, now_secs};
+    use crate::proxy_cache::{CacheStatus, now_ms, now_secs};
     let Some(deadline) = cache.wait_until.take() else {
         return;
     };
@@ -2908,7 +3162,7 @@ async fn wait_for_lock(cache: &mut CachePlan) {
         }
         monoio::time::sleep(pause).await;
         if cache.zone.is_fresh(&cache.hash, now_secs())
-            && let Some(entry) = Entry::read(&cache.zone.file_path(&cache.hash), &cache.key)
+            && let Ok(Some(entry)) = read_entry(cache).await
             && entry
                 .other_variant(&cache.main, &cache.request_headers)
                 .is_none()
@@ -3171,7 +3425,7 @@ fn conditional_fresh(method: Method, server: &[u8], cache: &CachePlan, resp: &mu
 /// The cached head as the not-modified filter sends a 304: without
 /// `Content-Type`, `Content-Length` and `Accept-Ranges`
 /// (ngx_http_not_modified_header_filter clears them).
-fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
+pub(crate) fn conditional_head(head: &[u8], status: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(head.len());
     out.extend_from_slice(
         format!("HTTP/1.1 {status} {}", crate::http::reason_phrase(status)).as_bytes(),

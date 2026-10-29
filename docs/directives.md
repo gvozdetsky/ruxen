@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 197 implemented, 18 accepted with a difference, 71 accepted with no effect, 0 refused, 278 unknown.
+Of 564 directives: 203 implemented, 18 accepted with a difference, 68 accepted with no effect, 0 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -58,7 +58,7 @@ Of 564 directives: 197 implemented, 18 accepted with a difference, 71 accepted w
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `thread_pool` | accepted, no effect | any |  |
+| `thread_pool` | yes | main |  |
 
 ## event
 
@@ -131,8 +131,8 @@ Not supported: `ssl_engine`.
 | `sendfile` | yes | any |  |
 | `sendfile_max_chunk` | accepted, no effect | any |  |
 | `subrequest_output_buffer_size` | no |  |  |
-| `aio` | accepted, no effect | any |  |
-| `aio_write` | accepted, no effect | any |  |
+| `aio` | yes | http, server, location |  |
+| `aio_write` | accepted, differs | any | proxy_cache files are still written on the worker (#526) |
 | `read_ahead` | accepted, no effect | any |  |
 | `directio` | accepted, no effect | any |  |
 | `directio_alignment` | accepted, no effect | any |  |
@@ -615,15 +615,15 @@ Not supported: `slice`.
 | `ssl_session_ticket_key` | yes | http, server |  |
 | `ssl_session_timeout` | yes | http, server |  |
 | `ssl_crl` | yes | http, server |  |
-| `ssl_ocsp` | no |  |  |
-| `ssl_ocsp_responder` | no |  |  |
-| `ssl_ocsp_cache` | no |  |  |
+| `ssl_ocsp` | yes | http, server |  |
+| `ssl_ocsp_responder` | yes | http, server |  |
+| `ssl_ocsp_cache` | yes | http, server |  |
 | `ssl_stapling` | yes | http, server |  |
 | `ssl_stapling_file` | yes | http, server |  |
 | `ssl_stapling_responder` | yes | http, server |  |
 | `ssl_stapling_verify` | yes | http, server |  |
 | `ssl_early_data` | accepted, differs | http, server | TLS 1.3 early data is not accepted |
-| `ssl_conf_command` | accepted, differs | http, server | OpenSSL commands are not applied: ruxen's TLS is rustls |
+| `ssl_conf_command` | yes | http, server |  |
 | `ssl_reject_handshake` | yes | http, server |  |
 
 ## http_stub_status

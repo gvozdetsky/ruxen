@@ -334,18 +334,28 @@ The last arg is the fallback:
 
 ## Byte ranges
 
-- **Static files** (`file.rs`, #401) use the range filter's parse (`worker::range::parse_header`, up to `max_ranges`; `max_ranges 0` turns ranges off) and `If-Range` against the ETag or `Last-Modified`. One range is a 206 with `Content-Range` whose body is the file slice, inline or as a `FileBody` (sendfile), and no `Accept-Ranges`, as nginx's. Several are a `multipart/byteranges` 206 built by `worker::range::multipart` with the parts `pread` from the file; up to 1 MiB in total (`MULTIPART_MAX`), beyond which the file goes whole as a 200, where nginx streams the parts from the file. None satisfiable is nginx's 416 page (`worker::range::not_satisfiable`).
+- **Static files** (`file.rs`, #401) use the range filter's parse (`worker::range::parse_header`, up to `max_ranges`; `max_ranges 0` turns ranges off) and `If-Range` against the ETag or `Last-Modified`. One range is a 206 with `Content-Range` whose body is the file slice, inline or as a `FileBody` (sendfile), and no `Accept-Ranges`, as nginx's. Several are a `multipart/byteranges` 206 with nginx's part layout: up to an inline body's size the parts are `pread` into it (`worker::range::multipart`), above it they are sent from the file as nginx's multipart body filter chains them (#414): `worker::range::multipart_file` gives a `FileBody` with `FileParts` (each part's header and file range, then the closing boundary), sent by the sendfile path or the read-and-write one (TLS, HTTP/2, `limit_rate`); a cache hit's parts go the same way. None satisfiable is nginx's 416 page (`worker::range::not_satisfiable`).
 - **Proxied and cached responses** (#370) go through `worker::range`, nginx's range filter over a response held in memory: nginx's range parse, one range as a 206 with the filter's own `Content-Range`, several as `multipart/byteranges` (a counter boundary, nginx's part layout), none satisfiable as nginx's 416 page with `Content-Range: bytes */<length>`. When it may cut follows `ngx_http_upstream_process_headers` and `ngx_http_upstream_copy_allow_ranges`: `proxy_force_ranges` (one range; several on a cache hit), an upstream `Accept-Ranges` on a cache hit (several) or on a cacheable response (one). The upstream's `Accept-Ranges` is dropped then and the filter writes its own; otherwise the response goes out as the upstream sent it. A body without a length (chunked) is never cut. The filter runs before `add_header` / `add_trailer` and skips a response gzip will compress, which is nginx's order: gzip, then the range filter, then the chunked filter that writes the trailers.
 
 ## Static file bodies and `sendfile`
 
 `sendfile on|off` (http / server / location, default off as in nginx) picks how file bodies leave the process. Measured on static_8k (8 KiB, `wrk -t16 -c512`): the copying path was at 89% of nginx; with sendfile on both servers ruxen is at ~96.5%.
 
-- **`sendfile off`** (and any TLS connection): bodies up to 8 KiB are `pread` into the response buffer and written with one io_uring write; larger bodies stream through a 64 KiB buffer (`stream_file`). Two user-space copies per body byte.
+- **`sendfile off`** (and a TLS connection in userspace): bodies up to 8 KiB are `pread` into the response buffer and written with one io_uring write; larger bodies stream through a 64 KiB buffer (`stream_file`). Two user-space copies per body byte.
 - **`sendfile on`, plain TCP, body ≥ 4 KiB**: `serve_path` returns `Response::File` and the worker calls `send_head_and_file`. The header block goes out with `send(MSG_MORE)` so the kernel coalesces it with the first file pages (nginx gets the same from `tcp_nopush`). The body goes out with `sendfile(2)` in ≤ 2 MiB chunks (`sendfile_max_chunk` default). No user-space copy.
 - **Non-blocking without a new io_uring op.** monoio's `Pipe` doesn't expose its fds, so io_uring `splice` isn't reachable from outside the crate. Instead the socket is switched to `O_NONBLOCK` on first use and `send`/`sendfile` are called directly; on `EAGAIN` the worker awaits `TcpStream::writable()` (an io_uring PollAdd). io_uring ops on the same socket behave the same with or without the flag, because the kernel already tries non-blocking first and arms a poll on EAGAIN. `tests/m45_sendfile.rs` checks that a stalled reader doesn't block the worker.
 - **Why 4 KiB.** Below it, `pread` + one io_uring write beats two direct syscalls: against the inline path, 1 KiB was −3%, 2 KiB break-even, 4 KiB +6%, 8 KiB +8%. nginx itself uses sendfile for every size.
-- **File side is synchronous**, like the `pread` it replaces: a page-cache miss blocks the worker for the disk read. nginx has the same property without `aio`.
+- **File side is synchronous**, like the `pread` it replaces: a page-cache miss blocks the worker for the disk read. nginx has the same property without `aio`; `aio threads` moves it off the worker (below).
+- **kTLS** (`ssl_conf_command Options KTLS`, #673; `src/ktls.rs`): rustls runs the handshake, then hands its traffic keys to the kernel (`dangerous_extract_secrets`, `setsockopt(SOL_TLS)`), and the connection goes on as a `KtlsStream`: plaintext reads and writes and `sendfile` on the socket, as plain TCP. The switch needs the record boundary: ciphertext rustls was given is tracked by record header (`RecordCursor`), and a read that ends mid-record keeps the connection in userspace. Also in userspace: a cipher or version the kernel lacks (`probe`, once at startup, as root, which loads the `tls` module). Non-data records come as `EIO` on a read, then `recvmsg` with a control buffer: close_notify is EOF, a TLS 1.3 KeyUpdate is taken (#852), anything else closes. Key updates: the buffered rustls API has no `KernelConnection`, so the kTLS configs log the application traffic secrets (`KeyLog`, `ktls::SecretLog`, filed by ClientHello random, which the record cursor keeps), the switch checks them against the extracted keys, and `Rekey` derives the next generation (RFC 8446, 7.2) and sets it again with `TLS_RX` / `TLS_TX` (Linux 6.14+; older kernels refuse, and the connection closes). A requested update is answered with our KeyUpdate before more data; at 2^24 AES-GCM records the server updates its own key (TLS 1.2 closes there). TLS 1.2 AES-GCM: the kernel counts explicit nonces up from the one it is given, rustls XORs the sequence in, so the kernel's start is moved half the range away.
+
+## `aio threads` (#526)
+
+- **What moves.** With `aio threads[=pool]` in a location, file bodies are read on a thread pool, as nginx's copy filter and `ngx_linux_sendfile_thread` do: the body read into the response buffer (which `serve_path` then leaves to the worker: `file::inline_limit` is 0), `sendfile` (each call is a task, on a `dup` of the socket; EAGAIN waits for room on the worker), the 64 KiB reads of `stream_file` (TLS, `sendfile off`, `limit_rate`) and `stream_file_gzip`, and HTTP/2's whole-body read. gzip streams a file instead of reading it whole. Cache hits go the same way. Without `aio threads` the paths are as before: the extra cost is a branch or two, and the pool code is `#[cold]` and boxed out of the connection's future.
+- **Cache reads.** A `proxy_cache` entry's first read (its header and a small body, `Entry::read`; nginx's `ngx_http_file_cache_aio_read`) goes on the pool for a hit and for a stale entry, and while waiting on `proxy_cache_lock`. The handler builds the upstream request before `run_proxy`, so `cache_plan` doesn't read the file there: it leaves the entry `unread`, picks no peer, and `run_proxy` reads it, then does what the lookup would have done (a hit, a stale answer, a miss when the file is gone, the variant's key) and picks the peer if the request goes upstream after all. Not where the lookup may still shape the request, even at a variant's key: `proxy_cache_revalidate` (a stale entry's validators), `proxy_cache_min_uses` above 1 (a variant not yet cacheable passes the client's conditions and `Range` on), a range past `proxy_cache_max_range_offset`. The first read of a file found after a restart, and those cases, stay on the worker.
+- **What doesn't** (as nginx, which offloads none of it): `open`/`fstat` in `fs_resolve`, `autoindex`. Also still on the worker, where nginx uses the pool: multipart ranges and `add_trailer` bodies read into memory, and `aio_write` (cache files written on the worker; a `--compat` finding). io_uring `OPENAT2`/`STATX` would take open and stat off the worker where the driver is io_uring, but the resolver is synchronous; not done.
+- **The pool** (`src/aio.rs`): per worker, as nginx's are per worker process: `thread_pool name threads=N max_queue=M` (nginx's `default`, 32 and 65536, is added when `aio threads` uses it undefined). Threads start on demand, up to N. A full queue fails the task as `ngx_thread_task_post` does, counting `waiting` as nginx does (tasks queued and running less the threads), with its `[error] thread pool "…" queue overflow` line; the request then ends without the rest of its response, the connection closes.
+- **Back on the worker.** monoio's wakers panic when woken from another thread unless its `sync` feature is on, which would put a remote-queue check in every wake-up. Instead a finished task pushes its id on the worker's list and, once per batch, a byte into a socket pair; a task on the worker (`pump`, alive only while tasks are out) reads the socket and wakes the futures. A task runs to its end even if its future is dropped, so it owns its buffer and descriptors.
+- Measured with the issue's FUSE file system (reads sleep 3 s): `/r` on the same worker answers in 0.3 ms while the file loads, as nginx's 0.2 ms; 2.7 s without `aio threads`. Plain, `sendfile`, gzip, `limit_rate`, TLS, HTTP/2, both drivers.
 
 ## TLS architecture
 
@@ -434,8 +444,7 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   `ServerSessionMemoryCache` (4096 entries) shared by all workers, with
   `ssl_session_timeout` enforced on lookup. `ssl_session_tickets` is on
   by default. A `shared:` cache is kept across a reload, not a restart.
-  0-RTT and OCSP checks of client certificates aren't implemented yet
-  (README, Limitations).
+  0-RTT isn't implemented yet (README, Limitations).
 - **Session ticket keys are nginx's (#140).** `tls_ticket::NginxTicketer`
   builds tickets in the layout OpenSSL uses for nginx's key callback
   (`key name | IV | AES-CBC | HMAC-SHA256`), so the key name is visible.
@@ -518,6 +527,25 @@ snapshot), `src/tls_stream.rs` (rustls ↔ monoio stream adapter) and
   to clone an `Arc`, for stapling certificates only. A server on several
   addresses staples once: `prepare` keeps the stapling certificates of a
   load by their files and settings.
+- **OCSP checks of client certificates (#142)** follow
+  ngx_ssl_ocsp_validate with the same `ocsp` code. A client-certificate
+  context with `ssl_ocsp on|leaf` has an `ocsp::ClientOcsp`; a chain that
+  verifies is `ClientVerify::OcspPending` (with the chain X509_verify_cert
+  built) until `handle_tls` awaits its check, before the first request,
+  under what is left of the handshake's timeout, as nginx holds the
+  handshake open. Each certificate but the last (`leaf`: the leaf only) is
+  asked about at `ssl_ocsp_responder` or its AIA URL, which isn't resolved
+  then: a name needs `resolver`, else the check fails as in nginx.
+  OCSP_basic_verify runs without flags, with the verified chain and the
+  context's certificates. Anything but `good` for all is
+  `ClientVerify::Revoked` with nginx's text (`certificate revoked`,
+  `certificate status unknown`, `certificate status request failed`), and
+  the request is refused with 495; a check that never ran is refused too.
+  `ssl_ocsp_cache shared:NAME:SIZE` is a map shared by the workers and the
+  servers naming it, about 4 entries per KB (nginx's 256-byte slab
+  chunk), the oldest dropped when full, kept across a reload. A resumed
+  session is checked again, as in nginx. Contexts without `ssl_ocsp` pay
+  one comparison after the handshake.
 - **`$ssl_session_id` is ruxen's id for the session, not the wire bytes.**
   rustls exposes neither the TLS 1.2 session ID nor the TLS 1.3 ticket.
   When the variable is used and the listen resumes sessions, a full
