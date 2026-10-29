@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 206 implemented, 17 accepted with a difference, 65 accepted with no effect, 0 refused, 276 unknown.
+Of 564 directives: 213 implemented, 16 accepted with a difference, 62 accepted with no effect, 0 refused, 273 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -58,7 +58,7 @@ Of 564 directives: 206 implemented, 17 accepted with a difference, 65 accepted w
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `thread_pool` | accepted, no effect | any |  |
+| `thread_pool` | yes | main |  |
 
 ## event
 
@@ -131,8 +131,8 @@ Not supported: `ssl_engine`.
 | `sendfile` | yes | any |  |
 | `sendfile_max_chunk` | accepted, no effect | any |  |
 | `subrequest_output_buffer_size` | no |  |  |
-| `aio` | accepted, no effect | any |  |
-| `aio_write` | accepted, no effect | any |  |
+| `aio` | yes | http, server, location |  |
+| `aio_write` | accepted, differs | any | proxy_cache files are still written on the worker (#526) |
 | `read_ahead` | accepted, no effect | any |  |
 | `directio` | accepted, no effect | any |  |
 | `directio_alignment` | accepted, no effect | any |  |
@@ -168,7 +168,7 @@ Not supported: `ssl_engine`.
 | `max_ranges` | yes | http, server, location |  |
 | `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in server and location only) |
 | `etag` | yes | http, server, location |  |
-| `early_hints` | no |  |  |
+| `early_hints` | yes | http, server, location |  |
 | `error_page` | yes | http, server, location |  |
 | `post_action` | yes | http, server, location |  |
 | `open_file_cache` | accepted, no effect | any |  |
@@ -176,8 +176,8 @@ Not supported: `ssl_engine`.
 | `open_file_cache_min_uses` | accepted, no effect | any |  |
 | `open_file_cache_errors` | accepted, no effect | any |  |
 | `open_file_cache_events` | no |  |  |
-| `resolver` | yes | http, server, location |  |
-| `resolver_timeout` | yes | http, server, location |  |
+| `resolver` | yes | http, server, location, upstream |  |
+| `resolver_timeout` | yes | http, server, location, upstream |  |
 | `gzip_vary` | yes | any |  |
 | `gzip_http_version` | yes | any |  |
 | `gzip_proxied` | yes | any |  |
@@ -424,7 +424,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_store` | accepted, differs | any | proxied responses are not stored |
 | `proxy_store_access` | accepted, no effect | any |  |
 | `proxy_buffering` | yes | http, server, location |  |
-| `proxy_request_buffering` | accepted, differs | any | request bodies are still read whole before they are proxied (#134) |
+| `proxy_request_buffering` | yes | http, server, location |  |
 | `proxy_ignore_client_abort` | yes | http, server, location |  |
 | `proxy_bind` | yes | http, server, location |  |
 | `proxy_socket_keepalive` | accepted, no effect | any |  |
@@ -439,7 +439,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_method` | yes | http, server, location |  |
 | `proxy_pass_request_headers` | yes | http, server, location |  |
 | `proxy_pass_request_body` | yes | http, server, location |  |
-| `proxy_pass_trailers` | no |  |  |
+| `proxy_pass_trailers` | yes | http, server, location |  |
 | `proxy_buffer_size` | yes | http, server, location |  |
 | `proxy_read_timeout` | yes | http, server, location |  |
 | `proxy_buffers` | yes | http, server, location |  |
@@ -623,7 +623,7 @@ Not supported: `slice`.
 | `ssl_stapling_responder` | yes | http, server |  |
 | `ssl_stapling_verify` | yes | http, server |  |
 | `ssl_early_data` | accepted, differs | http, server | TLS 1.3 early data is not accepted |
-| `ssl_conf_command` | accepted, differs | http, server | OpenSSL commands are not applied: ruxen's TLS is rustls |
+| `ssl_conf_command` | yes | http, server |  |
 | `ssl_reject_handshake` | yes | http, server |  |
 
 ## http_stub_status
@@ -672,7 +672,9 @@ Not supported: `random`.
 
 ## http_upstream_sticky
 
-Not supported: `sticky`.
+| directive | ruxen | contexts | notes |
+| --- | --- | --- | --- |
+| `sticky` | yes | upstream |  |
 
 ## http_upstream_zone
 

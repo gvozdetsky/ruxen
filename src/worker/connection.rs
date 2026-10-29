@@ -151,10 +151,22 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent + crate::duplex::Du
 
     /// Send a file body itself, when the transport can do better than
     /// `stream_file`'s read-and-write loop: an HTTP/2 stream hands the
-    /// bytes to its DATA frames without copying them (#348). `None`: not
-    /// done, use the loop. Called only when `sends_file_bodies`.
-    async fn send_file_body(&mut self, _body: &phase::FileBody) -> Option<bool> {
-        None
+    /// bytes to its DATA frames without copying them (#348). `Err`: not
+    /// done, use the loop. `aio`: read on that pool. Called only when
+    /// `sends_file_bodies`.
+    async fn send_file_body(
+        &mut self,
+        body: phase::FileBody,
+        _aio: Option<&'static crate::aio::ThreadPool>,
+    ) -> Result<bool, phase::FileBody> {
+        Err(body)
+    }
+
+    /// Copy what a read would return now into `dst`, leaving it unread:
+    /// nginx reads what is there before a body goes unbuffered (#134).
+    /// 0 where the transport can't tell (TLS, HTTP/2).
+    fn peek_ready(&self, _dst: &mut [u8]) -> usize {
+        0
     }
 
     /// An HTTP/2 stream (`h2::StreamIo`): its request line says `HTTP/2.0`.
@@ -268,6 +280,20 @@ impl ConnIo for TcpStream {
 
     async fn wait_writable(&self) -> std::io::Result<()> {
         self.writable(false).await
+    }
+
+    fn peek_ready(&self, dst: &mut [u8]) -> usize {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `dst` is valid for `dst.len()` bytes of writes.
+        let n = unsafe {
+            libc::recv(
+                self.as_raw_fd(),
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        n.max(0) as usize
     }
 
     async fn read_now<T: IoBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
@@ -395,28 +421,112 @@ impl ConnIo for crate::tls::ServerTlsStream<TcpStream> {
     /// `EPOLLRDHUP` does. What the stream and the socket hold stays for
     /// the next read.
     async fn peer_closed(&self) {
-        use std::os::unix::io::AsRawFd;
-        let io = self.io();
-        loop {
-            if io.readable(false).await.is_err() {
-                return;
-            }
-            let mut fd = libc::pollfd {
-                fd: io.as_raw_fd(),
-                events: libc::POLLIN | libc::POLLRDHUP,
-                revents: 0,
+        fin_behind_records(self.io()).await
+    }
+}
+
+/// `peer_closed` of a TLS connection: the FIN on its socket.
+async fn fin_behind_records(io: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        if io.readable(false).await.is_err() {
+            return;
+        }
+        let mut fd = libc::pollfd {
+            fd: io.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: one pollfd of our own; a zero timeout doesn't wait.
+        let n = unsafe { libc::poll(&mut fd, 1, 0) };
+        if n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+            return;
+        }
+        if n != 0 {
+            // Bytes and no FIN yet: the readiness wait would complete
+            // at once again, so look again a while later.
+            monoio::time::sleep(PEER_RECHECK).await;
+        }
+    }
+}
+
+/// A connection on kernel TLS (#673): the socket takes plaintext and
+/// `sendfile`, as plain TCP does; what rustls decrypted before the switch
+/// is read first.
+impl ConnIo for crate::ktls::KtlsStream {
+    async fn idle_read(
+        &mut self,
+        mut buf: Vec<u8>,
+        state: &RuntimeState,
+        idle: IdleLimits,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> (IdleRead, Vec<u8>) {
+        if self.has_buffered_input() {
+            // As `read_first_or_shutdown`: into `buf[..buf.len()]`.
+            // SAFETY: `buf` holds `len` initialized bytes to overwrite.
+            let n = unsafe { self.take_into(buf.as_mut_ptr(), buf.len()) };
+            let next = if n == 0 {
+                IdleRead::Close
+            } else {
+                IdleRead::Read(n)
             };
-            // SAFETY: one pollfd of our own; a zero timeout doesn't wait.
-            let n = unsafe { libc::poll(&mut fd, 1, 0) };
-            if n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
-                return;
-            }
-            if n != 0 {
-                // Bytes and no FIN yet: the readiness wait would complete
-                // at once again, so look again a while later.
-                monoio::time::sleep(PEER_RECHECK).await;
+            return (next, buf);
+        }
+        // Our KeyUpdate when due; at the record limit without one, closed.
+        if let Err(e) = self.ready_to_write()
+            && e.kind() != std::io::ErrorKind::WouldBlock
+        {
+            return (IdleRead::Close, buf);
+        }
+        use monoio::buf::IoBufMut;
+        loop {
+            let len = buf.len();
+            // A record other than data fails the read: a close_notify
+            // closes, a KeyUpdate is taken and the wait goes on.
+            let (next, returned) = read_first_or_shutdown(
+                self.io_mut(),
+                buf.slice_mut(0..len),
+                state,
+                idle,
+                fresh,
+                timers,
+            )
+            .await;
+            let Some(returned) = returned else {
+                return (next, Vec::new());
+            };
+            buf = returned.into_inner();
+            if !matches!(next, IdleRead::Close) || !self.idle_control_record() {
+                return (next, buf);
             }
         }
+    }
+
+    async fn idle_wait(
+        &self,
+        state: &RuntimeState,
+        idle: IdleLimits,
+        fresh: bool,
+        timers: &mut ConnTimers<'_>,
+    ) -> bool {
+        if self.has_buffered_input() {
+            return fresh || !state.is_shutting_down();
+        }
+        wait_readable_or_shutdown(self.io(), state, idle, fresh, timers).await
+    }
+
+    fn sendfile_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.io().as_raw_fd())
+    }
+
+    async fn wait_writable(&self) -> std::io::Result<()> {
+        self.io().writable(false).await
+    }
+
+    async fn peer_closed(&self) {
+        fin_behind_records(self.io()).await
     }
 }
 
@@ -624,15 +734,30 @@ const SENDFILE_MAX_CHUNK: usize = 2 * 1024 * 1024;
 /// Fails on any write error or if the file is shorter than the
 /// `Content-Length` already promised, with the bytes that went out (head
 /// and file); the caller logs the request and drops the connection.
+///
+/// `aio`: each `sendfile` runs on that pool (`sendfile_on_pool`).
 pub(crate) async fn send_head_and_file<S: ConnIo>(
-    stream: &S,
+    stream: &mut S,
     nonblocking: &mut bool,
     head: &[u8],
     body: phase::FileBody,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<(), u64> {
     use std::os::unix::io::AsRawFd;
+    if body.parts.is_some() {
+        return Box::pin(send_head_and_parts(
+            stream,
+            nonblocking,
+            head,
+            body,
+            timer,
+            send_timeout,
+            aio,
+        ))
+        .await;
+    }
     let Some(sock) = stream.sendfile_fd() else {
         return Err(0);
     };
@@ -677,6 +802,19 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
         }
     }
 
+    if let Some(pool) = aio {
+        // Boxed: cold, kept out of every connection's future.
+        return Box::pin(sendfile_on_pool(
+            stream,
+            sock,
+            body,
+            sent as u64,
+            timer,
+            send_timeout,
+            pool,
+        ))
+        .await;
+    }
     let file = body.fd.as_raw_fd();
     let mut offset = body.offset as libc::off_t;
     let end = offset + body.len as libc::off_t;
@@ -705,6 +843,178 @@ pub(crate) async fn send_head_and_file<S: ConnIo>(
         }
     }
     Ok(())
+}
+
+/// `send_head_and_file`'s body under `aio threads`, as nginx's
+/// `ngx_linux_sendfile_thread`: `sendfile` on the pool, where a page-cache
+/// miss blocks a pool thread, not the worker. The socket is non-blocking:
+/// EAGAIN waits for room on the worker and posts again. A task outlives
+/// a dropped future, so it has its own socket and file descriptors.
+#[cold]
+async fn sendfile_on_pool<S: ConnIo>(
+    stream: &S,
+    sock: std::os::unix::io::RawFd,
+    body: phase::FileBody,
+    head_sent: u64,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+    pool: &'static crate::aio::ThreadPool,
+) -> Result<(), u64> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    let start = body.offset;
+    let end = body.offset + body.len;
+    let mut offset = start;
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor or -1.
+    let dup = unsafe { libc::fcntl(sock, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(head_sent);
+    }
+    // SAFETY: `dup` is ours alone.
+    let sock = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(dup) });
+    let file = std::sync::Arc::new(body.fd);
+    while offset < end {
+        let chunk = ((end - offset) as usize).min(SENDFILE_MAX_CHUNK);
+        let (s, f) = (std::sync::Arc::clone(&sock), std::sync::Arc::clone(&file));
+        let res = crate::aio::run(pool, move || {
+            let mut off = offset as libc::off_t;
+            loop {
+                // SAFETY: both descriptors live as long as the task.
+                let n = unsafe { libc::sendfile(s.as_raw_fd(), f.as_raw_fd(), &mut off, chunk) };
+                if n >= 0 {
+                    return Ok(n as u64);
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        })
+        .await;
+        match res {
+            // The file shrank below the Content-Length already sent.
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => offset += n,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let ready = with_timeout(timer.as_mut(), send_timeout, stream.wait_writable());
+                if !matches!(ready.await, Some(Ok(_))) {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    if offset < end {
+        return Err(head_sent + (offset - start));
+    }
+    Ok(())
+}
+
+/// `aio threads`: a body small enough to go out with its head
+/// (`file::inline_limit` without aio), read on the pool.
+#[cold]
+pub(crate) async fn read_file_on_pool(
+    pool: &'static crate::aio::ThreadPool,
+    body: phase::FileBody,
+) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::io::AsRawFd;
+    crate::aio::run(pool, move || {
+        let mut buf = vec![0u8; body.len as usize];
+        crate::aio::pread_exact(body.fd.as_raw_fd(), &mut buf, body.offset).map(|()| buf)
+    })
+    .await?
+}
+
+/// A file body being streamed: read on the worker, or on an `aio threads`
+/// pool, where a task may outlive the stream and so shares the file.
+enum BodyFile {
+    Local(std::fs::File),
+    Pool(
+        std::sync::Arc<std::fs::File>,
+        &'static crate::aio::ThreadPool,
+    ),
+}
+
+impl BodyFile {
+    fn new(fd: std::os::unix::io::OwnedFd, aio: Option<&'static crate::aio::ThreadPool>) -> Self {
+        match aio {
+            None => BodyFile::Local(std::fs::File::from(fd)),
+            Some(pool) => BodyFile::Pool(std::sync::Arc::new(std::fs::File::from(fd)), pool),
+        }
+    }
+}
+
+/// `read_at` into `buf[..want]` on the pool; `buf` comes back unless the
+/// pool refused the task.
+#[cold]
+async fn read_at_on_pool(
+    file: &std::sync::Arc<std::fs::File>,
+    pool: &'static crate::aio::ThreadPool,
+    buf: &mut Vec<u8>,
+    want: usize,
+    offset: u64,
+) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let file = std::sync::Arc::clone(file);
+    let mut taken = std::mem::take(buf);
+    let (returned, res) = crate::aio::run(pool, move || {
+        let res = file.read_at(&mut taken[..want], offset);
+        (taken, res)
+    })
+    .await?;
+    *buf = returned;
+    res
+}
+
+/// `send_head_and_file` for a multipart body (#414): each part's header
+/// and range as one head and file, the response head before the first,
+/// then the closing boundary, sent without `MSG_MORE` so it isn't held.
+/// Each part gets a `dup` of the fd, which `send_head_and_file` closes.
+#[cold]
+async fn send_head_and_parts<S: ConnIo>(
+    stream: &mut S,
+    nonblocking: &mut bool,
+    head: &[u8],
+    body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+    aio: Option<&'static crate::aio::ThreadPool>,
+) -> Result<(), u64> {
+    let phase::FileParts { parts, trailer } = *body.parts.expect("multipart body");
+    let mut sent = 0u64;
+    let mut first = Some(head);
+    for (part, offset, len) in parts {
+        let lead = match first.take() {
+            Some(head) => [head, &part].concat(),
+            None => part,
+        };
+        let fd = body.fd.try_clone().map_err(|_| sent)?;
+        let range = phase::FileBody {
+            fd,
+            offset,
+            len,
+            parts: None,
+        };
+        send_head_and_file(
+            stream,
+            nonblocking,
+            &lead,
+            range,
+            timer.as_mut(),
+            send_timeout,
+            aio,
+        )
+        .await
+        .map_err(|n| sent + n)?;
+        sent += lead.len() as u64 + len;
+    }
+    let len = trailer.len();
+    match write_all_now(stream, trailer, len, timer, send_timeout)
+        .await
+        .0
+    {
+        Ok(()) => Ok(()),
+        Err(n) => Err(sent + n as u64),
+    }
 }
 
 /// A keep-alive wait's limits: `timeout` ends it (`None`: no limit), and
@@ -1178,28 +1488,39 @@ pub(crate) async fn write_all_paced<S: ConnIo>(
     (Ok(()), buf)
 }
 
-/// Fails with the body bytes that went out.
+/// Fails with the body bytes that went out. `aio`: the reads run on that
+/// pool.
 pub(crate) async fn stream_file<S: ConnIo>(
     stream: &mut S,
     body: phase::FileBody,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
     mut pacer: Option<&mut Pacer>,
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<(), u64> {
+    if body.parts.is_some() {
+        return Box::pin(stream_parts(stream, body, timer, send_timeout, pacer, aio)).await;
+    }
     // The fd is owned by `body` and was already opened + contained by the
     // resolver; wrap it into `std::fs::File` so we get Seek/Read without
     // duplicating the fd. Dropping `file` at the end closes the fd.
     // Positional reads: the fd may be a `dup` of an `alias` file's anchor,
     // whose file offset is shared with every other dup of it.
     use std::os::unix::fs::FileExt;
-    let file = std::fs::File::from(body.fd);
+    let file = BodyFile::new(body.fd, aio);
     let mut offset = body.offset;
     let mut remaining = body.len;
     let chunk = body.len.clamp(1, 65_536) as usize;
     let mut buf: Vec<u8> = vec![0u8; chunk];
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
-        let n = match file.read_at(&mut buf[..want], offset) {
+        let read = match &file {
+            BodyFile::Local(file) => file.read_at(&mut buf[..want], offset),
+            BodyFile::Pool(file, pool) => {
+                Box::pin(read_at_on_pool(file, pool, &mut buf, want, offset)).await
+            }
+        };
+        let n = match read {
             Ok(0) | Err(_) => return Err(body.len - remaining),
             Ok(n) => n,
         };
@@ -1238,6 +1559,64 @@ pub(crate) async fn stream_file<S: ConnIo>(
     Ok(())
 }
 
+/// `stream_file` for a multipart body (#414): each part's header, its
+/// range (through `stream_file`, on a `dup` of the fd), then the closing
+/// boundary.
+#[cold]
+async fn stream_parts<S: ConnIo>(
+    stream: &mut S,
+    body: phase::FileBody,
+    mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    send_timeout: Duration,
+    mut pacer: Option<&mut Pacer>,
+    aio: Option<&'static crate::aio::ThreadPool>,
+) -> Result<(), u64> {
+    let phase::FileParts { parts, trailer } = *body.parts.expect("multipart body");
+    let mut sent = 0u64;
+    let pieces = parts
+        .into_iter()
+        .map(|(part, offset, len)| (part, Some((offset, len))))
+        .chain(std::iter::once((trailer, None)));
+    for (bytes, range) in pieces {
+        let n = bytes.len();
+        let res = match pacer.as_deref_mut() {
+            Some(pacer) => {
+                write_all_paced(stream, bytes, n, pacer, timer.as_mut(), send_timeout)
+                    .await
+                    .0
+            }
+            None => {
+                write_all_now(stream, bytes, n, timer.as_mut(), send_timeout)
+                    .await
+                    .0
+            }
+        };
+        res.map_err(|k| sent + k as u64)?;
+        sent += n as u64;
+        let Some((offset, len)) = range else {
+            continue;
+        };
+        let range = phase::FileBody {
+            fd: body.fd.try_clone().map_err(|_| sent)?,
+            offset,
+            len,
+            parts: None,
+        };
+        stream_file(
+            stream,
+            range,
+            timer.as_mut(),
+            send_timeout,
+            pacer.as_deref_mut(),
+            aio,
+        )
+        .await
+        .map_err(|k| sent + k)?;
+        sent += len;
+    }
+    Ok(())
+}
+
 /// `stream_file` through the gzip filter: the file is read in 64 KiB
 /// blocks, compressed, and sent as HTTP/1.1 chunks (or raw for HTTP/1.0,
 /// where the connection closes after). Returns the bytes written, or
@@ -1250,9 +1629,10 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
     last_chunk: bool,
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<u64, u64> {
     use std::os::unix::fs::FileExt;
-    let file = std::fs::File::from(body.fd);
+    let file = BodyFile::new(body.fd, aio);
     let mut deflater = super::gzip::Deflater::new(gzip);
     let mut offset = body.offset;
     let mut remaining = body.len;
@@ -1272,7 +1652,13 @@ pub(crate) async fn stream_file_gzip<S: monoio::io::AsyncWriteRent>(
             0
         } else {
             let want = remaining.min(block as u64) as usize;
-            match file.read_at(&mut input[..want], offset) {
+            let read = match &file {
+                BodyFile::Local(file) => file.read_at(&mut input[..want], offset),
+                BodyFile::Pool(file, pool) => {
+                    Box::pin(read_at_on_pool(file, pool, &mut input, want, offset)).await
+                }
+            };
+            match read {
                 Ok(0) | Err(_) => break Err(sent),
                 Ok(n) => n,
             }
@@ -1347,12 +1733,15 @@ pub(crate) struct ChunkedBody {
 pub(crate) enum ChunkedBodyError {
     /// Over the size limit: 413, as nginx.
     TooLarge,
-    /// Malformed framing, a line or trailer block too long, a read error
-    /// or timeout, or a failed temp-file write: 400.
+    /// Malformed framing, a line or trailer block too long, or a failed
+    /// temp-file write: 400.
     Invalid,
-    /// The input ended before the body did: 400 from a connection, and
-    /// from `chunked_in_buffer` a body still to come.
+    /// The input ended (or the read failed) before the body did: from a
+    /// connection, a client gone; from `chunked_in_buffer`, a body still
+    /// to come.
     Ended,
+    /// `client_body_timeout` between reads (#858).
+    TimedOut,
 }
 
 /// A connection with nothing more to read, for `chunked_in_buffer`.
@@ -1382,7 +1771,7 @@ pub(crate) async fn chunked_in_buffer(
         &mut NoMoreInput,
         initial,
         u64::MAX,
-        None,
+        None::<&mut BodySink<'_>>,
         timer,
         LINGERING_TIMEOUT,
     )
@@ -1399,7 +1788,14 @@ pub(crate) async fn discard_chunked_body<S: AsyncReadRent>(
     initial: &[u8],
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
 ) -> Option<Vec<u8>> {
-    let read = read_chunked_request_body(stream, initial, u64::MAX, None, timer, LINGERING_TIMEOUT);
+    let read = read_chunked_request_body(
+        stream,
+        initial,
+        u64::MAX,
+        None::<&mut BodySink<'_>>,
+        timer,
+        LINGERING_TIMEOUT,
+    );
     match monoio::time::timeout(LINGERING_TIME, read).await {
         Ok(Ok(body)) => Some(body.pipelined_tail),
         _ => None,
@@ -1458,13 +1854,23 @@ pub(crate) async fn discard_request_body<S: ConnIo>(
     ok
 }
 
+/// Why a request body stopped coming before its end (#866).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyCut {
+    /// `client_body_timeout`: nginx logs 408.
+    TimedOut,
+    /// The client closed, or the read failed: 400 and an `[info]` line.
+    Closed,
+    /// The temp file failed (logged where it did).
+    Failed,
+}
+
 /// The rest of a body that has grown past `client_body_buffer_size`
 /// (`buffer`), through a pooled read buffer of that size, as nginx reuses
 /// its body buffer (#289). It stays in memory while it arrives within
 /// `BODY_IN_MEMORY_FOR` of `started`, and moves to the temp file when that
 /// passes. Apart from `handle`'s in-place reads, and boxed there, so this
-/// timer and `select!` don't weigh on every request's future. `false` on
-/// EOF, an error, `client_body_timeout`, or a temp file that fails.
+/// timer and `select!` don't weigh on every request's future.
 #[cold]
 pub(crate) async fn read_body_past_buffer<S: ConnIo>(
     stream: &mut S,
@@ -1474,14 +1880,14 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
     started: monoio::time::Instant,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
-) -> bool {
+) -> Result<(), BodyCut> {
     use monoio::buf::IoBufMut;
     let chunk_size = (buffer as usize).clamp(4096, 64 * 1024);
     let mut spill_timer = std::pin::pin!(monoio::time::sleep_until(started + BODY_IN_MEMORY_FOR));
     let mut chunk = super::take_body_buffer(chunk_size);
     let ok = loop {
         if sink.len() >= cl {
-            break true;
+            break Ok(());
         }
         let want = (cl - sink.len()).min(chunk_size as u64) as usize;
         chunk.clear();
@@ -1493,7 +1899,7 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
                 r = &mut read => done = Some(r),
                 _ = spill_timer.as_mut() => {
                     if !sink.spill() {
-                        break false;
+                        break Err(BodyCut::Failed);
                     }
                 }
             }
@@ -1503,15 +1909,15 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
             Some(r) => r,
             None => match with_timeout(timer.as_mut(), read_timeout, read).await {
                 Some(r) => r,
-                None => break false,
+                None => break Err(BodyCut::TimedOut),
             },
         };
         chunk = returned.into_inner();
         match res {
-            Ok(0) | Err(_) => break false,
+            Ok(0) | Err(_) => break Err(BodyCut::Closed),
             Ok(n) => {
                 if !sink.extend(&chunk[..n]) {
-                    break false;
+                    break Err(BodyCut::Failed);
                 }
             }
         }
@@ -1520,20 +1926,38 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
     ok
 }
 
+/// Where a decoded chunked request body goes: memory and a temp file
+/// (`BodySink`), or the proxy as it comes (#134).
+pub(crate) trait ChunkSink {
+    fn len(&self) -> u64;
+    /// `false`: the body can't be kept.
+    async fn put(&mut self, data: &[u8]) -> bool;
+}
+
+impl ChunkSink for BodySink<'_> {
+    fn len(&self) -> u64 {
+        BodySink::len(self)
+    }
+
+    async fn put(&mut self, data: &[u8]) -> bool {
+        self.extend(data)
+    }
+}
+
 /// Read and decode a chunked request body from the connection into `sink`
 /// (memory, then a temp file for large bodies). Chunk data is passed on as
 /// it arrives and consumed input is dropped, so memory stays bounded
 /// whatever the chunk sizes.
 /// `sink`: `None` drops the data (a body nothing reads).
-pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
+pub(crate) async fn read_chunked_request_body<S: AsyncReadRent, K: ChunkSink>(
     stream: &mut S,
     initial: &[u8],
     max_body: u64,
-    mut sink: Option<&mut BodySink<'_>>,
+    mut sink: Option<&mut K>,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
 ) -> Result<ChunkedBody, ChunkedBodyError> {
-    use ChunkedBodyError::{Ended, Invalid, TooLarge};
+    use ChunkedBodyError::{Ended, Invalid, TimedOut, TooLarge};
 
     // `raw[cursor..]` is unread input; `raw_base` is how many stream bytes
     // (counted from `initial[0]`) were dropped from the front of `raw`.
@@ -1554,10 +1978,9 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
             let chunk: Vec<u8> = vec![0u8; $cap];
             let (res, returned) = with_timeout(timer.as_mut(), read_timeout, stream.read(chunk))
                 .await
-                .ok_or(Invalid)?;
+                .ok_or(TimedOut)?;
             match res {
-                Ok(0) => return Err(Ended),
-                Err(_) => return Err(Invalid),
+                Ok(0) | Err(_) => return Err(Ended),
                 Ok(n) => raw.extend_from_slice(&returned[..n]),
             }
         }};
@@ -1639,7 +2062,7 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
             }
             let take = (left.min((raw.len() - cursor) as u64)) as usize;
             if let Some(sink) = sink.as_deref_mut()
-                && !sink.extend(&raw[cursor..cursor + take])
+                && !sink.put(&raw[cursor..cursor + take]).await
             {
                 return Err(Invalid);
             }

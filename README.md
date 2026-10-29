@@ -232,7 +232,8 @@ Supported functionality includes:
 - conditional requests
 - byte ranges (one range per request; `max_ranges 0` turns them off)
 - streamed large files
-- zero-copy `sendfile on|off` (plain TCP)
+- zero-copy `sendfile on|off` (plain TCP, and TLS with `ssl_conf_command Options KTLS`)
+- `aio threads[=pool]` and `thread_pool`: file reads and `sendfile` on a per-worker thread pool, so a slow disk doesn't stall the worker
 - URI decoding and normalization
 - trailing-slash redirects
 - `autoindex`
@@ -252,7 +253,7 @@ ruxen supports a growing subset of nginx's proxy functionality, including:
 - `proxy_bind` (including `transparent`)
 - WebSocket and other `Upgrade` connections, tunnelled after the upstream's 101
 - responses relayed as they arrive when nothing needs them whole (no cache or `add_trailer`), gzip-compressed on the way when gzip is on; otherwise buffered
-- `proxy_http_version`, `proxy_method`
+- `proxy_http_version` (`2`: HTTP/2 to the upstream, h2c or ALPN `h2`), `proxy_method`, `proxy_pass_trailers`, `early_hints` (103 Early Hints passed on)
 - `proxy_set_header`
 - request-body forwarding and `proxy_set_body`
 - `proxy_next_upstream` (including `_tries` / `_timeout`)
@@ -429,9 +430,8 @@ See [`DESIGN.md`](DESIGN.md) for the performance notes behind individual design 
 
 Not implemented yet (`--compat` names the ones a configuration uses):
 
-- HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
+- gRPC upstreams (`grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
-- streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
 - 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
 - nginx's binary upgrade (`SIGUSR2`)

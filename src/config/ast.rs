@@ -204,6 +204,8 @@ pub struct ProxyConf {
     pub set_headers: Option<Vec<ProxySetHeader>>,
     pub pass_request_headers: Option<bool>,
     pub pass_request_body: Option<bool>,
+    /// `proxy_request_buffering` (#134).
+    pub request_buffering: Option<bool>,
     /// `proxy_set_body`: the body sent upstream instead of the client's.
     pub set_body: Option<Vec<ValuePart>>,
     /// `proxy_ignore_headers`, lowercased.
@@ -214,7 +216,7 @@ pub struct ProxyConf {
     /// `proxy_limit_rate` in bytes/sec (a size, variables allowed); `0`
     /// means unlimited.
     pub limit_rate: Option<Vec<ValuePart>>,
-    /// `proxy_http_version 1.0|1.1`, stored as the minor digit.
+    /// `proxy_http_version 1.0|1.1|2`: 0, 1, or 2 for HTTP/2.
     pub http_version: Option<u8>,
     /// `proxy_next_upstream`; unset means nginx's `error timeout`.
     pub next_upstream: Option<ProxyNextUpstream>,
@@ -228,6 +230,11 @@ pub struct ProxyConf {
     /// `proxy_ignore_client_abort`: keep the upstream exchange when the
     /// client goes away (#136).
     pub ignore_client_abort: Option<bool>,
+    /// `early_hints` conditions (#848): a core directive, kept here as
+    /// only proxied responses carry a 103.
+    pub early_hints: Option<Vec<Vec<ValuePart>>>,
+    /// `proxy_pass_trailers` (#823); unset means off.
+    pub pass_trailers: Option<bool>,
     /// `proxy_redirect`; unset means nginx's implicit `default`.
     pub redirect: Option<ProxyRedirect>,
     /// `proxy_cookie_domain` and `proxy_cookie_path`: the `Domain` and
@@ -441,6 +448,7 @@ impl ProxyConf {
             set_headers: self.set_headers.or_else(|| parent.set_headers.clone()),
             pass_request_headers: self.pass_request_headers.or(parent.pass_request_headers),
             pass_request_body: self.pass_request_body.or(parent.pass_request_body),
+            request_buffering: self.request_buffering.or(parent.request_buffering),
             set_body: self.set_body.or_else(|| parent.set_body.clone()),
             ignore_headers: self
                 .ignore_headers
@@ -458,6 +466,8 @@ impl ProxyConf {
             intercept_errors: self.intercept_errors.or(parent.intercept_errors),
             force_ranges: self.force_ranges.or(parent.force_ranges),
             ignore_client_abort: self.ignore_client_abort.or(parent.ignore_client_abort),
+            early_hints: self.early_hints.or_else(|| parent.early_hints.clone()),
+            pass_trailers: self.pass_trailers.or(parent.pass_trailers),
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             cookie_domain: self.cookie_domain.or_else(|| parent.cookie_domain.clone()),
             cookie_path: self.cookie_path.or_else(|| parent.cookie_path.clone()),
@@ -595,6 +605,9 @@ pub struct RuntimeOpts {
     /// waits for in-flight connections, in ms. `None` (and nginx's `0`)
     /// waits without limit.
     pub worker_shutdown_timeout_ms: Option<u64>,
+    /// `thread_pool` definitions, with nginx's `default` added when an
+    /// `aio threads` uses it undefined.
+    pub thread_pools: Vec<ThreadPoolDef>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -676,6 +689,8 @@ pub struct HttpConfig {
     pub client_body_temp_path: Option<TempPath>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
+    /// http-scope `aio`. `None`: not set (off).
+    pub aio: Option<Aio>,
     /// http-scope `http2 on|off` (nginx 1.25.1+). `None`: not set (off).
     pub http2: Option<bool>,
     /// http-scope `http2_*` settings (#346).
@@ -760,6 +775,57 @@ pub struct UpstreamBlock {
     /// `zone name [size]` (#143): the peers' state is shared by all
     /// workers.
     pub zone: Option<String>,
+    /// `resolver` / `resolver_timeout` in the block (#597), else http's,
+    /// filled in once the http block is read.
+    pub resolver: Option<ResolverConf>,
+    pub resolver_timeout_ms: Option<u64>,
+    /// `sticky` (#600): session affinity.
+    pub sticky: Option<StickyConf>,
+}
+
+/// `sticky cookie | route | learn` (ngx_http_upstream_sticky_module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickyConf {
+    /// `sticky cookie name [expires=] [domain=] [httponly] [samesite=]
+    /// [secure] [path=]`: the server's ID goes to the client in a cookie.
+    Cookie(StickyCookie),
+    /// `sticky route $var ...`: the first non-empty variable is the
+    /// server's `route=`.
+    Route { lookup: Vec<Vec<ValuePart>> },
+    /// `sticky learn create=$var lookup=$var zone=name:size [timeout=]
+    /// [header]`: sessions the server creates, kept in a zone.
+    Learn(StickyLearn),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickyCookie {
+    pub name: String,
+    pub domain: Option<Vec<ValuePart>>,
+    /// `path=`, as `; path=VALUE`.
+    pub path: Option<String>,
+    /// `expires=` in seconds; `None`: a session cookie.
+    pub expires: Option<StickyExpires>,
+    pub httponly: bool,
+    pub secure: bool,
+    pub samesite: Option<Vec<ValuePart>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickyExpires {
+    /// `expires=max`.
+    Max,
+    Secs(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickyLearn {
+    pub lookup: Vec<Vec<ValuePart>>,
+    pub create: Vec<Vec<ValuePart>>,
+    pub zone: String,
+    pub zone_size: u64,
+    pub timeout_ms: u64,
+    /// `header`: learn once the response header arrives, not at the end.
+    pub header: bool,
 }
 
 /// Load-balancing algorithm for an `upstream {}` block. Smoothed weighted
@@ -787,15 +853,19 @@ pub enum UpstreamAddr {
 }
 
 /// One `server <host:port> [weight=N] [max_fails=N] [fail_timeout=Ts]
-/// [down] [backup];` entry inside an `upstream {}` block. The host+port
-/// is resolved at parse time via `to_socket_addrs` — we don't carry a
-/// runtime resolver. Hostname-only resolution picks the first address.
+/// [down] [backup] [resolve];` entry inside an `upstream {}` block. The
+/// host+port is resolved at parse time via `to_socket_addrs`, unless the
+/// name is `resolve`d at run time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamServer {
     /// Resolved peer address. A `server` whose name resolves to several
     /// addresses is one `UpstreamServer` per address, as nginx makes a
-    /// peer of each (#330).
+    /// peer of each (#330). For a `resolve` name, only its port counts.
     pub addr: UpstreamAddr,
+    /// `resolve` with a name (#597): the name, asked at run time.
+    pub resolve: Option<String>,
+    /// `service=`: the name's SRV records give the addresses and ports.
+    pub service: Option<String>,
     /// Original `host:port` string as written. Used for the upstream
     /// `Host:` header default and for diagnostics.
     pub display: String,
@@ -806,6 +876,10 @@ pub struct UpstreamServer {
     pub max_conns: u32,
     pub down: bool,
     pub backup: bool,
+    /// `drain`: down, except for requests bound to it by `sticky`.
+    pub drain: bool,
+    /// `route=`: the server's ID for `sticky`.
+    pub route: Option<String>,
 }
 
 /// One `listen` directive, address plus the flag bag. The current set of
@@ -957,6 +1031,41 @@ pub struct ServerSsl {
     pub password_file: Option<PathBuf>,
     /// `ssl_stapling` and its companions (#141), merged with http scope.
     pub stapling: StaplingConf,
+    /// `ssl_conf_command NAME VALUE` lines, in order; a server's own
+    /// replace the http level's, as nginx merges the array.
+    pub conf_commands: Option<Vec<(String, String)>>,
+}
+
+impl ServerSsl {
+    /// `ssl_conf_command Options KTLS` (#673), the one command applied:
+    /// later `Options` items override earlier ones, as OpenSSL sets and
+    /// clears SSL_OP_ENABLE_KTLS in order.
+    pub fn ktls(&self) -> bool {
+        let mut on = false;
+        for (name, value) in self.conf_commands.iter().flatten() {
+            if !name.eq_ignore_ascii_case("Options") {
+                continue;
+            }
+            for item in value.split(',').map(str::trim) {
+                if item.eq_ignore_ascii_case("KTLS") {
+                    on = true;
+                } else if item.eq_ignore_ascii_case("-KTLS") {
+                    on = false;
+                }
+            }
+        }
+        on
+    }
+}
+
+/// Whether an `ssl_conf_command` is applied in full: `Options` with
+/// only `KTLS` / `-KTLS` items. Anything else is accepted and not applied.
+pub(crate) fn conf_command_applied(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("Options")
+        && value
+            .split(',')
+            .map(str::trim)
+            .all(|item| item.eq_ignore_ascii_case("KTLS") || item.eq_ignore_ascii_case("-KTLS"))
 }
 
 /// `ssl_verify_client`'s modes (ngx_http_ssl_verify).
@@ -1126,8 +1235,7 @@ fn parse_ocsp_cache(value: &str) -> Result<Option<OcspCacheZone>, super::error::
     if value == "off" {
         return Ok(None);
     }
-    // Error::Message is static; a configuration error is made once.
-    let message = |text: String| Error::Message(Box::leak(text.into_boxed_str()));
+    let message = Error::Text;
     let invalid = || message(format!("invalid OCSP cache \"{value}\""));
     let rest = value.strip_prefix("shared:").ok_or_else(invalid)?;
     let (name, size) = rest.split_once(':').ok_or_else(invalid)?;
@@ -1425,6 +1533,8 @@ pub struct Server {
     pub client_body_temp_path: Option<TempPath>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
     pub sendfile: Option<bool>,
+    /// Server-scope `aio`. `None` inherits from http.
+    pub aio: Option<Aio>,
     /// Server-scope `http2 on|off`. `None` inherits from http.
     pub http2: Option<bool>,
     /// Server-scope `http2_*` settings; unset ones inherit from http.
@@ -1714,6 +1824,8 @@ pub struct Location {
     /// Location-scope `sendfile on|off`, inherited through nested locations
     /// at parse time. `None` inherits from server/http at prepare time.
     pub sendfile: Option<bool>,
+    /// Location-scope `aio`, inherited like `sendfile`.
+    pub aio: Option<Aio>,
     /// Location-scope `client_body_temp_path`, inherited like `sendfile`.
     pub client_body_temp_path: Option<TempPath>,
     /// Location-scope `disable_symlinks`, inherited through nested
@@ -2299,6 +2411,24 @@ pub fn limit_except_method_bit(method: &[u8]) -> u16 {
         .iter()
         .position(|m| m.as_bytes() == method)
         .map_or(0, |i| 1 << i)
+}
+
+/// `aio off|on|threads[=pool]` (#526). `On` (Linux native AIO) is
+/// accepted and reads stay on the worker, as with `Off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Aio {
+    Off,
+    On,
+    /// The pool's name, `default` when none is given.
+    Threads(String),
+}
+
+/// `thread_pool name threads=N [max_queue=M];` (main context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPoolDef {
+    pub name: String,
+    pub threads: usize,
+    pub max_queue: usize,
 }
 
 /// `client_body_temp_path path [level1 [level2 [level3]]]`: the directory

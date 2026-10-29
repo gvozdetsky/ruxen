@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod aio;
 mod arena;
 mod auth;
 mod autoindex;
@@ -26,6 +27,7 @@ mod file;
 mod fs_resolve;
 mod http;
 mod http_date;
+mod ktls;
 mod ocsp;
 mod phase;
 mod privileges;
@@ -33,6 +35,7 @@ mod proxy;
 mod proxy_cache;
 mod proxy_protocol;
 mod proxy_stream;
+mod request_feed;
 mod resolver;
 mod sd_notify;
 mod syslog;
@@ -43,7 +46,10 @@ mod tls_session;
 mod tls_stream;
 mod tls_ticket;
 mod upstream;
+mod upstream_h2;
 mod upstream_io;
+mod upstream_resolve;
+mod upstream_sticky;
 mod upstream_tls;
 mod uri;
 mod worker;
@@ -1424,6 +1430,8 @@ const VERSION_BODY: &str = concat!(
     "\n",
     "TLS SNI support enabled\n",
     "configure arguments:",
+    // `aio threads` (#526).
+    " --with-threads",
     " --with-http_ssl_module",
     " --with-http_realip_module",
     " --with-http_stub_status_module",
@@ -1445,7 +1453,6 @@ const VERSION_BODY: &str = concat!(
     " --without-http_empty_gif_module",
     " --without-http_browser_module",
     " --without-http_upstream_random_module",
-    " --without-http_upstream_sticky_module",
     " --without-mail_pop3_module",
     " --without-mail_imap_module",
     " --without-mail_smtp_module",
@@ -1713,6 +1720,7 @@ mod tests {
                 "\n",
                 "TLS SNI support enabled\n",
                 "configure arguments:",
+                " --with-threads",
                 " --with-http_ssl_module",
                 " --with-http_realip_module",
                 " --with-http_stub_status_module",
@@ -1734,7 +1742,6 @@ mod tests {
                 " --without-http_empty_gif_module",
                 " --without-http_browser_module",
                 " --without-http_upstream_random_module",
-                " --without-http_upstream_sticky_module",
                 " --without-mail_pop3_module",
                 " --without-mail_imap_module",
                 " --without-mail_smtp_module",

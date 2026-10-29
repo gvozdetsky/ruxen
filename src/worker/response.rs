@@ -185,12 +185,22 @@ pub(crate) fn response_header_values_all(response: &[u8], name: &[u8]) -> Vec<Ve
 }
 
 /// A 444 without a body: nginx's NGX_HTTP_CLOSE, which closes the
-/// connection instead of answering (#397); and the 499 of a client that
-/// went away while the upstream was awaited (#136).
+/// connection instead of answering (#397); the 499 of a client that
+/// went away while the upstream was awaited (#136); and `BODY_TIMED_OUT`.
 #[inline]
 pub(crate) fn closes_unanswered(bytes: &[u8]) -> bool {
-    matches!(bytes.get(9..12), Some(b"444" | b"499")) && bytes.ends_with(b"\r\n\r\n")
+    match bytes.get(9..12) {
+        Some(b"444" | b"499") => bytes.ends_with(b"\r\n\r\n"),
+        Some(b"408") => bytes.starts_with(&BODY_TIMED_OUT[..BODY_TIMED_OUT.len() - 2]),
+        _ => false,
+    }
 }
+
+/// A body sent upstream as it came (#134) that stopped coming: nginx
+/// terminates the request on 408 (ngx_http_finalize_request), so it is
+/// never sent, logged as 408. The reason phrase tells it from an
+/// upstream's 408.
+pub(crate) const BODY_TIMED_OUT: &[u8] = b"HTTP/1.1 408 Client Body Timed Out\r\n\r\n";
 
 /// What `settle_proxy_response` hands back when the client closed while
 /// the upstream was awaited: never sent, logged as 499 (#136).
@@ -759,7 +769,8 @@ pub(crate) fn apply_proxy_add_headers(
 
 /// The last chunk and the trailers after a relayed body (#463), rendered
 /// once the body is out, as nginx's trailers filter does on the last
-/// buffer. `head`: the header block as sent.
+/// buffer: the upstream's (`proxy_pass_trailers`), then `add_trailer`'s.
+/// `head`: the header block as sent.
 #[cold]
 #[inline(never)]
 pub(crate) fn relay_trailers(
@@ -768,7 +779,14 @@ pub(crate) fn relay_trailers(
     meta: &phase::ProcessMeta,
     uri: Option<&[u8]>,
     head: &[u8],
+    upstream: &[u8],
 ) -> Vec<u8> {
+    let mut out = b"0\r\n".to_vec();
+    out.extend_from_slice(upstream);
+    if meta.proxy_add_trailers.is_empty() {
+        out.extend_from_slice(b"\r\n");
+        return out;
+    }
     let root_only = root_only_state(meta);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -790,12 +808,9 @@ pub(crate) fn relay_trailers(
         Some(p) => &head[..p + 2],
         None => head,
     };
-    let mut out = b"0\r\n".to_vec();
-    out.extend_from_slice(&render_trailers(
-        meta.proxy_add_trailers,
-        &render_ctx,
-        sent_view,
-    ));
+    let mut block = upstream.to_vec();
+    render_trailers_into(meta.proxy_add_trailers, &render_ctx, sent_view, &mut block);
+    out.extend_from_slice(&block[upstream.len()..]);
     out.extend_from_slice(b"\r\n");
     out
 }
@@ -1735,6 +1750,17 @@ pub(crate) fn render_trailers(
     sent_view: &[u8],
 ) -> Vec<u8> {
     let mut trailer_block: Vec<u8> = Vec::with_capacity(trailers.len() * 64);
+    render_trailers_into(trailers, ctx, sent_view, &mut trailer_block);
+    trailer_block
+}
+
+/// `render_trailers` after the trailer lines already in `trailer_block`.
+fn render_trailers_into(
+    trailers: &[PreparedAddHeader],
+    ctx: &RenderCtx<'_>,
+    sent_view: &[u8],
+    trailer_block: &mut Vec<u8>,
+) {
     for t in trailers {
         if !t.always && !add_header_status_eligible(ctx.status) {
             continue;
@@ -1755,7 +1781,6 @@ pub(crate) fn render_trailers(
         trailer_block.extend_from_slice(&rendered);
         trailer_block.extend_from_slice(b"\r\n");
     }
-    trailer_block
 }
 
 /// Wrap a body buffer as a single chunked-transfer chunk (`<hex-len>\r\n
@@ -1966,6 +1991,7 @@ pub(crate) fn maybe_intercept_error_page_as(
             preserved_location,
             preserved_www_authenticate,
             closes: http::closes_connection(status),
+            named_from: None,
         });
     }
     if target[0] == b'@' {
@@ -1984,6 +2010,7 @@ pub(crate) fn maybe_intercept_error_page_as(
             preserved_location,
             preserved_www_authenticate,
             closes: http::closes_connection(status),
+            named_from: None,
         });
     }
     let redirect = http::build_redirect_response(

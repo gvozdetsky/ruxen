@@ -33,7 +33,6 @@ use crate::phase::Response;
 use crate::upstream;
 use crate::upstream::LeasedPeer;
 use crate::worker::PeerAddr;
-use crate::worker::PreparedUpstream;
 use crate::worker::range::RangeAllow;
 
 // Per-worker reusable scratch buffers for proxy::attempt. The proxy hot path
@@ -79,8 +78,9 @@ pub(crate) fn return_proxy_buf(mut v: Vec<u8>) {
 /// Per-request upstream attempt plan. Built synchronously inside the
 /// location handler; consumed by `run_proxy` on the worker async task.
 pub struct ProxyPlan {
-    /// Pointer to the prepared upstream (owns peers + keepalive config).
-    pub upstream: &'static PreparedUpstream,
+    /// The prepared upstream (owns peers + keepalive config), the version
+    /// of its peers this request uses.
+    pub upstream: upstream::UpstreamRef,
     /// `proxy_pass` with variables naming an address (#100) or a host
     /// name to resolve (#133): the peers to use instead of `upstream`'s,
     /// which is then a placeholder. Boxed: only a `proxy_pass` with
@@ -161,6 +161,9 @@ pub struct ProxyPlan {
     /// A request body too large to keep in memory: sent from this file
     /// after `request` (which then holds only the header block).
     pub body_file: Option<RequestBodyFile>,
+    /// `proxy_request_buffering off` (#134): the body, sent after
+    /// `request` as the client sends it.
+    pub body_feed: Option<crate::request_feed::BodyFeed>,
     /// Keep the upstream's header lines in `ProxyReport` because the
     /// location's add_header / add_trailer may read `$upstream_http_*`.
     pub keep_upstream_headers: bool,
@@ -178,6 +181,8 @@ pub struct ProxyPlan {
     /// A hash balancer's state for this request (`hash`, `ip_hash`), which
     /// `proxy_next_upstream` picks continue from.
     pub hash: Option<Box<upstream::HashPick>>,
+    /// The request's `sticky` (#600), for an upstream with one.
+    pub sticky: Option<Box<crate::upstream_sticky::StickyReq>>,
     /// `proxy_bind` for this request: the local address new upstream
     /// connections are bound to. Pooled ones are reused as they are.
     pub bind: Option<LocalBind>,
@@ -187,6 +192,13 @@ pub struct ProxyPlan {
     /// `proxy_ignore_client_abort`: when off, a client that closes while
     /// the upstream is awaited ends the exchange with 499 (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` held (#848): the upstream's 103s for the client.
+    pub early_hints: Option<std::rc::Rc<EarlyHints>>,
+    /// `proxy_pass_trailers` (#823): a chunked body's trailers reach the
+    /// client.
+    pub pass_trailers: bool,
+    /// `proxy_http_version 2` (#599): a new connection speaks HTTP/2.
+    pub h2: bool,
 }
 
 /// The peers of one request's `proxy_pass` with variables: nginx's
@@ -267,12 +279,269 @@ pub struct CachePlan {
     pub background: bool,
     /// The stale response's `stale-if-error` still covers it.
     pub stale_error: bool,
+    /// The location's `aio threads` pool: the cache file is read on it.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
+    /// A hit, or with `unread_stale` a stale entry, whose file `run_proxy`
+    /// reads on `aio` (`hit` is `None`).
+    pub unread: bool,
+    /// The stale entry's `stale_updating` (`Lookup::Stale`).
+    pub unread_stale: Option<bool>,
 }
 
 impl Drop for CachePlan {
     fn drop(&mut self) {
         if let Some(token) = self.token {
             self.zone.release(&self.hash, token);
+        }
+    }
+}
+
+impl CachePlan {
+    /// The lookup (ngx_http_file_cache_open) from `hash`. `defer`
+    /// (`aio threads`): a hit's or a stale entry's file isn't read here but
+    /// in `run_proxy`, on the pool (`unread`).
+    pub(crate) fn lookup(&mut self, headers: &[u8], no_cache: bool, defer: bool) {
+        use crate::proxy_cache::{CacheStatus, Entry, Lookup};
+        let (conf, zone) = (self.conf, self.zone);
+        let now = crate::proxy_cache::now_secs();
+        // ngx_http_file_cache_reopen: the main key holds a response stored
+        // for another variant (its `Vary` names headers this request has
+        // other values of), so the lookup goes on at the request's own
+        // variant's key, once.
+        loop {
+            let hash = self.hash;
+            let path = || zone.file_path(&hash);
+            let mut other = None;
+            match zone.lookup(&hash, conf.min_uses, now) {
+                Lookup::Error(code) => {
+                    self.status = CacheStatus::Hit;
+                    self.hit = Some(CacheHit::Error(code));
+                }
+                Lookup::Hit if defer => {
+                    self.status = CacheStatus::Hit;
+                    self.unread = true;
+                }
+                Lookup::Hit => match Entry::read(&path(), &self.key) {
+                    Some(entry) => match entry.other_variant(&self.main, headers) {
+                        None => {
+                            self.status = CacheStatus::Hit;
+                            self.hit = Some(CacheHit::Entry(entry));
+                        }
+                        variant => other = variant,
+                    },
+                    None => zone.forget_file(&hash),
+                },
+                Lookup::Stale {
+                    token: updater,
+                    stale_updating,
+                    stale_error: covered,
+                } => {
+                    // ngx_http_upstream_cache: STALE (this request updates)
+                    // or UPDATING (another one does).
+                    self.token = updater;
+                    self.stale_error = covered;
+                    if defer {
+                        self.unread = true;
+                        self.unread_stale = Some(stale_updating);
+                    } else if self.stale_wanted(stale_updating) {
+                        let entry = Entry::read(&path(), &self.key);
+                        other = self.take_stale(entry, None, stale_updating, headers);
+                    } else {
+                        // Only its header, for the variant.
+                        other = crate::proxy_cache::stored_other_variant(
+                            &path(),
+                            &self.key,
+                            &self.main,
+                            headers,
+                        );
+                        self.take_stale(None, other, stale_updating, headers);
+                    }
+                }
+                Lookup::Miss {
+                    store: enough,
+                    probe,
+                } => {
+                    self.store &= enough;
+                    self.cacheable = enough;
+                    // A file from before a restart (nginx's cold cache).
+                    if probe && let Some(entry) = Entry::read(&path(), &self.key) {
+                        zone.adopt(&hash, &entry);
+                        self.store = !no_cache;
+                        self.cacheable = true;
+                        other = entry.other_variant(&self.main, headers);
+                        if other.is_some() {
+                        } else if entry.valid_sec < now {
+                            self.status = CacheStatus::Expired;
+                            self.stale = Some(entry);
+                        } else {
+                            self.status = CacheStatus::Hit;
+                            self.hit = Some(CacheHit::Entry(entry));
+                        }
+                    }
+                    // proxy_cache_lock: one request fetches a missing
+                    // response, the others wait for it.
+                    if other.is_none()
+                        && self.status == CacheStatus::Miss
+                        && self.store
+                        && conf.lock
+                    {
+                        match zone.try_lock(&hash, conf.lock_age_ms) {
+                            Some(lock) => self.token = Some(lock),
+                            None if conf.lock_timeout_ms == 0 => self.store = false,
+                            None => {
+                                self.wait_until = Some(
+                                    Instant::now() + Duration::from_millis(conf.lock_timeout_ms),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // A variant's key holding yet another variant is a miss, as
+            // nginx's "incorrect vary hash".
+            let Some(variant) = other.filter(|_| !self.secondary) else {
+                break;
+            };
+            self.go_to_variant(variant, no_cache);
+        }
+    }
+
+    /// Something may answer with the stale entry: read it whole.
+    fn stale_wanted(&self, stale_updating: bool) -> bool {
+        let use_stale = self.conf.use_stale;
+        use_stale.updating
+            || stale_updating
+            || self.stale_error
+            || self.conf.revalidate
+            || use_stale.any()
+    }
+
+    /// What the stale entry answers with (ngx_http_upstream_cache: STALE,
+    /// this request updates, or UPDATING, another one does). Returns the
+    /// variant it holds instead, if any (`other`: known from its header).
+    fn take_stale(
+        &mut self,
+        entry: Option<crate::proxy_cache::Entry>,
+        other: Option<crate::proxy_cache::CacheHash>,
+        stale_updating: bool,
+        headers: &[u8],
+    ) -> Option<crate::proxy_cache::CacheHash> {
+        use crate::proxy_cache::CacheStatus;
+        let other = other.or_else(|| entry.as_ref()?.other_variant(&self.main, headers));
+        let serve_stale = self.conf.use_stale.updating || stale_updating;
+        match entry {
+            _ if other.is_some() => {}
+            Some(entry) if serve_stale && self.token.is_some() && self.conf.background_update => {
+                self.status = CacheStatus::Stale;
+                self.hit = Some(CacheHit::Entry(entry));
+                self.background = true;
+            }
+            Some(entry) if serve_stale && self.token.is_none() => {
+                self.status = CacheStatus::Updating;
+                self.hit = Some(CacheHit::Entry(entry));
+            }
+            // Fetched again; kept to revalidate with, or to answer with if
+            // the upstream fails (proxy_cache_use_stale).
+            entry => {
+                self.status = CacheStatus::Expired;
+                self.stale = entry;
+            }
+        }
+        other
+    }
+
+    /// The lookup goes on at the request's variant's key.
+    fn go_to_variant(&mut self, variant: crate::proxy_cache::CacheHash, no_cache: bool) {
+        if let Some(t) = self.token.take() {
+            self.zone.release(&self.hash, t);
+        }
+        self.hash = variant;
+        self.secondary = true;
+        self.status = crate::proxy_cache::CacheStatus::Miss;
+        self.store = !no_cache;
+        self.cacheable = true;
+        self.stale_error = false;
+    }
+}
+
+/// `aio threads`: the entry `cache_plan` left unread, read on the pool,
+/// then what the lookup would have done with it: a hit, a stale answer, a
+/// miss, or on to its variant. A request that goes upstream after all
+/// needs the peer the handler didn't pick.
+#[cold]
+#[inline(never)]
+async fn read_unread_hit(plan: &mut ProxyPlan) -> Result<(), Response> {
+    use crate::proxy_cache::CacheStatus;
+    let Some(cache) = plan.cache.as_deref_mut() else {
+        return Ok(());
+    };
+    let headers = std::mem::take(&mut cache.request_headers);
+    while cache.unread {
+        cache.unread = false;
+        // The lookup's Hit and Stale arms leave `store` at `!no_cache`.
+        let no_cache = !cache.store;
+        let Ok(entry) = read_entry(cache).await else {
+            // A full queue: nginx's NGX_ERROR from the cache read.
+            cache.request_headers = headers;
+            return Err(crate::worker::internal_error_response(plan.method));
+        };
+        let other = match cache.unread_stale.take() {
+            Some(stale_updating) => {
+                let other = entry
+                    .as_ref()
+                    .and_then(|e| e.other_variant(&cache.main, &headers));
+                let entry = entry.filter(|_| cache.stale_wanted(stale_updating));
+                cache.take_stale(entry, other, stale_updating, &headers)
+            }
+            None => match entry {
+                Some(entry) => {
+                    let other = entry.other_variant(&cache.main, &headers);
+                    if other.is_none() {
+                        cache.hit = Some(CacheHit::Entry(entry));
+                    } else {
+                        cache.status = CacheStatus::Miss;
+                    }
+                    other
+                }
+                None => {
+                    cache.zone.forget_file(&cache.hash);
+                    cache.status = CacheStatus::Miss;
+                    None
+                }
+            },
+        };
+        if let Some(variant) = other.filter(|_| !cache.secondary) {
+            cache.go_to_variant(variant, no_cache);
+            cache.lookup(&headers, no_cache, true);
+        }
+    }
+    cache.request_headers = headers;
+    if (cache.hit.is_none() || cache.background) && plan.initial_peer.is_none() {
+        plan.initial_peer = match plan.sticky.as_deref() {
+            None => upstream::pick_peer(
+                &plan.upstream,
+                &Default::default(),
+                plan.hash.as_deref_mut(),
+            ),
+            Some(st) => upstream::pick_peer_sticky(
+                &plan.upstream,
+                &Default::default(),
+                plan.hash.as_deref_mut(),
+                &st.hint,
+            ),
+        };
+    }
+    Ok(())
+}
+
+/// The entry at `cache.hash`, read on the location's pool if it has one.
+async fn read_entry(cache: &CachePlan) -> std::io::Result<Option<crate::proxy_cache::Entry>> {
+    let path = cache.zone.file_path(&cache.hash);
+    match cache.aio {
+        None => Ok(crate::proxy_cache::Entry::read(&path, &cache.key)),
+        Some(pool) => {
+            let key = cache.key.clone();
+            crate::aio::run(pool, move || crate::proxy_cache::Entry::read(&path, &key)).await
         }
     }
 }
@@ -456,6 +725,8 @@ pub struct InterceptRule {
     pub status: u16,
     pub action: crate::worker::PreparedErrorPageAction,
     pub target: Vec<u8>,
+    /// For a named target: where the request was (#814).
+    pub named_from: Option<Box<crate::phase::NamedFrom>>,
 }
 
 #[allow(dead_code)] // direct callers without a plan still want hardcoded fallback constants
@@ -515,7 +786,8 @@ pub fn write_request(
     buf.extend_from_slice(method_bytes);
     buf.push(b' ');
     buf.extend_from_slice(uri);
-    buf.extend_from_slice(if http_version_minor == 1 {
+    // HTTP/2 (2) goes to `upstream_h2` as an HTTP/1.1 head.
+    buf.extend_from_slice(if http_version_minor != 0 {
         b" HTTP/1.1\r\n"
     } else {
         b" HTTP/1.0\r\n"
@@ -601,6 +873,53 @@ fn upstream_uri(plan: &ProxyPlan) -> &[u8] {
     request_line.split(|&b| b == b' ').nth(1).unwrap_or(b"/")
 }
 
+/// The 103 heads for the client (#848), filled by the attempt and written
+/// while the upstream is awaited (`settle_proxy_response`).
+#[derive(Default)]
+pub struct EarlyHints {
+    heads: std::cell::RefCell<Vec<u8>>,
+}
+
+impl EarlyHints {
+    pub fn pending(&self) -> bool {
+        !self.heads.borrow().is_empty()
+    }
+
+    pub fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.heads.borrow_mut())
+    }
+
+    /// A 103 with the upstream's `fields` less the hidden ones; none
+    /// without fields (ngx_http_early_hints_filter).
+    fn push(&self, rules: &crate::worker::ProxyResponseRules, fields: &[u8]) {
+        let mut head = b"HTTP/1.1 103 Early Hints\r\n".to_vec();
+        let start = head.len();
+        for line in fields.split(|&b| b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                continue;
+            };
+            let name = trim_ascii(&line[..colon]);
+            let hidden = match classify_upstream_header(name) {
+                UpstreamHeader::HopByHop => true,
+                UpstreamHeader::Hidden(bit) => rules.pass_mask & bit == 0,
+                _ => false,
+            } || rules.hide.iter().any(|h| h.eq_ignore_ascii_case(name));
+            if !hidden {
+                head.extend_from_slice(line);
+                head.extend_from_slice(b"\r\n");
+            }
+        }
+        if head.len() > start {
+            head.extend_from_slice(b"\r\n");
+            self.heads.borrow_mut().extend_from_slice(&head);
+        }
+    }
+}
+
+/// nginx's default `proxy_buffer_size` (a page), its bound on the 103s.
+const EARLY_HINTS_MAX: usize = 4096;
+
 impl ProxyPlan {
     /// The address of `upstream.peers[peer_idx]`, or the request's own peer.
     fn peer_addr(&self, peer_idx: usize) -> PeerAddr {
@@ -617,9 +936,41 @@ impl ProxyPlan {
         match self.adhoc.as_deref() {
             Some(adhoc) if adhoc.peers.len() > 1 => (0..adhoc.peers.len())
                 .find(|&i| !tried.contains(i))
-                .map(|i| LeasedPeer::adhoc(self.upstream, i)),
-            _ => upstream::pick_peer(self.upstream, tried, self.hash.as_deref_mut()),
+                .map(|i| LeasedPeer::adhoc(&self.upstream, i)),
+            _ => match self.sticky.as_deref() {
+                None => upstream::pick_peer(&self.upstream, tried, self.hash.as_deref_mut()),
+                Some(st) => upstream::pick_peer_sticky(
+                    &self.upstream,
+                    tried,
+                    self.hash.as_deref_mut(),
+                    &st.hint,
+                ),
+            },
         }
+    }
+}
+
+/// `sticky learn` once a response is taken from the peer: at once with
+/// `header` (nginx's NOTIFY_HEADER, not for an intercepted error), else
+/// when the peer is freed.
+#[cold]
+#[inline(never)]
+fn sticky_learn(
+    sticky: &crate::upstream_sticky::StickyReq,
+    lease: &mut LeasedPeer,
+    upstream_headers: &[u8],
+    intercepted: bool,
+) {
+    let Some(learn) = sticky.conf.learn() else {
+        return;
+    };
+    let Some(session) = sticky.session(upstream_headers) else {
+        return;
+    };
+    if !learn.header {
+        lease.learn = Some(Box::new(session));
+    } else if !intercepted {
+        session.record(sticky.conf, lease.peer_idx);
     }
 }
 
@@ -693,6 +1044,11 @@ pub async fn run_proxy(
     late: Option<LateRender<'_>>,
 ) -> Response {
     report.passes_date = plan.response.passes_date;
+    if plan.cache.as_ref().is_some_and(|c| c.unread)
+        && let Err(response) = Box::pin(read_unread_hit(&mut plan)).await
+    {
+        return response;
+    }
     if let Some(cache) = plan.cache.as_deref_mut() {
         if cache.wait_until.is_some() {
             Box::pin(wait_for_lock(cache)).await;
@@ -719,7 +1075,7 @@ pub async fn run_proxy(
     let accel = &mut report.accel;
     let states = &mut report.states;
     let attempt_started = &mut report.attempt_started;
-    let upstream = plan.upstream;
+    let upstream = plan.upstream.clone();
     if plan.adhoc.as_ref().is_some_and(|a| a.resolve.is_some())
         && let Err(response) = Box::pin(resolve_peers(&mut plan, failures)).await
     {
@@ -759,6 +1115,10 @@ pub async fn run_proxy(
     // `proxy_next_upstream non_idempotent`. Before that (connect failed)
     // any request may.
     let sent_may_retry = plan.method_idempotent || plan.next_upstream.non_idempotent;
+    // A body sent as it came (#134) can't be sent again once a piece of it
+    // went (ngx_http_upstream_next, `request_body_no_buffering`).
+    let may_resend =
+        |plan: &ProxyPlan| sent_may_retry && !plan.body_feed.as_ref().is_some_and(|f| f.started());
     // Tracks the last response we'd return if the next failover branch
     // doesn't fire. The first iteration always overwrites it before any
     // read — `unused_assignments` complains about the initializer, but
@@ -777,12 +1137,16 @@ pub async fn run_proxy(
             plan.peer_addr(current.peer_idx),
         )));
         let state = states.last_mut().expect("just pushed");
+        if let Some(sticky) = plan.sticky.as_deref_mut() {
+            // The cookie names the peer of this attempt.
+            sticky.peer = current.peer_idx;
+        }
         // 1. Try the pool first for this peer. On any failure before the
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
         //    stale-retry counts as part of the same `attempt` budget.
         let pooled = upstream::pool_take(
-            upstream,
+            &upstream,
             current.peer_idx,
             plan.tls.as_deref(),
             plan.pool_tag,
@@ -809,7 +1173,7 @@ pub async fn run_proxy(
                     // if the body can be safely re-sent. The stale socket
                     // isn't an attempt of its own in nginx's terms.
                     *state = UpstreamState::new(state.peer);
-                    if sent_may_retry {
+                    if may_resend(&plan) {
                         attempt(
                             &plan,
                             current.peer_idx,
@@ -880,16 +1244,16 @@ pub async fn run_proxy(
                 // the peer isn't blamed and proxy_intercept_errors applies.
                 if plan.next_upstream.matches_status(status)
                     && attempts < max_tries
-                    && sent_may_retry
+                    && may_resend(&plan)
                     && !deadline_exceeded(overall_deadline)
                 {
                     // http_403 / http_404 move on without counting against
                     // max_fails (NGX_PEER_NEXT, ngx_http_upstream_next);
                     // 5xx and 429 are failures.
                     if matches!(status, 403 | 404) {
-                        upstream::report_success(upstream, current.peer_idx);
+                        upstream::report_success(&upstream, current.peer_idx);
                     } else {
-                        upstream::report_failure(upstream, current.peer_idx);
+                        upstream::report_failure(&upstream, current.peer_idx);
                     }
                     let Some(next) = plan.next_peer(&tried) else {
                         // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
@@ -911,7 +1275,7 @@ pub async fn run_proxy(
                 // check `proxy_intercept_errors`: an upstream status that
                 // matches a configured `error_page` rule turns into a
                 // Reroute instead of being forwarded.
-                upstream::report_success(upstream, current.peer_idx);
+                upstream::report_success(&upstream, current.peer_idx);
                 // ngx_http_upstream_test_next: a status
                 // proxy_cache_use_stale lists is answered from the cache.
                 if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Status(status)) {
@@ -935,6 +1299,14 @@ pub async fn run_proxy(
                     .intercept
                     .as_ref()
                     .and_then(|rules| rules.iter().find(|r| r.status == status));
+                if let Some(sticky) = plan.sticky.as_deref() {
+                    sticky_learn(
+                        sticky,
+                        &mut current,
+                        &report.upstream_headers,
+                        intercepted.is_some(),
+                    );
+                }
                 let mut resp = resp;
                 if let Some(cache) = plan.cache.as_deref_mut() {
                     if let Some(storable) = storable.take() {
@@ -979,13 +1351,16 @@ pub async fn run_proxy(
                 record_failure(failures, &plan, current.peer_idx, error);
                 return crate::worker::internal_error_response(plan.method);
             }
+            AttemptOutcome::ClientBody(status) => {
+                return client_body_error(&plan, status);
+            }
             AttemptOutcome::PooledStale => {
                 // The pre-match collapses PooledStale into either a fresh
                 // retry or a Failed; reaching here is a logic bug.
                 unreachable!("ruxen: pooled-stale outcome leaked past stale-retry collapse");
             }
             AttemptOutcome::Failed(resp, kind, error) => {
-                upstream::report_failure(upstream, current.peer_idx);
+                upstream::report_failure(&upstream, current.peer_idx);
                 let sent = !matches!(
                     *error,
                     UpstreamError::ConnectFailed(_)
@@ -1001,7 +1376,7 @@ pub async fn run_proxy(
                 last_failure = Some(resp);
                 if !triggers
                     || attempts >= max_tries
-                    || (sent && !sent_may_retry)
+                    || (sent && !may_resend(&plan))
                     || deadline_exceeded(overall_deadline)
                 {
                     if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Failed(kind)) {
@@ -1145,17 +1520,19 @@ fn build_intercept_reroute(
             preserved_location: None,
             preserved_www_authenticate,
             closes: crate::http::closes_connection(upstream_status),
+            named_from: None,
         });
     }
     if rule.target[0] == b'@' {
         return Response::Reroute(Reroute {
             target: RerouteTarget::Named(rule.target.clone()),
-            args: None,
+            args: rule.named_from.as_ref().and_then(|from| from.args.clone()),
             error_page_status,
             enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
             closes: crate::http::closes_connection(upstream_status),
+            named_from: rule.named_from.clone(),
         });
     }
     // An absolute URL: a redirect to it, 302 unless `=301` etc. says
@@ -1640,6 +2017,9 @@ enum AttemptOutcome {
     /// (`proxy_bind`): the request ends with a 500, the peer not blamed
     /// (ngx_http_upstream_connect on NGX_ERROR).
     LocalError(Box<UpstreamError>),
+    /// The client's body, sent as it came (#134), failed on the client's
+    /// side: the request ends with this status, the peer not blamed.
+    ClientBody(u16),
 }
 
 /// A `proxy_bind` address, resolved for one request.
@@ -1842,6 +2222,14 @@ async fn attempt(
                 }
             }
         };
+        let stream = if plan.h2 {
+            match Box::pin(h2_connect(plan, stream)).await {
+                Ok(stream) => stream,
+                Err(outcome) => return *outcome,
+            }
+        } else {
+            stream
+        };
         (stream, Instant::now(), 0, slot)
     };
     state.connect_ms = Some(elapsed_ms(started));
@@ -1855,7 +2243,11 @@ async fn attempt(
     // are never copied per attempt. `proxy_send_timeout` bounds each write
     // (#490): a request without a body usually goes in one, and the rest
     // of a head the socket didn't take goes as a body does.
-    let res = if plan.body.is_empty() {
+    let res = if plan.body_feed.is_some() || plan.body_file.is_some() {
+        // The head goes with the body's first piece (`send_body_feed`,
+        // `send_body_file`).
+        Some(Ok(()))
+    } else if plan.body.is_empty() {
         let len = plan.request.len();
         match timeout(
             plan.send_timeout,
@@ -1906,8 +2298,13 @@ async fn attempt(
     }
     state.bytes_sent = (plan.request.len() + plan.body.len()) as u64;
     if let Some(file) = &plan.body_file
-        && let Err(error) = send_body_file(&mut stream, file, plan.send_timeout).await
+        && let Err((error, first)) =
+            send_body_file(&mut stream, plan.request.clone(), file, plan.send_timeout).await
     {
+        // As a failed head write: a pooled connection the upstream closed.
+        if first && from_pool && matches!(error, UpstreamError::SendFailed(_)) {
+            return AttemptOutcome::PooledStale;
+        }
         let kind = match error {
             UpstreamError::TimedOut(_) => FailKind::Timeout,
             _ => FailKind::Error,
@@ -1924,6 +2321,35 @@ async fn attempt(
     }
     if let Some(file) = &plan.body_file {
         state.bytes_sent += file.len;
+    }
+    if let Some(feed) = &plan.body_feed {
+        match Box::pin(send_body_feed(
+            &mut stream,
+            plan.request.clone(),
+            feed,
+            plan.send_timeout,
+        ))
+        .await
+        {
+            Ok(sent) => state.bytes_sent = sent,
+            Err(FeedSendError::Client(e)) => return AttemptOutcome::ClientBody(e.status()),
+            Err(FeedSendError::Upstream(UpstreamError::SendFailed(_)))
+                if from_pool && !feed.started() =>
+            {
+                return AttemptOutcome::PooledStale;
+            }
+            Err(FeedSendError::Upstream(error)) => {
+                let (kind, response) = match error {
+                    UpstreamError::TimedOut(_) => (FailKind::Timeout, plan.gateway_timeout),
+                    _ => (FailKind::Error, plan.bad_gateway),
+                };
+                return AttemptOutcome::Failed(
+                    Response::Prebuilt(response.pick(plan.method)),
+                    kind,
+                    Box::new(error),
+                );
+            }
+        }
     }
 
     // 3. Receive the header block. We need at least the head/body
@@ -2034,6 +2460,9 @@ async fn attempt(
                 head_end_terminator,
                 first_line_end,
                 upstream_is_11,
+                plan.early_hints
+                    .as_deref()
+                    .map(|h| (h, plan.response, interim_len)),
             ) {
                 Err(error) => {
                     return AttemptOutcome::Failed(
@@ -2278,6 +2707,7 @@ async fn attempt(
             chunked,
             content_length,
             upstream_close,
+            plan.pass_trailers,
         )
     {
         // proxy_limit_rate paces from here, the bytes that came with the
@@ -2312,7 +2742,7 @@ async fn attempt(
         let pool =
             (plan.keepalive_eligible && status_code != 101 && !upstream_close && upstream_is_11)
                 .then_some(crate::proxy_stream::StreamPool {
-                    upstream: plan.upstream,
+                    upstream: plan.upstream.clone(),
                     peer_idx,
                     tag: plan.pool_tag,
                     opened_at,
@@ -2342,7 +2772,8 @@ async fn attempt(
                 gzip: None,
                 cache: None,
                 window: None,
-                trailers: false,
+                trailers: plan.pass_trailers && chunked,
+                pass_trailers: (plan.pass_trailers && chunked).then_some(plan.response),
                 buffering: accel
                     .as_ref()
                     .and_then(|a| a.buffering)
@@ -2464,7 +2895,7 @@ async fn attempt(
         && response_framed
     {
         upstream::pool_release(
-            plan.upstream,
+            &plan.upstream,
             peer_idx,
             plan.pool_tag,
             upstream::PooledConn {
@@ -2489,17 +2920,52 @@ async fn attempt(
     AttemptOutcome::Ok(Response::Owned(out))
 }
 
+/// `proxy_http_version 2` (#599): HTTP/2 on a new connection, under
+/// `proxy_connect_timeout` as the TLS handshake is.
+#[cold]
+async fn h2_connect(
+    plan: &ProxyPlan,
+    stream: UpstreamIo,
+) -> Result<UpstreamIo, Box<AttemptOutcome>> {
+    let identity = stream.tls_identity().cloned();
+    let https = identity.is_some();
+    match timeout(
+        plan.connect_timeout,
+        crate::upstream_h2::handshake(stream, https, identity),
+    )
+    .await
+    {
+        Ok(Ok(conn)) => Ok(UpstreamIo::H2(Box::new(conn))),
+        Ok(Err(e)) => Err(Box::new(AttemptOutcome::Failed(
+            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+            FailKind::Error,
+            Box::new(UpstreamError::SendFailed(e)),
+        ))),
+        Err(_) => Err(Box::new(AttemptOutcome::Failed(
+            Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+            FailKind::Timeout,
+            Box::new(UpstreamError::TimedOut(Stage::Connecting)),
+        ))),
+    }
+}
+
 /// How a body that hasn't all arrived with the header (`initial`) is
 /// relayed, or `None` when it is complete (or malformed): it is then
-/// buffered as before, which keeps small responses on one write.
+/// buffered as before, which keeps small responses on one write. A
+/// chunked one with `proxy_pass_trailers` is always relayed, for its
+/// trailers.
 fn stream_framing(
     initial: &[u8],
     chunked: bool,
     content_length: Option<u64>,
     upstream_close: bool,
+    pass_trailers: bool,
 ) -> Option<crate::proxy_stream::StreamFraming> {
     use crate::proxy_stream::{ChunkedDecoder, StreamFraming};
     if chunked {
+        if pass_trailers {
+            return Some(StreamFraming::Chunked(ChunkedDecoder::keeping_trailers()));
+        }
         let mut probe = ChunkedDecoder::default();
         return match probe.feed(initial, &mut Vec::new()) {
             Ok((false, _)) => Some(StreamFraming::Chunked(ChunkedDecoder::default())),
@@ -2603,6 +3069,9 @@ fn client_head(
         }
     }
     out.extend_from_slice(b"\r\n");
+    if !cached && let Some(sticky) = plan.sticky.as_deref() {
+        sticky.write_cookie(&mut out);
+    }
     // An X-Accel-Redirect target reads them too: its `$upstream_http_*`,
     // and the headers nginx carries over to its response.
     let keep_upstream_headers = plan.keep_upstream_headers || skip_body;
@@ -2887,7 +3356,7 @@ fn stale_answer(
 /// cached, the lock is free or aged, or `proxy_cache_lock_timeout` ends;
 /// then the response isn't stored.
 async fn wait_for_lock(cache: &mut CachePlan) {
-    use crate::proxy_cache::{CacheStatus, Entry, now_ms, now_secs};
+    use crate::proxy_cache::{CacheStatus, now_ms, now_secs};
     let Some(deadline) = cache.wait_until.take() else {
         return;
     };
@@ -2903,7 +3372,7 @@ async fn wait_for_lock(cache: &mut CachePlan) {
         }
         monoio::time::sleep(pause).await;
         if cache.zone.is_fresh(&cache.hash, now_secs())
-            && let Some(entry) = Entry::read(&cache.zone.file_path(&cache.hash), &cache.key)
+            && let Ok(Some(entry)) = read_entry(cache).await
             && entry
                 .other_variant(&cache.main, &cache.request_headers)
                 .is_none()
@@ -3202,9 +3671,11 @@ type HeadEnd = (usize, usize);
 /// line (ngx_http_proxy_process_header, ngx_http_proxy_module.c:1911,
 /// :1938; ngx_http_upstream_process_early_hints, ngx_http_upstream.c:2631,
 /// which with `early_hints` unset sends none). A 103 in an HTTP/1.0
-/// response is an invalid header (ngx_http_proxy_module.c:1840). Returns
-/// the bytes dropped and where the next head ends, when it is already in
-/// `accum`.
+/// response is an invalid header (ngx_http_proxy_module.c:1840). With
+/// `early_hints` (#848), its fields less the hidden ones go to `hints`
+/// (the 103s so far within `proxy_buffer_size`, as nginx bounds them).
+/// Returns the bytes dropped and where the next head ends, when it is
+/// already in `accum`.
 #[cold]
 #[inline(never)]
 fn drop_early_hints(
@@ -3212,6 +3683,7 @@ fn drop_early_hints(
     (head_end, term_len): HeadEnd,
     first_line_end: usize,
     upstream_is_11: bool,
+    hints: Option<(&EarlyHints, &crate::worker::ProxyResponseRules, usize)>,
 ) -> Result<(usize, Option<HeadEnd>), Box<UpstreamError>> {
     if !upstream_is_11 {
         return Err(Box::new(UpstreamError::EarlyHintsHttp10));
@@ -3240,6 +3712,11 @@ fn drop_early_hints(
         }
     }
     let dropped = head_end + term_len;
+    if let Some((hints, rules, before)) = hints
+        && before + dropped <= EARLY_HINTS_MAX
+    {
+        hints.push(rules, fields);
+    }
     accum.drain(..dropped);
     Ok((dropped, find_head_end(accum, 0)))
 }
@@ -3312,40 +3789,122 @@ fn upgraded(
 }
 
 /// Stream a request body that was too large to keep in memory from its
-/// temp file. Opened per attempt, so a retry on the next peer re-sends it
-/// from the start; `proxy_send_timeout` bounds each write.
+/// temp file, after the request `head`, which goes in the first write: a
+/// backend that reads the head alone may take the body for one still to
+/// come (#134). Opened per attempt, so a retry on the next peer re-sends
+/// it from the start; `proxy_send_timeout` bounds each write. The error
+/// says whether the first write failed.
 async fn send_body_file(
     stream: &mut UpstreamIo,
+    head: bytes::Bytes,
     file: &RequestBodyFile,
     send_timeout: Duration,
-) -> Result<(), UpstreamError> {
+) -> Result<(), (UpstreamError, bool)> {
     use monoio::buf::IoBuf;
     use std::os::unix::fs::FileExt;
+    const PIECE: usize = 64 * 1024;
     // Positional reads from the start: each attempt re-sends the whole
     // body through the same descriptor.
     let mut offset = 0u64;
     let mut left = file.len;
-    let mut buf = vec![0u8; 64 * 1024];
-    while left > 0 {
-        let want = left.min(buf.len() as u64) as usize;
+    let mut buf = Vec::with_capacity(head.len() + PIECE);
+    buf.extend_from_slice(&head);
+    let mut first = true;
+    while left > 0 || first {
+        let start = buf.len();
+        let want = left.min(PIECE as u64) as usize;
+        buf.resize(start + want, 0);
         let n = file
             .file
-            .read_at(&mut buf[..want], offset)
-            .map_err(UpstreamError::SendFailed)?;
-        if n == 0 {
-            return Err(UpstreamError::SendFailed(
-                std::io::ErrorKind::UnexpectedEof.into(),
+            .read_at(&mut buf[start..], offset)
+            .map_err(|e| (UpstreamError::SendFailed(e), false))?;
+        if n == 0 && want > 0 {
+            return Err((
+                UpstreamError::SendFailed(std::io::ErrorKind::UnexpectedEof.into()),
+                false,
             ));
         }
-        let (res, returned) = timeout(send_timeout, stream.write_all(buf.slice(..n)))
+        let len = start + n;
+        let (res, returned) = timeout(send_timeout, stream.write_all(buf.slice(..len)))
             .await
-            .map_err(|_| UpstreamError::TimedOut(Stage::SendingRequest))?;
+            .map_err(|_| (UpstreamError::TimedOut(Stage::SendingRequest), false))?;
         buf = returned.into_inner();
-        res.map_err(UpstreamError::SendFailed)?;
+        buf.clear();
+        res.map_err(|e| (UpstreamError::SendFailed(e), first))?;
+        first = false;
         left -= n as u64;
         offset += n as u64;
     }
     Ok(())
+}
+
+enum FeedSendError {
+    Client(crate::request_feed::FeedError),
+    Upstream(UpstreamError),
+}
+
+/// The request head, then the client's body as it arrives (#134):
+/// re-chunked when the client's is chunked (nginx's
+/// ngx_http_proxy_body_output_filter). What is there goes in one write,
+/// the head with the first piece and the last chunk with the one before,
+/// as nginx sends its buffers. The bytes written.
+#[cold]
+#[inline(never)]
+async fn send_body_feed(
+    stream: &mut UpstreamIo,
+    head: bytes::Bytes,
+    feed: &crate::request_feed::BodyFeed,
+    send_timeout: Duration,
+) -> Result<u64, FeedSendError> {
+    let mut out = head.to_vec();
+    let mut piece = feed.try_take();
+    let mut sent = 0u64;
+    loop {
+        if let Some(piece) = piece.take() {
+            if feed.chunked() {
+                out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                out.extend_from_slice(&piece);
+                out.extend_from_slice(b"\r\n");
+            } else {
+                out.extend_from_slice(&piece);
+            }
+        }
+        let last = feed.ended();
+        if last && feed.chunked() {
+            out.extend_from_slice(b"0\r\n\r\n");
+        }
+        if !out.is_empty() {
+            let len = out.len() as u64;
+            let (res, _) = timeout(send_timeout, stream.write_all(std::mem::take(&mut out)))
+                .await
+                .map_err(|_| {
+                    FeedSendError::Upstream(UpstreamError::TimedOut(Stage::SendingRequest))
+                })?;
+            res.map_err(|e| FeedSendError::Upstream(UpstreamError::SendFailed(e)))?;
+            sent += len;
+        }
+        if last {
+            return Ok(sent);
+        }
+        // `None`: the end, `ended` says so next time round.
+        piece = feed.next().await.map_err(FeedSendError::Client)?;
+    }
+}
+
+/// The client's body failed while it was sent upstream (#134).
+#[cold]
+#[inline(never)]
+fn client_body_error(plan: &ProxyPlan, status: u16) -> Response {
+    if status == 408 {
+        return Response::Prebuilt(crate::worker::BODY_TIMED_OUT);
+    }
+    let body = format!("{}\n", crate::http::reason_phrase(status));
+    Response::Owned(crate::http::error_response_for_method(
+        status,
+        &body,
+        plan.method,
+        plan.server_bytes,
+    ))
 }
 
 /// A `proxy_limit_rate` with variables, from the upstream's head: its
@@ -3391,6 +3950,26 @@ fn upstream_header_lines(head: &[u8], first_line_end: usize) -> Vec<u8> {
 fn paced_head_buf(buf: Vec<u8>) -> Vec<u8> {
     return_proxy_buf(buf);
     Vec::with_capacity(PROXY_SCRATCH_CAP)
+}
+
+/// `proxy_pass_trailers`: the upstream's trailer lines less the hidden
+/// ones (ngx_http_upstream_process_trailers, `hide_headers_hash`).
+#[cold]
+#[inline(never)]
+pub(crate) fn passed_trailers(rules: &crate::worker::ProxyResponseRules, lines: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines.split_inclusive(|&b| b == b'\n') {
+        let colon = line.iter().position(|&b| b == b':').unwrap_or(0);
+        let name = &line[..colon];
+        let hidden = match classify_upstream_header(name) {
+            UpstreamHeader::Hidden(bit) => rules.pass_mask & bit == 0,
+            _ => false,
+        } || rules.hide.iter().any(|h| h.eq_ignore_ascii_case(name));
+        if !hidden {
+            out.extend_from_slice(line);
+        }
+    }
+    out
 }
 
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body

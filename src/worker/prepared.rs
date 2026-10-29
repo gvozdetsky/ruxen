@@ -208,6 +208,11 @@ pub struct PreparedSplitClients {
 pub struct PreparedMapRegex {
     pub regex: regex::bytes::Regex,
     pub value: &'static [PreparedValuePart],
+    /// The parts of `value` that are this regex's captures (`$1`, a named
+    /// group), as (part index, group) (#800).
+    pub captures: &'static [(usize, usize)],
+    /// The regex has groups: a match sets the request's captures (#832).
+    pub groups: bool,
 }
 
 /// Prepared form of one `map $source $dest { ... }` program.
@@ -266,6 +271,11 @@ pub struct RewriteState {
     /// request, internal redirects included, unless the map is `volatile`.
     /// Filled while rendering, which only has `&self`.
     map_cache: std::cell::RefCell<Vec<(usize, Vec<u8>)>>,
+    /// `$1`…`$9` of the last `map` regex that matched (#832), until a
+    /// rewrite or location regex sets them again; set while rendering.
+    map_numbered: std::cell::RefCell<Option<Vec<Vec<u8>>>>,
+    /// The named groups of the `map` regexes that matched, last one wins.
+    map_named: std::cell::RefCell<Vec<(Box<str>, Vec<u8>)>>,
     /// The chosen location's (or, in the server's rewrite phase, the
     /// server's) root, for `$request_filename` / `$document_root`.
     pub(crate) doc_root: Option<&'static DocRoot>,
@@ -295,6 +305,8 @@ impl Default for RewriteState {
             unparsed_uri: true,
             internal: false,
             map_cache: std::cell::RefCell::new(Vec::new()),
+            map_numbered: std::cell::RefCell::new(None),
+            map_named: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
             limit_req_status: 0,
             limit_conn_status: 0,
@@ -306,6 +318,7 @@ impl Default for RewriteState {
 
 impl RewriteState {
     pub(crate) fn clear_numbered_captures(&mut self) {
+        *self.map_numbered.get_mut() = None;
         if self.numbered_captures.is_empty() {
             return;
         }
@@ -318,6 +331,7 @@ impl RewriteState {
         if n == 0 {
             return;
         }
+        *self.map_numbered.get_mut() = None;
         if self.numbered_captures.is_empty() {
             self.numbered_captures.resize_with(10, Vec::new);
         }
@@ -345,6 +359,8 @@ impl RewriteState {
     /// Whether a regex left `$1`…`$9` to render later.
     pub(crate) fn has_numbered_captures(&self) -> bool {
         self.numbered_captures.iter().any(|c| !c.is_empty())
+            || self.map_numbered.borrow().is_some()
+            || !self.map_named.borrow().is_empty()
     }
 
     pub(crate) fn set_numbered_from_regex_captures(
@@ -360,11 +376,63 @@ impl RewriteState {
         }
     }
 
-    pub(crate) fn numbered_capture(&self, n: usize) -> Option<&[u8]> {
-        self.numbered_captures
-            .get(n)
-            .filter(|v| !v.is_empty())
-            .map(Vec::as_slice)
+    /// Appends `$n` to `out`: a `map` regex's, else the request's.
+    pub(crate) fn write_numbered_capture(&self, n: usize, out: &mut Vec<u8>) {
+        if let Some(map) = self.map_numbered.borrow().as_ref() {
+            if let Some(v) = map.get(n) {
+                out.extend_from_slice(v);
+            }
+            return;
+        }
+        if let Some(v) = self.numbered_captures.get(n) {
+            out.extend_from_slice(v);
+        }
+    }
+
+    /// A `map` regex matched (ngx_http_regex_exec): its groups become the
+    /// request's `$1`…`$9` and named captures.
+    pub(crate) fn set_map_captures(
+        &self,
+        regex: &regex::bytes::Regex,
+        captures: &regex::bytes::Captures<'_>,
+    ) {
+        let numbered = (0..10)
+            .map(|n| {
+                captures
+                    .get(n)
+                    .map_or(Vec::new(), |m| m.as_bytes().to_vec())
+            })
+            .collect();
+        *self.map_numbered.borrow_mut() = Some(numbered);
+        let mut named = self.map_named.borrow_mut();
+        for (group, name) in regex.capture_names().enumerate() {
+            let Some(name) = name else {
+                continue;
+            };
+            let value = captures
+                .get(group)
+                .map_or(Vec::new(), |m| m.as_bytes().to_vec());
+            match named.iter_mut().find(|(n, _)| **n == *name) {
+                Some(slot) => slot.1 = value,
+                None => named.push((name.into(), value)),
+            }
+        }
+    }
+
+    /// A `map` regex without groups matched: `$1`…`$9` are empty.
+    pub(crate) fn clear_map_numbered(&self) {
+        *self.map_numbered.borrow_mut() = Some(Vec::new());
+    }
+
+    /// Appends a `map` regex's named capture `name`, if one matched.
+    pub(crate) fn write_map_named_capture(&self, name: &str, out: &mut Vec<u8>) -> bool {
+        match self.map_named.borrow().iter().find(|(n, _)| **n == *name) {
+            Some((_, v)) => {
+                out.extend_from_slice(v);
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn set_user_var(&mut self, name: &'static [u8], value: Vec<u8>) {
@@ -387,6 +455,7 @@ impl RewriteState {
     pub(crate) fn worth_keeping(&self) -> bool {
         self.has_user_vars()
             || !self.map_cache.borrow().is_empty()
+            || !self.map_named.borrow().is_empty()
             || self.limit_req_status != 0
             || self.limit_conn_status != 0
     }
@@ -768,6 +837,8 @@ pub struct PreparedProxy {
     pub pass_request_headers: bool,
     /// Inheritance-resolved `proxy_pass_request_body` (default `true`).
     pub pass_request_body: bool,
+    /// Inheritance-resolved `proxy_request_buffering` (default `true`).
+    pub request_buffering: bool,
     /// Inheritance-resolved `proxy_set_body`: rendered per request and sent
     /// instead of the client's body.
     pub set_body: Option<&'static [PreparedValuePart]>,
@@ -781,9 +852,9 @@ pub struct PreparedProxy {
     /// unlimited, and so is one with variables here: it is read when the
     /// upstream's header is in (`ProxyResponseRules::limit_rate`).
     pub limit_rate: u64,
-    /// 0 = HTTP/1.0, 1 = HTTP/1.1 (the default since nginx 1.29.7).
-    /// Drives the upstream request-line version and gates pool
-    /// eligibility (HTTP/1.0 always closes after the response).
+    /// 0 = HTTP/1.0, 1 = HTTP/1.1 (the default since nginx 1.29.7), 2 =
+    /// HTTP/2 (#599). Drives the upstream request-line version and gates
+    /// pool eligibility (HTTP/1.0 always closes after the response).
     pub http_version: u8,
     /// `proxy_next_upstream` mask. Default `error timeout`.
     pub next_upstream: crate::config::ProxyNextUpstream,
@@ -802,6 +873,10 @@ pub struct PreparedProxy {
     /// `proxy_ignore_client_abort`: keep the upstream exchange when the
     /// client goes away (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` conditions (#848); empty: off.
+    pub early_hints: &'static [&'static [PreparedValuePart]],
+    /// `proxy_pass_trailers` (#823).
+    pub pass_trailers: bool,
     /// Effective `ignore_invalid_headers` policy from the matched server.
     /// When true, headers with non-fatal invalid names are dropped before
     /// forwarding upstream.
@@ -884,10 +959,12 @@ impl PreparedProxy {
     /// 0 when the pool is shared by every location.
     #[inline]
     pub fn pool_tag(&self, upstream: &PreparedUpstream) -> usize {
+        // Bit 0 keeps HTTP/2 connections apart (`response` is aligned).
+        let h2 = usize::from(self.http_version == 2);
         if upstream.keepalive_local {
-            std::ptr::from_ref(self.response) as usize
+            std::ptr::from_ref(self.response) as usize | h2
         } else {
-            0
+            h2
         }
     }
 }
@@ -931,6 +1008,7 @@ pub(crate) struct ProxyEffective {
     pub set_headers: &'static [PreparedProxySetHeader],
     pub pass_request_headers: bool,
     pub pass_request_body: bool,
+    pub request_buffering: bool,
     pub set_body: Option<&'static [PreparedValuePart]>,
     pub ignore_accel_redirect: bool,
     pub ignore_accel_limit_rate: bool,
@@ -940,7 +1018,7 @@ pub(crate) struct ProxyEffective {
     /// `proxy_limit_rate`, a size that may hold variables; `None`
     /// means unlimited.
     pub limit_rate: Option<&'static [PreparedValuePart]>,
-    /// 0 = HTTP/1.0, 1 = HTTP/1.1. Matches nginx's default of 1.1 (1.29.7).
+    /// 0 = HTTP/1.0, 1 = HTTP/1.1, 2 = HTTP/2. nginx's default is 1.1 (1.29.7).
     pub http_version: u8,
     pub next_upstream: crate::config::ProxyNextUpstream,
     pub next_upstream_tries: u32,
@@ -949,6 +1027,10 @@ pub(crate) struct ProxyEffective {
     pub force_ranges: bool,
     /// `proxy_ignore_client_abort` (#136).
     pub ignore_client_abort: bool,
+    /// `early_hints` (#848).
+    pub early_hints: &'static [&'static [PreparedValuePart]],
+    /// `proxy_pass_trailers` (#823).
+    pub pass_trailers: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     /// The nearest scope's `proxy_redirect` lines; `None` = nginx's
@@ -1127,6 +1209,7 @@ impl ProxyEffective {
             set_headers: &[],
             pass_request_headers: true,
             pass_request_body: true,
+            request_buffering: true,
             set_body: None,
             ignore_accel_redirect: false,
             ignore_accel_limit_rate: false,
@@ -1142,6 +1225,8 @@ impl ProxyEffective {
             intercept_errors: false,
             force_ranges: false,
             ignore_client_abort: false,
+            early_hints: &[],
+            pass_trailers: false,
             ignore_invalid_headers: true,
             underscores_in_headers: false,
             redirect: None,
@@ -1179,7 +1264,7 @@ impl ProxyEffective {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PreparedUpstream {
     /// Display name. For named upstream blocks: the block name.
     /// For synthesized direct-form blocks: the literal host:port.
@@ -1210,6 +1295,11 @@ pub struct PreparedUpstream {
     /// all workers (one slot per peer). `None`: per worker, as nginx's
     /// without a zone.
     pub shared: Option<&'static [crate::upstream::PeerShared]>,
+    /// `resolve` servers (#597): the peers change at run time, and
+    /// requests use `current()`'s list.
+    pub dynamic: Option<&'static crate::upstream_resolve::Version>,
+    /// `sticky` (#600).
+    pub sticky: Option<&'static crate::upstream_sticky::Sticky>,
     /// Each peer's metrics slot (#481); `None` without `ruxen_metrics`.
     pub metrics: Option<&'static [u32]>,
 }
@@ -1696,6 +1786,9 @@ pub struct PreparedLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1756,6 +1849,9 @@ pub struct PreparedRegexLocation {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1803,6 +1899,9 @@ pub struct MatchedLocation<'a> {
     /// Effective `sendfile` (location → server → http, default off). When
     /// on, file bodies are sent zero-copy on plain TCP connections.
     pub sendfile: bool,
+    /// `aio threads`' pool (location → server → http, #526); `None`: file
+    /// reads stay on the worker.
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// Effective gzip settings; `None` when `gzip` is off.
     pub gzip: Option<&'static PreparedGzip>,
     pub limit_rate: Option<&'static PreparedLimitRate>,
@@ -1845,6 +1944,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            aio: loc.aio,
             gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
@@ -1899,6 +1999,7 @@ impl<'a> MatchedLocation<'a> {
             body_temp: loc.body_temp,
             doc_root: loc.doc_root,
             sendfile: loc.sendfile,
+            aio: loc.aio,
             gzip: loc.gzip,
             limit_rate: loc.limit_rate,
             post_action: loc.post_action,
