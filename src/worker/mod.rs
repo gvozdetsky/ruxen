@@ -58,6 +58,7 @@ pub(crate) mod limit_req;
 pub(crate) mod listeners;
 mod log;
 pub(crate) mod logbuf;
+pub(crate) mod metrics;
 pub(crate) mod open_log_cache;
 pub(crate) mod panics;
 mod prepare;
@@ -1251,6 +1252,7 @@ mod tests {
             body: &crate::phase::NO_BODY,
             body_len: 0,
             body_file: None,
+            body_feed: None,
             tls: None,
             conn: &phase::ConnInfo::NONE,
             refuse: None,

@@ -20,11 +20,33 @@ use super::connection::ConnIo;
 /// of it for every kind of connection.
 pub(crate) trait WatchClient {
     fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+    /// Write an interim head (a 103, #848); `false` if it didn't go out.
+    fn send_interim(
+        &mut self,
+        head: Vec<u8>,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = bool> + '_>>;
 }
 
 impl<S: ConnIo> WatchClient for S {
     fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         Box::pin(self.peer_closed())
+    }
+
+    fn send_interim(
+        &mut self,
+        head: Vec<u8>,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+        Box::pin(async move {
+            let len = head.len();
+            // Far off: the helper arms it (a fresh `timeout` one would never be).
+            let timer = std::pin::pin!(monoio::time::sleep(Duration::from_secs(3600)));
+            super::connection::write_all_timed(self, head, len, timer, timeout)
+                .await
+                .0
+                .is_ok()
+        })
     }
 }
 
@@ -87,6 +109,57 @@ impl<F: Future> Future for Watched<'_, F> {
         match this.watch.as_mut().map(|w| w.as_mut().poll(cx)) {
             Some(Poll::Ready(())) => Poll::Ready(None),
             _ => Poll::Pending,
+        }
+    }
+}
+
+/// `Watched` with `early_hints` (#848): the 103s the attempt collects go
+/// to the client while the upstream is awaited, and any left before the
+/// final response. `None`: the client went away.
+#[cold]
+#[inline(never)]
+pub(crate) async fn with_early_hints<F: Future>(
+    mut proxy: Pin<&mut F>,
+    client: &mut dyn WatchClient,
+    watch: bool,
+    at_once: bool,
+    hints: &crate::proxy::EarlyHints,
+    timeout: Duration,
+) -> Option<F::Output> {
+    loop {
+        let out = {
+            let watched_client = watch.then_some(&*client);
+            let watched = if at_once {
+                Watched::at_once(proxy.as_mut(), watched_client)
+            } else {
+                Watched::new(proxy.as_mut(), watched_client)
+            };
+            UntilHints { watched, hints }.await
+        };
+        if hints.pending() && !client.send_interim(hints.take(), timeout).await {
+            return None;
+        }
+        if let Some(out) = out {
+            return out;
+        }
+    }
+}
+
+/// `Watched` until it ends (`Some`) or a 103 is to go out (`None`).
+struct UntilHints<'a, 'b, F> {
+    watched: Watched<'a, F>,
+    hints: &'b crate::proxy::EarlyHints,
+}
+
+impl<F: Future> Future for UntilHints<'_, '_, F> {
+    type Output = Option<Option<F::Output>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.watched).poll(cx) {
+            Poll::Ready(out) => Poll::Ready(Some(out)),
+            Poll::Pending if this.hints.pending() => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

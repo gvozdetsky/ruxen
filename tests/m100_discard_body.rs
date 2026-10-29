@@ -7,7 +7,8 @@
 //! connection stays usable: keep-alive and a pipelined request after the
 //! body work, and `$request_length` still counts the whole body. A static
 //! file discards it too, as nginx's static module does, unless an `index`
-//! or `error_page` can take the request to something that reads it.
+//! or `error_page` can take the request to something that reads it. The
+//! access phase answers before the body is read too (#855).
 
 mod common;
 
@@ -36,6 +37,15 @@ fn start(name: &str) -> (Server, u16) {
 /// A server whose locations `locations` gives, from the temp dir and the
 /// port.
 fn start_with(name: &str, locations: impl FnOnce(&Path, u16) -> String) -> (Server, u16) {
+    start_with_http(name, "", locations)
+}
+
+/// As `start_with`, with `http` at the http level.
+fn start_with_http(
+    name: &str,
+    http: &str,
+    locations: impl FnOnce(&Path, u16) -> String,
+) -> (Server, u16) {
     let dir = std::env::temp_dir().join(format!("ruxen-m100-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -53,6 +63,7 @@ fn start_with(name: &str, locations: impl FnOnce(&Path, u16) -> String) -> (Serv
         format!(
             "events {{}}\nhttp {{\n\
              log_format len '$request_uri $request_length';\n\
+             {http}\n\
              server {{ listen 127.0.0.1:{port};\n\
              access_log {d}/access.log len;\n\
              client_max_body_size 10m;\n\
@@ -155,6 +166,38 @@ fn m100_dropped_body_keeps_the_connection_in_step() {
     let len_a: usize = lines[0].strip_prefix("/a ").unwrap().parse().unwrap();
     assert_eq!(len_a, head.len() + big.len(), "{lines:?}");
     assert!(lines[1].starts_with("/b "), "{lines:?}");
+}
+
+/// A body that came whole is dropped before the response, as nginx reads
+/// what has arrived, and the requests queued behind it are read from the
+/// socket at once (#757); with the body dropped by the read instead.
+#[test]
+fn m100_a_body_already_there_and_requests_behind_it() {
+    let (server, port) = start("there");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let body = vec![b'y'; 100 * 1024];
+    let mut all = Vec::new();
+    for path in ["/a", "/b"] {
+        all.extend_from_slice(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        all.extend_from_slice(&body);
+    }
+    all.extend_from_slice(b"GET /c HTTP/1.1\r\nHost: x\r\n\r\n");
+    s.write_all(&all).unwrap();
+    let ok = format!("HTTP/1.1 200 OK | ok {}\n", body.len());
+    assert_eq!(
+        responses(&mut s, 3),
+        [ok.clone(), ok, "HTTP/1.1 200 OK | ok \n".to_string()]
+    );
+    let lines = log_lines(&server.1.join("access.log"), 3);
+    assert!(lines[1].starts_with("/b "), "{lines:?}");
+    assert!(lines[2].starts_with("/c "), "{lines:?}");
 }
 
 #[test]
@@ -383,4 +426,189 @@ fn m100_a_refused_body_goes_upstream_empty() {
         .unwrap();
     let out = responses(&mut s, 1);
     assert!(out[0].ends_with("| got 0 of 0"), "{out:?}");
+}
+
+/// What answers before a location (a server-level `return`, a bad target,
+/// a missing Host) and `try_files` to a file (also via an SPA's `@router`)
+/// answer before the body has come, as nginx discards it (#776); so does
+/// a file found by a `try_files` that may end in a proxy (#836), while the
+/// proxy still gets the body when it isn't.
+#[test]
+fn m100_unrouted_answers_and_try_files_come_before_the_body() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with("unrouted", |dir, _| {
+        let html = dir.join("html");
+        std::fs::create_dir_all(&html).unwrap();
+        std::fs::write(html.join("index.html"), "index").unwrap();
+        std::fs::create_dir_all(html.join("p")).unwrap();
+        std::fs::write(html.join("p/f.txt"), "file").unwrap();
+        format!(
+            "root {html};\n\
+             if ($http_x_redirect) {{ return 301 https://example.com/; }}\n\
+             location / {{ try_files $uri $uri/ @router; }}\n\
+             location @router {{ rewrite ^ /index.html last; }}\n\
+             location /p/ {{ try_files $uri @up; }}\n\
+             location @up {{ proxy_pass http://127.0.0.1:{upstream}; }}",
+            html = html.display()
+        )
+    });
+    let first = |head: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(format!("{head}Content-Length: 10\r\n\r\nabc").as_bytes())
+            .unwrap();
+        let out = responses(&mut s, 1).remove(0);
+        (s, out)
+    };
+    let (_, out) = first("POST /x HTTP/1.1\r\nHost: x\r\nX-Redirect: 1\r\n");
+    assert!(out.starts_with("HTTP/1.1 301 "), "{out}");
+    let (_, out) = first("GET /%4 HTTP/1.1\r\nHost: x\r\n");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    let (_, out) = first("GET / HTTP/1.1\r\n");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    let (mut s, out) = first("GET /missing HTTP/1.1\r\nHost: x\r\n");
+    assert_eq!(out, "HTTP/1.1 200 OK | index");
+    s.write_all(b"defghijGET /index.html HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    assert_eq!(
+        responses(&mut s, 1),
+        ["HTTP/1.1 200 OK | index".to_string()]
+    );
+    let (_, out) = first("POST /p/f.txt HTTP/1.1\r\nHost: x\r\n");
+    assert!(out.starts_with("HTTP/1.1 405 "), "{out}");
+    let (_, out) = first("GET /p/f.txt HTTP/1.1\r\nHost: x\r\n");
+    assert_eq!(out, "HTTP/1.1 200 OK | file");
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"POST /p/none HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+        .unwrap();
+    let out = responses(&mut s, 1);
+    assert!(out[0].ends_with("| got 5 of 5"), "{out:?}");
+}
+
+/// The access phase answers before the body is read, as nginx's (#855):
+/// auth_basic, deny, auth_request, limit_req and limit_conn refuse at once
+/// and the body is dropped; a request they let through still sends its
+/// body upstream, counted once by the limits.
+#[test]
+fn m100_the_access_phase_answers_before_the_body() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with_http(
+        "access",
+        "limit_req_zone $binary_remote_addr zone=one:1m rate=1r/m;\n\
+         limit_conn_zone $binary_remote_addr zone=c:1m;",
+        |dir, _| {
+            let users = dir.join("htpasswd");
+            std::fs::write(&users, "u:{PLAIN}p\n").unwrap();
+            format!(
+                "location /basic/ {{ auth_basic x; auth_basic_user_file {users};\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /deny/ {{ deny all; proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /req/ {{ limit_req zone=one;\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /conn/ {{ limit_conn c 1;\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location /sub/ {{ auth_request /auth;\n\
+                 proxy_pass http://127.0.0.1:{upstream}; }}\n\
+                 location = /auth {{ internal;\n\
+                 if ($http_x_ok) {{ return 204; }} return 401; }}",
+                users = users.display()
+            )
+        },
+    );
+    // Head only: the answer comes without the body.
+    let refused = |target: &str, extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(
+            format!("POST {target} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: 10\r\n\r\nabc")
+                .as_bytes(),
+        )
+        .unwrap();
+        responses(&mut s, 1).remove(0)
+    };
+    let through = |target: &str, extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(
+            format!("POST {target} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: 5\r\n\r\nhello")
+                .as_bytes(),
+        )
+        .unwrap();
+        responses(&mut s, 1).remove(0)
+    };
+    let auth = "Authorization: Basic dTpw\r\n";
+    let out = refused("/basic/", "");
+    assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+    let out = through("/basic/", auth);
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    let out = refused("/deny/", "");
+    assert!(out.starts_with("HTTP/1.1 403 "), "{out}");
+    let out = refused("/sub/", "");
+    assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+    let out = through("/sub/", "X-Ok: 1\r\n");
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    // limit_conn 1: the request holds its count while the body goes up,
+    // without counting itself twice.
+    let out = through("/conn/", "");
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    // One a minute: the first goes through, counted once; the next is
+    // refused at once.
+    let out = through("/req/", "");
+    assert!(out.ends_with("| got 5 of 5"), "{out}");
+    let out = refused("/req/", "");
+    assert!(out.starts_with("HTTP/1.1 503 "), "{out}");
+}
+
+/// A chunked body with bad framing is the location's to answer, as nginx
+/// reads or discards it there (#806): a static file's 405 and an
+/// auth_basic 401 come first; otherwise the 400 carries the location's
+/// `add_header … always`. The connection closes after it.
+#[test]
+fn m100_a_bad_chunked_body_is_answered_by_the_location() {
+    let upstream = counting_upstream();
+    let (_server, port) = start_with("badchunk", |dir, _| {
+        let html = dir.join("html");
+        std::fs::create_dir_all(&html).unwrap();
+        std::fs::write(html.join("f.txt"), "file").unwrap();
+        let users = dir.join("htpasswd");
+        std::fs::write(&users, "u:{PLAIN}p\n").unwrap();
+        format!(
+            "location / {{ add_header X-Loc l always; return 200 \"ok\\n\"; }}\n\
+             location /s/ {{ alias {html}/; }}\n\
+             location /b/ {{ auth_basic x; auth_basic_user_file {users};\n\
+             proxy_pass http://127.0.0.1:{upstream}; }}\n\
+             location /p/ {{ add_header X-P p always;\n\
+             proxy_pass http://127.0.0.1:{upstream}; }}",
+            html = html.display(),
+            users = users.display()
+        )
+    });
+    let ask = |target: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(
+            format!(
+                "POST {target} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                 zz\r\nhello\r\n0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+    let out = ask("/");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    assert!(out.contains("\r\nX-Loc: l\r\n"), "{out}");
+    assert!(out.contains("\r\nConnection: close\r\n"), "{out}");
+    let out = ask("/s/f.txt");
+    assert!(out.starts_with("HTTP/1.1 405 "), "{out}");
+    let out = ask("/b/");
+    assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+    let out = ask("/p/");
+    assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+    assert!(out.contains("\r\nX-P: p\r\n"), "{out}");
 }

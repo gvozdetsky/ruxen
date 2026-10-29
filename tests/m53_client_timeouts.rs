@@ -44,8 +44,12 @@ fn start(tag: &str, sendfile: bool) -> Server {
         dir.join("nginx.conf"),
         format!(
             "events {{}}\nhttp {{\n  client_header_timeout 1s;\n  client_body_timeout 1s;\n\
+             log_format cut '$request $status $request_length';\n\
+             access_log {}/access.log cut;\n\
              server {{ listen 127.0.0.1:{port}; root {}; sendfile {}; send_timeout 1s;\n\
-               location = /echo {{ return 200 \"ok\"; }} }} }}\n",
+               location = /echo {{ return 200 \"ok\"; }}\n\
+               location = /up {{ proxy_pass http://127.0.0.1:{port}/echo; }} }} }}\n",
+            dir.display(),
             dir.display(),
             if sendfile { "on" } else { "off" }
         ),
@@ -132,6 +136,62 @@ fn stalled_body_is_closed_after_client_body_timeout() {
         .unwrap();
     let t = closed_after(&mut s, Duration::from_secs(5)).expect("still open after 5 s");
     assert!(t >= Duration::from_millis(800), "closed too early: {t:?}");
+}
+
+/// #858: a chunked one too, unanswered, as nginx terminates on 408.
+#[test]
+fn stalled_chunked_body_is_closed_unanswered() {
+    let server = start("chunked", false);
+    let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    // Proxied: the body is read before the response.
+    s.write_all(b"POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc")
+        .unwrap();
+    let start = Instant::now();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    let t = start.elapsed();
+    assert!(t >= Duration::from_millis(800), "closed too early: {t:?}");
+}
+
+/// #866: a request cut while its body is read is logged as nginx does:
+/// 408 on the timeout, 400 for a client gone; the bytes read so far.
+#[test]
+fn cut_body_is_logged() {
+    let server = start("cutlog", false);
+    let cases: [(&[u8], bool); 3] = [
+        (
+            b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc",
+            false,
+        ),
+        (
+            b"POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc",
+            false,
+        ),
+        (
+            b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc",
+            true,
+        ),
+    ];
+    for (head, close) in cases {
+        let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.write_all(head).unwrap();
+        if close {
+            sleep(Duration::from_millis(200));
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    }
+    sleep(Duration::from_millis(200));
+    let log = std::fs::read_to_string(server.dir.join("access.log")).unwrap();
+    assert_eq!(
+        log,
+        "POST /up HTTP/1.1 408 53\nPOST /up HTTP/1.1 408 64\nPOST /up HTTP/1.1 400 53\n"
+    );
 }
 
 #[test]

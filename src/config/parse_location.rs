@@ -271,14 +271,10 @@ pub(crate) fn parse_location_spec(args: &[String]) -> Result<LocationSpec, Error
 /// prepare time; storing it here would force `Location` to be non-`Debug`-
 /// friendly and bloat the parser surface.
 ///
-/// Uses `regex::bytes::RegexBuilder`: nginx matches PCRE against
-/// `r->uri.data` as raw bytes, and our normalized path is also a `Vec<u8>`
-/// (percent-decoding can produce arbitrary octets). Compiling here with
-/// the same builder used in `prepare` keeps validation and runtime in sync.
+/// Compiled with `crate::config::pcre::regex`, as in `prepare`, so validation and
+/// runtime agree.
 pub(crate) fn validate_regex(pattern: &str, case_insensitive: bool) -> Result<(), Error> {
-    regex::bytes::RegexBuilder::new(&pcre::translate(pattern))
-        .case_insensitive(case_insensitive)
-        .build()
+    crate::config::pcre::regex(pattern, case_insensitive)
         .map(|_| ())
         .map_err(|e| Error::InvalidRegex {
             pattern: pattern.to_string(),
@@ -325,6 +321,10 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
     or(&mut child.keepalive_timeout, &parent.keepalive_timeout);
     or(&mut child.keepalive_requests, &parent.keepalive_requests);
     or(&mut child.keepalive_time_ms, &parent.keepalive_time_ms);
+    or(
+        &mut child.keepalive_min_timeout_ms,
+        &parent.keepalive_min_timeout_ms,
+    );
     or(&mut child.keepalive_disable, &parent.keepalive_disable);
     or(&mut child.error_logs, &parent.error_logs);
     or(&mut child.log_not_found, &parent.log_not_found);
@@ -360,6 +360,7 @@ fn inherit_from_parent(child: &mut Location, parent: &Location) {
         &parent.client_body_buffer_size,
     );
     or(&mut child.sendfile, &parent.sendfile);
+    or(&mut child.aio, &parent.aio);
     or(
         &mut child.client_body_temp_path,
         &parent.client_body_temp_path,
@@ -479,8 +480,10 @@ fn merge_if_locations(ops: &mut [RewriteOp], parent: &Location) {
                     location.alias_prefix_override = parent.alias_prefix_override.clone();
                     location.inherits_root = parent.inherits_root;
                 }
-                let static_parent =
-                    !matches!(parent.handler, Handler::Proxy(_) | Handler::StubStatus);
+                let static_parent = !matches!(
+                    parent.handler,
+                    Handler::Proxy(_) | Handler::StubStatus | Handler::Metrics
+                );
                 let keeps_own =
                     !parent.explicit_return && (*own_handler || (*own_root && static_parent));
                 if keeps_own && *own_handler {
@@ -522,6 +525,7 @@ pub(crate) struct Inherited {
     pub(crate) post_action: Option<String>,
     pub(crate) expires: Option<ExpiresDirective>,
     pub(crate) sendfile: Option<bool>,
+    pub(crate) aio: Option<Aio>,
     pub(crate) client_body_temp_path: Option<TempPath>,
     pub(crate) disable_symlinks: Option<DisableSymlinks>,
 }
@@ -566,6 +570,7 @@ pub(crate) fn parse_location_block(
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
+    let mut keepalive_min_timeout_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
     let mut error_logs: Option<Vec<ErrorLog>> = None;
     let mut log_not_found: Option<bool> = None;
@@ -593,6 +598,7 @@ pub(crate) fn parse_location_block(
     let mut expires: Option<ExpiresDirective> = None;
     let mut proxy_pass: Option<ProxyPass> = None;
     let mut stub_status = false;
+    let mut metrics = false;
     let mut proxy = ProxyConf::default();
     let mut gzip = GzipConf::default();
     let mut limit_req = LimitReqConf::default();
@@ -602,6 +608,7 @@ pub(crate) fn parse_location_block(
     let mut mime = MimeConf::default();
     let mut charset = CharsetConf::default();
     let mut sendfile: Option<bool> = None;
+    let mut aio: Option<Aio> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
@@ -668,6 +675,8 @@ pub(crate) fn parse_location_block(
                         Handler::Return { status, body }
                     } else if stub_status {
                         Handler::StubStatus
+                    } else if metrics {
+                        Handler::Metrics
                     } else if let Some(pp) = proxy_pass {
                         Handler::Proxy(pp)
                     } else if let Some((path, mapping)) = root {
@@ -711,6 +720,7 @@ pub(crate) fn parse_location_block(
                     let effective_post_action = post_action.or(inherited.post_action);
                     let effective_expires = expires.or(inherited.expires);
                     let effective_sendfile = sendfile.or(inherited.sendfile);
+                    let effective_aio = aio.clone().or_else(|| inherited.aio.clone());
                     let effective_client_body_temp_path = client_body_temp_path
                         .clone()
                         .or_else(|| inherited.client_body_temp_path.clone());
@@ -734,6 +744,7 @@ pub(crate) fn parse_location_block(
                         keepalive_timeout,
                         keepalive_requests,
                         keepalive_time_ms,
+                        keepalive_min_timeout_ms,
                         keepalive_disable,
                         error_logs,
                         log_not_found,
@@ -757,6 +768,7 @@ pub(crate) fn parse_location_block(
                         max_ranges,
                         client_body_buffer_size: effective_client_body_buffer_size,
                         sendfile: effective_sendfile,
+                        aio: effective_aio,
                         document_root,
                         client_body_temp_path: effective_client_body_temp_path,
                         disable_symlinks: effective_disable_symlinks,
@@ -872,6 +884,12 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("keepalive_time"));
                 }
                 keepalive_time_ms = Some(parse_keepalive_time_args(&args[1..])?);
+            }
+            ("keepalive_min_timeout", Terminator::Semi) => {
+                if keepalive_min_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("keepalive_min_timeout"));
+                }
+                keepalive_min_timeout_ms = Some(parse_keepalive_min_timeout_args(&args[1..])?);
             }
             ("keepalive_disable", Terminator::Semi) => {
                 if keepalive_disable.is_some() {
@@ -1050,7 +1068,7 @@ pub(crate) fn parse_location_block(
                     return Err(Error::Duplicate("root/alias"));
                 }
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some((PathBuf::from(path), PathMapping::Root));
+                root = Some((parse_root_path(false, path)?, PathMapping::Root));
                 local_path_mapping = Some(PathMapping::Root);
                 alias_prefix_override = None;
             }
@@ -1092,7 +1110,7 @@ pub(crate) fn parse_location_block(
                         spec.pattern,
                     ));
                 }
-                root = Some((PathBuf::from(path), PathMapping::Alias));
+                root = Some((parse_root_path(true, path)?, PathMapping::Alias));
                 local_path_mapping = Some(PathMapping::Alias);
                 alias_prefix_override = None;
             }
@@ -1134,6 +1152,17 @@ pub(crate) fn parse_location_block(
             ("stub_status", Terminator::Semi) if args.len() <= 2 => {
                 stub_status = true;
                 crate::config::values::note_stats_used();
+            }
+            // ruxen's own (#481), where `stub_status` goes.
+            ("ruxen_metrics", Terminator::Semi) => {
+                if args.len() != 1 {
+                    return Err(Error::Directive {
+                        name: "ruxen_metrics",
+                        msg: "takes no arguments".to_string(),
+                    });
+                }
+                metrics = true;
+                crate::config::values::note_metrics_used();
             }
             ("proxy_pass", Terminator::Semi) => {
                 if proxy_pass.is_some() {
@@ -1178,6 +1207,12 @@ pub(crate) fn parse_location_block(
                 }
                 sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
             }
+            ("aio", Terminator::Semi) => {
+                if aio.is_some() {
+                    return Err(Error::Duplicate("aio"));
+                }
+                aio = Some(parse_aio_args(lx, &args)?);
+            }
             (name, Terminator::Semi) if RedirectConf::takes(name) => redirect.parse(&args)?,
             ("chunked_transfer_encoding", Terminator::Semi) => {
                 if chunked_transfer_encoding.is_some() {
@@ -1213,6 +1248,7 @@ pub(crate) fn parse_location_block(
                 let pass_post_action = post_action.clone().or(inherited.post_action.clone());
                 let pass_expires = expires.clone().or(inherited.expires.clone());
                 let pass_sendfile = sendfile.or(inherited.sendfile);
+                let pass_aio = aio.clone().or_else(|| inherited.aio.clone());
                 let pass_client_body_temp_path = client_body_temp_path
                     .clone()
                     .or_else(|| inherited.client_body_temp_path.clone());
@@ -1258,6 +1294,7 @@ pub(crate) fn parse_location_block(
                         post_action: pass_post_action,
                         expires: pass_expires,
                         sendfile: pass_sendfile,
+                        aio: pass_aio,
                         client_body_temp_path: pass_client_body_temp_path,
                         disable_symlinks: pass_disable_symlinks,
                     },
@@ -1282,6 +1319,7 @@ pub(crate) fn parse_location_block(
                 | "keepalive_timeout"
                 | "keepalive_requests"
                 | "keepalive_time"
+                | "keepalive_min_timeout"
                 | "keepalive_disable"
                 | "error_log"
                 | "log_not_found"
@@ -1318,6 +1356,7 @@ pub(crate) fn parse_location_block(
                 | "proxy_set_header"
                 | "proxy_pass_request_headers"
                 | "proxy_pass_request_body"
+                | "proxy_request_buffering"
                 | "proxy_set_body"
                 | "proxy_ignore_headers"
                 | "proxy_connect_timeout"
@@ -1331,6 +1370,8 @@ pub(crate) fn parse_location_block(
                 | "proxy_intercept_errors"
                 | "proxy_force_ranges"
                 | "proxy_ignore_client_abort"
+                | "early_hints"
+                | "proxy_pass_trailers"
                 | "proxy_redirect"
                 | "proxy_hide_header"
                 | "proxy_pass_header"

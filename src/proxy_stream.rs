@@ -1,9 +1,11 @@
 //! A proxied response whose body is relayed to the client as it arrives
 //! (#88), instead of being read whole first. `proxy::attempt` hands one
 //! over when the body didn't come in with the header and nothing needs it
-//! whole (no cache store, no `add_trailer`, no failover or interception on
-//! the status); the worker writes the head and calls [`relay`]. gzip
-//! compresses it on the way (`ProxyStream::gzip`). As in nginx
+//! whole (no `add_trailer`); the worker writes the head and calls
+//! [`relay`]. gzip compresses it on the way (`ProxyStream::gzip`), the
+//! range filter cuts one range from it (`ProxyStream::window`), and a
+//! cacheable one goes into the cache file as well (`ProxyStream::cache`,
+//! #463). As in nginx
 //! (`ngx_http_upstream_process_non_buffered_*`), once the head is out an
 //! upstream error can't become a 502 or a retry: the client connection is
 //! closed.
@@ -11,12 +13,10 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use monoio::io::AsyncReadRent;
 use monoio::time::timeout;
 
 use crate::proxy::{AttemptFailure, Stage, UpstreamError};
 use crate::upstream::{self, LeasedPeer};
-use crate::worker::PreparedUpstream;
 
 /// The body still to come from the upstream, and how it ends.
 pub struct ProxyStream {
@@ -48,6 +48,51 @@ pub struct ProxyStream {
     /// gzip compresses the body on its way (`gzip::filter`): the client
     /// gets no length.
     pub(crate) gzip: Option<crate::worker::gzip::GzipStream>,
+    /// `proxy_cache`: the body is written to this file as it goes, and
+    /// stored once complete (nginx's `p->cacheable`).
+    pub(crate) cache: Option<Box<crate::proxy_cache::CacheFill<'static>>>,
+    /// The range filter's one range: the client gets these body bytes
+    /// only.
+    pub(crate) window: Option<Window>,
+    /// `add_trailer` or `proxy_pass_trailers`: the body goes chunked, and
+    /// the worker writes the last chunk with the trailers
+    /// (`RelayEnd::trailers_due`).
+    pub(crate) trailers: bool,
+    /// `proxy_pass_trailers`: the upstream's trailers, less the hidden
+    /// ones, go to the client (`RelayEnd::upstream_trailers`).
+    pub(crate) pass_trailers: Option<&'static crate::worker::ProxyResponseRules>,
+}
+
+/// The part of the body still to skip, then to send.
+#[derive(Clone, Copy)]
+pub(crate) struct Window {
+    skip: u64,
+    left: u64,
+}
+
+impl Window {
+    /// Body bytes `[start, end)`.
+    pub(crate) fn new(start: u64, end: u64) -> Self {
+        Window {
+            skip: start,
+            left: end - start,
+        }
+    }
+
+    /// The part of the next `body` bytes inside the window.
+    fn cut<'a>(&mut self, body: &'a [u8]) -> &'a [u8] {
+        let skip = (self.skip.min(body.len() as u64)) as usize;
+        self.skip -= skip as u64;
+        let rest = &body[skip..];
+        let take = (self.left.min(rest.len() as u64)) as usize;
+        self.left -= take as u64;
+        &rest[..take]
+    }
+}
+
+/// The client has the whole window.
+fn window_sent(window: Option<&Window>) -> bool {
+    window.is_some_and(|w| w.left == 0)
 }
 
 pub(crate) enum StreamFraming {
@@ -60,7 +105,7 @@ pub(crate) enum StreamFraming {
 }
 
 pub(crate) struct StreamPool {
-    pub upstream: &'static PreparedUpstream,
+    pub upstream: upstream::UpstreamRef,
     pub peer_idx: usize,
     /// `PreparedProxy::pool_tag`.
     pub tag: usize,
@@ -72,7 +117,7 @@ impl ProxyStream {
     /// The client learns the length from the head (`Content-Length`);
     /// otherwise the worker chunks the body (HTTP/1.1) or closes after it.
     pub fn length_known(&self) -> bool {
-        matches!(self.framing, StreamFraming::Length(_)) && self.gzip.is_none()
+        matches!(self.framing, StreamFraming::Length(_)) && self.gzip.is_none() && !self.trailers
     }
 }
 
@@ -92,6 +137,10 @@ pub struct RelayEnd {
     pub failure: Option<AttemptFailure>,
     /// The body reached the client whole.
     pub complete: bool,
+    /// The last chunk is still to be written, with the trailers.
+    pub trailers_due: bool,
+    /// `proxy_pass_trailers`: the upstream's trailer lines to send.
+    pub upstream_trailers: Vec<u8>,
 }
 
 /// Read buffer of a relay: one read takes whatever the upstream socket
@@ -152,6 +201,14 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         response_ms: 0,
         failure: None,
         complete: false,
+        trailers_due: false,
+        upstream_trailers: Vec::new(),
+    };
+    // The last chunk, unless the worker writes it with the trailers.
+    let last_chunk: &[u8] = if chunked_out && !s.trailers {
+        b"0\r\n\r\n"
+    } else {
+        b""
     };
     // Bytes past the end of the body: the connection can't be pooled.
     let mut extra = false;
@@ -173,10 +230,15 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         chunked_out,
         &mut decoded,
         deflater.as_mut().map(|d| (d, &mut plain, &mut compressed)),
+        s.cache.as_deref_mut(),
+        s.window.as_mut(),
         &mut head,
     ) {
         Ok((done, _, more)) => {
             extra |= more;
+            if done {
+                head.extend_from_slice(last_chunk);
+            }
             done
         }
         Err(()) => {
@@ -196,7 +258,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         return finish(s, end, extra, head);
     }
     end.body_sent += body_len as u64;
-    if done {
+    if done || window_sent(s.window.as_ref()) {
         end.complete = true;
         return finish(s, end, extra, head);
     }
@@ -210,7 +272,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         if s.limit_rate != 0 {
             buf = paced_read_buf(buf, s.limit_rate, s.paced, s.pacer_start);
         }
-        let (res, returned) = match timeout(s.read_timeout, s.upstream.read(buf)).await {
+        let (res, returned) = match timeout(s.read_timeout, s.upstream.read_now(buf)).await {
             Ok(pair) => pair,
             Err(_) => {
                 end.failure = Some(failure(&s, UpstreamError::TimedOut(Stage::ReadingBody)));
@@ -231,9 +293,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
                         d.push(&[], &mut compressed, true);
                         push_body(&mut framed, &compressed, chunked_out);
                     }
-                    if chunked_out {
-                        framed.extend_from_slice(b"0\r\n\r\n");
-                    }
+                    framed.extend_from_slice(last_chunk);
                     if !framed.is_empty() {
                         let len = framed.len();
                         let (ok, _) = write_out(
@@ -278,6 +338,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         // out of the read buffer itself.
         if !chunked_out
             && deflater.is_none()
+            && s.window.is_none()
             && let StreamFraming::Length(left) = &mut s.framing
         {
             let take = n.min(*left as usize);
@@ -285,6 +346,9 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
             *left -= take as u64;
             let done = *left == 0;
             end.upstream_body += take as u64;
+            if let Some(fill) = s.cache.as_deref_mut() {
+                fill.write(&s.read_buf[..take]);
+            }
             let buf = std::mem::take(&mut s.read_buf);
             let (ok, returned) =
                 write_out(client, buf, take, &mut pacer, timer.as_mut(), send_timeout).await;
@@ -307,11 +371,16 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
             chunked_out,
             &mut decoded,
             deflater.as_mut().map(|d| (d, &mut plain, &mut compressed)),
+            s.cache.as_deref_mut(),
+            s.window.as_mut(),
             &mut framed,
         ) {
             Ok((done, used, more)) => {
                 extra |= more;
                 end.upstream_body += used as u64;
+                if done {
+                    framed.extend_from_slice(last_chunk);
+                }
                 done
             }
             Err(()) => {
@@ -336,7 +405,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
             }
             end.body_sent += len as u64;
         }
-        if done {
+        if done || window_sent(s.window.as_ref()) {
             end.complete = true;
             break;
         }
@@ -352,34 +421,49 @@ fn consume(
     input: &[u8],
     chunked_out: bool,
     decoded: &mut Vec<u8>,
+    cache: Option<&mut crate::proxy_cache::CacheFill<'static>>,
+    window: Option<&mut Window>,
     out: &mut Vec<u8>,
 ) -> Result<(bool, usize, bool), ()> {
+    let (body, done, used, more) = body_of(framing, input, decoded)?;
+    if let Some(fill) = cache {
+        fill.write(body);
+    }
+    let body = match window {
+        Some(w) => w.cut(body),
+        None => body,
+    };
+    push_body(out, body, chunked_out);
+    Ok((done, used, more))
+}
+
+/// The body bytes in `input` (decoded into `decoded` for chunked), and as
+/// `consume` returns: whether the body ended, the input bytes used, and
+/// whether bytes followed its end.
+fn body_of<'a>(
+    framing: &mut StreamFraming,
+    input: &'a [u8],
+    decoded: &'a mut Vec<u8>,
+) -> Result<(&'a [u8], bool, usize, bool), ()> {
     match framing {
         StreamFraming::Length(left) => {
             let take = input.len().min(*left as usize);
-            push_body(out, &input[..take], chunked_out);
             *left -= take as u64;
-            Ok((*left == 0, take, input.len() > take))
+            Ok((&input[..take], *left == 0, take, input.len() > take))
         }
         StreamFraming::Chunked(dec) => {
             decoded.clear();
             let (done, used) = dec.feed(input, decoded)?;
-            push_body(out, decoded, chunked_out);
-            if done && chunked_out {
-                out.extend_from_slice(b"0\r\n\r\n");
-            }
-            Ok((done, used, done && used < input.len()))
+            Ok((&decoded[..], done, used, done && used < input.len()))
         }
-        StreamFraming::Close => {
-            push_body(out, input, chunked_out);
-            Ok((false, input.len(), false))
-        }
+        StreamFraming::Close => Ok((input, false, input.len(), false)),
     }
 }
 
 /// `consume`, through the compressor when gzip is on: the body's bytes
 /// are decoded into `plain`, compressed into `compressed`, and those go
 /// out (chunked when `chunked_out`), the end of the member with the last.
+#[allow(clippy::too_many_arguments)]
 fn consume_out(
     framing: &mut StreamFraming,
     input: &[u8],
@@ -390,47 +474,95 @@ fn consume_out(
         &mut Vec<u8>,
         &mut Vec<u8>,
     )>,
+    cache: Option<&mut crate::proxy_cache::CacheFill<'static>>,
+    window: Option<&mut Window>,
     out: &mut Vec<u8>,
 ) -> Result<(bool, usize, bool), ()> {
     let Some((deflater, plain, compressed)) = gzip else {
-        return consume(framing, input, chunked_out, decoded, out);
+        return consume(framing, input, chunked_out, decoded, cache, window, out);
     };
     plain.clear();
-    let (done, used, more) = consume(framing, input, false, decoded, plain)?;
+    // The range filter leaves a compressed response alone: no window.
+    let (done, used, more) = consume(framing, input, false, decoded, cache, None, plain)?;
     compressed.clear();
     deflater.push(plain, compressed, done);
     push_body(out, compressed, chunked_out);
-    if done && chunked_out {
-        out.extend_from_slice(b"0\r\n\r\n");
-    }
     Ok((done, used, more))
 }
 
 /// The relay is over: time it, and pool the connection if the body was
 /// read exactly.
 fn finish(
-    s: Box<ProxyStream>,
+    mut s: Box<ProxyStream>,
     mut end: RelayEnd,
     extra: bool,
     head: Vec<u8>,
 ) -> (RelayEnd, Vec<u8>) {
     end.response_ms = s.started.elapsed().as_millis() as u64;
+    end.trailers_due = s.trailers && end.complete;
+    if end.trailers_due && s.pass_trailers.is_some() {
+        end.upstream_trailers = upstream_trailers(&mut s);
+    }
+    // The client may be done before the body: a range's window.
+    let body_done = match &s.framing {
+        StreamFraming::Length(left) => *left == 0,
+        StreamFraming::Chunked(dec) => dec.done(),
+        StreamFraming::Close => end.complete,
+    };
     // nginx warns, and doesn't keep the connection (#512).
-    if end.complete && extra && end.failure.is_none() {
+    if body_done && extra && end.failure.is_none() {
         let error = match s.framing {
             StreamFraming::Chunked(_) => UpstreamError::ExtraAfterFinalChunk,
             _ => UpstreamError::ExtraAfterLength,
         };
         end.failure = Some(failure(&s, error));
     }
+    if s.cache.is_some() {
+        // The client went away, or has its range: the cache reads on
+        // (nginx's downstream error on a cacheable pipe).
+        if !body_done && end.failure.is_none() {
+            fill_detached(s);
+            return (end, head);
+        }
+        if body_done {
+            store(&mut s);
+        }
+    }
+    close(s, body_done, extra);
+    (end, head)
+}
+
+/// `proxy_pass_trailers`: the trailers the client gets.
+#[cold]
+#[inline(never)]
+fn upstream_trailers(s: &mut ProxyStream) -> Vec<u8> {
+    match (&mut s.framing, s.pass_trailers) {
+        (StreamFraming::Chunked(dec), Some(rules)) => {
+            crate::proxy::passed_trailers(rules, &dec.take_trailers())
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Put a complete body's cache file in place.
+#[cold]
+#[inline(never)]
+fn store(s: &mut ProxyStream) {
+    if let Some(fill) = s.cache.take() {
+        let _ = fill.finish();
+    }
+}
+
+/// The upstream connection is done with: back to the pool if the body
+/// was read exactly, else closed.
+fn close(s: Box<ProxyStream>, complete: bool, extra: bool) {
     let s = *s;
     return_read_buf(s.read_buf);
-    if end.complete
-        && !extra
-        && let Some(pool) = s.pool
-    {
+    if !complete || extra {
+        // Closed as it is.
+    } else if let Some(pool) = s.pool {
         upstream::pool_release(
-            pool.upstream,
+            &pool.upstream,
             pool.peer_idx,
             pool.tag,
             upstream::PooledConn {
@@ -441,8 +573,82 @@ fn finish(
                 slot: s.slot,
             },
         );
+    } else if !matches!(s.framing, StreamFraming::Close) {
+        // A close-delimited body ended at the upstream's close already.
+        upstream::close_after_peer(s.upstream, s.slot);
     }
-    (end, head)
+}
+
+/// The rest of a body only the cache takes, read in a task of its own:
+/// the client went away, or got a 304 or a HEAD's answer. nginx reads on
+/// for a cacheable response after a downstream error, or for a header-only
+/// one (ngx_http_upstream_send_response). Without a cache file the
+/// connection just closes.
+pub(crate) fn fill_detached(s: Box<ProxyStream>) {
+    if s.cache.as_deref().is_some_and(|c| c.writing()) {
+        crate::worker::spawn_contained("a proxy_cache store", || {}, fill_cache(s));
+    }
+}
+
+/// Read the body to its end into the cache file, then store it.
+pub(crate) async fn fill_cache(mut s: Box<ProxyStream>) {
+    let mut decoded = Vec::new();
+    let mut extra = false;
+    let pending = std::mem::take(&mut s.pending);
+    let mut done = match &s.framing {
+        StreamFraming::Length(left) => *left == 0,
+        StreamFraming::Chunked(dec) => dec.done(),
+        StreamFraming::Close => false,
+    };
+    if !done && !pending.is_empty() {
+        match body_of(&mut s.framing, &pending, &mut decoded) {
+            Ok((body, end, _, more)) => {
+                if let Some(fill) = s.cache.as_deref_mut() {
+                    fill.write(body);
+                }
+                done = end;
+                extra = more;
+            }
+            Err(()) => return,
+        }
+    }
+    drop(pending);
+    if s.read_buf.capacity() < RELAY_BUF {
+        crate::proxy::return_proxy_buf(std::mem::replace(&mut s.read_buf, take_relay_buf()));
+    }
+    while !done {
+        if !s.cache.as_deref().is_some_and(|c| c.writing()) {
+            return;
+        }
+        let mut buf = std::mem::take(&mut s.read_buf);
+        buf.clear();
+        let Ok((res, returned)) = timeout(s.read_timeout, s.upstream.read_now(buf)).await else {
+            return;
+        };
+        s.read_buf = returned;
+        let n = match res {
+            Ok(0) if matches!(s.framing, StreamFraming::Close) => {
+                s.pool = None;
+                break;
+            }
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        s.paced += n as u64;
+        crate::proxy::pace_body_read(s.limit_rate, s.paced, s.pacer_start).await;
+        match body_of(&mut s.framing, &s.read_buf[..n], &mut decoded) {
+            Ok((body, end, _, more)) => {
+                if let Some(fill) = s.cache.as_deref_mut() {
+                    fill.write(body);
+                }
+                done = end;
+                extra = more;
+            }
+            Err(()) => return,
+        }
+    }
+    store(&mut s);
+    close(s, true, extra);
 }
 
 fn failure(s: &ProxyStream, error: UpstreamError) -> AttemptFailure {
@@ -512,14 +718,19 @@ async fn write_out<S: crate::worker::ConnIo>(
 }
 
 /// An incremental decoder of a chunked body (RFC 9112 7.1): chunk
-/// extensions and trailers are dropped. Buffered bodies go through it too
-/// (`read_chunked_body_with_buf`).
+/// extensions are dropped, trailers too unless kept (`keeping_trailers`).
 #[derive(Default)]
 pub(crate) struct ChunkedDecoder {
     state: ChunkState,
     /// A size or trailer line split across reads.
     line: Vec<u8>,
+    /// `proxy_pass_trailers`: the trailer lines, CRLF each.
+    trailers: Option<Vec<u8>>,
 }
+
+/// The trailer section kept, as nginx's `proxy_buffer_size` bounds it
+/// (a page by default): past it, "upstream sent too big trailers".
+const MAX_TRAILERS: usize = 4096;
 
 #[derive(Default)]
 enum ChunkState {
@@ -585,6 +796,9 @@ impl ChunkedDecoder {
                             if line.is_empty() {
                                 ChunkState::Done
                             } else {
+                                if let Some(kept) = &mut self.trailers {
+                                    keep_trailer(kept, line)?;
+                                }
                                 ChunkState::Trailer
                             }
                         }
@@ -603,6 +817,43 @@ impl ChunkedDecoder {
         }
         Ok((matches!(self.state, ChunkState::Done), pos))
     }
+
+    /// The last chunk and the trailer are in.
+    pub(crate) fn done(&self) -> bool {
+        matches!(self.state, ChunkState::Done)
+    }
+
+    /// One that keeps the trailer lines (`take_trailers`).
+    pub(crate) fn keeping_trailers() -> Self {
+        ChunkedDecoder {
+            trailers: Some(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn take_trailers(&mut self) -> Vec<u8> {
+        self.trailers.take().unwrap_or_default()
+    }
+}
+
+/// A trailer line, kept if it's a field (nginx's parser skips the rest);
+/// a CR or NUL in it is an error.
+fn keep_trailer(kept: &mut Vec<u8>, line: &[u8]) -> Result<(), ()> {
+    if line.iter().any(|&b| b == b'\r' || b == 0) {
+        return Err(());
+    }
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return Ok(());
+    };
+    if colon == 0 || line[..colon].iter().any(|&b| b == b' ' || b == b'\t') {
+        return Ok(());
+    }
+    if kept.len() + line.len() + 2 > MAX_TRAILERS {
+        return Err(());
+    }
+    kept.extend_from_slice(line);
+    kept.extend_from_slice(b"\r\n");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -645,6 +896,34 @@ mod tests {
             dec.feed(&[b'1'; MAX_CHUNK_LINE + 2], &mut Vec::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn chunked_decoder_keeps_trailers() {
+        let wire = b"3\r\nabc\r\n0\r\nX-T: 1\r\nno colon\r\n:x\r\nY-T:2\r\n\r\nNEXT";
+        for piece in 1..wire.len() {
+            let mut dec = ChunkedDecoder::keeping_trailers();
+            let mut out = Vec::new();
+            for part in wire.chunks(piece) {
+                if dec.feed(part, &mut out).unwrap().0 {
+                    break;
+                }
+            }
+            assert!(dec.done(), "piece {piece}");
+            assert_eq!(out, b"abc");
+            assert_eq!(dec.take_trailers(), b"X-T: 1\r\nY-T:2\r\n", "piece {piece}");
+        }
+        // Too big, or a NUL: an error.
+        let mut dec = ChunkedDecoder::keeping_trailers();
+        let line = format!("X: {}\r\n", "v".repeat(1000));
+        let wire = format!("0\r\n{}", line.repeat(5));
+        assert!(dec.feed(wire.as_bytes(), &mut Vec::new()).is_err());
+        let mut dec = ChunkedDecoder::keeping_trailers();
+        assert!(dec.feed(b"0\r\nX: \0\r\n\r\n", &mut Vec::new()).is_err());
+        // Not kept: dropped, whatever they are.
+        let mut dec = ChunkedDecoder::default();
+        assert!(dec.feed(b"0\r\nX: \0\r\n\r\n", &mut Vec::new()).unwrap().0);
+        assert!(dec.take_trailers().is_empty());
     }
 
     /// A bare LF anywhere in the framing is refused, as nginx 1.29.4+

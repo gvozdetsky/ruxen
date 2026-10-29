@@ -41,9 +41,8 @@ pub(crate) fn parse_value_with_vars_rewrite(s: &str) -> Result<Vec<ValuePart>, E
     parse_value_with_vars_impl(s, true)
 }
 
-/// For `log_format`, `map` and `split_clients`, where `$1` stays literal
-/// text: nginx refuses it in `log_format` (`unknown "1" variable`), and a
-/// map's `$1` is its own regex's capture, which ruxen doesn't provide.
+/// For `log_format`, a `map`'s key and `split_clients`, where `$1` stays
+/// literal text: nginx refuses it in `log_format` (`unknown "1" variable`).
 pub(crate) fn parse_value_without_captures(s: &str) -> Result<Vec<ValuePart>, Error> {
     parse_value_with_vars_impl(s, false)
 }
@@ -184,6 +183,8 @@ struct VariableRegistry {
     stderr_log: bool,
     /// `stub_status` or a `$connections_*` variable appears in the config.
     stats: bool,
+    /// `ruxen_metrics` appears in the config.
+    metrics: bool,
 }
 
 /// Whether the config just parsed reads `$request_body` anywhere: if not,
@@ -216,6 +217,20 @@ pub(crate) fn stats_used() -> bool {
 /// `stub_status` was parsed.
 pub(crate) fn note_stats_used() {
     VARIABLES.with(|v| v.borrow_mut().stats = true);
+}
+
+/// Whether the config just parsed has `ruxen_metrics`.
+pub(crate) fn metrics_used() -> bool {
+    VARIABLES.with(|v| v.borrow().metrics)
+}
+
+/// `ruxen_metrics` was parsed: it shows the connection counters too.
+pub(crate) fn note_metrics_used() {
+    VARIABLES.with(|v| {
+        let mut v = v.borrow_mut();
+        v.metrics = true;
+        v.stats = true;
+    });
 }
 
 /// Whether the config just parsed reads `$request_body_file` anywhere: if

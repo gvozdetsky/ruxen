@@ -5,12 +5,9 @@
 //! the stream it owns, each a boxed future polled from `poll_read` /
 //! `poll_write`, with buffers of its own.
 //!
-//! A read and a write can be in flight at once. That is what a TLS stream
-//! in tunnel mode (`TlsStream::begin_tunnel`) allows, and what a plain TCP
-//! socket does anyway: each operation touches the stream only between
-//! awaits.
+//! A read and a write can be in flight at once, each on its half of the
+//! stream (`crate::duplex`, #501).
 
-use std::cell::UnsafeCell;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -19,6 +16,8 @@ use std::task::{Context, Poll, ready};
 
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use tokio::io::ReadBuf;
+
+use crate::duplex::{Duplex, OwnedReadHalf, OwnedWriteHalf, Reclaim};
 
 /// Read size: one maximum-size TLS record, or a few HTTP/2 frames.
 const READ_BUF: usize = 16 * 1024;
@@ -152,11 +151,17 @@ pub(crate) fn scan_header_blocks(data: &[u8], cuts: &[usize]) -> Vec<(u32, u64)>
         .unwrap_or_default()
 }
 
-pub(crate) struct PollIo<S: 'static> {
-    // The operations borrow `*stream`; declared first, so they are dropped
-    // before it.
-    reading: Option<Op<(io::Result<usize>, Vec<u8>)>>,
-    writing: Option<Op<(io::Result<usize>, Vec<u8>)>>,
+/// An operation's result, and the half it ran on.
+type ReadDone<S> = (io::Result<usize>, Vec<u8>, OwnedReadHalf<S>);
+type WriteDone<S> = (io::Result<usize>, Vec<u8>, OwnedWriteHalf<S>);
+
+pub(crate) struct PollIo<S: Duplex> {
+    /// A half is in its operation while one runs, else here.
+    read_half: Option<OwnedReadHalf<S>>,
+    write_half: Option<OwnedWriteHalf<S>>,
+    reading: Option<Op<ReadDone<S>>>,
+    writing: Option<Op<WriteDone<S>>>,
+    /// Keeps the write half: nothing is written after.
     shutting_down: Option<Op<io::Result<()>>>,
     /// Bytes read and not yet handed out: `rbuf[rpos..]`.
     rbuf: Vec<u8>,
@@ -170,14 +175,16 @@ pub(crate) struct PollIo<S: 'static> {
     write_error: Option<io::Error>,
     /// When the write in flight started; `None` while none is.
     writing_since: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
-    /// Shared with `serve`, which closes the connection once the `h2`
-    /// connection (and with it this) is dropped.
-    stream: Rc<UnsafeCell<S>>,
 }
 
-impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
-    pub(crate) fn new(stream: S) -> Self {
-        PollIo {
+impl<S: Duplex> PollIo<S> {
+    /// Also the stream back for `serve`, which closes the connection once
+    /// the `h2` connection (and with it this) is dropped.
+    pub(crate) fn new(stream: S) -> (Self, Reclaim<S>) {
+        let (read_half, write_half, reclaim) = crate::duplex::into_split(stream);
+        let io = PollIo {
+            read_half: Some(read_half),
+            write_half: Some(write_half),
             reading: None,
             writing: None,
             shutting_down: None,
@@ -195,14 +202,16 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
             pending: Vec::new(),
             write_error: None,
             writing_since: Default::default(),
-            stream: Rc::new(UnsafeCell::new(stream)),
-        }
+        };
+        (io, reclaim)
     }
 
-    /// The stream, for after `self` is dropped: no operation borrows it
-    /// any more then.
-    pub(crate) fn stream_handle(&self) -> Rc<UnsafeCell<S>> {
-        self.stream.clone()
+    /// For a connection to an upstream (#599): the server's frames aren't
+    /// scanned for header blocks.
+    pub(crate) fn client(stream: S) -> Self {
+        let (mut io, _) = Self::new(stream);
+        io.scan.skip = usize::MAX;
+        io
     }
 
     /// The header block sizes the frames read so far gave.
@@ -216,24 +225,26 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
         self.writing_since.clone()
     }
 
-    /// The stream, for an operation that may run alongside the other
-    /// direction's.
-    ///
-    /// SAFETY: the caller keeps the reference inside an operation stored in
-    /// `self`, which is dropped before `stream` (field order), and at most
-    /// one read and one write operation exist at a time.
-    unsafe fn stream(&self) -> &'static mut S {
-        unsafe { &mut *self.stream.get() }
+    /// Write `buf` on the write half, which is free: `poll_in_flight` is
+    /// `Ready`.
+    fn write_op(&mut self, buf: Vec<u8>) -> io::Result<()> {
+        let Some(mut half) = self.write_half.take() else {
+            return Err(io::ErrorKind::NotConnected.into());
+        };
+        self.writing = Some(Box::pin(async move {
+            let (res, buf) = half.write_all(buf).await;
+            (res, buf, half)
+        }));
+        self.writing_since.set(Some(std::time::Instant::now()));
+        Ok(())
     }
 
     /// Start writing `buf` and poll it once: on io_uring, the submission
     /// is what gets it going.
-    fn start_write(&mut self, buf: Vec<u8>, cx: &mut Context<'_>) {
-        // SAFETY: see `stream`.
-        let stream = unsafe { self.stream() };
-        self.writing = Some(Box::pin(async move { stream.write_all(buf).await }));
-        self.writing_since.set(Some(std::time::Instant::now()));
+    fn start_write(&mut self, buf: Vec<u8>, cx: &mut Context<'_>) -> io::Result<()> {
+        self.write_op(buf)?;
         let _ = self.poll_in_flight(cx);
+        Ok(())
     }
 
     /// Poll the write in flight; when it is done, start the pending bytes.
@@ -243,8 +254,9 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
             let Some(op) = self.writing.as_mut() else {
                 return Poll::Ready(());
             };
-            let (res, buf) = ready!(op.as_mut().poll(cx));
+            let (res, buf, half) = ready!(op.as_mut().poll(cx));
             self.writing = None;
+            self.write_half = Some(half);
             self.writing_since.set(None);
             self.wbuf = buf;
             if let Err(e) = res {
@@ -258,10 +270,10 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
             let mut next = std::mem::take(&mut self.wbuf);
             next.clear();
             std::mem::swap(&mut next, &mut self.pending);
-            // SAFETY: see `stream`.
-            let stream = unsafe { self.stream() };
-            self.writing = Some(Box::pin(async move { stream.write_all(next).await }));
-            self.writing_since.set(Some(std::time::Instant::now()));
+            if let Err(e) = self.write_op(next) {
+                self.write_error = Some(e);
+                return Poll::Ready(());
+            }
         }
     }
 
@@ -275,7 +287,7 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> PollIo<S> {
     }
 }
 
-impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncRead for PollIo<S> {
+impl<S: Duplex> tokio::io::AsyncRead for PollIo<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -288,13 +300,18 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncRead for PollI
                 this.rpos = 0;
                 buf.clear();
                 buf.reserve(READ_BUF);
-                // SAFETY: see `stream`.
-                let stream = unsafe { this.stream() };
-                this.reading = Some(Box::pin(async move { stream.read(buf).await }));
+                let Some(mut half) = this.read_half.take() else {
+                    return Poll::Ready(Err(io::ErrorKind::NotConnected.into()));
+                };
+                this.reading = Some(Box::pin(async move {
+                    let (res, buf) = half.read(buf).await;
+                    (res, buf, half)
+                }));
             }
             let op = this.reading.as_mut().expect("set above");
-            let (res, buf) = ready!(op.as_mut().poll(cx));
+            let (res, buf, half) = ready!(op.as_mut().poll(cx));
             this.reading = None;
+            this.read_half = Some(half);
             this.rbuf = buf;
             this.rpos = 0;
             if let Err(e) = res {
@@ -311,7 +328,7 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncRead for PollI
     }
 }
 
-impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for PollIo<S> {
+impl<S: Duplex> tokio::io::AsyncWrite for PollIo<S> {
     /// Takes the bytes at once and writes them in the background; the next
     /// call waits for that write first, so one write is in flight at most.
     fn poll_write(
@@ -350,7 +367,7 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for Poll
         for slice in data {
             buf.extend_from_slice(slice);
         }
-        this.start_write(buf, cx);
+        this.start_write(buf, cx)?;
         Poll::Ready(Ok(len))
     }
 
@@ -366,9 +383,10 @@ impl<S: AsyncReadRent + AsyncWriteRent + 'static> tokio::io::AsyncWrite for Poll
         let this = self.get_mut();
         ready!(this.poll_written(cx))?;
         if this.shutting_down.is_none() {
-            // SAFETY: see `stream`; no write is in flight any more.
-            let stream = unsafe { this.stream() };
-            this.shutting_down = Some(Box::pin(async move { stream.shutdown().await }));
+            let Some(mut half) = this.write_half.take() else {
+                return Poll::Ready(Err(io::ErrorKind::NotConnected.into()));
+            };
+            this.shutting_down = Some(Box::pin(async move { half.shutdown().await }));
         }
         let res = ready!(
             this.shutting_down
@@ -394,10 +412,9 @@ mod tests {
         f
     }
 
-    /// Header block sizes as nginx counts them (#409), whatever the reads'
-    /// boundaries: HEADERS less padding and priority, plus CONTINUATIONs.
-    #[test]
-    fn header_blocks_follow_the_frames() {
+    /// A client's first bytes: stream 1 has a header block of 18 bytes,
+    /// 3 of 10, 5 of 11.
+    fn wire() -> Vec<u8> {
         let mut wire = super::super::PREFACE.to_vec();
         wire.extend(frame(0x4, 0, 0, &[0; 6])); // SETTINGS
         wire.extend(frame(0x1, 0x4, 1, &[0; 18])); // HEADERS, END_HEADERS
@@ -408,6 +425,14 @@ mod tests {
         wire.extend(frame(0x1, 0, 5, &[0; 7])); // HEADERS without END_HEADERS
         wire.extend(frame(0x0, 0x1, 1, &[0; 40])); // DATA: not counted
         wire.extend(frame(0x9, 0x4, 5, &[0; 4])); // CONTINUATION
+        wire
+    }
+
+    /// Header block sizes as nginx counts them (#409), whatever the reads'
+    /// boundaries: HEADERS less padding and priority, plus CONTINUATIONs.
+    #[test]
+    fn header_blocks_follow_the_frames() {
+        let wire = wire();
         for step in [1, 2, 7, 9, 10, wire.len()] {
             let blocks = Rc::new(HeaderBlocks::default());
             let mut scan = FrameScan {
@@ -425,5 +450,46 @@ mod tests {
             assert_eq!(blocks.take(5), 11, "step {step}");
             assert_eq!(blocks.take(5), 0, "taken once");
         }
+    }
+
+    /// A read and a write in flight at once, as `h2` drives `PollIo`, over
+    /// an in-memory stream: runs under Miri (#501, see `crate::duplex`).
+    #[test]
+    fn poll_io_reads_while_writing() {
+        use crate::duplex::testing::MemStream;
+        use std::task::Waker;
+        use tokio::io::{AsyncRead, AsyncWrite};
+
+        let wire = wire();
+        let (mut io, stream) = PollIo::new(MemStream::new(&wire, 10));
+        let blocks = io.header_blocks();
+        let mut cx = Context::from_waker(Waker::noop());
+        let (mut got, mut sent) = (Vec::new(), Vec::new());
+        let mut out = [0u8; 64];
+        for turn in 0u8.. {
+            let mut rb = ReadBuf::new(&mut out);
+            if let Poll::Ready(res) = Pin::new(&mut io).poll_read(&mut cx, &mut rb) {
+                res.unwrap();
+                if rb.filled().is_empty() {
+                    break;
+                }
+                got.extend_from_slice(rb.filled());
+            }
+            // Taken at once, also while the last write is in flight.
+            let data = [turn; 5];
+            if let Poll::Ready(res) = Pin::new(&mut io).poll_write(&mut cx, &data) {
+                assert_eq!(res.unwrap(), 5);
+                sent.extend_from_slice(&data);
+            }
+        }
+        while Pin::new(&mut io).poll_shutdown(&mut cx).is_pending() {}
+        assert_eq!(got, wire);
+        drop(io);
+        let s = stream.take().expect("PollIo dropped");
+        assert_eq!(s.output, sent);
+        assert!(s.shut);
+        assert_eq!(blocks.take(1), 18);
+        assert_eq!(blocks.take(3), 10);
+        assert_eq!(blocks.take(5), 11);
     }
 }

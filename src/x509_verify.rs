@@ -79,6 +79,24 @@ impl Cert {
     }
 }
 
+/// The DER of a live X509.
+///
+/// # Safety
+/// `x` is a live X509.
+unsafe fn der_of(x: *mut ffi::X509) -> Option<Vec<u8>> {
+    // SAFETY: `x` is live (the caller's promise); i2d_X509 writes exactly
+    // the length its first call returns.
+    unsafe {
+        let len = ffi::i2d_X509(x, ptr::null_mut());
+        if len <= 0 {
+            return None;
+        }
+        let mut der = vec![0u8; len as usize];
+        let mut p = der.as_mut_ptr();
+        (ffi::i2d_X509(x, &mut p) == len).then_some(der)
+    }
+}
+
 /// The most recent error of this thread's queue, as OpenSSL prints it;
 /// the queue is cleared.
 pub(crate) fn ssl_error() -> String {
@@ -232,7 +250,7 @@ impl Store {
         name: &NameToCheck<'_>,
     ) -> Result<(), Failure> {
         let leaf = Cert::from_der(leaf).ok_or(Failure::BadDer)?;
-        self.verify_chain(&leaf, intermediates, c"ssl_server")?;
+        self.verify_chain(&leaf, intermediates, c"ssl_server", None)?;
         if name.matches(&leaf) {
             Ok(())
         } else {
@@ -243,10 +261,16 @@ impl Store {
     /// A client's certificate (`ssl_verify_client`): the chain it sent,
     /// leaf first, verified for TLS client use, as OpenSSL verifies it in
     /// the handshake (SSL_get_verify_result).
-    pub fn verify_client(&self, chain: &[&[u8]]) -> Result<(), Failure> {
+    /// With `verified`, the chain it verified is put there, leaf to trust
+    /// anchor, as DER (SSL_get0_verified_chain).
+    pub fn verify_client(
+        &self,
+        chain: &[&[u8]],
+        verified: Option<&mut Vec<Vec<u8>>>,
+    ) -> Result<(), Failure> {
         let (leaf, intermediates) = chain.split_first().ok_or(Failure::BadDer)?;
         let leaf = Cert::from_der(leaf).ok_or(Failure::BadDer)?;
-        self.verify_chain(&leaf, intermediates, c"ssl_client")
+        self.verify_chain(&leaf, intermediates, c"ssl_client", verified)
     }
 
     fn verify_chain(
@@ -254,6 +278,7 @@ impl Store {
         leaf: &Cert,
         intermediates: &[&[u8]],
         purpose: &CStr,
+        verified: Option<&mut Vec<Vec<u8>>>,
     ) -> Result<(), Failure> {
         let chain: Vec<Cert> = intermediates
             .iter()
@@ -289,7 +314,31 @@ impl Store {
                 // as SSL_get_verify_result has it.
                 ffi::X509_STORE_CTX_set_verify_cb(ctx, Some(keep_going));
                 let ret = ffi::X509_verify_cert(ctx);
-                verdict(ret, ffi::X509_STORE_CTX_get_error(ctx) as c_long)
+                let code = verdict(ret, ffi::X509_STORE_CTX_get_error(ctx) as c_long);
+                if let Some(out) = verified
+                    && code == ffi::X509_V_OK as c_long
+                {
+                    let built = ffi::X509_STORE_CTX_get0_chain(ctx) as *const ffi::OPENSSL_STACK;
+                    let n = if built.is_null() {
+                        0
+                    } else {
+                        ffi::OPENSSL_sk_num(built)
+                    };
+                    out.clear();
+                    for i in 0..n {
+                        let x = ffi::OPENSSL_sk_value(built, i) as *mut ffi::X509;
+                        out.extend(der_of(x));
+                    }
+                    // An empty or partly encoded chain: nothing to check
+                    // its revocation with.
+                    if out.len() != n || n == 0 {
+                        out.clear();
+                        ffi::X509_STORE_CTX_free(ctx);
+                        ffi::OPENSSL_sk_free(stack);
+                        return Err(Failure::BadDer);
+                    }
+                }
+                code
             };
             ffi::X509_STORE_CTX_free(ctx);
             ffi::OPENSSL_sk_free(stack);

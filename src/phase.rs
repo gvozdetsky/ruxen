@@ -134,8 +134,99 @@ pub(crate) fn resume_auth_request(resume: Vec<(&'static [u8], AuthResume)>) {
     AUTH_RESUME.with(|r| *r.borrow_mut() = resume);
 }
 
+/// What the access phase noted on the pass before the body is read
+/// (#855), for the pass after it: limit_req and limit_conn don't count
+/// the request again.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BeforeBody {
+    pub limit_req_status: u8,
+    pub limit_conn_status: u8,
+}
+
+#[derive(Clone, Copy)]
+enum BeforeBodyPass {
+    Off,
+    /// The pass before the body: stop before a handler that may read it.
+    Probe,
+    /// It stopped there, with what the access phase noted.
+    Stopped(BeforeBody),
+    /// The pass after the read.
+    Resume(BeforeBody),
+}
+
+thread_local! {
+    static BEFORE_BODY: std::cell::Cell<BeforeBodyPass> =
+        const { std::cell::Cell::new(BeforeBodyPass::Off) };
+}
+
+/// The worker runs the access phase before reading a body, as nginx does
+/// (#855): the next `process` stops before a handler that may read it.
+pub(crate) fn probe_before_body() {
+    BEFORE_BODY.with(|b| b.set(BeforeBodyPass::Probe));
+}
+
+/// After that pass: `Some` when it stopped before such a handler (the
+/// body is to be read), `None` when its response is the answer.
+pub(crate) fn probe_result() -> Option<BeforeBody> {
+    match BEFORE_BODY.with(|b| b.replace(BeforeBodyPass::Off)) {
+        BeforeBodyPass::Stopped(noted) => Some(noted),
+        _ => None,
+    }
+}
+
+/// Around the pass after the read: what the one before noted.
+pub(crate) fn resume_before_body(noted: Option<BeforeBody>) {
+    BEFORE_BODY.with(|b| b.set(noted.map_or(BeforeBodyPass::Off, BeforeBodyPass::Resume)));
+}
+
+/// limit_req's and limit_conn's statuses from the pass before the body.
+pub(crate) fn before_body_noted() -> Option<BeforeBody> {
+    match BEFORE_BODY.with(|b| b.get()) {
+        BeforeBodyPass::Resume(noted) => Some(noted),
+        _ => None,
+    }
+}
+
+/// On the pass before the body, a handler that may read it ends the pass.
+/// A static file doesn't read it, nor does a `return` unless a variable
+/// reads it (#289): that answer stands.
+#[inline]
+fn stops_before(
+    http: &PreparedHttp,
+    handler: &crate::worker::PreparedHandler,
+    state: &RewriteState,
+) -> bool {
+    use crate::worker::PreparedHandler;
+    match handler {
+        PreparedHandler::Root(_) => false,
+        PreparedHandler::Return(..) if !http.uses_request_body && !http.uses_request_body_file => {
+            false
+        }
+        _ => stops_before_slow(state),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn stops_before_slow(state: &RewriteState) -> bool {
+    BEFORE_BODY.with(|b| match b.get() {
+        BeforeBodyPass::Probe => {
+            b.set(BeforeBodyPass::Stopped(BeforeBody {
+                limit_req_status: state.limit_req_status,
+                limit_conn_status: state.limit_conn_status,
+            }));
+            true
+        }
+        _ => false,
+    })
+}
+
 /// The body of a request that has none.
 pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
+
+/// `RequestCtx::body_len` of a body whose framing was bad: the location
+/// answers 400 where it would answer 413 (#806).
+pub const MALFORMED_BODY: u64 = u64::MAX;
 
 /// Per-request inputs the pipeline needs from the parser + connection.
 /// Narrow on purpose — each field added here is a new dependency between
@@ -226,6 +317,9 @@ pub struct RequestCtx<'a> {
     /// Path to a temp file containing the request body when the worker
     /// spilled it. Empty when no spill file exists.
     pub body_file: Option<&'a crate::worker::SpilledBody>,
+    /// `proxy_request_buffering off` (#134): the body is read as the proxy
+    /// sends it, from here; `body` holds what came with the header.
+    pub body_feed: Option<&'a crate::request_feed::BodyFeed>,
     /// Negotiated TLS handshake info, taken once at handshake completion.
     /// `None` for plain-HTTP connections. Drives `$scheme` and `$ssl_*`
     /// variable rendering; otherwise untouched on the hot path.
@@ -248,18 +342,39 @@ pub struct KeepaliveMeta {
     pub header_timeout_secs: Option<u64>,
     pub max_requests: u64,
     pub max_time_ms: u64,
+    /// `keepalive_min_timeout`, saturated: a u32 fits the padding.
+    pub min_timeout_ms: u32,
     pub disable_msie6: bool,
     pub disable_safari: bool,
+}
+
+impl KeepaliveMeta {
+    /// A server's settings, for a response before any location (a
+    /// server-level `return`, a refused URI).
+    fn of_server(server: &PreparedServer) -> Self {
+        let k = &server.keepalive;
+        KeepaliveMeta {
+            allow: k.allow,
+            idle_timeout_ms: k.idle_timeout_ms,
+            header_timeout_secs: k.header_timeout_secs,
+            max_requests: k.max_requests,
+            max_time_ms: k.max_time_ms,
+            min_timeout_ms: u32::try_from(k.min_timeout_ms).unwrap_or(u32::MAX),
+            disable_msie6: k.disable_msie6,
+            disable_safari: k.disable_safari,
+        }
+    }
 }
 
 impl Default for KeepaliveMeta {
     fn default() -> Self {
         KeepaliveMeta {
             allow: true,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(crate::worker::DEFAULT_KEEPALIVE_TIMEOUT_MS),
             header_timeout_secs: None,
             max_requests: 1_000,
             max_time_ms: 3_600_000,
+            min_timeout_ms: 0,
             disable_msie6: true,
             disable_safari: false,
         }
@@ -287,6 +402,8 @@ pub struct ProcessMeta {
     pub log: LogMeta,
     /// `$server_port` for access-log rendering on this request.
     pub server_port: u16,
+    /// The server's metrics slot (`PreparedServer::metrics_slot`).
+    pub metrics_server: u32,
     /// `access_log` sinks for the matched location (or server scope if no
     /// location matched). The worker uses this list — not `PreparedHttp::
     /// access_logs` — so location-scope `access_log` directives fire
@@ -352,10 +469,20 @@ pub struct ProcessMeta {
     /// `Response::File` body zero-copy when this is on and the transport
     /// allows it (plain TCP).
     pub sendfile: bool,
+    /// The location's `aio threads` pool: file bodies are read (and sent
+    /// with `sendfile`) on it, off the worker (#526).
+    pub aio: Option<&'static crate::aio::ThreadPool>,
     /// A proxied response under `proxy_pass_header Date`: its `Date` is
     /// the upstream's, or there is none, and the worker doesn't stamp one
     /// (#360).
     pub keep_upstream_date: bool,
+    /// `add_trailer`'s trailers go after a proxied body in memory or in
+    /// its cache file, added by the worker after gzip, as nginx's chunked
+    /// filter runs after its gzip filter (#793).
+    pub trailers_due: bool,
+    /// A handler's `add_trailer` left to the worker, to go after gzip too
+    /// (#809): `proxy_add_trailers` holds them.
+    pub handler_trailers: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
@@ -399,6 +526,7 @@ impl Default for ProcessMeta {
             keepalive: KeepaliveMeta::default(),
             log: LogMeta::default(),
             server_port: 0,
+            metrics_server: 0,
             access_logs: &[],
             limit_req_delay_ms: 0,
             limit_conn_held: None,
@@ -418,7 +546,10 @@ impl Default for ProcessMeta {
             underscores_in_headers: false,
             client_body_in_file_only: crate::config::ClientBodyInFileOnly::Off,
             sendfile: false,
+            aio: None,
             keep_upstream_date: false,
+            trailers_due: false,
+            handler_trailers: false,
             gzip: None,
             max_ranges: None,
             range_allow: crate::worker::range::RangeAllow::No,
@@ -451,9 +582,11 @@ fn refused_meta(server: &'static PreparedServer, invalid_uri: bool) -> ProcessMe
             log_not_found: server.log_not_found,
         },
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
         access_logs: server.access_logs,
         invalid_uri,
+        keepalive: KeepaliveMeta::of_server(server),
         ..ProcessMeta::default()
     }
 }
@@ -495,6 +628,74 @@ fn refuse(
         meta.keepalive.allow = false;
     }
     (response, meta)
+}
+
+/// A request target that doesn't normalise: nginx refuses it while
+/// reading the request line, with the default server's configuration
+/// (its `error_page`, `add_header … always`, #779). A 400 ends the
+/// connection.
+#[cold]
+#[inline(never)]
+fn bad_uri(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+    response: Response,
+) -> (Response, ProcessMeta) {
+    let server = &listen.servers[listen.default_server];
+    crate::worker::write_error_log(
+        server.error_logs,
+        crate::config::ErrorLogLevel::Info,
+        // Before the headers: no host in the line.
+        &crate::worker::ErrorLogRequest::new(
+            &RequestCtx {
+                headers_raw: b"",
+                ..*req
+            },
+            server.primary_server_name,
+        ),
+        b"client sent invalid request while reading client request line",
+        None,
+    );
+    // A target that isn't a path (`*`, `x`) fails nginx's request-line
+    // parse, before `$request_method` and `$request` are set.
+    let unparsed;
+    let req = if req.path.first() == Some(&b'/') {
+        req
+    } else {
+        unparsed = RequestCtx {
+            method_bytes: b"",
+            request_line: b"",
+            path: b"",
+            ..*req
+        };
+        &unparsed
+    };
+    let (response, mut meta) = refuse(http, req, url_scratch, server, response, true, false, None);
+    // No `$uri` for the log, unless an error page gave it one.
+    meta.invalid_uri |= !server.error_pages.iter().any(|p| p.status == 400);
+    (response, meta)
+}
+
+/// A refusal for the headers comes after the request target's, as nginx
+/// checks the target while it reads the request line (#807): only on the
+/// way to such a refusal is the target checked here first.
+#[cold]
+#[inline(never)]
+fn bad_target_first(
+    http: &'static PreparedHttp,
+    req: &RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    listen: &'static PreparedListen,
+) -> Option<(Response, ProcessMeta)> {
+    // CONNECT's target is an authority, not a path.
+    if req.method == Method::Connect {
+        return None;
+    }
+    url_scratch.clear();
+    let bad = normalize_request_uri_into(http, req, false, url_scratch).err()?;
+    Some(bad_uri(http, req, url_scratch, listen, bad))
 }
 
 /// The server's charset on what it answers before a location (#464);
@@ -568,6 +769,18 @@ pub struct FileBody {
     pub fd: OwnedFd,
     pub offset: u64,
     pub len: u64,
+    /// A multipart/byteranges body (#414): `len` counts the parts'
+    /// headers and the closing boundary too, `offset` is unused.
+    pub parts: Option<Box<FileParts>>,
+}
+
+/// The parts of a multipart/byteranges body sent from its file, as
+/// nginx's range filter chains them (ngx_http_range_multipart_body).
+pub struct FileParts {
+    /// Each part's header, and its range of the file: offset, length.
+    pub parts: Vec<(Vec<u8>, u64, u64)>,
+    /// The closing boundary.
+    pub trailer: Vec<u8>,
 }
 
 /// Status handling requested by `error_page` after an internal redirect.
@@ -611,6 +824,19 @@ pub struct Reroute {
     /// The error page answers a status after which nginx's special
     /// response handler ends the connection (`http::closes_connection`).
     pub closes: bool,
+    /// A named target reached from the proxy path: where the request was.
+    pub named_from: Option<Box<NamedFrom>>,
+}
+
+/// The URI, arguments and URI state a proxying location left, for a jump
+/// to a named location after `proxy_intercept_errors` (#814): nginx's
+/// ngx_http_named_location keeps `r->uri`, `r->args`, `valid_unparsed_uri`.
+#[derive(Clone)]
+pub struct NamedFrom {
+    pub uri: Vec<u8>,
+    pub args: Option<Vec<u8>>,
+    pub unparsed_uri: bool,
+    pub internal: bool,
 }
 
 /// Test-only helper: run the pipeline and return only the response,
@@ -669,6 +895,9 @@ fn rewrite_cycle_log(uri: &[u8]) {
 }
 
 /// nginx's `[info]` line for an HTTP/1.1 request without `Host` (#663).
+pub(crate) const MISSING_HOST: &str =
+    "client sent HTTP/1.1 request without \"Host\" header while reading client request headers";
+
 #[cold]
 #[inline(never)]
 fn missing_host_log(server: &PreparedServer, req: &RequestCtx<'_>) {
@@ -676,7 +905,7 @@ fn missing_host_log(server: &PreparedServer, req: &RequestCtx<'_>) {
         server.error_logs,
         crate::config::ErrorLogLevel::Info,
         &crate::worker::ErrorLogRequest::new(req, server.primary_server_name),
-        b"client sent HTTP/1.1 request without \"Host\" header while reading client request headers",
+        MISSING_HOST.as_bytes(),
         None,
     );
 }
@@ -730,6 +959,10 @@ fn process_with_meta_inner(
     // (request.c:2034–2039) after all headers parse. HTTP/1.0 falls through
     // — empty Host is treated as "default server".
     if refusing && req.http_11 && req.host.is_none_or(|h| h.is_empty()) {
+        if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+            return out;
+        }
+        url_scratch.clear();
         let server = &listen.servers[listen.default_server];
         // Not past an invalid one, logged already.
         if req.refuse.is_none() {
@@ -743,6 +976,10 @@ fn process_with_meta_inner(
 
     if refusing {
         if let Some(status) = req.refuse {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 501 => &http.not_implemented,
                 // nginx's 497: plain HTTP on an `ssl` port, sent as 400
@@ -771,6 +1008,10 @@ fn process_with_meta_inner(
             && let Some(tls) = req.tls
             && let Some((status, close)) = client_certificate_refusal(listen, server, req, tls)
         {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             let canned = match status {
                 421 => &http.misdirected,
                 495 => &http.cert_error,
@@ -781,6 +1022,10 @@ fn process_with_meta_inner(
             return refuse(http, req, url_scratch, server, response, close, false, code);
         }
         if matches!(req.method, Method::Trace | Method::Connect) {
+            if let Some(out) = bad_target_first(http, req, url_scratch, listen) {
+                return out;
+            }
+            url_scratch.clear();
             if req.method == Method::Trace
                 && crate::worker::test_panic() == crate::worker::TestPanic::Trace
             {
@@ -808,6 +1053,7 @@ fn process_with_meta_inner(
     let req_in = req;
     // An error page for a status that ends the connection (`Reroute::closes`).
     let mut closes = false;
+    let mut named_state: Option<(bool, bool)> = None;
     match initial_reroute {
         None => {
             // Normalize the URI once at FindConfig entry; Rewrite / internal
@@ -821,14 +1067,15 @@ fn process_with_meta_inner(
             if let Err(resp) =
                 normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
             {
-                // A 400 ends the connection, as nginx's does.
-                let mut meta = refused_meta(server, true);
-                meta.keepalive.allow = false;
-                return (resp, meta);
+                return bad_uri(http, req, url_scratch, listen, resp);
             }
         }
         Some(reroute) => {
             closes = reroute.closes;
+            named_state = reroute
+                .named_from
+                .as_ref()
+                .map(|from| (from.unparsed_uri, from.internal));
             if turns_into_get(req, &reroute) {
                 req_now = Some(error_page_request(req));
             }
@@ -867,10 +1114,12 @@ fn process_with_meta_inner(
                     }
                 }
                 RerouteTarget::Named(name) => {
-                    // Named-location jumps preserve the current URI. Seed the
-                    // normalized request URI and start the loop with a named target.
+                    // Named-location jumps preserve the current URI: the
+                    // one the proxying location had, else the request's.
                     url_scratch.clear();
-                    if let Err(resp) =
+                    if let Some(from) = &reroute.named_from {
+                        url_scratch.extend_from_slice(&from.uri);
+                    } else if let Err(resp) =
                         normalize_request_uri_into(http, req, server.merge_slashes, url_scratch)
                     {
                         return (resp, refused_meta(server, true));
@@ -882,6 +1131,10 @@ fn process_with_meta_inner(
     }
     let mut rewrite_state = RewriteState::default();
     rewrite_state.doc_root = Some(server.doc_root);
+    if let Some((unparsed_uri, internal)) = named_state {
+        rewrite_state.unparsed_uri = unparsed_uri;
+        rewrite_state.internal = internal;
+    }
     // A regex server_name's captures are `$1`…`$9` until another regex
     // matches (nginx's r->captures from ngx_http_find_virtual_server).
     if let Some(captures) = regex_captures.as_ref() {
@@ -891,10 +1144,17 @@ fn process_with_meta_inner(
     }
     let mut meta = ProcessMeta {
         server_port: server.listen_port,
+        metrics_server: server.metrics_slot,
         server_name: server.primary_server_name,
+        // `allow` is the client's until a location's applies: its
+        // keepalive_timeout decides, not the server's (nginx's
+        // ngx_http_update_location_config).
+        keepalive: KeepaliveMeta {
+            allow: !closes,
+            ..KeepaliveMeta::of_server(server)
+        },
         ..ProcessMeta::default()
     };
-    meta.keepalive.allow = !closes;
     // The realip module's post-read handler, with the server's settings.
     if !server.access.realip.from.is_empty() {
         let req = req_now.as_ref().unwrap_or(req_in);
@@ -916,9 +1176,14 @@ fn process_with_meta_inner(
         let req = req_now.as_ref().unwrap_or(req_in);
         // nginx's `r->internal`: set by any internal redirect (an entry
         // reroute, or a later hop: rewrite, error_page, try_files, index).
+        // A jump to a named location keeps `valid_unparsed_uri`
+        // (ngx_http_named_location); a redirect to a URI clears it.
         let internal_request = !refusing || hop > 0;
         if internal_request {
-            rewrite_state.unparsed_uri = false;
+            rewrite_state.internal = true;
+            if named_target.is_none() {
+                rewrite_state.unparsed_uri = false;
+            }
         }
         let mut loc = if let Some(name) = named_target.take() {
             match match_named_location(server, &name) {
@@ -938,7 +1203,7 @@ fn process_with_meta_inner(
         } else {
             if std::mem::take(&mut run_server_rewrite)
                 && !server.rewrite_program.is_empty()
-                && let Some(response) = crate::worker::run_server_rewrite(
+                && let Some((response, _)) = crate::worker::run_server_rewrite(
                     http,
                     server,
                     req,
@@ -950,6 +1215,13 @@ fn process_with_meta_inner(
             {
                 // Answered before any location: the server's error_page,
                 // add_header and logs, and the realip address.
+                let mut response = response;
+                crate::worker::generated_preconditions(
+                    &mut response,
+                    req,
+                    error_page_status,
+                    server.server_header,
+                );
                 let (response, mut refused) = refuse(
                     http,
                     req,
@@ -1225,6 +1497,7 @@ fn process_with_meta_inner(
         let loc_expires = loc.expires;
         meta.client_body_in_file_only = loc.client_body_in_file_only;
         meta.sendfile = loc.sendfile;
+        meta.aio = loc.aio;
         meta.gzip = loc.gzip;
         meta.max_ranges = loc.max_ranges;
         // `set $limit_rate` wins over the directive, as nginx's
@@ -1252,7 +1525,14 @@ fn process_with_meta_inner(
             meta.proxy_host = proxy.host_header;
             meta.proxy_tls = proxy.tls.is_some() && proxy.url.is_none();
         }
+        meta.handler_trailers = false;
+        if !loc_add_trailers.is_empty() && loc.gzip.is_some() {
+            defer_handler_trailers(&mut loc, &mut meta);
+        }
         let response = match denied {
+            None if stops_before(http, loc.handler, &rewrite_state) => {
+                return (Response::Prebuilt(http.not_found.pick(req.method)), meta);
+            }
             None => run_location_handler(
                 http,
                 server,
@@ -1353,6 +1633,18 @@ fn process_with_meta_inner(
                     keep_rewrite_state(&mut meta, rewrite_state);
                 }
                 return (Response::Proxy(plan), meta);
+            }
+            // `add_trailer` on a file too big to be read into the response
+            // (#844): the worker sends it chunked, the trailers after it,
+            // as for a cache hit.
+            Response::File { headers, body } if !loc_add_trailers.is_empty() => {
+                meta.proxy_add_trailers = loc_add_trailers;
+                meta.proxy_chunked_transfer_encoding = loc_chunked_te;
+                let headers = crate::worker::expect_file_trailers(headers, req, &mut meta);
+                if rewrite_state.worth_keeping() || rewrite_state.has_numbered_captures() {
+                    keep_rewrite_state(&mut meta, rewrite_state);
+                }
+                return (Response::File { headers, body }, meta);
             }
             other => {
                 if rewrite_state.worth_keeping() {
@@ -1581,6 +1873,21 @@ fn real_ip_trusted(from: &[AccessAddr], ip: IpAddr) -> bool {
         (AccessAddr::V6 { addr, mask }, IpAddr::V6(ip)) => u128::from(ip) & mask == addr,
         _ => false,
     })
+}
+
+/// `add_trailer` with gzip on (#809): the worker adds the trailers after
+/// gzip, as nginx's chunked filter runs after its gzip filter. A proxied
+/// response does that already.
+#[cold]
+#[inline(never)]
+fn defer_handler_trailers(loc: &mut MatchedLocation<'static>, meta: &mut ProcessMeta) {
+    if matches!(loc.handler, crate::worker::PreparedHandler::Proxy(_)) {
+        return;
+    }
+    meta.proxy_add_trailers = loc.add_trailers;
+    meta.proxy_chunked_transfer_encoding = loc.chunked_transfer_encoding;
+    meta.handler_trailers = true;
+    loc.add_trailers = &[];
 }
 
 /// `ngx_http_send_error_page`: an error_page that sends the request to a
@@ -1954,6 +2261,72 @@ fn write_auth_path_var(
     }
 }
 
+/// The client's request target with its `#fragment`, nginx's
+/// r->unparsed_uri (#748): `$request_uri`, and what `proxy_pass` without
+/// a URI part sends. `path` stops at the `#` (`$uri` and `$args` do); when
+/// it lies in `request_line` and a `#` follows it there, the target runs
+/// on to the next space. No work otherwise: a synthesized path isn't in
+/// the line.
+#[inline]
+pub(crate) fn unparsed_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    // Distinct live buffers don't overlap: an offset inside the line means
+    // `path` is part of it.
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start.checked_add(path.len()) {
+        Some(end) if request_line.get(end) == Some(&b'#') => {
+            with_fragment(request_line, start, end)
+        }
+        _ => path,
+    }
+}
+
+/// `$request_uri`: [`unparsed_uri`], except for an absolute-form target
+/// without a path (`GET http://h?a=1`), whose `/?a=1` is synthesized for
+/// `$uri`; nginx's unparsed_uri starts at the `?` there (#769). The
+/// upstream target keeps the `/` (valid_unparsed_uri is off for it).
+#[inline]
+pub(crate) fn request_uri<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let start = (path.as_ptr() as usize).wrapping_sub(request_line.as_ptr() as usize);
+    match start
+        .checked_add(path.len())
+        .map(|end| (end, request_line.get(end)))
+    {
+        Some((end, Some(b'#'))) => with_fragment(request_line, start, end),
+        Some((_, Some(_))) => path,
+        _ => absolute_query(path, request_line),
+    }
+}
+
+/// The client's `?args…` for a synthesized `/?args`, else `path`.
+#[cold]
+#[inline(never)]
+fn absolute_query<'a>(path: &'a [u8], request_line: &'a [u8]) -> &'a [u8] {
+    let Some(query) = path.strip_prefix(b"/").filter(|q| q.first() == Some(&b'?')) else {
+        return path;
+    };
+    let target = request_line
+        .split(|&b| b == b' ')
+        .nth(1)
+        .unwrap_or_default();
+    if target.first() == Some(&b'/') {
+        return path;
+    }
+    match target.iter().position(|&b| b == b'?') {
+        Some(i) if target[i..].starts_with(query) => &target[i..],
+        _ => path,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn with_fragment(request_line: &[u8], start: usize, end: usize) -> &[u8] {
+    let len = request_line[end..]
+        .iter()
+        .position(|&b| b == b' ')
+        .unwrap_or(request_line.len() - end);
+    &request_line[start..end + len]
+}
+
 fn request_uri_path(request_uri: &[u8]) -> &[u8] {
     match request_uri.iter().position(|&b| b == b'?') {
         Some(i) => &request_uri[..i],
@@ -2006,6 +2379,10 @@ pub(crate) struct FirstBodyLimit {
     /// with `client_body_in_file_only on|clean`, 0: every body does.
     pub buffer: u64,
     pub error_logs: &'static [PreparedErrorLog],
+    /// The location's access logs and its server's port, for a request
+    /// cut while its body is read (#866).
+    pub access_logs: &'static [crate::worker::PreparedAccessLog],
+    pub server_port: u16,
     pub server_name: &'static [u8],
     /// `client_body_in_file_only on`: a temp file holding the body
     /// outlives the request (nginx's `request_body_in_persistent_file`).
@@ -2022,14 +2399,28 @@ pub(crate) struct FirstBodyLimit {
     pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
+    /// `proxy_request_buffering off` (#134): the body goes upstream as it
+    /// arrives, with the `proxy_http_version` (a chunked one needs 1.1).
+    /// `None` where it is read first: nginx's `request_body_no_buffering`
+    /// also needs the body passed as it is (`proxy_pass_request_body`, no
+    /// `proxy_set_body`).
+    pub unbuffered: Option<u8>,
+    /// The request is processed up to a handler that may read the body
+    /// before the body is read: the location has access checks (or
+    /// rewrites that may lead to some), which answer first as nginx's
+    /// access phase does (#855), or is static, where a file `try_files` or
+    /// `index` finds is served without the body though another way may
+    /// lead to one that reads it (#836).
+    pub probe_first: bool,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
 /// body: that of the location `ngx_http_core_find_config_phase` finds
 /// first, after the server's rewrite phase. The worker reads bodies before
 /// routing, so it asks this first and refuses an oversized body unread.
-/// `None` when the request doesn't get to a location that way (refused,
-/// answered by the server's rewrite phase, an `internal` location): then
+/// A request answered before a location (a missing Host, a bad target, the
+/// server's `return`) discards its body. `None` (refused, an `internal`
+/// location, a server answer whose `error_page` may read it): then
 /// the body is read and the pipeline answers as before. Pure: runs the
 /// server's rewrite program on a throwaway state, and leaves `url_scratch`
 /// to be reset by `process_with_meta`.
@@ -2041,19 +2432,25 @@ pub(crate) fn first_body_limit(
     expect: bool,
 ) -> Option<FirstBodyLimit> {
     let listen = select_listen(http, req.listen_index)?;
-    if req.refuse.is_some()
-        || (req.http_11 && req.host.is_none_or(|h| h.is_empty()))
-        || matches!(req.method, Method::Trace | Method::Connect)
-    {
+    if req.refuse.is_some() {
         return None;
     }
     let (server, regex_captures) = find_config(listen, req.host, req.sni);
+    // Refused before a location (a missing Host, TRACE, a bad target): no
+    // body is read for that (#776).
+    if (req.http_11 && req.host.is_none_or(|h| h.is_empty()))
+        || matches!(req.method, Method::Trace | Method::Connect)
+    {
+        return Some(unrouted_discard(server, None));
+    }
     url_scratch.clear();
-    normalize_request_uri_into(http, req, server.merge_slashes, url_scratch).ok()?;
+    if normalize_request_uri_into(http, req, server.merge_slashes, url_scratch).is_err() {
+        return Some(unrouted_discard(server, None));
+    }
     let mut rewrite_state = RewriteState::default();
     if !server.rewrite_program.is_empty() {
         let mut current_args = None;
-        if crate::worker::run_server_rewrite(
+        if let Some((response, finalized)) = crate::worker::run_server_rewrite(
             http,
             server,
             req,
@@ -2061,10 +2458,8 @@ pub(crate) fn first_body_limit(
             &mut current_args,
             &mut rewrite_state,
             regex_captures.as_ref(),
-        )
-        .is_some()
-        {
-            return None;
+        ) {
+            return server_answer_discard(http, server, &response, finalized, expect);
         }
     }
     let loc = match match_location(server, url_scratch, &mut rewrite_state) {
@@ -2087,16 +2482,94 @@ pub(crate) fn first_body_limit(
             _ => 0,
         },
         error_logs: loc.error_logs,
+        access_logs: loc.access_logs,
+        server_port: server.listen_port,
         server_name: server.primary_server_name,
         persistent: matches!(
             loc.client_body_in_file_only,
             crate::config::ClientBodyInFileOnly::On
         ),
         body_temp: loc.body_temp,
-        discard: discards_body(http, server, &loc, url_scratch, true, 0),
+        discard: discards_body(http, server, &loc, url_scratch, true, &[]),
         continue_status: if expect { discard_continue(&loc) } else { None },
         body_timeout: loc.timeouts.body,
+        unbuffered: match &loc.handler {
+            crate::worker::PreparedHandler::Proxy(proxy)
+                if !proxy.request_buffering
+                    && proxy.pass_request_body
+                    && proxy.set_body.is_none() =>
+            {
+                Some(proxy.http_version)
+            }
+            _ => None,
+        },
+        probe_first: matches!(loc.handler, crate::worker::PreparedHandler::Root(_))
+            || !loc.access.rules.is_empty()
+            || !matches!(loc.access.auth_basic, PreparedAuthBasic::Off)
+            || loc.access.auth_request.is_some()
+            || loc.limit_req.is_some()
+            || loc.limit_conn.is_some()
+            || loc.limit_except.is_some()
+            || !loc.rewrite_program.is_empty(),
     })
+}
+
+/// A body dropped because the request is answered before any location:
+/// no limit, nothing kept; `continue_status` as `discard_continue`'s.
+#[cold]
+#[inline(never)]
+fn unrouted_discard(server: &PreparedServer, continue_status: Option<u16>) -> FirstBodyLimit {
+    FirstBodyLimit {
+        max: 0,
+        buffer: crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE,
+        error_logs: server.error_logs,
+        access_logs: server.access_logs,
+        server_port: server.listen_port,
+        server_name: server.primary_server_name,
+        persistent: false,
+        body_temp: None,
+        discard: true,
+        continue_status,
+        body_timeout: server.timeouts.body,
+        unbuffered: None,
+        probe_first: false,
+    }
+}
+
+/// The server's rewrite program answered (a server-level `return`, the
+/// usual http→https redirect): nginx discards the body as it sends that
+/// (ngx_http_send_response, the special response handler), unless its
+/// `error_page` takes the request somewhere that may read it, or a
+/// variable could read it. `None`: the body is read.
+#[cold]
+#[inline(never)]
+fn server_answer_discard(
+    http: &PreparedHttp,
+    server: &PreparedServer,
+    response: &Response,
+    finalized: bool,
+    expect: bool,
+) -> Option<FirstBodyLimit> {
+    let head: &[u8] = match response {
+        Response::Prebuilt(bytes) => bytes,
+        Response::Owned(bytes) => bytes,
+        _ => return None,
+    };
+    let status = crate::worker::response_status(head);
+    if http.uses_request_body
+        || http.uses_request_body_file
+        || (finalized && server.error_pages.iter().any(|p| p.status == status))
+    {
+        return None;
+    }
+    // As `discard_continue`: a 100 before a redirect or a text, not
+    // before an error the special response handler answers.
+    let continue_status = expect.then_some(if status < 400 || !finalized {
+        status
+    } else {
+        0
+    });
+    Some(unrouted_discard(server, continue_status))
 }
 
 /// Where the body is discarded, which response nginx sends a `100
@@ -2132,12 +2605,14 @@ fn discard_continue(loc: &MatchedLocation<'_>) -> Option<u16> {
 /// `$request_body` nor `$request_body_file` appears anywhere (#289). A
 /// static file, as nginx's static module discards the body
 /// (ngx_http_static_module.c:221), so `$request_body` is empty there as in
-/// nginx; but `index` and `error_page` redirect before that discard
-/// (ngx_http_special_response.c:470-481), so where they lead must discard
-/// too. `try_files`, rewrites, `auth_request` and the rest aren't
-/// followed: the body is read. `errors_redirect`: the location's
-/// `error_page` applies (not past an error page without
-/// `recursive_error_pages`). Cold: only for requests with a body.
+/// nginx; but `index`, `try_files` and `error_page` redirect before that
+/// discard (ngx_http_special_response.c:470-481), so where they lead must
+/// discard too, as must a fixed `rewrite … last`. Other rewrites,
+/// `auth_request` and the rest aren't followed: the body is read.
+/// `errors_redirect`: the location's `error_page` applies (not past an
+/// error page without `recursive_error_pages`). `outer`: the locations
+/// (and their `errors_redirect`) the request came through to here.
+/// Cold: only for requests with a body.
 #[cold]
 #[inline(never)]
 fn discards_body(
@@ -2146,32 +2621,50 @@ fn discards_body(
     loc: &MatchedLocation<'_>,
     uri: &[u8],
     errors_redirect: bool,
-    hops: u8,
+    outer: &[(&crate::worker::PreparedHandler, bool)],
 ) -> bool {
     use crate::worker::PreparedHandler;
-    if hops > 2
-        || !loc.rewrite_program.is_empty()
-        || loc.post_action.is_some()
-        || loc.limit_except.is_some()
-    {
+    if outer.len() > 2 || loc.post_action.is_some() || loc.limit_except.is_some() {
         return false;
+    }
+    // `rewrite … last` to a fixed URI (an SPA's `@router`) is followed;
+    // any other rewrite program may lead anywhere.
+    let mut rewrites: Vec<Vec<u8>> = Vec::new();
+    for op in loc.rewrite_program {
+        use crate::worker::{PreparedRewriteFlag, PreparedRewriteOp};
+        let PreparedRewriteOp::Rewrite {
+            replacement_uri,
+            flag: PreparedRewriteFlag::Last,
+            ..
+        } = op
+        else {
+            return false;
+        };
+        let Some(path) = literal_path(replacement_uri) else {
+            return false;
+        };
+        rewrites.push(path);
     }
     let root = match loc.handler {
         PreparedHandler::Return(..) => {
             return !http.uses_request_body
                 && !http.uses_request_body_file
+                && rewrites.is_empty()
                 && (loc.error_pages.is_empty() || !errors_redirect);
         }
         PreparedHandler::Root(root) => root,
         _ => return false,
     };
-    if root.try_files.is_some()
-        || loc.access.auth_request.is_some()
-        || loc.auto_redirect_to.is_some()
-    {
+    if loc.access.auth_request.is_some() || loc.auto_redirect_to.is_some() {
         return false;
     }
-    // Where an internal redirect goes, as `process` routes it.
+    // Where an internal redirect goes, as `process` routes it. Back into
+    // a location on the way here (`try_files $uri /index.html`, or via an
+    // `@router` that rewrites to it) at a file brings nothing its check
+    // doesn't cover.
+    let mut path = outer.to_vec();
+    path.push((loc.handler, errors_redirect));
+    let path = &path[..];
     let follow = |target: &[u8], errors_redirect: bool| {
         let mut state = RewriteState::default();
         let next = if target.first() == Some(&b'@') {
@@ -2185,20 +2678,81 @@ fn discards_body(
             })
         };
         next.is_some_and(|next| {
-            discards_body(http, server, &next, target, errors_redirect, hops + 1)
+            (!target.ends_with(b"/")
+                && path.iter().any(|&(handler, errors)| {
+                    std::ptr::eq(next.handler, handler) && (errors || !errors_redirect)
+                }))
+                || discards_body(http, server, &next, target, errors_redirect, path)
         })
     };
-    if uri.ends_with(b"/") {
-        for entry in root.index {
-            let Some(name) = literal_value(entry.parts) else {
+    if !rewrites
+        .iter()
+        .all(|target| follow(target, errors_redirect))
+    {
+        return false;
+    }
+    // The index files of a directory URI (`dir` ends in `/`), each an
+    // internal redirect.
+    let indexes = |dir: &[u8]| {
+        root.index.iter().all(|entry| {
+            literal_value(entry.parts).is_some_and(|name| {
+                let target = if name.first() == Some(&b'/') {
+                    name
+                } else {
+                    [dir, &name[..]].concat()
+                };
+                follow(&target, errors_redirect)
+            })
+        })
+    };
+    // `try_files` (#776): a file it finds is served here; a directory
+    // gets its index, or the 301 to `dir/`; else the fallback.
+    let mut fallback_status = None;
+    match root.try_files {
+        None => {
+            if uri.ends_with(b"/") && !indexes(uri) {
                 return false;
+            }
+        }
+        Some(tf) => {
+            use crate::worker::{PreparedFallback, PreparedProbe};
+            let dir = |path: &[u8]| !path.ends_with(b"/") || indexes(path);
+            let hits_discard = tf.probes.iter().all(|probe| match probe {
+                PreparedProbe::Uri
+                | PreparedProbe::Literal(_)
+                | PreparedProbe::Template { dir: false, .. } => true,
+                PreparedProbe::UriSlash => dir(uri),
+                PreparedProbe::LiteralSlash(path) => dir(path),
+                // Where it leads is known only when rendered: only
+                // absolute index files then.
+                PreparedProbe::Template { dir: true, .. } => {
+                    root.index.iter().all(|entry| {
+                        literal_value(entry.parts).is_some_and(|n| n.first() == Some(&b'/'))
+                    }) && indexes(b"")
+                }
+            });
+            if !hits_discard {
+                return false;
+            }
+            let path_of = |target: &[u8]| -> Vec<u8> {
+                target
+                    .split(|&b| b == b'?')
+                    .next()
+                    .unwrap_or_default()
+                    .to_vec()
             };
-            let target = if name.first() == Some(&b'/') {
-                name
-            } else {
-                [uri, &name[..]].concat()
+            let falls_back = match &tf.fallback {
+                PreparedFallback::Status(prebuilt) => {
+                    fallback_status = Some(crate::worker::response_status(prebuilt.head));
+                    true
+                }
+                PreparedFallback::Uri(target) => follow(&path_of(target), errors_redirect),
+                PreparedFallback::UriTemplate(parts) => {
+                    literal_path(parts).is_some_and(|path| follow(&path, errors_redirect))
+                }
+                PreparedFallback::Named(name) => follow(name, errors_redirect),
             };
-            if !follow(&target, errors_redirect) {
+            if !falls_back {
                 return false;
             }
         }
@@ -2209,8 +2763,9 @@ fn discards_body(
     loc.error_pages.iter().all(|page| {
         // What a static location answers before its handler drops the
         // body: the access phase, the file lookup, the method check, and
-        // the conditional and range checks.
+        // the conditional and range checks; and `try_files`' `=code`.
         let arises = matches!(page.status, 301 | 401 | 403 | 404 | 405 | 412 | 416 | 500)
+            || fallback_status == Some(page.status)
             || loc.limit_req.is_some_and(|l| l.status == page.status)
             || loc.limit_conn.is_some_and(|l| l.status == page.status);
         if !arises {
@@ -2229,6 +2784,25 @@ fn discards_body(
             _ => true,
         }
     })
+}
+
+/// The path of a URI value whose variables come only after its `?`
+/// (`/index.php?$args`), else `None`.
+fn literal_path(parts: &[crate::worker::PreparedValuePart]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            crate::worker::PreparedValuePart::Literal(bytes) => {
+                if let Some(q) = bytes.iter().position(|&b| b == b'?') {
+                    out.extend_from_slice(&bytes[..q]);
+                    return Some(out);
+                }
+                out.extend_from_slice(bytes);
+            }
+            crate::worker::PreparedValuePart::Var(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 /// A value with no variables, as its bytes.
@@ -2331,6 +2905,7 @@ fn apply_location_meta(
         header_timeout_secs: loc.keepalive.header_timeout_secs,
         max_requests: loc.keepalive.max_requests,
         max_time_ms: loc.keepalive.max_time_ms,
+        min_timeout_ms: u32::try_from(loc.keepalive.min_timeout_ms).unwrap_or(u32::MAX),
         disable_msie6: loc.keepalive.disable_msie6,
         disable_safari: loc.keepalive.disable_safari,
     };
@@ -2405,6 +2980,15 @@ fn client_certificate_refusal(
                 || !crate::x509_verify::error_is_optional(*code as std::ffi::c_long) =>
         {
             log(format!("client SSL certificate verify error: ({code}:{text})").as_bytes());
+            Some((495, true))
+        }
+        // `ssl_ocsp` (#142); a pending check fails closed.
+        (_, ClientVerify::Revoked(_) | ClientVerify::OcspPending(_)) => {
+            let text = match &tls.client_verify {
+                ClientVerify::Revoked(text) => text,
+                _ => crate::ocsp::REQUEST_FAILED,
+            };
+            log(format!("client SSL certificate verify error: {text}").as_bytes());
             Some((495, true))
         }
         (VerifyClient::On, ClientVerify::None) => {
@@ -2899,6 +3483,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unparsed_uri_keeps_the_fragment() {
+        let line = b"GET /a?b#f?x HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b#f?x");
+        let line = b"GET /a#f";
+        assert_eq!(unparsed_uri(&line[4..6], line), b"/a#f");
+        let line = b"GET /a?b HTTP/1.1";
+        assert_eq!(unparsed_uri(&line[4..8], line), b"/a?b");
+        // A path from elsewhere (absolute-form without one) stays as is.
+        let other = b"/#x".to_vec();
+        assert_eq!(unparsed_uri(&other[..1], line), b"/");
+        assert_eq!(unparsed_uri(b"/", b""), b"/");
+    }
+
+    #[test]
+    fn request_uri_of_an_absolute_target_without_a_path() {
+        let synth = b"/?a=1".to_vec();
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1 HTTP/1.1"), b"?a=1");
+        assert_eq!(
+            request_uri(&synth, b"GET http://h?a=1#f HTTP/1.1"),
+            b"?a=1#f"
+        );
+        assert_eq!(request_uri(&synth, b"GET http://h?a=1#f"), b"?a=1#f");
+        // Not the target's query, or an origin-form line: as is.
+        assert_eq!(request_uri(&synth, b"GET http://h?b=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(&synth, b"GET /x?a=1 HTTP/1.1"), b"/?a=1");
+        assert_eq!(request_uri(b"/", b"GET http://h HTTP/1.1"), b"/");
+        assert_eq!(request_uri(b"/", b""), b"/");
+        let line = b"GET http://h/?a=1#f HTTP/1.1";
+        assert_eq!(request_uri(&line[12..17], line), b"/?a=1#f");
+        assert_eq!(request_uri(&line[12..13], line), b"/");
+    }
+
+    #[test]
     fn wildcards_take_only_names_below_them() {
         // ngx_hash_find_wc_head / _tail: `*.example.com` and `www.example.*`
         // need a label more; `.example.com` covers the bare name as an exact
@@ -3023,6 +3640,7 @@ mod tests {
             body: &NO_BODY,
             body_len: 0,
             body_file: None,
+            body_feed: None,
             tls: None,
             conn: &ConnInfo::NONE,
             refuse: None,

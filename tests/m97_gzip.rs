@@ -51,6 +51,8 @@ fn start() -> (Server, u16) {
              location / {{ gzip on; gzip_vary on; root {www}; }}\n \
              location /ret {{ gzip on; default_type text/plain; gzip_types text/plain; \
              return 200 \"{body}\"; }}\n \
+             location /trailer {{ gzip on; default_type text/plain; gzip_types text/plain; \
+             add_trailer X-T $sent_http_content_encoding; return 200 \"{body}\"; }}\n \
              location /proxy/ {{ gzip on; proxy_pass http://127.0.0.1:{port}/local/; }}\n \
              location /relay/ {{ gzip on; proxy_pass http://127.0.0.1:{port}/local/; }}\n \
              location /local/ {{ alias {www}/; }}\n }}\n}}\n",
@@ -175,6 +177,11 @@ fn m97_gzip_like_nginx() {
     // `return` and a proxied response.
     let (head, body) = get(port, "/ret", GZ, "1.1");
     assert!(head.contains("Content-Encoding: gzip"), "{head}");
+    assert_eq!(gunzip(&dechunk(&body)), "one ".repeat(30).into_bytes());
+    // With `add_trailer`: compressed, the trailers after it (#809).
+    let (head, body) = get(port, "/trailer", GZ, "1.1");
+    assert!(head.contains("Content-Encoding: gzip"), "{head}");
+    assert!(body.ends_with(b"\r\n0\r\nX-T: gzip\r\n\r\n"), "{body:?}");
     assert_eq!(gunzip(&dechunk(&body)), "one ".repeat(30).into_bytes());
     let (head, body) = get(port, "/proxy/index.html", GZ, "1.1");
     assert!(head.contains("Content-Encoding: gzip"), "{head}");
