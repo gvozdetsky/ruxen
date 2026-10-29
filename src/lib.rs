@@ -36,6 +36,7 @@ mod tls_stream;
 mod tls_ticket;
 mod upstream;
 mod upstream_io;
+mod upstream_resolve;
 mod upstream_sticky;
 mod upstream_tls;
 mod uri;

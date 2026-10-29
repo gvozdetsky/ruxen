@@ -75,6 +75,8 @@ pub(crate) fn parse_upstream_block(
     let mut keepalive_max_lifetime_ms: Option<u64> = None;
     let mut lb: LbAlgorithm = LbAlgorithm::RoundRobin;
     let mut zone: Option<String> = None;
+    let mut resolver: Option<ResolverConf> = None;
+    let mut resolver_timeout_ms: Option<u64> = None;
     let mut sticky: Option<StickyConf> = None;
     loop {
         let (args, term) = lx.read_directive()?;
@@ -83,6 +85,20 @@ pub(crate) fn parse_upstream_block(
                 Terminator::BlockClose => {
                     if servers.is_empty() {
                         return Err(Error::MissingArg("upstream server"));
+                    }
+                    // ngx_http_upstream_init_round_robin.
+                    if zone.is_none() && servers.iter().any(|s| s.resolve.is_some()) {
+                        return Err(Error::Text(format!(
+                            "resolving names at run time requires upstream \"{name}\" \
+                             to be in shared memory"
+                        )));
+                    }
+                    // Peer IDs are per configured peer yet (#600, #597).
+                    if sticky.is_some() && servers.iter().any(|s| s.resolve.is_some()) {
+                        return Err(Error::Text(format!(
+                            "\"sticky\" with \"resolve\" servers is not supported yet \
+                             in upstream \"{name}\""
+                        )));
                     }
                     Ok(UpstreamBlock {
                         name,
@@ -94,6 +110,8 @@ pub(crate) fn parse_upstream_block(
                         keepalive_max_lifetime_ms,
                         lb,
                         zone,
+                        resolver,
+                        resolver_timeout_ms,
                         sticky,
                     })
                 }
@@ -203,6 +221,20 @@ pub(crate) fn parse_upstream_block(
                     }
                 }
                 zone = Some(name.clone());
+            }
+            // ngx_http_upstream_resolver and the msec slot (#597).
+            ("resolver", Terminator::Semi) => {
+                if resolver.is_some() {
+                    return Err(Error::Duplicate("resolver"));
+                }
+                resolver = Some(parse_resolver_args(&args[1..])?);
+            }
+            ("resolver_timeout", Terminator::Semi) => {
+                if resolver_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("resolver_timeout"));
+                }
+                resolver_timeout_ms =
+                    Some(parse_proxy_timeout_args(&args[1..], "resolver_timeout")?);
             }
             ("sticky", Terminator::Semi) => {
                 if sticky.is_some() {
@@ -471,13 +503,24 @@ fn parse_sticky_learn(args: &[String]) -> Result<StickyLearn, Error> {
 /// `server[i].naddrs` peers).
 pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<UpstreamServer>, Error> {
     let host_port = args.first().ok_or(Error::MissingArg("server host:port"))?;
-    let addrs = match strip_unix_prefix(host_port) {
-        Some(path) => vec![unix_socket_path(path).map_err(|what| Error::BadValue {
+    // ngx_http_upstream_server: a name with `resolve` is asked at run time
+    // (`u.no_resolve`); an address stays one.
+    let resolve = args[1..].iter().any(|a| a == "resolve");
+    let unix = strip_unix_prefix(host_port);
+    let name = match unix {
+        None if resolve => runtime_name(host_port)?,
+        _ => None,
+    };
+    let addrs = match (unix, &name) {
+        (Some(path), _) => vec![unix_socket_path(path).map_err(|what| Error::BadValue {
             what,
             got: host_port.clone(),
         })?],
+        (None, Some((_, port))) => {
+            vec![UpstreamAddr::Inet(SocketAddr::from(([0, 0, 0, 0], *port)))]
+        }
         // ngx_http_upstream_server: the port defaults to 80.
-        None => resolve_upstream_host(&with_default_port(host_port, 80), host_port)?
+        (None, None) => resolve_upstream_host(&with_default_port(host_port, 80), host_port)?
             .into_iter()
             .map(UpstreamAddr::Inet)
             .collect(),
@@ -534,6 +577,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
             route = Some(v.to_string());
         } else if tok == "backup" {
             backup = true;
+        } else if tok == "resolve" {
         } else {
             return Err(Error::BadValue {
                 what: "upstream server param",
@@ -545,6 +589,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
         .into_iter()
         .map(|addr| UpstreamServer {
             addr,
+            resolve: name.as_ref().map(|(host, _)| host.clone()),
             display: host_port.clone(),
             weight,
             max_fails,
@@ -556,6 +601,33 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
             route: route.clone(),
         })
         .collect())
+}
+
+/// `host[:port]` of a `resolve` server as ngx_parse_inet_url reads it
+/// with `no_resolve`: the name (lower case, as the resolver asks it) and
+/// the port (80 by default); `None` for an IP address.
+fn runtime_name(host_port: &str) -> Result<Option<(String, u16)>, Error> {
+    let with_port = with_default_port(host_port, 80);
+    if with_port.parse::<SocketAddr>().is_ok() || host_port.starts_with('[') {
+        return Ok(None);
+    }
+    let invalid_port = || Error::UpstreamUrl {
+        problem: "invalid port",
+        url: host_port.to_string(),
+    };
+    let (host, port) = with_port.rsplit_once(':').ok_or_else(invalid_port)?;
+    let port: u16 = port.parse().map_err(|_| invalid_port())?;
+    if port == 0 {
+        return Err(invalid_port());
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if crate::resolver::encode_name(host.as_bytes()).is_none() {
+        return Err(Error::UpstreamUrl {
+            problem: "host not found",
+            url: host_port.to_string(),
+        });
+    }
+    Ok(Some((host.to_ascii_lowercase(), port)))
 }
 
 /// The part after `unix:` (any case, as ngx_parse_url), if `s` names a
@@ -1907,6 +1979,40 @@ mod tests {
             ProxyPass::UpstreamRef { tls: false, .. }
         ));
         assert!(proxy_pass("ftp://127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn resolve_keeps_a_name_for_run_time() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Not looked up now: `svc.invalid` has no address anywhere.
+        let s =
+            parse_upstream_server_args(&args(&["Svc.Invalid.", "resolve", "weight=2"])).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].resolve.as_deref(), Some("svc.invalid"));
+        assert_eq!(s[0].addr, UpstreamAddr::Inet("0.0.0.0:80".parse().unwrap()));
+        assert_eq!((s[0].weight, s[0].display.as_str()), (2, "Svc.Invalid."));
+        let s = parse_upstream_server_args(&args(&["svc.invalid:8080", "resolve"])).unwrap();
+        assert_eq!(
+            s[0].addr,
+            UpstreamAddr::Inet("0.0.0.0:8080".parse().unwrap())
+        );
+        // An address stays one.
+        for addr in ["127.0.0.1:81", "[::1]:81"] {
+            let s = parse_upstream_server_args(&args(&[addr, "resolve"])).unwrap();
+            assert_eq!(s[0].resolve, None);
+            assert_eq!(s[0].addr, UpstreamAddr::Inet(addr.parse().unwrap()));
+        }
+        for bad in [
+            "svc.invalid:x",
+            "svc.invalid:0",
+            "svc.invalid:65536",
+            "a..b",
+        ] {
+            assert!(
+                parse_upstream_server_args(&args(&[bad, "resolve"])).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -1224,7 +1224,7 @@ impl ProxyEffective {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PreparedUpstream {
     /// Display name. For named upstream blocks: the block name.
     /// For synthesized direct-form blocks: the literal host:port.
@@ -1255,6 +1255,9 @@ pub struct PreparedUpstream {
     /// all workers (one slot per peer). `None`: per worker, as nginx's
     /// without a zone.
     pub shared: Option<&'static [crate::upstream::PeerShared]>,
+    /// `resolve` servers (#597): the peers change at run time, and
+    /// requests use `current()`'s list.
+    pub dynamic: Option<&'static crate::upstream_resolve::Version>,
     /// `sticky` (#600).
     pub sticky: Option<&'static crate::upstream_sticky::Sticky>,
     /// Each peer's metrics slot (#481); `None` without `ruxen_metrics`.

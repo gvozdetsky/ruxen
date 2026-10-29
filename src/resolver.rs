@@ -93,6 +93,18 @@ pub(crate) async fn resolve(
     name: &[u8],
     timeout: Duration,
 ) -> Result<Vec<IpAddr>, Failure> {
+    resolve_valid(resolver, name, timeout)
+        .await
+        .map(|(addrs, _)| addrs)
+}
+
+/// `resolve`, and until when the answer holds (the smallest of a CNAME
+/// chain's, as nginx's `ctx->valid`).
+pub(crate) async fn resolve_valid(
+    resolver: &'static Resolver,
+    name: &[u8],
+    timeout: Duration,
+) -> Result<(Vec<IpAddr>, Instant), Failure> {
     let name = normalize(name);
     match monoio::time::timeout(timeout, lookup(resolver, name)).await {
         Ok(result) => result,
@@ -106,12 +118,16 @@ pub(crate) fn normalize(name: &[u8]) -> Box<[u8]> {
     name.to_ascii_lowercase().into_boxed_slice()
 }
 
-async fn lookup(resolver: &'static Resolver, mut name: Box<[u8]>) -> Result<Vec<IpAddr>, Failure> {
+async fn lookup(
+    resolver: &'static Resolver,
+    mut name: Box<[u8]>,
+) -> Result<(Vec<IpAddr>, Instant), Failure> {
     let state = worker_state(resolver);
     let mut recursion = 0;
+    let mut valid = None::<Instant>;
     loop {
         let found = state.borrow_mut().find(&name, Instant::now());
-        let (answer, cached) = match found {
+        let ((answer, until), cached) = match found {
             Found::Cached(answer) => (answer, true),
             Found::Pending(pending) => match Wait::new(pending).await {
                 Outcome::Answer(answer) => (answer, false),
@@ -143,9 +159,10 @@ async fn lookup(resolver: &'static Resolver, mut name: Box<[u8]>) -> Result<Vec<
                 }
             }
         };
+        let valid = *valid.insert(valid.map_or(until, |v| v.min(until)));
         match answer {
-            Answer::Addrs(addrs) if cached => return Ok(rotate(&addrs)),
-            Answer::Addrs(addrs) => return Ok(addrs.to_vec()),
+            Answer::Addrs(addrs) if cached => return Ok((rotate(&addrs), valid)),
+            Answer::Addrs(addrs) => return Ok((addrs.to_vec(), valid)),
             Answer::Cname(target) => {
                 recursion += 1;
                 if recursion > MAX_RECURSION {
@@ -189,7 +206,8 @@ enum Answer {
 
 #[derive(Clone)]
 enum Outcome {
-    Answer(Answer),
+    /// With until when it holds.
+    Answer((Answer, Instant)),
     Failed(Failure),
 }
 
@@ -261,7 +279,7 @@ impl Drop for Wait {
 }
 
 enum Found {
-    Cached(Answer),
+    Cached((Answer, Instant)),
     Pending(Rc<Pending>),
     /// Nobody asks for it yet: the caller starts the query.
     New(Rc<Pending>),
@@ -281,7 +299,7 @@ impl State {
         if let Some(entry) = self.cache.get_mut(name) {
             if entry.valid_until > now {
                 entry.used = now;
-                return Found::Cached(entry.answer.clone());
+                return Found::Cached((entry.answer.clone(), entry.valid_until));
             }
             self.cache.remove(name);
         }
@@ -389,7 +407,7 @@ async fn drive(
                 .state
                 .borrow_mut()
                 .store(finish.name.clone(), answer.clone(), valid_until);
-            Outcome::Answer(answer)
+            Outcome::Answer((answer, valid_until))
         }
         Err(code) => Outcome::Failed(Failure(code)),
     };
@@ -1025,7 +1043,7 @@ fn random_u16() -> u16 {
 
 /// A line about the resolver, to the worker's error log (nginx's
 /// `r->log`, the main log).
-fn log(message: &str) {
+pub(crate) fn log(message: &str) {
     let logs = crate::worker::worker_http().map_or(&[][..], |h| h.error_logs);
     crate::worker::write_worker_log(logs, ErrorLogLevel::Error, message);
 }

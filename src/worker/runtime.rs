@@ -2561,6 +2561,7 @@ pub fn run(
         drop(ready);
         // Accept only once `main` has switched to the configured `user`.
         state.wait_released();
+        crate::upstream_resolve::start(http, state);
         // From now on its accept loop turns at least every ACCEPT_TICK.
         HEARTBEAT.with(|beat| {
             let _ = beat.set(state.heartbeat());
