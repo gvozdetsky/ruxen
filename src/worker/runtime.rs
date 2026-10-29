@@ -1020,6 +1020,15 @@ fn overlong_head_line(head: &[u8], max: usize, total: usize) -> Option<usize> {
     None
 }
 
+/// How many CR and LF bytes `buf` starts with.
+#[cold]
+#[inline(never)]
+fn empty_lines(buf: &[u8]) -> usize {
+    buf.iter()
+        .position(|&b| b != b'\r' && b != b'\n')
+        .unwrap_or(buf.len())
+}
+
 /// Whether a header block has more than `max` lines.
 #[cold]
 #[inline(never)]
@@ -5133,7 +5142,7 @@ pub(crate) async fn handle<S: ConnIo>(
             // The first bytes came with the idle wait: parse before reading.
             let mut skip_read = filled > 0;
 
-            loop {
+            'head: loop {
                 if std::mem::take(&mut skip_read) {
                     // Fall through to the parse loop with what idle_read read.
                 } else {
@@ -5362,7 +5371,21 @@ pub(crate) async fn handle<S: ConnIo>(
                             let header_host = req.host.map(|(s, e)| (base + s, base + e));
                             let request_line_host = match request_line_host {
                                 Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
-                                    Some(nh) => Some(nh),
+                                    Some(nh) => {
+                                        // HTTP/1.1 needs `Host` even with an
+                                        // absolute-form target (#781): nginx's
+                                        // 400, from the server the target names.
+                                        if req.http_11 && req.host.is_none() {
+                                            refuse = Some(400);
+                                            refused_parsed_head_log(
+                                                http,
+                                                conn_log!(),
+                                                &buf[base..base + req.headers_end],
+                                                phase::MISSING_HOST,
+                                            );
+                                        }
+                                        Some(nh)
+                                    }
                                     None => {
                                         // An invalid Host is refused by the
                                         // default server, before the checks
@@ -6822,6 +6845,20 @@ pub(crate) async fn handle<S: ConnIo>(
                             };
                         }
                         Parse::Incomplete => break,
+                        // Empty lines before a request line are skipped, as
+                        // nginx's `sw_start` does (RFC 9112 §2.2), e.g. a CRLF
+                        // a client sent after a body (#778). Only CRLFs: the
+                        // buffer starts over, the head's deadline stays.
+                        Parse::Invalid
+                            if !parse_state.rline_done
+                                && matches!(buf[read_start], b'\r' | b'\n') =>
+                        {
+                            read_start += empty_lines(&buf[read_start..filled]);
+                            if read_start == filled {
+                                (read_start, filled) = (0, 0);
+                                continue 'head;
+                            }
+                        }
                         Parse::Invalid => {
                             request_count = request_count.saturating_add(1);
                             if parse_state.rline_done

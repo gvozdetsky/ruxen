@@ -1134,6 +1134,10 @@ pub(crate) fn prepare_upstreams(
                         service: s.service,
                         port: addr.port(),
                         template: peer,
+                        route: s.route.map(|r| -> &'static [u8] {
+                            crate::arena::leak(r.into_bytes().into_boxed_slice())
+                        }),
+                        drain: s.drain,
                     })
                 }
                 _ => peers_vec.push(peer),

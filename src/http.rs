@@ -846,33 +846,15 @@ fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
     } = match method {
         Method::Connect => match parse_connect_target(buf, i) {
             Some(target) => target,
-            None => {
-                return if buf[i..].contains(&b' ') {
-                    LineParse::Invalid
-                } else {
-                    LineParse::Incomplete
-                };
-            }
+            None => return target_refused(buf, i),
         },
         _ if looks_like_absolute_form(buf, i, n) => match parse_absolute_form_target(buf, i) {
             Some(target) => target,
-            None => {
-                return if buf[i..].contains(&b' ') {
-                    LineParse::Invalid
-                } else {
-                    LineParse::Incomplete
-                };
-            }
+            None => return target_refused(buf, i),
         },
         _ => match parse_origin_form_target(buf, i) {
             Some(target) => target,
-            None => {
-                return if buf[i..].contains(&b' ') {
-                    LineParse::Invalid
-                } else {
-                    LineParse::Incomplete
-                };
-            }
+            None => return target_refused(buf, i),
         },
     };
     // The usual `HTTP/1.1\r\n` (or an HTTP/2 stream's `HTTP/2.0`) here,
@@ -907,6 +889,20 @@ fn parse_request_line(buf: &[u8], start: usize, h2: bool) -> LineParse {
         request_line_host,
         absolute_query,
         http_11,
+    }
+}
+
+/// A request target that didn't parse: invalid once its line went on
+/// past it, else not complete yet. A CR or LF there ends an HTTP/0.9
+/// line (`GET /`), which nginx answers without a head; refused at once
+/// here instead of waiting for more (#784).
+#[cold]
+#[inline(never)]
+fn target_refused(buf: &[u8], i: usize) -> LineParse {
+    if buf[i..].iter().any(|&b| matches!(b, b' ' | b'\r' | b'\n')) {
+        LineParse::Invalid
+    } else {
+        LineParse::Incomplete
     }
 }
 
@@ -2400,6 +2396,11 @@ mod tests {
             (b"GET /a HTTP/1.1 x\r\n", false),
             (b"GET /a HTTP/1.1\r\r\n", false),
             (b"GET /a http/1.1\r\n", false),
+            // HTTP/0.9 (#784), and no target.
+            (b"GET /\r\n", false),
+            (b"GET /a\n", false),
+            (b"GET http://h/\r\n", false),
+            (b"GET \r\n", false),
         ];
         for &(line, bad_version) in refused {
             assert!(matches!(parse_fresh(line), Parse::Invalid), "{line:?}");

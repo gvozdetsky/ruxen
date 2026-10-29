@@ -17,6 +17,8 @@
 //!   keeps indexing a fixed slice; a request keeps the version it started
 //!   with. Peers that stay keep their failure state; keep-alive
 //!   connections move to the new version in each worker.
+//! - With `sticky`, a version has its own peer IDs and `drain` flags
+//!   (#883), so a request's IDs and peer indices are of one version.
 //! - A version is freed once no worker holds it. A worker holds the one
 //!   it last took (its keep-alive pool and balancer state are keyed by
 //!   it) and those its requests still use; the holds are counted per
@@ -26,6 +28,7 @@
 //!   zone, upstream, name and service (ngx_http_upstream_zone_preresolve),
 //!   with the new `server` line's port and parameters.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -35,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use crate::resolver::{Failure, SrvAddr};
 use crate::upstream::{HashLb, Lb, PeerShared};
+use crate::upstream_sticky::Sticky;
 use crate::worker::{PeerAddr, PreparedHttp, PreparedPeer, PreparedUpstream, RuntimeState};
 
 /// A `server … resolve` line.
@@ -46,6 +50,18 @@ struct Host {
     port: u16,
     /// What each of its addresses becomes, but for the address.
     template: PreparedPeer,
+    /// `route=` and `drain`, for `sticky`.
+    route: Option<&'static [u8]>,
+    drain: bool,
+}
+
+/// Where a peer of a version comes from.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// The template's peer.
+    Static(usize),
+    /// A host's address.
+    Host(usize),
 }
 
 /// `PreparedUpstream::dynamic`: the upstream a peer list (a version) is
@@ -154,6 +170,8 @@ pub(crate) struct HostConf {
     pub service: Option<String>,
     pub port: u16,
     pub template: PreparedPeer,
+    pub route: Option<&'static [u8]>,
+    pub drain: bool,
 }
 
 impl Dynamic {
@@ -176,6 +194,8 @@ impl Dynamic {
                 service: h.service.map(|s| s.into_bytes().into_boxed_slice()),
                 port: h.port,
                 template: h.template,
+                route: h.route,
+                drain: h.drain,
             })
             .collect();
         let backup_tier = has_backup_tier(&template);
@@ -304,15 +324,17 @@ impl Dynamic {
     /// Make the version for the current peers current: the one that has
     /// them already, or a new one.
     fn publish(&'static self, state: &mut State) {
-        // The peers, and the SRV target each is named after.
+        // The peers, the SRV target each is named after, and where it
+        // comes from.
         let mut wanted = Vec::with_capacity(self.template.peers.len() + state.resolved.len());
         for backup in [false, true] {
             wanted.extend(
                 self.template
                     .peers
                     .iter()
-                    .filter(|p| p.backup == backup)
-                    .map(|p| (*p, None)),
+                    .enumerate()
+                    .filter(|(_, p)| p.backup == backup)
+                    .map(|(i, p)| (*p, None, Origin::Static(i))),
             );
             wanted.extend(
                 state
@@ -326,16 +348,22 @@ impl Dynamic {
                             backup: r.backup,
                             ..self.hosts[r.host].template
                         };
-                        (peer, r.server.as_deref())
+                        (peer, r.server.as_deref(), Origin::Host(r.host))
                     }),
             );
         }
+        let ids = self.template.sticky.map(|st| self.sticky_ids(st, &wanted));
         if let Some((version, _)) = state.versions.iter().find(|(v, _)| {
             v.peers.len() == wanted.len()
                 && v.peers
                     .iter()
                     .zip(&wanted)
-                    .all(|(a, (b, name))| same_peer(a, b, *name))
+                    .all(|(a, (b, name, _))| same_peer(a, b, *name))
+                && v.sticky.zip(ids.as_deref()).is_none_or(|(have, want)| {
+                    want.iter().enumerate().all(|(i, (sid, drain))| {
+                        have.sids[i] == &**sid && have.draining[i] == *drain
+                    })
+                })
         }) {
             self.current
                 .store(std::ptr::from_ref(*version).cast_mut(), Ordering::SeqCst);
@@ -347,7 +375,7 @@ impl Dynamic {
         let mut owner = unsafe { crate::arena::Owner::new() };
         let peers: Vec<PreparedPeer> = wanted
             .into_iter()
-            .map(|(peer, name)| match name {
+            .map(|(peer, name, _)| match name {
                 None => peer,
                 Some(name) => PreparedPeer {
                     display: owner.leak(name.into()),
@@ -386,6 +414,19 @@ impl Dynamic {
                 .collect();
             owner.leak(slots)
         });
+        let sticky = self.template.sticky.zip(ids).map(|(st, ids)| {
+            let (sids, draining): (Vec<_>, Vec<_>) = ids.into_iter().unzip();
+            let sids: Box<[&'static [u8]]> = sids
+                .into_iter()
+                .map(|sid| match sid {
+                    Cow::Borrowed(sid) => sid,
+                    Cow::Owned(sid) => &*owner.leak(sid.into_boxed_slice()),
+                })
+                .collect();
+            let sids = owner.leak(sids);
+            let draining = owner.leak(draining.into_boxed_slice());
+            &*owner.leak(Box::new(st.with_peers(sids, draining)))
+        });
         let tag: &'static Version = owner.leak(Box::new(Version {
             dynamic: self,
             holds: AtomicUsize::new(0),
@@ -396,12 +437,36 @@ impl Dynamic {
             shared: Some(shared),
             dynamic: Some(tag),
             metrics,
+            sticky,
             ..self.template
         }));
         state.versions.push((version, owner));
         self.current
             .store(std::ptr::from_ref(version).cast_mut(), Ordering::SeqCst);
         self.sweep(state);
+    }
+
+    /// Each peer's `sticky` ID and `drain`: a resolved one's are its
+    /// line's `route=`, else its address's (ngx_http_upstream_copy_round_robin_sid).
+    fn sticky_ids(
+        &self,
+        st: &'static Sticky,
+        wanted: &[(PreparedPeer, Option<&[u8]>, Origin)],
+    ) -> Vec<(Cow<'static, [u8]>, bool)> {
+        wanted
+            .iter()
+            .map(|(peer, _, origin)| match *origin {
+                Origin::Static(i) => (Cow::Borrowed(st.sids[i]), st.draining[i]),
+                Origin::Host(h) => {
+                    let host = &self.hosts[h];
+                    let sid = match host.route {
+                        Some(route) => Cow::Borrowed(route),
+                        None => Cow::Owned(crate::upstream_sticky::addr_sid(peer.addr)),
+                    };
+                    (sid, host.drain)
+                }
+            })
+            .collect()
     }
 
     /// Free the versions no worker holds or is about to.
@@ -828,6 +893,8 @@ mod tests {
                 weight,
                 ..peer("0.0.0.0:0", backup)
             },
+            route: None,
+            drain: false,
         };
         Dynamic::prepare(
             template,
@@ -1043,6 +1110,164 @@ mod tests {
                 row("10.0.0.1:8081", "pod-499.example", 1, false),
                 row("10.0.1.1:1", "c", 1, true)
             ]
+        );
+    }
+
+    /// A static peer with `route=s`, `a.test` without a route and
+    /// `b.test route=rb drain`, with `sticky learn`.
+    fn sticky_upstream(zone: &str) -> &'static PreparedUpstream {
+        let server = |addr: &str, resolve: Option<&str>| crate::config::UpstreamServer {
+            addr: crate::config::UpstreamAddr::Inet(addr.parse().unwrap()),
+            resolve: resolve.map(String::from),
+            service: None,
+            display: "x".into(),
+            weight: 1,
+            max_fails: 1,
+            fail_timeout_secs: 10,
+            max_conns: 0,
+            down: false,
+            backup: false,
+            drain: false,
+            route: resolve.is_none().then(|| "s".into()),
+        };
+        let conf = crate::config::StickyConf::Learn(crate::config::StickyLearn {
+            lookup: vec![crate::config::parse_value_with_vars("$arg_s").unwrap()],
+            create: vec![crate::config::parse_value_with_vars("$arg_s").unwrap()],
+            zone: zone.into(),
+            zone_size: 32768,
+            timeout_ms: 60_000,
+            header: false,
+        });
+        let servers = [
+            server("127.0.0.9:80", None),
+            server("0.0.0.0:8080", Some("a.test")),
+        ];
+        let sticky = Sticky::prepare(conf, &servers, "u");
+        let statics: &'static [PreparedPeer] =
+            Box::leak(vec![peer("127.0.0.9:80", false)].into_boxed_slice());
+        let template = PreparedUpstream {
+            name: b"u",
+            peers: statics,
+            keepalive_max_idle: None,
+            keepalive_local: false,
+            keepalive_requests: 1000,
+            keepalive_idle_timeout_ms: 60_000,
+            keepalive_max_lifetime_ms: 3_600_000,
+            lb: Lb::RoundRobin,
+            shared: None,
+            dynamic: None,
+            sticky: Some(sticky),
+            metrics: None,
+        };
+        let resolver = Box::leak(Box::new(crate::resolver::Resolver {
+            servers: Box::new(["127.0.0.1:53".parse().unwrap()]),
+            valid: None,
+            ipv4: true,
+            ipv6: true,
+        }));
+        let host = |name: &str, route: Option<&'static [u8]>, drain: bool| HostConf {
+            name: name.into(),
+            service: None,
+            port: 8080,
+            template: PreparedPeer {
+                down: drain,
+                ..peer("0.0.0.0:0", false)
+            },
+            route,
+            drain,
+        };
+        Dynamic::prepare(
+            template,
+            zone,
+            vec![
+                host("a.test", None, false),
+                host("b.test", Some(b"rb"), true),
+            ],
+            resolver,
+            Duration::from_secs(1),
+            None,
+        )
+    }
+
+    fn sids(v: &PreparedUpstream) -> Vec<(String, bool)> {
+        let st = v.sticky.unwrap();
+        assert_eq!(st.sids.len(), v.peers.len());
+        st.sids
+            .iter()
+            .zip(st.draining)
+            .map(|(s, d)| (String::from_utf8_lossy(s).into_owned(), *d))
+            .collect()
+    }
+
+    fn hashed(addr: &str) -> String {
+        let sid = crate::upstream_sticky::addr_sid(PeerAddr::Inet(addr.parse().unwrap()));
+        String::from_utf8(sid).unwrap()
+    }
+
+    fn pick(base: &'static PreparedUpstream, hint: &str) -> Option<String> {
+        let up = crate::upstream::UpstreamRef::current(base);
+        crate::upstream::pick_peer_sticky(
+            &up,
+            &crate::upstream::Tried::default(),
+            None,
+            hint.as_bytes(),
+        )
+        .map(|l| l.addr().to_string())
+    }
+
+    #[test]
+    fn sticky_ids_follow_each_version() {
+        let base = sticky_upstream("st1");
+        let d = base.dynamic.unwrap().dynamic;
+        assert_eq!(sids(version(d)), [("s".to_string(), false)]);
+        let later = Instant::now() + Duration::from_secs(5);
+        d.apply(0, &ips(&["10.0.0.2", "10.0.0.1"]), later);
+        d.apply(1, &ips(&["10.0.1.1"]), later);
+        let first = version(d);
+        assert_eq!(
+            sids(first),
+            [
+                ("s".into(), false),
+                (hashed("10.0.0.1:8080"), false),
+                (hashed("10.0.0.2:8080"), false),
+                ("rb".into(), true),
+            ]
+        );
+        // The ID names the peer; a drained one only by its ID.
+        assert_eq!(
+            pick(base, &hashed("10.0.0.2:8080")).as_deref(),
+            Some("10.0.0.2:8080")
+        );
+        assert_eq!(pick(base, "rb").as_deref(), Some("10.0.1.1:8080"));
+        for _ in 0..6 {
+            assert_ne!(pick(base, "").as_deref(), Some("10.0.1.1:8080"));
+        }
+        // A request keeps its version's IDs; the next version has its own.
+        let held = crate::upstream::UpstreamRef::current(base);
+        let learn = held.sticky.unwrap().learn().unwrap();
+        let session = crate::auth::md5(b"x");
+        learn
+            .zone
+            .learn(&session, true, held.sticky.unwrap().sids[2]);
+        d.apply(0, &ips(&["10.0.0.2"]), later);
+        assert!(std::ptr::eq(&*held, first));
+        assert_eq!(sids(&held).len(), 4);
+        let now = version(d);
+        assert_eq!(
+            sids(now),
+            [
+                ("s".into(), false),
+                (hashed("10.0.0.2:8080"), false),
+                ("rb".into(), true),
+            ]
+        );
+        // A session learned on one version names its peer in the next.
+        let st = now.sticky.unwrap();
+        assert!(std::ptr::eq(st.learn().unwrap().zone, learn.zone));
+        let sid = st.learn().unwrap().zone.lookup(&session).unwrap();
+        assert_eq!(
+            pick(base, std::str::from_utf8(&sid).unwrap()).as_deref(),
+            Some("10.0.0.2:8080")
         );
     }
 }
