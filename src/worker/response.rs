@@ -596,7 +596,7 @@ fn format_http_date_clamped(secs: i64) -> Vec<u8> {
 fn next_daily_time(now: i64, when_secs_of_day: u32) -> i64 {
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
-        let now_t = now as libc::time_t;
+        let now_t = now as _;
         libc::localtime_r(&now_t, &mut tm);
         tm.tm_hour = (when_secs_of_day / 3600) as i32;
         let rem = when_secs_of_day % 3600;
