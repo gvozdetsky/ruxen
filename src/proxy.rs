@@ -2792,6 +2792,7 @@ async fn attempt(
 /// `proxy_http_version 2` (#599): HTTP/2 on a new connection, under
 /// `proxy_connect_timeout` as the TLS handshake is.
 #[cold]
+#[allow(clippy::result_large_err)] // cold: once per new connection
 async fn h2_connect(plan: &ProxyPlan, stream: UpstreamIo) -> Result<UpstreamIo, AttemptOutcome> {
     let identity = stream.tls_identity().cloned();
     let https = identity.is_some();
