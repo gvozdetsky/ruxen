@@ -829,6 +829,92 @@ impl super::super::ConnIo for StreamIo {
     }
 }
 
+/// One stream the `h2` crate accepted, as `handle` would see it.
+#[cfg(feature = "fuzzing")]
+pub(crate) struct FuzzStream {
+    pub head: Vec<u8>,
+    pub method: String,
+    pub target: String,
+    pub header_block: u64,
+}
+
+/// For the `h2_request` fuzz target (#477): `data` (preface and frames)
+/// read `piece` bytes at a time by the `h2` crate's server over `PollIo`,
+/// with `serve`'s settings; each stream it accepts becomes the head
+/// `StreamIo` gives `handle`. What the server writes is dropped.
+#[cfg(feature = "fuzzing")]
+pub(crate) async fn fuzz_connection(data: &[u8], piece: usize) -> Vec<FuzzStream> {
+    struct Wire {
+        data: Vec<u8>,
+        pos: usize,
+        piece: usize,
+    }
+    // SAFETY: the futures make their reference only when polled, and hold
+    // none across an await (there is none).
+    unsafe impl crate::duplex::Duplex for Wire {
+        async unsafe fn read_raw<T: IoBufMut>(
+            this: std::ptr::NonNull<Self>,
+            mut buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            // SAFETY: the caller's.
+            let w = unsafe { &mut *this.as_ptr() };
+            let n = w.piece.min(w.data.len() - w.pos).min(buf.bytes_total());
+            // SAFETY: `n` is within the source and the buffer's capacity.
+            unsafe {
+                std::ptr::copy_nonoverlapping(w.data[w.pos..].as_ptr(), buf.write_ptr(), n);
+                buf.set_init(n);
+            }
+            w.pos += n;
+            (Ok(n), buf)
+        }
+        async unsafe fn write_raw<T: IoBuf>(
+            _this: std::ptr::NonNull<Self>,
+            buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            let n = buf.bytes_init();
+            (Ok(n), buf)
+        }
+        async unsafe fn shutdown_raw(_this: std::ptr::NonNull<Self>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (io, _reclaim) = super::compat::PollIo::new(Wire {
+        data: data.to_vec(),
+        pos: 0,
+        piece: piece.max(1),
+    });
+    let blocks = io.header_blocks();
+    let handshake = h2::server::Builder::new()
+        .max_concurrent_streams(128)
+        .initial_window_size(64 * 1024)
+        .initial_connection_window_size((1 << 31) - 1)
+        .max_header_list_size(super::max_header_list(32 * 1024))
+        .handshake::<_, Bytes>(io);
+    let mut out = Vec::new();
+    let Ok(mut conn) = handshake.await else {
+        return out;
+    };
+    while let Some(Ok((request, respond))) = conn.accept().await {
+        let (parts, body) = request.into_parts();
+        let chunked =
+            !body.is_end_stream() && !parts.headers.contains_key(http::header::CONTENT_LENGTH);
+        let mut head = Vec::new();
+        request_head(&parts, chunked, &mut head);
+        out.push(FuzzStream {
+            head,
+            method: parts.method.as_str().to_string(),
+            target: parts
+                .uri
+                .path_and_query()
+                .map_or("/", |p| p.as_str())
+                .to_string(),
+            header_block: blocks.take(u32::from(respond.stream_id())),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

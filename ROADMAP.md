@@ -56,7 +56,7 @@ Each release reports five numbers, and the release pull request adds its row to 
 2. **nginx-tests**: files passing, out of those that run (`NGINX_TEST_PROGRESS.md`). The `-V` banner skips the files of modules ruxen doesn't claim: 314 of 511 at 0.2.2.
 3. **Config corpus** (#216): the share of a few hundred real-world nginx configurations that ruxen loads, from application docs, popular container images and certbot setups, and the share that loads with nothing `--compat` reports as different (`corpus/RESULTS.md`). This is the best proxy for "would ruxen work for me", and its failures say what to build next.
 4. **Performance**: ruxen vs nginx's stable release on every bench scenario, measured as ABBA pairs on a dedicated quiet machine (`bench/README.md`); between campaigns, the headline scenarios against the previous release.
-5. **Robustness**: fuzzing, worker panics (target: none), and security fixes (`SECURITY.md`).
+5. **Robustness**: fuzzing, worker panics (target: none), and security fixes (`SECURITY.md`). Fuzzing is CPU hours and executions since the previous release, from the nightly runs on a private machine (`scripts/fuzz_long.sh --report`, #477).
 
 | release | deployments | nginx-tests | corpus | scenarios ≥ 95% of nginx, median (i7) | fuzzing | security fixes |
 |---|---|---|---|---|---|---|
