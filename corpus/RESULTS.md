@@ -6,13 +6,13 @@ current nginx (nginx 1.30.5) accepts after the same normalisation: stub
 certificates and includes, upstream names pointed at 127.0.0.1, privileged
 ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 
-**ruxen loads 218 of 238 configurations nginx accepts (92%).** 92 more cases were not valid for nginx either and don't count.
+**ruxen loads 220 of 238 configurations nginx accepts (92%).** 92 more cases were not valid for nginx either and don't count.
 
-**183 of them (77% of 238) load with nothing that behaves differently from nginx**, by `ruxen --compat` (#278): no "differs" finding. Upstream names point at 127.0.0.1 here, so `resolver` and DNS-dependent behaviour are not measured.
+**210 of them (88% of 238) load with nothing that behaves differently from nginx**, by `ruxen --compat` (#278): no "differs" finding. Upstream names point at 127.0.0.1 here, so `resolver` and DNS-dependent behaviour are not measured.
 
 | use | nginx accepts | ruxen loads | share |
 |---|---:|---:|---:|
-| github | 214 | 197 | 92% |
+| github | 214 | 199 | 93% |
 | php | 3 | 0 | 0% |
 | proxy | 17 | 17 | 100% |
 | static | 4 | 4 | 100% |
@@ -24,9 +24,7 @@ ports moved up, fragments wrapped. See `corpus/README.md` and issue #216.
 | 6 | unknown directive `stream` | gh:Agunxzzz/XrayCol/nginx.conf.txt, gh:Azigaming404/Autoscript-by-azi/nginx.conf.txt, gh:Azigaming404/cyber/nginx.conf.txt, gh:essoojay/Autoscript-by-azi/nginx.conf.txt … |
 | 4 | unknown directive `uwsgi_pass` | gh:Cloud-CV/Fabrik/ide_nginx.conf, gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf, gh:deshraj/VQA-Chatbot/svqa_nginx.conf, gh:flowerinheart/VisualNN/ide_nginx.conf |
 | 3 | unknown directive `fastcgi_buffers` | nextcloud-root, nextcloud-subdir, gh:EstudioNexos/flautodiscover/fla_nginx.conf |
-| 1 | "…" is not supported yet, and ignoring it is unsafe: variables in the path aren't expanded yet (#N), | gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf |
-| 1 | bad value for upstream server param: resolve in <sandbox>…:N | gh:rajim59/SwarmFort/infra/docker/nginx.conf |
-| 1 | invalid location regex `^${SEEK_SUB_URI}(…: regex parse error: | gh:nfdi4health/ldh-deployment/nginx.conf.https |
+| 1 | unknown directive `fastcgi_param` | gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf |
 | 1 | unknown directive `fastcgi_pass` | laravel#1 |
 | 1 | unknown directive `grpc_pass` | gh:refluxdb/influxdb3-community/iox-nginx.conf |
 | 1 | unknown directive `sub_filter_types` | gh:MRLokop/shiki-proxy/nginx.conf |
@@ -38,10 +36,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 
 | configurations | differs | examples |
 |---:|---|---|
-| 25 | proxy_buffering off | mastodon, gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example, gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in, gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/prod-nginx.conf … |
-| 5 | ssl_protocols | gh:decred/dcrstakepool/sample-nginx.conf, gh:eubr-bigsea/citrus/custom_nginx.conf, gh:TetAlius/GoSyncMyCalendars/.nginx.conf, gh:sepep-pmsp/api_observasampa/nginx/nginx.conf … |
-| 4 | gzip_static on | mastodon, gh:decred/dcrstakepool/sample-nginx.conf, gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf, gh:dimaslz/local-ssl-management/packages/app/nginx.conf |
-| 4 | proxy_request_buffering off | immich#1, gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in, gh:inab/openEBench-nuxt/nginx.conf.devci, gh:inab/openEBench-nuxt-v3/nginx.conf.devci |
+| 6 | ssl_protocols | gh:decred/dcrstakepool/sample-nginx.conf, gh:eubr-bigsea/citrus/custom_nginx.conf, gh:TetAlius/GoSyncMyCalendars/.nginx.conf, gh:nfdi4health/ldh-deployment/nginx.conf.https … |
 | 2 | alias and location: one ends with / | gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf, gh:devstroop/penpot/docker/devenv/files/nginx.conf |
 | 1 | $date_gmt | gh:deft1991/watchman/docker/proxy/nginx.conf |
 | 1 | ssl_* without listen … ssl | certbot-options |
@@ -51,7 +46,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | case | use | nginx | ruxen | differs | ruxen's error |
 |---|---|---|---|---:|---|
 | nginx-default | static | ok | ok |  |  |
-| mastodon | proxy | ok | ok | 2 |  |
+| mastodon | proxy | ok | ok |  |  |
 | nextcloud-root | php | ok | FAIL |  | ruxen: [emerg] unknown directive `fastcgi_buffers` in a server block in <sandbox>/conf/nginx.conf:63 |
 | nextcloud-subdir | php | ok | FAIL |  | ruxen: [emerg] unknown directive `fastcgi_buffers` in a location block in <sandbox>/conf/nginx.conf:90 |
 | certbot-options | proxy | ok | ok | 1 |  |
@@ -71,7 +66,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | vaultwarden#3 | proxy | ok | ok |  |  |
 | laravel#1 | php | ok | FAIL |  | ruxen: [emerg] unknown directive `fastcgi_pass` in a location block in <sandbox>/conf/nginx.conf:27 |
 | puma#1 | proxy | ok | ok |  |  |
-| immich#1 | proxy | ok | ok | 1 |  |
+| immich#1 | proxy | ok | ok |  |  |
 | uptime-kuma#1 | proxy | ok | ok |  |  |
 | uptime-kuma#2 | proxy | ok | ok |  |  |
 | uptime-kuma#3 | proxy | ok | ok |  |  |
@@ -94,11 +89,11 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:tulayang/okdoc/docs/Nginx/nginx.conf.md | github | — | — |  | (nginx: [emerg] unknown directive "```" in <sandbox>/conf/nginx.conf:2) |
 | gh:cqfn/jpeek/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:pclubiitk/puppy-love/puppy.nginx.conf | github | ok | ok |  |  |
-| gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example | github | ok | ok | 1 |  |
+| gh:huangjunsen0406/xiaozhi-mcphub/nginx.conf.example | github | ok | ok |  |  |
 | gh:yunzhu-li/blupig-gomoku/docker-nginx.conf | github | ok | ok |  |  |
 | gh:healthlocker/healthlocker/nginx.config | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:35) |
 | gh:Cloud-CV/diverse-beam-search/dbs_nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `uwsgi_pass` in a location block in <sandbox>/conf/nginx.conf:39 |
-| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | ok | 2 |  |
+| gh:decred/dcrstakepool/sample-nginx.conf | github | ok | ok | 1 |  |
 | gh:ericbarch/socket-tunnel/nginx.conf.sample | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:17) |
 | gh:runzhliu/welink/dev-nginx.conf | github | ok | ok |  |  |
 | gh:TaitoUnited/full-stack-template/docker-nginx.conf | github | ok | ok |  |  |
@@ -109,7 +104,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:wednesday-solutions/react-template/app/.nginx.conf | github | ok | ok |  |  |
 | gh:react-boilerplate/site/app/.nginx.conf | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
 | gh:ansari-project/ansari-frontend/nginx.conf.sample | github | — | — |  | (nginx: [emerg] directive "server_name" is not terminated by ";" in <sandbox>/con) |
-| gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in | github | ok | ok | 2 |  |
+| gh:TritonDataCenter/triton-grafana/etc/nginx.conf.in | github | ok | ok |  |  |
 | gh:shufo/nginx-consul-template/nginx.conf.ctmpl | github | — | — |  | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:2) |
 | gh:tnborg/proxy-conf/hub-nginx.conf | github | — | — |  | (nginx: [emerg] unknown directive "header_filter_by_lua_block" in <sandbox>/conf/) |
 | gh:paperhive/frontend/docker-nginx.conf | github | — | — |  | (nginx: [emerg] unknown "prerender_token" variable) |
@@ -139,23 +134,23 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:lizardsystem/lizard-screenshotter/etc/nginx.conf.in | github | — | — |  | (nginx: [emerg] the closing bracket in "buildout" variable is missing in <sandbox) |
 | gh:nens/krwlight/etc/nginx.conf.in | github | — | — |  | (nginx: [emerg] the closing bracket in "buildout" variable is missing in <sandbox) |
 | gh:KnowledgeLinks/dpla-service-hub/bibcat-nginx.conf | github | ok | ok |  |  |
-| gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/prod-nginx.conf | github | ok | ok | 1 |  |
+| gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/prod-nginx.conf | github | ok | ok |  |  |
 | gh:yunzhu-li/multiplayer-snake/docker-nginx.conf | github | ok | ok |  |  |
 | gh:legendsort/TackleAI/nginx.conf.txt | github | ok | ok |  |  |
-| gh:jsjfai/AgentDNS-Node/nginx.conf.example | github | ok | ok | 1 |  |
+| gh:jsjfai/AgentDNS-Node/nginx.conf.example | github | ok | ok |  |  |
 | gh:nocomp/scribe/nginx.conf.example | github | ok | ok |  |  |
 | gh:Apress/adv-microservices/ch4-nginx.conf | github | ok | ok |  |  |
 | gh:gsw945/wechat-demo4dev/app-nginx.conf | github | ok | ok |  |  |
 | gh:backupify/yard-server/yard-nginx.conf | github | ok | ok |  |  |
 | gh:Agunxzzz/XrayCol/nginx.conf.txt | github | ok | FAIL |  | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:34 |
-| gh:inab/openEBench-nuxt/nginx.conf.devci | github | ok | ok | 2 |  |
+| gh:inab/openEBench-nuxt/nginx.conf.devci | github | ok | ok |  |  |
 | gh:allisterb/Alpheus/Examples/nginx.conf.1 | github | — | — |  | (nginx: [emerg] invalid event type "kqueue" in <sandbox>/conf/nginx.conf:15) |
 | gh:Ozrlz/odoo-nginx-reverse-proxy/odoo-nginx.conf | github | ok | ok |  |  |
 | gh:kaakaww/vuln_django_play/nginx.conf.micro | github | ok | ok |  |  |
 | gh:mohamedtharwat000/eliteTech/nginx.config | github | ok | ok |  |  |
 | gh:vazw/siamstr/nginx.config | github | ok | ok |  |  |
 | gh:awfeequdng/rust-admin/nginx.conf.default | github | ok | ok |  |  |
-| gh:mazz/kifu/nginx.conf.sample | github | ok | ok | 1 |  |
+| gh:mazz/kifu/nginx.conf.sample | github | ok | ok |  |  |
 | gh:eubr-bigsea/citrus/custom_nginx.conf | github | ok | ok | 1 |  |
 | gh:brick-family/brick/nginx.config | github | ok | ok |  |  |
 | gh:bakery/openmic/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
@@ -163,13 +158,13 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:ocftw/OpenGovReport14-16/nginx.config | github | ok | ok |  |  |
 | gh:TortugaPower/bookplayer-api/nginx.config | github | ok | ok |  |  |
 | gh:amoeba/treestats.net/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
-| gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf | github | ok | ok | 2 |  |
+| gh:fga-eps-mds/2020.1-Minacademy-FrontEnd/hom-nginx.conf | github | ok | ok |  |  |
 | gh:Fysiksektionen/konsol-2024/outer-nginx.conf | github | ok | ok |  |  |
 | gh:omni-system-creator/omni/nginx/nginx.conf.readme.txt | github | — | — |  | (nginx: [emerg] unknown directive "nginx配置说明：" in <sandbox>/conf/nginx.conf:9) |
 | gh:MEGWARE-HPC/xbat/conf/nginx.conf.in | github | — | — |  | (nginx: [emerg] unexpected "}" in <sandbox>/conf/nginx.conf:15) |
 | gh:rede-sustentabilidade/site-wordpress/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] directive "server_name" is not terminated by ";" in <sandbox>/con) |
 | gh:sk123/theyownwhat/nginx.conf_dev | github | ok | ok |  |  |
-| gh:sul-cidr/mime/nginx.config | github | ok | ok | 1 |  |
+| gh:sul-cidr/mime/nginx.config | github | ok | ok |  |  |
 | gh:llong2195/nest-fastify/nginx.conf.d | github | ok | ok |  |  |
 | gh:TetAlius/GoSyncMyCalendars/.nginx.conf | github | ok | ok | 1 |  |
 | gh:opensessions/opensessions/app/.nginx.conf | github | — | — |  | (nginx: [emerg] unknown directive "ssl" in <sandbox>/conf/nginx.conf:36) |
@@ -177,8 +172,8 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:alecgorge/iguana/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
 | gh:liujitao/tvbox/suntv_nginx.conf | github | — | — |  | (nginx: [emerg] unknown log format "main" in <sandbox>/conf/nginx.conf:8) |
 | gh:gierens/yubipi/yubipi-nginx.conf | github | ok | ok |  |  |
-| gh:nfdi4health/ldh-deployment/nginx.conf.https | github | ok | FAIL |  | ruxen: [emerg] invalid location regex `^${SEEK_SUB_URI}(/.*\|$)`: regex parse error: |
-| gh:Wubbadub/ClubHub/nginx.config | github | ok | ok | 1 |  |
+| gh:nfdi4health/ldh-deployment/nginx.conf.https | github | ok | ok | 1 |  |
+| gh:Wubbadub/ClubHub/nginx.config | github | ok | ok |  |  |
 | gh:EstudioNexos/flautodiscover/fla_nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `fastcgi_buffers` in a server block in <sandbox>/conf/nginx.conf:15 |
 | gh:aws-solutions-library-samples/guidance-for-training-an-aws-deepracer-model-using-amazon-sagemaker/dpr401/src/lib/nginx.conf | github | ok | ok |  |  |
 | gh:yegor256/jare/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] unexpected "{" in <sandbox>/conf/nginx.conf:4) |
@@ -191,7 +186,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:lizardsystem/lizard-efcis/etc/nginx.conf.in | github | — | — |  | (nginx: [emerg] the closing bracket in "buildout" variable is missing in <sandbox) |
 | gh:feross/play.cash/nginx.conf | github | — | ok |  | (nginx: [emerg] bind() to 50.116.11.184:18080 failed (99: Cannot assign requested) |
 | gh:flowerinheart/VisualNN/ide_nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `uwsgi_pass` in a location block in <sandbox>/conf/nginx.conf:33 |
-| gh:inab/openEBench-nuxt-v3/nginx.conf.devci | github | ok | ok | 2 |  |
+| gh:inab/openEBench-nuxt-v3/nginx.conf.devci | github | ok | ok |  |  |
 | gh:keya254/pharmacy-pos/nginx.conf.sigil | github | — | — |  | (nginx: [emerg] invalid number of arguments in "upstream" directive in <sandbox>/) |
 | gh:ddsc/ddsc-site/etc/nginx.conf.in | github | — | — |  | (nginx: [emerg] the closing bracket in "buildout" variable is missing in <sandbox) |
 | gh:ddsc/ddsc-management/etc/nginx.conf.in | github | — | — |  | (nginx: [emerg] the closing bracket in "buildout" variable is missing in <sandbox) |
@@ -259,14 +254,14 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:ThNikGhost/notipus2/nginx.conf | github | ok | ok |  |  |
 | gh:Gagen4/map4/nginx.conf | github | ok | ok |  |  |
 | gh:ok245/Food-Order-System-Backend/nginx.conf | github | — | — |  | (nginx: [emerg] unexpected end of file, expecting ";" or "}" in <sandbox>/conf/ng) |
-| gh:Athenavi/chiron/frontend-vue/nginx.conf | github | ok | ok | 1 |  |
+| gh:Athenavi/chiron/frontend-vue/nginx.conf | github | ok | ok |  |  |
 | gh:QuantumBitstream/travelplanner_vue/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:mohamed-azd/sonidle/nginx/nginx.conf | github | ok | ok |  |  |
-| gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | ok | 1 |  |
+| gh:coder-bigwig/Ai_project-2026-2-20-23.35/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:Amitkushwaha328/CivicSense-AI/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:zumassh/foodgram-st/infra/nginx.conf | github | ok | ok |  |  |
 | gh:HisseinMhtDrya/Protection-hamson/nginx/nginx.conf | github | ok | ok |  |  |
-| gh:Kwon9302/LetsGoToWork/nginx/nginx.conf | github | ok | ok | 1 |  |
+| gh:Kwon9302/LetsGoToWork/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:wongywrongy/legal-nlp-citation-graph/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:c2-07/postOffice/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:MikhailGubin/knowledge_plus/nginx/nginx.conf | github | — | — |  | (nginx: [emerg] invalid parameter "8000" in <sandbox>/conf/nginx.conf:11) |
@@ -274,7 +269,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:Getsuga01/MicroServices/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:LJH-apk/CR-monitor/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:raul-dan23/fsgc-java/frontend/nginx.conf | github | ok | ok |  |  |
-| gh:relhamdi/aplusa-test_technique_datahub/frontend/nginx.conf | github | ok | ok | 1 |  |
+| gh:relhamdi/aplusa-test_technique_datahub/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:romitechdev/sevima-semai/apps/web/nginx.conf | github | ok | ok |  |  |
 | gh:Mumurilo375/nexusFull/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:KietLe624/ai-3d-asset-organizer/frontend/nginx.conf | github | ok | ok |  |  |
@@ -289,9 +284,9 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:freinbichler/drone-nginx-configuration/drone-nginx.conf | github | ok | ok |  |  |
 | gh:tibbotech/yocto_layers/meta-tibbo/recipes-core/tps-node-apps/tps-node-demo/demo0/conf/nginx.conf.off | github | ok | ok |  |  |
 | gh:NatsumeRyuhane/activity-ledger/deploy/nginx.conf.template | github | — | — |  | (nginx: [emerg] invalid port in upstream "${APP_HOST}:${APP_PORT}" in <sandbox>/c) |
-| gh:azzaraq-creator/admix/deploy/nginx.conf.template | github | ok | ok | 1 |  |
-| gh:panyam/onehub/configs/nginx.conf | github | ok | ok | 1 |  |
-| gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf | github | ok | ok | 1 |  |
+| gh:azzaraq-creator/admix/deploy/nginx.conf.template | github | ok | ok |  |  |
+| gh:panyam/onehub/configs/nginx.conf | github | ok | ok |  |  |
+| gh:rollingfruit/pr-pipeline-hub/deploy/cloud/same-site.nginx.conf | github | ok | ok |  |  |
 | gh:MRLokop/shiki-proxy/nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `sub_filter_types` in a location block in <sandbox>/conf/nginx.conf:112 |
 | gh:codeDogMcGee/Django-RestApi-Appointments/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:wxy2077/djangoBlog/deployment/nginx/nginx.conf | github | ok | ok | 1 |  |
@@ -319,8 +314,8 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:Ermuk-code/arenda-site/nginx.conf | github | ok | ok |  |  |
 | gh:ksanyok/mailforge/docker/web/nginx.conf | github | ok | ok |  |  |
 | gh:Ikeu-1030/iRun/docker/nginx/nginx.conf | github | ok | ok |  |  |
-| gh:rajim59/SwarmFort/infra/docker/nginx.conf | github | ok | FAIL |  | ruxen: [emerg] bad value for upstream server param: resolve in <sandbox>/conf/nginx.conf:6 |
-| gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf | github | ok | ok | 1 |  |
+| gh:rajim59/SwarmFort/infra/docker/nginx.conf | github | ok | ok |  |  |
+| gh:112-njx/stock-invest-system/deploy/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:izumiriyad/bsass-demov2/ops/nginx.conf | github | ok | ok |  |  |
 | gh:devfernandoa/HyController/panel/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:mabels/mailu-arm/core/nginx/conf/nginx.conf | github | — | — |  | (nginx: [emerg] directive "resolver" is not terminated by ";" in <sandbox>/conf/n) |
@@ -336,7 +331,7 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:NineToSixVisti/visti/src/frontend/visti/nginx.conf | github | ok | ok | 1 |  |
 | gh:franjavi-upct-es/SafeStream-AI/services/dashboard/nginx.conf | github | ok | ok |  |  |
 | gh:Lucasgarciamdz/reminders_app/frontend/nginx.conf | github | ok | ok |  |  |
-| gh:tesfandiari1/LLM-txt/frontend/nginx.conf | github | ok | ok | 1 |  |
+| gh:tesfandiari1/LLM-txt/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:sujal-goel/Smartleads/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:Amit-Gupta75/Telecom-Churn-Intelligence/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:slayer-ak4sh/RetainIQ_F/frontend/nginx.conf | github | ok | ok |  |  |
@@ -349,12 +344,12 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:fatmagulfidan/DEP-LB1/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:thodotpro/PonchoProphet/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:vthot4/poc_nifi/examples/Ejemplo_2/nginx-conf/nginx.conf | github | ok | ok |  |  |
-| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | ok | 2 |  |
+| gh:devstroop/penpot/docker/devenv/files/nginx.conf | github | ok | ok | 1 |  |
 | gh:kc611/microservices-app/m-frontend/nginx.conf | github | ok | ok |  |  |
 | gh:noam-r/produckt/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:pranali04/SampleTradingApp/api_gateway/nginx.conf | github | ok | ok |  |  |
 | gh:josiahdavis/deploy-keyword-topic-model/topic-model/nginx.conf | github | ok | ok |  |  |
-| gh:dimaslz/local-ssl-management/packages/app/nginx.conf | github | ok | ok | 1 |  |
+| gh:dimaslz/local-ssl-management/packages/app/nginx.conf | github | ok | ok |  |  |
 | gh:AlinAlexMyladoor/VeriCred-Campus/esignet-mock/nginx.conf | github | ok | ok |  |  |
 | gh:369sabinsaigal-byte/aetheria/aetheria-web/nginx.conf | github | ok | ok |  |  |
 | gh:zae-hyeong/homeserver/reverse-proxy/nginx.conf | github | ok | ok |  |  |
@@ -363,20 +358,20 @@ Among the configurations ruxen loads, how many have each `--compat` "differs" fi
 | gh:nicolasfmelo/NPS-CASE/services/front-end/nginx.conf | github | ok | ok |  |  |
 | gh:asyayakim/product-service-frontend/product-service-app/nginx.conf | github | ok | ok |  |  |
 | gh:alphadx/nginx-proxy-html-mysql/nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `stream` at the top level in <sandbox>/conf/nginx.conf:6 |
-| gh:HendrickFS/olive-oil-digital-twin/ditto/deployment/docker/nginx.conf | github | ok | ok | 1 |  |
-| gh:dheerajsharma2399/ditto-twin/ditto/deployment/docker/nginx.conf | github | ok | ok | 1 |  |
+| gh:HendrickFS/olive-oil-digital-twin/ditto/deployment/docker/nginx.conf | github | ok | ok |  |  |
+| gh:dheerajsharma2399/ditto-twin/ditto/deployment/docker/nginx.conf | github | ok | ok |  |  |
 | gh:SoggyHammyDev/soggy-pools/soggy-pools-xec-solo/web/nginx.conf | github | ok | ok |  |  |
 | gh:Hama-Gama/task-tracker/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:muhammedhanii/bunzo/nginx/nginx.conf | github | ok | ok |  |  |
 | gh:johnmathews/game/nginx/nginx.conf | github | ok | ok |  |  |
-| gh:marcphilippebeaujean-abertay/cs50project2/server/nginx.conf | github | ok | ok | 1 |  |
+| gh:marcphilippebeaujean-abertay/cs50project2/server/nginx.conf | github | ok | ok |  |  |
 | gh:djsmacker01/Crayfield/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:zwlcoding/yt-todo/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:hypothetical-andrei/compnet-live-2026/s11/1_nginx-reverse-proxy/nginx.conf | github | ok | ok |  |  |
 | gh:Mozart409/nixos-fleet/hosts/containers/harbor/config/nginx.conf | github | ok | ok |  |  |
-| gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf | github | ok | FAIL |  | ruxen: [emerg] "root /srv/p1-$domain" is not supported yet, and ignoring it is unsafe: variables in the path aren't expanded yet (#232), so other files would be served than nginx serves in <sandbox>/conf/nginx.conf:55 |
+| gh:Mikulas/thesis/src/web-servers/plain/cookbooks/nginx/files/nginx.conf | github | ok | FAIL |  | ruxen: [emerg] unknown directive `fastcgi_param` in a location block in <sandbox>/conf/fastcgi_params:2 |
 | gh:GrabowMar/result_llm_analysis/generated/apps/openai_gpt-5.2-codex-20260114/app1/frontend/nginx.conf | github | ok | ok |  |  |
 | gh:duongnghia222/DATKLL_Object_Tracking_Robot/Ref/Object-Finding-Rover-master/raspberry_pi_packet_serial/nginx.conf | github | ok | ok |  |  |
 | gh:wildfly-security/wildfly-elytron/http/oidc/src/test/resources/org/wildfly/security/http/oidc/nginx.conf | github | — | — |  | (nginx: [emerg] unknown "client_port" variable) |
 | gh:FarrukhCyber/debloating-test-suit/nginx/chisel/nginx_test_cases/test_c/conf/nginx.conf | github | ok | ok |  |  |
-| gh:jiangxxxue/KOCO-bench/KOCO-bench-en/domain_code_generation/scripts/agent/dataset/dataset_remove_implementation_remove_test_en/raganything/test_examples/Chat-ANYTHING/code/rag-web-ui/nginx.conf | github | ok | ok | 1 |  |
+| gh:jiangxxxue/KOCO-bench/KOCO-bench-en/domain_code_generation/scripts/agent/dataset/dataset_remove_implementation_remove_test_en/raganything/test_examples/Chat-ANYTHING/code/rag-web-ui/nginx.conf | github | ok | ok |  |  |

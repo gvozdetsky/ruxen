@@ -54,7 +54,7 @@ Phases were planned as minor versions, but work ships when it is ready: phase 2 
 Each release reports five numbers, and the release pull request adds its row to the table below:
 
 1. **Deployments**: sites outside the project known to run ruxen, shadow or live. The number the rest serve.
-2. **nginx-tests**: files passing, out of those that run (`NGINX_TEST_PROGRESS.md`). The `-V` banner skips the files of modules ruxen doesn't claim: 314 of 511 at 0.2.2.
+2. **nginx-tests**: files passing, out of those that run (`NGINX_TEST_PROGRESS.md`). The `-V` banner skips the files of modules ruxen doesn't claim: 288 of 511 at 0.2.3.
 3. **Config corpus** (#216): the share of a few hundred real-world nginx configurations that ruxen loads, from application docs, popular container images and certbot setups, and the share that loads with nothing `--compat` reports as different (`corpus/RESULTS.md`). This is the best proxy for "would ruxen work for me", and its failures say what to build next.
 4. **Performance**: ruxen vs nginx's stable release on every bench scenario, measured as ABBA pairs on a dedicated quiet machine (`bench/README.md`); between campaigns, the headline scenarios against the previous release.
 5. **Robustness**: fuzzing, worker panics (target: none), and security fixes (`SECURITY.md`). Fuzzing is CPU hours and executions since the previous release, from the nightly runs on a private machine (`scripts/fuzz_long.sh --report`, #477).
@@ -67,6 +67,7 @@ Each release reports five numbers, and the release pull request adds its row to 
 | 0.2.0 | 0 | 165 / 191 | 217 / 238 (91%) | 85 of 94, 120.2% ([report](https://github.com/gvozdetsky/ruxen/blob/v0.2.0/bench/campaign-2026-10-17/REPORT.md)) | ~37 billion runs, 8 targets | 13 issues from the audit (#529) |
 | 0.2.1 | 0 | 172 / 192 | 217 / 238 (91%) | 91 of 94, 121.5% ([report](https://github.com/gvozdetsky/ruxen/blob/v0.2.1/bench/campaign-2026-10-21/REPORT.md)) | ASan nginx-tests sweep, no reports | 5 issues |
 | 0.2.2 | 0 | 182 / 197 | 218 / 238 (92%), 171 with no difference | no campaign; ABBA against 0.2.1 (i7, 6 pairs each): h2c_hello 106.2%, h2_tls_hello 104.7%, proxy_64k 100.3%, m1_hello 99.6%, tls_hello 99.5%, proxy_hello 99.2%, m3_static_1k 99.1%, gzip_html_8k 97.3% | ASan nginx-tests sweep, no reports; ~2.7 billion runs, 5 targets | 1 issue (#586), 1 dependency advisory |
+| 0.2.3 | 0 | 212 / 223 | 220 / 238 (92%), 210 with no difference | no campaign; ABBA against 0.2.2 (i7, 6 pairs each): proxy_64k 137.3%, h2_tls_hello 103.7%, h2c_hello 102.3%, m1_hello 100.5%, tls_hello 100.0%, m3_static_1k 99.7%, gzip_html_8k 99.5%, proxy_hello 98.2% | ~79 billion runs, 14 targets; 17 targets in CI | 5 issues (#730, #797, #798, #833, #855), 1 dependency advisory |
 
 Performance up to 0.2.0 is against nginx 1.24.0, from 0.2.1 against 1.30.6; on the bench configurations the two run at the same speed (±1.3%).
 
