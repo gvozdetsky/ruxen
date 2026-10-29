@@ -1185,10 +1185,19 @@ pub(crate) fn run_location_handler(
             for ep in loc.error_pages {
                 let mut buf = Vec::with_capacity(64);
                 render_parts(ep.target, &proxy_render_ctx, &mut buf);
+                let named_from = (buf.first() == Some(&b'@')).then(|| {
+                    Box::new(phase::NamedFrom {
+                        uri: url_path.to_vec(),
+                        args: current_args.map(<[u8]>::to_vec),
+                        unparsed_uri: rewrite_state.unparsed_uri,
+                        internal: rewrite_state.internal,
+                    })
+                });
                 rules.push(crate::proxy::InterceptRule {
                     status: ep.status,
                     action: ep.action,
                     target: buf,
+                    named_from,
                 });
             }
             Some(rules)
@@ -1496,6 +1505,7 @@ pub(crate) fn run_location_handler(
                         preserved_location: None,
                         preserved_www_authenticate: Vec::new(),
                         closes: false,
+                        named_from: None,
                     });
                 }
                 fs_resolve::Outcome::NotFound => {
