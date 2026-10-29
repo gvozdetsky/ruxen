@@ -2193,7 +2193,7 @@ async fn attempt(
         let stream = if plan.h2 {
             match Box::pin(h2_connect(plan, stream)).await {
                 Ok(stream) => stream,
-                Err(outcome) => return outcome,
+                Err(outcome) => return *outcome,
             }
         } else {
             stream
@@ -2844,7 +2844,10 @@ async fn attempt(
 /// `proxy_http_version 2` (#599): HTTP/2 on a new connection, under
 /// `proxy_connect_timeout` as the TLS handshake is.
 #[cold]
-async fn h2_connect(plan: &ProxyPlan, stream: UpstreamIo) -> Result<UpstreamIo, AttemptOutcome> {
+async fn h2_connect(
+    plan: &ProxyPlan,
+    stream: UpstreamIo,
+) -> Result<UpstreamIo, Box<AttemptOutcome>> {
     let identity = stream.tls_identity().cloned();
     let https = identity.is_some();
     match timeout(
@@ -2854,16 +2857,16 @@ async fn h2_connect(plan: &ProxyPlan, stream: UpstreamIo) -> Result<UpstreamIo, 
     .await
     {
         Ok(Ok(conn)) => Ok(UpstreamIo::H2(Box::new(conn))),
-        Ok(Err(e)) => Err(AttemptOutcome::Failed(
+        Ok(Err(e)) => Err(Box::new(AttemptOutcome::Failed(
             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
             FailKind::Error,
             Box::new(UpstreamError::SendFailed(e)),
-        )),
-        Err(_) => Err(AttemptOutcome::Failed(
+        ))),
+        Err(_) => Err(Box::new(AttemptOutcome::Failed(
             Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
             FailKind::Timeout,
             Box::new(UpstreamError::TimedOut(Stage::Connecting)),
-        )),
+        ))),
     }
 }
 
