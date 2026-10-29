@@ -575,8 +575,140 @@ pub fn pick_peer(
         Some(LeasedPeer {
             upstream: leased,
             peer_idx: idx,
+            learn: None,
         })
     })
+}
+
+/// `pick_peer` for an upstream with `sticky` (#600): the peer whose ID is
+/// `hint` if it can take the request, else the balancer's pick. A tier
+/// (primary, then backup) is searched for the ID before the balancer
+/// picks in it, as nginx's balancers ask ngx_http_upstream_get_rr_peer_by_sid
+/// over `rrp->peers`.
+#[cold]
+#[inline(never)]
+pub fn pick_peer_sticky(
+    upstream: &UpstreamRef,
+    tried: &Tried,
+    mut hash: Option<&mut HashPick>,
+    hint: &[u8],
+) -> Option<LeasedPeer> {
+    let leased = upstream.clone();
+    let upstream: &PreparedUpstream = upstream;
+    let sticky = upstream.sticky?;
+    let now = Instant::now();
+    LB_STATE.with(|state| {
+        let mut map = state.borrow_mut();
+        let key = upstream as *const PreparedUpstream;
+        let rt = map.entry(key).or_insert_with(|| ensure_rt(upstream));
+        let mut pick = None;
+        for backup_tier in [false, true] {
+            if let Some(st) = peer_by_sid(rt, upstream, sticky, hint, backup_tier, tried, now) {
+                pick = Some(match upstream.lb {
+                    Lb::RoundRobin => rr_pick_sticky(rt, upstream, st, backup_tier, tried, now),
+                    _ => st,
+                });
+                break;
+            }
+            pick = match (upstream.lb, backup_tier) {
+                (Lb::LeastConn, _) => least_conn_pick(rt, upstream, backup_tier, tried, now),
+                (Lb::Hash(_) | Lb::IpHash, false) => hash
+                    .as_deref_mut()
+                    .and_then(|h| hash_pick(rt, upstream, h, tried, now))
+                    .or_else(|| rr_pick_with_filter(rt, upstream, false, tried, now)),
+                _ => rr_pick_with_filter(rt, upstream, backup_tier, tried, now),
+            };
+            if pick.is_some() {
+                break;
+            }
+        }
+        let idx = pick?;
+        match upstream.shared {
+            Some(shared) => {
+                shared[idx].conns.fetch_add(1, Ordering::Relaxed);
+            }
+            None => rt.peers[idx].active = rt.peers[idx].active.saturating_add(1),
+        }
+        Some(LeasedPeer {
+            upstream: leased,
+            peer_idx: idx,
+            learn: None,
+        })
+    })
+}
+
+/// ngx_http_upstream_get_rr_peer_by_sid: the first peer of the tier with
+/// ID `hint`, if it isn't tried, down (`drain` is fine), failed or full.
+fn peer_by_sid(
+    rt: &UpstreamRt,
+    up: &PreparedUpstream,
+    sticky: &crate::upstream_sticky::Sticky,
+    hint: &[u8],
+    backup_tier: bool,
+    tried: &Tried,
+    now: Instant,
+) -> Option<usize> {
+    if hint.is_empty() {
+        return None;
+    }
+    let i = up
+        .peers
+        .iter()
+        .zip(sticky.sids)
+        .position(|(p, sid)| p.backup == backup_tier && *sid == hint)?;
+    let p = &up.peers[i];
+    if tried.contains(i) || (p.down && !sticky.draining[i]) {
+        return None;
+    }
+    let (fails, fails_started) = fail_state(rt, up, i);
+    if let Some(opened) = fails_started
+        && p.max_fails > 0
+        && fails >= p.max_fails
+        && now.saturating_duration_since(opened) < Duration::from_millis(p.fail_timeout_ms)
+    {
+        return None;
+    }
+    if p.max_conns > 0 && active(rt, up, i) >= p.max_conns {
+        return None;
+    }
+    Some(i)
+}
+
+/// ngx_http_upstream_get_peer with a sticky peer `st`: taken as is while
+/// its weight is that far behind, else the others are weighted as for a
+/// pick and `st` pays for it, so new requests stay balanced.
+fn rr_pick_sticky(
+    rt: &mut UpstreamRt,
+    up: &PreparedUpstream,
+    st: usize,
+    backup_tier: bool,
+    tried: &Tried,
+    now: Instant,
+) -> usize {
+    let total_weight: i64 = up
+        .peers
+        .iter()
+        .filter(|p| p.backup == backup_tier)
+        .map(|p| p.weight as i64)
+        .sum();
+    let low_limit = -(total_weight - up.peers[st].weight as i64);
+    if rt.peers[st].current_weight <= low_limit {
+        return st;
+    }
+    let mut total: i64 = 0;
+    for (i, peer) in up.peers.iter().enumerate() {
+        if !peer_eligible(rt, up, i, backup_tier, tried, now) {
+            continue;
+        }
+        let s = &mut rt.peers[i];
+        s.current_weight = s.current_weight.saturating_add(s.effective_weight);
+        total = total.saturating_add(s.effective_weight);
+        if s.effective_weight < peer.weight as i64 {
+            s.effective_weight += 1;
+        }
+    }
+    rt.peers[st].current_weight = rt.peers[st].current_weight.saturating_sub(total);
+    st
 }
 
 /// Whether peer `i` can be picked: not `down`, and not cooling off after
@@ -873,6 +1005,8 @@ pub fn report_success(upstream: &PreparedUpstream, peer_idx: usize) {
 pub struct LeasedPeer {
     upstream: UpstreamRef,
     pub peer_idx: usize,
+    /// `sticky learn`: the session to bind to the peer when it is freed.
+    pub learn: Option<Box<crate::upstream_sticky::PendingLearn>>,
 }
 
 impl LeasedPeer {
@@ -882,6 +1016,7 @@ impl LeasedPeer {
         LeasedPeer {
             upstream: upstream.clone(),
             peer_idx,
+            learn: None,
         }
     }
     #[allow(dead_code)]
@@ -896,6 +1031,9 @@ impl LeasedPeer {
 
 impl Drop for LeasedPeer {
     fn drop(&mut self) {
+        if let Some(learn) = self.learn.take() {
+            learn_on_free(&self.upstream, self.peer_idx, &learn);
+        }
         if let Some(shared) = self.upstream.shared {
             shared[self.peer_idx].conns.fetch_sub(1, Ordering::Relaxed);
             return;
@@ -910,6 +1048,58 @@ impl Drop for LeasedPeer {
             }
         });
     }
+}
+
+#[cold]
+#[inline(never)]
+fn learn_on_free(
+    upstream: &PreparedUpstream,
+    peer_idx: usize,
+    learn: &crate::upstream_sticky::PendingLearn,
+) {
+    if let Some(sticky) = upstream.sticky {
+        learn.record(sticky, peer_idx);
+    }
+}
+
+/// How long a finished upstream connection waits for the upstream's close.
+const PEER_CLOSE_WAIT: Duration = Duration::from_millis(200);
+
+/// Close an upstream connection whose response was read in full and that
+/// isn't kept, after the upstream closes its end (#249): the side that
+/// closes first holds the TIME_WAIT, and on ours it holds an ephemeral
+/// port. A loopback upstream answering ~30k new connections a second
+/// then runs the port range out, and every connect() searches it. Under
+/// io_uring the response is often read before the upstream's FIN is out.
+pub(crate) fn close_after_peer(
+    stream: crate::upstream_io::UpstreamIo,
+    slot: crate::worker::UpstreamSlot,
+) {
+    // TLS ends with close_notify; it isn't worth waiting for.
+    let crate::upstream_io::UpstreamIo::Plain(mut stream) = stream else {
+        return;
+    };
+    // Mostly the FIN is in already: then no task.
+    let mut byte = 0u8;
+    // SAFETY: a one-byte read into `byte` from the stream's own fd.
+    let n = unsafe {
+        libc::recv(
+            std::os::fd::AsRawFd::as_raw_fd(&stream),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+        return;
+    }
+    monoio::spawn(async move {
+        use monoio::io::AsyncReadRent;
+        let read = stream.read(Vec::with_capacity(1));
+        let _ = crate::worker::lazy_timeout(PEER_CLOSE_WAIT, read).await;
+        drop(stream);
+        drop(slot);
+    });
 }
 
 /// One pooled upstream connection awaiting reuse. The stream is the raw
@@ -1302,6 +1492,7 @@ mod tests {
             lb,
             shared: None,
             dynamic: None,
+            sticky: None,
             metrics: None,
         }))
     }
@@ -1504,6 +1695,7 @@ mod tests {
             lb: Lb::prepare(lb, peers),
             shared: None,
             dynamic: None,
+            sticky: None,
             metrics: None,
         }))
     }
@@ -1630,6 +1822,7 @@ mod tests {
             lb: Lb::RoundRobin,
             shared: zone.then(|| PeerShared::for_peers(peers.len())),
             dynamic: None,
+            sticky: None,
             metrics: None,
         }))
     }
@@ -1666,5 +1859,119 @@ mod tests {
             let l = pick_peer(u, &Tried::default(), None).unwrap();
             assert_eq!(l.peer_idx, 1);
         }
+    }
+
+    /// Peers `(route, down, drain, max_conns)` on 127.0.0.1:1.., with
+    /// `sticky route $arg_r`.
+    fn sticky_upstream(specs: &[(&str, bool, bool, u32)]) -> &'static PreparedUpstream {
+        let servers: Vec<crate::config::UpstreamServer> = specs
+            .iter()
+            .enumerate()
+            .map(
+                |(i, &(route, down, drain, max_conns))| crate::config::UpstreamServer {
+                    addr: crate::config::UpstreamAddr::Inet(
+                        format!("127.0.0.1:{}", i + 1).parse().unwrap(),
+                    ),
+                    display: "x".into(),
+                    weight: 1,
+                    max_fails: 1,
+                    fail_timeout_secs: 10,
+                    max_conns,
+                    down,
+                    backup: false,
+                    drain,
+                    route: Some(route.into()),
+                    resolve: None,
+                },
+            )
+            .collect();
+        let conf = crate::config::StickyConf::Route {
+            lookup: vec![crate::config::parse_value_with_vars("$arg_r").unwrap()],
+        };
+        let sticky = crate::upstream_sticky::Sticky::prepare(conf, &servers, "t");
+        let peers: Vec<PreparedPeer> = servers
+            .iter()
+            .map(|s| PreparedPeer {
+                addr: crate::worker::PeerAddr::from_config(s.addr.clone()),
+                display: b"x",
+                weight: 1,
+                max_fails: 1,
+                fail_timeout_ms: 10_000,
+                max_conns: s.max_conns,
+                down: s.down,
+                backup: false,
+            })
+            .collect();
+        crate::arena::leak(Box::new(PreparedUpstream {
+            name: b"t",
+            peers: crate::arena::leak(peers.into_boxed_slice()),
+            keepalive_max_idle: None,
+            keepalive_local: false,
+            keepalive_requests: 1000,
+            keepalive_idle_timeout_ms: 60_000,
+            keepalive_max_lifetime_ms: 3_600_000,
+            lb: Lb::RoundRobin,
+            shared: None,
+            sticky: Some(sticky),
+            metrics: None,
+            dynamic: None,
+        }))
+    }
+
+    fn sticky_pick(u: &'static PreparedUpstream, hint: &str) -> Option<usize> {
+        pick_peer_sticky(
+            &UpstreamRef::current(u),
+            &Tried::default(),
+            None,
+            hint.as_bytes(),
+        )
+        .map(|l| l.peer_idx)
+    }
+
+    #[test]
+    fn sticky_takes_the_named_peer_and_keeps_the_rest_balanced() {
+        let u = sticky_upstream(&[
+            ("a", false, false, 0),
+            ("b", false, false, 0),
+            ("c", false, false, 0),
+            ("d", false, false, 0),
+        ]);
+        for _ in 0..20 {
+            assert_eq!(sticky_pick(u, "c"), Some(2));
+        }
+        // An unknown or empty ID: the balancer's pick.
+        let mut hits = [0; 4];
+        for i in 0..20 {
+            hits[sticky_pick(u, if i % 2 == 0 { "zz" } else { "" }).unwrap()] += 1;
+        }
+        // As upstream_sticky.t checks it: within one of an even share.
+        assert!(hits.iter().all(|&h| (4..=6).contains(&h)), "{hits:?}");
+    }
+
+    #[test]
+    fn sticky_reaches_drained_but_not_down_full_or_tried_peers() {
+        let u = sticky_upstream(&[
+            ("a", true, true, 0),
+            ("b", true, false, 0),
+            ("c", false, false, 1),
+            ("d", false, false, 0),
+        ]);
+        assert_eq!(sticky_pick(u, "a"), Some(0), "drain: reachable by ID");
+        for _ in 0..4 {
+            assert!(
+                matches!(sticky_pick(u, ""), Some(2 | 3)),
+                "drain: not balanced to"
+            );
+        }
+        assert!(matches!(sticky_pick(u, "b"), Some(2 | 3)), "down");
+        let held =
+            pick_peer_sticky(&UpstreamRef::current(u), &Tried::default(), None, b"c").unwrap();
+        assert_eq!(held.peer_idx, 2);
+        assert_eq!(sticky_pick(u, "c"), Some(3), "max_conns reached");
+        drop(held);
+        let mut tried = Tried::default();
+        tried.insert(2);
+        let l = pick_peer_sticky(&UpstreamRef::current(u), &tried, None, b"c").unwrap();
+        assert_eq!(l.peer_idx, 3, "tried");
     }
 }
