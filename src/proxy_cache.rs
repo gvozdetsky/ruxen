@@ -1145,6 +1145,7 @@ impl Entry {
             fd: self.file.into(),
             offset: self.body.0,
             len: self.body.1,
+            parts: None,
         }
     }
 

@@ -13,5 +13,4 @@ connection	^response: nginx \d+ ok, ruxen - error: timeout$	sul-cidr/mime	cl-big
 header	ruxen doesn't send it		body:POST-chunked-bad.* 400$		#806: a malformed chunked body is refused before routing, without the location's `add_header`
 status	^status: nginx 40[1345], ruxen 400$		body:POST-chunked-bad		#806: a malformed chunked body is refused before the location answers
 status	^status: nginx 400, ruxen		absolute-uri.* 400$		#781: an absolute-form HTTP/1.1 request without Host is served
-status	^status: nginx (412|304), ruxen 200$		(im-|ius-|inm-star|rand)		#782: `return 200` ignores If-Match, If-Unmodified-Since, `If-None-Match: *`
 			version:0\.9		#784: an HTTP/0.9 request waits for client_header_timeout
