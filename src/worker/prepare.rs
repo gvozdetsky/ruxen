@@ -1162,26 +1162,31 @@ pub(crate) fn prepare_upstreams(
                 .as_ref()
                 .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
             sticky,
-            // Resolved peers aren't counted (#597).
-            metrics: if hosts.is_empty() {
-                super::metrics::peer_slots(name_static.as_bytes(), peers)
-            } else {
-                None
-            },
+            metrics: super::metrics::peer_slots(name_static.as_bytes(), peers),
             dynamic: None,
         }));
-        super::metrics::note_upstream(prepared);
         let prepared: &'static PreparedUpstream = match (&u.zone, u.resolver) {
             (Some(zone), Some(resolver)) if !hosts.is_empty() => {
-                crate::upstream_resolve::Dynamic::prepare(
+                // Resolved peers take slots from a pool (#879).
+                let pool =
+                    super::metrics::peer_pool(name_static.as_bytes(), peers, prepared.metrics);
+                let dynamic = crate::upstream_resolve::Dynamic::prepare(
                     *prepared,
                     zone,
                     hosts,
                     prepare_resolver(resolver),
                     std::time::Duration::from_millis(u.resolver_timeout_ms.unwrap_or(30_000)),
-                )
+                    pool,
+                );
+                if let Some(pool) = pool {
+                    pool.note(dynamic);
+                }
+                dynamic
             }
-            _ => prepared,
+            _ => {
+                super::metrics::note_upstream(prepared);
+                prepared
+            }
         };
         out.insert(name_static, prepared);
     }
