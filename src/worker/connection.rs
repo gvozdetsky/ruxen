@@ -162,6 +162,13 @@ pub trait ConnIo: AsyncReadRent + monoio::io::AsyncWriteRent + crate::duplex::Du
         Err(body)
     }
 
+    /// Copy what a read would return now into `dst`, leaving it unread:
+    /// nginx reads what is there before a body goes unbuffered (#134).
+    /// 0 where the transport can't tell (TLS, HTTP/2).
+    fn peek_ready(&self, _dst: &mut [u8]) -> usize {
+        0
+    }
+
     /// An HTTP/2 stream (`h2::StreamIo`): its request line says `HTTP/2.0`.
     fn h2(&self) -> bool {
         false
@@ -273,6 +280,20 @@ impl ConnIo for TcpStream {
 
     async fn wait_writable(&self) -> std::io::Result<()> {
         self.writable(false).await
+    }
+
+    fn peek_ready(&self, dst: &mut [u8]) -> usize {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `dst` is valid for `dst.len()` bytes of writes.
+        let n = unsafe {
+            libc::recv(
+                self.as_raw_fd(),
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        n.max(0) as usize
     }
 
     async fn read_now<T: IoBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
@@ -1747,7 +1768,7 @@ pub(crate) async fn chunked_in_buffer(
         &mut NoMoreInput,
         initial,
         u64::MAX,
-        None,
+        None::<&mut BodySink<'_>>,
         timer,
         LINGERING_TIMEOUT,
     )
@@ -1764,7 +1785,14 @@ pub(crate) async fn discard_chunked_body<S: AsyncReadRent>(
     initial: &[u8],
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
 ) -> Option<Vec<u8>> {
-    let read = read_chunked_request_body(stream, initial, u64::MAX, None, timer, LINGERING_TIMEOUT);
+    let read = read_chunked_request_body(
+        stream,
+        initial,
+        u64::MAX,
+        None::<&mut BodySink<'_>>,
+        timer,
+        LINGERING_TIMEOUT,
+    );
     match monoio::time::timeout(LINGERING_TIME, read).await {
         Ok(Ok(body)) => Some(body.pipelined_tail),
         _ => None,
@@ -1885,16 +1913,34 @@ pub(crate) async fn read_body_past_buffer<S: ConnIo>(
     ok
 }
 
+/// Where a decoded chunked request body goes: memory and a temp file
+/// (`BodySink`), or the proxy as it comes (#134).
+pub(crate) trait ChunkSink {
+    fn len(&self) -> u64;
+    /// `false`: the body can't be kept.
+    async fn put(&mut self, data: &[u8]) -> bool;
+}
+
+impl ChunkSink for BodySink<'_> {
+    fn len(&self) -> u64 {
+        BodySink::len(self)
+    }
+
+    async fn put(&mut self, data: &[u8]) -> bool {
+        self.extend(data)
+    }
+}
+
 /// Read and decode a chunked request body from the connection into `sink`
 /// (memory, then a temp file for large bodies). Chunk data is passed on as
 /// it arrives and consumed input is dropped, so memory stays bounded
 /// whatever the chunk sizes.
 /// `sink`: `None` drops the data (a body nothing reads).
-pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
+pub(crate) async fn read_chunked_request_body<S: AsyncReadRent, K: ChunkSink>(
     stream: &mut S,
     initial: &[u8],
     max_body: u64,
-    mut sink: Option<&mut BodySink<'_>>,
+    mut sink: Option<&mut K>,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     read_timeout: Duration,
 ) -> Result<ChunkedBody, ChunkedBodyError> {
@@ -2004,7 +2050,7 @@ pub(crate) async fn read_chunked_request_body<S: AsyncReadRent>(
             }
             let take = (left.min((raw.len() - cursor) as u64)) as usize;
             if let Some(sink) = sink.as_deref_mut()
-                && !sink.extend(&raw[cursor..cursor + take])
+                && !sink.put(&raw[cursor..cursor + take]).await
             {
                 return Err(Invalid);
             }

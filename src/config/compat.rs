@@ -304,12 +304,6 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "ruxen relays a response as it arrives either way (#88, #463)",
         "proxy_buffering-off",
     ),
-    (
-        "proxy_request_buffering",
-        Some("on"),
-        "request bodies are still read whole before they are proxied (#134)",
-        "proxy_request_buffering-off",
-    ),
     // `aio threads` is implemented and not a finding.
     (
         "aio",

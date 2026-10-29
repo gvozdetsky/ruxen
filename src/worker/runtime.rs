@@ -2398,6 +2398,7 @@ async fn run_post_action(
         body: &phase::NO_BODY,
         body_len: 0,
         body_file: None,
+        body_feed: None,
         refuse: None,
         ..*base_ctx
     };
@@ -3087,6 +3088,7 @@ async fn run_auth_subrequest(
         body: &phase::NO_BODY,
         body_len: 0,
         body_file: None,
+        body_feed: None,
         refuse: None,
         upstream: None,
         ..*ctx
@@ -4957,6 +4959,243 @@ enum PendingDiscard {
     Chunked { from: usize },
 }
 
+/// The rest of a request body sent upstream as it comes, with
+/// `proxy_request_buffering off` (#134): read from the client while the
+/// proxy runs (`settle_unbuffered`).
+struct BodyPump {
+    feed: crate::request_feed::BodyFeed,
+    /// What came with the header (a Content-Length body's start).
+    preread: bytes::Bytes,
+    rest: PumpRest,
+}
+
+enum PumpRest {
+    /// This many bytes still to read.
+    Length(u64),
+    /// A chunked body, from what came with the header on.
+    Chunked { initial: Vec<u8>, max_body: u64 },
+}
+
+/// How the client's body ended, for the connection.
+enum PumpEnd {
+    /// Read whole: the bytes read past it start the next request.
+    Done(Vec<u8>),
+    /// Nothing proxied it: dropped after the response, as nginx's
+    /// discard does (`Some`: of a Content-Length body, these bytes).
+    Discard(Option<u64>),
+    /// Not read to its end: the connection closes after the response.
+    Unfinished,
+}
+
+impl BodyPump {
+    #[cold]
+    #[inline(never)]
+    fn length(preread: &[u8], left: u64) -> (crate::request_feed::BodyFeed, Box<BodyPump>) {
+        let feed = crate::request_feed::BodyFeed::new(false);
+        let pump = Box::new(BodyPump {
+            feed: feed.clone(),
+            preread: bytes::Bytes::copy_from_slice(preread),
+            rest: PumpRest::Length(left),
+        });
+        (feed, pump)
+    }
+
+    /// The rest of a Content-Length body is already there and fits the
+    /// buffer nginx reads it into before going unbuffered
+    /// (ngx_http_read_client_request_body): nginx then has it all, and
+    /// the body is a buffered one.
+    #[cold]
+    #[inline(never)]
+    fn rest_ready<S: ConnIo>(stream: &S, rest: u64, body_buffer: u64) -> bool {
+        if rest >= body_buffer + (body_buffer >> 2) {
+            return false;
+        }
+        let mut peek = vec![0u8; rest as usize];
+        stream.peek_ready(&mut peek) as u64 == rest
+    }
+
+    /// `None` when the body came whole with the header or right after it
+    /// (as `rest_ready`), or is malformed: it is read as usual then.
+    #[cold]
+    #[inline(never)]
+    async fn chunked<S: ConnIo>(
+        stream: &S,
+        initial: &[u8],
+        max_body: u64,
+        body_buffer: u64,
+        mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    ) -> Option<(crate::request_feed::BodyFeed, Box<BodyPump>)> {
+        match chunked_in_buffer(initial, timer.as_mut()).await {
+            Err(ChunkedBodyError::Ended) => {}
+            _ => return None,
+        }
+        let mut peek = vec![0u8; body_buffer as usize];
+        let n = stream.peek_ready(&mut peek);
+        if n > 0 {
+            let mut joined = initial.to_vec();
+            joined.extend_from_slice(&peek[..n]);
+            match chunked_in_buffer(&joined, timer).await {
+                Err(ChunkedBodyError::Ended) => {}
+                _ => return None,
+            }
+        }
+        let feed = crate::request_feed::BodyFeed::new(true);
+        let pump = Box::new(BodyPump {
+            feed: feed.clone(),
+            preread: bytes::Bytes::new(),
+            rest: PumpRest::Chunked {
+                initial: initial.to_vec(),
+                max_body,
+            },
+        });
+        Some((feed, pump))
+    }
+
+    fn preread(&self) -> bytes::Bytes {
+        self.preread.clone()
+    }
+}
+
+/// A chunked body's data, to the proxy as it is decoded (#134).
+struct FeedSink<'a> {
+    feed: &'a crate::request_feed::BodyFeed,
+    len: u64,
+}
+
+impl super::connection::ChunkSink for FeedSink<'_> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    async fn put(&mut self, data: &[u8]) -> bool {
+        self.len += data.len() as u64;
+        self.feed.put(data.to_vec()).await;
+        true
+    }
+}
+
+/// Read the rest of the client's body into the feed, under
+/// `client_body_timeout` per read. Reads stop at the body's end, so a
+/// pipelined request isn't consumed (a chunked body's over-read comes
+/// back in `Done`).
+async fn pump_body<S: ConnIo>(
+    stream: &mut S,
+    feed: &crate::request_feed::BodyFeed,
+    preread: bytes::Bytes,
+    rest: PumpRest,
+    body_timeout: Duration,
+) -> PumpEnd {
+    use crate::request_feed::FeedError;
+    if !preread.is_empty() {
+        feed.put(preread.to_vec()).await;
+    }
+    // Armed by each read; a fresh one would never be polled (with_timeout).
+    let mut timer = std::pin::pin!(monoio::time::sleep(Duration::from_secs(3600)));
+    match rest {
+        PumpRest::Length(mut left) => {
+            while left > 0 {
+                let want = left.min(64 * 1024) as usize;
+                let Some((res, piece)) = with_timeout(
+                    timer.as_mut(),
+                    body_timeout,
+                    stream.read(Vec::with_capacity(want)),
+                )
+                .await
+                else {
+                    feed.finish(Err(FeedError::TimedOut));
+                    return PumpEnd::Unfinished;
+                };
+                match res {
+                    Ok(n) if n > 0 => {
+                        left -= n as u64;
+                        feed.put(piece).await;
+                    }
+                    _ => {
+                        feed.finish(Err(FeedError::Invalid));
+                        return PumpEnd::Unfinished;
+                    }
+                }
+            }
+            feed.finish(Ok(()));
+            PumpEnd::Done(Vec::new())
+        }
+        PumpRest::Chunked { initial, max_body } => {
+            let mut sink = FeedSink { feed, len: 0 };
+            match read_chunked_request_body(
+                stream,
+                &initial,
+                max_body,
+                Some(&mut sink),
+                timer.as_mut(),
+                body_timeout,
+            )
+            .await
+            {
+                Ok(body) => {
+                    feed.finish(Ok(()));
+                    PumpEnd::Done(body.pipelined_tail)
+                }
+                Err(e) => {
+                    feed.finish(Err(match e {
+                        ChunkedBodyError::TooLarge => FeedError::TooLarge,
+                        _ => FeedError::Invalid,
+                    }));
+                    PumpEnd::Unfinished
+                }
+            }
+        }
+    }
+}
+
+/// `settle_proxy_response` while the client's body is still read and sent
+/// upstream (#134). Not proxied: the body is dropped after the response.
+#[allow(clippy::too_many_arguments)]
+async fn settle_unbuffered<S: ConnIo>(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    response: Response,
+    process_meta: phase::ProcessMeta,
+    stream: &mut S,
+    pump: Box<BodyPump>,
+    body_timeout: Duration,
+) -> (Response, phase::ProcessMeta, PumpEnd) {
+    use std::future::Future;
+    let BodyPump {
+        feed,
+        preread,
+        rest,
+    } = *pump;
+    if !matches!(response, Response::Proxy(_)) {
+        let left = match rest {
+            PumpRest::Length(left) => Some(left),
+            PumpRest::Chunked { .. } => None,
+        };
+        return (response, process_meta, PumpEnd::Discard(left));
+    }
+    // The client isn't watched meanwhile: the reads see it go.
+    let mut settle = std::pin::pin!(settle_proxy_response(
+        http,
+        ctx,
+        url_scratch,
+        response,
+        process_meta,
+        None
+    ));
+    let mut read = std::pin::pin!(pump_body(stream, &feed, preread, rest, body_timeout));
+    let mut end = None;
+    let (response, process_meta) = std::future::poll_fn(|cx| {
+        if end.is_none()
+            && let std::task::Poll::Ready(e) = read.as_mut().poll(cx)
+        {
+            end = Some(e);
+        }
+        settle.as_mut().poll(cx)
+    })
+    .await;
+    (response, process_meta, end.unwrap_or(PumpEnd::Unfinished))
+}
+
 #[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) async fn handle<S: ConnIo>(
     stream: &mut S,
@@ -5529,8 +5768,8 @@ pub(crate) async fn handle<S: ConnIo>(
                             // `$request_id`, one for the request (#487).
                             let request_id = super::draw_request_id(http);
                             macro_rules! request_ctx {
-                                ($body:expr, $body_len:expr, $body_file:expr, $request_length:expr,
-                                 $epoch_secs:expr, $epoch_ms:expr) => {
+                                ($body:expr, $body_len:expr, $body_file:expr, $body_feed:expr,
+                             $request_length:expr, $epoch_secs:expr, $epoch_ms:expr) => {
                                     phase::RequestCtx {
                                         method,
                                         method_bytes,
@@ -5563,6 +5802,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         body: $body,
                                         body_len: $body_len,
                                         body_file: $body_file,
+                                        body_feed: $body_feed,
                                         tls,
                                         conn,
                                         refuse,
@@ -5591,6 +5831,9 @@ pub(crate) async fn handle<S: ConnIo>(
                             let mut continue_status = None;
                             // The routed location's client_body_timeout (#147).
                             let mut body_timeout = timeouts.body;
+                            // `proxy_request_buffering off` there (#134), with
+                            // its proxy_http_version.
+                            let mut unbuffered: Option<u8> = None;
                             // What the access phase did before the read (#855).
                             let mut access_first: Option<Box<AccessFirst>> = None;
                             // A chunked body whose framing was bad, once the
@@ -5607,6 +5850,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     &phase::NO_BODY,
                                     cl,
                                     None,
+                                    None,
                                     req.consumed as u64 + cl,
                                     0,
                                     0
@@ -5621,6 +5865,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     discard_body = first.discard;
                                     continue_status = first.continue_status;
                                     body_timeout = first.body_timeout;
+                                    unbuffered = first.unbuffered;
                                     body_buffer = first.buffer;
                                     body_temp = first.body_temp.unwrap_or(body_temp);
                                     max_body = match first.max {
@@ -5743,6 +5988,11 @@ pub(crate) async fn handle<S: ConnIo>(
                             // read and dropped after it (#627). `u64::MAX`: a
                             // chunked one, whose end isn't known.
                             let mut pending_discard: Option<PendingDiscard> = None;
+                            // A body sent upstream as it comes (#134): the
+                            // proxy reads it from `body_feed`, the rest of it
+                            // read from the client by `pump`.
+                            let mut body_feed: Option<crate::request_feed::BodyFeed> = None;
+                            let mut pump: Option<Box<BodyPump>> = None;
                             let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some()
                             {
                                 (0, 0)
@@ -5765,6 +6015,22 @@ pub(crate) async fn handle<S: ConnIo>(
                                                     Some(PendingDiscard::Length(rest));
                                             }
                                         }
+                                        break 'read (take, cl);
+                                    }
+                                    if unbuffered.is_some()
+                                        && cl > take as u64
+                                        && !BodyPump::rest_ready(
+                                            stream,
+                                            cl - take as u64,
+                                            body_buffer,
+                                        )
+                                    {
+                                        let (feed, rest) = BodyPump::length(
+                                            &buf[body_start..body_start + take],
+                                            cl - take as u64,
+                                        );
+                                        body_feed = Some(feed);
+                                        pump = Some(rest);
                                         break 'read (take, cl);
                                     }
                                     if !sink.extend(&buf[body_start..body_start + take]) {
@@ -5861,6 +6127,21 @@ pub(crate) async fn handle<S: ConnIo>(
                                         return false;
                                     }
                                 }
+                            } else if req.transfer_encoding_chunked
+                                && unbuffered == Some(1)
+                                && let Some((feed, rest)) = Box::pin(BodyPump::chunked(
+                                    stream,
+                                    &buf[base + req.consumed..filled],
+                                    max_body,
+                                    body_buffer,
+                                    io_timer.as_mut(),
+                                ))
+                                .await
+                            {
+                                body_feed = Some(feed);
+                                pump = Some(rest);
+                                let came = filled - (base + req.consumed);
+                                (came, came as u64)
                             } else if req.transfer_encoding_chunked {
                                 let body_start = base + req.consumed;
                                 let initial = &buf[body_start..filled];
@@ -5909,7 +6190,9 @@ pub(crate) async fn handle<S: ConnIo>(
                                 request_body_len.max(max_body.saturating_add(1))
                             } else if body_malformed {
                                 phase::MALFORMED_BODY
-                            } else if discard_body && req.content_length.is_some() {
+                            } else if (discard_body || pump.is_some())
+                                && req.content_length.is_some()
+                            {
                                 request_body_len
                             } else {
                                 sink.len()
@@ -5930,7 +6213,10 @@ pub(crate) async fn handle<S: ConnIo>(
                             // instead of a copy (#289); the buffer goes back to
                             // the pool when the last holder is done.
                             let body_vec = if body_vec.is_empty() {
-                                bytes::Bytes::new()
+                                // A body sent as it comes (#134): `$request_body`
+                                // is what came with the header.
+                                pump.as_deref()
+                                    .map_or_else(bytes::Bytes::new, BodyPump::preread)
                             } else {
                                 bytes::Bytes::from_owner(body_vec)
                             };
@@ -5959,6 +6245,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                 &body_vec,
                                 body_len,
                                 body_file,
+                                body_feed.as_ref(),
                                 request_length,
                                 epoch_secs,
                                 epoch_ms
@@ -6007,7 +6294,36 @@ pub(crate) async fn handle<S: ConnIo>(
                             // Only a proxied response has anything to settle;
                             // the call would move `process_meta` (~1 KB) in
                             // and out for nothing.
-                            let mut response = if matches!(response, Response::Proxy(_)) {
+                            let mut response = if let Some(rest) = pump.take() {
+                                // A body still to come (#134): sent upstream as
+                                // it comes, or dropped after the response.
+                                let (response, settled_meta, end) = Box::pin(settle_unbuffered(
+                                    http,
+                                    &ctx,
+                                    &mut *url_scratch,
+                                    response,
+                                    process_meta,
+                                    stream,
+                                    rest,
+                                    body_timeout,
+                                ))
+                                .await;
+                                process_meta = settled_meta;
+                                match end {
+                                    PumpEnd::Done(tail) => pipelined_tail = tail,
+                                    PumpEnd::Discard(rest) => {
+                                        pending_discard = Some(match rest {
+                                            Some(left) => PendingDiscard::Length(left),
+                                            None => PendingDiscard::Chunked {
+                                                from: base + req.consumed,
+                                            },
+                                        })
+                                    }
+                                    // Where the next request starts isn't known.
+                                    PumpEnd::Unfinished => process_meta.keepalive.allow = false,
+                                }
+                                response
+                            } else if matches!(response, Response::Proxy(_)) {
                                 let (response, settled_meta) = settle_proxy_response(
                                     http,
                                     &ctx,

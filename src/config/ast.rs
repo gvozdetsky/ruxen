@@ -204,6 +204,8 @@ pub struct ProxyConf {
     pub set_headers: Option<Vec<ProxySetHeader>>,
     pub pass_request_headers: Option<bool>,
     pub pass_request_body: Option<bool>,
+    /// `proxy_request_buffering` (#134).
+    pub request_buffering: Option<bool>,
     /// `proxy_set_body`: the body sent upstream instead of the client's.
     pub set_body: Option<Vec<ValuePart>>,
     /// `proxy_ignore_headers`, lowercased.
@@ -413,6 +415,7 @@ impl ProxyConf {
             set_headers: self.set_headers.or_else(|| parent.set_headers.clone()),
             pass_request_headers: self.pass_request_headers.or(parent.pass_request_headers),
             pass_request_body: self.pass_request_body.or(parent.pass_request_body),
+            request_buffering: self.request_buffering.or(parent.request_buffering),
             set_body: self.set_body.or_else(|| parent.set_body.clone()),
             ignore_headers: self
                 .ignore_headers

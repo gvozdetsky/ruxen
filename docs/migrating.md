@@ -168,18 +168,6 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
   clients need TLS 1.0.
 - **Issue:** none; [#36] (closed) made the old names a warning.
 
-### `proxy_request_buffering off`
-
-- **ruxen:** reads the whole request body before it connects to the
-  upstream, spilling to `client_body_temp_path` beyond
-  `client_body_buffer_size`, as nginx does with the default `on`.
-- **Matters:** for large uploads: the upstream sees the body only once it
-  is complete, and the disk holds it meanwhile. Applications that read a
-  body as it streams in (progress, early rejection) wait.
-- **Do:** room in `client_body_temp_path` and a `client_max_body_size`
-  that fits; keep nginx for upload endpoints that need streaming.
-- **Issue:** [#134] (open).
-
 ### `alias` and the trailing slash
 
 `location /static { alias /srv/static/; }`: only one of them ends with `/`.
@@ -448,7 +436,6 @@ start without it.
   `/etc/ruxen/ruxen.conf`.
 
 [#36]: https://github.com/gvozdetsky/ruxen/issues/36
-[#134]: https://github.com/gvozdetsky/ruxen/issues/134
 [#337]: https://github.com/gvozdetsky/ruxen/issues/337
 [#463]: https://github.com/gvozdetsky/ruxen/issues/463
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464

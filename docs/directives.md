@@ -424,7 +424,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_store` | accepted, differs | any | proxied responses are not stored |
 | `proxy_store_access` | accepted, no effect | any |  |
 | `proxy_buffering` | accepted, differs | any | ruxen relays a response as it arrives either way (#88, #463) |
-| `proxy_request_buffering` | accepted, differs | any | request bodies are still read whole before they are proxied (#134) |
+| `proxy_request_buffering` | yes | http, server, location |  |
 | `proxy_ignore_client_abort` | yes | http, server, location |  |
 | `proxy_bind` | yes | http, server, location |  |
 | `proxy_socket_keepalive` | accepted, no effect | any |  |
