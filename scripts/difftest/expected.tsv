@@ -8,6 +8,5 @@ upstream	^upstream connection: only ruxen sends it			-> close$	#582: ruxen sends
 header	value differs		 416$	^(.*) \| \1 -> \1$	nginx's range filter turns the 200 into a 416 after the header filters ran: `add_header … always` headers come twice; ruxen sends them once
 header	ruxen doesn't send it		 416$		nginx's range filter turns the 200 into a 416 after the header filters ran: the 200's `add_header`/`expires` headers stay on the 416; ruxen's 416 has only the `always` ones
 			frag	#.* -> [^#]*$	#748: ruxen drops a #fragment nginx keeps in $request_uri and the proxied request line
-			leading-crlf		#778: an empty line before the request line is a 400
 status	^status: nginx 400, ruxen		absolute-uri.* 400$		#781: an absolute-form HTTP/1.1 request without Host is served
-			version:0\.9		#784: an HTTP/0.9 request waits for client_header_timeout
+			version:0\.9		#784: ruxen refuses HTTP/0.9 with a 400 at once; nginx answers with the body alone, by design
