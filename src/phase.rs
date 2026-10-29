@@ -1534,6 +1534,18 @@ fn process_with_meta_inner(
                 }
                 return (Response::Proxy(plan), meta);
             }
+            // `add_trailer` on a file too big to be read into the response
+            // (#844): the worker sends it chunked, the trailers after it,
+            // as for a cache hit.
+            Response::File { headers, body } if !loc_add_trailers.is_empty() => {
+                meta.proxy_add_trailers = loc_add_trailers;
+                meta.proxy_chunked_transfer_encoding = loc_chunked_te;
+                let headers = crate::worker::expect_file_trailers(headers, req, &mut meta);
+                if rewrite_state.worth_keeping() || rewrite_state.has_numbered_captures() {
+                    keep_rewrite_state(&mut meta, rewrite_state);
+                }
+                return (Response::File { headers, body }, meta);
+            }
             other => {
                 if rewrite_state.worth_keeping() {
                     keep_rewrite_state(&mut meta, rewrite_state);
