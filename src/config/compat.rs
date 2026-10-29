@@ -298,11 +298,18 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "not applied at this level (ruxen reads it in server and location only)",
         "chunked_transfer_encoding",
     ),
+    // `aio threads` is implemented and not a finding.
     (
-        "proxy_request_buffering",
-        Some("on"),
-        "request bodies are still read whole before they are proxied (#134)",
-        "proxy_request_buffering-off",
+        "aio",
+        Some("off"),
+        "no Linux native AIO: file reads block the worker, as with `aio off`; `aio threads` moves them off it",
+        "aio-on-and-aio_write-on",
+    ),
+    (
+        "aio_write",
+        Some("off"),
+        "proxy_cache files are still written on the worker (#526)",
+        "aio-on-and-aio_write-on",
     ),
     (
         "proxy_store",
@@ -320,7 +327,7 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
     (
         "ssl_conf_command",
         None,
-        "OpenSSL commands are not applied: ruxen's TLS is rustls",
+        "OpenSSL commands are not applied, but for `Options KTLS`: ruxen's TLS is rustls",
         "ssl_conf_command",
     ),
     ("http3", None, NO_HTTP3, "http3-and-quic"),
@@ -594,6 +601,27 @@ mod tests {
     }
 
     #[test]
+    fn aio_threads_is_honoured_and_aio_on_differs() {
+        let (found, res) = findings(
+            "thread_pool p threads=2; http { aio threads=p; aio_write on; server { aio on; \
+             location / { aio off; } } }",
+        );
+        assert!(res.is_ok(), "{res:?}");
+        let got: Vec<(Severity, &str)> = found
+            .iter()
+            .map(|f| (f.severity, f.directive.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Severity::Differs, "aio_write on"),
+                (Severity::Differs, "aio on"),
+                (Severity::Ignored, "aio off"),
+            ]
+        );
+    }
+
+    #[test]
     fn unenforced_restrictions_are_unsupported() {
         let (found, _) = findings("http { server { location $arg_x { return 403; } } }");
         assert_eq!(found.len(), 1, "{found:?}");
@@ -652,7 +680,7 @@ mod tests {
     #[test]
     fn the_report_links_each_section_once() {
         let (found, _) = findings(
-            "http { server { location / { proxy_request_buffering off; fastcgi_pass x; \
+            "http { server { location / { proxy_store on; fastcgi_pass x; \
              uwsgi_pass y; } } }",
         );
         let out = report(
@@ -669,7 +697,7 @@ mod tests {
             links,
             [
                 format!("{GUIDE}#fastcgi-uwsgi-scgi-memcached"),
-                format!("{GUIDE}#proxy_request_buffering-off"),
+                format!("{GUIDE}#proxy_store"),
                 format!("{GUIDE}#variables-that-are-always-empty"),
             ],
             "{out}"

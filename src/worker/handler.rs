@@ -199,10 +199,8 @@ pub(crate) fn finalize_location_response(
                 };
                 out = inject_add_headers(out, add_headers, &ctx);
             }
-            // `add_trailer` against a streamed file body would require the
-            // worker to wrap the body in chunked encoding on the way out;
-            // the static-file path doesn't support that today. Quietly skip
-            // — the directive is rare on static content anyway.
+            // `add_trailer`: the worker sends the file chunked, the
+            // trailers after it (`phase`, #844).
             if status == 204 {
                 // `error_page … =204`: header-only, the file isn't sent.
                 return Response::Owned(out);
@@ -286,6 +284,23 @@ fn dynamic_client_config(
         .map_err(|e| crate::fs_resolve::note_failed_lookup(e, false))
 }
 
+/// `early_hints` (#848): a condition holds (ngx_http_test_predicates) and
+/// the client takes a 103 (ngx_http_early_hints_filter: HTTP/1.1 on).
+#[cold]
+#[inline(never)]
+fn early_hints(
+    conditions: &[&[PreparedValuePart]],
+    req: &phase::RequestCtx<'_>,
+    ctx: &RenderCtx<'_>,
+) -> Option<std::rc::Rc<crate::proxy::EarlyHints>> {
+    let holds = conditions.iter().any(|parts| {
+        let mut value = Vec::new();
+        render_parts(parts, ctx, &mut value);
+        !value.is_empty() && value != b"0"
+    });
+    (holds && req.http_11).then(std::rc::Rc::default)
+}
+
 /// The client framed a body (even an empty one): it sent Content-Length
 /// or Transfer-Encoding. nginx's `content_length_n` is -1 otherwise. A
 /// proxied GET without a body asks, so the scan is cheap: line starts by
@@ -336,6 +351,20 @@ fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// The request's `sticky` (#600). Out of line: only upstreams with one.
+#[cold]
+#[inline(never)]
+fn sticky_for_request(
+    conf: &'static crate::upstream_sticky::Sticky,
+    ctx: &RenderCtx<'_>,
+) -> Box<crate::upstream_sticky::StickyReq> {
+    crate::upstream_sticky::StickyReq::new(conf, |parts| {
+        let mut out = Vec::new();
+        render_parts(parts, ctx, &mut out);
+        out
+    })
+}
+
 /// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
 /// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
 /// a request line split in two (#541).
@@ -361,9 +390,10 @@ fn cache_plan(
     ctx: &RenderCtx<'_>,
     request_uri: &[u8],
     host_header: &[u8],
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<Option<Box<crate::proxy::CachePlan>>, ()> {
-    use crate::proxy::{CacheHit, CachePlan};
-    use crate::proxy_cache::{CacheStatus, Entry, Lookup};
+    use crate::proxy::CachePlan;
+    use crate::proxy_cache::CacheStatus;
     // proxy_cache_methods: GET and HEAD always.
     if !matches!(req.method, Method::Get | Method::Head)
         && !(conf.methods_post && req.method_bytes == b"POST")
@@ -406,8 +436,6 @@ fn cache_plan(
         }
     }
     let main = crate::proxy_cache::hash_key(&key);
-    let mut hash = main;
-    let mut secondary = false;
     // ngx_http_test_predicates: a condition holds when it renders
     // non-empty and not "0".
     let holds = |conditions: &[&[PreparedValuePart]]| {
@@ -418,186 +446,66 @@ fn cache_plan(
         })
     };
     let no_cache = holds(conf.no_cache);
-    let mut status = CacheStatus::Miss;
-    let mut hit = None;
-    let mut stale = None;
-    let mut store = !no_cache;
-    // nginx's NGX_HTTP_CACHE_SCARCE: below proxy_cache_min_uses.
-    let mut cacheable = true;
-    let mut token = None;
-    let mut wait_until = None;
-    let mut background = false;
-    let mut stale_error = false;
-    if holds(conf.bypass) {
-        // The response still refreshes the cache.
-        status = CacheStatus::Bypass;
-    } else {
-        let now = crate::proxy_cache::now_secs();
-        let headers = req.headers_raw;
-        // ngx_http_file_cache_reopen: the main key holds a response stored
-        // for another variant (its `Vary` names headers this request has
-        // other values of), so the lookup goes on at the request's own
-        // variant's key, once.
-        loop {
-            let path = || zone.file_path(&hash);
-            let mut other = None;
-            match zone.lookup(&hash, conf.min_uses, now) {
-                Lookup::Error(code) => {
-                    status = CacheStatus::Hit;
-                    hit = Some(CacheHit::Error(code));
-                }
-                Lookup::Hit => match Entry::read(&path(), &key) {
-                    Some(entry) => match entry.other_variant(&main, headers) {
-                        None => {
-                            status = CacheStatus::Hit;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                        variant => other = variant,
-                    },
-                    None => zone.forget_file(&hash),
-                },
-                Lookup::Stale {
-                    token: updater,
-                    stale_updating,
-                    stale_error: covered,
-                } => {
-                    // ngx_http_upstream_cache: STALE (this request updates)
-                    // or UPDATING (another one does).
-                    token = updater;
-                    stale_error = covered;
-                    let serve_stale = conf.use_stale.updating || stale_updating;
-                    // Read only when something may answer with it; else
-                    // only its header, for the variant.
-                    let entry = if serve_stale || covered || conf.revalidate || conf.use_stale.any()
-                    {
-                        Entry::read(&path(), &key)
-                    } else {
-                        other =
-                            crate::proxy_cache::stored_other_variant(&path(), &key, &main, headers);
-                        None
-                    };
-                    if let Some(e) = &entry {
-                        other = e.other_variant(&main, headers);
-                    }
-                    match entry {
-                        _ if other.is_some() => {}
-                        Some(entry)
-                            if serve_stale && updater.is_some() && conf.background_update =>
-                        {
-                            status = CacheStatus::Stale;
-                            hit = Some(CacheHit::Entry(entry));
-                            background = true;
-                        }
-                        Some(entry) if serve_stale && updater.is_none() => {
-                            status = CacheStatus::Updating;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                        // Fetched again; kept to revalidate with, or to
-                        // answer with if the upstream fails
-                        // (proxy_cache_use_stale).
-                        entry => {
-                            status = CacheStatus::Expired;
-                            stale = entry;
-                        }
-                    }
-                }
-                Lookup::Miss {
-                    store: enough,
-                    probe,
-                } => {
-                    store &= enough;
-                    cacheable = enough;
-                    // A file from before a restart (nginx's cold cache).
-                    if probe && let Some(entry) = Entry::read(&path(), &key) {
-                        zone.adopt(&hash, &entry);
-                        store = !no_cache;
-                        cacheable = true;
-                        other = entry.other_variant(&main, headers);
-                        if other.is_some() {
-                        } else if entry.valid_sec < now {
-                            status = CacheStatus::Expired;
-                            stale = Some(entry);
-                        } else {
-                            status = CacheStatus::Hit;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                    }
-                    // proxy_cache_lock: one request fetches a missing
-                    // response, the others wait for it.
-                    if other.is_none() && status == CacheStatus::Miss && store && conf.lock {
-                        match zone.try_lock(&hash, conf.lock_age_ms) {
-                            Some(lock) => token = Some(lock),
-                            None if conf.lock_timeout_ms == 0 => store = false,
-                            None => {
-                                wait_until = Some(
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_millis(conf.lock_timeout_ms),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            // A variant's key holding yet another variant is a miss, as
-            // nginx's "incorrect vary hash".
-            let Some(variant) = other.filter(|_| !secondary) else {
-                break;
-            };
-            if let Some(t) = token.take() {
-                zone.release(&hash, t);
-            }
-            hash = variant;
-            secondary = true;
-            status = CacheStatus::Miss;
-            store = !no_cache;
-            cacheable = true;
-            stale_error = false;
-        }
-    }
-    // ngx_http_upstream_cache_check_range: a range from too far into the
-    // response isn't worth fetching it whole for the cache; it goes
-    // upstream as asked, and nothing is stored. A `proxy_cache_lock` taken
-    // stays with the request, released when it ends, as nginx's (#864).
-    if hit.is_none()
-        && cacheable
-        && let Some(max) = conf.max_range_offset
-        && let Some(range) = req.range
-        && range_too_far(range, max)
-    {
-        cacheable = false;
-        store = false;
-    }
-    Ok(Some(Box::new(CachePlan {
+    let mut plan = Box::new(CachePlan {
         conf,
         zone,
         main,
-        hash,
-        secondary,
-        status,
-        store,
-        cacheable,
-        // A hit needs neither, unless it is updated in the background, or
-        // the request is conditional (the not-modified check, #349).
-        request_headers: if hit.is_some()
-            && !background
-            && req.if_none_match.is_none()
-            && req.if_modified_since.is_none()
-            && req.if_match.is_none()
-            && req.if_unmodified_since.is_none()
-        {
-            Vec::new()
-        } else {
-            req.headers_raw.to_vec()
-        },
+        hash: main,
+        secondary: false,
+        status: CacheStatus::Miss,
+        store: !no_cache,
+        // nginx's NGX_HTTP_CACHE_SCARCE: below proxy_cache_min_uses.
+        cacheable: true,
+        request_headers: Vec::new(),
         key,
-        hit,
-        stale,
+        hit: None,
+        stale: None,
         head_as_get: conf.convert_head && matches!(req.method, Method::Head),
-        token,
-        wait_until,
-        background,
-        stale_error,
-    })))
+        token: None,
+        wait_until: None,
+        background: false,
+        stale_error: false,
+        aio,
+        unread: false,
+        unread_stale: None,
+    });
+    // ngx_http_upstream_cache_check_range: a range from too far into the
+    // response isn't worth fetching it whole for the cache; it goes
+    // upstream as asked, and nothing is stored.
+    let far = conf
+        .max_range_offset
+        .zip(req.range)
+        .is_some_and(|(max, range)| range_too_far(range, max));
+    if holds(conf.bypass) {
+        // The response still refreshes the cache.
+        plan.status = CacheStatus::Bypass;
+    } else {
+        // `aio threads`: the file is read in `run_proxy`, after the request
+        // is built, unless the lookup may still shape it: a stale entry's
+        // validators, a variant below `min_uses` (not cacheable: the
+        // client's conditions and range go upstream), a far range.
+        let defer = aio.is_some() && !far && !conf.revalidate && conf.min_uses <= 1;
+        plan.lookup(req.headers_raw, no_cache, defer);
+    }
+    // A `proxy_cache_lock` taken stays with the request, released when it
+    // ends, as nginx's (#864).
+    if far && plan.hit.is_none() && plan.cacheable {
+        plan.cacheable = false;
+        plan.store = false;
+    }
+    // A hit needs them only if it is updated in the background, or the
+    // request is conditional (the not-modified check, #349); an unread
+    // one, for its variant.
+    if !(plan.hit.is_some()
+        && !plan.background
+        && req.if_none_match.is_none()
+        && req.if_modified_since.is_none()
+        && req.if_match.is_none()
+        && req.if_unmodified_since.is_none())
+    {
+        plan.request_headers = req.headers_raw.to_vec();
+    }
+    Ok(Some(plan))
 }
 
 pub(crate) fn forward_client_headers<'a>(
@@ -778,11 +686,7 @@ pub(crate) fn finish_access_denial(
         rewrite_state,
         server_name_captures,
     );
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    if body_limit > 0 && req.body_len > body_limit && !in_error_page && error_page_status.is_none()
-    {
+    if req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none() {
         return entity_too_large(
             &loc,
             req,
@@ -932,13 +836,8 @@ pub(crate) fn run_location_handler(
     // nginx's default client_max_body_size is 1m; `0` turns the check off.
     // Not again on the way to an error page: nginx has discarded the body
     // by then (`!r->discard_body` in ngx_http_core_find_config_phase).
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    let too_large = body_limit > 0
-        && req.body_len > body_limit
-        && !in_error_page
-        && error_page_status.is_none();
+    let too_large =
+        req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none();
 
     let render_ctx_base = location_render_ctx(
         http,
@@ -998,7 +897,9 @@ pub(crate) fn run_location_handler(
                 }
             },
         };
-        let upstream = variable.as_ref().map_or(proxy.upstream, |v| v.upstream);
+        let upstream = crate::upstream::UpstreamRef::current(
+            variable.as_ref().map_or(proxy.upstream, |v| v.upstream),
+        );
         let host_header: &[u8] = variable
             .as_ref()
             .map_or(proxy.host_header, |v| &v.host_header);
@@ -1079,7 +980,14 @@ pub(crate) fn run_location_handler(
         // `proxy_cache` (#233): what the cache has for this request.
         let cache = match proxy.cache {
             Some(conf) => {
-                match cache_plan(conf, req, &proxy_render_ctx, request_uri, host_header) {
+                match cache_plan(
+                    conf,
+                    req,
+                    &proxy_render_ctx,
+                    request_uri,
+                    host_header,
+                    loc.aio,
+                ) {
                     Ok(cache) => cache,
                     Err(()) => return crate::worker::internal_error_response(req.method),
                 }
@@ -1091,7 +999,7 @@ pub(crate) fn run_location_handler(
         // 502 and reports `no live upstreams` for the error log. A cache
         // hit needs none.
         let mut hash = crate::upstream::HashPick::for_request(
-            upstream,
+            &upstream,
             |key| {
                 let mut out = Vec::new();
                 render_parts(key, &render_ctx_base, &mut out);
@@ -1099,13 +1007,26 @@ pub(crate) fn run_location_handler(
             },
             render_ctx_base.remote_addr,
         );
+        let sticky = upstream
+            .sticky
+            .map(|conf| sticky_for_request(conf, &render_ctx_base));
         let initial_peer = if cache
             .as_ref()
-            .is_some_and(|c| c.hit.is_some() && !c.background)
+            .is_some_and(|c| (c.hit.is_some() && !c.background) || c.unread)
         {
             None
         } else {
-            crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+            match sticky.as_deref() {
+                None => {
+                    crate::upstream::pick_peer(&upstream, &Default::default(), hash.as_deref_mut())
+                }
+                Some(st) => crate::upstream::pick_peer_sticky(
+                    &upstream,
+                    &Default::default(),
+                    hash.as_deref_mut(),
+                    &st.hint,
+                ),
+            }
         };
 
         // Build the final header set: proxy_set_header overrides first
@@ -1137,13 +1058,19 @@ pub(crate) fn run_location_handler(
         }
         if !have_host_override {
             overrides_buf.insert(0, (b"Host", host_header.to_vec()));
+            if proxy.http_version == 2 {
+                // Sent as `:authority` (`upstream_h2`); the empty `Host`
+                // still keeps the client's out.
+                let host = std::mem::take(&mut overrides_buf[0].1);
+                overrides_buf.insert(0, (b":authority", host));
+            }
         }
 
-        // Pool eligibility: HTTP/1.1 + the upstream block has a keepalive
-        // pool (every `upstream {}` block unless `keepalive 0;`). Drives
-        // both the Connection-header default below and `run_proxy`'s
+        // Pool eligibility: HTTP/1.1 or HTTP/2 + the upstream block has a
+        // keepalive pool (every `upstream {}` block unless `keepalive 0;`).
+        // Drives both the Connection-header default below and `run_proxy`'s
         // pool-release decision.
-        let pool_eligible = proxy.http_version == 1 && upstream.keepalive_max_idle.is_some();
+        let pool_eligible = proxy.http_version != 0 && upstream.keepalive_max_idle.is_some();
 
         // nginx 1.29.7 sends no Connection header by default
         // (ngx_http_proxy_headers). Over HTTP/1.1 with no pool to take the
@@ -1191,13 +1118,22 @@ pub(crate) fn run_location_handler(
             render_parts(parts, &proxy_render_ctx, &mut body);
             body
         });
+        // `proxy_request_buffering off` (#134): the body goes from the
+        // feed, what came with the header included, as the client sends
+        // it. Once a pass sent some, there is none for another.
+        let body_feed = req
+            .body_feed
+            .filter(|f| set_body.is_none() && proxy.pass_request_body && !f.started());
         let forward_body: &[u8] = match &set_body {
             Some(body) => body,
+            None if body_feed.is_some() => &[],
             None if proxy.pass_request_body => req.body,
             None => &[],
         };
         let forward_len = match &set_body {
             Some(body) => body.len() as u64,
+            None if body_feed.is_some_and(|f| f.chunked()) => 0,
+            None if body_feed.is_some() => req.body_len,
             None if proxy.pass_request_body && req.body_file.is_some() => req.body_len,
             // A body dropped unread (discarded, or over the limit, on the
             // way to an error page) has a length and no bytes: none go
@@ -1220,7 +1156,9 @@ pub(crate) fn run_location_handler(
         // client framed a body (a Content-Length, a chunked body, an
         // HTTP/2 stream with DATA) or `proxy_set_body` gave one, whatever
         // the method; a request without body framing has none (#493).
-        if !have_content_length_override {
+        if body_feed.is_some_and(|f| f.chunked()) {
+            overrides_buf.push((b"Transfer-Encoding", b"chunked".to_vec()));
+        } else if !have_content_length_override {
             if forward_len > 0 {
                 overrides_buf.push((b"Content-Length", forward_len.to_string().into_bytes()));
             } else if set_body.is_some() || body_framed(req.headers_raw) {
@@ -1299,10 +1237,19 @@ pub(crate) fn run_location_handler(
             for ep in loc.error_pages {
                 let mut buf = Vec::with_capacity(64);
                 render_parts(ep.target, &proxy_render_ctx, &mut buf);
+                let named_from = (buf.first() == Some(&b'@')).then(|| {
+                    Box::new(phase::NamedFrom {
+                        uri: url_path.to_vec(),
+                        args: current_args.map(<[u8]>::to_vec),
+                        unparsed_uri: rewrite_state.unparsed_uri,
+                        internal: rewrite_state.internal,
+                    })
+                });
                 rules.push(crate::proxy::InterceptRule {
                     status: ep.status,
                     action: ep.action,
                     target: buf,
+                    named_from,
                 });
             }
             Some(rules)
@@ -1342,6 +1289,12 @@ pub(crate) fn run_location_handler(
                 Some(Box::new(crate::upstream_tls::TlsPlan { config, name }))
             }
         };
+        let early_hints = if proxy.early_hints.is_empty() {
+            None
+        } else {
+            early_hints(proxy.early_hints, req, &proxy_render_ctx)
+        };
+        let pool_tag = proxy.pool_tag(&upstream);
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             tls,
@@ -1359,24 +1312,34 @@ pub(crate) fn run_location_handler(
             bad_gateway: &http.bad_gateway,
             gateway_timeout: &http.gateway_timeout,
             keepalive_eligible: pool_eligible,
-            pool_tag: proxy.pool_tag(upstream),
+            pool_tag,
             next_upstream: proxy.next_upstream,
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
             body_file,
+            body_feed: body_feed.cloned(),
             keep_upstream_headers: !loc.add_headers.is_empty()
                 || !loc.add_trailers.is_empty()
-                || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
+                || loc.access_logs.iter().any(|l| l.reads_upstream_headers)
+                || sticky
+                    .as_ref()
+                    .and_then(|s| s.conf.learn())
+                    .is_some_and(|l| l.reads_upstream),
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
             error_page_status,
             intercept,
-            upgrade: client_upgrade,
+            // No protocol switch over HTTP/2 (ngx_http_proxy_v2_module).
+            upgrade: client_upgrade && proxy.http_version != 2,
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
+            early_hints,
+            pass_trailers: proxy.pass_trailers,
+            h2: proxy.http_version == 2,
             cache,
             hash,
+            sticky,
             bind,
         }));
     }
@@ -1471,6 +1434,10 @@ pub(crate) fn run_location_handler(
                     server_bytes,
                 ),
                 fs_resolve::Outcome::Serve(opened) => {
+                    // `aio threads`: even a small body is read on the pool
+                    // (`file::inline_limit`), except under `add_trailer`,
+                    // which needs it in memory here.
+                    let aio_reads = loc.aio.is_some() && loc.add_trailers.is_empty();
                     // An error page that goes out with another status than
                     // 200 is sent whole: nginx's not_modified and range
                     // filters only act on a 200, so no 304, no 206 and no
@@ -1499,6 +1466,7 @@ pub(crate) fn run_location_handler(
                             },
                             server_bytes,
                             loc.sendfile,
+                            aio_reads,
                         );
                     }
                     // `max_ranges 0`: nginx's range filter declines, so
@@ -1543,6 +1511,7 @@ pub(crate) fn run_location_handler(
                         },
                         server_bytes,
                         loc.sendfile,
+                        aio_reads,
                     );
                     match vary_cut {
                         Some((gz, mime, size)) => {
@@ -1574,10 +1543,15 @@ pub(crate) fn run_location_handler(
                         server_bytes,
                     ))
                 }
-                fs_resolve::Outcome::Reroute(target) => {
-                    // A try_files fallback such as `/index.php?$args`
-                    // brings its own arguments: nginx's internal redirect
-                    // takes the part after `?` as the new `$args`.
+                outcome @ (fs_resolve::Outcome::Reroute(_) | fs_resolve::Outcome::Fallback(_)) => {
+                    // A try_files fallback URI brings its own arguments,
+                    // the part after `?`, and none without one
+                    // (ngx_http_try_files_module.c, ngx_http_split_args).
+                    let (target, fallback) = match outcome {
+                        fs_resolve::Outcome::Fallback(target) => (target, true),
+                        fs_resolve::Outcome::Reroute(target) => (target, false),
+                        _ => unreachable!(),
+                    };
                     let (target, args) = match target {
                         phase::RerouteTarget::Uri(mut uri) => {
                             match uri.iter().position(|&b| b == b'?') {
@@ -1586,7 +1560,7 @@ pub(crate) fn run_location_handler(
                                     uri.truncate(q);
                                     (phase::RerouteTarget::Uri(uri), Some(args))
                                 }
-                                None => (phase::RerouteTarget::Uri(uri), None),
+                                None => (phase::RerouteTarget::Uri(uri), fallback.then(Vec::new)),
                             }
                         }
                         named => (named, None),
@@ -1599,6 +1573,7 @@ pub(crate) fn run_location_handler(
                         preserved_location: None,
                         preserved_www_authenticate: Vec::new(),
                         closes: false,
+                        named_from: None,
                     });
                 }
                 fs_resolve::Outcome::NotFound => {
@@ -1767,6 +1742,19 @@ pub(crate) fn run_location_handler(
     )
 }
 
+/// The body length past which the location refuses the request: its
+/// `client_max_body_size` (`0`: none), and always a malformed body.
+#[inline]
+fn body_threshold(loc: &MatchedLocation<'static>) -> u64 {
+    match loc
+        .client_max_body_size
+        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE)
+    {
+        0 => phase::MALFORMED_BODY - 1,
+        limit => limit.min(phase::MALFORMED_BODY - 1),
+    }
+}
+
 /// A file under `gzip_static` (#760), as the `Serve` arm sends a file:
 /// `file.gz` with `Content-Encoding: gzip` (`gzip`), or the file itself,
 /// and `Vary: Accept-Encoding` with `vary` unless the gzip filter adds it.
@@ -1827,6 +1815,7 @@ fn serve_gzip_static(
         conditionals(error_status.is_none()),
         server_bytes,
         loc.sendfile,
+        loc.aio.is_some() && loc.add_trailers.is_empty(),
     );
     if let (Some(_), Some(gz)) = (range, filter)
         && gz.vary
@@ -1858,7 +1847,8 @@ fn serve_gzip_static(
 /// The 413 for a body over the location's `client_max_body_size`, sent as
 /// nginx's special response: the location's `error_page` and `add_header
 /// … always` apply (ngx_http_finalize_request(r, 413) from the find_config
-/// phase). Cold.
+/// phase); or the 400 for a malformed body, as nginx finalizes it where the
+/// location reads or discards the body (#806).
 #[cold]
 #[inline(never)]
 fn entity_too_large(
@@ -1868,12 +1858,16 @@ fn entity_too_large(
     in_error_page: bool,
     preserved_www_authenticate: &[Vec<u8>],
 ) -> Response {
-    let response = http::error_response_for_method(
-        413,
-        "Request Entity Too Large\n",
-        req.method,
-        loc.server_header,
-    );
+    let response = if req.body_len == phase::MALFORMED_BODY {
+        http::error_response_for_method(400, "Bad Request\n", req.method, loc.server_header)
+    } else {
+        http::error_response_for_method(
+            413,
+            "Request Entity Too Large\n",
+            req.method,
+            loc.server_header,
+        )
+    };
     let intercepted = maybe_intercept_error_page(
         Response::Owned(response),
         loc.error_pages,

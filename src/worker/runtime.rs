@@ -648,6 +648,51 @@ async fn log_before_routing(
     .await;
 }
 
+/// A request cut while its body was read (#866), as nginx's
+/// ngx_http_terminate_request ends it: nothing sent, 408 in the access log
+/// on `client_body_timeout`, else 400 and an `[info]` line. The location's
+/// logs, found again as before the read; `None`: nothing to log.
+#[cold]
+#[inline(never)]
+fn cut_body_logs(
+    http: &'static PreparedHttp,
+    probe: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    cut: BodyCut,
+) -> Option<(&'static [PreparedAccessLog], u16, &'static [u8])> {
+    if cut == BodyCut::Failed {
+        return None;
+    }
+    let first = phase::first_body_limit(http, probe, url_scratch, false);
+    let (error_logs, access_logs, server_port, server_name) = match &first {
+        Some(f) => (f.error_logs, f.access_logs, f.server_port, f.server_name),
+        None => {
+            let listen = &http.listens[probe.listen_index];
+            let server = &listen.servers[listen.default_server];
+            (
+                server.error_logs,
+                server.access_logs,
+                server.listen_port,
+                server.primary_server_name,
+            )
+        }
+    };
+    if cut == BodyCut::Closed {
+        write_error_log(
+            error_logs,
+            ErrorLogLevel::Info,
+            &ErrorLogRequest::new(probe, server_name),
+            b"client prematurely closed connection",
+            None,
+        );
+    }
+    let status: &'static [u8] = match cut {
+        BodyCut::TimedOut => b"HTTP/1.1 408 \r\n\r\n",
+        _ => b"HTTP/1.1 400 \r\n\r\n",
+    };
+    (!access_logs.is_empty()).then_some((access_logs, server_port, status))
+}
+
 /// How a request head ended before it was complete (#509).
 #[derive(Clone, Copy)]
 enum HeadCut<'e> {
@@ -734,6 +779,7 @@ async fn write_response_paced<S: ConnIo>(
     request_start: Instant,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<(), u64> {
     let Some(mut pacer) = Pacer::new(rate, after, request_start) else {
         return Err(0);
@@ -747,7 +793,7 @@ async fn write_response_paced<S: ConnIo>(
         return Err(n as u64);
     }
     match file_body {
-        Some(body) => stream_file(stream, body, timer, send_timeout, Some(&mut pacer))
+        Some(body) => stream_file(stream, body, timer, send_timeout, Some(&mut pacer), aio)
             .await
             .map_err(|n| len as u64 + n),
         None => Ok(()),
@@ -771,6 +817,91 @@ fn read_queued<S: ConnIo>(
     match stream.read_queued(buf)? {
         Ok(n) if n > 0 => Some(IdleRead::Read(n)),
         _ => Some(IdleRead::Close),
+    }
+}
+
+/// A connection's active session (#467): its future in a block this worker
+/// reuses, built in place. Moving a future copies all of its size (8 KiB),
+/// where building it in place writes only its captures; a fresh 8 KiB,
+/// 128-byte aligned allocation per request cost glibc ~280 instructions.
+struct Session<F> {
+    ptr: std::ptr::NonNull<F>,
+    // Drops an `F` (drop check).
+    _owns: std::marker::PhantomData<F>,
+}
+
+/// Session blocks freed on this worker, for the next sessions.
+struct SessionBlocks(Vec<(std::alloc::Layout, std::ptr::NonNull<u8>)>);
+
+impl Drop for SessionBlocks {
+    fn drop(&mut self) {
+        for (layout, ptr) in self.0.drain(..) {
+            // SAFETY: allocated with this layout by `session`.
+            unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+thread_local! {
+    static SESSION_BLOCKS: RefCell<SessionBlocks> = const { RefCell::new(SessionBlocks(Vec::new())) };
+}
+
+/// Blocks kept per worker: as many sessions as are usually active at once.
+const SESSION_BLOCKS_KEPT: usize = 16;
+
+#[inline(always)]
+fn session<F>(make: impl FnOnce() -> F) -> Session<F> {
+    let layout = std::alloc::Layout::new::<F>();
+    assert!(layout.size() > 0);
+    let block = SESSION_BLOCKS.with(|blocks| {
+        let blocks = &mut blocks.borrow_mut().0;
+        let i = blocks.iter().rposition(|(l, _)| *l == layout)?;
+        Some(blocks.swap_remove(i).1)
+    });
+    let ptr = block.unwrap_or_else(|| {
+        // SAFETY: a non-zero size.
+        let p = unsafe { std::alloc::alloc(layout) };
+        std::ptr::NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+    });
+    let ptr = ptr.cast::<F>();
+    // SAFETY: a block of `F`'s layout, which nothing else uses.
+    unsafe { ptr.as_ptr().write(make()) };
+    Session {
+        ptr,
+        _owns: std::marker::PhantomData,
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for Session<F> {
+    type Output = F::Output;
+
+    #[inline(always)]
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // SAFETY: the future stays in its block until dropped there.
+        unsafe { std::pin::Pin::new_unchecked(&mut *self.ptr.as_ptr()) }.poll(cx)
+    }
+}
+
+impl<F> Drop for Session<F> {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::new::<F>();
+        // SAFETY: written by `session`, dropped once, here.
+        unsafe { std::ptr::drop_in_place(self.ptr.as_ptr()) };
+        let block = self.ptr.cast::<u8>();
+        let kept = SESSION_BLOCKS
+            .try_with(|blocks| {
+                let blocks = &mut blocks.borrow_mut().0;
+                (blocks.len() < SESSION_BLOCKS_KEPT).then(|| blocks.push((layout, block)))
+            })
+            .ok()
+            .flatten();
+        if kept.is_none() {
+            // SAFETY: allocated with this layout.
+            unsafe { std::alloc::dealloc(block.as_ptr(), layout) };
+        }
     }
 }
 
@@ -932,6 +1063,15 @@ fn overlong_head_line(head: &[u8], max: usize, total: usize) -> Option<usize> {
         start += line.len() + 1;
     }
     None
+}
+
+/// How many CR and LF bytes `buf` starts with.
+#[cold]
+#[inline(never)]
+fn empty_lines(buf: &[u8]) -> usize {
+    buf.iter()
+        .position(|&b| b != b'\r' && b != b'\n')
+        .unwrap_or(buf.len())
 }
 
 /// Whether a header block has more than `max` lines.
@@ -1185,6 +1325,24 @@ fn authority_mismatch_log(meta: &phase::ProcessMeta, ctx: &phase::RequestCtx<'_>
     );
 }
 
+/// `run_proxy` with `early_hints` held (#848), out of line: the usual
+/// path keeps no state for it.
+#[cold]
+#[inline(never)]
+async fn proxy_with_early_hints(
+    plan: Box<crate::proxy::ProxyPlan>,
+    report: &mut crate::proxy::ProxyReport,
+    late: Option<crate::proxy::LateLimitRate<'_>>,
+    client: &mut dyn super::client_watch::WatchClient,
+    at_once: bool,
+    timeout: Duration,
+) -> Option<Response> {
+    let watch = !plan.ignore_client_abort;
+    let hints = plan.early_hints.clone()?;
+    let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, report, late));
+    super::client_watch::with_early_hints(proxy, client, watch, at_once, &hints, timeout).await
+}
+
 async fn settle_proxy_response(
     http: &'static PreparedHttp,
     ctx: &phase::RequestCtx<'_>,
@@ -1193,7 +1351,7 @@ async fn settle_proxy_response(
     process_meta: phase::ProcessMeta,
     // The client, watched while the upstream is awaited (`None`: nobody
     // waits for the answer, as for post_action).
-    client: Option<&dyn super::client_watch::WatchClient>,
+    client: Option<&mut dyn super::client_watch::WatchClient>,
 ) -> (Response, phase::ProcessMeta) {
     let Response::Proxy(plan) = response else {
         return (response, process_meta);
@@ -1214,10 +1372,6 @@ async fn settle_proxy_response(
     };
     let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
-    // nginx's ngx_http_upstream_check_broken_connection: a client that
-    // closes ends the exchange, and with it the upstream connection (the
-    // proxy future is dropped).
-    let client = client.filter(|_| !plan.ignore_client_abort);
     let late_limit_rate = plan.response.limit_rate.map(|parts| {
         let meta = &process_meta;
         move |status: u16, headers: &[u8]| {
@@ -1228,13 +1382,36 @@ async fn settle_proxy_response(
         let late = late_limit_rate
             .as_ref()
             .map(|late| late as crate::proxy::LateLimitRate<'_>);
-        let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
-        let watched = if process_meta.limit_conn_held.is_some() {
-            super::client_watch::Watched::at_once(proxy, client)
-        } else {
-            super::client_watch::Watched::new(proxy, client)
-        };
-        watched.await
+        let at_once = process_meta.limit_conn_held.is_some();
+        match client {
+            Some(client) if plan.early_hints.is_some() => {
+                let timeout = process_meta
+                    .timeouts
+                    .map_or(Duration::from_secs(60), |t| t.send);
+                Box::pin(proxy_with_early_hints(
+                    plan,
+                    &mut report,
+                    late,
+                    client,
+                    at_once,
+                    timeout,
+                ))
+                .await
+            }
+            client => {
+                // nginx's ngx_http_upstream_check_broken_connection: a
+                // client that closes ends the exchange, and with it the
+                // upstream connection (the proxy future is dropped).
+                let client = client.map(|c| &*c).filter(|_| !plan.ignore_client_abort);
+                let proxy = std::pin::pin!(crate::proxy::run_proxy(plan, &mut report, late));
+                let watched = if at_once {
+                    super::client_watch::Watched::at_once(proxy, client)
+                } else {
+                    super::client_watch::Watched::new(proxy, client)
+                };
+                watched.await
+            }
+        }
     };
     let Some(upstream_resp) = upstream_resp else {
         client_closed_log(&process_meta, ctx);
@@ -1545,10 +1722,11 @@ async fn send_relay_trailers<S: ConnIo>(
     meta: &phase::ProcessMeta,
     uri: Option<&[u8]>,
     head: &[u8],
+    upstream: &[u8],
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
 ) -> Option<u64> {
-    let out = super::response::relay_trailers(http, ctx, meta, uri, head);
+    let out = super::response::relay_trailers(http, ctx, meta, uri, head, upstream);
     let len = out.len();
     let (res, _) = write_all_timed(stream, out, len, timer, send_timeout).await;
     res.ok().map(|()| len as u64)
@@ -1579,6 +1757,7 @@ async fn send_file_trailers<S: ConnIo>(
     tc: TrailerCtx<'_, '_>,
     mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<u64, u64> {
     let head_len = head.len();
     let len = body.len;
@@ -1595,7 +1774,7 @@ async fn send_file_trailers<S: ConnIo>(
     let mut sent = n as u64;
     match gzip {
         Some(gz) => {
-            sent += stream_file_gzip(stream, body, gz, timer.as_mut(), send_timeout, false)
+            sent += stream_file_gzip(stream, body, gz, timer.as_mut(), send_timeout, false, aio)
                 .await
                 .map_err(|n| sent + n)?;
         }
@@ -1603,9 +1782,16 @@ async fn send_file_trailers<S: ConnIo>(
             let mut pacer = limit
                 .filter(|l| l.rate > 0)
                 .and_then(|l| super::Pacer::new(l.rate, l.after, request_start));
-            stream_file(stream, body, timer.as_mut(), send_timeout, pacer.as_mut())
-                .await
-                .map_err(|n| sent + n)?;
+            stream_file(
+                stream,
+                body,
+                timer.as_mut(),
+                send_timeout,
+                pacer.as_mut(),
+                aio,
+            )
+            .await
+            .map_err(|n| sent + n)?;
             sent += len;
         }
     }
@@ -1615,7 +1801,12 @@ async fn send_file_trailers<S: ConnIo>(
         Vec::new()
     };
     out.extend_from_slice(&super::response::relay_trailers(
-        tc.http, tc.ctx, tc.meta, tc.uri, head,
+        tc.http,
+        tc.ctx,
+        tc.meta,
+        tc.uri,
+        head,
+        &[],
     ));
     let n = out.len();
     let (res, _) = write_all_timed(stream, out, n, timer, send_timeout).await;
@@ -1659,7 +1850,7 @@ fn trailers_in_memory(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(0, |p| p + 4);
-    let trailers = super::response::relay_trailers(http, ctx, meta, uri, &out[..head_end]);
+    let trailers = super::response::relay_trailers(http, ctx, meta, uri, &out[..head_end], &[]);
     out.extend_from_slice(&super::response::build_single_chunk_body(&body));
     out.extend_from_slice(&trailers);
     out
@@ -1692,11 +1883,29 @@ fn trailers_due(head: &[u8], ctx: &phase::RequestCtx<'_>, meta: &phase::ProcessM
         && super::response::expects_trailers(meta.proxy_add_trailers, response_status(head))
 }
 
-/// `add_trailer` on a cached body sent from its file (#793): it goes
-/// chunked, without its length, the trailers after it.
+/// `add_trailer` on a handler's response in memory, with gzip on (#809):
+/// due as for a proxied one, added after gzip (`trailers_in_memory`).
 #[cold]
 #[inline(never)]
-fn expect_file_trailers(
+fn handler_trailers_due(
+    response: &mut Response,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &mut phase::ProcessMeta,
+) {
+    meta.handler_trailers = false;
+    if let Response::Prebuilt(bytes) = *response {
+        *response = Response::Owned(bytes.to_vec());
+    }
+    if let Response::Owned(bytes) = response {
+        meta.trailers_due = trailers_due(bytes, ctx, meta);
+    }
+}
+
+/// `add_trailer` on a body sent from its file, cached (#793) or static
+/// (#844): it goes chunked, without its length, the trailers after it.
+#[cold]
+#[inline(never)]
+pub(crate) fn expect_file_trailers(
     head: Vec<u8>,
     ctx: &phase::RequestCtx<'_>,
     meta: &mut phase::ProcessMeta,
@@ -2141,6 +2350,7 @@ fn accel_redirect_reroute(target: Vec<u8>) -> phase::Reroute {
         preserved_location: None,
         preserved_www_authenticate: Vec::new(),
         closes: false,
+        named_from: None,
     }
 }
 
@@ -2270,6 +2480,7 @@ async fn run_post_action(
         body: &phase::NO_BODY,
         body_len: 0,
         body_file: None,
+        body_feed: None,
         refuse: None,
         ..*base_ctx
     };
@@ -2289,6 +2500,7 @@ async fn run_post_action(
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
                 closes: false,
+                named_from: None,
             },
         )
     };
@@ -2465,6 +2677,7 @@ pub fn run(
         drop(ready);
         // Accept only once `main` has switched to the configured `user`.
         state.wait_released();
+        crate::upstream_resolve::start(http, state);
         // From now on its accept loop turns at least every ACCEPT_TICK.
         HEARTBEAT.with(|beat| {
             let _ = beat.set(state.heartbeat());
@@ -2802,6 +3015,11 @@ async fn drain(state: &RuntimeState, inherited: Option<&[std::os::fd::RawFd]>) {
         }
         monoio::time::sleep(Duration::from_millis(10)).await;
     }
+    // HTTP/2 upstream connections end in their own tasks (GOAWAY): a
+    // moment for them.
+    if crate::upstream::pool_clear() {
+        monoio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The accept loop of a `listen unix:` socket (#263). A connection is
@@ -2952,6 +3170,7 @@ async fn run_auth_subrequest(
         body: &phase::NO_BODY,
         body_len: 0,
         body_file: None,
+        body_feed: None,
         refuse: None,
         upstream: None,
         ..*ctx
@@ -2970,6 +3189,7 @@ async fn run_auth_subrequest(
                 preserved_location: None,
                 preserved_www_authenticate: Vec::new(),
                 closes: false,
+                named_from: None,
             }
         });
     // `auth_request_set` reads the upstream's header (`$upstream_http_*`):
@@ -3034,6 +3254,145 @@ async fn run_auth_subrequest(
         vars,
         limit_req_status: pending.limit_req_status,
         limit_conn_status: pending.limit_conn_status,
+    }
+}
+
+/// What the access phase did before the body was read (#855). Boxed
+/// where `handle` keeps it.
+#[allow(clippy::large_enum_variant)]
+enum AccessFirst {
+    /// It answered (a denial, a limit, or a handler that reads no body):
+    /// that is the response, and the body is discarded.
+    Answer(Response, phase::ProcessMeta),
+    /// It let the request on to a handler that may read the body: the pass
+    /// after the read doesn't count it again, nor redo the subrequests.
+    Continue {
+        noted: phase::BeforeBody,
+        auth: Vec<(&'static [u8], phase::AuthResume)>,
+        held: Option<std::rc::Rc<super::limit_conn::Held>>,
+    },
+}
+
+/// The access phase before the body is read, as nginx runs it (#855): a
+/// pass that stops before any handler that may read the body, with
+/// limit_req's delay and auth_request's subrequests as after the read.
+#[cold]
+#[inline(never)]
+async fn access_before_body(
+    http: &'static PreparedHttp,
+    ctx: &mut phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    request_start: Instant,
+) -> AccessFirst {
+    let pass = |ctx: &phase::RequestCtx<'_>, url_scratch: &mut Vec<u8>| {
+        phase::probe_before_body();
+        let (response, meta) = phase::process_with_meta(http, ctx, url_scratch);
+        (response, meta, phase::probe_result())
+    };
+    let (mut response, mut meta, mut noted) = pass(ctx, url_scratch);
+    if meta.limit_req_delay_ms > 0 {
+        monoio::time::sleep(Duration::from_millis(meta.limit_req_delay_ms)).await;
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        super::limit_req::resume_after_delay(true);
+        (response, meta, noted) = pass(ctx, url_scratch);
+        super::limit_req::resume_after_delay(false);
+    }
+    let held = meta.limit_conn_held.clone();
+    let mut auth: Vec<(&'static [u8], phase::AuthResume)> = Vec::new();
+    // As `auth_subrequest`.
+    for _ in 0..8 {
+        let Some(pending) = meta.auth_request.take() else {
+            break;
+        };
+        let outcome = run_auth_subrequest(http, ctx, url_scratch, &pending, request_start).await;
+        auth.push((pending.uri, outcome));
+        phase::resume_auth_request(auth.clone());
+        ctx.request_time_us = request_start.elapsed().as_micros() as u64;
+        (response, meta, noted) = pass(ctx, url_scratch);
+        phase::resume_auth_request(Vec::new());
+        if meta.limit_conn_held.is_none() {
+            meta.limit_conn_held = held.clone();
+        }
+    }
+    if meta.auth_request.take().is_some() {
+        return AccessFirst::Answer(
+            Response::Prebuilt(http.internal_error.pick(ctx.method)),
+            meta,
+        );
+    }
+    match noted {
+        Some(noted) => AccessFirst::Continue {
+            noted,
+            auth,
+            held: meta.limit_conn_held,
+        },
+        None => AccessFirst::Answer(response, meta),
+    }
+}
+
+/// The pass after the body was read, when the access phase ran before it.
+#[cold]
+#[inline(never)]
+fn process_after_access(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    first: AccessFirst,
+    // The body's framing was bad (#806).
+    malformed: bool,
+) -> (Response, phase::ProcessMeta) {
+    let (noted, auth, held) = match first {
+        // An error stands, and the connection closes after it; any other
+        // answer would have discarded the body, which fails: the
+        // location's 400 (ngx_http_send_response, the static handler).
+        AccessFirst::Answer(response, mut meta) => {
+            if !malformed {
+                return (response, meta);
+            }
+            if response_head(&response).is_some_and(|head| response_status(head) >= 400) {
+                malformed_body(ctx, &mut meta);
+                return (response, meta);
+            }
+            let (response, mut meta) = phase::process_with_meta(http, ctx, url_scratch);
+            malformed_body(ctx, &mut meta);
+            return (response, meta);
+        }
+        AccessFirst::Continue { noted, auth, held } => (noted, auth, held),
+    };
+    phase::resume_before_body(Some(noted));
+    phase::resume_auth_request(auth);
+    let (response, mut meta) = phase::process_with_meta(http, ctx, url_scratch);
+    phase::resume_auth_request(Vec::new());
+    phase::resume_before_body(None);
+    if held.is_some() {
+        meta.limit_conn_held = held;
+    }
+    if malformed {
+        malformed_body(ctx, &mut meta);
+    }
+    (response, meta)
+}
+
+/// nginx's line for a bad chunked body, with the location's error log,
+/// and the connection closes after the response.
+fn malformed_body(ctx: &phase::RequestCtx<'_>, meta: &mut phase::ProcessMeta) {
+    meta.keepalive.allow = false;
+    write_error_log(
+        meta.log.error_logs,
+        ErrorLogLevel::Error,
+        &ErrorLogRequest::new(ctx, meta.server_name).with_realip(meta),
+        b"client sent invalid chunked body",
+        None,
+    );
+}
+
+/// A response's head, where it has one already.
+fn response_head(response: &Response) -> Option<&[u8]> {
+    match response {
+        Response::Prebuilt(bytes) => Some(bytes),
+        Response::Owned(bytes) => Some(bytes),
+        Response::File { headers, .. } => Some(headers),
+        _ => None,
     }
 }
 
@@ -3727,6 +4086,8 @@ thread_local! {
 const CONN_BUFS_KEPT: usize = 64;
 /// A scratch buffer that grew past this (a large response) isn't kept.
 const CONN_SCRATCH_KEEP: usize = 64 * 1024;
+/// What an idle connection keeps of its scratch buffer: room for a head.
+const CONN_SCRATCH_IDLE: usize = 1024;
 
 impl ConnBufs {
     /// `size`: `client_header_buffer_size` (#467). An idle keep-alive
@@ -4244,6 +4605,32 @@ fn handshake_failed(
     );
 }
 
+/// The switch to kTLS failed past the point of return (#673).
+#[cold]
+#[inline(never)]
+fn ktls_failed(
+    http: &PreparedHttp,
+    listen_index: usize,
+    connection_id: u64,
+    peer_addr: SocketAddr,
+    e: std::io::Error,
+) {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        let e = crate::tls::AcceptError::Tls(e);
+        return handshake_failed(http, listen_index, connection_id, peer_addr, &e);
+    }
+    let listen = &http.listens[listen_index];
+    write_worker_log(
+        listen.servers[listen.default_server].error_logs,
+        ErrorLogLevel::Info,
+        &format!(
+            "*{connection_id} kTLS: {e} while SSL handshaking, client: {}, server: {}",
+            peer_addr.ip(),
+            listen.addr
+        ),
+    );
+}
+
 /// A TLS record after the handshake that rustls refused, as nginx's
 /// `SSL_read() failed` at `info` (#595): `while waiting for request` before
 /// any byte of one, else while reading its head.
@@ -4375,6 +4762,36 @@ pub(crate) async fn handle_tls(
             .map(|b| b.to_ascii_lowercase())
             .collect()
     });
+    // `ssl_conf_command Options KTLS` (#673). The switch's result is gone
+    // before the await: it would be in every connection's future.
+    'ktls: {
+        if !tls_stream.wants_ktls() {
+            break 'ktls;
+        }
+        let stream = match crate::ktls::switch(tls_stream) {
+            crate::ktls::Switch::Kernel(stream) => stream,
+            crate::ktls::Switch::Userspace(stream) => {
+                tls_stream = stream;
+                break 'ktls;
+            }
+            crate::ktls::Switch::Failed(e) => {
+                ktls_failed(http, listen_index, connection_id, peer_addr, e);
+                return;
+            }
+        };
+        return serve_ktls(
+            stream,
+            peer_addr,
+            listen_index,
+            sni,
+            info,
+            conn,
+            http,
+            state,
+            connection_id,
+        )
+        .await;
+    }
     if info.alpn_protocol.as_deref() == Some(b"h2") {
         let sni = sni.clone();
         return serve_h2(
@@ -4412,6 +4829,59 @@ pub(crate) async fn handle_tls(
         monoio::io::AsyncWriteRent::shutdown(&mut tls_stream),
     )
     .await;
+}
+
+/// A connection on kernel TLS (#673), as `handle_tls` serves one in
+/// userspace; boxed, so that its future isn't part of the others'.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::boxed_local)] // boxed by `switch`: `handle_tls` holds a pointer across the await
+fn serve_ktls(
+    stream: Box<crate::ktls::KtlsStream>,
+    peer_addr: SocketAddr,
+    listen_index: usize,
+    sni: Option<Vec<u8>>,
+    info: crate::tls::HandshakeInfo,
+    conn: phase::ConnInfo,
+    http: &'static PreparedHttp,
+    state: &'static RuntimeState,
+    connection_id: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    let mut stream = *stream;
+    Box::pin(async move {
+        if info.alpn_protocol.as_deref() == Some(b"h2") {
+            return serve_h2(
+                stream,
+                peer_addr,
+                listen_index,
+                sni,
+                Some(info),
+                conn,
+                http,
+                state,
+                connection_id,
+            )
+            .await;
+        }
+        handle(
+            &mut stream,
+            peer_addr,
+            listen_index,
+            sni.as_deref(),
+            Some(&info),
+            &conn,
+            http,
+            state,
+            connection_id,
+        )
+        .await;
+        let _ = monoio::time::timeout(
+            Duration::from_secs(3),
+            monoio::io::AsyncWriteRent::shutdown(&mut stream),
+        )
+        .await;
+    })
 }
 
 /// The OCSP check of a client certificate (`ssl_ocsp`, #142), boxed and
@@ -4571,6 +5041,244 @@ enum PendingDiscard {
     Chunked { from: usize },
 }
 
+/// The rest of a request body sent upstream as it comes, with
+/// `proxy_request_buffering off` (#134): read from the client while the
+/// proxy runs (`settle_unbuffered`).
+struct BodyPump {
+    feed: crate::request_feed::BodyFeed,
+    /// What came with the header (a Content-Length body's start).
+    preread: bytes::Bytes,
+    rest: PumpRest,
+}
+
+enum PumpRest {
+    /// This many bytes still to read.
+    Length(u64),
+    /// A chunked body, from what came with the header on.
+    Chunked { initial: Vec<u8>, max_body: u64 },
+}
+
+/// How the client's body ended, for the connection.
+enum PumpEnd {
+    /// Read whole: the bytes read past it start the next request.
+    Done(Vec<u8>),
+    /// Nothing proxied it: dropped after the response, as nginx's
+    /// discard does (`Some`: of a Content-Length body, these bytes).
+    Discard(Option<u64>),
+    /// Not read to its end: the connection closes after the response.
+    Unfinished,
+}
+
+impl BodyPump {
+    #[cold]
+    #[inline(never)]
+    fn length(preread: &[u8], left: u64) -> (crate::request_feed::BodyFeed, Box<BodyPump>) {
+        let feed = crate::request_feed::BodyFeed::new(false);
+        let pump = Box::new(BodyPump {
+            feed: feed.clone(),
+            preread: bytes::Bytes::copy_from_slice(preread),
+            rest: PumpRest::Length(left),
+        });
+        (feed, pump)
+    }
+
+    /// The rest of a Content-Length body is already there and fits the
+    /// buffer nginx reads it into before going unbuffered
+    /// (ngx_http_read_client_request_body): nginx then has it all, and
+    /// the body is a buffered one.
+    #[cold]
+    #[inline(never)]
+    fn rest_ready<S: ConnIo>(stream: &S, rest: u64, body_buffer: u64) -> bool {
+        if rest >= body_buffer + (body_buffer >> 2) {
+            return false;
+        }
+        let mut peek = vec![0u8; rest as usize];
+        stream.peek_ready(&mut peek) as u64 == rest
+    }
+
+    /// `None` when the body came whole with the header or right after it
+    /// (as `rest_ready`), or is malformed: it is read as usual then.
+    #[cold]
+    #[inline(never)]
+    async fn chunked<S: ConnIo>(
+        stream: &S,
+        initial: &[u8],
+        max_body: u64,
+        body_buffer: u64,
+        mut timer: std::pin::Pin<&mut monoio::time::Sleep>,
+    ) -> Option<(crate::request_feed::BodyFeed, Box<BodyPump>)> {
+        match chunked_in_buffer(initial, timer.as_mut()).await {
+            Err(ChunkedBodyError::Ended) => {}
+            _ => return None,
+        }
+        let mut peek = vec![0u8; body_buffer as usize];
+        let n = stream.peek_ready(&mut peek);
+        if n > 0 {
+            let mut joined = initial.to_vec();
+            joined.extend_from_slice(&peek[..n]);
+            match chunked_in_buffer(&joined, timer).await {
+                Err(ChunkedBodyError::Ended) => {}
+                _ => return None,
+            }
+        }
+        let feed = crate::request_feed::BodyFeed::new(true);
+        let pump = Box::new(BodyPump {
+            feed: feed.clone(),
+            preread: bytes::Bytes::new(),
+            rest: PumpRest::Chunked {
+                initial: initial.to_vec(),
+                max_body,
+            },
+        });
+        Some((feed, pump))
+    }
+
+    fn preread(&self) -> bytes::Bytes {
+        self.preread.clone()
+    }
+}
+
+/// A chunked body's data, to the proxy as it is decoded (#134).
+struct FeedSink<'a> {
+    feed: &'a crate::request_feed::BodyFeed,
+    len: u64,
+}
+
+impl super::connection::ChunkSink for FeedSink<'_> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    async fn put(&mut self, data: &[u8]) -> bool {
+        self.len += data.len() as u64;
+        self.feed.put(data.to_vec()).await;
+        true
+    }
+}
+
+/// Read the rest of the client's body into the feed, under
+/// `client_body_timeout` per read. Reads stop at the body's end, so a
+/// pipelined request isn't consumed (a chunked body's over-read comes
+/// back in `Done`).
+async fn pump_body<S: ConnIo>(
+    stream: &mut S,
+    feed: &crate::request_feed::BodyFeed,
+    preread: bytes::Bytes,
+    rest: PumpRest,
+    body_timeout: Duration,
+) -> PumpEnd {
+    use crate::request_feed::FeedError;
+    if !preread.is_empty() {
+        feed.put(preread.to_vec()).await;
+    }
+    // Armed by each read; a fresh one would never be polled (with_timeout).
+    let mut timer = std::pin::pin!(monoio::time::sleep(Duration::from_secs(3600)));
+    match rest {
+        PumpRest::Length(mut left) => {
+            while left > 0 {
+                let want = left.min(64 * 1024) as usize;
+                let Some((res, piece)) = with_timeout(
+                    timer.as_mut(),
+                    body_timeout,
+                    stream.read(Vec::with_capacity(want)),
+                )
+                .await
+                else {
+                    feed.finish(Err(FeedError::TimedOut));
+                    return PumpEnd::Unfinished;
+                };
+                match res {
+                    Ok(n) if n > 0 => {
+                        left -= n as u64;
+                        feed.put(piece).await;
+                    }
+                    _ => {
+                        feed.finish(Err(FeedError::Invalid));
+                        return PumpEnd::Unfinished;
+                    }
+                }
+            }
+            feed.finish(Ok(()));
+            PumpEnd::Done(Vec::new())
+        }
+        PumpRest::Chunked { initial, max_body } => {
+            let mut sink = FeedSink { feed, len: 0 };
+            match read_chunked_request_body(
+                stream,
+                &initial,
+                max_body,
+                Some(&mut sink),
+                timer.as_mut(),
+                body_timeout,
+            )
+            .await
+            {
+                Ok(body) => {
+                    feed.finish(Ok(()));
+                    PumpEnd::Done(body.pipelined_tail)
+                }
+                Err(e) => {
+                    feed.finish(Err(match e {
+                        ChunkedBodyError::TooLarge => FeedError::TooLarge,
+                        ChunkedBodyError::TimedOut => FeedError::TimedOut,
+                        _ => FeedError::Invalid,
+                    }));
+                    PumpEnd::Unfinished
+                }
+            }
+        }
+    }
+}
+
+/// `settle_proxy_response` while the client's body is still read and sent
+/// upstream (#134). Not proxied: the body is dropped after the response.
+#[allow(clippy::too_many_arguments)]
+async fn settle_unbuffered<S: ConnIo>(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    url_scratch: &mut Vec<u8>,
+    response: Response,
+    process_meta: phase::ProcessMeta,
+    stream: &mut S,
+    pump: Box<BodyPump>,
+    body_timeout: Duration,
+) -> (Response, phase::ProcessMeta, PumpEnd) {
+    use std::future::Future;
+    let BodyPump {
+        feed,
+        preread,
+        rest,
+    } = *pump;
+    if !matches!(response, Response::Proxy(_)) {
+        let left = match rest {
+            PumpRest::Length(left) => Some(left),
+            PumpRest::Chunked { .. } => None,
+        };
+        return (response, process_meta, PumpEnd::Discard(left));
+    }
+    // The client isn't watched meanwhile: the reads see it go.
+    let mut settle = std::pin::pin!(settle_proxy_response(
+        http,
+        ctx,
+        url_scratch,
+        response,
+        process_meta,
+        None
+    ));
+    let mut read = std::pin::pin!(pump_body(stream, &feed, preread, rest, body_timeout));
+    let mut end = None;
+    let (response, process_meta) = std::future::poll_fn(|cx| {
+        if end.is_none()
+            && let std::task::Poll::Ready(e) = read.as_mut().poll(cx)
+        {
+            end = Some(e);
+        }
+        settle.as_mut().poll(cx)
+    })
+    .await;
+    (response, process_meta, end.unwrap_or(PumpEnd::Unfinished))
+}
+
 #[allow(clippy::too_many_arguments)] // hot path: a parameter struct needs ABBA numbers first
 pub(crate) async fn handle<S: ConnIo>(
     stream: &mut S,
@@ -4583,19 +5291,10 @@ pub(crate) async fn handle<S: ConnIo>(
     state: &'static RuntimeState,
     connection_id: u64,
 ) {
-    // Mirrors nginx's keepalive_handler ↔ wait_request_handler dance: no
-    // read buffer is held while the connection is idle. On idle-to-active
-    // transition we PollAdd for readability (one io_uring SQE, no buffer),
-    // then allocate the 8 KiB read buffer when data is actually arriving.
-    //
-    // Outer loop = idle ↔ active cycle; inner loop = within an active
-    // session, read more / parse / write until the session drains back to
-    // empty (→ idle) or the request-line overflows the buffer (→ close).
-    let mut parse_state = ParseState {
-        h2: stream.h2(),
-        ..ParseState::default()
-    };
-
+    // Outer loop = idle ↔ active cycle: the keep-alive wait here, with only
+    // the connection's state; the active session (read more / parse / write
+    // until it drains back to empty, or closes) in its own allocation, as
+    // nginx keeps a request only while it is active (#467).
     // Per-connection counters surfaced via `$connection*` variables.
     // `connection_id` is assigned once in the accept loop. `request_count` tracks
     // requests on this connection *including* the one being processed —
@@ -4642,9 +5341,6 @@ pub(crate) async fn handle<S: ConnIo>(
         })),
         min: None,
     };
-    // When the current request's header must be complete; set on the first
-    // read for it, cleared once the request is handled.
-    let mut header_deadline: Option<monoio::time::Instant>;
     // Long-lived timers for this connection (see `ConnTimers`).
     let far = Duration::from_secs(3600);
     let mut timers = ConnTimers {
@@ -4666,9 +5362,9 @@ pub(crate) async fn handle<S: ConnIo>(
     // Per-connection scratch buffers — allocated once and reused across
     // every request on this connection. `mem::take` during `write_all`
     // briefly leaves these empty, monoio returns the Vec after the I/O
-    // completes, and we restore it. `buf` lives outside `'idle: loop`
+    // completes, and we restore it. `buf` lives outside the idle loop
     // because non-pipelining clients (wrk, curl) drain `buf` after each
-    // response and `continue 'idle`, so a per-iteration alloc here was
+    // response and go idle, so a per-iteration alloc here was
     // showing up as ~3% memset / ~1% calloc in the proxy bench profile.
     // Taken from this worker's pool and given back when the connection
     // ends: a connection per request doesn't allocate (and zero) them each
@@ -4709,7 +5405,7 @@ pub(crate) async fn handle<S: ConnIo>(
     // stub_status / $connections_* (#96); inert unless the config reads them.
     let mut conn_stats = super::stats::ConnStats::new(http.stats);
 
-    'idle: loop {
+    loop {
         conn_stats.set(super::stats::Phase::Waiting);
         let (buf_ptr, buf_len) = (buf.as_ptr(), buf.len());
         let next = match std::mem::take(&mut body_read) {
@@ -4732,965 +5428,1797 @@ pub(crate) async fn handle<S: ConnIo>(
                 next
             }
         };
-        let mut filled: usize = match next {
+        let filled: usize = match next {
             IdleRead::Close => return,
             IdleRead::Ready => 0,
             IdleRead::Read(n) => n,
         };
-        restore_read_len(buf, buf_ptr, buf_len);
-        conn_stats.set(super::stats::Phase::Reading);
-        keepalive_idle = IdleLimits {
-            timeout: None,
-            min: None,
-        };
-        // The header's time starts with its first bytes, as nginx's
-        // client_header_timeout after the keep-alive read; the first
-        // request's runs from the accept.
-        header_deadline = match first_head_due.take() {
-            Some(due) => Some(monoio::time::Instant::from_std(due)),
-            None => (filled > 0).then(|| monoio::time::Instant::now() + timeouts.header),
-        };
+        // The request's state lives in its own allocation, freed when the
+        // connection goes idle again: a keep-alive connection holds only
+        // this loop's, as nginx frees the request between requests (#467).
+        let active = session(|| async {
+            let mut filled = filled;
+            let mut parse_state = ParseState {
+                h2: stream.h2(),
+                ..ParseState::default()
+            };
+            // client_header_timeout / client_body_timeout / send_timeout.
+            let mut io_timer = timers.io.as_mut();
+            restore_read_len(buf, buf_ptr, buf_len);
+            conn_stats.set(super::stats::Phase::Reading);
+            keepalive_idle = IdleLimits {
+                timeout: None,
+                min: None,
+            };
+            // The header's time starts with its first bytes, as nginx's
+            // client_header_timeout after the keep-alive read; the first
+            // request's runs from the accept.
+            // When the current request's header must be complete; set on the
+            // first read for it, cleared once the request is handled.
+            let mut header_deadline = match first_head_due.take() {
+                Some(due) => Some(monoio::time::Instant::from_std(due)),
+                None => (filled > 0).then(|| monoio::time::Instant::now() + timeouts.header),
+            };
 
-        let mut read_start: usize = 0; // first unread byte of the current request
-        // The first bytes came with the idle wait: parse before reading.
-        let mut skip_read = filled > 0;
+            let mut read_start: usize = 0; // first unread byte of the current request
+            // The first bytes came with the idle wait: parse before reading.
+            let mut skip_read = filled > 0;
 
-        loop {
-            if std::mem::take(&mut skip_read) {
-                // Fall through to the parse loop with what idle_read read.
-            } else {
-                // The read takes the buffer, and one that times out keeps
-                // it: what came of the head is put aside for its log line
-                // (#509). Only a head that didn't come in one read.
-                if filled > read_start {
-                    scratch.clear();
-                    scratch.extend_from_slice(&buf[read_start..filled]);
-                }
-                let taken = std::mem::take(&mut *buf);
-                let (buf_ptr, end) = (taken.as_ptr(), taken.len());
-                let slice = taken.slice_mut(filled..end);
-                let deadline = *header_deadline
-                    .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
-                let read = with_deadline(timers.io.as_mut(), deadline, stream.read(slice));
-                // client_header_timeout: nginx closes without a response,
-                // and logs the request if it had begun (#509).
-                let Some((res, returned)) = read.await else {
+            'head: loop {
+                if std::mem::take(&mut skip_read) {
+                    // Fall through to the parse loop with what idle_read read.
+                } else {
+                    // The read takes the buffer, and one that times out keeps
+                    // it: what came of the head is put aside for its log line
+                    // (#509). Only a head that didn't come in one read.
                     if filled > read_start {
-                        log_unfinished_head(
-                            http,
-                            &scratch[..],
-                            parse_state.rline_done,
-                            HeadCut::TimedOut,
-                            conn_log!(),
-                        )
-                        .await;
+                        scratch.clear();
+                        scratch.extend_from_slice(&buf[read_start..filled]);
                     }
-                    return;
-                };
-                *buf = returned.into_inner();
-                restore_read_len(buf, buf_ptr, end);
-                match res {
-                    Ok(n) if n > 0 => filled += n,
-                    // What a TLS stream couldn't decrypt or rustls refused
-                    // (#595); plain TCP never says InvalidData.
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                        tls_read_failed(http, listen_index, connection_id, peer_addr, filled, &e);
-                        return;
-                    }
-                    res => {
+                    let taken = std::mem::take(&mut *buf);
+                    let (buf_ptr, end) = (taken.as_ptr(), taken.len());
+                    let slice = taken.slice_mut(filled..end);
+                    let deadline = *header_deadline
+                        .get_or_insert_with(|| monoio::time::Instant::now() + timeouts.header);
+                    let read = with_deadline(io_timer.as_mut(), deadline, stream.read(slice));
+                    // client_header_timeout: nginx closes without a response,
+                    // and logs the request if it had begun (#509).
+                    let Some((res, returned)) = read.await else {
                         if filled > read_start {
-                            let cut = match &res {
-                                Ok(_) => HeadCut::Closed,
-                                Err(e) => HeadCut::Failed(e),
-                            };
                             log_unfinished_head(
                                 http,
-                                &buf[read_start..filled],
+                                &scratch[..],
                                 parse_state.rline_done,
-                                cut,
+                                HeadCut::TimedOut,
                                 conn_log!(),
                             )
                             .await;
                         }
-                        return;
+                        return false;
+                    };
+                    *buf = returned.into_inner();
+                    restore_read_len(buf, buf_ptr, end);
+                    match res {
+                        Ok(n) if n > 0 => filled += n,
+                        // What a TLS stream couldn't decrypt or rustls refused
+                        // (#595); plain TCP never says InvalidData.
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            tls_read_failed(
+                                http,
+                                listen_index,
+                                connection_id,
+                                peer_addr,
+                                filled,
+                                &e,
+                            );
+                            return false;
+                        }
+                        res => {
+                            if filled > read_start {
+                                let cut = match &res {
+                                    Ok(_) => HeadCut::Closed,
+                                    Err(e) => HeadCut::Failed(e),
+                                };
+                                log_unfinished_head(
+                                    http,
+                                    &buf[read_start..filled],
+                                    parse_state.rline_done,
+                                    cut,
+                                    conn_log!(),
+                                )
+                                .await;
+                            }
+                            return false;
+                        }
                     }
                 }
-            }
 
-            loop {
-                let view = &buf[read_start..filled];
-                match http::parse_request(view, &mut parse_state) {
-                    Parse::Complete(req) => {
-                        // Only a head longer than one line may hold: is
-                        // each line within `large_client_header_buffers`?
-                        // An HTTP/2 stream's fields were checked as nginx
-                        // does when it arrived (#623); its head is rebuilt.
-                        if req.consumed > timeouts.large_header_line
-                            && !stream.h2()
-                            && let Some(line) = overlong_head_line(
-                                &buf[read_start..read_start + req.consumed],
-                                timeouts.large_header_line,
-                                timeouts.large_header,
-                            )
-                        {
-                            let head = &buf[read_start..read_start + req.consumed];
-                            if line > 0
-                                && let Some(refusal) =
+                loop {
+                    let view = &buf[read_start..filled];
+                    match http::parse_request(view, &mut parse_state) {
+                        Parse::Complete(req) => {
+                            // Only a head longer than one line may hold: is
+                            // each line within `large_client_header_buffers`?
+                            // An HTTP/2 stream's fields were checked as nginx
+                            // does when it arrived (#623); its head is rebuilt.
+                            if req.consumed > timeouts.large_header_line
+                                && !stream.h2()
+                                && let Some(line) = overlong_head_line(
+                                    &buf[read_start..read_start + req.consumed],
+                                    timeouts.large_header_line,
+                                    timeouts.large_header,
+                                )
+                            {
+                                let head = &buf[read_start..read_start + req.consumed];
+                                if line > 0
+                                    && let Some(refusal) =
+                                        parsed_line_refusal(head, &req, timeouts.large_header_line)
+                                {
+                                    refuse_line(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        head,
+                                        refusal,
+                                        conn_log!(),
+                                    )
+                                    .await;
+                                    return false;
+                                }
+                                head_too_large(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    head,
+                                    (line > 0).then_some(line),
+                                    conn_log!(),
+                                )
+                                .await;
+                                return false;
+                            }
+                            // `max_headers` (#584): only a block long enough
+                            // to hold more lines is counted.
+                            if req.headers_end - req.headers_start >= timeouts.max_headers_span
+                                && too_many_header_lines(
+                                    &buf[read_start + req.headers_start
+                                        ..read_start + req.headers_end],
+                                    timeouts
+                                        .max_headers
+                                        .saturating_add(stream.h2_synthetic_lines()),
+                                )
+                            {
+                                let head = &buf[read_start..read_start + req.consumed];
+                                if let Some(refusal) =
                                     parsed_line_refusal(head, &req, timeouts.large_header_line)
-                            {
-                                refuse_line(
-                                    stream,
-                                    &mut *scratch,
-                                    http,
-                                    head,
-                                    refusal,
-                                    conn_log!(),
-                                )
-                                .await;
-                                return;
-                            }
-                            head_too_large(
-                                stream,
-                                &mut *scratch,
-                                http,
-                                head,
-                                (line > 0).then_some(line),
-                                conn_log!(),
-                            )
-                            .await;
-                            return;
-                        }
-                        // `max_headers` (#584): only a block long enough
-                        // to hold more lines is counted.
-                        if req.headers_end - req.headers_start >= timeouts.max_headers_span
-                            && too_many_header_lines(
-                                &buf[read_start + req.headers_start..read_start + req.headers_end],
-                                timeouts
-                                    .max_headers
-                                    .saturating_add(stream.h2_synthetic_lines()),
-                            )
-                        {
-                            let head = &buf[read_start..read_start + req.consumed];
-                            if let Some(refusal) =
-                                parsed_line_refusal(head, &req, timeouts.large_header_line)
-                            {
-                                refuse_line(
-                                    stream,
-                                    &mut *scratch,
-                                    http,
-                                    head,
-                                    refusal,
-                                    conn_log!(),
-                                )
-                                .await;
-                                return;
-                            }
-                            many_header_lines(stream, &mut *scratch, http, head, conn_log!()).await;
-                            return;
-                        }
-                        conn_stats.request();
-                        let request_start = Instant::now();
-                        // Counted up front so a request refused below logs
-                        // `$connection_requests` as nginx does.
-                        request_count = request_count.saturating_add(1);
-                        // All offsets in `req` are relative to `view`; shift
-                        // to absolute buffer offsets before indexing.
-                        let base = read_start;
-                        // Copy the method out of the read buffer up front
-                        // (from when the host was lowercased in it): onto
-                        // the stack, or, for one longer than any standard
-                        // method, to the heap; nginx has no length limit
-                        // (#485).
-                        let method_len = req.method_end - req.method_start;
-                        let mut method_buf: [u8; 16] = [0; 16];
-                        let long_method: Vec<u8>;
-                        let method_bytes: &[u8] = if method_len <= method_buf.len() {
-                            method_buf[..method_len].copy_from_slice(
-                                &buf[base + req.method_start..base + req.method_end],
-                            );
-                            &method_buf[..method_len]
-                        } else {
-                            long_method =
-                                buf[base + req.method_start..base + req.method_end].to_vec();
-                            &long_method
-                        };
-                        let method = http::classify_method(method_bytes);
-                        let method_is_post = method_bytes.eq_ignore_ascii_case(b"POST");
-                        // Refused below at the server level, where its
-                        // `error_page` applies (`phase::process`). The body
-                        // is not read and the connection closes.
-                        let mut refuse: Option<u16> = None;
-                        // The parser noted whether there is one: no scan of
-                        // the header block for a request without it.
-                        if parse_state.has_transfer_encoding
-                            && let Some(te) = lookup_request_header(
-                                &buf[base + req.headers_start..base + req.headers_end],
-                                b"transfer-encoding",
-                            )
-                        {
-                            // nginx request-body gate:
-                            // - Transfer-Encoding is HTTP/1.1-only.
-                            // - Transfer-Encoding + Content-Length is rejected.
-                            refuse = if !req.http_11 || req.content_length.is_some() {
-                                Some(400)
-                            } else {
-                                match classify_request_transfer_encoding(te) {
-                                    RequestTransferEncoding::ChunkedOnly => None,
-                                    RequestTransferEncoding::Unsupported => Some(501),
-                                    RequestTransferEncoding::Invalid => Some(400),
-                                }
-                            };
-                            if refuse.is_some()
-                                && parsed_line_refusal(
-                                    &buf[base..base + req.consumed],
-                                    &req,
-                                    usize::MAX,
-                                )
-                                .is_none()
-                            {
-                                let message = if !req.http_11 {
-                                    "client sent HTTP/1.0 request with \"Transfer-Encoding\" header"
-                                        .to_string()
-                                } else if req.content_length.is_some() {
-                                    "client sent \"Content-Length\" and \"Transfer-Encoding\" \
-                                     headers at the same time"
-                                        .to_string()
-                                } else {
-                                    format!(
-                                        "client sent unknown \"Transfer-Encoding\": \"{}\"",
-                                        String::from_utf8_lossy(te)
+                                {
+                                    refuse_line(
+                                        stream,
+                                        &mut *scratch,
+                                        http,
+                                        head,
+                                        refusal,
+                                        conn_log!(),
                                     )
-                                };
-                                refused_parsed_head_log(
-                                    http,
-                                    conn_log!(),
-                                    &buf[base..base + req.headers_end],
-                                    &format!("{message} while reading client request headers"),
+                                    .await;
+                                    return false;
+                                }
+                                many_header_lines(stream, &mut *scratch, http, head, conn_log!())
+                                    .await;
+                                return false;
+                            }
+                            conn_stats.request();
+                            let request_start = Instant::now();
+                            // Counted up front so a request refused below logs
+                            // `$connection_requests` as nginx does.
+                            request_count = request_count.saturating_add(1);
+                            // All offsets in `req` are relative to `view`; shift
+                            // to absolute buffer offsets before indexing.
+                            let base = read_start;
+                            // Copy the method out of the read buffer up front
+                            // (from when the host was lowercased in it): onto
+                            // the stack, or, for one longer than any standard
+                            // method, to the heap; nginx has no length limit
+                            // (#485).
+                            let method_len = req.method_end - req.method_start;
+                            let mut method_buf: [u8; 16] = [0; 16];
+                            let long_method: Vec<u8>;
+                            let method_bytes: &[u8] = if method_len <= method_buf.len() {
+                                method_buf[..method_len].copy_from_slice(
+                                    &buf[base + req.method_start..base + req.method_end],
                                 );
-                            }
-                        }
-                        let mut bad_host = false;
-                        let request_line_host =
-                            req.request_line_host.map(|(s, e)| (base + s, base + e));
-                        let header_host = req.host.map(|(s, e)| (base + s, base + e));
-                        let request_line_host = match request_line_host {
-                            Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
-                                Some(nh) => Some(nh),
-                                None => {
-                                    // An invalid Host is refused by the
-                                    // default server, before the checks
-                                    // above (nginx validates it while
-                                    // reading the headers).
-                                    refuse = Some(400);
-                                    bad_host = true;
-                                    if parsed_line_refusal(
-                                        &buf[base..base + req.consumed],
-                                        &req,
-                                        usize::MAX,
-                                    )
-                                    .is_none()
-                                    {
-                                        refused_parsed_head_log(
-                                            http,
-                                            conn_log!(),
-                                            &buf[base..base + req.headers_end],
-                                            "client sent invalid host in request line while reading client request line",
-                                        );
-                                    }
-                                    None
-                                }
-                            },
-                            None => None,
-                        };
-                        let header_host = match header_host {
-                            Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
-                                Some(nh) => Some(nh),
-                                None => {
-                                    // An invalid Host is refused by the
-                                    // default server, before the checks
-                                    // above (nginx validates it while
-                                    // reading the headers).
-                                    refuse = Some(400);
-                                    bad_host = true;
-                                    if parsed_line_refusal(
-                                        &buf[base..base + req.consumed],
-                                        &req,
-                                        usize::MAX,
-                                    )
-                                    .is_none()
-                                    {
-                                        refused_parsed_head_log(
-                                            http,
-                                            conn_log!(),
-                                            &buf[base..base + req.headers_end],
-                                            "client sent invalid host header while reading client request headers",
-                                        );
-                                    }
-                                    None
-                                }
-                            },
-                            None => None,
-                        };
-                        // Pick request-line authority over Host header when both
-                        // present (mirrors nginx's `r->headers_in.server`
-                        // priority for absolute-form requests). Both `host`
-                        // and `request_port` come from the same chosen
-                        // authority so they stay consistent.
-                        let chosen_authority = if bad_host {
-                            None
-                        } else {
-                            request_line_host.as_ref().or(header_host.as_ref())
-                        };
-                        // Routing uses the host lowercased; the buffer keeps
-                        // it as sent. A copy only when it has capitals.
-                        let mut host_lowercased = Vec::new();
-                        if let Some(nh) = chosen_authority.filter(|nh| nh.uppercase) {
-                            host_lowercased.extend_from_slice(&buf[nh.host.0..nh.host.1]);
-                            host_lowercased.make_ascii_lowercase();
-                        }
-                        let host = chosen_authority.map(|nh| {
-                            if nh.uppercase {
-                                host_lowercased.as_slice()
+                                &method_buf[..method_len]
                             } else {
-                                &buf[nh.host.0..nh.host.1]
-                            }
-                        });
-                        let request_port: &[u8] = chosen_authority
-                            .and_then(|nh| nh.port.map(|(s, e)| &buf[s..e]))
-                            .unwrap_or(&[]);
-                        // Absolute-form `GET http://host?args HTTP/1.1`
-                        // has no path byte but a query. We splice `/` in
-                        // front of the raw `?args…` so the rest of the
-                        // pipeline (URI normalization, `$args`,
-                        // `$request_uri`) sees a conventional origin-form.
-                        let synthesized_path: Option<Vec<u8>> = req.absolute_query.map(|(s, e)| {
-                            let mut v = Vec::with_capacity(1 + (e - s));
-                            v.push(b'/');
-                            v.extend_from_slice(&buf[base + s..base + e]);
-                            v
-                        });
-                        let path: &[u8] = if let Some(ref p) = synthesized_path {
-                            p.as_slice()
-                        } else if req.implicit_path {
-                            &b"/"[..]
-                        } else {
-                            &buf[base + req.path_start..base + req.path_end]
-                        };
-                        let if_modified_since =
-                            req.if_modified_since.map(|(s, e)| &buf[base + s..base + e]);
-                        let if_unmodified_since = req
-                            .if_unmodified_since
-                            .map(|(s, e)| &buf[base + s..base + e]);
-                        let if_none_match =
-                            req.if_none_match.map(|(s, e)| &buf[base + s..base + e]);
-                        let if_match = req.if_match.map(|(s, e)| &buf[base + s..base + e]);
-                        let range = req.range.map(|(s, e)| &buf[base + s..base + e]);
-                        let if_range = req.if_range.map(|(s, e)| &buf[base + s..base + e]);
-                        // HTTP/2 with an `:authority` and a `Host` that
-                        // differs (#592): nginx answers 400 once the head is
-                        // read, from the server the `:authority` chose
-                        // (ngx_http_v2_run_request, since 1.29.1).
-                        let authority_mismatch = stream.h2_authority_mismatch();
-                        if authority_mismatch && refuse.is_none() {
-                            refuse = Some(400);
-                        }
-                        // Plain HTTP on an `ssl` port (#384): once its head is
-                        // read, nginx finalizes the request with 497
-                        // (ngx_http_process_request), unless it was refused
-                        // already.
-                        if conn.plain_http && refuse.is_none() {
-                            refuse = Some(497);
-                        }
-                        let headers_raw = &buf[base + req.headers_start..base + req.headers_end];
-                        let keep_alive = req.keep_alive && refuse.is_none();
-                        // `as u64` saturates only at ~584k years of uptime;
-                        // the explicit clamp would be unreachable.
-                        let connection_time_us = connection_start.elapsed().as_micros() as u64;
-                        let request_time_us = request_start.elapsed().as_micros() as u64;
-                        // `read_start > 0` ⇒ a previous request on this
-                        // connection already consumed bytes from this read
-                        // buffer ⇒ pipelined. Matches nginx's `r->pipeline`
-                        // semantic.
-                        let pipe_byte: u8 = if read_start > 0 { b'p' } else { b'.' };
-                        let request_line =
-                            trim_crlf(&buf[base + req.method_start..base + req.headers_start]);
-                        // `$request_id`, one for the request (#487).
-                        let request_id = super::draw_request_id(http);
-                        macro_rules! request_ctx {
-                            ($body:expr, $body_len:expr, $body_file:expr, $request_length:expr,
-                             $epoch_secs:expr, $epoch_ms:expr) => {
-                                phase::RequestCtx {
-                                    method,
-                                    method_bytes,
-                                    path,
-                                    request_line,
-                                    upstream: None,
-                                    http_11: req.http_11,
-                                    host,
-                                    sni,
-                                    listen_index,
-                                    remote_addr: &remote_addr,
-                                    remote_port,
-                                    if_modified_since,
-                                    if_unmodified_since,
-                                    if_none_match,
-                                    if_match,
-                                    range,
-                                    if_range,
-                                    headers_raw,
-                                    connection_id,
-                                    request_id,
-                                    connection_requests: request_count,
-                                    connection_time_us,
-                                    request_time_us,
-                                    request_port,
-                                    pipe: pipe_byte,
-                                    request_length: $request_length,
-                                    epoch_secs: $epoch_secs,
-                                    epoch_ms: $epoch_ms,
-                                    body: $body,
-                                    body_len: $body_len,
-                                    body_file: $body_file,
-                                    tls,
-                                    conn,
-                                    refuse,
-                                }
+                                long_method =
+                                    buf[base + req.method_start..base + req.method_end].to_vec();
+                                &long_method
                             };
-                        }
-                        // The read is bounded by the client_max_body_size
-                        // of the location the request is routed to first,
-                        // and a Content-Length over it is refused unread,
-                        // as nginx's find_config phase does. Without a
-                        // location (refused, answered by the server's
-                        // rewrite phase) the bound is the largest of any
-                        // location; the matched location checks its own
-                        // limit after the read either way.
-                        let mut max_body = http.max_request_body;
-                        // `client_body_in_file_only on` where the request goes:
-                        // a temp file holding the body outlives it.
-                        let mut persistent_body = false;
-                        // Bodies above it go to a temp file (#246).
-                        let mut body_buffer = crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE;
-                        // And its `client_body_temp_path`, else the http one.
-                        let mut body_temp = &http.body_temp;
-                        // Nothing will read the body: drop it as it comes.
-                        let mut discard_body = false;
-                        // With it, the response a 100 goes out before.
-                        let mut continue_status = None;
-                        // The routed location's client_body_timeout (#147).
-                        let mut body_timeout = timeouts.body;
-                        // A body is framed, even an empty one (`Content-Length:
-                        // 0`, or chunked): nginx reads it, and with
-                        // client_body_in_file_only writes its file (#628).
-                        let has_body =
-                            req.content_length.is_some() || req.transfer_encoding_chunked;
-                        if refuse.is_none() && has_body {
-                            let cl = req.content_length.unwrap_or(0);
-                            let probe = request_ctx!(
-                                &phase::NO_BODY,
-                                cl,
-                                None,
-                                req.consumed as u64 + cl,
-                                0,
-                                0
-                            );
-                            if let Some(first) = phase::first_body_limit(
-                                http,
-                                &probe,
-                                &mut *url_scratch,
-                                parse_state.has_expect,
-                            ) {
-                                persistent_body = first.persistent;
-                                discard_body = first.discard;
-                                continue_status = first.continue_status;
-                                body_timeout = first.body_timeout;
-                                body_buffer = first.buffer;
-                                body_temp = first.body_temp.unwrap_or(body_temp);
-                                max_body = match first.max {
-                                    0 => u64::MAX,
-                                    n => n,
+                            let method = http::classify_method(method_bytes);
+                            let method_is_post = method_bytes.eq_ignore_ascii_case(b"POST");
+                            // Refused below at the server level, where its
+                            // `error_page` applies (`phase::process`). The body
+                            // is not read and the connection closes.
+                            let mut refuse: Option<u16> = None;
+                            // The parser noted whether there is one: no scan of
+                            // the header block for a request without it.
+                            if parse_state.has_transfer_encoding
+                                && let Some(te) = lookup_request_header(
+                                    &buf[base + req.headers_start..base + req.headers_end],
+                                    b"transfer-encoding",
+                                )
+                            {
+                                // nginx request-body gate:
+                                // - Transfer-Encoding is HTTP/1.1-only.
+                                // - Transfer-Encoding + Content-Length is rejected.
+                                refuse = if !req.http_11 || req.content_length.is_some() {
+                                    Some(400)
+                                } else {
+                                    match classify_request_transfer_encoding(te) {
+                                        RequestTransferEncoding::ChunkedOnly => None,
+                                        RequestTransferEncoding::Unsupported => Some(501),
+                                        RequestTransferEncoding::Invalid => Some(400),
+                                    }
                                 };
-                                if cl > max_body {
-                                    write_error_log(
-                                        first.error_logs,
-                                        ErrorLogLevel::Error,
-                                        &ErrorLogRequest::new(&probe, first.server_name),
+                                if refuse.is_some()
+                                    && parsed_line_refusal(
+                                        &buf[base..base + req.consumed],
+                                        &req,
+                                        usize::MAX,
+                                    )
+                                    .is_none()
+                                {
+                                    let message = if !req.http_11 {
+                                        "client sent HTTP/1.0 request with \"Transfer-Encoding\" header"
+                                            .to_string()
+                                    } else if req.content_length.is_some() {
+                                        "client sent \"Content-Length\" and \"Transfer-Encoding\" \
+                                         headers at the same time"
+                                            .to_string()
+                                    } else {
                                         format!(
-                                            "client intended to send too large body: {cl} bytes"
+                                            "client sent unknown \"Transfer-Encoding\": \"{}\"",
+                                            String::from_utf8_lossy(te)
                                         )
-                                        .as_bytes(),
-                                        None,
+                                    };
+                                    refused_parsed_head_log(
+                                        http,
+                                        conn_log!(),
+                                        &buf[base..base + req.headers_end],
+                                        &format!("{message} while reading client request headers"),
                                     );
                                 }
                             }
-                        }
-                        // Expect: 100-continue (nginx ngx_http_test_expect):
-                        // when the client sent the exact value "100-continue"
-                        // on HTTP/1.1, send the interim `HTTP/1.1 100 Continue`
-                        // response before reading the body. nginx fires this
-                        // from both read_client_request_body and
-                        // discard_request_body, so it applies regardless of
-                        // whether the eventual handler consumes the body and
-                        // regardless of Content-Length (CL: 0 with the header
-                        // still gets a 100). Other Expect tokens (extensions
-                        // / unknown) are silently ignored — RFC says 417, but
-                        // nginx never implemented that branch and the upstream
-                        // test marks it TODO.
-                        // Not when the body is refused from its
-                        // Content-Length below: nginx sets expect_tested
-                        // before discarding it, so no 100 goes out.
-                        let refused_unread = req.content_length.is_some_and(|cl| cl > max_body);
-                        let expect_continue = req.http_11
-                            && refuse.is_none()
-                            && !refused_unread
-                            && parse_state.has_expect
-                            && lookup_request_header(
-                                &buf[base + req.headers_start..base + req.headers_end],
-                                b"expect",
-                            )
-                            .is_some_and(|e| e.eq_ignore_ascii_case(b"100-continue"));
-                        // A body nobody reads gets its 100 with the response
-                        // (#627), and none before an error nginx's special
-                        // response handler answers: a client doesn't upload
-                        // a body to a 401 (`continue_first`).
-                        if expect_continue && !discard_body {
-                            // nginx sends it in one send() and gives up
-                            // the connection if it doesn't all go out;
-                            // here send_timeout bounds the wait.
-                            let resp: Vec<u8> = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
-                            let len = resp.len();
-                            let (res, _) = write_all_timed(
-                                stream,
-                                resp,
-                                len,
-                                timers.io.as_mut(),
-                                timeouts.send,
-                            )
-                            .await;
-                            if res.is_err() {
-                                return;
-                            }
-                        }
-                        // Request bodies stay in memory up to the location's
-                        // client_body_buffer_size and go to a temp file past
-                        // that (`BodySink`), within `max_body` above. Past
-                        // it, a body that arrives within BODY_IN_MEMORY_FOR
-                        // stays in memory, unless something can tell: the
-                        // body variables show whether it went to a file, and
-                        // a chunked body is read without that timer.
-                        let mut pipelined_tail: Vec<u8> = Vec::new();
-                        let nginx_rule = http.uses_request_body
-                            || http.uses_request_body_file
-                            || body_buffer == 0
-                            || req.transfer_encoding_chunked;
-                        let mut sink = BodySink::with_capacity(
-                            if discard_body {
-                                0
-                            } else {
-                                req.content_length.unwrap_or(0)
-                            },
-                            body_buffer,
-                            if nginx_rule {
-                                body_buffer
-                            } else {
-                                body_buffer.max(crate::worker::BODY_IN_MEMORY_MAX)
-                            },
-                            body_temp,
-                            persistent_body,
-                        );
-                        // The body is over the limit and isn't read: the
-                        // location answers 413 through its error_page, and
-                        // the connection closes after it (lingering).
-                        let mut body_too_large = false;
-                        // What of a body nobody reads is still to come: the
-                        // response goes first, as nginx's
-                        // ngx_http_discard_request_body, and the rest is
-                        // read and dropped after it (#627). `u64::MAX`: a
-                        // chunked one, whose end isn't known.
-                        let mut pending_discard: Option<PendingDiscard> = None;
-                        let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some() {
-                            (0, 0)
-                        } else if let Some(cl) = req.content_length {
-                            'read: {
-                                if cl > max_body {
-                                    // nginx answers 413 from the Content-Length
-                                    // alone, without reading the body.
-                                    body_too_large = true;
-                                    break 'read (0, cl);
-                                }
-                                let body_start = base + req.consumed;
-                                let already = filled.saturating_sub(body_start);
-                                let take = (already as u64).min(cl) as usize;
-                                if discard_body {
-                                    if cl > take as u64 {
-                                        let rest = stream.discard_queued(cl - take as u64);
-                                        if rest > 0 {
-                                            pending_discard = Some(PendingDiscard::Length(rest));
+                            let mut bad_host = false;
+                            let request_line_host =
+                                req.request_line_host.map(|(s, e)| (base + s, base + e));
+                            let header_host = req.host.map(|(s, e)| (base + s, base + e));
+                            let request_line_host = match request_line_host {
+                                Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
+                                    Some(nh) => {
+                                        // HTTP/1.1 needs `Host` even with an
+                                        // absolute-form target (#781): nginx's
+                                        // 400, from the server the target names.
+                                        if req.http_11 && req.host.is_none() {
+                                            refuse = Some(400);
+                                            refused_parsed_head_log(
+                                                http,
+                                                conn_log!(),
+                                                &buf[base..base + req.headers_end],
+                                                phase::MISSING_HOST,
+                                            );
                                         }
+                                        Some(nh)
                                     }
-                                    break 'read (take, cl);
-                                }
-                                if !sink.extend(&buf[body_start..body_start + take]) {
-                                    return;
-                                }
-                                // Each read stops at the body's end so a
-                                // pipelined next request isn't consumed. A body
-                                // that stays in memory is read straight into
-                                // its buffer: no copy, no second buffer (#289).
-                                if sink.len() < cl {
-                                    // From the start of the body: past
-                                    // client_body_buffer_size, the body goes
-                                    // to the temp file BODY_IN_MEMORY_FOR on.
-                                    let started = monoio::time::Instant::now();
-                                    while sink.len() < cl {
-                                        let Some((mem, room)) = sink.take_read_buf() else {
-                                            // Boxed: its timer and select!
-                                            // stay out of every request's
-                                            // future.
-                                            if !Box::pin(read_body_past_buffer(
-                                                stream,
-                                                &mut sink,
-                                                cl,
-                                                body_buffer,
-                                                started,
-                                                timers.io.as_mut(),
-                                                body_timeout,
-                                            ))
-                                            .await
-                                            {
-                                                return;
-                                            }
-                                            break;
-                                        };
-                                        let start = mem.len();
-                                        let end = (start as u64 + (cl - sink.len()))
-                                            .min(room as u64)
-                                            as usize;
-                                        let slice = mem.slice_mut(start..end);
-                                        // client_body_timeout between reads.
-                                        let Some((res, returned)) = with_timeout(
-                                            timers.io.as_mut(),
-                                            body_timeout,
-                                            stream.read_now(slice),
+                                    None => {
+                                        // An invalid Host is refused by the
+                                        // default server, before the checks
+                                        // above (nginx validates it while
+                                        // reading the headers).
+                                        refuse = Some(400);
+                                        bad_host = true;
+                                        if parsed_line_refusal(
+                                            &buf[base..base + req.consumed],
+                                            &req,
+                                            usize::MAX,
                                         )
-                                        .await
-                                        else {
-                                            return;
-                                        };
-                                        match res {
-                                            Ok(0) | Err(_) => return,
-                                            Ok(n) => sink.put_read_buf(returned.into_inner(), n),
+                                        .is_none()
+                                        {
+                                            refused_parsed_head_log(
+                                                http,
+                                                conn_log!(),
+                                                &buf[base..base + req.headers_end],
+                                                "client sent invalid host in request line while reading client request line",
+                                            );
                                         }
+                                        None
+                                    }
+                                },
+                                None => None,
+                            };
+                            let header_host = match header_host {
+                                Some((s, e)) => match http::normalize_host(&buf[..], s, e) {
+                                    Some(nh) => Some(nh),
+                                    None => {
+                                        // An invalid Host is refused by the
+                                        // default server, before the checks
+                                        // above (nginx validates it while
+                                        // reading the headers).
+                                        refuse = Some(400);
+                                        bad_host = true;
+                                        if parsed_line_refusal(
+                                            &buf[base..base + req.consumed],
+                                            &req,
+                                            usize::MAX,
+                                        )
+                                        .is_none()
+                                        {
+                                            refused_parsed_head_log(
+                                                http,
+                                                conn_log!(),
+                                                &buf[base..base + req.headers_end],
+                                                "client sent invalid host header while reading client request headers",
+                                            );
+                                        }
+                                        None
+                                    }
+                                },
+                                None => None,
+                            };
+                            // Pick request-line authority over Host header when both
+                            // present (mirrors nginx's `r->headers_in.server`
+                            // priority for absolute-form requests). Both `host`
+                            // and `request_port` come from the same chosen
+                            // authority so they stay consistent.
+                            let chosen_authority = if bad_host {
+                                None
+                            } else {
+                                request_line_host.as_ref().or(header_host.as_ref())
+                            };
+                            // Routing uses the host lowercased; the buffer keeps
+                            // it as sent. A copy only when it has capitals.
+                            let mut host_lowercased = Vec::new();
+                            if let Some(nh) = chosen_authority.filter(|nh| nh.uppercase) {
+                                host_lowercased.extend_from_slice(&buf[nh.host.0..nh.host.1]);
+                                host_lowercased.make_ascii_lowercase();
+                            }
+                            let host = chosen_authority.map(|nh| {
+                                if nh.uppercase {
+                                    host_lowercased.as_slice()
+                                } else {
+                                    &buf[nh.host.0..nh.host.1]
+                                }
+                            });
+                            let request_port: &[u8] = chosen_authority
+                                .and_then(|nh| nh.port.map(|(s, e)| &buf[s..e]))
+                                .unwrap_or(&[]);
+                            // Absolute-form `GET http://host?args HTTP/1.1`
+                            // has no path byte but a query. We splice `/` in
+                            // front of the raw `?args…` so the rest of the
+                            // pipeline (URI normalization, `$args`,
+                            // `$request_uri`) sees a conventional origin-form.
+                            let synthesized_path: Option<Vec<u8>> =
+                                req.absolute_query.map(|(s, e)| {
+                                    let mut v = Vec::with_capacity(1 + (e - s));
+                                    v.push(b'/');
+                                    v.extend_from_slice(&buf[base + s..base + e]);
+                                    v
+                                });
+                            let path: &[u8] = if let Some(ref p) = synthesized_path {
+                                p.as_slice()
+                            } else if req.implicit_path {
+                                &b"/"[..]
+                            } else {
+                                &buf[base + req.path_start..base + req.path_end]
+                            };
+                            let if_modified_since =
+                                req.if_modified_since.map(|(s, e)| &buf[base + s..base + e]);
+                            let if_unmodified_since = req
+                                .if_unmodified_since
+                                .map(|(s, e)| &buf[base + s..base + e]);
+                            let if_none_match =
+                                req.if_none_match.map(|(s, e)| &buf[base + s..base + e]);
+                            let if_match = req.if_match.map(|(s, e)| &buf[base + s..base + e]);
+                            let range = req.range.map(|(s, e)| &buf[base + s..base + e]);
+                            let if_range = req.if_range.map(|(s, e)| &buf[base + s..base + e]);
+                            // HTTP/2 with an `:authority` and a `Host` that
+                            // differs (#592): nginx answers 400 once the head is
+                            // read, from the server the `:authority` chose
+                            // (ngx_http_v2_run_request, since 1.29.1).
+                            let authority_mismatch = stream.h2_authority_mismatch();
+                            if authority_mismatch && refuse.is_none() {
+                                refuse = Some(400);
+                            }
+                            // Plain HTTP on an `ssl` port (#384): once its head is
+                            // read, nginx finalizes the request with 497
+                            // (ngx_http_process_request), unless it was refused
+                            // already.
+                            if conn.plain_http && refuse.is_none() {
+                                refuse = Some(497);
+                            }
+                            let headers_raw =
+                                &buf[base + req.headers_start..base + req.headers_end];
+                            let keep_alive = req.keep_alive && refuse.is_none();
+                            // `as u64` saturates only at ~584k years of uptime;
+                            // the explicit clamp would be unreachable.
+                            let connection_time_us = connection_start.elapsed().as_micros() as u64;
+                            let request_time_us = request_start.elapsed().as_micros() as u64;
+                            // `read_start > 0` ⇒ a previous request on this
+                            // connection already consumed bytes from this read
+                            // buffer ⇒ pipelined. Matches nginx's `r->pipeline`
+                            // semantic.
+                            let pipe_byte: u8 = if read_start > 0 { b'p' } else { b'.' };
+                            let request_line =
+                                trim_crlf(&buf[base + req.method_start..base + req.headers_start]);
+                            // `$request_id`, one for the request (#487).
+                            let request_id = super::draw_request_id(http);
+                            macro_rules! request_ctx {
+                                ($body:expr, $body_len:expr, $body_file:expr, $body_feed:expr,
+                             $request_length:expr, $epoch_secs:expr, $epoch_ms:expr) => {
+                                    phase::RequestCtx {
+                                        method,
+                                        method_bytes,
+                                        path,
+                                        request_line,
+                                        upstream: None,
+                                        http_11: req.http_11,
+                                        host,
+                                        sni,
+                                        listen_index,
+                                        remote_addr: &remote_addr,
+                                        remote_port,
+                                        if_modified_since,
+                                        if_unmodified_since,
+                                        if_none_match,
+                                        if_match,
+                                        range,
+                                        if_range,
+                                        headers_raw,
+                                        connection_id,
+                                        request_id,
+                                        connection_requests: request_count,
+                                        connection_time_us,
+                                        request_time_us,
+                                        request_port,
+                                        pipe: pipe_byte,
+                                        request_length: $request_length,
+                                        epoch_secs: $epoch_secs,
+                                        epoch_ms: $epoch_ms,
+                                        body: $body,
+                                        body_len: $body_len,
+                                        body_file: $body_file,
+                                        body_feed: $body_feed,
+                                        tls,
+                                        conn,
+                                        refuse,
+                                    }
+                                };
+                            }
+                            // A request cut while its body is read (#866):
+                            // logged, nothing sent, the connection closed.
+                            macro_rules! cut_body {
+                                ($cut:expr, $request_length:expr) => {{
+                                    let request_length: u64 = $request_length;
+                                    let logs = {
+                                        let probe = request_ctx!(
+                                            &phase::NO_BODY,
+                                            0,
+                                            None,
+                                            None,
+                                            request_length,
+                                            0,
+                                            0
+                                        );
+                                        cut_body_logs(http, &probe, &mut *url_scratch, $cut)
+                                    };
+                                    if let Some((logs, server_port, status)) = logs {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default();
+                                        Box::pin(write_access_logs(
+                                            logs,
+                                            path,
+                                            method_bytes,
+                                            request_line,
+                                            host,
+                                            remote_addr,
+                                            remote_port,
+                                            None,
+                                            headers_raw,
+                                            status,
+                                            connection_id,
+                                            request_count,
+                                            request_id,
+                                            connection_time_us,
+                                            request_start.elapsed().as_micros() as u64,
+                                            server_port,
+                                            request_port,
+                                            pipe_byte,
+                                            request_length,
+                                            0,
+                                            0,
+                                            now.as_secs(),
+                                            now.subsec_millis() as u16,
+                                            tls,
+                                            conn,
+                                            http,
+                                            None,
+                                            None,
+                                        ))
+                                        .await;
+                                    }
+                                    return false;
+                                }};
+                            }
+                            // The read is bounded by the client_max_body_size
+                            // of the location the request is routed to first,
+                            // and a Content-Length over it is refused unread,
+                            // as nginx's find_config phase does. Without a
+                            // location (refused, answered by the server's
+                            // rewrite phase) the bound is the largest of any
+                            // location; the matched location checks its own
+                            // limit after the read either way.
+                            let mut max_body = http.max_request_body;
+                            // `client_body_in_file_only on` where the request goes:
+                            // a temp file holding the body outlives it.
+                            let mut persistent_body = false;
+                            // Bodies above it go to a temp file (#246).
+                            let mut body_buffer = crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE;
+                            // And its `client_body_temp_path`, else the http one.
+                            let mut body_temp = &http.body_temp;
+                            // Nothing will read the body: drop it as it comes.
+                            let mut discard_body = false;
+                            // With it, the response a 100 goes out before.
+                            let mut continue_status = None;
+                            // The routed location's client_body_timeout (#147).
+                            let mut body_timeout = timeouts.body;
+                            // `proxy_request_buffering off` there (#134), with
+                            // its proxy_http_version.
+                            let mut unbuffered: Option<u8> = None;
+                            // What the access phase did before the read (#855).
+                            let mut access_first: Option<Box<AccessFirst>> = None;
+                            // A chunked body whose framing was bad, once the
+                            // location is known: it answers the 400 (#806).
+                            let mut body_malformed = false;
+                            // A body is framed, even an empty one (`Content-Length:
+                            // 0`, or chunked): nginx reads it, and with
+                            // client_body_in_file_only writes its file (#628).
+                            let has_body =
+                                req.content_length.is_some() || req.transfer_encoding_chunked;
+                            if refuse.is_none() && has_body {
+                                let cl = req.content_length.unwrap_or(0);
+                                let probe = request_ctx!(
+                                    &phase::NO_BODY,
+                                    cl,
+                                    None,
+                                    None,
+                                    req.consumed as u64 + cl,
+                                    0,
+                                    0
+                                );
+                                if let Some(first) = phase::first_body_limit(
+                                    http,
+                                    &probe,
+                                    &mut *url_scratch,
+                                    parse_state.has_expect,
+                                ) {
+                                    persistent_body = first.persistent;
+                                    discard_body = first.discard;
+                                    continue_status = first.continue_status;
+                                    body_timeout = first.body_timeout;
+                                    unbuffered = first.unbuffered;
+                                    body_buffer = first.buffer;
+                                    body_temp = first.body_temp.unwrap_or(body_temp);
+                                    max_body = match first.max {
+                                        0 => u64::MAX,
+                                        n => n,
+                                    };
+                                    if cl > max_body {
+                                        write_error_log(
+                                            first.error_logs,
+                                            ErrorLogLevel::Error,
+                                            &ErrorLogRequest::new(&probe, first.server_name),
+                                            format!(
+                                                "client intended to send too large body: {cl} bytes"
+                                            )
+                                            .as_bytes(),
+                                            None,
+                                        );
+                                    } else if (first.probe_first && !discard_body)
+                                        || req.transfer_encoding_chunked
+                                    {
+                                        // The access phase answers before the
+                                        // body is read (#855), and a static
+                                        // file found then (#836); and where a
+                                        // chunked body can turn out bad, the
+                                        // location answers that (#806).
+                                        let mut probe = probe;
+                                        let outcome = Box::pin(access_before_body(
+                                            http,
+                                            &mut probe,
+                                            &mut *url_scratch,
+                                            request_start,
+                                        ))
+                                        .await;
+                                        discard_body = matches!(outcome, AccessFirst::Answer(..));
+                                        access_first = Some(Box::new(outcome));
                                     }
                                 }
-                                (take, cl)
                             }
-                        } else if req.transfer_encoding_chunked && discard_body {
-                            // What came with the head is parsed first, as
-                            // nginx's discard does: a framing error there is
-                            // a 400, and the rest is read after the response.
-                            let body_start = base + req.consumed;
-                            match Box::pin(chunked_in_buffer(
-                                &buf[body_start..filled],
-                                timers.io.as_mut(),
-                            ))
-                            .await
-                            {
-                                Ok(body) => (body.consumed_initial, body.raw_consumed),
-                                Err(ChunkedBodyError::Ended) => {
-                                    pending_discard =
-                                        Some(PendingDiscard::Chunked { from: body_start });
-                                    let came = filled - body_start;
-                                    (came, came as u64)
-                                }
-                                Err(_) => {
-                                    reject_request(
-                                        stream,
-                                        &mut *scratch,
-                                        http,
-                                        http.bad_request.pick(method),
-                                        &buf[read_start..filled],
-                                        Refused::Body,
-                                        conn_log!(),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
-                        } else if req.transfer_encoding_chunked {
-                            let body_start = base + req.consumed;
-                            let initial = &buf[body_start..filled];
-                            match read_chunked_request_body(
-                                stream,
-                                initial,
-                                max_body,
-                                Some(&mut sink),
-                                timers.io.as_mut(),
-                                body_timeout,
-                            )
-                            .await
-                            {
-                                Ok(decoded) => {
-                                    pipelined_tail = decoded.pipelined_tail;
-                                    (decoded.consumed_initial, decoded.raw_consumed)
-                                }
-                                Err(ChunkedBodyError::TooLarge) => {
-                                    body_too_large = true;
-                                    (0, 0)
-                                }
-                                Err(_) => {
-                                    reject_request(
-                                        stream,
-                                        &mut *scratch,
-                                        http,
-                                        http.bad_request.pick(method),
-                                        &buf[read_start..filled],
-                                        Refused::Body,
-                                        conn_log!(),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
-                        } else {
-                            (0, 0)
-                        };
-                        body_read = request_body_len > body_in_buf as u64;
-                        // Over the limit: big enough for the location's check.
-                        let body_len = if body_too_large {
-                            request_body_len.max(max_body.saturating_add(1))
-                        } else if discard_body && req.content_length.is_some() {
-                            request_body_len
-                        } else {
-                            sink.len()
-                        };
-                        // client_body_in_file_only (a zero buffer): an empty
-                        // body gets its file too (ngx_http_write_request_body).
-                        if body_buffer == 0
-                            && has_body
-                            && !discard_body
-                            && !body_too_large
-                            && sink.len() == 0
-                            && !sink.spill()
-                        {
-                            return;
-                        }
-                        let (body_vec, spooled) = sink.finish();
-                        // Shared, so a proxied request sends it from here
-                        // instead of a copy (#289); the buffer goes back to
-                        // the pool when the last holder is done.
-                        let body_vec = if body_vec.is_empty() {
-                            bytes::Bytes::new()
-                        } else {
-                            bytes::Bytes::from_owner(body_vec)
-                        };
-                        // Bound to this request iteration; holds the
-                        // temp-file path bytes for `$request_body_file`. A
-                        // body over client_body_buffer_size (any body, with
-                        // client_body_in_file_only) is already there.
-                        let request_body_file = spooled;
-                        let body_file = request_body_file.as_ref();
-                        let request_total_consumed = req.consumed + body_in_buf;
-                        // HTTP/2: the header block, and the body as it was
-                        // read (DATA bytes), not when it was discarded:
-                        // nginx counts it in ngx_http_v2_process_request_body.
-                        let request_length = match stream.h2_header_block() {
-                            Some(block) if discard_body || body_too_large => block,
-                            Some(block) => block + body_len,
-                            None => req.consumed as u64 + request_body_len,
-                        };
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default();
-                        let epoch_secs = now.as_secs();
-                        let epoch_ms = (now.subsec_millis() as u16) % 1000;
-
-                        let mut ctx = request_ctx!(
-                            &body_vec,
-                            body_len,
-                            body_file,
-                            request_length,
-                            epoch_secs,
-                            epoch_ms
-                        );
-                        let (mut response, mut process_meta) =
-                            phase::process_with_meta(http, &ctx, &mut *url_scratch);
-                        if authority_mismatch {
-                            authority_mismatch_log(&process_meta, &ctx);
-                        }
-                        // limit_req delayed the request (#94): processing
-                        // stopped before the content handler. Boxed, so the
-                        // wait's timer isn't part of every connection's
-                        // future.
-                        if process_meta.limit_req_delay_ms > 0 {
-                            (response, process_meta) = Box::pin(limit_req_delayed(
-                                http,
-                                &mut ctx,
-                                &mut *url_scratch,
-                                process_meta.limit_req_delay_ms,
-                                request_start,
-                            ))
-                            .await;
-                        }
-
-                        // auth_request's subrequest (#358): the request is
-                        // processed again with its outcome.
-                        if process_meta.auth_request.is_some() {
-                            (response, process_meta) = Box::pin(auth_subrequest(
-                                http,
-                                &mut ctx,
-                                &mut *url_scratch,
-                                process_meta,
-                                request_start,
-                            ))
-                            .await;
-                        }
-
-                        // Only a proxied response has anything to settle;
-                        // the call would move `process_meta` (~1 KB) in
-                        // and out for nothing.
-                        let response = if matches!(response, Response::Proxy(_)) {
-                            let (response, settled_meta) = settle_proxy_response(
-                                http,
-                                &ctx,
-                                &mut *url_scratch,
-                                response,
-                                process_meta,
-                                Some(&*stream as &dyn super::client_watch::WatchClient),
-                            )
-                            .await;
-                            process_meta = settled_meta;
-                            response
-                        } else {
-                            response
-                        };
-                        // The location's send_timeout for this response (#147);
-                        // the next request's header waits use the default
-                        // server's values again, as in nginx.
-                        let send_timeout = process_meta.timeouts.map_or(timeouts.send, |t| t.send);
-                        if expect_continue
-                            && discard_body
-                            && !Box::pin(continue_first(
-                                stream,
-                                &response,
-                                continue_status,
-                                timers.io.as_mut(),
-                                send_timeout,
-                            ))
-                            .await
-                        {
-                            return;
-                        }
-                        // And on an HTTP/2 stream, its http2_chunk_size (#594).
-                        if let Some(t) = process_meta.timeouts {
-                            stream.set_h2_chunk(t.h2_chunk);
-                        }
-
-                        // An upstream 101 to a client that asked to upgrade:
-                        // the head goes out, then the connection is a tunnel
-                        // until either side closes, and then it closes.
-                        if let Response::Upgrade(upgraded) = response {
-                            let crate::proxy::Upgraded {
-                                head,
-                                upstream,
-                                leftover,
-                                slot,
-                                read_timeout,
-                                send_timeout,
-                                upstream_url,
-                                lease,
-                            } = *upgraded;
-                            let head_len = head.len();
-                            let (res, head) = write_all_timed(
-                                stream,
-                                head,
-                                head_len,
-                                timers.io.as_mut(),
-                                timeouts.send,
-                            )
-                            .await;
-                            // A head that didn't go out: no tunnel, but the
-                            // request is logged all the same (#410).
-                            let head_sent = res.is_ok();
-                            let head_cut_at = res.err().unwrap_or(0) as u64;
-                            let head = if head.is_empty() {
-                                lost_head(101)
-                            } else {
-                                head
-                            };
-                            let tunnelled = if head_sent {
-                                let early: &[u8] = if pipelined_tail.is_empty() {
-                                    &buf[read_start + request_total_consumed..filled]
-                                } else {
-                                    &pipelined_tail
-                                };
-                                Box::pin(run_tunnel(
+                            // Expect: 100-continue (nginx ngx_http_test_expect):
+                            // when the client sent the exact value "100-continue"
+                            // on HTTP/1.1, send the interim `HTTP/1.1 100 Continue`
+                            // response before reading the body. nginx fires this
+                            // from both read_client_request_body and
+                            // discard_request_body, so it applies regardless of
+                            // whether the eventual handler consumes the body and
+                            // regardless of Content-Length (CL: 0 with the header
+                            // still gets a 100). Other Expect tokens (extensions
+                            // / unknown) are silently ignored — RFC says 417, but
+                            // nginx never implemented that branch and the upstream
+                            // test marks it TODO.
+                            // Not when the body is refused from its
+                            // Content-Length below: nginx sets expect_tested
+                            // before discarding it, so no 100 goes out.
+                            let refused_unread = req.content_length.is_some_and(|cl| cl > max_body);
+                            let expect_continue = req.http_11
+                                && refuse.is_none()
+                                && !refused_unread
+                                && parse_state.has_expect
+                                && lookup_request_header(
+                                    &buf[base + req.headers_start..base + req.headers_end],
+                                    b"expect",
+                                )
+                                .is_some_and(|e| e.eq_ignore_ascii_case(b"100-continue"));
+                            // A body nobody reads gets its 100 with the response
+                            // (#627), and none before an error nginx's special
+                            // response handler answers: a client doesn't upload
+                            // a body to a 401 (`continue_first`).
+                            if expect_continue && !discard_body {
+                                // nginx sends it in one send() and gives up
+                                // the connection if it doesn't all go out;
+                                // here send_timeout bounds the wait.
+                                let resp: Vec<u8> = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+                                let len = resp.len();
+                                let (res, _) = write_all_timed(
                                     stream,
-                                    upstream,
-                                    early,
-                                    leftover,
-                                    TunnelConf {
-                                        read_timeout,
-                                        upstream_send_timeout: send_timeout,
-                                        client_send_timeout: timeouts.send,
-                                        http,
-                                        state,
-                                        start_reload_gen,
-                                    },
+                                    resp,
+                                    len,
+                                    io_timer.as_mut(),
+                                    timeouts.send,
+                                )
+                                .await;
+                                if res.is_err() {
+                                    return false;
+                                }
+                            }
+                            // Request bodies stay in memory up to the location's
+                            // client_body_buffer_size and go to a temp file past
+                            // that (`BodySink`), within `max_body` above. Past
+                            // it, a body that arrives within BODY_IN_MEMORY_FOR
+                            // stays in memory, unless something can tell: the
+                            // body variables show whether it went to a file, and
+                            // a chunked body is read without that timer.
+                            let mut pipelined_tail: Vec<u8> = Vec::new();
+                            let nginx_rule = http.uses_request_body
+                                || http.uses_request_body_file
+                                || body_buffer == 0
+                                || req.transfer_encoding_chunked;
+                            let mut sink = BodySink::with_capacity(
+                                if discard_body {
+                                    0
+                                } else {
+                                    req.content_length.unwrap_or(0)
+                                },
+                                body_buffer,
+                                if nginx_rule {
+                                    body_buffer
+                                } else {
+                                    body_buffer.max(crate::worker::BODY_IN_MEMORY_MAX)
+                                },
+                                body_temp,
+                                persistent_body,
+                            );
+                            // The body is over the limit and isn't read: the
+                            // location answers 413 through its error_page, and
+                            // the connection closes after it (lingering).
+                            let mut body_too_large = false;
+                            // What of a body nobody reads is still to come: the
+                            // response goes first, as nginx's
+                            // ngx_http_discard_request_body, and the rest is
+                            // read and dropped after it (#627). `u64::MAX`: a
+                            // chunked one, whose end isn't known.
+                            let mut pending_discard: Option<PendingDiscard> = None;
+                            // A body sent upstream as it comes (#134): the
+                            // proxy reads it from `body_feed`, the rest of it
+                            // read from the client by `pump`.
+                            let mut body_feed: Option<crate::request_feed::BodyFeed> = None;
+                            let mut pump: Option<Box<BodyPump>> = None;
+                            let (body_in_buf, request_body_len): (usize, u64) = if refuse.is_some()
+                            {
+                                (0, 0)
+                            } else if let Some(cl) = req.content_length {
+                                'read: {
+                                    if cl > max_body {
+                                        // nginx answers 413 from the Content-Length
+                                        // alone, without reading the body.
+                                        body_too_large = true;
+                                        break 'read (0, cl);
+                                    }
+                                    let body_start = base + req.consumed;
+                                    let already = filled.saturating_sub(body_start);
+                                    let take = (already as u64).min(cl) as usize;
+                                    if discard_body {
+                                        if cl > take as u64 {
+                                            let rest = stream.discard_queued(cl - take as u64);
+                                            if rest > 0 {
+                                                pending_discard =
+                                                    Some(PendingDiscard::Length(rest));
+                                            }
+                                        }
+                                        break 'read (take, cl);
+                                    }
+                                    if unbuffered.is_some()
+                                        && cl > take as u64
+                                        && !BodyPump::rest_ready(
+                                            stream,
+                                            cl - take as u64,
+                                            body_buffer,
+                                        )
+                                    {
+                                        let (feed, rest) = BodyPump::length(
+                                            &buf[body_start..body_start + take],
+                                            cl - take as u64,
+                                        );
+                                        body_feed = Some(feed);
+                                        pump = Some(rest);
+                                        break 'read (take, cl);
+                                    }
+                                    if !sink.extend(&buf[body_start..body_start + take]) {
+                                        return false;
+                                    }
+                                    // Each read stops at the body's end so a
+                                    // pipelined next request isn't consumed. A body
+                                    // that stays in memory is read straight into
+                                    // its buffer: no copy, no second buffer (#289).
+                                    if sink.len() < cl {
+                                        // From the start of the body: past
+                                        // client_body_buffer_size, the body goes
+                                        // to the temp file BODY_IN_MEMORY_FOR on.
+                                        let started = monoio::time::Instant::now();
+                                        while sink.len() < cl {
+                                            let Some((mem, room)) = sink.take_read_buf() else {
+                                                // Boxed: its timer and select!
+                                                // stay out of every request's
+                                                // future.
+                                                if let Err(cut) = Box::pin(read_body_past_buffer(
+                                                    stream,
+                                                    &mut sink,
+                                                    cl,
+                                                    body_buffer,
+                                                    started,
+                                                    io_timer.as_mut(),
+                                                    body_timeout,
+                                                ))
+                                                .await
+                                                {
+                                                    cut_body!(
+                                                        cut,
+                                                        req.consumed as u64 + sink.len()
+                                                    );
+                                                }
+                                                break;
+                                            };
+                                            let start = mem.len();
+                                            let end = (start as u64 + (cl - sink.len()))
+                                                .min(room as u64)
+                                                as usize;
+                                            let slice = mem.slice_mut(start..end);
+                                            // client_body_timeout between reads.
+                                            let Some((res, returned)) = with_timeout(
+                                                io_timer.as_mut(),
+                                                body_timeout,
+                                                stream.read_now(slice),
+                                            )
+                                            .await
+                                            else {
+                                                cut_body!(
+                                                    BodyCut::TimedOut,
+                                                    req.consumed as u64 + sink.len()
+                                                );
+                                            };
+                                            match res {
+                                                Ok(0) | Err(_) => cut_body!(
+                                                    BodyCut::Closed,
+                                                    req.consumed as u64 + sink.len()
+                                                ),
+                                                Ok(n) => {
+                                                    sink.put_read_buf(returned.into_inner(), n)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    (take, cl)
+                                }
+                            } else if req.transfer_encoding_chunked && discard_body {
+                                // What came with the head is parsed first, as
+                                // nginx's discard does: a framing error there is
+                                // a 400, and the rest is read after the response.
+                                let body_start = base + req.consumed;
+                                match Box::pin(chunked_in_buffer(
+                                    &buf[body_start..filled],
+                                    io_timer.as_mut(),
                                 ))
                                 .await
+                                {
+                                    Ok(body) => (body.consumed_initial, body.raw_consumed),
+                                    Err(ChunkedBodyError::Ended) => {
+                                        pending_discard =
+                                            Some(PendingDiscard::Chunked { from: body_start });
+                                        let came = filled - body_start;
+                                        (came, came as u64)
+                                    }
+                                    Err(_) if access_first.is_some() => {
+                                        body_malformed = true;
+                                        let came = filled - body_start;
+                                        (came, came as u64)
+                                    }
+                                    Err(_) => {
+                                        reject_request(
+                                            stream,
+                                            &mut *scratch,
+                                            http,
+                                            http.bad_request.pick(method),
+                                            &buf[read_start..filled],
+                                            Refused::Body,
+                                            conn_log!(),
+                                        )
+                                        .await;
+                                        return false;
+                                    }
+                                }
+                            } else if req.transfer_encoding_chunked
+                                && unbuffered == Some(1)
+                                && let Some((feed, rest)) = Box::pin(BodyPump::chunked(
+                                    stream,
+                                    &buf[base + req.consumed..filled],
+                                    max_body,
+                                    body_buffer,
+                                    io_timer.as_mut(),
+                                ))
+                                .await
+                            {
+                                body_feed = Some(feed);
+                                pump = Some(rest);
+                                let came = filled - (base + req.consumed);
+                                (came, came as u64)
+                            } else if req.transfer_encoding_chunked {
+                                let body_start = base + req.consumed;
+                                let initial = &buf[body_start..filled];
+                                match read_chunked_request_body(
+                                    stream,
+                                    initial,
+                                    max_body,
+                                    Some(&mut sink),
+                                    io_timer.as_mut(),
+                                    body_timeout,
+                                )
+                                .await
+                                {
+                                    Ok(decoded) => {
+                                        pipelined_tail = decoded.pipelined_tail;
+                                        (decoded.consumed_initial, decoded.raw_consumed)
+                                    }
+                                    Err(ChunkedBodyError::TooLarge) => {
+                                        body_too_large = true;
+                                        (0, 0)
+                                    }
+                                    // Timed out or gone: nginx terminates the
+                                    // request unanswered, as for a Content-Length
+                                    // body above (#858).
+                                    Err(
+                                        e @ (ChunkedBodyError::TimedOut | ChunkedBodyError::Ended),
+                                    ) => {
+                                        let cut = match e {
+                                            ChunkedBodyError::TimedOut => BodyCut::TimedOut,
+                                            _ => BodyCut::Closed,
+                                        };
+                                        // What came with the head: the reads
+                                        // after it aren't counted back.
+                                        cut_body!(cut, (filled - base) as u64);
+                                    }
+                                    Err(_) if access_first.is_some() => {
+                                        body_malformed = true;
+                                        (0, 0)
+                                    }
+                                    Err(_) => {
+                                        reject_request(
+                                            stream,
+                                            &mut *scratch,
+                                            http,
+                                            http.bad_request.pick(method),
+                                            &buf[read_start..filled],
+                                            Refused::Body,
+                                            conn_log!(),
+                                        )
+                                        .await;
+                                        return false;
+                                    }
+                                }
                             } else {
-                                super::tunnel::Tunnelled {
-                                    to_client: 0,
-                                    to_upstream: 0,
-                                    from_upstream: 0,
-                                    end: TunnelEnd::Closed,
+                                (0, 0)
+                            };
+                            body_read = request_body_len > body_in_buf as u64;
+                            // Over the limit: big enough for the location's check.
+                            let body_len = if body_too_large {
+                                request_body_len.max(max_body.saturating_add(1))
+                            } else if body_malformed {
+                                phase::MALFORMED_BODY
+                            } else if (discard_body || pump.is_some())
+                                && req.content_length.is_some()
+                            {
+                                request_body_len
+                            } else {
+                                sink.len()
+                            };
+                            // client_body_in_file_only (a zero buffer): an empty
+                            // body gets its file too (ngx_http_write_request_body).
+                            if body_buffer == 0
+                                && has_body
+                                && !discard_body
+                                && !body_too_large
+                                && sink.len() == 0
+                                && !sink.spill()
+                            {
+                                return false;
+                            }
+                            let (body_vec, spooled) = sink.finish();
+                            // Shared, so a proxied request sends it from here
+                            // instead of a copy (#289); the buffer goes back to
+                            // the pool when the last holder is done.
+                            let body_vec = if body_vec.is_empty() {
+                                // A body sent as it comes (#134): `$request_body`
+                                // is what came with the header.
+                                pump.as_deref()
+                                    .map_or_else(bytes::Bytes::new, BodyPump::preread)
+                            } else {
+                                bytes::Bytes::from_owner(body_vec)
+                            };
+                            // Bound to this request iteration; holds the
+                            // temp-file path bytes for `$request_body_file`. A
+                            // body over client_body_buffer_size (any body, with
+                            // client_body_in_file_only) is already there.
+                            let request_body_file = spooled;
+                            let body_file = request_body_file.as_ref();
+                            let request_total_consumed = req.consumed + body_in_buf;
+                            // HTTP/2: the header block, and the body as it was
+                            // read (DATA bytes), not when it was discarded:
+                            // nginx counts it in ngx_http_v2_process_request_body.
+                            let request_length = match stream.h2_header_block() {
+                                Some(block) if discard_body || body_too_large => block,
+                                Some(block) => block + body_len,
+                                None => req.consumed as u64 + request_body_len,
+                            };
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default();
+                            let epoch_secs = now.as_secs();
+                            let epoch_ms = (now.subsec_millis() as u16) % 1000;
+
+                            let mut ctx = request_ctx!(
+                                &body_vec,
+                                body_len,
+                                body_file,
+                                body_feed.as_ref(),
+                                request_length,
+                                epoch_secs,
+                                epoch_ms
+                            );
+                            let (mut response, mut process_meta) = match access_first.take() {
+                                None => phase::process_with_meta(http, &ctx, &mut *url_scratch),
+                                Some(first) => process_after_access(
+                                    http,
+                                    &ctx,
+                                    &mut *url_scratch,
+                                    *first,
+                                    body_malformed,
+                                ),
+                            };
+                            if authority_mismatch {
+                                authority_mismatch_log(&process_meta, &ctx);
+                            }
+                            // limit_req delayed the request (#94): processing
+                            // stopped before the content handler. Boxed, so the
+                            // wait's timer isn't part of every connection's
+                            // future.
+                            if process_meta.limit_req_delay_ms > 0 {
+                                (response, process_meta) = Box::pin(limit_req_delayed(
+                                    http,
+                                    &mut ctx,
+                                    &mut *url_scratch,
+                                    process_meta.limit_req_delay_ms,
+                                    request_start,
+                                ))
+                                .await;
+                            }
+
+                            // auth_request's subrequest (#358): the request is
+                            // processed again with its outcome.
+                            if process_meta.auth_request.is_some() {
+                                (response, process_meta) = Box::pin(auth_subrequest(
+                                    http,
+                                    &mut ctx,
+                                    &mut *url_scratch,
+                                    process_meta,
+                                    request_start,
+                                ))
+                                .await;
+                            }
+
+                            // Only a proxied response has anything to settle;
+                            // the call would move `process_meta` (~1 KB) in
+                            // and out for nothing.
+                            let mut response = if let Some(rest) = pump.take() {
+                                // A body still to come (#134): sent upstream as
+                                // it comes, or dropped after the response.
+                                let (response, settled_meta, end) = Box::pin(settle_unbuffered(
+                                    http,
+                                    &ctx,
+                                    &mut *url_scratch,
+                                    response,
+                                    process_meta,
+                                    stream,
+                                    rest,
+                                    body_timeout,
+                                ))
+                                .await;
+                                process_meta = settled_meta;
+                                match end {
+                                    PumpEnd::Done(tail) => pipelined_tail = tail,
+                                    PumpEnd::Discard(rest) => {
+                                        pending_discard = Some(match rest {
+                                            Some(left) => PendingDiscard::Length(left),
+                                            None => PendingDiscard::Chunked {
+                                                from: base + req.consumed,
+                                            },
+                                        })
+                                    }
+                                    // Where the next request starts isn't known.
+                                    PumpEnd::Unfinished => process_meta.keepalive.allow = false,
+                                }
+                                response
+                            } else if matches!(response, Response::Proxy(_)) {
+                                let (response, settled_meta) = settle_proxy_response(
+                                    http,
+                                    &ctx,
+                                    &mut *url_scratch,
+                                    response,
+                                    process_meta,
+                                    Some(&mut *stream as &mut dyn super::client_watch::WatchClient),
+                                )
+                                .await;
+                                process_meta = settled_meta;
+                                response
+                            } else {
+                                response
+                            };
+                            // The location's send_timeout for this response (#147);
+                            // the next request's header waits use the default
+                            // server's values again, as in nginx.
+                            let send_timeout =
+                                process_meta.timeouts.map_or(timeouts.send, |t| t.send);
+                            if expect_continue
+                                && discard_body
+                                && !Box::pin(continue_first(
+                                    stream,
+                                    &response,
+                                    continue_status,
+                                    io_timer.as_mut(),
+                                    send_timeout,
+                                ))
+                                .await
+                            {
+                                return false;
+                            }
+                            // And on an HTTP/2 stream, its http2_chunk_size (#594).
+                            if let Some(t) = process_meta.timeouts {
+                                stream.set_h2_chunk(t.h2_chunk);
+                            }
+
+                            // An upstream 101 to a client that asked to upgrade:
+                            // the head goes out, then the connection is a tunnel
+                            // until either side closes, and then it closes.
+                            if let Response::Upgrade(upgraded) = response {
+                                let crate::proxy::Upgraded {
+                                    head,
+                                    upstream,
+                                    leftover,
+                                    slot,
+                                    read_timeout,
+                                    send_timeout,
+                                    upstream_url,
+                                    lease,
+                                } = *upgraded;
+                                let head_len = head.len();
+                                let (res, head) = write_all_timed(
+                                    stream,
+                                    head,
+                                    head_len,
+                                    io_timer.as_mut(),
+                                    timeouts.send,
+                                )
+                                .await;
+                                // A head that didn't go out: no tunnel, but the
+                                // request is logged all the same (#410).
+                                let head_sent = res.is_ok();
+                                let head_cut_at = res.err().unwrap_or(0) as u64;
+                                let head = if head.is_empty() {
+                                    lost_head(101)
+                                } else {
+                                    head
+                                };
+                                let tunnelled = if head_sent {
+                                    let early: &[u8] = if pipelined_tail.is_empty() {
+                                        &buf[read_start + request_total_consumed..filled]
+                                    } else {
+                                        &pipelined_tail
+                                    };
+                                    Box::pin(run_tunnel(
+                                        stream,
+                                        upstream,
+                                        early,
+                                        leftover,
+                                        TunnelConf {
+                                            read_timeout,
+                                            upstream_send_timeout: send_timeout,
+                                            client_send_timeout: timeouts.send,
+                                            http,
+                                            state,
+                                            start_reload_gen,
+                                        },
+                                    ))
+                                    .await
+                                } else {
+                                    super::tunnel::Tunnelled {
+                                        to_client: 0,
+                                        to_upstream: 0,
+                                        from_upstream: 0,
+                                        end: TunnelEnd::Closed,
+                                    }
+                                };
+                                drop(slot);
+                                drop(lease);
+                                if tunnelled.end == TunnelEnd::ClientTimedOut {
+                                    // ngx_http_upstream_process_upgraded, at info.
+                                    write_error_log(
+                                        process_meta.log.error_logs,
+                                        ErrorLogLevel::Info,
+                                        &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                            .with_realip(&process_meta),
+                                        b"client timed out (110: Connection timed out) while proxying upgraded connection",
+                                        Some(&upstream_url),
+                                    );
+                                }
+                                if tunnelled.end == TunnelEnd::UpstreamTimedOut {
+                                    write_upstream_error_log(
+                                        &process_meta.log,
+                                        &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                            .with_realip(&process_meta),
+                                        &[crate::proxy::AttemptFailure {
+                                            error: crate::proxy::UpstreamError::TimedOut(
+                                                crate::proxy::Stage::Upgraded,
+                                            ),
+                                            upstream: upstream_url,
+                                        }],
+                                    );
+                                }
+                                if let Some(last) = process_meta.upstream_states.last_mut() {
+                                    last.bytes_received += tunnelled.from_upstream;
+                                    last.bytes_sent += tunnelled.to_upstream;
+                                }
+                                let bytes_sent = if head_sent {
+                                    head_len as u64 + tunnelled.to_client
+                                } else {
+                                    head_cut_at
+                                };
+                                if http.metrics.is_some() {
+                                    super::metrics::response(
+                                        process_meta.metrics_server,
+                                        &head,
+                                        bytes_sent,
+                                    );
+                                }
+                                if !process_meta.access_logs.is_empty() {
+                                    let request_time_us =
+                                        request_start.elapsed().as_micros() as u64;
+                                    write_access_logs(
+                                        process_meta.access_logs,
+                                        path,
+                                        method_bytes,
+                                        request_line,
+                                        host,
+                                        remote_addr,
+                                        remote_port,
+                                        process_meta.remote_user.as_deref(),
+                                        headers_raw,
+                                        &head,
+                                        connection_id,
+                                        request_count,
+                                        request_id,
+                                        connection_time_us,
+                                        request_time_us,
+                                        process_meta.server_port,
+                                        request_port,
+                                        pipe_byte,
+                                        request_length,
+                                        bytes_sent,
+                                        tunnelled.to_client,
+                                        epoch_secs,
+                                        epoch_ms,
+                                        tls,
+                                        conn,
+                                        http,
+                                        Some(&process_meta),
+                                        final_uri(&process_meta, url_scratch),
+                                    )
+                                    .await;
+                                }
+                                return false;
+                            }
+
+                            // Defer the response write per `auth_delay`. We
+                            // sleep on the runtime, not the OS thread, so other
+                            // connections on this worker keep progressing.
+                            if process_meta.response_delay_ms > 0 {
+                                monoio::time::sleep(Duration::from_millis(
+                                    process_meta.response_delay_ms,
+                                ))
+                                .await;
+                            }
+
+                            // gzip (`gzip on` in the location): a body in memory
+                            // is compressed here, a file on its way out below.
+                            if process_meta.handler_trailers {
+                                handler_trailers_due(&mut response, &ctx, &mut process_meta);
+                            }
+                            let (mut response, gzip_stream) = match process_meta.gzip {
+                                Some(gz) => super::gzip::filter(
+                                    gz,
+                                    &super::gzip::GzipRequest {
+                                        head_only: method_bytes == b"HEAD",
+                                        aio: process_meta.aio.is_some(),
+                                        ..super::gzip::GzipRequest::from_headers(
+                                            req.http_11,
+                                            headers_raw,
+                                        )
+                                    },
+                                    response,
+                                ),
+                                None => (response, None),
+                            };
+                            // `add_trailer` on a body in memory: after gzip.
+                            if process_meta.trailers_due
+                                && let Response::Owned(bytes) = &mut response
+                            {
+                                *bytes = trailers_in_memory(
+                                    std::mem::take(bytes),
+                                    http,
+                                    &ctx,
+                                    &process_meta,
+                                    final_uri(&process_meta, url_scratch),
+                                );
+                                process_meta.trailers_due = false;
+                            }
+                            // `charset` (#464): the label on Content-Type, from
+                            // the location's DocRoot, in place.
+                            if let Some(charset) = process_meta.doc_root.and_then(|d| d.charset) {
+                                super::add_charset(charset, &mut response);
+                            }
+
+                            // `return 444;` (no text) is nginx's NGX_HTTP_CLOSE: no
+                            // response at all; the connection closes after the
+                            // log line (#397). With text it is an ordinary response.
+                            let closes = match &response {
+                                Response::Prebuilt(b) => super::closes_unanswered(b),
+                                Response::Owned(b) => super::closes_unanswered(b),
+                                _ => false,
+                            };
+                            if closes {
+                                if http.metrics.is_some() {
+                                    let head: &[u8] = match &response {
+                                        Response::Prebuilt(b) => b,
+                                        Response::Owned(b) => b,
+                                        _ => &[],
+                                    };
+                                    super::metrics::response(process_meta.metrics_server, head, 0);
+                                }
+                                if !process_meta.access_logs.is_empty() {
+                                    let logged: &[u8] = match &response {
+                                        Response::Prebuilt(b) => b,
+                                        Response::Owned(b) => b,
+                                        _ => &[],
+                                    };
+                                    Box::pin(write_access_logs(
+                                        process_meta.access_logs,
+                                        path,
+                                        method_bytes,
+                                        request_line,
+                                        host,
+                                        remote_addr,
+                                        remote_port,
+                                        process_meta.remote_user.as_deref(),
+                                        headers_raw,
+                                        logged,
+                                        connection_id,
+                                        request_count,
+                                        request_id,
+                                        connection_time_us,
+                                        request_start.elapsed().as_micros() as u64,
+                                        process_meta.server_port,
+                                        request_port,
+                                        pipe_byte,
+                                        request_length,
+                                        0,
+                                        0,
+                                        epoch_secs,
+                                        epoch_ms,
+                                        tls,
+                                        conn,
+                                        http,
+                                        Some(&process_meta),
+                                        final_uri(&process_meta, url_scratch),
+                                    ))
+                                    .await;
+                                }
+                                return false;
+                            }
+
+                            // Funnel the response bytes into `scratch`. Owned and
+                            // File variants hand us a Vec the handler allocated
+                            // this request — prefer whichever of the two buffers
+                            // has the larger capacity so scratch converges to the
+                            // high-water mark and stops allocating after a few
+                            // iterations. Prebuilt responses stay as static slices:
+                            // we can synthesize and cache finalized header variants
+                            // once per worker and avoid per-request Vec copies.
+                            scratch.clear();
+                            let mut prebuilt_base: Option<&'static [u8]> = None;
+                            // An upstream body relayed after the head (#88).
+                            let mut proxy_body: Option<Box<crate::proxy_stream::ProxyStream>> =
+                                None;
+                            let mut file_body: Option<phase::FileBody> = match response {
+                                Response::Prebuilt(bytes) => {
+                                    prebuilt_base = Some(bytes);
+                                    None
+                                }
+                                // The buffer not kept goes back to the worker's
+                                // pool, for the next response head built
+                                // (`response::take_buf`).
+                                Response::Owned(bytes) => {
+                                    if bytes.capacity() > scratch.capacity() {
+                                        super::response::give_buf(std::mem::replace(
+                                            &mut *scratch,
+                                            bytes,
+                                        ));
+                                    } else {
+                                        scratch.extend_from_slice(&bytes);
+                                        super::response::give_buf(bytes);
+                                    }
+                                    None
+                                }
+                                Response::File { headers, body } => {
+                                    if headers.capacity() > scratch.capacity() {
+                                        super::response::give_buf(std::mem::replace(
+                                            &mut *scratch,
+                                            headers,
+                                        ));
+                                    } else {
+                                        scratch.extend_from_slice(&headers);
+                                        super::response::give_buf(headers);
+                                    }
+                                    Some(body)
+                                }
+                                Response::ProxyStream(mut body) => {
+                                    let head = std::mem::take(&mut body.head);
+                                    if head.capacity() > scratch.capacity() {
+                                        *scratch = head;
+                                    } else {
+                                        scratch.extend_from_slice(&head);
+                                    }
+                                    proxy_body = Some(body);
+                                    None
+                                }
+                                // phase::process consumes Reroute internally
+                                // via its hop loop; a Reroute reaching the
+                                // worker means the loop terminated without a
+                                // terminal outcome, which `process` already
+                                // guards against with a 500. Defensive only.
+                                Response::Reroute(_) => return false,
+                                // The Proxy variant is consumed above by
+                                // `run_proxy` before this match runs; reaching
+                                // here is a logic bug.
+                                Response::Proxy(_) => return false,
+                                // Tunnelled above.
+                                Response::Upgrade(_) => return false,
+                            };
+                            // Single walk over the response header block replaces
+                            // what used to be three separate scans. For static
+                            // prebuilts, cache the result by pointer so repeat
+                            // requests stay allocation-free.
+                            let mut scan = match prebuilt_base {
+                                Some(bytes) => cached_scan_response_headers(bytes),
+                                None => {
+                                    let mut scan =
+                                        scan_response_headers(scratch).unwrap_or_default();
+                                    if !process_meta.keep_upstream_date {
+                                        stamp_date(&mut *scratch, &mut scan);
+                                    }
+                                    scan
                                 }
                             };
-                            drop(slot);
-                            drop(lease);
-                            if tunnelled.end == TunnelEnd::ClientTimedOut {
-                                // ngx_http_upstream_process_upgraded, at info.
-                                write_error_log(
-                                    process_meta.log.error_logs,
-                                    ErrorLogLevel::Info,
-                                    &ErrorLogRequest::new(&ctx, process_meta.server_name)
-                                        .with_realip(&process_meta),
-                                    b"client timed out (110: Connection timed out) while proxying upgraded connection",
-                                    Some(&upstream_url),
+                            // No idle timeout: `keepalive_timeout 0` of a
+                            // server answering before any location.
+                            let mut close_after = !keep_alive
+                                || body_too_large
+                                || !process_meta.keepalive.allow
+                                || process_meta.keepalive.idle_timeout_ms.is_none()
+                                || request_count >= process_meta.keepalive.max_requests
+                                || connection_time_us / 1_000 > process_meta.keepalive.max_time_ms
+                                || matches!(method, Method::Trace | Method::Connect)
+                                || state.is_shutting_down()
+                                || (scan.has_connection && scan.connection_is_close)
+                                // A compressed file to an HTTP/1.0 client has no
+                                // length or chunks: the close ends it.
+                                || gzip_stream.is_some_and(|g| !g.chunked);
+                            // A relayed body of unknown length: chunked to an
+                            // HTTP/1.1 client, ended by the close otherwise.
+                            let mut chunked_out = false;
+                            if proxy_body.as_ref().is_some_and(|b| !b.length_known()) {
+                                if req.http_11 {
+                                    insert_header_at(
+                                        &mut *scratch,
+                                        &mut scan.head_end,
+                                        b"Transfer-Encoding: chunked\r\n",
+                                    );
+                                    chunked_out = true;
+                                } else {
+                                    close_after = true;
+                                }
+                            } else if process_meta.trailers_due && gzip_stream.is_none() {
+                                insert_header_at(
+                                    &mut *scratch,
+                                    &mut scan.head_end,
+                                    b"Transfer-Encoding: chunked\r\n",
                                 );
                             }
-                            if tunnelled.end == TunnelEnd::UpstreamTimedOut {
-                                write_upstream_error_log(
-                                    &process_meta.log,
-                                    &ErrorLogRequest::new(&ctx, process_meta.server_name)
-                                        .with_realip(&process_meta),
-                                    &[crate::proxy::AttemptFailure {
-                                        error: crate::proxy::UpstreamError::TimedOut(
-                                            crate::proxy::Stage::Upgraded,
-                                        ),
-                                        upstream: upstream_url,
-                                    }],
+                            // The client stopped taking the response: it is
+                            // logged with what is known to have gone out, then
+                            // the connection closes, as nginx's
+                            // ngx_http_terminate_request after a failed send
+                            // (#410). `cut_sent`: the bytes that went out then
+                            // (nginx's c->sent), when the write here failed.
+                            // to have gone out.
+                            let mut cut_short = false;
+                            let mut cut_sent: Option<u64> = None;
+                            // Only scan the raw headers for User-Agent when a
+                            // policy could actually trigger. disable_safari fires
+                            // on any method; disable_msie6 only on POST. Skipping
+                            // the scan in the common case (both flags off, or
+                            // msie6-only + non-POST) removes a full header-block
+                            // walk from the hot path.
+                            let ua_scan_needed = process_meta.keepalive.disable_safari
+                                || (process_meta.keepalive.disable_msie6 && method_is_post);
+                            if ua_scan_needed
+                                && should_disable_keepalive_for_user_agent(
+                                    method_is_post,
+                                    process_meta.keepalive,
+                                    lookup_request_header(headers_raw, b"user-agent"),
+                                )
+                            {
+                                close_after = true;
+                            }
+                            // `aio threads`: a body small enough to go with
+                            // the head, as `file::serve_path` sends it without
+                            // aio, is read on the pool. Failed, the request
+                            // ends without a response (nginx's copy filter
+                            // error after the header).
+                            let mut aio_failed = false;
+                            if let Some(pool) = process_meta.aio
+                                && gzip_stream.is_none()
+                                && file_body.as_ref().is_some_and(|b| {
+                                    b.len <= crate::file::aio_inline_limit(process_meta.sendfile)
+                                })
+                            {
+                                let body = file_body.take().expect("checked is_some");
+                                match Box::pin(super::read_file_on_pool(pool, body)).await {
+                                    Ok(bytes) => scratch.extend_from_slice(&bytes),
+                                    Err(_) => aio_failed = true,
+                                }
+                            }
+                            // Capture file body length before `stream_file`
+                            // consumes the value — `$bytes_sent` and
+                            // `$body_bytes_sent` need it after the write
+                            // completes.
+                            let mut streamed_body_len =
+                                file_body.as_ref().map(|b| b.len).unwrap_or(0);
+                            let response_for_logs: &[u8];
+                            if let Some(base) = prebuilt_base {
+                                let variant = cached_prebuilt_variant(
+                                    base,
+                                    close_after,
+                                    if close_after {
+                                        None
+                                    } else {
+                                        process_meta.keepalive.header_timeout_secs
+                                    },
                                 );
-                            }
-                            if let Some(last) = process_meta.upstream_states.last_mut() {
-                                last.bytes_received += tunnelled.from_upstream;
-                                last.bytes_sent += tunnelled.to_upstream;
-                            }
-                            let bytes_sent = if head_sent {
-                                head_len as u64 + tunnelled.to_client
+                                // The cached variant is shared and its `Date` is
+                                // from when it was built: send a stamped copy.
+                                scratch.extend_from_slice(variant.bytes);
+                                scan = variant.scan;
+                                stamp_date(&mut *scratch, &mut scan);
+                                let taken = std::mem::take(&mut *scratch);
+                                let len = taken.len();
+                                let (res, returned) = write_response(
+                                    stream,
+                                    taken,
+                                    len,
+                                    io_timer.as_mut(),
+                                    send_timeout,
+                                    body_read,
+                                )
+                                .await;
+                                *scratch = returned;
+                                if let Err(n) = res {
+                                    // A timed-out write took the buffer with it.
+                                    if scratch.is_empty() {
+                                        scratch.extend_from_slice(variant.bytes);
+                                    }
+                                    cut_short = true;
+                                    cut_sent = Some(n as u64);
+                                }
+                                response_for_logs = &*scratch;
                             } else {
-                                head_cut_at
-                            };
+                                if !close_after
+                                    && !scan.has_keep_alive
+                                    && let Some(timeout_secs) =
+                                        process_meta.keepalive.header_timeout_secs
+                                {
+                                    let mut buf: [u8; 48] = [0; 48];
+                                    let n = format_keep_alive_header(timeout_secs, &mut buf);
+                                    insert_header_at(&mut *scratch, &mut scan.head_end, &buf[..n]);
+                                }
+                                if !scan.has_connection {
+                                    let header: &[u8] = if close_after {
+                                        b"Connection: close\r\n"
+                                    } else {
+                                        b"Connection: keep-alive\r\n"
+                                    };
+                                    insert_header_at(&mut *scratch, &mut scan.head_end, header);
+                                }
+                                // For the log, should a timed-out write take the
+                                // head with it.
+                                let status = response_status(scratch);
+                                if aio_failed {
+                                    cut_short = true;
+                                    cut_sent = Some(0);
+                                } else if let Some(body) = proxy_body.take() {
+                                    let pacer = process_meta.limit_rate.as_deref().and_then(|l| {
+                                        super::Pacer::new(l.rate, l.after, request_start)
+                                    });
+                                    let head = std::mem::take(&mut *scratch);
+                                    let (end, head) = Box::pin(crate::proxy_stream::relay(
+                                        body,
+                                        stream,
+                                        head,
+                                        chunked_out,
+                                        pacer,
+                                        io_timer.as_mut(),
+                                        send_timeout,
+                                        &http.body_temp,
+                                    ))
+                                    .await;
+                                    *scratch = head;
+                                    streamed_body_len = end.body_sent;
+                                    if let Some(state) = process_meta.upstream_states.last_mut() {
+                                        state.bytes_received += end.upstream_read;
+                                        state.response_length += end.upstream_body;
+                                        state.response_ms = Some(end.response_ms);
+                                        state.in_flight = false;
+                                    }
+                                    if let Some(failure) = end.failure {
+                                        write_upstream_error_log(
+                                            &process_meta.log,
+                                            &ErrorLogRequest::new(&ctx, process_meta.server_name)
+                                                .with_realip(&process_meta),
+                                            &[failure],
+                                        );
+                                    }
+                                    // Cut short: the client can't tell, so the
+                                    // connection closes (nginx closes it too).
+                                    cut_short = !end.complete;
+                                    if end.trailers_due && chunked_out {
+                                        match Box::pin(send_relay_trailers(
+                                            stream,
+                                            http,
+                                            &ctx,
+                                            &process_meta,
+                                            final_uri(&process_meta, url_scratch),
+                                            scratch,
+                                            &end.upstream_trailers,
+                                            io_timer.as_mut(),
+                                            send_timeout,
+                                        ))
+                                        .await
+                                        {
+                                            Some(sent) => streamed_body_len += sent,
+                                            None => cut_short = true,
+                                        }
+                                    }
+                                } else if process_meta.trailers_due
+                                    && let Some(body) = file_body.take()
+                                {
+                                    let head_len = scratch.len() as u64;
+                                    match Box::pin(send_file_trailers(
+                                        stream,
+                                        scratch,
+                                        body,
+                                        gzip_stream,
+                                        process_meta.limit_rate.as_deref(),
+                                        request_start,
+                                        TrailerCtx {
+                                            http,
+                                            ctx: &ctx,
+                                            meta: &process_meta,
+                                            uri: final_uri(&process_meta, url_scratch),
+                                        },
+                                        io_timer.as_mut(),
+                                        send_timeout,
+                                        process_meta.aio,
+                                    ))
+                                    .await
+                                    {
+                                        Ok(sent) => streamed_body_len = sent - head_len,
+                                        Err(n) => {
+                                            cut_short = true;
+                                            cut_sent = Some(n);
+                                        }
+                                    }
+                                } else if let Some(limit) = process_meta.limit_rate.as_deref()
+                                    && limit.rate > 0
+                                    && gzip_stream.is_none()
+                                {
+                                    // Cold: `limit_rate`. Boxed so the pacer
+                                    // doesn't grow every connection's future.
+                                    let body = file_body.take();
+                                    if let Err(n) = Box::pin(write_response_paced(
+                                        stream,
+                                        &mut *scratch,
+                                        body,
+                                        limit.rate,
+                                        limit.after,
+                                        request_start,
+                                        io_timer.as_mut(),
+                                        send_timeout,
+                                        process_meta.aio,
+                                    ))
+                                    .await
+                                    {
+                                        cut_short = true;
+                                        cut_sent = Some(n);
+                                    }
+                                } else if process_meta.sendfile
+                                    && file_body.is_some()
+                                    && gzip_stream.is_none()
+                                    && stream.sendfile_fd().is_some()
+                                {
+                                    let body = file_body.take().expect("checked is_some");
+                                    if let Err(n) = send_head_and_file(
+                                        stream,
+                                        &mut sock_nonblocking,
+                                        scratch,
+                                        body,
+                                        io_timer.as_mut(),
+                                        send_timeout,
+                                        process_meta.aio,
+                                    )
+                                    .await
+                                    {
+                                        cut_short = true;
+                                        cut_sent = Some(n);
+                                    }
+                                } else {
+                                    // Hand scratch to the write (io_uring, or at
+                                    // once after a body); it returns the Vec after
+                                    // the write completes so we reuse the same
+                                    // allocation next request.
+                                    let taken = std::mem::take(&mut *scratch);
+                                    let len = taken.len();
+                                    let (res, returned) = write_response(
+                                        stream,
+                                        taken,
+                                        len,
+                                        io_timer.as_mut(),
+                                        send_timeout,
+                                        body_read,
+                                    )
+                                    .await;
+                                    *scratch = returned;
+                                    if let Err(n) = res {
+                                        cut_short = true;
+                                        cut_sent = Some(n as u64);
+                                    }
+                                }
+                                if cut_short && scratch.is_empty() {
+                                    *scratch = lost_head(status);
+                                }
+                                response_for_logs = &*scratch;
+                                if let Some(body) = file_body.take().filter(|_| !cut_short) {
+                                    let sent = match gzip_stream {
+                                        Some(gz) => {
+                                            stream_file_gzip(
+                                                stream,
+                                                body,
+                                                gz,
+                                                io_timer.as_mut(),
+                                                send_timeout,
+                                                true,
+                                                process_meta.aio,
+                                            )
+                                            .await
+                                        }
+                                        None => match if stream.sends_file_bodies() {
+                                            stream.send_file_body(body, process_meta.aio).await
+                                        } else {
+                                            Err(body)
+                                        } {
+                                            // HTTP/2 doesn't say how much of
+                                            // its DATA went out: none, then.
+                                            Ok(sent) => sent.then_some(streamed_body_len).ok_or(0),
+                                            Err(body) => stream_file(
+                                                stream,
+                                                body,
+                                                io_timer.as_mut(),
+                                                send_timeout,
+                                                None,
+                                                process_meta.aio,
+                                            )
+                                            .await
+                                            .map(|()| streamed_body_len),
+                                        },
+                                    };
+                                    // The head went out whole: the body counts
+                                    // as far as it got.
+                                    match sent {
+                                        Ok(n) => streamed_body_len = n,
+                                        Err(n) => {
+                                            streamed_body_len = n;
+                                            cut_short = true;
+                                        }
+                                    }
+                                }
+                            }
+
                             if http.metrics.is_some() {
                                 super::metrics::response(
                                     process_meta.metrics_server,
-                                    &head,
-                                    bytes_sent,
+                                    response_for_logs,
+                                    cut_sent.unwrap_or(
+                                        response_for_logs.len() as u64 + streamed_body_len,
+                                    ),
                                 );
                             }
                             if !process_meta.access_logs.is_empty() {
                                 let request_time_us = request_start.elapsed().as_micros() as u64;
+                                // Body bytes = total minus header block. The header
+                                // block is everything up to and including the
+                                // `\r\n\r\n` separator; `scan.head_end` points at
+                                // the terminator's first `\r` and was kept in sync
+                                // through the Connection / Keep-Alive injections
+                                // above, so we don't need a second `windows(4)`
+                                // scan here.
+                                let header_size = scan.head_end + 4;
+                                let bytes_sent = cut_sent
+                                    .unwrap_or(response_for_logs.len() as u64 + streamed_body_len);
+                                let body_bytes_sent = bytes_sent.saturating_sub(header_size as u64);
                                 write_access_logs(
                                     process_meta.access_logs,
                                     path,
@@ -5701,7 +7229,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     remote_port,
                                     process_meta.remote_user.as_deref(),
                                     headers_raw,
-                                    &head,
+                                    response_for_logs,
                                     connection_id,
                                     request_count,
                                     request_id,
@@ -5712,7 +7240,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                     pipe_byte,
                                     request_length,
                                     bytes_sent,
-                                    tunnelled.to_client,
+                                    body_bytes_sent,
                                     epoch_secs,
                                     epoch_ms,
                                     tls,
@@ -5723,758 +7251,233 @@ pub(crate) async fn handle<S: ConnIo>(
                                 )
                                 .await;
                             }
-                            return;
-                        }
 
-                        // Defer the response write per `auth_delay`. We
-                        // sleep on the runtime, not the OS thread, so other
-                        // connections on this worker keep progressing.
-                        if process_meta.response_delay_ms > 0 {
-                            monoio::time::sleep(Duration::from_millis(
-                                process_meta.response_delay_ms,
-                            ))
-                            .await;
-                        }
-
-                        // gzip (`gzip on` in the location): a body in memory
-                        // is compressed here, a file on its way out below.
-                        let (mut response, gzip_stream) = match process_meta.gzip {
-                            Some(gz) => super::gzip::filter(
-                                gz,
-                                &super::gzip::GzipRequest {
-                                    head_only: method_bytes == b"HEAD",
-                                    ..super::gzip::GzipRequest::from_headers(
-                                        req.http_11,
-                                        headers_raw,
-                                    )
-                                },
-                                response,
-                            ),
-                            None => (response, None),
-                        };
-                        // `add_trailer` on a body in memory: after gzip.
-                        if process_meta.trailers_due
-                            && let Response::Owned(bytes) = &mut response
-                        {
-                            *bytes = trailers_in_memory(
-                                std::mem::take(bytes),
-                                http,
-                                &ctx,
-                                &process_meta,
-                                final_uri(&process_meta, url_scratch),
-                            );
-                            process_meta.trailers_due = false;
-                        }
-                        // `charset` (#464): the label on Content-Type, from
-                        // the location's DocRoot, in place.
-                        if let Some(charset) = process_meta.doc_root.and_then(|d| d.charset) {
-                            super::add_charset(charset, &mut response);
-                        }
-
-                        // `return 444;` (no text) is nginx's NGX_HTTP_CLOSE: no
-                        // response at all; the connection closes after the
-                        // log line (#397). With text it is an ordinary response.
-                        let closes = match &response {
-                            Response::Prebuilt(b) => super::closes_unanswered(b),
-                            Response::Owned(b) => super::closes_unanswered(b),
-                            _ => false,
-                        };
-                        if closes {
-                            if http.metrics.is_some() {
-                                let head: &[u8] = match &response {
-                                    Response::Prebuilt(b) => b,
-                                    Response::Owned(b) => b,
-                                    _ => &[],
-                                };
-                                super::metrics::response(process_meta.metrics_server, head, 0);
-                            }
-                            if !process_meta.access_logs.is_empty() {
-                                let logged: &[u8] = match &response {
-                                    Response::Prebuilt(b) => b,
-                                    Response::Owned(b) => b,
-                                    _ => &[],
-                                };
-                                Box::pin(write_access_logs(
-                                    process_meta.access_logs,
-                                    path,
-                                    method_bytes,
-                                    request_line,
-                                    host,
-                                    remote_addr,
-                                    remote_port,
-                                    process_meta.remote_user.as_deref(),
-                                    headers_raw,
-                                    logged,
-                                    connection_id,
-                                    request_count,
-                                    request_id,
-                                    connection_time_us,
-                                    request_start.elapsed().as_micros() as u64,
-                                    process_meta.server_port,
-                                    request_port,
-                                    pipe_byte,
-                                    request_length,
-                                    0,
-                                    0,
-                                    epoch_secs,
-                                    epoch_ms,
-                                    tls,
-                                    conn,
+                            if let Some(target) = process_meta.post_action {
+                                run_post_action(
                                     http,
-                                    Some(&process_meta),
-                                    final_uri(&process_meta, url_scratch),
-                                ))
-                                .await;
-                            }
-                            return;
-                        }
-
-                        // Funnel the response bytes into `scratch`. Owned and
-                        // File variants hand us a Vec the handler allocated
-                        // this request — prefer whichever of the two buffers
-                        // has the larger capacity so scratch converges to the
-                        // high-water mark and stops allocating after a few
-                        // iterations. Prebuilt responses stay as static slices:
-                        // we can synthesize and cache finalized header variants
-                        // once per worker and avoid per-request Vec copies.
-                        scratch.clear();
-                        let mut prebuilt_base: Option<&'static [u8]> = None;
-                        // An upstream body relayed after the head (#88).
-                        let mut proxy_body: Option<Box<crate::proxy_stream::ProxyStream>> = None;
-                        let mut file_body: Option<phase::FileBody> = match response {
-                            Response::Prebuilt(bytes) => {
-                                prebuilt_base = Some(bytes);
-                                None
-                            }
-                            // The buffer not kept goes back to the worker's
-                            // pool, for the next response head built
-                            // (`response::take_buf`).
-                            Response::Owned(bytes) => {
-                                if bytes.capacity() > scratch.capacity() {
-                                    super::response::give_buf(std::mem::replace(
-                                        &mut *scratch,
-                                        bytes,
-                                    ));
-                                } else {
-                                    scratch.extend_from_slice(&bytes);
-                                    super::response::give_buf(bytes);
-                                }
-                                None
-                            }
-                            Response::File { headers, body } => {
-                                if headers.capacity() > scratch.capacity() {
-                                    super::response::give_buf(std::mem::replace(
-                                        &mut *scratch,
-                                        headers,
-                                    ));
-                                } else {
-                                    scratch.extend_from_slice(&headers);
-                                    super::response::give_buf(headers);
-                                }
-                                Some(body)
-                            }
-                            Response::ProxyStream(mut body) => {
-                                let head = std::mem::take(&mut body.head);
-                                if head.capacity() > scratch.capacity() {
-                                    *scratch = head;
-                                } else {
-                                    scratch.extend_from_slice(&head);
-                                }
-                                proxy_body = Some(body);
-                                None
-                            }
-                            // phase::process consumes Reroute internally
-                            // via its hop loop; a Reroute reaching the
-                            // worker means the loop terminated without a
-                            // terminal outcome, which `process` already
-                            // guards against with a 500. Defensive only.
-                            Response::Reroute(_) => return,
-                            // The Proxy variant is consumed above by
-                            // `run_proxy` before this match runs; reaching
-                            // here is a logic bug.
-                            Response::Proxy(_) => return,
-                            // Tunnelled above.
-                            Response::Upgrade(_) => return,
-                        };
-                        // Single walk over the response header block replaces
-                        // what used to be three separate scans. For static
-                        // prebuilts, cache the result by pointer so repeat
-                        // requests stay allocation-free.
-                        let mut scan = match prebuilt_base {
-                            Some(bytes) => cached_scan_response_headers(bytes),
-                            None => {
-                                let mut scan = scan_response_headers(scratch).unwrap_or_default();
-                                if !process_meta.keep_upstream_date {
-                                    stamp_date(&mut *scratch, &mut scan);
-                                }
-                                scan
-                            }
-                        };
-                        // No idle timeout: `keepalive_timeout 0` of a
-                        // server answering before any location.
-                        let mut close_after = !keep_alive
-                            || body_too_large
-                            || !process_meta.keepalive.allow
-                            || process_meta.keepalive.idle_timeout_ms.is_none()
-                            || request_count >= process_meta.keepalive.max_requests
-                            || connection_time_us / 1_000 > process_meta.keepalive.max_time_ms
-                            || matches!(method, Method::Trace | Method::Connect)
-                            || state.is_shutting_down()
-                            || (scan.has_connection && scan.connection_is_close)
-                            // A compressed file to an HTTP/1.0 client has no
-                            // length or chunks: the close ends it.
-                            || gzip_stream.is_some_and(|g| !g.chunked);
-                        // A relayed body of unknown length: chunked to an
-                        // HTTP/1.1 client, ended by the close otherwise.
-                        let mut chunked_out = false;
-                        if proxy_body.as_ref().is_some_and(|b| !b.length_known()) {
-                            if req.http_11 {
-                                insert_header_at(
-                                    &mut *scratch,
-                                    &mut scan.head_end,
-                                    b"Transfer-Encoding: chunked\r\n",
-                                );
-                                chunked_out = true;
-                            } else {
-                                close_after = true;
-                            }
-                        } else if process_meta.trailers_due && gzip_stream.is_none() {
-                            insert_header_at(
-                                &mut *scratch,
-                                &mut scan.head_end,
-                                b"Transfer-Encoding: chunked\r\n",
-                            );
-                        }
-                        // The client stopped taking the response: it is
-                        // logged with what is known to have gone out, then
-                        // the connection closes, as nginx's
-                        // ngx_http_terminate_request after a failed send
-                        // (#410). `cut_sent`: the bytes that went out then
-                        // (nginx's c->sent), when the write here failed.
-                        // to have gone out.
-                        let mut cut_short = false;
-                        let mut cut_sent: Option<u64> = None;
-                        // Only scan the raw headers for User-Agent when a
-                        // policy could actually trigger. disable_safari fires
-                        // on any method; disable_msie6 only on POST. Skipping
-                        // the scan in the common case (both flags off, or
-                        // msie6-only + non-POST) removes a full header-block
-                        // walk from the hot path.
-                        let ua_scan_needed = process_meta.keepalive.disable_safari
-                            || (process_meta.keepalive.disable_msie6 && method_is_post);
-                        if ua_scan_needed
-                            && should_disable_keepalive_for_user_agent(
-                                method_is_post,
-                                process_meta.keepalive,
-                                lookup_request_header(headers_raw, b"user-agent"),
-                            )
-                        {
-                            close_after = true;
-                        }
-                        // Capture file body length before `stream_file`
-                        // consumes the value — `$bytes_sent` and
-                        // `$body_bytes_sent` need it after the write
-                        // completes.
-                        let mut streamed_body_len = file_body.as_ref().map(|b| b.len).unwrap_or(0);
-                        let response_for_logs: &[u8];
-                        if let Some(base) = prebuilt_base {
-                            let variant = cached_prebuilt_variant(
-                                base,
-                                close_after,
-                                if close_after {
-                                    None
-                                } else {
-                                    process_meta.keepalive.header_timeout_secs
-                                },
-                            );
-                            // The cached variant is shared and its `Date` is
-                            // from when it was built: send a stamped copy.
-                            scratch.extend_from_slice(variant.bytes);
-                            scan = variant.scan;
-                            stamp_date(&mut *scratch, &mut scan);
-                            let taken = std::mem::take(&mut *scratch);
-                            let len = taken.len();
-                            let (res, returned) = write_response(
-                                stream,
-                                taken,
-                                len,
-                                timers.io.as_mut(),
-                                send_timeout,
-                                body_read,
-                            )
-                            .await;
-                            *scratch = returned;
-                            if let Err(n) = res {
-                                // A timed-out write took the buffer with it.
-                                if scratch.is_empty() {
-                                    scratch.extend_from_slice(variant.bytes);
-                                }
-                                cut_short = true;
-                                cut_sent = Some(n as u64);
-                            }
-                            response_for_logs = &*scratch;
-                        } else {
-                            if !close_after
-                                && !scan.has_keep_alive
-                                && let Some(timeout_secs) =
-                                    process_meta.keepalive.header_timeout_secs
-                            {
-                                let mut buf: [u8; 48] = [0; 48];
-                                let n = format_keep_alive_header(timeout_secs, &mut buf);
-                                insert_header_at(&mut *scratch, &mut scan.head_end, &buf[..n]);
-                            }
-                            if !scan.has_connection {
-                                let header: &[u8] = if close_after {
-                                    b"Connection: close\r\n"
-                                } else {
-                                    b"Connection: keep-alive\r\n"
-                                };
-                                insert_header_at(&mut *scratch, &mut scan.head_end, header);
-                            }
-                            // For the log, should a timed-out write take the
-                            // head with it.
-                            let status = response_status(scratch);
-                            if let Some(body) = proxy_body.take() {
-                                let pacer = process_meta.limit_rate.as_deref().and_then(|l| {
-                                    super::Pacer::new(l.rate, l.after, request_start)
-                                });
-                                let head = std::mem::take(&mut *scratch);
-                                let (end, head) = Box::pin(crate::proxy_stream::relay(
-                                    body,
-                                    stream,
-                                    head,
-                                    chunked_out,
-                                    pacer,
-                                    timers.io.as_mut(),
-                                    send_timeout,
-                                    &http.body_temp,
-                                ))
-                                .await;
-                                *scratch = head;
-                                streamed_body_len = end.body_sent;
-                                if let Some(state) = process_meta.upstream_states.last_mut() {
-                                    state.bytes_received += end.upstream_read;
-                                    state.response_length += end.upstream_body;
-                                    state.response_ms = Some(end.response_ms);
-                                    state.in_flight = false;
-                                }
-                                if let Some(failure) = end.failure {
-                                    write_upstream_error_log(
-                                        &process_meta.log,
-                                        &ErrorLogRequest::new(&ctx, process_meta.server_name)
-                                            .with_realip(&process_meta),
-                                        &[failure],
-                                    );
-                                }
-                                // Cut short: the client can't tell, so the
-                                // connection closes (nginx closes it too).
-                                cut_short = !end.complete;
-                                if end.trailers_due && chunked_out {
-                                    match Box::pin(send_relay_trailers(
-                                        stream,
-                                        http,
-                                        &ctx,
-                                        &process_meta,
-                                        final_uri(&process_meta, url_scratch),
-                                        scratch,
-                                        timers.io.as_mut(),
-                                        send_timeout,
-                                    ))
-                                    .await
-                                    {
-                                        Some(sent) => streamed_body_len += sent,
-                                        None => cut_short = true,
-                                    }
-                                }
-                            } else if process_meta.trailers_due
-                                && let Some(body) = file_body.take()
-                            {
-                                let head_len = scratch.len() as u64;
-                                match Box::pin(send_file_trailers(
-                                    stream,
-                                    scratch,
-                                    body,
-                                    gzip_stream,
-                                    process_meta.limit_rate.as_deref(),
+                                    &ctx,
+                                    target,
                                     request_start,
-                                    TrailerCtx {
-                                        http,
-                                        ctx: &ctx,
-                                        meta: &process_meta,
-                                        uri: final_uri(&process_meta, url_scratch),
-                                    },
-                                    timers.io.as_mut(),
-                                    send_timeout,
-                                ))
-                                .await
-                                {
-                                    Ok(sent) => streamed_body_len = sent - head_len,
-                                    Err(n) => {
-                                        cut_short = true;
-                                        cut_sent = Some(n);
-                                    }
-                                }
-                            } else if let Some(limit) = process_meta.limit_rate.as_deref()
-                                && limit.rate > 0
-                                && gzip_stream.is_none()
-                            {
-                                // Cold: `limit_rate`. Boxed so the pacer
-                                // doesn't grow every connection's future.
-                                let body = file_body.take();
-                                if let Err(n) = Box::pin(write_response_paced(
-                                    stream,
-                                    &mut *scratch,
-                                    body,
-                                    limit.rate,
-                                    limit.after,
-                                    request_start,
-                                    timers.io.as_mut(),
-                                    send_timeout,
-                                ))
-                                .await
-                                {
-                                    cut_short = true;
-                                    cut_sent = Some(n);
-                                }
-                            } else if process_meta.sendfile
-                                && file_body.is_some()
-                                && gzip_stream.is_none()
-                                && stream.sendfile_fd().is_some()
-                            {
-                                let body = file_body.take().expect("checked is_some");
-                                if let Err(n) = send_head_and_file(
-                                    &*stream,
-                                    &mut sock_nonblocking,
-                                    scratch,
-                                    body,
-                                    timers.io.as_mut(),
-                                    send_timeout,
-                                )
-                                .await
-                                {
-                                    cut_short = true;
-                                    cut_sent = Some(n);
-                                }
-                            } else {
-                                // Hand scratch to the write (io_uring, or at
-                                // once after a body); it returns the Vec after
-                                // the write completes so we reuse the same
-                                // allocation next request.
-                                let taken = std::mem::take(&mut *scratch);
-                                let len = taken.len();
-                                let (res, returned) = write_response(
-                                    stream,
-                                    taken,
-                                    len,
-                                    timers.io.as_mut(),
-                                    send_timeout,
-                                    body_read,
+                                    &mut *url_scratch,
                                 )
                                 .await;
-                                *scratch = returned;
-                                if let Err(n) = res {
-                                    cut_short = true;
-                                    cut_sent = Some(n as u64);
-                                }
                             }
-                            if cut_short && scratch.is_empty() {
-                                *scratch = lost_head(status);
+                            if cut_short {
+                                return false;
                             }
-                            response_for_logs = &*scratch;
-                            if let Some(body) = file_body.take().filter(|_| !cut_short) {
-                                let sent = match gzip_stream {
-                                    Some(gz) => {
-                                        stream_file_gzip(
-                                            stream,
-                                            body,
-                                            gz,
-                                            timers.io.as_mut(),
-                                            send_timeout,
-                                            true,
-                                        )
-                                        .await
-                                    }
-                                    None => match if stream.sends_file_bodies() {
-                                        stream.send_file_body(&body).await
-                                    } else {
-                                        None
-                                    } {
-                                        // HTTP/2 doesn't say how much of
-                                        // its DATA went out: none, then.
-                                        Some(sent) => sent.then_some(streamed_body_len).ok_or(0),
-                                        None => stream_file(
-                                            stream,
-                                            body,
-                                            timers.io.as_mut(),
-                                            send_timeout,
-                                            None,
-                                        )
-                                        .await
-                                        .map(|()| streamed_body_len),
-                                    },
+                            if let Some(rest) = pending_discard {
+                                let Some(tail) = Box::pin(discard_after_response(
+                                    stream,
+                                    rest,
+                                    &buf[..filled],
+                                    close_after,
+                                    &mut *scratch,
+                                    io_timer.as_mut(),
+                                ))
+                                .await
+                                else {
+                                    return false;
                                 };
-                                // The head went out whole: the body counts
-                                // as far as it got.
-                                match sent {
-                                    Ok(n) => streamed_body_len = n,
-                                    Err(n) => {
-                                        streamed_body_len = n;
-                                        cut_short = true;
-                                    }
-                                }
+                                pipelined_tail = tail;
                             }
-                        }
 
-                        if http.metrics.is_some() {
-                            super::metrics::response(
-                                process_meta.metrics_server,
-                                response_for_logs,
-                                cut_sent
-                                    .unwrap_or(response_for_logs.len() as u64 + streamed_body_len),
-                            );
-                        }
-                        if !process_meta.access_logs.is_empty() {
-                            let request_time_us = request_start.elapsed().as_micros() as u64;
-                            // Body bytes = total minus header block. The header
-                            // block is everything up to and including the
-                            // `\r\n\r\n` separator; `scan.head_end` points at
-                            // the terminator's first `\r` and was kept in sync
-                            // through the Connection / Keep-Alive injections
-                            // above, so we don't need a second `windows(4)`
-                            // scan here.
-                            let header_size = scan.head_end + 4;
-                            let bytes_sent = cut_sent
-                                .unwrap_or(response_for_logs.len() as u64 + streamed_body_len);
-                            let body_bytes_sent = bytes_sent.saturating_sub(header_size as u64);
-                            write_access_logs(
-                                process_meta.access_logs,
-                                path,
-                                method_bytes,
-                                request_line,
-                                host,
-                                remote_addr,
-                                remote_port,
-                                process_meta.remote_user.as_deref(),
-                                headers_raw,
-                                response_for_logs,
-                                connection_id,
-                                request_count,
-                                request_id,
-                                connection_time_us,
-                                request_time_us,
-                                process_meta.server_port,
-                                request_port,
-                                pipe_byte,
-                                request_length,
-                                bytes_sent,
-                                body_bytes_sent,
-                                epoch_secs,
-                                epoch_ms,
-                                tls,
-                                conn,
-                                http,
-                                Some(&process_meta),
-                                final_uri(&process_meta, url_scratch),
-                            )
-                            .await;
-                        }
+                            read_start += request_total_consumed;
+                            parse_state.reset();
+                            header_deadline = None;
 
-                        if let Some(target) = process_meta.post_action {
-                            run_post_action(http, &ctx, target, request_start, &mut *url_scratch)
-                                .await;
-                        }
-                        if cut_short {
-                            return;
-                        }
-                        if let Some(rest) = pending_discard {
-                            let Some(tail) = Box::pin(discard_after_response(
-                                stream,
-                                rest,
-                                &buf[..filled],
-                                close_after,
-                                &mut *scratch,
-                                timers.io.as_mut(),
-                            ))
-                            .await
-                            else {
-                                return;
+                            // Chunked decode may have read post-terminator
+                            // bytes from the socket — those belong to the next
+                            // pipelined request. The chunked path consumes all
+                            // of `initial`, so `read_start == filled` here;
+                            // compact the buffer and lay the tail down at
+                            // offset 0 so the next parse iteration sees it.
+                            if !pipelined_tail.is_empty() {
+                                if pipelined_tail.len() > buf.len() {
+                                    if pipelined_tail.len() > READ_BUF {
+                                        // Larger than READ_BUF: can't resume keep-alive.
+                                        return false;
+                                    }
+                                    grow_read_buffer(buf);
+                                }
+                                buf[..pipelined_tail.len()].copy_from_slice(&pipelined_tail);
+                                read_start = 0;
+                                filled = pipelined_tail.len();
+                            }
+
+                            if body_too_large {
+                                // The client is likely still sending the body:
+                                // let it, so it gets the 413 (nginx's lingering
+                                // close; not for 400s, as nginx).
+                                Box::pin(lingering_close(stream, &mut *scratch)).await;
+                                return false;
+                            }
+                            if close_after {
+                                return false;
+                            }
+
+                            let keepalive = &process_meta.keepalive;
+                            keepalive_idle = IdleLimits {
+                                timeout: keepalive.idle_timeout_ms.map(Duration::from_millis),
+                                min: (keepalive.min_timeout_ms > 0).then(|| {
+                                    Duration::from_millis(keepalive.min_timeout_ms.into())
+                                }),
                             };
-                            pipelined_tail = tail;
                         }
-
-                        read_start += request_total_consumed;
-                        parse_state.reset();
-                        header_deadline = None;
-
-                        // Chunked decode may have read post-terminator
-                        // bytes from the socket — those belong to the next
-                        // pipelined request. The chunked path consumes all
-                        // of `initial`, so `read_start == filled` here;
-                        // compact the buffer and lay the tail down at
-                        // offset 0 so the next parse iteration sees it.
-                        if !pipelined_tail.is_empty() {
-                            if pipelined_tail.len() > buf.len() {
-                                if pipelined_tail.len() > READ_BUF {
-                                    // Larger than READ_BUF: can't resume keep-alive.
-                                    return;
-                                }
-                                grow_read_buffer(buf);
+                        Parse::Incomplete => break,
+                        // Empty lines before a request line are skipped, as
+                        // nginx's `sw_start` does (RFC 9112 §2.2), e.g. a CRLF
+                        // a client sent after a body (#778). Only CRLFs: the
+                        // buffer starts over, the head's deadline stays.
+                        Parse::Invalid
+                            if !parse_state.rline_done
+                                && matches!(buf[read_start], b'\r' | b'\n') =>
+                        {
+                            read_start += empty_lines(&buf[read_start..filled]);
+                            if read_start == filled {
+                                (read_start, filled) = (0, 0);
+                                continue 'head;
                             }
-                            buf[..pipelined_tail.len()].copy_from_slice(&pipelined_tail);
-                            read_start = 0;
-                            filled = pipelined_tail.len();
                         }
-
-                        if body_too_large {
-                            // The client is likely still sending the body:
-                            // let it, so it gets the 413 (nginx's lingering
-                            // close; not for 400s, as nginx).
-                            Box::pin(lingering_close(stream, &mut *scratch)).await;
-                            return;
+                        Parse::Invalid => {
+                            request_count = request_count.saturating_add(1);
+                            if parse_state.rline_done
+                                && let Some(refusal) = line_refusal(
+                                    &buf[read_start..filled],
+                                    (!parse_state.implicit_path && !parse_state.has_absolute_query)
+                                        .then_some((parse_state.path_start, parse_state.path_end)),
+                                    timeouts.large_header_line,
+                                )
+                            {
+                                refuse_line(
+                                    stream,
+                                    &mut *scratch,
+                                    http,
+                                    &buf[read_start..filled],
+                                    refusal,
+                                    conn_log!(),
+                                )
+                                .await;
+                                return false;
+                            }
+                            let bad_version = invalid_head_log(
+                                http,
+                                conn_log!(),
+                                &buf[read_start..filled],
+                                stream.h2(),
+                            );
+                            // Honor HEAD once the request line got past the
+                            // method, as nginx knows it then; otherwise a full
+                            // response.
+                            let method = if parse_state.rline_done {
+                                http::classify_method(
+                                    &buf[read_start + parse_state.method_start
+                                        ..read_start + parse_state.method_end],
+                                )
+                            } else {
+                                head_method(&buf[read_start..filled])
+                            };
+                            let page = if bad_version {
+                                &http.version_not_supported
+                            } else {
+                                &http.bad_request
+                            };
+                            reject_request(
+                                stream,
+                                &mut *scratch,
+                                http,
+                                page.pick(method),
+                                &buf[read_start..filled],
+                                if parse_state.rline_done {
+                                    Refused::Headers
+                                } else {
+                                    Refused::Line
+                                },
+                                conn_log!(),
+                            )
+                            .await;
+                            return false;
                         }
-                        if close_after {
-                            return;
-                        }
-
-                        let keepalive = &process_meta.keepalive;
-                        keepalive_idle = IdleLimits {
-                            timeout: keepalive.idle_timeout_ms.map(Duration::from_millis),
-                            min: (keepalive.min_timeout_ms > 0)
-                                .then(|| Duration::from_millis(keepalive.min_timeout_ms.into())),
-                        };
                     }
-                    Parse::Incomplete => break,
-                    Parse::Invalid => {
-                        request_count = request_count.saturating_add(1);
+                }
+
+                if read_start == filled {
+                    // Drained everything — release the buffer and wait idle.
+                    if buf.len() > READ_BUF {
+                        // A large head grew it (#482): back to the usual size,
+                        // as nginx frees its large buffers for keep-alive.
+                        shrink_head_buffer(buf);
+                    } else if filled == buf.len() && filled < READ_BUF {
+                        // The request filled `client_header_buffer_size` (a
+                        // body after the head): this client's next ones get
+                        // `READ_BUF` and come in one read (#467).
+                        grow_read_buffer(buf);
+                    }
+                    return true;
+                }
+
+                if filled == buf.len() {
+                    // No tail room left. If we have a prefix of consumed bytes,
+                    // compact the remaining partial request down to offset 0 and
+                    // keep reading. Otherwise the head itself is larger than the
+                    // buffer: it grows up to `large_client_header_buffers`, as
+                    // nginx moves it into a large buffer (#482), and past that
+                    // gets nginx's 414 or 400.
+                    if read_start == 0 {
+                        // An HTTP/2 stream's rebuilt head adds the request
+                        // line and `: ` and CRLF to fields within the total
+                        // (#623): the crate's bound is its limit.
+                        let limit = if stream.h2() {
+                            super::h2::max_header_list(timeouts.large_header) as usize
+                        } else {
+                            timeouts.large_header
+                        };
+                        if buf.len() < limit {
+                            grow_head_buffer(buf, limit);
+                            continue;
+                        }
                         if parse_state.rline_done
                             && let Some(refusal) = line_refusal(
-                                &buf[read_start..filled],
+                                &buf[..filled],
                                 (!parse_state.implicit_path && !parse_state.has_absolute_query)
                                     .then_some((parse_state.path_start, parse_state.path_end)),
-                                timeouts.large_header_line,
+                                usize::MAX,
                             )
                         {
                             refuse_line(
                                 stream,
                                 &mut *scratch,
                                 http,
-                                &buf[read_start..filled],
+                                &buf[..filled],
                                 refusal,
                                 conn_log!(),
                             )
                             .await;
-                            return;
+                            return false;
                         }
-                        let bad_version = invalid_head_log(
-                            http,
-                            conn_log!(),
-                            &buf[read_start..filled],
-                            stream.h2(),
-                        );
-                        // Honor HEAD once the request line got past the
-                        // method, as nginx knows it then; otherwise a full
-                        // response.
-                        let method = if parse_state.rline_done {
-                            http::classify_method(
-                                &buf[read_start + parse_state.method_start
-                                    ..read_start + parse_state.method_end],
-                            )
-                        } else {
-                            head_method(&buf[read_start..filled])
-                        };
-                        let page = if bad_version {
-                            &http.version_not_supported
-                        } else {
-                            &http.bad_request
-                        };
-                        reject_request(
-                            stream,
-                            &mut *scratch,
-                            http,
-                            page.pick(method),
-                            &buf[read_start..filled],
-                            if parse_state.rline_done {
-                                Refused::Headers
-                            } else {
-                                Refused::Line
-                            },
-                            conn_log!(),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            }
-
-            if read_start == filled {
-                // Drained everything — release the buffer and wait idle.
-                if buf.len() > READ_BUF {
-                    // A large head grew it (#482): back to the usual size,
-                    // as nginx frees its large buffers for keep-alive.
-                    shrink_head_buffer(buf);
-                } else if filled == buf.len() && filled < READ_BUF {
-                    // The request filled `client_header_buffer_size` (a
-                    // body after the head): this client's next ones get
-                    // `READ_BUF` and come in one read (#467).
-                    grow_read_buffer(buf);
-                }
-                continue 'idle;
-            }
-
-            if filled == buf.len() {
-                // No tail room left. If we have a prefix of consumed bytes,
-                // compact the remaining partial request down to offset 0 and
-                // keep reading. Otherwise the head itself is larger than the
-                // buffer: it grows up to `large_client_header_buffers`, as
-                // nginx moves it into a large buffer (#482), and past that
-                // gets nginx's 414 or 400.
-                if read_start == 0 {
-                    // An HTTP/2 stream's rebuilt head adds the request
-                    // line and `: ` and CRLF to fields within the total
-                    // (#623): the crate's bound is its limit.
-                    let limit = if stream.h2() {
-                        super::h2::max_header_list(timeouts.large_header) as usize
-                    } else {
-                        timeouts.large_header
-                    };
-                    if buf.len() < limit {
-                        grow_head_buffer(buf, limit);
-                        continue;
-                    }
-                    if parse_state.rline_done
-                        && let Some(refusal) = line_refusal(
-                            &buf[..filled],
-                            (!parse_state.implicit_path && !parse_state.has_absolute_query)
-                                .then_some((parse_state.path_start, parse_state.path_end)),
-                            usize::MAX,
-                        )
-                    {
-                        refuse_line(
+                        head_too_large(
                             stream,
                             &mut *scratch,
                             http,
                             &buf[..filled],
-                            refusal,
+                            parse_state.rline_done.then_some(parse_state.cursor),
                             conn_log!(),
                         )
                         .await;
-                        return;
+                        return false;
                     }
-                    head_too_large(
-                        stream,
-                        &mut *scratch,
-                        http,
-                        &buf[..filled],
-                        parse_state.rline_done.then_some(parse_state.cursor),
-                        conn_log!(),
-                    )
-                    .await;
-                    return;
+                    buf.copy_within(read_start..filled, 0);
+                    filled -= read_start;
+                    read_start = 0;
                 }
-                buf.copy_within(read_start..filled, 0);
-                filled -= read_start;
-                read_start = 0;
             }
+        });
+        if !active.await {
+            return;
+        }
+        // Idle: a response buffer bigger than a head goes back to the worker's
+        // pool (an inline body grew it), as nginx frees the request's (#467).
+        if scratch.capacity() > CONN_SCRATCH_IDLE {
+            super::response::give_buf(std::mem::take(&mut *scratch));
         }
     }
 }

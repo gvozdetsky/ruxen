@@ -26,6 +26,7 @@ NOTES = {
     "h2_priority.t": "by design: priorities ignored, as RFC 9113 deprecates them, #347",
     "h2_request_body.t": "by design: Content-Length mismatches, the WINDOW_UPDATE size "
     "and a malformed request's 400, #347",
+    "h2_proxy_request_buffering.t": "by design: Content-Length mismatches, #347",
     "h2_request_body_preread.t": "by design: #347",
 }
 

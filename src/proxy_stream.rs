@@ -20,7 +20,6 @@ use monoio::time::timeout;
 
 use crate::proxy::{AttemptFailure, Stage, UpstreamError};
 use crate::upstream::{self, LeasedPeer};
-use crate::worker::PreparedUpstream;
 
 /// The body still to come from the upstream, and how it ends.
 pub struct ProxyStream {
@@ -58,9 +57,13 @@ pub struct ProxyStream {
     /// The range filter's one range: the client gets these body bytes
     /// only.
     pub(crate) window: Option<Window>,
-    /// `add_trailer`: the body goes chunked, and the worker writes the
-    /// last chunk with the trailers (`RelayEnd::trailers_due`).
+    /// `add_trailer` or `proxy_pass_trailers`: the body goes chunked, and
+    /// the worker writes the last chunk with the trailers
+    /// (`RelayEnd::trailers_due`).
     pub(crate) trailers: bool,
+    /// `proxy_pass_trailers`: the upstream's trailers, less the hidden
+    /// ones, go to the client (`RelayEnd::upstream_trailers`).
+    pub(crate) pass_trailers: Option<&'static crate::worker::ProxyResponseRules>,
     /// `proxy_buffering` (#764); `None`: off, or `X-Accel-Buffering: no`.
     pub(crate) buffering: Option<Buffering>,
 }
@@ -107,7 +110,7 @@ pub(crate) enum StreamFraming {
 }
 
 pub(crate) struct StreamPool {
-    pub upstream: &'static PreparedUpstream,
+    pub upstream: upstream::UpstreamRef,
     pub peer_idx: usize,
     /// `PreparedProxy::pool_tag`.
     pub tag: usize,
@@ -139,9 +142,10 @@ pub struct RelayEnd {
     pub failure: Option<AttemptFailure>,
     /// The body reached the client whole.
     pub complete: bool,
-    /// `add_trailer`: the last chunk is still to be written, with the
-    /// trailers.
+    /// The last chunk is still to be written, with the trailers.
     pub trailers_due: bool,
+    /// `proxy_pass_trailers`: the upstream's trailer lines to send.
+    pub upstream_trailers: Vec<u8>,
 }
 
 /// Read buffer of a relay: one read takes whatever the upstream socket
@@ -236,6 +240,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         failure: None,
         complete: false,
         trailers_due: false,
+        upstream_trailers: Vec::new(),
     };
     // The last chunk, unless the worker writes it with the trailers.
     let last_chunk: &'static [u8] = if chunked_out && !s.trailers {
@@ -317,6 +322,8 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         read: 0,
         body: 0,
     };
+    // `proxy_pass_trailers`: the upstream's, taken when it is released.
+    let mut passed = Vec::new();
     // The rest often comes in one read: it goes out without the pipe
     // (~2% on a 64 KiB response).
     let step = rd.read(&mut s, Vec::new).await;
@@ -331,6 +338,7 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
             send_timeout,
             default_temp,
             &mut end,
+            &mut passed,
         ))
         .await;
     } else {
@@ -354,11 +362,20 @@ pub(crate) async fn relay<S: crate::worker::ConnIo>(
         }
         // Released after the write, as before #764: the other way round
         // the next request's read mostly finds nothing yet and parks.
-        end.response_ms = release(s, read_end.done, read_end.extra, &mut read_end.failure);
+        end.response_ms = release(
+            s,
+            read_end.done,
+            read_end.extra,
+            &mut read_end.failure,
+            &mut passed,
+        );
         end.failure = read_end.failure;
         end.complete = ok && read_end.done;
     }
     end.trailers_due = trailers && end.complete;
+    if end.trailers_due {
+        end.upstream_trailers = passed;
+    }
     (end, head)
 }
 
@@ -375,6 +392,7 @@ async fn pipelined<S: crate::worker::ConnIo>(
     send_timeout: Duration,
     default_temp: &crate::worker::BodyTempDir,
     end: &mut RelayEnd,
+    passed: &mut Vec<u8>,
 ) {
     let started = s.started;
     let has_cache = s.cache.is_some();
@@ -407,7 +425,13 @@ async fn pipelined<S: crate::worker::ConnIo>(
                     pipe.bump();
                     // The body is in: the upstream goes now, not once the
                     // client has it all.
-                    let ms = release(s, read_end.done, read_end.extra, &mut read_end.failure);
+                    let ms = release(
+                        s,
+                        read_end.done,
+                        read_end.extra,
+                        &mut read_end.failure,
+                        passed,
+                    );
                     released = Some((read_end, ms));
                 }
                 if writing && let Poll::Ready(ok) = writer.as_mut().poll(cx) {
@@ -973,20 +997,29 @@ fn finish(
     head: Vec<u8>,
 ) -> (RelayEnd, Vec<u8>) {
     end.trailers_due = s.trailers && end.complete;
-    end.response_ms = release(s, end.complete, extra, &mut end.failure);
+    let mut passed = Vec::new();
+    end.response_ms = release(s, end.complete, extra, &mut end.failure, &mut passed);
+    if end.trailers_due {
+        end.upstream_trailers = passed;
+    }
     (end, head)
 }
 
 /// The upstream is done with (`complete`: the client has, or will have,
-/// all it gets): warn of bytes past the body, store or go on filling the
-/// cache, pool the connection. Returns `$upstream_response_time`.
+/// all it gets): take the trailers to pass, warn of bytes past the body,
+/// store or go on filling the cache, pool the connection. Returns
+/// `$upstream_response_time`.
 fn release(
     mut s: Box<ProxyStream>,
     complete: bool,
     extra: bool,
     failure_slot: &mut Option<AttemptFailure>,
+    passed: &mut Vec<u8>,
 ) -> u64 {
     let ms = s.started.elapsed().as_millis() as u64;
+    if s.pass_trailers.is_some() {
+        *passed = upstream_trailers(&mut s);
+    }
     // The client may be done before the body: a range's window.
     let body_done = match &s.framing {
         StreamFraming::Length(left) => *left == 0,
@@ -1016,6 +1049,18 @@ fn release(
     ms
 }
 
+/// `proxy_pass_trailers`: the trailers the client gets.
+#[cold]
+#[inline(never)]
+fn upstream_trailers(s: &mut ProxyStream) -> Vec<u8> {
+    match (&mut s.framing, s.pass_trailers) {
+        (StreamFraming::Chunked(dec), Some(rules)) => {
+            crate::proxy::passed_trailers(rules, &dec.take_trailers())
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Put a complete body's cache file in place.
 #[cold]
 #[inline(never)]
@@ -1034,7 +1079,7 @@ fn close(s: Box<ProxyStream>, complete: bool, extra: bool) {
         // Closed as it is.
     } else if let Some(pool) = s.pool {
         upstream::pool_release(
-            pool.upstream,
+            &pool.upstream,
             pool.peer_idx,
             pool.tag,
             upstream::PooledConn {
@@ -1190,14 +1235,19 @@ async fn write_out<S: crate::worker::ConnIo>(
 }
 
 /// An incremental decoder of a chunked body (RFC 9112 7.1): chunk
-/// extensions and trailers are dropped. Buffered bodies go through it too
-/// (`read_chunked_body_with_buf`).
+/// extensions are dropped, trailers too unless kept (`keeping_trailers`).
 #[derive(Default)]
 pub(crate) struct ChunkedDecoder {
     state: ChunkState,
     /// A size or trailer line split across reads.
     line: Vec<u8>,
+    /// `proxy_pass_trailers`: the trailer lines, CRLF each.
+    trailers: Option<Vec<u8>>,
 }
+
+/// The trailer section kept, as nginx's `proxy_buffer_size` bounds it
+/// (a page by default): past it, "upstream sent too big trailers".
+const MAX_TRAILERS: usize = 4096;
 
 #[derive(Default)]
 enum ChunkState {
@@ -1263,6 +1313,9 @@ impl ChunkedDecoder {
                             if line.is_empty() {
                                 ChunkState::Done
                             } else {
+                                if let Some(kept) = &mut self.trailers {
+                                    keep_trailer(kept, line)?;
+                                }
                                 ChunkState::Trailer
                             }
                         }
@@ -1286,6 +1339,38 @@ impl ChunkedDecoder {
     pub(crate) fn done(&self) -> bool {
         matches!(self.state, ChunkState::Done)
     }
+
+    /// One that keeps the trailer lines (`take_trailers`).
+    pub(crate) fn keeping_trailers() -> Self {
+        ChunkedDecoder {
+            trailers: Some(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn take_trailers(&mut self) -> Vec<u8> {
+        self.trailers.take().unwrap_or_default()
+    }
+}
+
+/// A trailer line, kept if it's a field (nginx's parser skips the rest);
+/// a CR or NUL in it is an error.
+fn keep_trailer(kept: &mut Vec<u8>, line: &[u8]) -> Result<(), ()> {
+    if line.iter().any(|&b| b == b'\r' || b == 0) {
+        return Err(());
+    }
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return Ok(());
+    };
+    if colon == 0 || line[..colon].iter().any(|&b| b == b' ' || b == b'\t') {
+        return Ok(());
+    }
+    if kept.len() + line.len() + 2 > MAX_TRAILERS {
+        return Err(());
+    }
+    kept.extend_from_slice(line);
+    kept.extend_from_slice(b"\r\n");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1328,6 +1413,34 @@ mod tests {
             dec.feed(&[b'1'; MAX_CHUNK_LINE + 2], &mut Vec::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn chunked_decoder_keeps_trailers() {
+        let wire = b"3\r\nabc\r\n0\r\nX-T: 1\r\nno colon\r\n:x\r\nY-T:2\r\n\r\nNEXT";
+        for piece in 1..wire.len() {
+            let mut dec = ChunkedDecoder::keeping_trailers();
+            let mut out = Vec::new();
+            for part in wire.chunks(piece) {
+                if dec.feed(part, &mut out).unwrap().0 {
+                    break;
+                }
+            }
+            assert!(dec.done(), "piece {piece}");
+            assert_eq!(out, b"abc");
+            assert_eq!(dec.take_trailers(), b"X-T: 1\r\nY-T:2\r\n", "piece {piece}");
+        }
+        // Too big, or a NUL: an error.
+        let mut dec = ChunkedDecoder::keeping_trailers();
+        let line = format!("X: {}\r\n", "v".repeat(1000));
+        let wire = format!("0\r\n{}", line.repeat(5));
+        assert!(dec.feed(wire.as_bytes(), &mut Vec::new()).is_err());
+        let mut dec = ChunkedDecoder::keeping_trailers();
+        assert!(dec.feed(b"0\r\nX: \0\r\n\r\n", &mut Vec::new()).is_err());
+        // Not kept: dropped, whatever they are.
+        let mut dec = ChunkedDecoder::default();
+        assert!(dec.feed(b"0\r\nX: \0\r\n\r\n", &mut Vec::new()).unwrap().0);
+        assert!(dec.take_trailers().is_empty());
     }
 
     /// A bare LF anywhere in the framing is refused, as nginx 1.29.4+
