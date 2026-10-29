@@ -2385,9 +2385,13 @@ pub(crate) struct FirstBodyLimit {
     pub continue_status: Option<u16>,
     /// The location's `client_body_timeout` (#147).
     pub body_timeout: std::time::Duration,
-    /// The location has access checks (or rewrites that may lead to some):
-    /// they answer before the body is read, as nginx's access phase (#855).
-    pub access_first: bool,
+    /// The request is processed up to a handler that may read the body
+    /// before the body is read: the location has access checks (or
+    /// rewrites that may lead to some), which answer first as nginx's
+    /// access phase does (#855), or is static, where a file `try_files` or
+    /// `index` finds is served without the body though another way may
+    /// lead to one that reads it (#836).
+    pub probe_first: bool,
 }
 
 /// The limit nginx holds a request's Content-Length to before reading the
@@ -2467,7 +2471,8 @@ pub(crate) fn first_body_limit(
         discard: discards_body(http, server, &loc, url_scratch, true, &[]),
         continue_status: if expect { discard_continue(&loc) } else { None },
         body_timeout: loc.timeouts.body,
-        access_first: !loc.access.rules.is_empty()
+        probe_first: matches!(loc.handler, crate::worker::PreparedHandler::Root(_))
+            || !loc.access.rules.is_empty()
             || !matches!(loc.access.auth_basic, PreparedAuthBasic::Off)
             || loc.access.auth_request.is_some()
             || loc.limit_req.is_some()
@@ -2492,7 +2497,7 @@ fn unrouted_discard(server: &PreparedServer, continue_status: Option<u16>) -> Fi
         discard: true,
         continue_status,
         body_timeout: server.timeouts.body,
-        access_first: false,
+        probe_first: false,
     }
 }
 

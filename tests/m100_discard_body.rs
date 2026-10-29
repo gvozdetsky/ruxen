@@ -430,8 +430,9 @@ fn m100_a_refused_body_goes_upstream_empty() {
 
 /// What answers before a location (a server-level `return`, a bad target,
 /// a missing Host) and `try_files` to a file (also via an SPA's `@router`)
-/// answer before the body has come, as nginx discards it (#776); a
-/// `try_files` that ends in a proxy still sends the body upstream.
+/// answer before the body has come, as nginx discards it (#776); so does
+/// a file found by a `try_files` that may end in a proxy (#836), while the
+/// proxy still gets the body when it isn't.
 #[test]
 fn m100_unrouted_answers_and_try_files_come_before_the_body() {
     let upstream = counting_upstream();
@@ -439,6 +440,8 @@ fn m100_unrouted_answers_and_try_files_come_before_the_body() {
         let html = dir.join("html");
         std::fs::create_dir_all(&html).unwrap();
         std::fs::write(html.join("index.html"), "index").unwrap();
+        std::fs::create_dir_all(html.join("p")).unwrap();
+        std::fs::write(html.join("p/f.txt"), "file").unwrap();
         format!(
             "root {html};\n\
              if ($http_x_redirect) {{ return 301 https://example.com/; }}\n\
@@ -471,6 +474,10 @@ fn m100_unrouted_answers_and_try_files_come_before_the_body() {
         responses(&mut s, 1),
         ["HTTP/1.1 200 OK | index".to_string()]
     );
+    let (_, out) = first("POST /p/f.txt HTTP/1.1\r\nHost: x\r\n");
+    assert!(out.starts_with("HTTP/1.1 405 "), "{out}");
+    let (_, out) = first("GET /p/f.txt HTTP/1.1\r\nHost: x\r\n");
+    assert_eq!(out, "HTTP/1.1 200 OK | file");
 
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

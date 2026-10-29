@@ -5559,9 +5559,10 @@ pub(crate) async fn handle<S: ConnIo>(
                                             .as_bytes(),
                                             None,
                                         );
-                                    } else if first.access_first && !discard_body {
+                                    } else if first.probe_first && !discard_body {
                                         // The access phase answers before the
-                                        // body is read (#855).
+                                        // body is read (#855), and a static
+                                        // file found then (#836).
                                         let mut probe = probe;
                                         let outcome = Box::pin(access_before_body(
                                             http,
