@@ -22,6 +22,9 @@
 //! own (`spawn_contained`), so it ends with that worker's generation and
 //! logs to its error log. The handshake itself takes a lock to clone an
 //! `Arc`, and only for certificates that staple.
+//!
+//! `ClientOcsp` checks client certificates with the same requests
+//! (`ssl_ocsp`, #142).
 
 use std::ffi::{CStr, c_char, c_int, c_long, c_ulong, c_void};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -71,21 +74,26 @@ impl std::fmt::Debug for Stapling {
 struct Fetch {
     leaf: Vec<u8>,
     issuer: Vec<u8>,
-    /// The certificates after the leaf in `ssl_certificate`: nginx's
-    /// extra chain certificates, searched for the responder's.
+    /// Stapling: the certificates after the leaf in `ssl_certificate`,
+    /// nginx's extra chain certificates. A client's: its verified chain.
+    /// Searched for the responder's.
     chain: Vec<Vec<u8>>,
     /// The server's trusted certificates (`ssl_trusted_certificate`, and
     /// `ssl_client_certificate` with `ssl_verify_client`).
     store: Arc<Store>,
-    verify: bool,
+    /// OCSP_basic_verify's.
+    flags: c_ulong,
     responder: Responder,
     /// The server's `resolver` and `resolver_timeout`.
     resolver: Option<&'static crate::resolver::Resolver>,
     resolver_timeout: Duration,
-    /// The certificate file, for log lines.
-    name: String,
+    /// The certificate file, for stapling's log lines.
+    name: Option<String>,
+    /// A client's check logs as its connection, to its server's log.
+    connection: Option<(u64, &'static [crate::worker::PreparedErrorLog])>,
 }
 
+#[derive(Clone)]
 struct Responder {
     /// As written in the URL, for `Host` and log lines.
     host: String,
@@ -152,7 +160,7 @@ impl Stapling {
                 }
             },
         };
-        let responder = match parse_responder(&url) {
+        let responder = match parse_responder(&url, true) {
             Ok(r) => r,
             Err((err, url)) => {
                 warn(format!(
@@ -170,11 +178,16 @@ impl Stapling {
                 issuer,
                 chain,
                 store: settings.store.clone(),
-                verify: settings.verify,
+                flags: if settings.verify {
+                    ffi::OCSP_TRUSTOTHER
+                } else {
+                    ffi::OCSP_NOVERIFY
+                } as c_ulong,
                 responder,
                 resolver: settings.resolver,
                 resolver_timeout: settings.resolver_timeout,
-                name,
+                name: Some(name),
+                connection: None,
             }),
             loading: AtomicBool::new(false),
             refresh: AtomicI64::new(0),
@@ -260,15 +273,23 @@ impl Fetch {
     /// A line about this fetch, with nginx's context
     /// (ngx_ssl_ocsp_log_error).
     fn log(&self, level: ErrorLogLevel, message: &str, peer: Option<SocketAddr>) {
-        let logs = crate::worker::worker_http().map_or(&[][..], |h| h.error_logs);
-        let mut line = format!(
+        let (mut line, logs) = match self.connection {
+            Some((id, logs)) => (format!("*{id} "), logs),
+            None => (
+                String::new(),
+                crate::worker::worker_http().map_or(&[][..], |h| h.error_logs),
+            ),
+        };
+        line.push_str(&format!(
             "{message} while requesting certificate status, responder: {}",
             self.responder.host
-        );
+        ));
         if let Some(peer) = peer {
             line.push_str(&format!(", peer: {peer}"));
         }
-        line.push_str(&format!(", certificate: \"{}\"", self.name));
+        if let Some(name) = &self.name {
+            line.push_str(&format!(", certificate: \"{name}\""));
+        }
         crate::worker::write_worker_log(logs, level, &line);
     }
 
@@ -301,14 +322,19 @@ impl Fetch {
     /// Where this fetch connects (ngx_ssl_ocsp_request): an IPv4 address
     /// as written (ngx_resolve_start's quick path), else what the
     /// server's `resolver` answers now, else the startup addresses, with
-    /// a warning. `None` after logging why the name gave none.
+    /// a warning. `None` after logging why the name gave none, as for a
+    /// name from a client's certificate without a `resolver`.
     async fn responder_addrs(&self) -> Option<Vec<SocketAddr>> {
         let host = &self.responder.host;
-        if host.parse::<Ipv4Addr>().is_ok() {
-            return Some(self.responder.addrs.clone());
+        if let Ok(ip) = host.parse::<Ipv4Addr>() {
+            return Some(vec![SocketAddr::new(ip.into(), self.responder.port)]);
         }
         let Some(resolver) = self.resolver else {
             let line = format!("no resolver defined to resolve {host}");
+            if self.responder.addrs.is_empty() {
+                self.log(ErrorLogLevel::Error, &line, None);
+                return None;
+            }
             self.log(ErrorLogLevel::Warn, &line, None);
             return Some(self.responder.addrs.clone());
         };
@@ -431,22 +457,29 @@ impl Fetch {
     /// `peer` is valid until when it verifies and says `good`, else `None`
     /// after logging why.
     fn check(&self, response: &[u8], peer: SocketAddr) -> Option<i64> {
+        let (status, valid) = self.verified(response, peer)?;
+        if status == ffi::V_OCSP_CERTSTATUS_GOOD {
+            return Some(valid);
+        }
+        let text = unsafe { CStr::from_ptr(ffi::OCSP_cert_status_str(status as c_long)) };
+        self.log(
+            ErrorLogLevel::Error,
+            &format!(
+                "certificate status \"{}\" in the OCSP response",
+                text.to_string_lossy()
+            ),
+            Some(peer),
+        );
+        None
+    }
+
+    /// ngx_ssl_ocsp_verify: the status and the time the response is valid
+    /// until, or `None` after logging why it doesn't verify.
+    fn verified(&self, response: &[u8], peer: SocketAddr) -> Option<(c_int, i64)> {
         let result = unsafe { self.verify(response) };
         unsafe { ffi::ERR_clear_error() };
         match result {
-            Ok((status, valid)) if status == ffi::V_OCSP_CERTSTATUS_GOOD => Some(valid),
-            Ok((status, _)) => {
-                let text = unsafe { CStr::from_ptr(ffi::OCSP_cert_status_str(status as c_long)) };
-                self.log(
-                    ErrorLogLevel::Error,
-                    &format!(
-                        "certificate status \"{}\" in the OCSP response",
-                        text.to_string_lossy()
-                    ),
-                    Some(peer),
-                );
-                None
-            }
+            Ok(found) => Some(found),
             Err((level, message)) => {
                 self.log(level, &message, Some(peer));
                 None
@@ -493,16 +526,11 @@ impl Fetch {
             for c in &chain {
                 ffi::OPENSSL_sk_push(stack, c.0 as *mut c_void);
             }
-            let flags = if self.verify {
-                ffi::OCSP_TRUSTOTHER
-            } else {
-                ffi::OCSP_NOVERIFY
-            };
             let verified = ffi::OCSP_basic_verify(
                 basic.0,
                 stack as *mut ffi::stack_st_X509,
                 self.store.as_ptr(),
-                flags as c_ulong,
+                self.flags,
             );
             // The certificates are `chain`'s, freed with it.
             ffi::OPENSSL_sk_free(stack);
@@ -556,6 +584,268 @@ impl Fetch {
                 t
             };
             Ok((status, valid))
+        }
+    }
+}
+
+/// `ssl_ocsp` for one client-certificate context (#142), as
+/// ngx_ssl_ocsp_validate checks: after the handshake, the certificates of
+/// the verified chain, leaf first, each but the last (`leaf`: the leaf
+/// only), with the responder of `ssl_ocsp_responder` or of the
+/// certificate's AIA, until one isn't `good`. Any failure is
+/// `certificate status request failed`; nothing admits a client whose
+/// status wasn't read.
+pub struct ClientOcsp {
+    leaf_only: bool,
+    /// `ssl_ocsp_responder`, resolved at startup.
+    responder: Option<Responder>,
+    /// The server's trusted certificates, without its verify depth, as
+    /// for stapling (the SSL_CTX's store).
+    store: Arc<Store>,
+    resolver: Option<&'static crate::resolver::Resolver>,
+    resolver_timeout: Duration,
+    cache: Option<Arc<Cache>>,
+}
+
+impl std::fmt::Debug for ClientOcsp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientOcsp")
+            .field("leaf_only", &self.leaf_only)
+            .field("responder", &self.responder.as_ref().map(|r| &r.host))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A server's `ssl_ocsp*` lines, read.
+pub struct ClientSettings<'a> {
+    pub leaf_only: bool,
+    pub responder: Option<&'a str>,
+    pub store: Arc<Store>,
+    pub resolver: Option<&'static crate::resolver::Resolver>,
+    pub resolver_timeout: Duration,
+    /// `ssl_ocsp_cache shared:NAME:SIZE`.
+    pub cache: Option<(&'a str, u64)>,
+}
+
+/// Where a client's check logs what isn't about the responder: its
+/// connection, as nginx's connection log does during the handshake.
+pub struct ConnLog {
+    pub id: u64,
+    pub logs: &'static [crate::worker::PreparedErrorLog],
+    /// ` while SSL handshaking, client: …, server: …`.
+    pub context: String,
+}
+
+impl ConnLog {
+    fn error(&self, message: &str) {
+        let line = format!("*{} {message}{}", self.id, self.context);
+        crate::worker::write_worker_log(self.logs, ErrorLogLevel::Error, &line);
+    }
+}
+
+/// What makes `$ssl_client_verify` `FAILED:…` (ngx_ssl_ocsp_get_status).
+pub const REQUEST_FAILED: &str = "certificate status request failed";
+
+impl ClientOcsp {
+    /// ngx_ssl_ocsp: `Err` is the `[emerg]`.
+    pub fn new(settings: ClientSettings<'_>) -> Result<ClientOcsp, String> {
+        let responder = match settings.responder {
+            Some(url) => Some(parse_responder(url, true).map_err(|(err, url)| {
+                format!("{err} in OCSP responder \"{url}\" in \"ssl_ocsp_responder\"")
+            })?),
+            None => None,
+        };
+        Ok(ClientOcsp {
+            leaf_only: settings.leaf_only,
+            responder,
+            store: settings.store,
+            resolver: settings.resolver,
+            resolver_timeout: settings.resolver_timeout,
+            cache: settings.cache.map(|(name, size)| Cache::zone(name, size)),
+        })
+    }
+
+    /// The status of a client's verified `chain` (leaf to trust anchor):
+    /// `Ok` when every certificate checked is `good`, else what
+    /// `$ssl_client_verify` says after `FAILED:`.
+    pub async fn validate(&self, chain: &[Vec<u8>], log: &ConnLog) -> Result<(), &'static str> {
+        let last = chain.len().saturating_sub(1);
+        let checked = if self.leaf_only { last.min(1) } else { last };
+        for i in 0..checked {
+            let status = self.status(&chain[i], &chain[i + 1], chain, log).await?;
+            match status {
+                ffi::V_OCSP_CERTSTATUS_GOOD => {}
+                ffi::V_OCSP_CERTSTATUS_REVOKED => return Err("certificate revoked"),
+                _ => return Err("certificate status unknown"),
+            }
+        }
+        Ok(())
+    }
+
+    /// One certificate's status, from the cache or its responder
+    /// (ngx_ssl_ocsp_validate_next and ngx_ssl_ocsp_handler).
+    async fn status(
+        &self,
+        cert: &[u8],
+        issuer: &[u8],
+        chain: &[Vec<u8>],
+        log: &ConnLog,
+    ) -> Result<c_int, &'static str> {
+        let responder = match &self.responder {
+            Some(r) => r.clone(),
+            None => responder_of(cert, log).ok_or(REQUEST_FAILED)?,
+        };
+        let key = match &self.cache {
+            Some(cache) => {
+                let key = cache_key(cert, issuer).ok_or(REQUEST_FAILED)?;
+                if let Some(status) = cache.lookup(&key) {
+                    return Ok(status);
+                }
+                Some((cache, key))
+            }
+            None => None,
+        };
+        let fetch = Fetch {
+            leaf: cert.to_vec(),
+            issuer: issuer.to_vec(),
+            chain: chain.to_vec(),
+            store: self.store.clone(),
+            flags: 0,
+            responder,
+            resolver: self.resolver,
+            resolver_timeout: self.resolver_timeout,
+            name: None,
+            connection: Some((log.id, log.logs)),
+        };
+        let (peer, response) = fetch.request().await.ok_or(REQUEST_FAILED)?;
+        let (status, valid) = fetch.verified(&response, peer).ok_or(REQUEST_FAILED)?;
+        if let Some((cache, key)) = key {
+            cache.store(key, status, valid);
+        }
+        Ok(status)
+    }
+}
+
+/// ngx_ssl_ocsp_responder for a certificate without `ssl_ocsp_responder`:
+/// the first OCSP URL of its AIA, not resolved yet.
+fn responder_of(cert: &[u8], log: &ConnLog) -> Option<Responder> {
+    let Some(url) = responder_in(cert) else {
+        log.error("no OCSP responder URL in certificate");
+        return None;
+    };
+    match parse_responder(&url, false) {
+        Ok(r) => Some(r),
+        Err(("invalid URL prefix", url)) => {
+            log.error(&format!(
+                "invalid URL prefix in OCSP responder \"{url}\" in certificate"
+            ));
+            None
+        }
+        Err(("no host", _)) => {
+            log.error("empty host in OCSP responder in certificate");
+            None
+        }
+        Err((err, url)) => {
+            log.error(&format!("{err} in OCSP responder \"{url}\" in certificate"));
+            None
+        }
+    }
+}
+
+/// ngx_ssl_ocsp_create_key: SHA-1 of the issuer's name and of its key,
+/// and the certificate's serial, zero-padded to 20 bytes.
+fn cache_key(cert: &[u8], issuer: &[u8]) -> Option<[u8; 60]> {
+    let (cert, issuer) = (Cert::from_der(cert)?, Cert::from_der(issuer)?);
+    let mut key = [0u8; 60];
+    unsafe {
+        let name = ffi::X509_get_subject_name(issuer.0);
+        let mut len = 0;
+        if ffi::X509_NAME_digest(name, ffi::EVP_sha1(), key.as_mut_ptr(), &mut len) != 1
+            || len != 20
+            || ffi::X509_pubkey_digest(issuer.0, ffi::EVP_sha1(), key[20..].as_mut_ptr(), &mut len)
+                != 1
+            || len != 20
+        {
+            ffi::ERR_clear_error();
+            return None;
+        }
+        let serial = ffi::X509_get_serialNumber(cert.0);
+        let n = ffi::ASN1_STRING_length(serial);
+        if !(0..=20).contains(&n) {
+            return None;
+        }
+        let data = ffi::ASN1_STRING_get0_data(serial);
+        if n > 0 {
+            ptr::copy_nonoverlapping(data, key[40..].as_mut_ptr(), n as usize);
+        }
+    }
+    Some(key)
+}
+
+/// An `ssl_ocsp_cache` zone: statuses by certificate until their
+/// nextUpdate, shared by the workers and the servers that name it. When
+/// full, the oldest entry goes, as nginx's zone frees its oldest node.
+pub struct Cache {
+    entries: Mutex<CacheEntries>,
+    /// About what nginx's zone of that size holds: a node takes a 256-byte
+    /// slab chunk.
+    limit: usize,
+}
+
+#[derive(Default)]
+struct CacheEntries {
+    by_key: std::collections::HashMap<[u8; 60], (c_int, i64)>,
+    /// Keys in the order they were stored, oldest first.
+    order: std::collections::VecDeque<[u8; 60]>,
+}
+
+/// The zones of every configuration loaded, by name and size: a reload
+/// that keeps a zone keeps its entries, as nginx keeps a shared zone.
+static ZONES: Mutex<Vec<(String, u64, Arc<Cache>)>> = Mutex::new(Vec::new());
+
+impl Cache {
+    fn zone(name: &str, size: u64) -> Arc<Cache> {
+        let mut zones = ZONES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, cache)) = zones.iter().find(|(n, s, _)| n == name && *s == size) {
+            return cache.clone();
+        }
+        let cache = Arc::new(Cache {
+            entries: Mutex::default(),
+            limit: (size / 256).max(1) as usize,
+        });
+        zones.push((name.to_string(), size, cache.clone()));
+        cache
+    }
+
+    /// ngx_ssl_ocsp_cache_lookup: an expired entry goes.
+    fn lookup(&self, key: &[u8; 60]) -> Option<c_int> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let (status, valid) = *entries.by_key.get(key)?;
+        if valid > unix_now() {
+            return Some(status);
+        }
+        entries.by_key.remove(key);
+        entries.order.retain(|k| k != key);
+        None
+    }
+
+    /// ngx_ssl_ocsp_cache_store: a response without nextUpdate for an
+    /// hour, an expired one not at all.
+    fn store(&self, key: [u8; 60], status: c_int, valid: i64) {
+        let now = unix_now();
+        if valid < now {
+            return;
+        }
+        let valid = if valid == i64::MAX { now + 3600 } else { valid };
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.by_key.insert(key, (status, valid)).is_some() {
+            entries.order.retain(|k| *k != key);
+        }
+        entries.order.push_back(key);
+        while entries.order.len() > self.limit {
+            if let Some(old) = entries.order.pop_front() {
+                entries.by_key.remove(&old);
+            }
         }
     }
 }
@@ -692,9 +982,10 @@ fn responder_in(leaf: &[u8]) -> Option<String> {
 }
 
 /// ngx_ssl_stapling_responder's checks and ngx_parse_url: an `http://`
-/// URL, the host resolved now, as nginx resolves it while reading its
-/// configuration. `Err` is nginx's reason and the URL it names.
-fn parse_responder(url: &str) -> Result<Responder, (&'static str, String)> {
+/// URL, the host resolved now with `resolve`, as nginx resolves it while
+/// reading its configuration; else only an address as written is one
+/// (`no_resolve`). `Err` is nginx's reason and the URL it names.
+fn parse_responder(url: &str, resolve: bool) -> Result<Responder, (&'static str, String)> {
     let rest = match url.get(..7) {
         Some(scheme) if url.len() > 7 && scheme.eq_ignore_ascii_case("http://") => &url[7..],
         _ => return Err(("invalid URL prefix", url.to_string())),
@@ -731,6 +1022,18 @@ fn parse_responder(url: &str) -> Result<Responder, (&'static str, String)> {
         return fail("no host");
     }
     let lookup = host.trim_start_matches('[').trim_end_matches(']');
+    if !resolve {
+        let addrs = lookup
+            .parse::<std::net::IpAddr>()
+            .map(|ip| vec![SocketAddr::new(ip, port)])
+            .unwrap_or_default();
+        return Ok(Responder {
+            host: host.to_string(),
+            uri: if uri.is_empty() { "/" } else { uri }.to_string(),
+            port,
+            addrs,
+        });
+    }
     let addrs: Vec<SocketAddr> = match (lookup, port).to_socket_addrs() {
         Ok(addrs) => addrs.collect(),
         Err(_) => return fail("host not found"),
@@ -845,30 +1148,30 @@ mod tests {
 
     #[test]
     fn responder_urls_parse_as_nginx_parses_them() {
-        let r = parse_responder("http://127.0.0.1:8081").unwrap();
+        let r = parse_responder("http://127.0.0.1:8081", true).unwrap();
         assert_eq!(r.host, "127.0.0.1");
         assert_eq!(r.uri, "/");
         assert_eq!(r.addrs, vec!["127.0.0.1:8081".parse().unwrap()]);
-        let r = parse_responder("HTTP://127.0.0.1/ocsp?x").unwrap();
+        let r = parse_responder("HTTP://127.0.0.1/ocsp?x", true).unwrap();
         assert_eq!((r.host.as_str(), r.uri.as_str()), ("127.0.0.1", "/ocsp?x"));
         assert_eq!(r.addrs[0].port(), 80);
-        let r = parse_responder("http://[::1]:8080/").unwrap();
+        let r = parse_responder("http://[::1]:8080/", true).unwrap();
         assert_eq!(r.host, "[::1]");
         assert_eq!(r.addrs, vec!["[::1]:8080".parse().unwrap()]);
         assert_eq!(
-            parse_responder("https://ocsp.example.com/").err(),
+            parse_responder("https://ocsp.example.com/", true).err(),
             Some(("invalid URL prefix", "https://ocsp.example.com/".into()))
         );
         assert_eq!(
-            parse_responder("http://127.0.0.1:0/").err(),
+            parse_responder("http://127.0.0.1:0/", true).err(),
             Some(("invalid port", "127.0.0.1:0/".into()))
         );
         assert_eq!(
-            parse_responder("http://:80/").err(),
+            parse_responder("http://:80/", true).err(),
             Some(("no host", ":80/".into()))
         );
         assert_eq!(
-            parse_responder("http://").err(),
+            parse_responder("http://", true).err(),
             Some(("invalid URL prefix", "http://".into()))
         );
     }
