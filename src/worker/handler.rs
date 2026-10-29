@@ -1041,13 +1041,19 @@ pub(crate) fn run_location_handler(
         }
         if !have_host_override {
             overrides_buf.insert(0, (b"Host", host_header.to_vec()));
+            if proxy.http_version == 2 {
+                // Sent as `:authority` (`upstream_h2`); the empty `Host`
+                // still keeps the client's out.
+                let host = std::mem::take(&mut overrides_buf[0].1);
+                overrides_buf.insert(0, (b":authority", host));
+            }
         }
 
-        // Pool eligibility: HTTP/1.1 + the upstream block has a keepalive
-        // pool (every `upstream {}` block unless `keepalive 0;`). Drives
-        // both the Connection-header default below and `run_proxy`'s
+        // Pool eligibility: HTTP/1.1 or HTTP/2 + the upstream block has a
+        // keepalive pool (every `upstream {}` block unless `keepalive 0;`).
+        // Drives both the Connection-header default below and `run_proxy`'s
         // pool-release decision.
-        let pool_eligible = proxy.http_version == 1 && upstream.keepalive_max_idle.is_some();
+        let pool_eligible = proxy.http_version != 0 && upstream.keepalive_max_idle.is_some();
 
         // nginx 1.29.7 sends no Connection header by default
         // (ngx_http_proxy_headers). Over HTTP/1.1 with no pool to take the
@@ -1290,9 +1296,11 @@ pub(crate) fn run_location_handler(
             in_error_page,
             error_page_status,
             intercept,
-            upgrade: client_upgrade,
+            // No protocol switch over HTTP/2 (ngx_http_proxy_v2_module).
+            upgrade: client_upgrade && proxy.http_version != 2,
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
+            h2: proxy.http_version == 2,
             cache,
             hash,
             sticky,

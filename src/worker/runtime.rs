@@ -2917,6 +2917,11 @@ async fn drain(state: &RuntimeState, inherited: Option<&[std::os::fd::RawFd]>) {
         }
         monoio::time::sleep(Duration::from_millis(10)).await;
     }
+    // HTTP/2 upstream connections end in their own tasks (GOAWAY): a
+    // moment for them.
+    if crate::upstream::pool_clear() {
+        monoio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The accept loop of a `listen unix:` socket (#263). A connection is

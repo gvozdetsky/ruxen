@@ -214,7 +214,7 @@ pub struct ProxyConf {
     /// `proxy_limit_rate` in bytes/sec (a size, variables allowed); `0`
     /// means unlimited.
     pub limit_rate: Option<Vec<ValuePart>>,
-    /// `proxy_http_version 1.0|1.1`, stored as the minor digit.
+    /// `proxy_http_version 1.0|1.1|2`: 0, 1, or 2 for HTTP/2.
     pub http_version: Option<u8>,
     /// `proxy_next_upstream`; unset means nginx's `error timeout`.
     pub next_upstream: Option<ProxyNextUpstream>,

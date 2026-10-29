@@ -189,6 +189,8 @@ pub struct ProxyPlan {
     /// `proxy_ignore_client_abort`: when off, a client that closes while
     /// the upstream is awaited ends the exchange with 499 (#136).
     pub ignore_client_abort: bool,
+    /// `proxy_http_version 2` (#599): a new connection speaks HTTP/2.
+    pub h2: bool,
 }
 
 /// The peers of one request's `proxy_pass` with variables: nginx's
@@ -776,7 +778,8 @@ pub fn write_request(
     buf.extend_from_slice(method_bytes);
     buf.push(b' ');
     buf.extend_from_slice(uri);
-    buf.extend_from_slice(if http_version_minor == 1 {
+    // HTTP/2 (2) goes to `upstream_h2` as an HTTP/1.1 head.
+    buf.extend_from_slice(if http_version_minor != 0 {
         b" HTTP/1.1\r\n"
     } else {
         b" HTTP/1.0\r\n"
@@ -2138,6 +2141,14 @@ async fn attempt(
                 }
             }
         };
+        let stream = if plan.h2 {
+            match Box::pin(h2_connect(plan, stream)).await {
+                Ok(stream) => stream,
+                Err(outcome) => return outcome,
+            }
+        } else {
+            stream
+        };
         (stream, Instant::now(), 0, slot)
     };
     state.connect_ms = Some(elapsed_ms(started));
@@ -2776,6 +2787,32 @@ async fn attempt(
     return_proxy_buf(accum);
     return_proxy_buf(read_buf);
     AttemptOutcome::Ok(Response::Owned(out))
+}
+
+/// `proxy_http_version 2` (#599): HTTP/2 on a new connection, under
+/// `proxy_connect_timeout` as the TLS handshake is.
+#[cold]
+async fn h2_connect(plan: &ProxyPlan, stream: UpstreamIo) -> Result<UpstreamIo, AttemptOutcome> {
+    let identity = stream.tls_identity().cloned();
+    let https = identity.is_some();
+    match timeout(
+        plan.connect_timeout,
+        crate::upstream_h2::handshake(stream, https, identity),
+    )
+    .await
+    {
+        Ok(Ok(conn)) => Ok(UpstreamIo::H2(Box::new(conn))),
+        Ok(Err(e)) => Err(AttemptOutcome::Failed(
+            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+            FailKind::Error,
+            Box::new(UpstreamError::SendFailed(e)),
+        )),
+        Err(_) => Err(AttemptOutcome::Failed(
+            Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+            FailKind::Timeout,
+            Box::new(UpstreamError::TimedOut(Stage::Connecting)),
+        )),
+    }
 }
 
 /// How a body that hasn't all arrived with the header (`initial`) is
