@@ -23,6 +23,9 @@ jobs:
         run: cargo fmt --check
       - name: Build
         run: cargo build --release --all-targets --locked
+      - name: Load the kernel TLS module
+        # tests/m166_ktls.rs then checks the switch to kTLS (#673).
+        run: sudo modprobe tls || echo "no tls module, kTLS tests run in userspace"
       - name: Test
         run: cargo test --release --locked
       - name: Test on the epoll driver
