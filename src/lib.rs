@@ -329,6 +329,7 @@ pub mod fuzzing {
                 body: &crate::phase::NO_BODY,
                 body_len: 0,
                 body_file: None,
+                body_feed: None,
                 tls: None,
                 conn: &crate::phase::ConnInfo::NONE,
                 refuse: None,

@@ -12,7 +12,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexBuilder};
 use ruxen::fuzzing::{Server, escape_redirect_location, normalize_uri, unescape_redirect};
 
 const CONFIG: &str = r#"
@@ -39,6 +39,10 @@ http {
 }
 "#;
 
+fn re(pattern: &str) -> Regex {
+    RegexBuilder::new(pattern).unicode(false).build().unwrap()
+}
+
 struct Rules {
     a: Regex,
     b: Regex,
@@ -50,14 +54,14 @@ struct Rules {
 
 thread_local! {
     static SERVER: Server = Server::new(CONFIG);
-    // As ruxen compiles them.
+    // As ruxen compiles them: bytes, as PCRE without UTF.
     static RULES: Rules = Rules {
-        a: Regex::new("^/a/([^/]*)/(.*)$").unwrap(),
-        b: Regex::new("^/b/(.*)$").unwrap(),
-        n: Regex::new("^/n/(.*)$").unwrap(),
-        e: Regex::new("^/e(/.*)?$").unwrap(),
-        r: Regex::new("^/r/(.*)$").unwrap(),
-        p: Regex::new("^/p/([^/]*)$").unwrap(),
+        a: re("^/a/([^/]*)/(.*)$"),
+        b: re("^/b/(.*)$"),
+        n: re("^/n/(.*)$"),
+        e: re("^/e(/.*)?$"),
+        r: re("^/r/(.*)$"),
+        p: re("^/p/([^/]*)$"),
     };
 }
 

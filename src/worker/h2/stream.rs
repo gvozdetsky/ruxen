@@ -849,45 +849,37 @@ pub(crate) async fn fuzz_connection(data: &[u8], piece: usize) -> Vec<FuzzStream
         pos: usize,
         piece: usize,
     }
-    impl AsyncReadRent for Wire {
-        async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
-            let n = self
-                .piece
-                .min(self.data.len() - self.pos)
-                .min(buf.bytes_total());
+    // SAFETY: the futures make their reference only when polled, and hold
+    // none across an await (there is none).
+    unsafe impl crate::duplex::Duplex for Wire {
+        async unsafe fn read_raw<T: IoBufMut>(
+            this: std::ptr::NonNull<Self>,
+            mut buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            // SAFETY: the caller's.
+            let w = unsafe { &mut *this.as_ptr() };
+            let n = w.piece.min(w.data.len() - w.pos).min(buf.bytes_total());
             // SAFETY: `n` is within the source and the buffer's capacity.
             unsafe {
-                std::ptr::copy_nonoverlapping(self.data[self.pos..].as_ptr(), buf.write_ptr(), n);
+                std::ptr::copy_nonoverlapping(w.data[w.pos..].as_ptr(), buf.write_ptr(), n);
                 buf.set_init(n);
             }
-            self.pos += n;
+            w.pos += n;
             (Ok(n), buf)
         }
-        async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-            (Err(io::ErrorKind::Unsupported.into()), buf)
-        }
-    }
-    impl AsyncWriteRent for Wire {
-        async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        async unsafe fn write_raw<T: IoBuf>(
+            _this: std::ptr::NonNull<Self>,
+            buf: T,
+        ) -> monoio::BufResult<usize, T> {
             let n = buf.bytes_init();
             (Ok(n), buf)
         }
-        async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-            // SAFETY: valid iovecs, owned here until returned.
-            let iovecs =
-                unsafe { std::slice::from_raw_parts(buf.read_iovec_ptr(), buf.read_iovec_len()) };
-            let n = iovecs.iter().map(|v| v.iov_len).sum();
-            (Ok(n), buf)
-        }
-        async fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-        async fn shutdown(&mut self) -> io::Result<()> {
+        async unsafe fn shutdown_raw(_this: std::ptr::NonNull<Self>) -> io::Result<()> {
             Ok(())
         }
     }
 
-    let io = super::compat::PollIo::new(Wire {
+    let (io, _reclaim) = super::compat::PollIo::new(Wire {
         data: data.to_vec(),
         pos: 0,
         piece: piece.max(1),
