@@ -206,17 +206,21 @@ fn m168_chunked_body_is_rechunked() {
 #[test]
 fn m168_stalled_body_times_out() {
     let s = setup("stall");
-    let started = Instant::now();
-    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    c.write_all(b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n01234")
-        .unwrap();
-    let mut out = Vec::new();
-    let _ = c.read_to_end(&mut out);
-    let resp = String::from_utf8_lossy(&out);
-    assert_eq!(resp, "");
-    let waited = started.elapsed();
-    assert!(waited >= Duration::from_secs(2) && waited < Duration::from_secs(6));
+    for head in [
+        "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n01234",
+        // #858: a chunked one alike.
+        "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n012",
+    ] {
+        let started = Instant::now();
+        let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(head.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        assert_eq!(String::from_utf8_lossy(&out), "", "{head}");
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_secs(2) && waited < Duration::from_secs(6));
+    }
 }
 
 /// `proxy_request_buffering on` (the default) still reads it first.

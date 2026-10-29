@@ -5138,6 +5138,7 @@ async fn pump_body<S: ConnIo>(
                 Err(e) => {
                     feed.finish(Err(match e {
                         ChunkedBodyError::TooLarge => FeedError::TooLarge,
+                        ChunkedBodyError::TimedOut => FeedError::TimedOut,
                         _ => FeedError::Invalid,
                     }));
                     PumpEnd::Unfinished
@@ -6162,6 +6163,12 @@ pub(crate) async fn handle<S: ConnIo>(
                                     Err(ChunkedBodyError::TooLarge) => {
                                         body_too_large = true;
                                         (0, 0)
+                                    }
+                                    // Timed out or gone: nginx terminates the
+                                    // request unanswered, as for a Content-Length
+                                    // body above (#858).
+                                    Err(ChunkedBodyError::TimedOut | ChunkedBodyError::Ended) => {
+                                        return false;
                                     }
                                     Err(_) if access_first.is_some() => {
                                         body_malformed = true;
