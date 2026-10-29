@@ -2,7 +2,7 @@
 //! response held whole in memory (#370), or a cached one, whose body may
 //! be in its file (#515). Static
 //! files (`file.rs`) use its parse, multipart layout and 416 page, with the
-//! parts read from the file (#401).
+//! parts sent from the file (#414).
 //!
 //! The filter runs after gzip and add_header, on a 200 of known length,
 //! when the response allows ranges (`RangeAllow`, nginx's
@@ -450,9 +450,8 @@ pub(crate) fn filter(
 }
 
 /// `filter` for a response whose body is in a file (a cache hit): one
-/// range is a part of the file, several are read for their multipart
-/// response up to `multipart_max` bytes, beyond which the body goes whole,
-/// as a static file's does (#401).
+/// range is a part of the file, several the parts of a multipart body sent
+/// from it (#414).
 pub(crate) fn filter_file(
     headers: Vec<u8>,
     body: crate::phase::FileBody,
@@ -488,18 +487,14 @@ pub(crate) fn filter_file(
                     offset: body.offset + start,
                     len: end - start,
                     fd: body.fd,
+                    parts: None,
                 },
             }
         }
-        Cut::Ranges(ranges, _) if ranges.size() > crate::file::MULTIPART_MAX => whole(body),
-        Cut::Ranges(ranges, len) => {
-            use std::os::fd::AsRawFd;
-            let fd = body.fd.as_raw_fd();
-            let read = |start: u64, end: u64, out: &mut Vec<u8>| {
-                crate::file::read_at_into(fd, body.offset + start, end - start, out)
-            };
-            Response::Owned(multipart(head, len, &ranges, req.head_only, read)?)
+        Cut::Ranges(ranges, len) if req.head_only => {
+            Response::Owned(multipart(head, len, &ranges, true, |_, _, _| Ok(()))?)
         }
+        Cut::Ranges(ranges, len) => multipart_file(head, len, &ranges, body.fd, body.offset),
     })
 }
 
@@ -515,36 +510,84 @@ pub(crate) fn multipart(
     head_only: bool,
     mut read: impl FnMut(u64, u64, &mut Vec<u8>) -> std::io::Result<()>,
 ) -> std::io::Result<Vec<u8>> {
+    let (mut out, parts, trailer) = multipart_layout(head, len, ranges);
+    if !head_only {
+        out.reserve(ranges.size() as usize + ranges.len() * 96 + trailer.len());
+        for (part, start, end) in parts {
+            out.extend_from_slice(&part);
+            read(start, end, &mut out)?;
+        }
+        out.extend_from_slice(&trailer);
+    }
+    Ok(out)
+}
+
+/// `multipart` with the parts sent from the file (#414), whose body
+/// starts at `base` in it, as nginx's multipart body filter points each
+/// part's buffer into the file: no part is read here.
+pub(crate) fn multipart_file(
+    head: &[u8],
+    len: u64,
+    ranges: &Ranges,
+    fd: std::os::fd::OwnedFd,
+    base: u64,
+) -> crate::phase::Response {
+    use crate::phase::{FileBody, FileParts, Response};
+    let (headers, parts, trailer) = multipart_layout(head, len, ranges);
+    let parts: Vec<_> = parts
+        .into_iter()
+        .map(|(part, start, end)| (part, base + start, end - start))
+        .collect();
+    let len = parts
+        .iter()
+        .map(|(part, _, len)| part.len() as u64 + len)
+        .sum::<u64>()
+        + trailer.len() as u64;
+    Response::File {
+        headers,
+        body: FileBody {
+            fd,
+            offset: 0,
+            len,
+            parts: Some(Box::new(FileParts { parts, trailer })),
+        },
+    }
+}
+
+/// The multipart response's head (final CRLF included), each range's
+/// part header with the range, and the closing boundary
+/// (ngx_http_range_multipart_header).
+#[allow(clippy::type_complexity)]
+fn multipart_layout(
+    head: &[u8],
+    len: u64,
+    ranges: &Ranges,
+) -> (Vec<u8>, Vec<(Vec<u8>, u64, u64)>, Vec<u8>) {
     let boundary = format!("{:020}", next_boundary());
     let part_type = header(head, b"content-type")
         .map(|t| format!("\r\nContent-Type: {}", String::from_utf8_lossy(t)))
         .unwrap_or_default();
-    let mut parts =
-        Vec::with_capacity(if head_only { 0 } else { ranges.size() as usize } + ranges.len() * 96);
-    // A HEAD response counts the parts' bodies without them.
-    let mut skipped = 0;
-    for (start, end) in ranges.iter() {
-        parts.extend_from_slice(
-            format!(
+    let mut body_len = 0;
+    let parts: Vec<_> = ranges
+        .iter()
+        .map(|(start, end)| {
+            let part = format!(
                 "\r\n--{boundary}{part_type}\r\nContent-Range: bytes {}-{}/{len}\r\n\r\n",
                 start,
                 end - 1
             )
-            .as_bytes(),
-        );
-        if head_only {
-            skipped += end - start;
-        } else {
-            read(start, end, &mut parts)?;
-        }
-    }
-    parts.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            .into_bytes();
+            body_len += part.len() as u64 + (end - start);
+            (part, start, end)
+        })
+        .collect();
+    let trailer = format!("\r\n--{boundary}--\r\n").into_bytes();
+    body_len += trailer.len() as u64;
     let add = format!(
-        "\r\nContent-Type: multipart/byteranges; boundary={boundary}\r\nContent-Length: {}",
-        parts.len() as u64 + skipped
+        "\r\nContent-Type: multipart/byteranges; boundary={boundary}\r\nContent-Length: {body_len}"
     );
     let status_line = b"HTTP/1.1 206 Partial Content";
-    let mut out = rebuild(
+    let out = rebuild(
         status_line,
         head,
         &[
@@ -555,10 +598,7 @@ pub(crate) fn multipart(
         ],
         add.as_bytes(),
     );
-    if !head_only {
-        out.extend_from_slice(&parts);
-    }
-    Ok(out)
+    (out, parts, trailer)
 }
 
 /// The 416 the range filter finalizes the request with: nginx's page

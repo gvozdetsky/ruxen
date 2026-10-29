@@ -789,6 +789,7 @@ mod tests {
             lb: Lb::RoundRobin,
             shared: None,
             dynamic: None,
+            sticky: None,
             metrics: None,
         };
         let resolver = Box::leak(Box::new(crate::resolver::Resolver {
