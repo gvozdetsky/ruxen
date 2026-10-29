@@ -371,6 +371,15 @@ fn m165_configuration_errors() {
     assert!(ok, "{err}");
     let (ok, err) = check("upstream u { server 127.0.0.1:81 resolve; }");
     assert!(ok, "{err}");
+    // Fails closed until sticky follows resolved peers.
+    let (ok, err) = check(
+        "upstream u { zone z; sticky cookie s; server svc.test resolve; }\n\
+         resolver 127.0.0.1;",
+    );
+    assert!(
+        !ok && err.contains("\"sticky\" with \"resolve\" servers is not supported yet"),
+        "{err}"
+    );
 }
 
 #[test]
