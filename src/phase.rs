@@ -2376,6 +2376,7 @@ fn unrouted_discard(server: &PreparedServer, continue_status: Option<u16>) -> Fi
         discard: true,
         continue_status,
         body_timeout: server.timeouts.body,
+        unbuffered: None,
     }
 }
 
