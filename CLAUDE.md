@@ -59,12 +59,12 @@ that changes only startup, configuration or docs doesn't need one.
 The backlog is GitHub issues, nothing else; there is no backlog file.
 
 - Query it: `gh issue list --state open --json number,title,labels,milestone`,
-  narrowed with `--label area:proxy`, `--milestone v0.2.1`, etc. Labels:
+  narrowed with `--label area:proxy`, `--milestone v0.3.0`, etc. Labels:
   `area:{proxy,http,tls,config,static,cli,core,logging}`, `size:{S,M,L}`,
   `nginx-compatibility`, `performance`, `bug`, `documentation`,
-  `good first issue`, `help wanted`. Milestones: minor versions (`v0.3.0`)
-  are the phases in `ROADMAP.md`; patch versions (`v0.2.1`, `v0.2.2`, …)
-  order the work in between (see `ROADMAP.md`, Releases).
+  `good first issue`, `help wanted`. Milestones are versions: patch ones
+  (`v0.2.3`, …) order the work, and `v0.3.0` holds what is left of phase 2
+  (see `ROADMAP.md`, Releases).
 - One issue = one root cause. Sections: Summary, Repro (minimal config +
   command, nginx vs ruxen), nginx reference (`file.c:line` at 1.30.6),
   Unlocks (nginx-tests files), Notes, Where in ruxen (files, no line
