@@ -78,6 +78,46 @@ same locally with your checkout at that commit. To move to a newer
 nginx-tests, change the commit and regenerate the progress file in the same
 PR.
 
+### Differential testing (nginx as the oracle)
+
+`scripts/difftest/` sends the same requests to nginx and ruxen on the same
+configuration and reports where the answers differ (#750). It needs Python 3
+and an nginx 1.30 binary (`--nginx`, or `$DIFFTEST_NGINX`; build one from
+`../nginx` with `--with-http_ssl_module --with-http_v2_module` and the
+modules your configs use).
+
+```bash
+cargo build --release
+scripts/difftest/difftest.py run --quick --nginx PATH/TO/nginx   # curated + bench configs, under a minute
+scripts/difftest/difftest.py run --nginx PATH/TO/nginx           # + nginx-tests and corpus configs
+scripts/difftest/difftest.py list --suite corpus                 # which cases a suite has
+```
+
+The report, `difftest-out/report.md`, groups differences by class (status,
+header, body, framing, connection, upstream request) so one root cause shows
+up once, with example requests. Requests are generated from `--seed`
+(default 1); to look at one, rerun it with both answers printed:
+
+```bash
+scripts/difftest/difftest.py run --only curated:proxy --request 't0:localhost/base:/uri/'
+```
+
+What is normalised away (`Date`, the server version, gzip bytes, request
+ids, …) is listed in `normalise.py`; anything else that differs is
+reported. Upstreams go to `echo_upstream.py`, which answers with the request
+it received, so the proxy's request rewriting is compared too. Differences
+that are by design, or already have an issue, go into `expected.tsv` with
+the reason (an issue number), and `difftest.py report` re-renders the last
+run with it; configurations `ruxen --compat` flags are reported apart.
+HTTP/2 is not exercised (the h2 crate follows the RFC where nginx doesn't,
+#347).
+
+To try a configuration, `--config FILE`; to keep it, drop it into
+`scripts/difftest/configs/`: any ports, any upstream host names (they are
+mapped), `root html;` gets a fixture tree. A new difference becomes an
+issue (one root cause each), then a line in `expected.tsv` until it is
+fixed.
+
 ### Benchmarks (performance)
 
 See [`bench/README.md`](bench/README.md). Short version: single runs on a

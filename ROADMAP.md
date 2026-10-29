@@ -32,7 +32,7 @@ v0.2.0 brought HTTP/2 for clients, reload without dropping connections, WebSocke
 
 Goal: an operator can run ruxen next to their nginx on a copy of their real traffic, see where its answers differ, judge it by numbers, and move a non-critical site with a guide for each difference. Target: mid-December 2026. In order of priority:
 - Trying it on real traffic: shadow mode behind nginx's `mirror` with a report of where the answers differ (#751), differential testing against nginx 1.30.6 in the lab (#750), metrics in Prometheus format (#481), a migration guide organised by what `--compat` reports (#752).
-- The differences a typical configuration hits most, by corpus count: proxied responses still read whole, which is what `proxy_buffering off` (25 configurations) and failover depend on (#463); the rest of proxy caching (#233, 13); streaming request bodies with `proxy_request_buffering off` (#134, 4, together with the 64 KiB POST rate, #289).
+- The differences a typical configuration hits most, by corpus count: the rest of proxy caching (#233, 13); the 64 KiB POST rate (#289).
 - Robustness a trial would meet: blocking file I/O off the worker (#526), the two `&mut` to one stream (#501), fuzzing of the HTTP/2 glue, Range, rewrite and gzip with long runs on a schedule (#477).
 - Performance: no regression on the headline scenarios.
 

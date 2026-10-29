@@ -55,9 +55,15 @@ fn spawn_target_echo() -> u16 {
                 .map_or("", |(t, _)| t);
             let lines = head.trim_end().split("\r\n").count() - 1;
             let body = format!("[{target}] lines={lines}");
+            // `/st404…` answers 404, for `proxy_intercept_errors`.
+            let status = if target.starts_with("/st404") {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
             let _ = write!(
                 s,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }
@@ -81,7 +87,7 @@ fn start(up: u16) -> Server {
         dir.join("nginx.conf"),
         format!(
             "events {{}}\nhttp {{ access_log off; server {{ listen 127.0.0.1:{port};\n\
-               location / {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+               location / {{ add_header X-RU $request_uri; proxy_pass http://127.0.0.1:{up}; }}\n\
                location /p/ {{ proxy_pass http://127.0.0.1:{up}/x/; }}\n\
                location /r/ {{ rewrite ^/r/(.*)$ /n/$1 break; proxy_pass http://127.0.0.1:{up}; }}\n\
                location /v/ {{ proxy_pass http://127.0.0.1:{up}$uri; }}\n\
@@ -91,6 +97,19 @@ fn start(up: u16) -> Server {
                  proxy_pass http://127.0.0.1:{up}; }}\n\
                location /sr/ {{ set $args \"a=1\";\n\
                  return 200 \"$args|$arg_a|$arg_b|$is_args|$query_string|$request_uri\"; }}\n\
+               location /ru {{ return 200 \"$request_uri|$uri|$args|$is_args\"; }}\n\
+               location /t/ {{ try_files $uri @app; }}\n\
+               location /e/ {{ error_page 404 = @app; }}\n\
+               location /tr/ {{ rewrite ^/tr/(.*)$ /n/$1 break; try_files $uri @app; }}\n\
+               location /tu/ {{ try_files $uri /n/; }}\n\
+               location @app {{ proxy_pass http://127.0.0.1:{up}; }}\n\
+               location /pi/ {{ proxy_pass http://127.0.0.1:{up}/st404/;\n\
+                 proxy_intercept_errors on; error_page 404 = @app; }}\n\
+               location /pr/ {{ rewrite ^/pr/(.*)$ /st404/$1 break;\n\
+                 proxy_pass http://127.0.0.1:{up};\n\
+                 proxy_intercept_errors on; error_page 404 = @app; }}\n\
+               location /pa/ {{ set $args \"x=1\"; proxy_pass http://127.0.0.1:{up}/st404/;\n\
+                 proxy_intercept_errors on; error_page 404 = @app; }}\n\
              }} }}\n"
         ),
     )
@@ -202,4 +221,115 @@ fn set_args_replaces_the_arguments() {
     }
     let resp = get(server.port, "/sr/x?b=2");
     assert!(resp.ends_with("\r\n\r\na=1|1||?|a=1|/sr/x?b=2"), "{resp}");
+}
+
+/// #748: a `#fragment` stays in the client's target, as nginx keeps it in
+/// `r->unparsed_uri`: `$request_uri` and an unchanged upstream target have
+/// it; `$uri`, `$args` and a URI part stop at the `#`.
+#[test]
+fn fragment_stays_in_the_unparsed_uri() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, upstream_gets) in [
+        ("/a?b=1#frag", "/a?b=1#frag"),
+        ("/a#f?x", "/a#f?x"),
+        ("/a%61#f", "/a%61#f"),
+        ("http://h/a#f", "/a#f"),
+        ("/p/x?y#frag", "/x/x?y"),
+        ("/r/x#frag", "/n/x"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
+    for (target, body) in [
+        ("/ru?b=1#frag", "/ru?b=1#frag|/ru|b=1|?"),
+        ("/ru#f?x", "/ru#f?x|/ru||"),
+        ("/ru#", "/ru#|/ru||"),
+        ("/ru?a=1#f#g", "/ru?a=1#f#g|/ru|a=1|?"),
+        ("http://h/ru#f", "/ru#f|/ru||"),
+        ("/ru?a", "/ru?a|/ru|a|?"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("\r\n\r\n{body}")),
+            "{target}: {resp}"
+        );
+    }
+}
+
+/// #769: an absolute-form target without a path has `$request_uri` from
+/// its `?`, as nginx's unparsed_uri; the upstream still gets `/?…`.
+#[test]
+fn absolute_target_without_a_path() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, ru, upstream_gets) in [
+        ("http://h?a=1", "?a=1", "/?a=1"),
+        ("http://h?a=1#f", "?a=1#f", "/?a=1"),
+        ("http://h", "/", "/"),
+        ("http://h/?a=1", "/?a=1", "/?a=1"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.contains(&format!("\r\nX-RU: {ru}\r\n")),
+            "{target}: {resp}"
+        );
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
+}
+
+/// A jump to a named location (`try_files … @app`, `error_page … @app`)
+/// keeps the client's target; a rewrite before it, or a redirect to a URI,
+/// sends the escaped `$uri` (#777).
+#[test]
+fn named_location_keeps_the_client_target() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, upstream_gets) in [
+        ("/t/a%2Fb", "/t/a%2Fb"),
+        ("/t/x/../a", "/t/x/../a"),
+        ("/t//a", "/t//a"),
+        ("/t/%41?q=1", "/t/%41?q=1"),
+        ("/t/a\\b", "/t/a\\b"),
+        ("/e/a%2Fb", "/e/a%2Fb"),
+        ("/tr/a%2Fb", "/n/a/b"),
+        ("/tr/a\\b", "/n/a%5Cb"),
+        ("/tu/a%2Fb", "/n/"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
+}
+
+/// `proxy_intercept_errors` to `error_page … @app`: the named location
+/// starts from where the proxying location was, its rewritten URI and
+/// arguments, as ngx_http_named_location keeps them (#814).
+#[test]
+fn intercepted_error_to_a_named_location_keeps_the_uri() {
+    let up = spawn_target_echo();
+    let server = start(up);
+    for (target, upstream_gets) in [
+        // Unchanged: the client's own target.
+        ("/pi/a%2Fb", "/pi/a%2Fb"),
+        // Rewritten: the new `$uri`, escaped, with the client's args.
+        ("/pr/a%2Fb?q=1", "/st404/a/b?q=1"),
+        ("/pr/a\\b", "/st404/a%5Cb"),
+        // `set $args`: the new arguments.
+        ("/pa/a%2Fb?q=1", "/pa/a/b?x=1"),
+    ] {
+        let resp = get(server.port, target);
+        assert!(
+            resp.ends_with(&format!("[{upstream_gets}] lines=2")),
+            "{target}: {resp}"
+        );
+    }
 }

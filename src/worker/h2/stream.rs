@@ -637,11 +637,36 @@ impl AsyncWriteRent for StreamIo {
     }
 }
 
+// SAFETY: never touches the stream. An HTTP/2 stream carries no tunnel:
+// the `h2` crate refuses a request with an `Upgrade` field (RFC 9113,
+// 8.2.2), so no upstream 101 is relayed on one.
+unsafe impl crate::duplex::Duplex for StreamIo {
+    unsafe fn read_raw<T: IoBufMut>(
+        _: std::ptr::NonNull<Self>,
+        buf: T,
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> + 'static {
+        std::future::ready((Err(io::ErrorKind::Unsupported.into()), buf))
+    }
+
+    unsafe fn write_raw<T: IoBuf>(
+        _: std::ptr::NonNull<Self>,
+        buf: T,
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> + 'static {
+        std::future::ready((Err(io::ErrorKind::Unsupported.into()), buf))
+    }
+
+    unsafe fn shutdown_raw(
+        _: std::ptr::NonNull<Self>,
+    ) -> impl std::future::Future<Output = io::Result<()>> + 'static {
+        std::future::ready(Ok(()))
+    }
+}
+
 impl super::super::ConnIo for StreamIo {
     async fn idle_wait(
         &self,
         _state: &RuntimeState,
-        _idle: Option<std::time::Duration>,
+        _idle: super::super::IdleLimits,
         _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> bool {
@@ -653,7 +678,7 @@ impl super::super::ConnIo for StreamIo {
         &mut self,
         mut buf: Vec<u8>,
         _state: &RuntimeState,
-        _idle: Option<std::time::Duration>,
+        _idle: super::super::IdleLimits,
         _fresh: bool,
         _timers: &mut ConnTimers<'_>,
     ) -> (IdleRead, Vec<u8>) {
@@ -705,14 +730,32 @@ impl super::super::ConnIo for StreamIo {
     /// The file read straight into the `Bytes` its DATA frames carry: no
     /// zeroed buffer per request and no copy into the frames (#348). Only
     /// for a body the head announced with its length, up to 1 MiB.
-    async fn send_file_body(&mut self, body: &crate::phase::FileBody) -> Option<bool> {
+    async fn send_file_body(
+        &mut self,
+        body: crate::phase::FileBody,
+        aio: Option<&'static crate::aio::ThreadPool>,
+    ) -> Result<bool, crate::phase::FileBody> {
         use std::os::fd::AsRawFd;
         const MAX: u64 = 1 << 20;
+        // Multipart parts go through `stream_file`.
         if self.head_request
             || body.len > MAX
+            || body.parts.is_some()
             || !matches!(self.out, Out::Length(n) if n == body.len)
         {
-            return None;
+            return Err(body);
+        }
+        if let Some(pool) = aio {
+            let read = Box::pin(crate::aio::run(pool, move || {
+                let mut buf = bytes::BytesMut::zeroed(body.len as usize);
+                crate::aio::pread_exact(body.fd.as_raw_fd(), &mut buf, body.offset).map(|()| buf)
+            }))
+            .await;
+            let Ok(Ok(buf)) = read else {
+                return Ok(false);
+            };
+            self.out = Out::Done;
+            return Ok(self.send_data_owned(buf.freeze()).await.is_ok());
         }
         let len = body.len as usize;
         let mut buf = bytes::BytesMut::with_capacity(len);
@@ -730,14 +773,14 @@ impl super::super::ConnIo for StreamIo {
             };
             if n <= 0 {
                 // An error, or a file shorter than its stat said.
-                return Some(false);
+                return Ok(false);
             }
             filled += n as usize;
         }
         // SAFETY: `filled == len` bytes were written above.
         unsafe { buf.set_len(len) };
         self.out = Out::Done;
-        Some(self.send_data_owned(buf.freeze()).await.is_ok())
+        Ok(self.send_data_owned(buf.freeze()).await.is_ok())
     }
 
     fn h2_header_block(&self) -> Option<u64> {

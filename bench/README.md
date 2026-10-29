@@ -188,6 +188,36 @@ CARGO_TARGET_DIR=/tmp/ruxen-prof CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
 ```
 
+### Other hardware (#14)
+
+`.github/workflows/bench-hardware.yml` (Actions → "Bench on hosted
+hardware" → Run workflow) runs the A/A calibration and `pair.sh` against
+nginx 1.30.6, built with the reference configure line, on GitHub's
+x86_64 and ARM64 runners. It records the CPU, kernel and the driver
+(io_uring or epoll), and uploads the outputs as artifacts. The scenario
+list and the number of pairs are inputs.
+
+First data set, 2026-10-28, main `1e716b79` ([#14 comment](https://github.com/gvozdetsky/ruxen/issues/14#issuecomment-6474759301)):
+4-vCPU Azure VMs, kernel 7.0 (azure), wrk on the same VM, io_uring.
+Geometric mean of ruxen / nginx over 6 pairs:
+
+| scenario | x86_64 AMD EPYC 9V74 | ARM64 Neoverse-N2 | i9 laptop (c021) |
+|---|---:|---:|---:|
+| A/A m1_hello | 100.1% | 99.9% | 99.8% |
+| m1_hello | 115.0% | 120.1% | 102.2% |
+| m3_static_1k | 132.5% | 142.9% | 105.0% |
+| static_8k | 113.0% | 115.4% | 100.9% |
+| m5_conditional_304 | 118.1% | 130.5% | |
+| m1_no_keepalive | 96.3% | 92.4% | 95.7% |
+| proxy_hello | 113.9% | 130.4% | 97.2% |
+| tls_hello | 128.6% | 129.8% | 108.8% |
+
+The A/A spread is about ±1% per pair on these VMs, as on the idle laptop.
+The keep-alive lead is much larger than on the laptop: on 4 shared vCPUs the
+server and wrk compete for the cores, and on a virtualised kernel io_uring's
+fewer syscalls pay off more. `m1_no_keepalive` stays below nginx everywhere.
+Missing so far: a client on a separate machine over a real NIC.
+
 ---
 
 ## Adding a new scenario

@@ -105,6 +105,9 @@ fn setup(name: &str) -> Setup {
                location /vary/ {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
                  proxy_cache_valid 1m; }}\n\
                location @fallback {{ return 403; }}\n\
+               location /nch/ {{ proxy_pass http://127.0.0.1:{backend}/; proxy_cache one;\n\
+                 proxy_cache_valid 1m; proxy_cache_convert_head off;\n\
+                 proxy_cache_key $request_uri; }}\n\
              }}\n\
              server {{ listen 127.0.0.1:{backend}; root {d}/html;\n\
                location /cc {{ add_header Cache-Control no-store; }}\n\
@@ -177,6 +180,34 @@ fn m116_store_hit_bypass_and_errors() {
     assert_eq!((status_of(&r), body_of(&r)), ("", "TWO"), "{r}");
     let r = get(s.port, "/var/t.txt?c=nope");
     assert!(r.starts_with("HTTP/1.1 500"), "{r}");
+}
+
+/// `proxy_cache_convert_head off`: a HEAD goes up as a HEAD and its answer
+/// is stored, as nginx stores it. A GET then hits the head without its
+/// body, and the connection closes rather than leave the client waiting
+/// for it (nginx keeps it; proxy_cache_convert_head.t 3–4).
+#[test]
+fn m116_head_answer_is_stored_without_convert_head() {
+    let s = setup("convert-head-off");
+    std::fs::write(s.dir.join("html/t.html"), "SEE-THIS").unwrap();
+    let _server = start(&s.dir.join("nginx.conf"));
+    let head = "HEAD /nch/t.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let r = request(s.port, head);
+    assert_eq!(status_of(&r), "MISS", "{r}");
+    let r = request(s.port, head);
+    assert_eq!(status_of(&r), "HIT", "{r}");
+    assert!(r.contains("\r\nContent-Length: 8\r\n"), "{r}");
+    // A keep-alive GET: the head, no body, then the close.
+    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(b"GET /nch/t.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).unwrap();
+    let r = String::from_utf8_lossy(&out);
+    assert_eq!(status_of(&r), "HIT", "{r}");
+    assert!(r.contains("\r\nConnection: close\r\n"), "{r}");
+    assert_eq!(body_of(&r), "", "{r}");
 }
 
 #[test]
@@ -437,6 +468,23 @@ fn m116_large_hits_come_from_the_file() {
         big.len()
     )));
     assert!(body.contains(&*String::from_utf8_lossy(&big[5_000_000..5_000_010])));
+    // Parts over 1 MiB are sent from the cache file too (#414).
+    let (head, body) = get("/big.bin", "Range: bytes=0-999999,2000000-2999999\r\n");
+    assert!(head.contains("multipart/byteranges; boundary="), "{head}");
+    assert!(body.len() > 2_000_000 && body.len() < 2_001_000, "{head}");
+    for (start, end) in [(0, 1_000_000), (2_000_000, 3_000_000)] {
+        let line = format!(
+            "Content-Range: bytes {start}-{}/{}\r\n\r\n",
+            end - 1,
+            big.len()
+        );
+        let at = body
+            .windows(line.len())
+            .position(|w| w == line.as_bytes())
+            .unwrap()
+            + line.len();
+        assert!(body[at..].starts_with(&big[start..end]), "{start}");
+    }
     let (head, _) = get("/big.bin", "Range: bytes=9000000-\r\n");
     assert!(head.starts_with("HTTP/1.1 416 "), "{head}");
 
@@ -455,4 +503,53 @@ fn m116_large_hits_come_from_the_file() {
         assert!(status.ends_with(" 200"), "{proto}: {status}");
         assert!(std::fs::read(&out).unwrap() == big, "{proto}");
     }
+}
+
+/// A range past `proxy_cache_max_range_offset` goes upstream as asked,
+/// holding the `proxy_cache_lock` it took only until it ends (#864): the
+/// next request isn't left waiting for the lock to age.
+#[test]
+fn m116_far_range_releases_the_cache_lock() {
+    let setup_lock = common::ports::setup_lock();
+    let dir = std::env::temp_dir().join(format!("ruxen-m116-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("html")).unwrap();
+    std::fs::write(dir.join("html/f"), "a".repeat(1000)).unwrap();
+    let [port, backend] = common::ports::free_ports();
+    let d = dir.display();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "events {{}}\nhttp {{ access_log off;\n\
+             proxy_cache_path {d}/cache keys_zone=one:1m;\n\
+             server {{ listen 127.0.0.1:{port};\n\
+               add_header X-Cache $upstream_cache_status;\n\
+               location / {{ proxy_pass http://127.0.0.1:{backend}; proxy_cache one;\n\
+                 proxy_cache_valid 1m; proxy_cache_lock on;\n\
+                 proxy_cache_max_range_offset 10; }}\n\
+             }}\n\
+             server {{ listen 127.0.0.1:{backend}; root {d}/html; }} }}\n"
+        ),
+    )
+    .unwrap();
+    let _server = start(&dir.join("nginx.conf"));
+    drop(setup_lock);
+
+    let r = request(
+        port,
+        "GET /f HTTP/1.0\r\nHost: localhost\r\nRange: bytes=100-199\r\n\r\n",
+    );
+    assert!(r.starts_with("HTTP/1.1 206"), "{r}");
+    assert_eq!(body_of(&r).len(), 100, "{r}");
+    let started = Instant::now();
+    let r = get(port, "/f");
+    assert_eq!(status_of(&r), "MISS", "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "waited {:?} for the lock",
+        started.elapsed()
+    );
+    let r = get(port, "/f");
+    assert_eq!((status_of(&r), body_of(&r).len()), ("HIT", 1000), "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

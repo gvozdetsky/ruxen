@@ -185,12 +185,22 @@ pub(crate) fn response_header_values_all(response: &[u8], name: &[u8]) -> Vec<Ve
 }
 
 /// A 444 without a body: nginx's NGX_HTTP_CLOSE, which closes the
-/// connection instead of answering (#397); and the 499 of a client that
-/// went away while the upstream was awaited (#136).
+/// connection instead of answering (#397); the 499 of a client that
+/// went away while the upstream was awaited (#136); and `BODY_TIMED_OUT`.
 #[inline]
 pub(crate) fn closes_unanswered(bytes: &[u8]) -> bool {
-    matches!(bytes.get(9..12), Some(b"444" | b"499")) && bytes.ends_with(b"\r\n\r\n")
+    match bytes.get(9..12) {
+        Some(b"444" | b"499") => bytes.ends_with(b"\r\n\r\n"),
+        Some(b"408") => bytes.starts_with(&BODY_TIMED_OUT[..BODY_TIMED_OUT.len() - 2]),
+        _ => false,
+    }
 }
+
+/// A body sent upstream as it came (#134) that stopped coming: nginx
+/// terminates the request on 408 (ngx_http_finalize_request), so it is
+/// never sent, logged as 408. The reason phrase tells it from an
+/// upstream's 408.
+pub(crate) const BODY_TIMED_OUT: &[u8] = b"HTTP/1.1 408 Client Body Timed Out\r\n\r\n";
 
 /// What `settle_proxy_response` hands back when the client closed while
 /// the upstream was awaited: never sent, logged as 499 (#136).
@@ -708,6 +718,7 @@ pub(crate) fn rewrite_response_status(response: Vec<u8>, status: u16) -> Vec<u8>
 /// response. Bypasses non-`Owned` variants because the proxy response path
 /// always materializes an `Owned` buffer (or a 502/504 prebuilt that has no
 /// add_header context to apply).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_proxy_add_headers(
     response: Response,
     http: &'static PreparedHttp,
@@ -752,29 +763,63 @@ pub(crate) fn apply_proxy_add_headers(
         out = apply_expires(out, meta.proxy_expires, &render_ctx);
     }
     out = inject_add_headers(out, meta.proxy_add_headers, &render_ctx);
-    let trailers_allowed = ctx.http_11
-        && !matches!(ctx.method, crate::http::Method::Head)
-        && meta.proxy_chunked_transfer_encoding;
-    if trailers_allowed {
-        // Refresh `$msec` / `$time_local` / `$time_iso8601` to wall-clock-now
-        // for the trailer block. Trailers are emitted after the upstream body
-        // has finished arriving, which under `proxy_limit_rate` can lag the
-        // request-start epoch by seconds; nginx's variable cache likewise
-        // advances across that gap. Headers keep the request-start epoch via
-        // the outer `render_ctx`, so a `$msec` rendered into both `add_header`
-        // and `add_trailer` reflects the time difference.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let render_ctx = RenderCtx {
-            status: response_status(&out),
-            epoch_secs: now.as_secs(),
-            epoch_ms: (now.subsec_millis()) as u16,
-            ..render_ctx
-        };
-        out = inject_add_trailers(out, meta.proxy_add_trailers, &render_ctx);
-    }
+    // `add_trailer`: after the body, in the worker (`relay_trailers`).
     Response::Owned(out)
+}
+
+/// The last chunk and the trailers after a relayed body (#463), rendered
+/// once the body is out, as nginx's trailers filter does on the last
+/// buffer: the upstream's (`proxy_pass_trailers`), then `add_trailer`'s.
+/// `head`: the header block as sent.
+#[cold]
+#[inline(never)]
+pub(crate) fn relay_trailers(
+    http: &'static PreparedHttp,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &phase::ProcessMeta,
+    uri: Option<&[u8]>,
+    head: &[u8],
+    upstream: &[u8],
+) -> Vec<u8> {
+    let mut out = b"0\r\n".to_vec();
+    out.extend_from_slice(upstream);
+    if meta.proxy_add_trailers.is_empty() {
+        out.extend_from_slice(b"\r\n");
+        return out;
+    }
+    let root_only = root_only_state(meta);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let render_ctx = RenderCtx {
+        epoch_secs: now.as_secs(),
+        epoch_ms: (now.subsec_millis()) as u16,
+        ..proxy_render_ctx(
+            http,
+            ctx,
+            meta,
+            response_status(head),
+            &meta.upstream_headers,
+            &root_only,
+            uri,
+        )
+    };
+    let sent_view = match head.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => &head[..p + 2],
+        None => head,
+    };
+    let mut block = upstream.to_vec();
+    render_trailers_into(meta.proxy_add_trailers, &render_ctx, sent_view, &mut block);
+    out.extend_from_slice(&block[upstream.len()..]);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// The client can take trailers: chunked HTTP/1.1 (or HTTP/2), not HEAD.
+pub(crate) fn trailers_allowed(ctx: &phase::RequestCtx<'_>, meta: &phase::ProcessMeta) -> bool {
+    ctx.http_11
+        && !matches!(ctx.method, crate::http::Method::Head)
+        && meta.proxy_chunked_transfer_encoding
 }
 
 /// A 502/504 the proxy produced itself (every attempt failed) goes through
@@ -1637,7 +1682,7 @@ pub(crate) fn inject_add_trailers(
     trailers: &[PreparedAddHeader],
     ctx: &RenderCtx<'_>,
 ) -> Vec<u8> {
-    if trailers.is_empty() || !chunked_status_eligible(ctx.status) {
+    if !expects_trailers(trailers, ctx.status) {
         return response;
     }
     // Build the `sent_headers` view from the actual response so
@@ -1649,39 +1694,7 @@ pub(crate) fn inject_add_trailers(
         Some(p) => &response[..p + 2],
         None => &response[..],
     };
-
-    // Render each trailer's value, building the trailer block incrementally
-    // so subsequent `$sent_trailer_*` lookups can see prior entries. Skip
-    // entries with empty rendered values (matches `add_header`).
-    let mut trailer_block: Vec<u8> = Vec::with_capacity(trailers.len() * 64);
-    // nginx's `r->expect_trailers`: a trailer the status allows makes the
-    // response chunked, even when its value renders empty and it isn't
-    // sent (ngx_http_headers_filter).
-    let mut expect_trailers = false;
-    for t in trailers {
-        if !t.always && !add_header_status_eligible(ctx.status) {
-            continue;
-        }
-        expect_trailers = true;
-        let mut rendered = Vec::with_capacity(64);
-        {
-            let mut local_ctx = *ctx;
-            local_ctx.sent_headers = sent_view;
-            local_ctx.sent_trailers = trailer_block.as_slice();
-            render_parts(t.value, &local_ctx, &mut rendered);
-        }
-        http::make_header_value_safe(&mut rendered);
-        if rendered.is_empty() {
-            continue;
-        }
-        trailer_block.extend_from_slice(t.name);
-        trailer_block.extend_from_slice(b": ");
-        trailer_block.extend_from_slice(&rendered);
-        trailer_block.extend_from_slice(b"\r\n");
-    }
-    if !expect_trailers {
-        return response;
-    }
+    let trailer_block = render_trailers(trailers, ctx, sent_view);
 
     // Split status line + headers vs body. Without a well-formed split we
     // can't safely chunked-rewrite, so leave the response untouched.
@@ -1716,6 +1729,59 @@ pub(crate) fn inject_add_trailers(
     out.extend_from_slice(&trailer_block);
     out.extend_from_slice(b"\r\n");
     out
+}
+
+/// nginx's `r->expect_trailers`: a trailer the status allows makes the
+/// response chunked, even when its value renders empty and it isn't sent
+/// (ngx_http_headers_filter).
+pub(crate) fn expects_trailers(trailers: &[PreparedAddHeader], status: u16) -> bool {
+    chunked_status_eligible(status)
+        && trailers
+            .iter()
+            .any(|t| t.always || add_header_status_eligible(status))
+}
+
+/// The trailer lines (each ending in CRLF), for a response whose header
+/// block as sent is `sent_view`. Each value is rendered with the block so
+/// far as `$sent_trailer_*`; an empty one is skipped, as for
+/// `add_header`.
+pub(crate) fn render_trailers(
+    trailers: &[PreparedAddHeader],
+    ctx: &RenderCtx<'_>,
+    sent_view: &[u8],
+) -> Vec<u8> {
+    let mut trailer_block: Vec<u8> = Vec::with_capacity(trailers.len() * 64);
+    render_trailers_into(trailers, ctx, sent_view, &mut trailer_block);
+    trailer_block
+}
+
+/// `render_trailers` after the trailer lines already in `trailer_block`.
+fn render_trailers_into(
+    trailers: &[PreparedAddHeader],
+    ctx: &RenderCtx<'_>,
+    sent_view: &[u8],
+    trailer_block: &mut Vec<u8>,
+) {
+    for t in trailers {
+        if !t.always && !add_header_status_eligible(ctx.status) {
+            continue;
+        }
+        let mut rendered = Vec::with_capacity(64);
+        {
+            let mut local_ctx = *ctx;
+            local_ctx.sent_headers = sent_view;
+            local_ctx.sent_trailers = trailer_block.as_slice();
+            render_parts(t.value, &local_ctx, &mut rendered);
+        }
+        http::make_header_value_safe(&mut rendered);
+        if rendered.is_empty() {
+            continue;
+        }
+        trailer_block.extend_from_slice(t.name);
+        trailer_block.extend_from_slice(b": ");
+        trailer_block.extend_from_slice(&rendered);
+        trailer_block.extend_from_slice(b"\r\n");
+    }
 }
 
 /// Wrap a body buffer as a single chunked-transfer chunk (`<hex-len>\r\n
@@ -1926,6 +1992,7 @@ pub(crate) fn maybe_intercept_error_page_as(
             preserved_location,
             preserved_www_authenticate,
             closes: http::closes_connection(status),
+            named_from: None,
         });
     }
     if target[0] == b'@' {
@@ -1944,6 +2011,7 @@ pub(crate) fn maybe_intercept_error_page_as(
             preserved_location,
             preserved_www_authenticate,
             closes: http::closes_connection(status),
+            named_from: None,
         });
     }
     let redirect = http::build_redirect_response(

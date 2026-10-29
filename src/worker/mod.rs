@@ -58,6 +58,7 @@ pub(crate) mod limit_req;
 pub(crate) mod listeners;
 mod log;
 pub(crate) mod logbuf;
+pub(crate) mod metrics;
 pub(crate) mod open_log_cache;
 pub(crate) mod panics;
 mod prepare;
@@ -1251,6 +1252,7 @@ mod tests {
             body: &crate::phase::NO_BODY,
             body_len: 0,
             body_file: None,
+            body_feed: None,
             tls: None,
             conn: &phase::ConnInfo::NONE,
             refuse: None,
@@ -1587,6 +1589,15 @@ mod tests {
         let err = prepare(parse_cfg(&format!(
             "http {{ server {{ listen 127.0.0.1:{port} backlog=100; }} \
              server {{ listen 127.0.0.1:{port} rcvbuf=8k; }} }}"
+        )))
+        .err()
+        .expect("duplicate options");
+        assert!(err.contains("duplicate listen options"), "{err}");
+
+        // `reuseport` is one of them, as in nginx (#761).
+        let err = prepare(parse_cfg(&format!(
+            "http {{ server {{ listen 127.0.0.1:{port} reuseport; }} \
+             server {{ listen 127.0.0.1:{port} reuseport; }} }}"
         )))
         .err()
         .expect("duplicate options");

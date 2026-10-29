@@ -16,15 +16,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod aio;
 mod arena;
 mod auth;
 mod autoindex;
 mod client_verify;
 mod config;
+mod duplex;
 mod file;
 mod fs_resolve;
 mod http;
 mod http_date;
+mod ktls;
 mod ocsp;
 mod phase;
 mod privileges;
@@ -32,6 +35,7 @@ mod proxy;
 mod proxy_cache;
 mod proxy_protocol;
 mod proxy_stream;
+mod request_feed;
 mod resolver;
 mod sd_notify;
 mod syslog;
@@ -42,7 +46,10 @@ mod tls_session;
 mod tls_stream;
 mod tls_ticket;
 mod upstream;
+mod upstream_h2;
 mod upstream_io;
+mod upstream_resolve;
+mod upstream_sticky;
 mod upstream_tls;
 mod uri;
 mod worker;
@@ -444,6 +451,20 @@ fn real_main() -> Result<(), Failure> {
         && let Err(e) = privileges::switch(creds)
     {
         startup_error = Some(e);
+    }
+    // A reload reads these as the user; nginx's master reads them as root.
+    let unreadable = privileges::unreadable_startup_files();
+    if startup_error.is_none()
+        && let Some(creds) = switch_to.as_ref().filter(|c| c.uid != 0)
+    {
+        let user = creds.name.to_string_lossy();
+        for path in unreadable {
+            eprintln!(
+                "ruxen: [warn] user \"{user}\" can't read \"{}\": a reload will fail \
+                 to read it (docs/migrating.md)",
+                path.display()
+            );
+        }
     }
     if let Some(e) = startup_error {
         eprintln!("ruxen: [emerg] {e}");
@@ -1079,7 +1100,11 @@ impl Master {
         for w in &warnings {
             log(old_http, config::ErrorLogLevel::Warn, w);
         }
-        let worker_listeners = match self.listeners.open(http, settings.workers) {
+        // After the switch to `user`, ports below 1024 bind with the one
+        // capability kept for it (#344).
+        let worker_listeners = match privileges::with_bind_capability(|| {
+            self.listeners.open(http, settings.workers)
+        }) {
             Ok(l) => l,
             Err(e) => {
                 http.close_root_fds();
@@ -1354,6 +1379,7 @@ fn read_main_config(cli: &Cli) -> io::Result<(PathBuf, String)> {
         .canonicalize()
         .map_err(|e| failed(&cli.config_path, e))?;
     let src = std::fs::read_to_string(&abs).map_err(|e| failed(&abs, e))?;
+    privileges::note_read(&abs);
     Ok((abs, src))
 }
 
@@ -1404,11 +1430,14 @@ const VERSION_BODY: &str = concat!(
     "\n",
     "TLS SNI support enabled\n",
     "configure arguments:",
+    // `aio threads` (#526).
+    " --with-threads",
     " --with-http_ssl_module",
     " --with-http_realip_module",
     " --with-http_stub_status_module",
     " --with-http_auth_request_module",
     " --with-http_v2_module",
+    " --with-http_gzip_static_module",
     " --without-pcre",
     " --without-http_charset_module",
     " --without-http_ssi_module",
@@ -1424,7 +1453,6 @@ const VERSION_BODY: &str = concat!(
     " --without-http_empty_gif_module",
     " --without-http_browser_module",
     " --without-http_upstream_random_module",
-    " --without-http_upstream_sticky_module",
     " --without-mail_pop3_module",
     " --without-mail_imap_module",
     " --without-mail_smtp_module",
@@ -1692,11 +1720,13 @@ mod tests {
                 "\n",
                 "TLS SNI support enabled\n",
                 "configure arguments:",
+                " --with-threads",
                 " --with-http_ssl_module",
                 " --with-http_realip_module",
                 " --with-http_stub_status_module",
                 " --with-http_auth_request_module",
                 " --with-http_v2_module",
+                " --with-http_gzip_static_module",
                 " --without-pcre",
                 " --without-http_charset_module",
                 " --without-http_ssi_module",
@@ -1712,7 +1742,6 @@ mod tests {
                 " --without-http_empty_gif_module",
                 " --without-http_browser_module",
                 " --without-http_upstream_random_module",
-                " --without-http_upstream_sticky_module",
                 " --without-mail_pop3_module",
                 " --without-mail_imap_module",
                 " --without-mail_smtp_module",

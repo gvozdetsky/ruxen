@@ -7,15 +7,18 @@
 #![cfg(feature = "fuzzing")]
 #![allow(dead_code, unused_imports, unused_variables, unused_macros, unused_mut)]
 
+mod aio;
 mod arena;
 mod auth;
 mod autoindex;
 mod client_verify;
 mod config;
+mod duplex;
 mod file;
 mod fs_resolve;
 mod http;
 mod http_date;
+mod ktls;
 mod ocsp;
 mod phase;
 mod privileges;
@@ -23,6 +26,7 @@ mod proxy;
 mod proxy_cache;
 mod proxy_protocol;
 mod proxy_stream;
+mod request_feed;
 mod resolver;
 mod syslog;
 mod tls;
@@ -32,7 +36,10 @@ mod tls_session;
 mod tls_stream;
 mod tls_ticket;
 mod upstream;
+mod upstream_h2;
 mod upstream_io;
+mod upstream_resolve;
+mod upstream_sticky;
 mod upstream_tls;
 mod uri;
 mod worker;
@@ -57,7 +64,19 @@ pub mod fuzzing {
     pub fn parse_request(data: &[u8]) -> Option<Result<usize, ()>> {
         let mut st = crate::http::ParseState::default();
         match crate::http::parse_request(data, &mut st) {
-            crate::http::Parse::Complete(req) => Some(Ok(req.consumed)),
+            crate::http::Parse::Complete(req) => {
+                // `$request_uri`: the path, and a `#fragment` from the line.
+                if !req.implicit_path {
+                    let path = &data[req.path_start..req.path_end];
+                    let line = &data[req.method_start..req.headers_start];
+                    let line = line.strip_suffix(b"\n").unwrap_or(line);
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    let uri = crate::phase::unparsed_uri(path, line);
+                    assert!(uri.starts_with(path) && !uri.contains(&b' '));
+                    assert!(uri.len() == path.len() || uri[path.len()] == b'#');
+                }
+                Some(Ok(req.consumed))
+            }
             crate::http::Parse::Incomplete => None,
             _ => {
                 // The log line for a refused request is found again from

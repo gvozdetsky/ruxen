@@ -7,9 +7,8 @@
 //! closes the listening sockets, so new connections are refused, stops the
 //! other workers gracefully for at most 5 s (or `worker_shutdown_timeout`
 //! if shorter), removes the pid file and exits with status 1, for systemd's
-//! `Restart=` to take over (#495). Respawning the worker in place, as nginx's master does,
-//! would mean binding its listeners again after the switch to `user`,
-//! which can't bind ports below 1024.
+//! `Restart=` to take over (#495), rather than respawning the worker in
+//! place as nginx's master does.
 
 use std::future::Future;
 use std::net::SocketAddr;

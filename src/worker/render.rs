@@ -162,12 +162,15 @@ impl RenderCtx<'_> {
                 {
                     return;
                 }
-                let path = crate::fs_resolve::request_filename(doc_root, self.uri);
+                let root = doc_root.path_for(self);
+                let path = crate::fs_resolve::request_filename(doc_root, &root, self.uri);
                 out.extend_from_slice(path.as_os_str().as_bytes());
             }
-            Variable::DocumentRoot => out.extend_from_slice(doc_root.path.as_os_str().as_bytes()),
+            Variable::DocumentRoot => {
+                out.extend_from_slice(doc_root.path_for(self).as_os_str().as_bytes())
+            }
             _ => {
-                if let Ok(real) = doc_root.path.canonicalize() {
+                if let Ok(real) = doc_root.path_for(self).canonicalize() {
                     out.extend_from_slice(real.as_os_str().as_bytes());
                 }
             }
@@ -191,7 +194,9 @@ impl RenderCtx<'_> {
     pub(crate) fn write_var(&self, var: &Variable, out: &mut Vec<u8>) {
         match var {
             Variable::Uri => out.extend_from_slice(self.uri),
-            Variable::RequestUri => out.extend_from_slice(self.request_uri),
+            Variable::RequestUri => {
+                out.extend_from_slice(phase::request_uri(self.request_uri, self.request_line))
+            }
             Variable::RequestMethod => out.extend_from_slice(self.request_method),
             Variable::Request => out.extend_from_slice(self.request_line),
             Variable::ProxyProtocolAddr
@@ -349,6 +354,14 @@ impl RenderCtx<'_> {
                         out.extend_from_slice(b"FAILED:");
                         out.extend_from_slice(text.as_bytes());
                     }
+                    Some(ClientVerify::Revoked(text)) => {
+                        out.extend_from_slice(b"FAILED:");
+                        out.extend_from_slice(text.as_bytes());
+                    }
+                    Some(ClientVerify::OcspPending(_)) => {
+                        out.extend_from_slice(b"FAILED:");
+                        out.extend_from_slice(crate::ocsp::REQUEST_FAILED.as_bytes());
+                    }
                 }
             }
             // The client certificate, printed as nginx prints it (#114).
@@ -494,10 +507,8 @@ impl RenderCtx<'_> {
             Variable::TimeLocal => write_time_local(out, self.epoch_secs),
             Variable::Msec => write_msec(out, self.epoch_secs, self.epoch_ms),
             Variable::Capture(n) => {
-                if let Some(state) = self.rewrite_state
-                    && let Some(value) = state.numbered_capture(*n)
-                {
-                    out.extend_from_slice(value);
+                if let Some(state) = self.rewrite_state {
+                    state.write_numbered_capture(*n, out);
                 }
             }
             Variable::ProxyHost => out.extend_from_slice(self.proxy_host),
@@ -527,6 +538,11 @@ impl RenderCtx<'_> {
                     && let Some(value) = state.user_var(name)
                 {
                     out.extend_from_slice(value);
+                    return;
+                }
+                if let Some(state) = self.rewrite_state
+                    && state.write_map_named_capture(name, out)
+                {
                     return;
                 }
                 if let Some(split_clients) = self.split_clients
@@ -613,6 +629,26 @@ pub(crate) fn lookup_request_header<'a>(mut block: &'a [u8], name: &[u8]) -> Opt
         return Some(v);
     }
     None
+}
+
+/// Every value of `name` in the raw header block, trimmed, in order.
+pub(crate) fn request_header_values<'a>(
+    block: &'a [u8],
+    name: &'a [u8],
+) -> impl DoubleEndedIterator<Item = &'a [u8]> {
+    block.split(|&b| b == b'\n').filter_map(move |line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let colon = line.iter().position(|&b| b == b':')?;
+        header_name_eq_ci(&line[..colon], name)
+            .then(|| line[colon + 1..].trim_ascii_start())
+            .map(|v| {
+                let end = v
+                    .iter()
+                    .rposition(|&c| c != b' ' && c != b'\t')
+                    .map_or(0, |i| i + 1);
+                &v[..end]
+            })
+    })
 }
 
 /// Walk every occurrence of `name` in the raw header block and write each
@@ -973,24 +1009,50 @@ fn render_map(program: &PreparedMap, ctx: &RenderCtx<'_>, out: &mut Vec<u8>) {
         return;
     }
     // One pass over the regex keys (#248), else each in turn.
-    match &program.regex_set {
-        Some(set) => {
-            if let Some(i) = set.matches(&key).iter().next() {
-                render_parts(program.regex[i].value, ctx, out);
-                return;
+    let matched = match &program.regex_set {
+        Some(set) => set.matches(&key).iter().next().map(|i| &program.regex[i]),
+        None => program.regex.iter().find(|e| e.regex.is_match(&key)),
+    };
+    if let Some(entry) = matched {
+        if entry.groups {
+            render_map_captures(entry, &key, ctx, out);
+        } else {
+            // nginx's match leaves no `$1`…`$9` (r->ncaptures = 2).
+            if let Some(state) = ctx.rewrite_state {
+                state.clear_map_numbered();
             }
+            render_parts(entry.value, ctx, out);
         }
-        None => {
-            for entry in program.regex {
-                if entry.regex.is_match(&key) {
-                    render_parts(entry.value, ctx, out);
-                    return;
-                }
-            }
-        }
+        return;
     }
     if let Some(default) = program.default {
         render_parts(default, ctx, out);
+    }
+}
+
+/// A map regex entry with groups: they become the request's captures
+/// (#832), and its value is rendered with them (#800).
+#[cold]
+#[inline(never)]
+fn render_map_captures(
+    entry: &PreparedMapRegex,
+    key: &[u8],
+    ctx: &RenderCtx<'_>,
+    out: &mut Vec<u8>,
+) {
+    let caps = entry.regex.captures(key);
+    if let (Some(state), Some(caps)) = (ctx.rewrite_state, &caps) {
+        state.set_map_captures(&entry.regex, caps);
+    }
+    for (i, part) in entry.value.iter().enumerate() {
+        match entry.captures.iter().find(|(p, _)| *p == i) {
+            Some(&(_, group)) => {
+                if let Some(m) = caps.as_ref().and_then(|c| c.get(group)) {
+                    out.extend_from_slice(m.as_bytes());
+                }
+            }
+            None => render_parts(std::slice::from_ref(part), ctx, out),
+        }
     }
 }
 

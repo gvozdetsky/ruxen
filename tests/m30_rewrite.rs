@@ -551,3 +551,34 @@ http { absolute_redirect off; server { listen 127.0.0.1:%%PORT%%;
     let r = http_get(port, "/e/");
     assert_eq!(status_line(&r), "HTTP/1.1 500 Internal Server Error");
 }
+
+/// #798: a redirect is decided on the replacement as written. One starting
+/// with a capture stays internal even when it renders as a URL (no open
+/// redirect); one starting with a scheme redirects despite `last`/`break`.
+#[test]
+fn redirect_is_decided_by_the_replacement_as_written() {
+    let (_guard, port) = spawn_server(
+        r#"
+events {}
+http { merge_slashes off; server { listen 127.0.0.1:%%PORT%%;
+    location /v/ { rewrite ^/v/(.*)$ $1; }
+    location /r  { rewrite ^ http://x last; }
+    location /b  { rewrite ^ https://x/b?c=1 break; }
+    location /s  { rewrite ^/s(.*)$ $scheme://y$1; }
+    location / { return 200 "ok"; }
+} }
+"#,
+    );
+    let r = http_get(port, "/v/http://evil.example/");
+    assert_eq!(status_line(&r), "HTTP/1.1 404 Not Found");
+    assert_eq!(header_value(&r, "Location"), None);
+    for (path, want) in [
+        ("/r?a=1", "http://x?a=1"),
+        ("/b", "https://x/b?c=1"),
+        ("/sx?q=2", "http://yx?q=2"),
+    ] {
+        let r = http_get(port, path);
+        assert_eq!(status_line(&r), "HTTP/1.1 302 Moved Temporarily", "{path}");
+        assert_eq!(header_value(&r, "Location"), Some(want), "{path}");
+    }
+}

@@ -222,7 +222,8 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
             });
         }
         let (lhs, rhs) = (&line_args[0], &line_args[1]);
-        let value = parse_value_without_captures(rhs)?;
+        // `$1`…`$9`: a regex entry's own captures, else the request's.
+        let value = parse_value_with_vars(rhs)?;
 
         if lhs == "default" {
             if default.is_some() {
@@ -305,10 +306,10 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
 /// happens again in `prepare_maps`, but we do it here so malformed
 /// patterns surface during `-t` rather than at worker startup.
 pub(crate) fn compile_map_regex(pattern: &str, case_insensitive: bool) -> Result<(), Error> {
-    let mut builder = regex::bytes::RegexBuilder::new(pattern);
-    builder.case_insensitive(case_insensitive);
-    builder.build().map(|_| ()).map_err(|_| Error::BadValue {
-        what: "map regex",
-        got: pattern.to_string(),
-    })
+    crate::config::pcre::regex(pattern, case_insensitive)
+        .map(|_| ())
+        .map_err(|_| Error::BadValue {
+            what: "map regex",
+            got: pattern.to_string(),
+        })
 }

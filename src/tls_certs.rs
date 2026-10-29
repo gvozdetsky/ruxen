@@ -105,6 +105,16 @@ pub(crate) fn parse_certified_key(
     key_path: &Path,
     passwords: &[Vec<u8>],
 ) -> Result<CertifiedKey, LoadCertError> {
+    let certs = parse_cert_chain(cert_pem, cert_path)?;
+    let key = parse_private_key(key_pem, key_path, passwords)?;
+    certified_key(certs, key)
+}
+
+/// The certificates of a PEM file, leaf first.
+pub(crate) fn parse_cert_chain(
+    cert_pem: &[u8],
+    cert_path: &Path,
+) -> Result<Vec<CertificateDer<'static>>, LoadCertError> {
     let cert_pem = with_trusted_certificates_relabeled(cert_pem);
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .map(|cert| cert.map(only_the_certificate))
@@ -116,7 +126,15 @@ pub(crate) fn parse_certified_key(
     if certs.is_empty() {
         return Err(LoadCertError::NoCerts(cert_path.to_path_buf()));
     }
+    Ok(certs)
+}
 
+/// The first private key of a PEM file, PKCS#1, PKCS#8 or SEC1.
+pub(crate) fn parse_private_key(
+    key_pem: &[u8],
+    key_path: &Path,
+    passwords: &[Vec<u8>],
+) -> Result<PrivateKeyDer<'static>, LoadCertError> {
     // The PEM reader skips encrypted blocks: those go through OpenSSL's
     // PEM_read_bio_PrivateKey with each password in turn, as nginx reads
     // them (ngx_ssl_load_certificate_key).
@@ -127,31 +145,27 @@ pub(crate) fn parse_certified_key(
                 reason: e,
             }
         })?;
-        let key = PrivateKeyDer::Pkcs8(der.into());
-        let signing_key = active_provider()
-            .key_provider
-            .load_private_key(key)
-            .map_err(LoadCertError::Rustls)?;
-        let certified = CertifiedKey::new(certs, signing_key);
-        keys_match(&certified).map_err(LoadCertError::Rustls)?;
-        return Ok(certified);
+        return Ok(PrivateKeyDer::Pkcs8(der.into()));
     }
-    // The first private key, PKCS#1, PKCS#8 or SEC1.
-    let key: PrivateKeyDer<'static> = match PrivateKeyDer::from_pem_slice(key_pem) {
-        Ok(key) => key,
+    match PrivateKeyDer::from_pem_slice(key_pem) {
+        Ok(key) => Ok(key),
         Err(rustls::pki_types::pem::Error::NoItemsFound) => {
-            return Err(LoadCertError::NoKey(key_path.to_path_buf()));
+            Err(LoadCertError::NoKey(key_path.to_path_buf()))
         }
-        Err(err) => {
-            return Err(LoadCertError::Pem {
-                path: key_path.to_path_buf(),
-                err,
-            });
-        }
-    };
+        Err(err) => Err(LoadCertError::Pem {
+            path: key_path.to_path_buf(),
+            err,
+        }),
+    }
+}
 
-    let provider = active_provider();
-    let signing_key = provider
+/// `certs` with `key`, loaded by the active provider; a key that isn't
+/// the leaf's is `InconsistentKeys::KeyMismatch`.
+pub(crate) fn certified_key(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<CertifiedKey, LoadCertError> {
+    let signing_key = active_provider()
         .key_provider
         .load_private_key(key)
         .map_err(LoadCertError::Rustls)?;
@@ -307,7 +321,7 @@ pub struct ServerNameResolver {
     /// Lowercased head (without trailing `.*`) of `www.example.*` names.
     wildcard_trailing: Vec<(String, Vec<ServerKey>)>,
     /// `~regex` names, in declaration order.
-    regex: Vec<(regex::Regex, Vec<ServerKey>)>,
+    regex: Vec<(regex::bytes::Regex, Vec<ServerKey>)>,
     default: Vec<ServerKey>,
 }
 
@@ -403,7 +417,7 @@ impl ServerNameResolver {
 
     /// Register `key` under a `~regex` server name. A regex registered
     /// again (same server, RSA + ECDSA) adds to its slot.
-    pub fn add_regex(&mut self, regex: &regex::Regex, key: impl Into<ServerKey>) {
+    pub fn add_regex(&mut self, regex: &regex::bytes::Regex, key: impl Into<ServerKey>) {
         let key = key.into();
         if let Some((_, slot)) = self
             .regex
@@ -482,7 +496,7 @@ impl ServerNameResolver {
             return Self::select(slot, schemes);
         }
         for (regex, slot) in &self.regex {
-            if regex.is_match(&normalized) {
+            if regex.is_match(normalized.as_bytes()) {
                 return Self::select(slot, schemes);
             }
         }
@@ -649,6 +663,7 @@ pub fn password_file(path: &Path) -> Result<Arc<[Vec<u8>]>, String> {
             crate::worker::errno_text(&e)
         )
     })?;
+    crate::privileges::note_read(path);
     let passwords: Arc<[Vec<u8>]> = text
         .split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
@@ -695,6 +710,7 @@ pub fn pem_file(path: &Path) -> std::io::Result<Arc<[u8]>> {
         Some(bytes) => bytes,
         None => std::fs::read(path)?.into(),
     };
+    crate::privileges::note_read(path);
     files.push((path.to_path_buf(), id, bytes.clone()));
     Ok(bytes)
 }
