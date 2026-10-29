@@ -24,6 +24,8 @@ pub struct ClientAuth {
     /// list of the CertificateRequest (SSL_CTX_set_client_CA_list). Empty
     /// with only `ssl_trusted_certificate` (nginx ≥ 1.27.2, #587).
     pub hints: Vec<DistinguishedName>,
+    /// `ssl_ocsp on|leaf` (#142).
+    pub ocsp: Option<Arc<crate::ocsp::ClientOcsp>>,
 }
 
 impl ClientAuth {
@@ -36,14 +38,24 @@ impl ClientAuth {
     }
 
     /// The handshake's result for `$ssl_client_verify` and the request
-    /// checks: the chain the client sent, if any, against the store.
+    /// checks: the chain the client sent, if any, against the store. With
+    /// `ssl_ocsp`, a chain that verifies is `OcspPending` until its
+    /// status is read.
     pub fn check(&self, chain: Option<&[CertificateDer<'_>]>) -> ClientVerify {
         let Some(chain) = chain.filter(|c| !c.is_empty()) else {
             return ClientVerify::None;
         };
         let ders: Vec<&[u8]> = chain.iter().map(|c| c.as_ref()).collect();
-        match self.store.verify_client(&ders) {
-            Ok(()) => ClientVerify::Success,
+        let mut verified = Vec::new();
+        let out = self.ocsp.is_some().then_some(&mut verified);
+        match self.store.verify_client(&ders, out) {
+            Ok(()) => match &self.ocsp {
+                Some(ocsp) => ClientVerify::OcspPending(Arc::new(OcspPending {
+                    ocsp: ocsp.clone(),
+                    chain: verified,
+                })),
+                None => ClientVerify::Success,
+            },
             Err(crate::x509_verify::Failure::Verify(code, text)) => {
                 ClientVerify::Failed(code, text.into())
             }
@@ -63,7 +75,50 @@ pub enum ClientVerify {
     Success,
     /// SSL_get_verify_result's code and X509_verify_cert_error_string.
     Failed(i64, Box<str>),
+    /// The chain verified, its OCSP status not read yet: resolved before
+    /// the first request, and refused like a failure if it ever isn't.
+    OcspPending(Arc<OcspPending>),
+    /// The chain verified, and OCSP says no: ngx_ssl_ocsp_get_status's
+    /// words.
+    Revoked(&'static str),
 }
+
+impl ClientVerify {
+    /// The OCSP check of a pending chain, then its outcome in `self`.
+    pub async fn resolve_ocsp(&mut self, log: &crate::ocsp::ConnLog) {
+        let ClientVerify::OcspPending(pending) = &*self else {
+            return;
+        };
+        let pending = pending.clone();
+        *self = match pending.ocsp.validate(&pending.chain, log).await {
+            Ok(()) => ClientVerify::Success,
+            Err(text) => ClientVerify::Revoked(text),
+        };
+    }
+}
+
+/// A verified chain waiting for its OCSP check.
+pub struct OcspPending {
+    ocsp: Arc<crate::ocsp::ClientOcsp>,
+    /// Leaf to trust anchor, DER.
+    chain: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for OcspPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OcspPending")
+            .field("certificates", &self.chain.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for OcspPending {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for OcspPending {}
 
 /// Asks for a certificate, takes whatever chain comes (it is checked after
 /// the handshake), and checks the handshake signature for real: that is

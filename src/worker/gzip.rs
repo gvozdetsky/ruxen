@@ -27,6 +27,9 @@ pub(crate) struct GzipRequest<'a> {
     pub user_agent: Option<&'a [u8]>,
     pub via: bool,
     pub authorization: bool,
+    /// `aio threads`: a file is streamed, its reads on the pool, never
+    /// read whole here on the worker.
+    pub aio: bool,
 }
 
 impl<'a> GzipRequest<'a> {
@@ -39,6 +42,7 @@ impl<'a> GzipRequest<'a> {
             user_agent: h(headers_raw, b"user-agent"),
             via: h(headers_raw, b"via").is_some(),
             authorization: h(headers_raw, b"authorization").is_some(),
+            aio: false,
         }
     }
 }
@@ -409,6 +413,11 @@ pub(crate) fn filter(
             Some(out) => (Response::Owned(out), None),
             None => (Response::Owned(bytes), None),
         },
+        // Multipart parts (a 206, or a status `error_page` set): never
+        // compressed, as nginx's range filter runs after gzip.
+        Response::File { headers, body } if body.parts.is_some() => {
+            (Response::File { headers, body }, None)
+        }
         Response::File { headers, body } => {
             let Some(head) = parse_head(&headers) else {
                 return (Response::File { headers, body }, None);
@@ -419,7 +428,7 @@ pub(crate) fn filter(
                     let out = rewrite_head(&headers, gz.vary, None);
                     (Response::File { headers: out, body }, None)
                 }
-                Decision::Compress if body.len <= WHOLE_FILE_MAX => {
+                Decision::Compress if body.len <= WHOLE_FILE_MAX && !req.aio => {
                     match compress_file(gz, req.http_11, &headers, body) {
                         Ok(out) => (Response::Owned(out), None),
                         // A read error: the plain path reports it.
@@ -511,6 +520,7 @@ fn compress_file(
             fd: file.into(),
             offset: body.offset,
             len: body.len,
+            parts: None,
         })
     };
     BUFFER_POOL.with(|p| {
@@ -869,6 +879,7 @@ mod tests {
             user_agent: None,
             via: false,
             authorization: false,
+            aio: false,
         }
     }
 
