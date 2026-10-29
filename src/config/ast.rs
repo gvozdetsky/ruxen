@@ -1143,8 +1143,7 @@ fn parse_ocsp_cache(value: &str) -> Result<Option<OcspCacheZone>, super::error::
     if value == "off" {
         return Ok(None);
     }
-    // Error::Message is static; a configuration error is made once.
-    let message = |text: String| Error::Message(Box::leak(text.into_boxed_str()));
+    let message = Error::Text;
     let invalid = || message(format!("invalid OCSP cache \"{value}\""));
     let rest = value.strip_prefix("shared:").ok_or_else(invalid)?;
     let (name, size) = rest.split_once(':').ok_or_else(invalid)?;
