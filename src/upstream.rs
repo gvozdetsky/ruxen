@@ -1882,6 +1882,7 @@ mod tests {
                     drain,
                     route: Some(route.into()),
                     resolve: None,
+                    service: None,
                 },
             )
             .collect();

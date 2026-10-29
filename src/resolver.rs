@@ -45,6 +45,7 @@ const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
 const TYPE_AAAA: u16 = 28;
 const TYPE_DNAME: u16 = 39;
+const TYPE_SRV: u16 = 33;
 
 /// rcodes, and NGX_RESOLVE_TIMEDOUT (NGX_ETIMEDOUT).
 pub(crate) const FORMERR: u16 = 1;
@@ -120,13 +121,148 @@ pub(crate) fn normalize(name: &[u8]) -> Box<[u8]> {
 
 async fn lookup(
     resolver: &'static Resolver,
-    mut name: Box<[u8]>,
+    name: Box<[u8]>,
 ) -> Result<(Vec<IpAddr>, Instant), Failure> {
+    match lookup_answer(resolver, name, false).await? {
+        (Answer::Addrs(addrs), valid, true) => Ok((rotate(&addrs), valid)),
+        (Answer::Addrs(addrs), valid, false) => Ok((addrs.to_vec(), valid)),
+        _ => Err(Failure(NXDOMAIN)),
+    }
+}
+
+/// The SRV records of a service (#597), as ngx_resolve_name with
+/// `ctx->service` and ngx_resolver_report_srv hand them to the upstream:
+/// each target's addresses with the record's port, by priority. The
+/// targets are asked at once, each within `timeout`; the whole fails only
+/// when none gave an address.
+pub(crate) async fn resolve_service(
+    resolver: &'static Resolver,
+    name: &[u8],
+    service: &[u8],
+    timeout: Duration,
+) -> Result<Service, (Failure, Vec<(Box<[u8]>, Failure)>)> {
+    let srv_name = normalize(&service_name(name, service));
+    let (srvs, mut valid) =
+        match monoio::time::timeout(timeout, lookup_answer(resolver, srv_name, true)).await {
+            Ok(Ok((Answer::Srvs(srvs), valid, _))) => (srvs, valid),
+            Ok(Ok(_)) => return Err((Failure(NXDOMAIN), Vec::new())),
+            Ok(Err(failure)) => return Err((failure, Vec::new())),
+            Err(_) => return Err((Failure(TIMEDOUT), Vec::new())),
+        };
+    let mut lookups: Vec<_> = srvs
+        .iter()
+        .map(|srv| {
+            Some(Box::pin(monoio::time::timeout(
+                timeout,
+                lookup(resolver, srv.name.clone()),
+            )))
+        })
+        .collect();
+    let mut results: Vec<_> = (0..srvs.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut waiting = false;
+        for (lookup, result) in lookups.iter_mut().zip(results.iter_mut()) {
+            if let Some(future) = lookup {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(done) => {
+                        *result = Some(done.unwrap_or(Err(Failure(TIMEDOUT))));
+                        *lookup = None;
+                    }
+                    Poll::Pending => waiting = true,
+                }
+            }
+        }
+        if waiting {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    let mut addrs = Vec::new();
+    let mut failed = Vec::new();
+    for (srv, result) in srvs.iter().zip(results) {
+        match result {
+            Some(Ok((found, until))) => {
+                valid = valid.min(until);
+                addrs.extend(found.into_iter().map(|ip| SrvAddr {
+                    addr: SocketAddr::new(ip, srv.port),
+                    name: srv.name.clone(),
+                    priority: srv.priority,
+                    weight: srv.weight,
+                }));
+            }
+            Some(Err(failure)) => failed.push((srv.name.clone(), failure)),
+            None => {}
+        }
+    }
+    if addrs.is_empty() {
+        // ngx_resolver_report_srv: the first target's state, or NXDOMAIN
+        // if any had it.
+        let nxdomain = failed.iter().any(|(_, f)| f.0 == NXDOMAIN);
+        let failure = match failed.first() {
+            Some((_, failure)) if !nxdomain => *failure,
+            _ => Failure(NXDOMAIN),
+        };
+        return Err((failure, failed));
+    }
+    Ok(Service {
+        addrs,
+        failed,
+        valid,
+    })
+}
+
+/// `_http._tcp.example.net` for `service=http`, `_x._udp.example.net`
+/// for `service=_x._udp` (a service with a dot is taken as it is).
+pub(crate) fn service_name(name: &[u8], service: &[u8]) -> Vec<u8> {
+    let name = name.strip_suffix(b".").unwrap_or(name);
+    let mut out = Vec::with_capacity(service.len() + name.len() + 7);
+    if service.contains(&b'.') {
+        out.extend_from_slice(service);
+    } else {
+        out.push(b'_');
+        out.extend_from_slice(service);
+        out.extend_from_slice(b"._tcp");
+    }
+    out.push(b'.');
+    out.extend_from_slice(name);
+    out
+}
+
+/// What a service resolved to.
+#[derive(Debug)]
+pub(crate) struct Service {
+    pub addrs: Vec<SrvAddr>,
+    /// The targets that didn't resolve, for the log.
+    pub failed: Vec<(Box<[u8]>, Failure)>,
+    pub valid: Instant,
+}
+
+/// One address of a service (ngx_resolver_addr_t with its SRV record).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SrvAddr {
+    pub addr: SocketAddr,
+    /// The record's target.
+    pub name: Box<[u8]>,
+    pub priority: u16,
+    pub weight: u16,
+}
+
+/// The final answer for `name` after CNAMEs, until when it holds, and
+/// whether it came from the cache. SRV records are cached apart from
+/// addresses, as nginx's `srv_rbtree`.
+async fn lookup_answer(
+    resolver: &'static Resolver,
+    mut name: Box<[u8]>,
+    srv: bool,
+) -> Result<(Answer, Instant, bool), Failure> {
     let state = worker_state(resolver);
     let mut recursion = 0;
     let mut valid = None::<Instant>;
     loop {
-        let found = state.borrow_mut().find(&name, Instant::now());
+        let key = cache_key(&name, srv);
+        let found = state.borrow_mut().find(&key, Instant::now());
         let ((answer, until), cached) = match found {
             Found::Cached(answer) => (answer, true),
             Found::Pending(pending) => match Wait::new(pending).await {
@@ -134,7 +270,7 @@ async fn lookup(
                 Outcome::Failed(failure) => return Err(failure),
             },
             Found::New(pending) => {
-                if let Some(query) = Queries::new(resolver, &name) {
+                if let Some(query) = Queries::new(resolver, &name, srv) {
                     let server = state.borrow_mut().next_server(resolver);
                     crate::worker::spawn_contained(
                         "a resolver query",
@@ -143,14 +279,14 @@ async fn lookup(
                             resolver,
                             state.clone(),
                             pending.clone(),
-                            name.clone(),
+                            key.clone(),
                             query,
                             server,
                         ),
                     );
                 } else {
                     // ngx_resolver_create_name_query declines it.
-                    state.borrow_mut().pending.remove(&name);
+                    state.borrow_mut().pending.remove(&key);
                     return Err(Failure(NXDOMAIN));
                 }
                 match Wait::new(pending).await {
@@ -161,8 +297,6 @@ async fn lookup(
         };
         let valid = *valid.insert(valid.map_or(until, |v| v.min(until)));
         match answer {
-            Answer::Addrs(addrs) if cached => return Ok((rotate(&addrs), valid)),
-            Answer::Addrs(addrs) => return Ok((addrs.to_vec(), valid)),
             Answer::Cname(target) => {
                 recursion += 1;
                 if recursion > MAX_RECURSION {
@@ -170,8 +304,21 @@ async fn lookup(
                 }
                 name = target;
             }
+            answer => return Ok((answer, valid, cached)),
         }
     }
+}
+
+/// Cache and query key: an SRV name is kept apart from the same name's
+/// addresses.
+fn cache_key(name: &[u8], srv: bool) -> Box<[u8]> {
+    if !srv {
+        return name.into();
+    }
+    let mut key = Vec::with_capacity(name.len() + 1);
+    key.push(0);
+    key.extend_from_slice(name);
+    key.into_boxed_slice()
 }
 
 /// ngx_resolver_export with `rotate`: the A and the AAAA lists each start
@@ -202,6 +349,18 @@ fn rotate(addrs: &[IpAddr]) -> Vec<IpAddr> {
 enum Answer {
     Addrs(Rc<[IpAddr]>),
     Cname(Box<[u8]>),
+    /// By priority.
+    Srvs(Rc<[Srv]>),
+}
+
+/// An SRV record (ngx_resolver_srv_t).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Srv {
+    pub priority: u16,
+    /// 0 counts as 1, as in nginx.
+    pub weight: u16,
+    pub port: u16,
+    pub name: Box<[u8]>,
 }
 
 #[derive(Clone)]
@@ -429,7 +588,7 @@ enum Step {
 enum Got {
     Waiting,
     Error,
-    Answer { addrs: Vec<IpAddr> },
+    Answer { addrs: Vec<IpAddr>, srvs: Vec<Srv> },
 }
 
 struct Query {
@@ -440,7 +599,8 @@ struct Query {
     got: Got,
 }
 
-/// The A and AAAA queries for one name (ngx_resolver_node_t).
+/// The A and AAAA queries for one name, or its SRV query
+/// (ngx_resolver_node_t).
 struct Queries {
     /// The question, `\3www\7example\3com\0`.
     qname: Vec<u8>,
@@ -456,10 +616,15 @@ struct Queries {
 impl Queries {
     /// `None` for a name that can't be asked: an empty label, or one
     /// longer than 63 bytes.
-    fn new(resolver: &Resolver, name: &[u8]) -> Option<Queries> {
+    fn new(resolver: &Resolver, name: &[u8], srv: bool) -> Option<Queries> {
         let qname = encode_name(name)?;
         let mut queries = Vec::with_capacity(2);
-        for (on, qtype) in [(resolver.ipv4, TYPE_A), (resolver.ipv6, TYPE_AAAA)] {
+        let types = if srv {
+            [(true, TYPE_SRV), (false, 0)]
+        } else {
+            [(resolver.ipv4, TYPE_A), (resolver.ipv6, TYPE_AAAA)]
+        };
+        for (on, qtype) in types {
             if on {
                 queries.push(Query {
                     qtype,
@@ -656,7 +821,10 @@ impl Queries {
             return self.decide(Ok(None));
         }
         if head.answers == 0 {
-            self.queries[i].got = Got::Answer { addrs: Vec::new() };
+            self.queries[i].got = Got::Answer {
+                addrs: Vec::new(),
+                srvs: Vec::new(),
+            };
             return self.decide(Err(()));
         }
         let answers = match parse_answers(packet, &head) {
@@ -672,6 +840,7 @@ impl Queries {
         self.ttl = self.ttl.min(answers.ttl);
         self.queries[i].got = Got::Answer {
             addrs: answers.addrs,
+            srvs: answers.srvs,
         };
         self.decide(Ok(answers.cname.map(|at| (packet, at))))
     }
@@ -690,10 +859,19 @@ impl Queries {
             .queries
             .iter()
             .flat_map(|q| match &q.got {
-                Got::Answer { addrs } => addrs.as_slice(),
+                Got::Answer { addrs, .. } => addrs.as_slice(),
                 _ => &[],
             })
             .copied()
+            .collect();
+        let mut srvs: Vec<Srv> = self
+            .queries
+            .iter()
+            .flat_map(|q| match &q.got {
+                Got::Answer { srvs, .. } => srvs.as_slice(),
+                _ => &[],
+            })
+            .cloned()
             .collect();
         let valid_until = Instant::now()
             + self
@@ -701,6 +879,11 @@ impl Queries {
                 .unwrap_or(Duration::from_secs(u64::from(self.ttl)));
         if !addrs.is_empty() {
             return Step::Done(Ok((Answer::Addrs(addrs.into()), valid_until)));
+        }
+        if !srvs.is_empty() {
+            // ngx_resolver_cmp_srvs.
+            srvs.sort_by_key(|s| s.priority);
+            return Step::Done(Ok((Answer::Srvs(srvs.into()), valid_until)));
         }
         match last {
             Ok(Some((packet, at))) => match copy_name(packet, at) {
@@ -712,7 +895,11 @@ impl Queries {
             },
             // nginx waits on after this line, until the request times out.
             Ok(None) => {
-                log("no A or CNAME types in DNS response");
+                log(if self.queries.iter().any(|q| q.qtype == TYPE_SRV) {
+                    "no SRV type in DNS response"
+                } else {
+                    "no A or CNAME types in DNS response"
+                });
                 Step::Done(Err(NXDOMAIN))
             }
             Err(()) => Step::Done(Err(NXDOMAIN)),
@@ -891,7 +1078,7 @@ pub(crate) fn parse_head(buf: &[u8], tcp: bool) -> Result<Head, String> {
     if qclass != 1 {
         return Err(format!("unknown query class {qclass} in DNS response"));
     }
-    if qtype != TYPE_A && qtype != TYPE_AAAA {
+    if qtype != TYPE_A && qtype != TYPE_AAAA && qtype != TYPE_SRV {
         return Err(format!("unknown query type {qtype} in DNS response"));
     }
     let qname = copy_name(buf, 12)?;
@@ -910,6 +1097,8 @@ pub(crate) fn parse_head(buf: &[u8], tcp: bool) -> Result<Head, String> {
 #[derive(Debug, Default)]
 pub(crate) struct Answers {
     pub addrs: Vec<IpAddr>,
+    /// The SRV records, for an SRV question.
+    pub srvs: Vec<Srv>,
     /// Where the last CNAME's target starts.
     pub cname: Option<usize>,
     /// The smallest TTL of all the records.
@@ -964,7 +1153,7 @@ pub(crate) fn parse_answers(buf: &[u8], head: &Head) -> Result<Answers, String> 
         out.ttl = out.ttl.min(if ttl > i32::MAX as u32 { 0 } else { ttl });
         i += 10;
         match rtype {
-            TYPE_A | TYPE_AAAA => {
+            TYPE_A | TYPE_AAAA if head.qtype != TYPE_SRV => {
                 let (size, name) = if rtype == TYPE_A {
                     (4, "A")
                 } else {
@@ -983,6 +1172,19 @@ pub(crate) fn parse_answers(buf: &[u8], head: &Head) -> Result<Answers, String> 
                     IpAddr::from(<[u8; 4]>::try_from(data).expect("4 bytes"))
                 } else {
                     IpAddr::from(<[u8; 16]>::try_from(data).expect("16 bytes"))
+                });
+            }
+            // ngx_resolver_process_srv.
+            TYPE_SRV if head.qtype == TYPE_SRV => {
+                if i + 6 >= n {
+                    return Err(SHORT.into());
+                }
+                let word = |at: usize| u16::from_be_bytes([buf[at], buf[at + 1]]);
+                out.srvs.push(Srv {
+                    priority: word(i),
+                    weight: word(i + 2).max(1),
+                    port: word(i + 4),
+                    name: copy_name(buf, i + 6)?,
                 });
             }
             TYPE_CNAME => out.cname = Some(i),
@@ -1104,7 +1306,7 @@ mod tests {
 
     /// Queries for `name` with ids 1 (A) and 2 (AAAA).
     fn queries(name: &str, ipv6: bool) -> Queries {
-        let mut q = Queries::new(&resolver(ipv6), name.as_bytes()).unwrap();
+        let mut q = Queries::new(&resolver(ipv6), name.as_bytes(), false).unwrap();
         for (i, query) in q.queries.iter_mut().enumerate() {
             query.id = i as u16 + 1;
         }
@@ -1115,6 +1317,7 @@ mod tests {
         match step {
             Step::Done(Ok((Answer::Addrs(a), _))) => a.to_vec(),
             Step::Done(Ok((Answer::Cname(c), _))) => panic!("cname {c:?}"),
+            Step::Done(Ok((Answer::Srvs(s), _))) => panic!("srvs {s:?}"),
             Step::Done(Err(code)) => panic!("error {code}"),
             Step::Wait => panic!("wait"),
             Step::Tcp(i) => panic!("tcp {i}"),
@@ -1166,6 +1369,68 @@ mod tests {
         let mut lying = ok.clone();
         lying[7] = 5;
         assert!(parse_head(&lying, false).is_err());
+    }
+
+    #[test]
+    fn services() {
+        assert_eq!(
+            service_name(b"example.net.", b"http"),
+            b"_http._tcp.example.net"
+        );
+        assert_eq!(
+            service_name(b"example.net", b"_x._udp"),
+            b"_x._udp.example.net"
+        );
+        let srv = |priority: u16, weight: u16, port: u16, target: &[u8]| {
+            let mut d = Vec::new();
+            for w in [priority, weight, port] {
+                d.extend_from_slice(&w.to_be_bytes());
+            }
+            d.extend_from_slice(target);
+            d
+        };
+        let packet = response(
+            1,
+            0,
+            0,
+            "_http._tcp.example.net",
+            TYPE_SRV,
+            &[
+                rr(TYPE_SRV, 60, &srv(20, 0, 8081, b"\x01b\xc0\x17")),
+                rr(TYPE_A, 60, &[10, 0, 0, 1]),
+                rr(TYPE_SRV, 30, &srv(10, 5, 8080, b"\x01a\x00")),
+            ],
+        );
+        let head = parse_head(&packet, false).unwrap();
+        let a = parse_answers(&packet, &head).unwrap();
+        // A weight of 0 counts as 1; an A record is unexpected here.
+        let want = |priority, weight, port, name: &[u8]| Srv {
+            priority,
+            weight,
+            port,
+            name: name.into(),
+        };
+        assert_eq!(
+            a.srvs,
+            [want(20, 1, 8081, b"b.example.net"), want(10, 5, 8080, b"a")]
+        );
+        assert_eq!(
+            (a.addrs.len(), a.unexpected.as_slice(), a.ttl),
+            (0, &[1][..], 30)
+        );
+        for n in head.at..packet.len() {
+            let _ = parse_answers(&packet[..n], &head);
+        }
+        // Decided: sorted by priority.
+        let mut q = Queries::new(&resolver(true), b"_http._tcp.example.net", true).unwrap();
+        assert_eq!(q.queries.len(), 1);
+        q.queries[0].id = 1;
+        match q.process(&packet, false) {
+            Step::Done(Ok((Answer::Srvs(s), _))) => {
+                assert_eq!(s.iter().map(|s| s.priority).collect::<Vec<_>>(), [10, 20]);
+            }
+            _ => panic!("no srvs"),
+        }
     }
 
     #[test]

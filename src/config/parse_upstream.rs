@@ -506,11 +506,31 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
     // ngx_http_upstream_server: a name with `resolve` is asked at run time
     // (`u.no_resolve`); an address stays one.
     let resolve = args[1..].iter().any(|a| a == "resolve");
+    let service = args[1..].iter().find_map(|a| a.strip_prefix("service="));
     let unix = strip_unix_prefix(host_port);
     let name = match unix {
         None if resolve => runtime_name(host_port)?,
         _ => None,
     };
+    if let Some(service) = service {
+        let refuse = |problem: &str| {
+            Err(Error::Text(format!(
+                "service upstream \"{host_port}\" {problem}"
+            )))
+        };
+        if service.is_empty() {
+            return Err(Error::Message("service is empty"));
+        }
+        if !resolve {
+            return refuse("requires \"resolve\" parameter");
+        }
+        if with_default_port(host_port, 0) == *host_port {
+            return refuse("may not have port");
+        }
+        if name.is_none() {
+            return refuse("requires domain name");
+        }
+    }
     let addrs = match (unix, &name) {
         (Some(path), _) => vec![unix_socket_path(path).map_err(|what| Error::BadValue {
             what,
@@ -577,7 +597,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
             route = Some(v.to_string());
         } else if tok == "backup" {
             backup = true;
-        } else if tok == "resolve" {
+        } else if tok == "resolve" || tok.starts_with("service=") {
         } else {
             return Err(Error::BadValue {
                 what: "upstream server param",
@@ -590,6 +610,7 @@ pub(crate) fn parse_upstream_server_args(args: &[String]) -> Result<Vec<Upstream
         .map(|addr| UpstreamServer {
             addr,
             resolve: name.as_ref().map(|(host, _)| host.clone()),
+            service: service.map(str::to_string),
             display: host_port.clone(),
             weight,
             max_fails,

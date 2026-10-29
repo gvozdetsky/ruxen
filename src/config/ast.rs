@@ -772,6 +772,8 @@ pub struct UpstreamServer {
     pub addr: UpstreamAddr,
     /// `resolve` with a name (#597): the name, asked at run time.
     pub resolve: Option<String>,
+    /// `service=`: the name's SRV records give the addresses and ports.
+    pub service: Option<String>,
     /// Original `host:port` string as written. Used for the upstream
     /// `Host:` header default and for diagnostics.
     pub display: String,

@@ -21,6 +21,9 @@ unsafe extern "C" {
 enum Reply {
     Addrs(Vec<[u8; 4]>),
     Rcode(u16),
+    /// SRV records (priority, port), all for target `t.test`, and the
+    /// target's addresses.
+    Service(Vec<(u16, u16)>, Vec<[u8; 4]>),
 }
 
 /// A name server for `svc.test`: what it answers, and how many questions
@@ -73,20 +76,32 @@ fn answer(query: &[u8], reply: &Reply) -> Vec<u8> {
         i += 1 + query[i] as usize;
     }
     let question = &query[12..i + 5];
-    let (rcode, addrs) = match reply {
-        Reply::Addrs(addrs) => (0, addrs.as_slice()),
-        Reply::Rcode(code) => (*code, &[][..]),
+    let srv = query[i + 2] == 33;
+    let (rcode, addrs, srvs) = match reply {
+        Reply::Addrs(addrs) => (0, addrs.as_slice(), &[][..]),
+        Reply::Rcode(code) => (*code, &[][..], &[][..]),
+        Reply::Service(srvs, _) if srv => (0, &[][..], srvs.as_slice()),
+        Reply::Service(_, addrs) => (0, addrs.as_slice(), &[][..]),
     };
     let mut out = query[..2].to_vec();
     out.extend_from_slice(&(0x8180 | rcode).to_be_bytes());
     out.extend_from_slice(&[0, 1]);
-    out.extend_from_slice(&(addrs.len() as u16).to_be_bytes());
+    out.extend_from_slice(&((addrs.len() + srvs.len()) as u16).to_be_bytes());
     out.extend_from_slice(&[0, 0, 0, 0]);
     out.extend_from_slice(question);
     for ip in addrs {
         // TTL 1.
         out.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4]);
         out.extend_from_slice(ip);
+    }
+    for (priority, port) in srvs {
+        let target = b"\x01t\x04test\x00";
+        out.extend_from_slice(&[0xc0, 12, 0, 33, 0, 1, 0, 0, 0, 1, 0]);
+        out.push(6 + target.len() as u8);
+        out.extend_from_slice(&priority.to_be_bytes());
+        out.extend_from_slice(&[0, 1]);
+        out.extend_from_slice(&port.to_be_bytes());
+        out.extend_from_slice(target);
     }
     out
 }
@@ -379,6 +394,67 @@ fn m165_configuration_errors() {
     assert!(
         !ok && err.contains("\"sticky\" with \"resolve\" servers is not supported yet"),
         "{err}"
+    );
+    for (line, problem) in [
+        ("svc.test service=http", "requires \"resolve\" parameter"),
+        ("svc.test:80 resolve service=http", "may not have port"),
+        ("127.0.0.1 resolve service=http", "requires domain name"),
+    ] {
+        let (ok, err) = check(&format!(
+            "upstream u {{ zone z; server {line}; }} resolver 127.0.0.1;"
+        ));
+        let want = format!(
+            "service upstream \"{}\" {problem}",
+            line.split(' ').next().unwrap()
+        );
+        assert!(!ok && err.contains(&want), "{line}: {err}");
+    }
+    let (ok, err) = check("upstream u { zone z; server svc.test resolve service=; }");
+    assert!(!ok && err.contains("service is empty"), "{err}");
+}
+
+#[test]
+fn m165_services_give_ports_and_backups() {
+    let (backend, _) = backends(false);
+    let dead = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dns = Dns::start(Reply::Service(vec![(1, backend)], vec![ONE]));
+    let server = start(&format!(
+        "resolver 127.0.0.1:{} valid=1s ipv6=off; resolver_timeout 1s;\n\
+         upstream u {{ zone z 64k; server svc.test resolve service=http max_fails=0; }}",
+        dns.port
+    ));
+    server.wait_for((200, "one"));
+    // The target's address changes.
+    dns.set(Reply::Service(vec![(1, backend)], vec![TWO]));
+    server.wait_for((200, "two"));
+    // A port nothing listens on first, the backend as a lower priority:
+    // a backup peer.
+    dns.set(Reply::Service(vec![(1, dead), (2, backend)], vec![ONE]));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let access = std::fs::read_to_string(server.dir.join("access.log")).unwrap();
+        if access.contains(&format!("200 127.0.0.1:{dead}, 127.0.0.1:{backend}\n")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{access}\n{}",
+            server.error_log()
+        );
+        let _ = server.get();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // No SRV records: no peers.
+    dns.set(Reply::Rcode(3));
+    server.wait_for((502, ""));
+    let log = server.error_log();
+    assert!(
+        log.contains("service http of svc.test could not be resolved (3: Host not found)"),
+        "{log}"
     );
 }
 
