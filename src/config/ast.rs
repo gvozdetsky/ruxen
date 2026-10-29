@@ -230,6 +230,8 @@ pub struct ProxyConf {
     /// `proxy_ignore_client_abort`: keep the upstream exchange when the
     /// client goes away (#136).
     pub ignore_client_abort: Option<bool>,
+    /// `proxy_pass_trailers` (#823); unset means off.
+    pub pass_trailers: Option<bool>,
     /// `proxy_redirect`; unset means nginx's implicit `default`.
     pub redirect: Option<ProxyRedirect>,
     /// `proxy_cookie_domain` and `proxy_cookie_path`: the `Domain` and
@@ -431,6 +433,7 @@ impl ProxyConf {
             intercept_errors: self.intercept_errors.or(parent.intercept_errors),
             force_ranges: self.force_ranges.or(parent.force_ranges),
             ignore_client_abort: self.ignore_client_abort.or(parent.ignore_client_abort),
+            pass_trailers: self.pass_trailers.or(parent.pass_trailers),
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             cookie_domain: self.cookie_domain.or_else(|| parent.cookie_domain.clone()),
             cookie_path: self.cookie_path.or_else(|| parent.cookie_path.clone()),
