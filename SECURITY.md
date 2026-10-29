@@ -35,11 +35,11 @@ do something it shouldn't, for example:
   access (ruxen refuses such configurations on purpose; a gap there is a bug).
 
 Missing nginx features and behaviour differences that aren't security-relevant
-are ordinary issues: use the *nginx behaviour difference* template.
+are ordinary issues: use the *nginx/ruxen behave differently* template.
 
 ## Supported versions
 
-Fixes go into the latest release only (currently `0.1.x`).
+Fixes go into the latest release only (currently `0.2.x`).
 
 ## Disclosure
 
