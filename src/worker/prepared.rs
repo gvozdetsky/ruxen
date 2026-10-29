@@ -208,6 +208,11 @@ pub struct PreparedSplitClients {
 pub struct PreparedMapRegex {
     pub regex: regex::bytes::Regex,
     pub value: &'static [PreparedValuePart],
+    /// The parts of `value` that are this regex's captures (`$1`, a named
+    /// group), as (part index, group) (#800).
+    pub captures: &'static [(usize, usize)],
+    /// The regex has groups: a match sets the request's captures (#832).
+    pub groups: bool,
 }
 
 /// Prepared form of one `map $source $dest { ... }` program.
@@ -266,6 +271,11 @@ pub struct RewriteState {
     /// request, internal redirects included, unless the map is `volatile`.
     /// Filled while rendering, which only has `&self`.
     map_cache: std::cell::RefCell<Vec<(usize, Vec<u8>)>>,
+    /// `$1`…`$9` of the last `map` regex that matched (#832), until a
+    /// rewrite or location regex sets them again; set while rendering.
+    map_numbered: std::cell::RefCell<Option<Vec<Vec<u8>>>>,
+    /// The named groups of the `map` regexes that matched, last one wins.
+    map_named: std::cell::RefCell<Vec<(Box<str>, Vec<u8>)>>,
     /// The chosen location's (or, in the server's rewrite phase, the
     /// server's) root, for `$request_filename` / `$document_root`.
     pub(crate) doc_root: Option<&'static DocRoot>,
@@ -295,6 +305,8 @@ impl Default for RewriteState {
             unparsed_uri: true,
             internal: false,
             map_cache: std::cell::RefCell::new(Vec::new()),
+            map_numbered: std::cell::RefCell::new(None),
+            map_named: std::cell::RefCell::new(Vec::new()),
             doc_root: None,
             limit_req_status: 0,
             limit_conn_status: 0,
@@ -306,6 +318,7 @@ impl Default for RewriteState {
 
 impl RewriteState {
     pub(crate) fn clear_numbered_captures(&mut self) {
+        *self.map_numbered.get_mut() = None;
         if self.numbered_captures.is_empty() {
             return;
         }
@@ -318,6 +331,7 @@ impl RewriteState {
         if n == 0 {
             return;
         }
+        *self.map_numbered.get_mut() = None;
         if self.numbered_captures.is_empty() {
             self.numbered_captures.resize_with(10, Vec::new);
         }
@@ -345,6 +359,8 @@ impl RewriteState {
     /// Whether a regex left `$1`…`$9` to render later.
     pub(crate) fn has_numbered_captures(&self) -> bool {
         self.numbered_captures.iter().any(|c| !c.is_empty())
+            || self.map_numbered.borrow().is_some()
+            || !self.map_named.borrow().is_empty()
     }
 
     pub(crate) fn set_numbered_from_regex_captures(
@@ -360,11 +376,63 @@ impl RewriteState {
         }
     }
 
-    pub(crate) fn numbered_capture(&self, n: usize) -> Option<&[u8]> {
-        self.numbered_captures
-            .get(n)
-            .filter(|v| !v.is_empty())
-            .map(Vec::as_slice)
+    /// Appends `$n` to `out`: a `map` regex's, else the request's.
+    pub(crate) fn write_numbered_capture(&self, n: usize, out: &mut Vec<u8>) {
+        if let Some(map) = self.map_numbered.borrow().as_ref() {
+            if let Some(v) = map.get(n) {
+                out.extend_from_slice(v);
+            }
+            return;
+        }
+        if let Some(v) = self.numbered_captures.get(n) {
+            out.extend_from_slice(v);
+        }
+    }
+
+    /// A `map` regex matched (ngx_http_regex_exec): its groups become the
+    /// request's `$1`…`$9` and named captures.
+    pub(crate) fn set_map_captures(
+        &self,
+        regex: &regex::bytes::Regex,
+        captures: &regex::bytes::Captures<'_>,
+    ) {
+        let numbered = (0..10)
+            .map(|n| {
+                captures
+                    .get(n)
+                    .map_or(Vec::new(), |m| m.as_bytes().to_vec())
+            })
+            .collect();
+        *self.map_numbered.borrow_mut() = Some(numbered);
+        let mut named = self.map_named.borrow_mut();
+        for (group, name) in regex.capture_names().enumerate() {
+            let Some(name) = name else {
+                continue;
+            };
+            let value = captures
+                .get(group)
+                .map_or(Vec::new(), |m| m.as_bytes().to_vec());
+            match named.iter_mut().find(|(n, _)| **n == *name) {
+                Some(slot) => slot.1 = value,
+                None => named.push((name.into(), value)),
+            }
+        }
+    }
+
+    /// A `map` regex without groups matched: `$1`…`$9` are empty.
+    pub(crate) fn clear_map_numbered(&self) {
+        *self.map_numbered.borrow_mut() = Some(Vec::new());
+    }
+
+    /// Appends a `map` regex's named capture `name`, if one matched.
+    pub(crate) fn write_map_named_capture(&self, name: &str, out: &mut Vec<u8>) -> bool {
+        match self.map_named.borrow().iter().find(|(n, _)| **n == *name) {
+            Some((_, v)) => {
+                out.extend_from_slice(v);
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn set_user_var(&mut self, name: &'static [u8], value: Vec<u8>) {
@@ -387,6 +455,7 @@ impl RewriteState {
     pub(crate) fn worth_keeping(&self) -> bool {
         self.has_user_vars()
             || !self.map_cache.borrow().is_empty()
+            || !self.map_named.borrow().is_empty()
             || self.limit_req_status != 0
             || self.limit_conn_status != 0
     }

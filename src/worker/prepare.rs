@@ -3127,9 +3127,12 @@ pub(crate) fn prepare_maps(
             // Already validated at parse time; a failure here is a bug.
             let compiled = crate::config::pcre::regex(&pattern, case_insensitive)
                 .expect("map regex validated at parse time");
+            let captures = map_value_captures(&compiled, &value);
             regex_entries.push(PreparedMapRegex {
+                groups: compiled.captures_len() > 1,
                 regex: compiled,
                 value: prepare_value_parts(value),
+                captures,
             });
         }
         let regex_set = first_match_set(regex_set_patterns.iter().map(String::as_str));
@@ -3149,6 +3152,28 @@ pub(crate) fn prepare_maps(
         out.insert(var_key, prepared);
     }
     out
+}
+
+/// The parts of a map regex entry's value that name the regex's own
+/// captures: `$1`…`$9` and its named groups, as nginx's
+/// ngx_http_regex_exec sets them before the value is evaluated (#800).
+fn map_value_captures(
+    regex: &regex::bytes::Regex,
+    value: &[ValuePart],
+) -> &'static [(usize, usize)] {
+    let captures: Vec<(usize, usize)> = value
+        .iter()
+        .enumerate()
+        .filter_map(|(i, part)| match part {
+            ValuePart::Var(Variable::Capture(n)) => Some((i, *n)),
+            ValuePart::Var(Variable::Unknown(name)) => regex
+                .capture_names()
+                .position(|g| g == Some(name.as_str()))
+                .map(|g| (i, g)),
+            _ => None,
+        })
+        .collect();
+    crate::arena::leak(captures.into_boxed_slice())
 }
 
 /// Whether `parts` render the same all through a request: literals and
