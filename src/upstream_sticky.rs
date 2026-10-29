@@ -24,7 +24,8 @@ use crate::worker::{PeerAddr, PreparedValuePart};
 /// nginx's NGX_HTTP_STICKY_COOKIE_MAX_EXPIRES `expires=max` cookie tail.
 const EXPIRES_MAX: &[u8] = b"; expires=Thu, 31-Dec-37 23:55:55 GMT; max-age=315360000";
 
-/// An upstream's `sticky`, prepared.
+/// An upstream's `sticky`, prepared. Each version of a resolved upstream
+/// has its own, for its peers (#883).
 #[derive(Debug)]
 pub struct Sticky {
     /// Each peer's ID, by peer index.
@@ -36,14 +37,14 @@ pub struct Sticky {
     pub mode: Mode,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Mode {
     Cookie(Cookie),
     Route,
     Learn(Learn),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Cookie {
     /// `name=`.
     pub prefix: &'static [u8],
@@ -56,14 +57,14 @@ pub struct Cookie {
     pub samesite: Option<SameSite>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SameSite {
     Static(&'static [u8]),
     /// Rendered per request; an invalid value is `strict`.
     Var(&'static [PreparedValuePart]),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Learn {
     pub create: &'static [&'static [PreparedValuePart]],
     pub zone: &'static SessionZone,
@@ -73,19 +74,21 @@ pub struct Learn {
 }
 
 impl Sticky {
+    /// For the static peers of `servers`; a version of resolved peers
+    /// gets its own (`with_peers`).
     pub(crate) fn prepare(
         conf: StickyConf,
         servers: &[UpstreamServer],
         upstream: &str,
     ) -> &'static Sticky {
-        let sids = servers
-            .iter()
+        let servers = || servers.iter().filter(|s| s.resolve.is_none());
+        let sids = servers()
             .map(|s| match &s.route {
                 Some(route) => leak(route.as_bytes()),
                 None => leak(&addr_sid(PeerAddr::from_config(s.addr.clone()))),
             })
             .collect::<Vec<_>>();
-        let draining = servers.iter().map(|s| s.drain).collect::<Vec<_>>();
+        let draining = servers().map(|s| s.drain).collect::<Vec<_>>();
         let vars =
             |v: Vec<Vec<crate::config::ValuePart>>| -> &'static [&'static [PreparedValuePart]] {
                 crate::arena::leak(
@@ -160,6 +163,21 @@ impl Sticky {
         }))
     }
 
+    /// This `sticky` for a version's peers (ngx_http_upstream_copy_round_robin_sid).
+    /// `learn` sessions keep IDs, so they carry over.
+    pub(crate) fn with_peers(
+        &self,
+        sids: &'static [&'static [u8]],
+        draining: &'static [bool],
+    ) -> Sticky {
+        Sticky {
+            sids,
+            draining,
+            lookup: self.lookup,
+            mode: self.mode.clone(),
+        }
+    }
+
     pub fn learn(&self) -> Option<&Learn> {
         match &self.mode {
             Mode::Learn(l) => Some(l),
@@ -174,7 +192,7 @@ fn leak(b: &[u8]) -> &'static [u8] {
 
 /// A peer's ID without `route=`: the MD5 of its address as nginx prints
 /// it, in hex (ngx_http_upstream_init_round_robin_sid).
-fn addr_sid(addr: PeerAddr) -> Vec<u8> {
+pub(crate) fn addr_sid(addr: PeerAddr) -> Vec<u8> {
     let digest = crate::auth::md5(addr.to_string().as_bytes());
     let mut out = Vec::with_capacity(32);
     for b in digest {
