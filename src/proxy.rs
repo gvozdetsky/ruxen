@@ -189,6 +189,9 @@ pub struct ProxyPlan {
     /// `proxy_ignore_client_abort`: when off, a client that closes while
     /// the upstream is awaited ends the exchange with 499 (#136).
     pub ignore_client_abort: bool,
+    /// `proxy_pass_trailers` (#823): a chunked body's trailers reach the
+    /// client.
+    pub pass_trailers: bool,
     /// `proxy_http_version 2` (#599): a new connection speaks HTTP/2.
     pub h2: bool,
 }
@@ -2144,7 +2147,7 @@ async fn attempt(
         let stream = if plan.h2 {
             match Box::pin(h2_connect(plan, stream)).await {
                 Ok(stream) => stream,
-                Err(outcome) => return outcome,
+                Err(outcome) => return *outcome,
             }
         } else {
             stream
@@ -2585,6 +2588,7 @@ async fn attempt(
             chunked,
             content_length,
             upstream_close,
+            plan.pass_trailers,
         )
     {
         // proxy_limit_rate paces from here, the bytes that came with the
@@ -2647,7 +2651,8 @@ async fn attempt(
                 gzip: None,
                 cache: None,
                 window: None,
-                trailers: false,
+                trailers: plan.pass_trailers && chunked,
+                pass_trailers: (plan.pass_trailers && chunked).then_some(plan.response),
             },
         )));
     }
@@ -2792,8 +2797,10 @@ async fn attempt(
 /// `proxy_http_version 2` (#599): HTTP/2 on a new connection, under
 /// `proxy_connect_timeout` as the TLS handshake is.
 #[cold]
-#[allow(clippy::result_large_err)] // cold: once per new connection
-async fn h2_connect(plan: &ProxyPlan, stream: UpstreamIo) -> Result<UpstreamIo, AttemptOutcome> {
+async fn h2_connect(
+    plan: &ProxyPlan,
+    stream: UpstreamIo,
+) -> Result<UpstreamIo, Box<AttemptOutcome>> {
     let identity = stream.tls_identity().cloned();
     let https = identity.is_some();
     match timeout(
@@ -2803,30 +2810,36 @@ async fn h2_connect(plan: &ProxyPlan, stream: UpstreamIo) -> Result<UpstreamIo, 
     .await
     {
         Ok(Ok(conn)) => Ok(UpstreamIo::H2(Box::new(conn))),
-        Ok(Err(e)) => Err(AttemptOutcome::Failed(
+        Ok(Err(e)) => Err(Box::new(AttemptOutcome::Failed(
             Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
             FailKind::Error,
             Box::new(UpstreamError::SendFailed(e)),
-        )),
-        Err(_) => Err(AttemptOutcome::Failed(
+        ))),
+        Err(_) => Err(Box::new(AttemptOutcome::Failed(
             Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
             FailKind::Timeout,
             Box::new(UpstreamError::TimedOut(Stage::Connecting)),
-        )),
+        ))),
     }
 }
 
 /// How a body that hasn't all arrived with the header (`initial`) is
 /// relayed, or `None` when it is complete (or malformed): it is then
-/// buffered as before, which keeps small responses on one write.
+/// buffered as before, which keeps small responses on one write. A
+/// chunked one with `proxy_pass_trailers` is always relayed, for its
+/// trailers.
 fn stream_framing(
     initial: &[u8],
     chunked: bool,
     content_length: Option<u64>,
     upstream_close: bool,
+    pass_trailers: bool,
 ) -> Option<crate::proxy_stream::StreamFraming> {
     use crate::proxy_stream::{ChunkedDecoder, StreamFraming};
     if chunked {
+        if pass_trailers {
+            return Some(StreamFraming::Chunked(ChunkedDecoder::keeping_trailers()));
+        }
         let mut probe = ChunkedDecoder::default();
         return match probe.feed(initial, &mut Vec::new()) {
             Ok((false, _)) => Some(StreamFraming::Chunked(ChunkedDecoder::default())),
@@ -3694,6 +3707,26 @@ fn late_limit_rate_of(
 fn paced_head_buf(buf: Vec<u8>) -> Vec<u8> {
     return_proxy_buf(buf);
     Vec::with_capacity(PROXY_SCRATCH_CAP)
+}
+
+/// `proxy_pass_trailers`: the upstream's trailer lines less the hidden
+/// ones (ngx_http_upstream_process_trailers, `hide_headers_hash`).
+#[cold]
+#[inline(never)]
+pub(crate) fn passed_trailers(rules: &crate::worker::ProxyResponseRules, lines: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines.split_inclusive(|&b| b == b'\n') {
+        let colon = line.iter().position(|&b| b == b':').unwrap_or(0);
+        let name = &line[..colon];
+        let hidden = match classify_upstream_header(name) {
+            UpstreamHeader::Hidden(bit) => rules.pass_mask & bit == 0,
+            _ => false,
+        } || rules.hide.iter().any(|h| h.eq_ignore_ascii_case(name));
+        if !hidden {
+            out.extend_from_slice(line);
+        }
+    }
+    out
 }
 
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body

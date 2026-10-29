@@ -1640,10 +1640,11 @@ async fn send_relay_trailers<S: ConnIo>(
     meta: &phase::ProcessMeta,
     uri: Option<&[u8]>,
     head: &[u8],
+    upstream: &[u8],
     timer: std::pin::Pin<&mut monoio::time::Sleep>,
     send_timeout: Duration,
 ) -> Option<u64> {
-    let out = super::response::relay_trailers(http, ctx, meta, uri, head);
+    let out = super::response::relay_trailers(http, ctx, meta, uri, head, upstream);
     let len = out.len();
     let (res, _) = write_all_timed(stream, out, len, timer, send_timeout).await;
     res.ok().map(|()| len as u64)
@@ -1718,7 +1719,12 @@ async fn send_file_trailers<S: ConnIo>(
         Vec::new()
     };
     out.extend_from_slice(&super::response::relay_trailers(
-        tc.http, tc.ctx, tc.meta, tc.uri, head,
+        tc.http,
+        tc.ctx,
+        tc.meta,
+        tc.uri,
+        head,
+        &[],
     ));
     let n = out.len();
     let (res, _) = write_all_timed(stream, out, n, timer, send_timeout).await;
@@ -1762,7 +1768,7 @@ fn trailers_in_memory(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(0, |p| p + 4);
-    let trailers = super::response::relay_trailers(http, ctx, meta, uri, &out[..head_end]);
+    let trailers = super::response::relay_trailers(http, ctx, meta, uri, &out[..head_end], &[]);
     out.extend_from_slice(&super::response::build_single_chunk_body(&body));
     out.extend_from_slice(&trailers);
     out
@@ -6558,6 +6564,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                             &process_meta,
                                             final_uri(&process_meta, url_scratch),
                                             scratch,
+                                            &end.upstream_trailers,
                                             io_timer.as_mut(),
                                             send_timeout,
                                         ))

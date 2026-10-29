@@ -439,7 +439,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_method` | yes | http, server, location |  |
 | `proxy_pass_request_headers` | yes | http, server, location |  |
 | `proxy_pass_request_body` | yes | http, server, location |  |
-| `proxy_pass_trailers` | no |  |  |
+| `proxy_pass_trailers` | yes | http, server, location |  |
 | `proxy_buffer_size` | accepted, no effect | any |  |
 | `proxy_read_timeout` | yes | http, server, location |  |
 | `proxy_buffers` | accepted, no effect | any |  |
