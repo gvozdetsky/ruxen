@@ -445,7 +445,8 @@ fn cache_plan(
             !value.is_empty() && value != b"0"
         })
     };
-    let no_cache = holds(conf.no_cache);
+    // One that reads the response is tested after its header (#826).
+    let no_cache = !conf.no_cache_late && holds(conf.no_cache);
     let mut plan = Box::new(CachePlan {
         conf,
         zone,

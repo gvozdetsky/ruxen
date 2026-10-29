@@ -1332,7 +1332,7 @@ fn authority_mismatch_log(meta: &phase::ProcessMeta, ctx: &phase::RequestCtx<'_>
 async fn proxy_with_early_hints(
     plan: Box<crate::proxy::ProxyPlan>,
     report: &mut crate::proxy::ProxyReport,
-    late: Option<crate::proxy::LateLimitRate<'_>>,
+    late: Option<crate::proxy::LateRender<'_>>,
     client: &mut dyn super::client_watch::WatchClient,
     at_once: bool,
     timeout: Duration,
@@ -1372,16 +1372,16 @@ async fn settle_proxy_response(
     };
     let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
-    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+    let late_render = late_render_needed(&plan).then(|| {
         let meta = &process_meta;
-        move |status: u16, headers: &[u8]| {
-            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        move |parts: &[PreparedValuePart], status: u16, headers: &[u8], out: &mut Vec<u8>| {
+            super::render_proxy_late(parts, http, ctx, meta, status, headers, uri, out)
         }
     });
     let upstream_resp = {
-        let late = late_limit_rate
+        let late = late_render
             .as_ref()
-            .map(|late| late as crate::proxy::LateLimitRate<'_>);
+            .map(|late| late as crate::proxy::LateRender<'_>);
         let at_once = process_meta.limit_conn_held.is_some();
         match client {
             Some(client) if plan.early_hints.is_some() => {
@@ -2068,15 +2068,15 @@ async fn run_proxy_pass(
     };
     let error_page_status = plan.error_page_status;
     let mut report = crate::proxy::ProxyReport::default();
-    let late_limit_rate = plan.response.limit_rate.map(|parts| {
+    let late_render = late_render_needed(&plan).then(|| {
         let meta = &process_meta;
-        move |status: u16, headers: &[u8]| {
-            super::render_proxy_limit_rate(parts, http, ctx, meta, status, headers, uri)
+        move |parts: &[PreparedValuePart], status: u16, headers: &[u8], out: &mut Vec<u8>| {
+            super::render_proxy_late(parts, http, ctx, meta, status, headers, uri, out)
         }
     });
-    let late = late_limit_rate
+    let late = late_render
         .as_ref()
-        .map(|late| late as crate::proxy::LateLimitRate<'_>);
+        .map(|late| late as crate::proxy::LateRender<'_>);
     let upstream_resp = crate::proxy::run_proxy(plan, &mut report, late).await;
     if !report.failures.is_empty() {
         write_upstream_error_log(
@@ -4210,6 +4210,12 @@ thread_local! {
             http: Cell::new(None),
         }
     };
+}
+
+/// The proxy renders something once the upstream's header is in: a
+/// `proxy_limit_rate` or a `proxy_no_cache` with variables (#826).
+fn late_render_needed(plan: &crate::proxy::ProxyPlan) -> bool {
+    plan.response.limit_rate.is_some() || plan.cache.as_ref().is_some_and(|c| c.conf.no_cache_late)
 }
 
 /// An upstream connection's slot in `worker_connections`, held as long as
@@ -7013,6 +7019,7 @@ pub(crate) async fn handle<S: ConnIo>(
                                         pacer,
                                         io_timer.as_mut(),
                                         send_timeout,
+                                        &http.body_temp,
                                     ))
                                     .await;
                                     *scratch = head;

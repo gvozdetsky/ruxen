@@ -757,6 +757,12 @@ pub struct ProxyResponseRules {
     pub ignore_accel_redirect: bool,
     /// `proxy_ignore_headers X-Accel-Limit-Rate`.
     pub ignore_accel_limit_rate: bool,
+    /// `proxy_ignore_headers X-Accel-Buffering`.
+    pub ignore_accel_buffering: bool,
+    /// `proxy_buffering` and its sizes (#764).
+    pub buffering: crate::config::ProxyBuffering,
+    /// `proxy_temp_path`; `None`: the http level's request-body directory.
+    pub temp: Option<&'static BodyTempDir>,
     /// A `proxy_limit_rate` with variables, rendered once the upstream's
     /// header is in, as nginx's ngx_http_upstream_send_response does
     /// (`$upstream_http_*` included). `None` when it has none: the plan's
@@ -916,6 +922,9 @@ pub struct PreparedProxyCache {
     pub min_uses: u32,
     pub bypass: &'static [&'static [PreparedValuePart]],
     pub no_cache: &'static [&'static [PreparedValuePart]],
+    /// `proxy_no_cache` reads the response (`$upstream_*`, or a variable
+    /// that may): tested once its header is in, not before (#826).
+    pub no_cache_late: bool,
     pub convert_head: bool,
     pub revalidate: bool,
     pub use_stale: crate::config::UseStale,
@@ -1050,6 +1059,11 @@ pub(crate) struct ProxyEffective {
     pub cache_ignore: crate::proxy_cache::Ignore,
     /// `proxy_ssl_*` (#116).
     pub tls: UpstreamTlsSettings,
+    /// `proxy_buffering` and its sizes (#764).
+    pub buffering: crate::config::ProxyBufferingConf,
+    pub ignore_accel_buffering: bool,
+    /// `proxy_temp_path`; `None`: the http level's request-body directory.
+    pub temp: Option<&'static BodyTempDir>,
 }
 
 fn leak_path(path: &std::path::Path) -> &'static std::path::Path {
@@ -1228,6 +1242,16 @@ impl ProxyEffective {
             recursive_error_pages: false,
             proxy_method: None,
             tls: UpstreamTlsSettings::DEFAULT,
+            buffering: crate::config::ProxyBufferingConf {
+                on: None,
+                buffers: None,
+                buffer_size: None,
+                busy_buffers_size: None,
+                temp_file_write_size: None,
+                max_temp_file_size: None,
+            },
+            ignore_accel_buffering: false,
+            temp: None,
             cache: &NO_CACHE_CONF,
             cache_ignore: crate::proxy_cache::Ignore {
                 x_accel_expires: false,

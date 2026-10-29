@@ -1722,9 +1722,8 @@ pub(crate) fn parse_add_header_args(args: &[String]) -> Result<AddHeader, Error>
     })
 }
 
-/// `proxy_ignore_headers`: the fields nginx accepts there. Only
-/// X-Accel-Redirect changes anything in ruxen (no cache, no X-Accel-*
-/// buffering or rate controls), the others are already not acted on.
+/// `proxy_ignore_headers`: the fields nginx accepts there. X-Accel-Charset
+/// is never acted on.
 pub(crate) fn parse_proxy_ignore_headers(args: &[String]) -> Result<Vec<String>, Error> {
     const FIELDS: &[&str] = &[
         "x-accel-redirect",

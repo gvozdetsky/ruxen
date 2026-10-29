@@ -373,7 +373,9 @@ The HTTPS integration tests use the system `curl` binary and generate temporary 
 - `proxy_protocol`: PROXY protocol v1/v2;
 - `upstream_head` and `upstream_chunked`: an upstream's response head and a relayed chunked body, as a broken or hostile upstream would send them;
 - `dns_response`: a name server's response to the resolver;
-- `config`: the configuration parser.
+- `config`: the configuration parser;
+- `h2_frames` and `h2_request`: HTTP/2 client bytes, the header-block sizes ruxen counts from them, and each request the `h2` crate accepts as the head the HTTP/1.1 parser then takes;
+- `range`, `gzip_negotiation`, `http_date`, `basic_auth`, `realip`, `rewrite`: `Range`, `Accept-Encoding` and `User-Agent`, dates, `Authorization: Basic`, `X-Forwarded-For`, and rewrite rendering, most against a model of nginx's code.
 
 They need a nightly toolchain:
 
@@ -382,7 +384,7 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run request fuzz/corpus/request fuzz/seeds/request
 ```
 
-CI runs each target for 30 seconds on every pull request. If a crash could be a vulnerability, report it as `SECURITY.md` describes, not in a public issue.
+CI runs each target for 30 seconds on every pull request. Long runs happen on a private machine, so that a crash goes through `SECURITY.md` before it is public: `scripts/fuzz_long.sh OUT` runs every target with the corpus it keeps in `OUT` and logs wall time and executions per target to `OUT/fuzz-hours.tsv`; `scripts/fuzz_long.sh --report OUT/fuzz-hours.tsv <since>` sums them for a release. If a crash could be a vulnerability, report it as `SECURITY.md` describes, not in a public issue.
 
 ### nginx-tests
 

@@ -85,7 +85,7 @@ pub struct RealIpPeer {
 
 impl ConnInfo {
     /// For request contexts built by tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub const NONE: ConnInfo = ConnInfo {
         proxy_protocol: None,
         server_addr: std::borrow::Cow::Borrowed(b""),
@@ -1823,7 +1823,7 @@ fn walk_forwarded(list: &[u8], from: &[AccessAddr], recursive: bool, mut trusted
 
 /// `ngx_parse_addr_port`: an address, `[addr]`, or `addr:port` /
 /// `[addr]:port`. The port is 0 when there is none.
-fn parse_addr_port(text: &[u8]) -> Option<(IpAddr, u16)> {
+pub(crate) fn parse_addr_port(text: &[u8]) -> Option<(IpAddr, u16)> {
     let text = std::str::from_utf8(text).ok()?;
     let addr = |s: &str| {
         crate::config::parse_inet_addr(s)
