@@ -2379,6 +2379,10 @@ pub(crate) struct FirstBodyLimit {
     /// with `client_body_in_file_only on|clean`, 0: every body does.
     pub buffer: u64,
     pub error_logs: &'static [PreparedErrorLog],
+    /// The location's access logs and its server's port, for a request
+    /// cut while its body is read (#866).
+    pub access_logs: &'static [crate::worker::PreparedAccessLog],
+    pub server_port: u16,
     pub server_name: &'static [u8],
     /// `client_body_in_file_only on`: a temp file holding the body
     /// outlives the request (nginx's `request_body_in_persistent_file`).
@@ -2478,6 +2482,8 @@ pub(crate) fn first_body_limit(
             _ => 0,
         },
         error_logs: loc.error_logs,
+        access_logs: loc.access_logs,
+        server_port: server.listen_port,
         server_name: server.primary_server_name,
         persistent: matches!(
             loc.client_body_in_file_only,
@@ -2517,6 +2523,8 @@ fn unrouted_discard(server: &PreparedServer, continue_status: Option<u16>) -> Fi
         max: 0,
         buffer: crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE,
         error_logs: server.error_logs,
+        access_logs: server.access_logs,
+        server_port: server.listen_port,
         server_name: server.primary_server_name,
         persistent: false,
         body_temp: None,
