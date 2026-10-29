@@ -1323,6 +1323,7 @@ pub(crate) fn run_location_handler(
             force_ranges,
             ignore_client_abort: proxy.ignore_client_abort,
             early_hints,
+            pass_trailers: proxy.pass_trailers,
             h2: proxy.http_version == 2,
             cache,
             hash,

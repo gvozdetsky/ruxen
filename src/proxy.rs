@@ -191,6 +191,9 @@ pub struct ProxyPlan {
     pub ignore_client_abort: bool,
     /// `early_hints` held (#848): the upstream's 103s for the client.
     pub early_hints: Option<std::rc::Rc<EarlyHints>>,
+    /// `proxy_pass_trailers` (#823): a chunked body's trailers reach the
+    /// client.
+    pub pass_trailers: bool,
     /// `proxy_http_version 2` (#599): a new connection speaks HTTP/2.
     pub h2: bool,
 }
@@ -2637,6 +2640,7 @@ async fn attempt(
             chunked,
             content_length,
             upstream_close,
+            plan.pass_trailers,
         )
     {
         // proxy_limit_rate paces from here, the bytes that came with the
@@ -2699,7 +2703,8 @@ async fn attempt(
                 gzip: None,
                 cache: None,
                 window: None,
-                trailers: false,
+                trailers: plan.pass_trailers && chunked,
+                pass_trailers: (plan.pass_trailers && chunked).then_some(plan.response),
             },
         )));
     }
@@ -2872,15 +2877,21 @@ async fn h2_connect(
 
 /// How a body that hasn't all arrived with the header (`initial`) is
 /// relayed, or `None` when it is complete (or malformed): it is then
-/// buffered as before, which keeps small responses on one write.
+/// buffered as before, which keeps small responses on one write. A
+/// chunked one with `proxy_pass_trailers` is always relayed, for its
+/// trailers.
 fn stream_framing(
     initial: &[u8],
     chunked: bool,
     content_length: Option<u64>,
     upstream_close: bool,
+    pass_trailers: bool,
 ) -> Option<crate::proxy_stream::StreamFraming> {
     use crate::proxy_stream::{ChunkedDecoder, StreamFraming};
     if chunked {
+        if pass_trailers {
+            return Some(StreamFraming::Chunked(ChunkedDecoder::keeping_trailers()));
+        }
         let mut probe = ChunkedDecoder::default();
         return match probe.feed(initial, &mut Vec::new()) {
             Ok((false, _)) => Some(StreamFraming::Chunked(ChunkedDecoder::default())),
@@ -3756,6 +3767,26 @@ fn late_limit_rate_of(
 fn paced_head_buf(buf: Vec<u8>) -> Vec<u8> {
     return_proxy_buf(buf);
     Vec::with_capacity(PROXY_SCRATCH_CAP)
+}
+
+/// `proxy_pass_trailers`: the upstream's trailer lines less the hidden
+/// ones (ngx_http_upstream_process_trailers, `hide_headers_hash`).
+#[cold]
+#[inline(never)]
+pub(crate) fn passed_trailers(rules: &crate::worker::ProxyResponseRules, lines: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines.split_inclusive(|&b| b == b'\n') {
+        let colon = line.iter().position(|&b| b == b':').unwrap_or(0);
+        let name = &line[..colon];
+        let hidden = match classify_upstream_header(name) {
+            UpstreamHeader::Hidden(bit) => rules.pass_mask & bit == 0,
+            _ => false,
+        } || rules.hide.iter().any(|h| h.eq_ignore_ascii_case(name));
+        if !hidden {
+            out.extend_from_slice(line);
+        }
+    }
+    out
 }
 
 /// `proxy_limit_rate` pacer. Sleeps just enough that the cumulative body

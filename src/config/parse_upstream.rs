@@ -93,13 +93,6 @@ pub(crate) fn parse_upstream_block(
                              to be in shared memory"
                         )));
                     }
-                    // Peer IDs are per configured peer yet (#600, #597).
-                    if sticky.is_some() && servers.iter().any(|s| s.resolve.is_some()) {
-                        return Err(Error::Text(format!(
-                            "\"sticky\" with \"resolve\" servers is not supported yet \
-                             in upstream \"{name}\""
-                        )));
-                    }
                     Ok(UpstreamBlock {
                         name,
                         servers,
@@ -1070,6 +1063,7 @@ impl ProxyConf {
         "proxy_force_ranges",
         "proxy_ignore_client_abort",
         "early_hints",
+        "proxy_pass_trailers",
         "proxy_bind",
         "proxy_redirect",
         "proxy_cookie_domain",
@@ -1458,6 +1452,12 @@ impl ProxyConf {
                 for value in &args[1..] {
                     list.push(parse_value_with_vars(value)?);
                 }
+            }
+            "proxy_pass_trailers" => {
+                if self.pass_trailers.is_some() {
+                    return Err(Error::Duplicate("proxy_pass_trailers"));
+                }
+                self.pass_trailers = Some(parse_on_off_args(&args[1..], "proxy_pass_trailers")?);
             }
             "proxy_ignore_client_abort" => {
                 if self.ignore_client_abort.is_some() {

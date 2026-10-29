@@ -231,6 +231,8 @@ pub struct ProxyConf {
     /// `early_hints` conditions (#848): a core directive, kept here as
     /// only proxied responses carry a 103.
     pub early_hints: Option<Vec<Vec<ValuePart>>>,
+    /// `proxy_pass_trailers` (#823); unset means off.
+    pub pass_trailers: Option<bool>,
     /// `proxy_redirect`; unset means nginx's implicit `default`.
     pub redirect: Option<ProxyRedirect>,
     /// `proxy_cookie_domain` and `proxy_cookie_path`: the `Domain` and
@@ -432,6 +434,7 @@ impl ProxyConf {
             force_ranges: self.force_ranges.or(parent.force_ranges),
             ignore_client_abort: self.ignore_client_abort.or(parent.ignore_client_abort),
             early_hints: self.early_hints.or_else(|| parent.early_hints.clone()),
+            pass_trailers: self.pass_trailers.or(parent.pass_trailers),
             redirect: self.redirect.or_else(|| parent.redirect.clone()),
             cookie_domain: self.cookie_domain.or_else(|| parent.cookie_domain.clone()),
             cookie_path: self.cookie_path.or_else(|| parent.cookie_path.clone()),
@@ -1147,8 +1150,7 @@ fn parse_ocsp_cache(value: &str) -> Result<Option<OcspCacheZone>, super::error::
     if value == "off" {
         return Ok(None);
     }
-    // Error::Message is static; a configuration error is made once.
-    let message = |text: String| Error::Message(Box::leak(text.into_boxed_str()));
+    let message = Error::Text;
     let invalid = || message(format!("invalid OCSP cache \"{value}\""));
     let rest = value.strip_prefix("shared:").ok_or_else(invalid)?;
     let (name, size) = rest.split_once(':').ok_or_else(invalid)?;

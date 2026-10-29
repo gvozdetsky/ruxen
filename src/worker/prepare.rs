@@ -1134,6 +1134,10 @@ pub(crate) fn prepare_upstreams(
                         service: s.service,
                         port: addr.port(),
                         template: peer,
+                        route: s.route.map(|r| -> &'static [u8] {
+                            crate::arena::leak(r.into_bytes().into_boxed_slice())
+                        }),
+                        drain: s.drain,
                     })
                 }
                 _ => peers_vec.push(peer),
@@ -1603,6 +1607,7 @@ pub(crate) fn build_proxy(
                 force_ranges: eff.force_ranges,
                 ignore_client_abort: eff.ignore_client_abort,
                 early_hints: eff.early_hints,
+                pass_trailers: eff.pass_trailers,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -1654,6 +1659,7 @@ pub(crate) fn build_proxy(
                 force_ranges: eff.force_ranges,
                 ignore_client_abort: eff.ignore_client_abort,
                 early_hints: eff.early_hints,
+                pass_trailers: eff.pass_trailers,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix,
@@ -1722,6 +1728,7 @@ pub(crate) fn build_proxy(
                 force_ranges: eff.force_ranges,
                 ignore_client_abort: eff.ignore_client_abort,
                 early_hints: eff.early_hints,
+                pass_trailers: eff.pass_trailers,
                 ignore_invalid_headers: eff.ignore_invalid_headers,
                 underscores_in_headers: eff.underscores_in_headers,
                 location_prefix: b"",
@@ -2077,6 +2084,7 @@ pub(crate) struct ServerProxyDefaults {
     pub force_ranges: bool,
     pub ignore_client_abort: bool,
     pub early_hints: &'static [&'static [PreparedValuePart]],
+    pub pass_trailers: bool,
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
     pub redirect: Option<&'static crate::config::ProxyRedirect>,
@@ -2181,6 +2189,7 @@ impl ServerProxyDefaults {
             early_hints: conf
                 .early_hints
                 .map_or(defaults.early_hints, prepare_conditions),
+            pass_trailers: conf.pass_trailers.unwrap_or(defaults.pass_trailers),
             ignore_invalid_headers,
             underscores_in_headers,
             redirect: conf.redirect.map(|r| &*crate::arena::leak(Box::new(r))),
@@ -2317,6 +2326,9 @@ pub(crate) fn resolve_proxy_effective(
         early_hints: location
             .early_hints
             .map_or(server_defaults.early_hints, prepare_conditions),
+        pass_trailers: location
+            .pass_trailers
+            .unwrap_or(server_defaults.pass_trailers),
         ignore_invalid_headers: server_defaults.ignore_invalid_headers,
         underscores_in_headers: server_defaults.underscores_in_headers,
         redirect: match location.redirect {
