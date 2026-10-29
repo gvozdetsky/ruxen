@@ -20,7 +20,7 @@
 // #116): `TlsStream<IO, ClientConnection>`, made by `connect`. What is
 // server-only (the session id, `connection()`) is on `TlsStream<IO>`.
 
-use std::io::{self, BufRead, IoSlice, Write};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::mem;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -219,7 +219,11 @@ impl TlsAcceptor {
             return Ok(Accepted::Plain(io, first));
         }
         let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
-        self.handshake_with(io, conn, first)
+        let records = self
+            .config
+            .enable_secret_extraction
+            .then(crate::ktls::RecordCursor::default);
+        self.handshake_with(io, conn, first, records)
             .await
             .map(|s| Accepted::Tls(s, self.verify.clone()))
     }
@@ -247,6 +251,8 @@ impl TlsAcceptor {
             return Ok(Accepted::Plain(io, buf));
         }
         let mut first = true;
+        // Every byte given to rustls, for a switch to kTLS (#673).
+        let mut records = crate::ktls::RecordCursor::default();
         let accepted = loop {
             if !mem::take(&mut first) {
                 buf.clear();
@@ -256,6 +262,7 @@ impl TlsAcceptor {
                     return Err(handshake_eof());
                 }
             }
+            records.feed(&buf);
             let mut pending = &buf[..];
             // rustls documents `Ok(0)` as EOF (or a close_notify already
             // received); without this check the loop, which never awaits,
@@ -302,6 +309,7 @@ impl TlsAcceptor {
             _ => config.clone(),
         };
         let verify = verify.clone();
+        let records = config.enable_secret_extraction.then_some(records);
         let conn = match accepted.into_connection(config) {
             Ok(conn) => conn,
             Err((e, mut alert)) => {
@@ -311,7 +319,7 @@ impl TlsAcceptor {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
         };
-        self.handshake_with(io, conn, Vec::new())
+        self.handshake_with(io, conn, Vec::new(), records)
             .await
             .map(|s| Accepted::Tls(s, verify))
     }
@@ -322,6 +330,7 @@ impl TlsAcceptor {
         io: IO,
         mut conn: ServerConnection,
         rbuf: Vec<u8>,
+        records: Option<crate::ktls::RecordCursor>,
     ) -> io::Result<TlsStream<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent + 'static,
@@ -345,6 +354,7 @@ impl TlsAcceptor {
             rpos: 0,
             wbuf: Vec::new(),
             session_id,
+            records,
         };
         stream.handshake().await?;
         Ok(stream)
@@ -364,6 +374,9 @@ pub struct TlsStream<IO, C = ServerConnection> {
     wbuf: Vec<u8>,
     /// The session's `$ssl_session_id` bytes, with `with_session_ids`.
     session_id: Option<[u8; 32]>,
+    /// Where the records of what rustls was given end, with kTLS on
+    /// (#673): the kernel can take over only at a record boundary.
+    records: Option<crate::ktls::RecordCursor>,
 }
 
 impl<IO> TlsStream<IO> {
@@ -385,6 +398,100 @@ impl<IO> TlsStream<IO> {
     }
 }
 
+/// What `TlsStream::into_ktls` made of a stream.
+#[allow(clippy::large_enum_variant)] // once per connection, not kept
+pub(crate) enum IntoKtls<IO> {
+    /// For the kernel: the traffic secrets, and the plaintext rustls had
+    /// already decrypted, then whether a close_notify followed it.
+    Kernel {
+        io: IO,
+        secrets: rustls::ExtractedSecrets,
+        read: Vec<u8>,
+        closed: bool,
+        /// The ClientHello's random, for the logged secrets (#852).
+        random: Option<[u8; 32]>,
+    },
+    /// Not switched, nothing changed: serve it in userspace.
+    Userspace(TlsStream<IO>),
+    /// Rustls refused what it was given, or the secrets weren't there.
+    Failed(io::Error),
+}
+
+impl<IO> TlsStream<IO> {
+    /// Whether the config asked for kTLS (`ssl_conf_command Options KTLS`).
+    pub(crate) fn wants_ktls(&self) -> bool {
+        self.records.is_some()
+    }
+
+    /// The ClientHello's random, with kTLS on (#852).
+    pub(crate) fn client_random(&self) -> Option<[u8; 32]> {
+        self.records.and_then(|r| r.client_random())
+    }
+
+    /// Hand the session to the kernel (#673), after the handshake.
+    /// `attach` checks the cipher suite and sets the TLS ULP on the
+    /// socket; `false` keeps the stream in userspace, as does ciphertext
+    /// read that ends mid-record (rustls's deframer would keep the rest).
+    pub(crate) fn into_ktls(
+        mut self,
+        attach: impl FnOnce(&IO, rustls::ProtocolVersion, rustls::SupportedCipherSuite) -> bool,
+    ) -> IntoKtls<IO> {
+        let Some(mut records) = self.records else {
+            return IntoKtls::Userspace(self);
+        };
+        records.feed(&self.rbuf[self.rpos..]);
+        let (Some(version), Some(suite)) = (
+            self.conn.protocol_version(),
+            self.conn.negotiated_cipher_suite(),
+        ) else {
+            return IntoKtls::Userspace(self);
+        };
+        if !records.at_boundary() || self.conn.wants_write() || !attach(&self.io, version, suite) {
+            return IntoKtls::Userspace(self);
+        }
+        // The rest of the ciphertext through rustls; the socket's queue
+        // starts at a record now.
+        let mut read = Vec::new();
+        let closed = loop {
+            match self.conn.reader().read_to_end(&mut read) {
+                Ok(_) => break true,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return IntoKtls::Failed(e),
+            }
+            if self.rpos == self.rbuf.len() {
+                break false;
+            }
+            let mut pending = &self.rbuf[self.rpos..];
+            match self.conn.read_tls(&mut pending) {
+                Ok(0) => return IntoKtls::Failed(handshake_eof()),
+                Ok(n) => self.rpos += n,
+                Err(e) => return IntoKtls::Failed(e),
+            }
+            if let Err(e) = self.conn.process_new_packets() {
+                return IntoKtls::Failed(io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        };
+        // Rustls answers a KeyUpdate request or a renegotiation; the
+        // kernel can't, with keys rustls would change.
+        if self.conn.wants_write() {
+            return IntoKtls::Failed(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake message right after the handshake",
+            ));
+        }
+        match self.conn.dangerous_extract_secrets() {
+            Ok(secrets) => IntoKtls::Kernel {
+                io: self.io,
+                secrets,
+                read,
+                closed,
+                random: records.client_random(),
+            },
+            Err(e) => IntoKtls::Failed(io::Error::other(e)),
+        }
+    }
+}
+
 /// A TLS client connection to `name` over `io`, handshaken: an HTTPS
 /// upstream (#116). `name` is what the certificate is checked against
 /// and, with SNI on in `config`, what the ClientHello names.
@@ -402,6 +509,7 @@ pub async fn connect<IO: AsyncReadRent + AsyncWriteRent + 'static>(
         rpos: 0,
         wbuf: Vec::new(),
         session_id: None,
+        records: None,
     };
     loop {
         stream.write_tls().await?;
@@ -578,8 +686,12 @@ impl<IO: AsyncReadRent + AsyncWriteRent + 'static> TlsStream<IO> {
             if !self.conn.is_handshaking() {
                 return Ok(());
             }
-            if self.read_tls().await? == 0 {
+            let n = self.read_tls().await?;
+            if n == 0 {
                 return Err(handshake_eof());
+            }
+            if let Some(records) = &mut self.records {
+                records.feed(&self.rbuf[self.rpos - n..self.rpos]);
             }
             // A resumed TLS 1.3 session keeps its id, also in the tickets
             // issued now (after the client's Finished, a later flight).
