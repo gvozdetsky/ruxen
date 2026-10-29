@@ -468,6 +468,23 @@ fn m116_large_hits_come_from_the_file() {
         big.len()
     )));
     assert!(body.contains(&*String::from_utf8_lossy(&big[5_000_000..5_000_010])));
+    // Parts over 1 MiB are sent from the cache file too (#414).
+    let (head, body) = get("/big.bin", "Range: bytes=0-999999,2000000-2999999\r\n");
+    assert!(head.contains("multipart/byteranges; boundary="), "{head}");
+    assert!(body.len() > 2_000_000 && body.len() < 2_001_000, "{head}");
+    for (start, end) in [(0, 1_000_000), (2_000_000, 3_000_000)] {
+        let line = format!(
+            "Content-Range: bytes {start}-{}/{}\r\n\r\n",
+            end - 1,
+            big.len()
+        );
+        let at = body
+            .windows(line.len())
+            .position(|w| w == line.as_bytes())
+            .unwrap()
+            + line.len();
+        assert!(body[at..].starts_with(&big[start..end]), "{start}");
+    }
     let (head, _) = get("/big.bin", "Range: bytes=9000000-\r\n");
     assert!(head.starts_with("HTTP/1.1 416 "), "{head}");
 

@@ -37,6 +37,7 @@ pub(crate) fn parse_server_block(
     let mut client_verify = ClientVerifyConf::default();
     let mut stapling = StaplingConf::default();
     let mut ssl_password_file: Option<PathBuf> = None;
+    let mut ssl_conf_commands: Option<Vec<(String, String)>> = None;
     let mut saw_any_ssl_directive = false;
     let mut server_names: Vec<ServerNameSpec> = Vec::new();
     let mut index: Option<Vec<IndexEntry>> = None;
@@ -76,6 +77,7 @@ pub(crate) fn parse_server_block(
     let mut max_ranges: Option<u32> = None;
     let mut client_body_buffer_size: Option<u64> = None;
     let mut sendfile: Option<bool> = None;
+    let mut aio: Option<Aio> = None;
     let mut http2: Option<bool> = None;
     let mut http2_conf = Http2Conf::default();
     let mut client_body_temp_path: Option<TempPath> = None;
@@ -129,6 +131,7 @@ pub(crate) fn parse_server_block(
                         client_verify,
                         password_file: ssl_password_file,
                         stapling,
+                        conf_commands: ssl_conf_commands,
                     };
                     let ssl_directives = if saw_any_ssl_directive || saw_local_ssl_cert_or_key {
                         listens.iter().map(|l| (l.addr, l.unix.clone())).collect()
@@ -183,6 +186,7 @@ pub(crate) fn parse_server_block(
                         client_body_buffer_size,
                         client_body_temp_path: client_body_temp_path.clone(),
                         sendfile,
+                        aio: aio.clone(),
                         http2,
                         http2_conf,
                         disable_symlinks: disable_symlinks.clone(),
@@ -372,9 +376,23 @@ pub(crate) fn parse_server_block(
                 saw_any_ssl_directive = true;
                 stapling.parse(&args, lx.conf_prefix())?;
             }
+            ("ssl_conf_command", Terminator::Semi) => {
+                saw_any_ssl_directive = true;
+                let [_, name, value] = args.as_slice() else {
+                    return Err(Error::BadValue {
+                        what: "ssl_conf_command (invalid number of arguments)",
+                        got: args[1..].join(" "),
+                    });
+                };
+                if !super::ast::conf_command_applied(name, value) {
+                    compat::ignored(lx, &args);
+                }
+                ssl_conf_commands
+                    .get_or_insert_with(Vec::new)
+                    .push((name.clone(), value.clone()));
+            }
             (
-                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data"
-                | "ssl_conf_command",
+                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data",
                 Terminator::Semi,
             ) => {
                 saw_any_ssl_directive = true;
@@ -654,6 +672,12 @@ pub(crate) fn parse_server_block(
                     return Err(Error::Duplicate("sendfile"));
                 }
                 sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
+            }
+            ("aio", Terminator::Semi) => {
+                if aio.is_some() {
+                    return Err(Error::Duplicate("aio"));
+                }
+                aio = Some(parse_aio_args(lx, &args)?);
             }
             ("post_action", Terminator::Semi) => {
                 if post_action.is_some() {
