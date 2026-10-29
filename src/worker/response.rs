@@ -1967,6 +1967,7 @@ pub(crate) fn maybe_intercept_error_page_as(
             preserved_location,
             preserved_www_authenticate,
             closes: http::closes_connection(status),
+            named_from: None,
         });
     }
     if target[0] == b'@' {
@@ -1985,6 +1986,7 @@ pub(crate) fn maybe_intercept_error_page_as(
             preserved_location,
             preserved_www_authenticate,
             closes: http::closes_connection(status),
+            named_from: None,
         });
     }
     let redirect = http::build_redirect_response(

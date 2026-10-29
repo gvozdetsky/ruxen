@@ -75,7 +75,7 @@ pub enum Error {
     /// A message nginx logs as it is, with no directive name around it
     /// (`the pool size must be no less than 112`).
     Message(&'static str),
-    /// The same, made up at run time.
+    /// The same, built at parse time (`unknown thread pool "x"`).
     Text(String),
     /// Any of the above with where it happened, nginx's ` in file:line`.
     At {
