@@ -47,6 +47,7 @@ mod tls_stream;
 mod tls_ticket;
 mod upstream;
 mod upstream_io;
+mod upstream_sticky;
 mod upstream_tls;
 mod uri;
 mod worker;
@@ -1450,7 +1451,6 @@ const VERSION_BODY: &str = concat!(
     " --without-http_empty_gif_module",
     " --without-http_browser_module",
     " --without-http_upstream_random_module",
-    " --without-http_upstream_sticky_module",
     " --without-mail_pop3_module",
     " --without-mail_imap_module",
     " --without-mail_smtp_module",
@@ -1740,7 +1740,6 @@ mod tests {
                 " --without-http_empty_gif_module",
                 " --without-http_browser_module",
                 " --without-http_upstream_random_module",
-                " --without-http_upstream_sticky_module",
                 " --without-mail_pop3_module",
                 " --without-mail_imap_module",
                 " --without-mail_smtp_module",
