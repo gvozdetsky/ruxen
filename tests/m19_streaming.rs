@@ -87,6 +87,8 @@ http {{
     listen 127.0.0.1:{port};
     root {root};
     location / {{ }}
+    location /sf/ {{ alias {root}/; sendfile on; }}
+    location /lr/ {{ alias {root}/; limit_rate 100m; }}
   }}
 }}
 "#,
@@ -301,6 +303,54 @@ fn range_206_streams_requested_slice() {
         Some("bytes 12345-22344/16777216")
     );
     assert_eq!(body(&r), expected_pattern(12_345, 10_000).as_slice());
+}
+
+/// #414: several ranges larger than 1 MiB in total are a multipart 206
+/// sent from the file (sendfile, read-and-write, paced), and the
+/// connection carries on after it.
+#[test]
+fn large_multipart_ranges_stream_from_the_file() {
+    let (_guard, port) = spawn_server();
+    let ranges = [(0usize, 1_000_000usize), (2_000_000, 3_000_000), (5, 6)];
+    for prefix in ["/", "/sf/", "/lr/"] {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET {prefix}16m.bin HTTP/1.1\r\nHost: localhost\r\n\
+             Range: bytes=0-999999,2000000-2999999,5-5\r\n\r\n"
+        )
+        .unwrap();
+        let r = read_one_response(&mut s);
+        assert_eq!(status_line(&r), "HTTP/1.1 206 Partial Content", "{prefix}");
+        let boundary = header_value(&r, "Content-Type")
+            .and_then(|t| t.strip_prefix("multipart/byteranges; boundary="))
+            .unwrap()
+            .to_string();
+        let mut want = Vec::new();
+        for (start, end) in ranges {
+            want.extend_from_slice(
+                format!(
+                    "\r\n--{boundary}\r\nContent-Type: text/plain\r\n\
+                     Content-Range: bytes {start}-{}/16777216\r\n\r\n",
+                    end - 1
+                )
+                .as_bytes(),
+            );
+            want.extend_from_slice(&expected_pattern(start, end - start));
+        }
+        want.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        assert_eq!(
+            header_value(&r, "Content-Length"),
+            Some(want.len().to_string().as_str())
+        );
+        assert!(body(&r) == want.as_slice(), "{prefix}: body differs");
+
+        s.write_all(b"GET /small.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let r = read_one_response(&mut s);
+        assert_eq!(body(&r), b"small-streaming-body\n", "{prefix}");
+    }
 }
 
 #[test]
