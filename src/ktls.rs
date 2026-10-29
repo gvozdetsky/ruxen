@@ -782,7 +782,7 @@ impl KtlsStream {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = size_of_val(&control);
+        msg.msg_controllen = size_of_val(&control) as _;
         // SAFETY: `msg` points at buffers of ours, of the sizes it says.
         let n = unsafe { libc::recvmsg(self.io.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
         if n < 0 {
@@ -856,11 +856,11 @@ fn send_record(fd: RawFd, record_type: u8, payload: &[u8]) -> io::Result<()> {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = libc::CMSG_SPACE(1) as usize;
+        msg.msg_controllen = libc::CMSG_SPACE(1) as _;
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         (*cmsg).cmsg_level = libc::SOL_TLS;
         (*cmsg).cmsg_type = libc::TLS_SET_RECORD_TYPE;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(1) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(1) as _;
         *libc::CMSG_DATA(cmsg) = record_type;
         let n = libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
         if n < 0 {
