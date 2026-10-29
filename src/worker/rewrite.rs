@@ -153,7 +153,7 @@ fn eval_guard_plain(guard: &PreparedGuard, ctx: &RenderCtx<'_>) -> bool {
 /// redirect` target goes through before the request's arguments are
 /// added: `%XX` turns into the byte when it is printable and above `%`,
 /// and the first `?` (written or decoded) ends the decoding.
-fn unescape_redirect(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn unescape_redirect(raw: &[u8]) -> Vec<u8> {
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;

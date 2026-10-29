@@ -17,6 +17,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 ruxen = { path = "..", features = ["fuzzing"] }
+# The `rewrite` target's model; the same crate ruxen compiles its regexes with.
+regex = "1"
 
 # Not part of the ruxen package's workspace.
 [workspace]
@@ -114,6 +116,27 @@ bench = false
 [[bin]]
 name = "h2_frames"
 path = "fuzz_targets/h2_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_request"
+path = "fuzz_targets/h2_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rewrite"
+path = "fuzz_targets/rewrite.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "realip"
+path = "fuzz_targets/realip.rs"
 test = false
 doc = false
 bench = false
