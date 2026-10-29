@@ -17,7 +17,6 @@ use monoio::time::timeout;
 
 use crate::proxy::{AttemptFailure, Stage, UpstreamError};
 use crate::upstream::{self, LeasedPeer};
-use crate::worker::PreparedUpstream;
 
 /// The body still to come from the upstream, and how it ends.
 pub struct ProxyStream {
@@ -106,7 +105,7 @@ pub(crate) enum StreamFraming {
 }
 
 pub(crate) struct StreamPool {
-    pub upstream: &'static PreparedUpstream,
+    pub upstream: upstream::UpstreamRef,
     pub peer_idx: usize,
     /// `PreparedProxy::pool_tag`.
     pub tag: usize,
@@ -563,7 +562,7 @@ fn close(s: Box<ProxyStream>, complete: bool, extra: bool) {
         // Closed as it is.
     } else if let Some(pool) = s.pool {
         upstream::pool_release(
-            pool.upstream,
+            &pool.upstream,
             pool.peer_idx,
             pool.tag,
             upstream::PooledConn {

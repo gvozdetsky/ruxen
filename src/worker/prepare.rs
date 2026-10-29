@@ -1109,11 +1109,15 @@ pub(crate) fn prepare_upstreams(
     let mut out = std::collections::HashMap::new();
     for u in upstreams {
         let name_static: &'static str = crate::arena::leak(u.name.into_boxed_str());
+        let sticky = u
+            .sticky
+            .map(|conf| crate::upstream_sticky::Sticky::prepare(conf, &u.servers, name_static));
         let mut peers_vec: Vec<PreparedPeer> = Vec::with_capacity(u.servers.len());
+        let mut hosts = Vec::new();
         for s in u.servers {
             let display: &'static [u8] =
                 crate::arena::leak(s.display.into_bytes().into_boxed_slice());
-            peers_vec.push(PreparedPeer {
+            let peer = PreparedPeer {
                 addr: PeerAddr::from_config(s.addr),
                 display,
                 weight: s.weight,
@@ -1122,7 +1126,18 @@ pub(crate) fn prepare_upstreams(
                 max_conns: s.max_conns,
                 down: s.down,
                 backup: s.backup,
-            });
+            };
+            match (s.resolve, peer.addr) {
+                (Some(name), PeerAddr::Inet(addr)) => {
+                    hosts.push(crate::upstream_resolve::HostConf {
+                        name,
+                        service: s.service,
+                        port: addr.port(),
+                        template: peer,
+                    })
+                }
+                _ => peers_vec.push(peer),
+            }
         }
         let peers: &'static [PreparedPeer] = crate::arena::leak(peers_vec.into_boxed_slice());
         // ngx_http_upstream_keepalive_init_main_conf: since 1.29.7 every
@@ -1144,11 +1159,36 @@ pub(crate) fn prepare_upstreams(
             lb: crate::upstream::Lb::prepare(u.lb, peers),
             shared: u
                 .zone
+                .as_ref()
                 .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
+            sticky,
             metrics: super::metrics::peer_slots(name_static.as_bytes(), peers),
+            dynamic: None,
         }));
-        super::metrics::note_upstream(prepared);
-        out.insert(name_static, &*prepared);
+        let prepared: &'static PreparedUpstream = match (&u.zone, u.resolver) {
+            (Some(zone), Some(resolver)) if !hosts.is_empty() => {
+                // Resolved peers take slots from a pool (#879).
+                let pool =
+                    super::metrics::peer_pool(name_static.as_bytes(), peers, prepared.metrics);
+                let dynamic = crate::upstream_resolve::Dynamic::prepare(
+                    *prepared,
+                    zone,
+                    hosts,
+                    prepare_resolver(resolver),
+                    std::time::Duration::from_millis(u.resolver_timeout_ms.unwrap_or(30_000)),
+                    pool,
+                );
+                if let Some(pool) = pool {
+                    pool.note(dynamic);
+                }
+                dynamic
+            }
+            _ => {
+                super::metrics::note_upstream(prepared);
+                prepared
+            }
+        };
+        out.insert(name_static, prepared);
     }
     out
 }
@@ -1536,6 +1576,8 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    dynamic: None,
+                    sticky: None,
                     metrics: super::metrics::peer_slots(host_header_static, peers),
                 }));
             super::metrics::note_upstream(upstream);
@@ -1588,7 +1630,7 @@ pub(crate) fn build_proxy(
             let upstream = *upstreams.get(name.as_str()).unwrap_or_else(|| {
                 panic!("ruxen: proxy_pass http://{name} references undeclared upstream block")
             });
-            if upstream.peers.is_empty() {
+            if upstream.peers.is_empty() && upstream.dynamic.is_none() {
                 panic!("ruxen: upstream {name} has no servers (parser invariant violated)");
             }
             let host_header_static: &'static [u8] =
@@ -1656,6 +1698,8 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    dynamic: None,
+                    sticky: None,
                     // A request's own peers: not counted.
                     metrics: None,
                 }));
@@ -3143,9 +3187,12 @@ pub(crate) fn prepare_maps(
             // Already validated at parse time; a failure here is a bug.
             let compiled = crate::config::pcre::regex(&pattern, case_insensitive)
                 .expect("map regex validated at parse time");
+            let captures = map_value_captures(&compiled, &value);
             regex_entries.push(PreparedMapRegex {
+                groups: compiled.captures_len() > 1,
                 regex: compiled,
                 value: prepare_value_parts(value),
+                captures,
             });
         }
         let regex_set = first_match_set(regex_set_patterns.iter().map(String::as_str));
@@ -3165,6 +3212,28 @@ pub(crate) fn prepare_maps(
         out.insert(var_key, prepared);
     }
     out
+}
+
+/// The parts of a map regex entry's value that name the regex's own
+/// captures: `$1`…`$9` and its named groups, as nginx's
+/// ngx_http_regex_exec sets them before the value is evaluated (#800).
+fn map_value_captures(
+    regex: &regex::bytes::Regex,
+    value: &[ValuePart],
+) -> &'static [(usize, usize)] {
+    let captures: Vec<(usize, usize)> = value
+        .iter()
+        .enumerate()
+        .filter_map(|(i, part)| match part {
+            ValuePart::Var(Variable::Capture(n)) => Some((i, *n)),
+            ValuePart::Var(Variable::Unknown(name)) => regex
+                .capture_names()
+                .position(|g| g == Some(name.as_str()))
+                .map(|g| (i, g)),
+            _ => None,
+        })
+        .collect();
+    crate::arena::leak(captures.into_boxed_slice())
 }
 
 /// Whether `parts` render the same all through a request: literals and

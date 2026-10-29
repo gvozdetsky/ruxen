@@ -128,9 +128,6 @@ too, the line only differs.
 (`error: … the check stopped here`), as `-t` does. The ones real
 configurations hit:
 
-- `bad value for upstream server param: resolve`: `server … resolve` in an
-  `upstream` (nginx 1.27.3). ruxen resolves upstream names once, at start
-  and reload. [#597] (open).
 - `bad value for disable_symlinks from=`: `from=` with a variable other
   than `$document_root`. ruxen refuses it rather than not enforce it; use
   `$document_root` or a literal path.
@@ -457,7 +454,6 @@ start without it.
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
 [#526]: https://github.com/gvozdetsky/ruxen/issues/526
 [#596]: https://github.com/gvozdetsky/ruxen/issues/596
-[#597]: https://github.com/gvozdetsky/ruxen/issues/597
 [#599]: https://github.com/gvozdetsky/ruxen/issues/599
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
 [#764]: https://github.com/gvozdetsky/ruxen/issues/764

@@ -382,6 +382,21 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                                 .into(),
                         );
                     }
+                    // `resolve` servers take http's resolver unless their
+                    // block has one (ngx_http_upstream_init_round_robin).
+                    for u in &mut upstreams {
+                        if u.resolver.is_none() {
+                            u.resolver.clone_from(&proxy.resolver);
+                        }
+                        u.resolver_timeout_ms = u.resolver_timeout_ms.or(proxy.resolver_timeout_ms);
+                        if u.resolver.is_none() && u.servers.iter().any(|s| s.resolve.is_some()) {
+                            return Err(Error::Text(format!(
+                                "no resolver defined to resolve names at run time \
+                                 in upstream \"{}\"",
+                                u.name
+                            )));
+                        }
+                    }
                     // After the whole block: an http-level proxy_* line
                     // below a server still applies to it, as in nginx.
                     for server in &mut servers {

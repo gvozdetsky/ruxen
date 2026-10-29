@@ -191,14 +191,15 @@ fn parse_head(head: &[u8]) -> Option<Head<'_>> {
 }
 
 /// `ngx_http_test_content_type`: the type without parameters, matched
-/// case-insensitively against `gzip_types`.
+/// case-insensitively against `gzip_types`. `*` matches before a missing
+/// type is checked (an empty types hash, #808).
 fn type_matches(gz: &PreparedGzip, content_type: Option<&[u8]>) -> bool {
-    let Some(ct) = content_type else {
-        return false;
-    };
     if gz.any_type {
         return true;
     }
+    let Some(ct) = content_type else {
+        return false;
+    };
     let base = ct.split(|&b| b == b';').next().unwrap_or(ct).trim_ascii();
     gz.types
         .iter()
@@ -1010,6 +1011,27 @@ mod tests {
             let (out, _) = filter(&conf, &req(Some(b"gzip")), Response::Prebuilt(leaked));
             assert!(matches!(out, Response::Prebuilt(_)));
         }
+    }
+
+    /// `gzip_types *` takes a response without `Content-Type` (#808);
+    /// a list doesn't.
+    #[test]
+    fn any_type_takes_a_response_without_content_type() {
+        const NO_TYPE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n\
+            XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let listed = gz(&["text/html"]);
+        let (out, _) = filter(&listed, &req(Some(b"gzip")), Response::Prebuilt(NO_TYPE));
+        assert!(matches!(out, Response::Prebuilt(_)));
+        let any = PreparedGzip {
+            any_type: true,
+            ..gz(&[])
+        };
+        let (out, _) = filter(&any, &req(Some(b"gzip")), Response::Prebuilt(NO_TYPE));
+        let Response::Owned(bytes) = out else {
+            panic!("compressed response expected");
+        };
+        let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        assert!(String::from_utf8_lossy(&bytes[..end]).contains("Content-Encoding: gzip"));
     }
 
     #[test]

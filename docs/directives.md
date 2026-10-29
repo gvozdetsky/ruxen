@@ -176,8 +176,8 @@ Not supported: `ssl_engine`.
 | `open_file_cache_min_uses` | accepted, no effect | any |  |
 | `open_file_cache_errors` | accepted, no effect | any |  |
 | `open_file_cache_events` | no |  |  |
-| `resolver` | yes | http, server, location |  |
-| `resolver_timeout` | yes | http, server, location |  |
+| `resolver` | yes | http, server, location, upstream |  |
+| `resolver_timeout` | yes | http, server, location, upstream |  |
 | `gzip_vary` | yes | any |  |
 | `gzip_http_version` | yes | any |  |
 | `gzip_proxied` | yes | any |  |
@@ -672,7 +672,9 @@ Not supported: `random`.
 
 ## http_upstream_sticky
 
-Not supported: `sticky`.
+| directive | ruxen | contexts | notes |
+| --- | --- | --- | --- |
+| `sticky` | yes | upstream |  |
 
 ## http_upstream_zone
 

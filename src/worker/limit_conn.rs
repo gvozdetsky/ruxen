@@ -297,6 +297,14 @@ pub(crate) fn run(
     server_name: &'static [u8],
     server_header: &'static [u8],
 ) -> (Option<crate::phase::Response>, Held) {
+    // Counted on the pass before the body was read (#855); the worker
+    // keeps that pass's counts with the request.
+    if let Some(noted) = crate::phase::before_body_noted()
+        && noted.limit_conn_status != 0
+    {
+        rewrite_state.limit_conn_status = noted.limit_conn_status;
+        return (None, Held(Vec::new()));
+    }
     let verdict = {
         let args = current_args.unwrap_or_else(|| super::request_args(req.path));
         let captures_slice: &[(&'static str, Vec<u8>)] = match captures {

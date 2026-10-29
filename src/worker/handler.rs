@@ -199,10 +199,8 @@ pub(crate) fn finalize_location_response(
                 };
                 out = inject_add_headers(out, add_headers, &ctx);
             }
-            // `add_trailer` against a streamed file body would require the
-            // worker to wrap the body in chunked encoding on the way out;
-            // the static-file path doesn't support that today. Quietly skip
-            // — the directive is rare on static content anyway.
+            // `add_trailer`: the worker sends the file chunked, the
+            // trailers after it (`phase`, #844).
             if status == 204 {
                 // `error_page … =204`: header-only, the file isn't sent.
                 return Response::Owned(out);
@@ -334,6 +332,20 @@ fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
     } else {
         out.extend_from_slice(path);
     }
+}
+
+/// The request's `sticky` (#600). Out of line: only upstreams with one.
+#[cold]
+#[inline(never)]
+fn sticky_for_request(
+    conf: &'static crate::upstream_sticky::Sticky,
+    ctx: &RenderCtx<'_>,
+) -> Box<crate::upstream_sticky::StickyReq> {
+    crate::upstream_sticky::StickyReq::new(conf, |parts| {
+        let mut out = Vec::new();
+        render_parts(parts, ctx, &mut out);
+        out
+    })
 }
 
 /// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
@@ -657,11 +669,7 @@ pub(crate) fn finish_access_denial(
         rewrite_state,
         server_name_captures,
     );
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    if body_limit > 0 && req.body_len > body_limit && !in_error_page && error_page_status.is_none()
-    {
+    if req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none() {
         return entity_too_large(
             &loc,
             req,
@@ -811,13 +819,8 @@ pub(crate) fn run_location_handler(
     // nginx's default client_max_body_size is 1m; `0` turns the check off.
     // Not again on the way to an error page: nginx has discarded the body
     // by then (`!r->discard_body` in ngx_http_core_find_config_phase).
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    let too_large = body_limit > 0
-        && req.body_len > body_limit
-        && !in_error_page
-        && error_page_status.is_none();
+    let too_large =
+        req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none();
 
     let render_ctx_base = location_render_ctx(
         http,
@@ -877,7 +880,9 @@ pub(crate) fn run_location_handler(
                 }
             },
         };
-        let upstream = variable.as_ref().map_or(proxy.upstream, |v| v.upstream);
+        let upstream = crate::upstream::UpstreamRef::current(
+            variable.as_ref().map_or(proxy.upstream, |v| v.upstream),
+        );
         let host_header: &[u8] = variable
             .as_ref()
             .map_or(proxy.host_header, |v| &v.host_header);
@@ -977,7 +982,7 @@ pub(crate) fn run_location_handler(
         // 502 and reports `no live upstreams` for the error log. A cache
         // hit needs none.
         let mut hash = crate::upstream::HashPick::for_request(
-            upstream,
+            &upstream,
             |key| {
                 let mut out = Vec::new();
                 render_parts(key, &render_ctx_base, &mut out);
@@ -985,13 +990,26 @@ pub(crate) fn run_location_handler(
             },
             render_ctx_base.remote_addr,
         );
+        let sticky = upstream
+            .sticky
+            .map(|conf| sticky_for_request(conf, &render_ctx_base));
         let initial_peer = if cache
             .as_ref()
             .is_some_and(|c| (c.hit.is_some() && !c.background) || c.unread)
         {
             None
         } else {
-            crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+            match sticky.as_deref() {
+                None => {
+                    crate::upstream::pick_peer(&upstream, &Default::default(), hash.as_deref_mut())
+                }
+                Some(st) => crate::upstream::pick_peer_sticky(
+                    &upstream,
+                    &Default::default(),
+                    hash.as_deref_mut(),
+                    &st.hint,
+                ),
+            }
         };
 
         // Build the final header set: proxy_set_header overrides first
@@ -1191,10 +1209,19 @@ pub(crate) fn run_location_handler(
             for ep in loc.error_pages {
                 let mut buf = Vec::with_capacity(64);
                 render_parts(ep.target, &proxy_render_ctx, &mut buf);
+                let named_from = (buf.first() == Some(&b'@')).then(|| {
+                    Box::new(phase::NamedFrom {
+                        uri: url_path.to_vec(),
+                        args: current_args.map(<[u8]>::to_vec),
+                        unparsed_uri: rewrite_state.unparsed_uri,
+                        internal: rewrite_state.internal,
+                    })
+                });
                 rules.push(crate::proxy::InterceptRule {
                     status: ep.status,
                     action: ep.action,
                     target: buf,
+                    named_from,
                 });
             }
             Some(rules)
@@ -1234,6 +1261,7 @@ pub(crate) fn run_location_handler(
                 Some(Box::new(crate::upstream_tls::TlsPlan { config, name }))
             }
         };
+        let pool_tag = proxy.pool_tag(&upstream);
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             tls,
@@ -1251,14 +1279,18 @@ pub(crate) fn run_location_handler(
             bad_gateway: &http.bad_gateway,
             gateway_timeout: &http.gateway_timeout,
             keepalive_eligible: pool_eligible,
-            pool_tag: proxy.pool_tag(upstream),
+            pool_tag,
             next_upstream: proxy.next_upstream,
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
             body_file,
             keep_upstream_headers: !loc.add_headers.is_empty()
                 || !loc.add_trailers.is_empty()
-                || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
+                || loc.access_logs.iter().any(|l| l.reads_upstream_headers)
+                || sticky
+                    .as_ref()
+                    .and_then(|s| s.conf.learn())
+                    .is_some_and(|l| l.reads_upstream),
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
@@ -1272,6 +1304,7 @@ pub(crate) fn run_location_handler(
             h2: proxy.http_version == 2,
             cache,
             hash,
+            sticky,
             bind,
         }));
     }
@@ -1475,10 +1508,15 @@ pub(crate) fn run_location_handler(
                         server_bytes,
                     ))
                 }
-                fs_resolve::Outcome::Reroute(target) => {
-                    // A try_files fallback such as `/index.php?$args`
-                    // brings its own arguments: nginx's internal redirect
-                    // takes the part after `?` as the new `$args`.
+                outcome @ (fs_resolve::Outcome::Reroute(_) | fs_resolve::Outcome::Fallback(_)) => {
+                    // A try_files fallback URI brings its own arguments,
+                    // the part after `?`, and none without one
+                    // (ngx_http_try_files_module.c, ngx_http_split_args).
+                    let (target, fallback) = match outcome {
+                        fs_resolve::Outcome::Fallback(target) => (target, true),
+                        fs_resolve::Outcome::Reroute(target) => (target, false),
+                        _ => unreachable!(),
+                    };
                     let (target, args) = match target {
                         phase::RerouteTarget::Uri(mut uri) => {
                             match uri.iter().position(|&b| b == b'?') {
@@ -1487,7 +1525,7 @@ pub(crate) fn run_location_handler(
                                     uri.truncate(q);
                                     (phase::RerouteTarget::Uri(uri), Some(args))
                                 }
-                                None => (phase::RerouteTarget::Uri(uri), None),
+                                None => (phase::RerouteTarget::Uri(uri), fallback.then(Vec::new)),
                             }
                         }
                         named => (named, None),
@@ -1500,6 +1538,7 @@ pub(crate) fn run_location_handler(
                         preserved_location: None,
                         preserved_www_authenticate: Vec::new(),
                         closes: false,
+                        named_from: None,
                     });
                 }
                 fs_resolve::Outcome::NotFound => {
@@ -1668,6 +1707,19 @@ pub(crate) fn run_location_handler(
     )
 }
 
+/// The body length past which the location refuses the request: its
+/// `client_max_body_size` (`0`: none), and always a malformed body.
+#[inline]
+fn body_threshold(loc: &MatchedLocation<'static>) -> u64 {
+    match loc
+        .client_max_body_size
+        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE)
+    {
+        0 => phase::MALFORMED_BODY - 1,
+        limit => limit.min(phase::MALFORMED_BODY - 1),
+    }
+}
+
 /// A file under `gzip_static` (#760), as the `Serve` arm sends a file:
 /// `file.gz` with `Content-Encoding: gzip` (`gzip`), or the file itself,
 /// and `Vary: Accept-Encoding` with `vary` unless the gzip filter adds it.
@@ -1760,7 +1812,8 @@ fn serve_gzip_static(
 /// The 413 for a body over the location's `client_max_body_size`, sent as
 /// nginx's special response: the location's `error_page` and `add_header
 /// … always` apply (ngx_http_finalize_request(r, 413) from the find_config
-/// phase). Cold.
+/// phase); or the 400 for a malformed body, as nginx finalizes it where the
+/// location reads or discards the body (#806).
 #[cold]
 #[inline(never)]
 fn entity_too_large(
@@ -1770,12 +1823,16 @@ fn entity_too_large(
     in_error_page: bool,
     preserved_www_authenticate: &[Vec<u8>],
 ) -> Response {
-    let response = http::error_response_for_method(
-        413,
-        "Request Entity Too Large\n",
-        req.method,
-        loc.server_header,
-    );
+    let response = if req.body_len == phase::MALFORMED_BODY {
+        http::error_response_for_method(400, "Bad Request\n", req.method, loc.server_header)
+    } else {
+        http::error_response_for_method(
+            413,
+            "Request Entity Too Large\n",
+            req.method,
+            loc.server_header,
+        )
+    };
     let intercepted = maybe_intercept_error_page(
         Response::Owned(response),
         loc.error_pages,
