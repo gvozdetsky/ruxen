@@ -2376,6 +2376,8 @@ fn unrouted_discard(server: &PreparedServer, continue_status: Option<u16>) -> Fi
         max: 0,
         buffer: crate::worker::DEFAULT_CLIENT_BODY_BUFFER_SIZE,
         error_logs: server.error_logs,
+        access_logs: server.access_logs,
+        server_port: server.listen_port,
         server_name: server.primary_server_name,
         persistent: false,
         body_temp: None,
