@@ -28,6 +28,10 @@ pub struct UpstreamTlsConn {
 pub enum UpstreamIo {
     Plain(TcpStream),
     Tls(Box<UpstreamTlsConn>),
+    /// `proxy_http_version 2` (#599): HTTP/1.1 in and out, a stream on an
+    /// HTTP/2 connection underneath. Its operations are boxed, so the
+    /// other arms' futures don't grow.
+    H2(Box<crate::upstream_h2::H2Conn>),
 }
 
 impl UpstreamIo {
@@ -35,6 +39,7 @@ impl UpstreamIo {
         match self {
             UpstreamIo::Plain(_) => None,
             UpstreamIo::Tls(s) => Some(&s.identity),
+            UpstreamIo::H2(c) => c.tls_identity(),
         }
     }
 
@@ -43,6 +48,7 @@ impl UpstreamIo {
         match self {
             UpstreamIo::Plain(s) => crate::worker::recv_now(s, buf).await,
             UpstreamIo::Tls(s) => s.stream.read(buf).await,
+            UpstreamIo::H2(c) => Box::pin(c.read(buf)).await,
         }
     }
 
@@ -58,6 +64,8 @@ impl UpstreamIo {
                 let (r, w, _) = into_split(s.stream);
                 (UpstreamRead::Tls(r), UpstreamWrite::Tls(w))
             }
+            // An HTTP/2 response is never a 101: the plan has no upgrade.
+            UpstreamIo::H2(_) => unreachable!("ruxen: no tunnel over an HTTP/2 upstream"),
         }
     }
 }
@@ -67,6 +75,7 @@ impl AsyncReadRent for UpstreamIo {
         match self {
             UpstreamIo::Plain(s) => s.read(buf).await,
             UpstreamIo::Tls(s) => s.stream.read(buf).await,
+            UpstreamIo::H2(c) => Box::pin(c.read(buf)).await,
         }
     }
 
@@ -74,6 +83,7 @@ impl AsyncReadRent for UpstreamIo {
         match self {
             UpstreamIo::Plain(s) => s.readv(buf).await,
             UpstreamIo::Tls(s) => s.stream.readv(buf).await,
+            UpstreamIo::H2(c) => Box::pin(c.readv(buf)).await,
         }
     }
 }
@@ -83,6 +93,7 @@ impl AsyncWriteRent for UpstreamIo {
         match self {
             UpstreamIo::Plain(s) => s.write(buf).await,
             UpstreamIo::Tls(s) => s.stream.write(buf).await,
+            UpstreamIo::H2(c) => Box::pin(c.write(buf)).await,
         }
     }
 
@@ -90,6 +101,7 @@ impl AsyncWriteRent for UpstreamIo {
         match self {
             UpstreamIo::Plain(s) => s.writev(buf).await,
             UpstreamIo::Tls(s) => s.stream.writev(buf).await,
+            UpstreamIo::H2(c) => Box::pin(c.writev(buf)).await,
         }
     }
 
@@ -97,6 +109,7 @@ impl AsyncWriteRent for UpstreamIo {
         match self {
             UpstreamIo::Plain(s) => s.flush().await,
             UpstreamIo::Tls(s) => s.stream.flush().await,
+            UpstreamIo::H2(_) => Ok(()),
         }
     }
 
@@ -104,6 +117,7 @@ impl AsyncWriteRent for UpstreamIo {
         match self {
             UpstreamIo::Plain(s) => s.shutdown().await,
             UpstreamIo::Tls(s) => s.stream.shutdown().await,
+            UpstreamIo::H2(_) => Ok(()),
         }
     }
 }

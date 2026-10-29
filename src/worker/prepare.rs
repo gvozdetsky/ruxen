@@ -1113,10 +1113,11 @@ pub(crate) fn prepare_upstreams(
             .sticky
             .map(|conf| crate::upstream_sticky::Sticky::prepare(conf, &u.servers, name_static));
         let mut peers_vec: Vec<PreparedPeer> = Vec::with_capacity(u.servers.len());
+        let mut hosts = Vec::new();
         for s in u.servers {
             let display: &'static [u8] =
                 crate::arena::leak(s.display.into_bytes().into_boxed_slice());
-            peers_vec.push(PreparedPeer {
+            let peer = PreparedPeer {
                 addr: PeerAddr::from_config(s.addr),
                 display,
                 weight: s.weight,
@@ -1125,7 +1126,22 @@ pub(crate) fn prepare_upstreams(
                 max_conns: s.max_conns,
                 down: s.down,
                 backup: s.backup,
-            });
+            };
+            match (s.resolve, peer.addr) {
+                (Some(name), PeerAddr::Inet(addr)) => {
+                    hosts.push(crate::upstream_resolve::HostConf {
+                        name,
+                        service: s.service,
+                        port: addr.port(),
+                        template: peer,
+                        route: s.route.map(|r| -> &'static [u8] {
+                            crate::arena::leak(r.into_bytes().into_boxed_slice())
+                        }),
+                        drain: s.drain,
+                    })
+                }
+                _ => peers_vec.push(peer),
+            }
         }
         let peers: &'static [PreparedPeer] = crate::arena::leak(peers_vec.into_boxed_slice());
         // ngx_http_upstream_keepalive_init_main_conf: since 1.29.7 every
@@ -1147,12 +1163,36 @@ pub(crate) fn prepare_upstreams(
             lb: crate::upstream::Lb::prepare(u.lb, peers),
             shared: u
                 .zone
+                .as_ref()
                 .map(|_| crate::upstream::PeerShared::for_peers(peers.len())),
             sticky,
             metrics: super::metrics::peer_slots(name_static.as_bytes(), peers),
+            dynamic: None,
         }));
-        super::metrics::note_upstream(prepared);
-        out.insert(name_static, &*prepared);
+        let prepared: &'static PreparedUpstream = match (&u.zone, u.resolver) {
+            (Some(zone), Some(resolver)) if !hosts.is_empty() => {
+                // Resolved peers take slots from a pool (#879).
+                let pool =
+                    super::metrics::peer_pool(name_static.as_bytes(), peers, prepared.metrics);
+                let dynamic = crate::upstream_resolve::Dynamic::prepare(
+                    *prepared,
+                    zone,
+                    hosts,
+                    prepare_resolver(resolver),
+                    std::time::Duration::from_millis(u.resolver_timeout_ms.unwrap_or(30_000)),
+                    pool,
+                );
+                if let Some(pool) = pool {
+                    pool.note(dynamic);
+                }
+                dynamic
+            }
+            _ => {
+                super::metrics::note_upstream(prepared);
+                prepared
+            }
+        };
+        out.insert(name_static, prepared);
     }
     out
 }
@@ -1540,6 +1580,7 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    dynamic: None,
                     sticky: None,
                     metrics: super::metrics::peer_slots(host_header_static, peers),
                 }));
@@ -1578,7 +1619,9 @@ pub(crate) fn build_proxy(
                 resolver: eff.resolver,
                 resolver_timeout_ms: eff.resolver_timeout_ms,
                 tls: tls
-                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .then(|| {
+                        prepare_upstream_tls(eff.tls, host_header_static, eff.http_version == 2)
+                    })
                     .transpose()?,
             }
         }
@@ -1591,7 +1634,7 @@ pub(crate) fn build_proxy(
             let upstream = *upstreams.get(name.as_str()).unwrap_or_else(|| {
                 panic!("ruxen: proxy_pass http://{name} references undeclared upstream block")
             });
-            if upstream.peers.is_empty() {
+            if upstream.peers.is_empty() && upstream.dynamic.is_none() {
                 panic!("ruxen: upstream {name} has no servers (parser invariant violated)");
             }
             let host_header_static: &'static [u8] =
@@ -1627,7 +1670,9 @@ pub(crate) fn build_proxy(
                 resolver: eff.resolver,
                 resolver_timeout_ms: eff.resolver_timeout_ms,
                 tls: tls
-                    .then(|| prepare_upstream_tls(eff.tls, host_header_static))
+                    .then(|| {
+                        prepare_upstream_tls(eff.tls, host_header_static, eff.http_version == 2)
+                    })
                     .transpose()?,
             }
         }
@@ -1657,6 +1702,7 @@ pub(crate) fn build_proxy(
                     keepalive_max_lifetime_ms: 3_600_000,
                     lb: crate::upstream::Lb::RoundRobin,
                     shared: None,
+                    dynamic: None,
                     sticky: None,
                     // A request's own peers: not counted.
                     metrics: None,
@@ -1690,7 +1736,7 @@ pub(crate) fn build_proxy(
                 bind: eff.bind,
                 resolver: eff.resolver,
                 resolver_timeout_ms: eff.resolver_timeout_ms,
-                tls: Some(prepare_upstream_tls(eff.tls, b"")?),
+                tls: Some(prepare_upstream_tls(eff.tls, b"", eff.http_version == 2)?),
                 proxy_method: eff.proxy_method,
             }
         }
@@ -1704,9 +1750,11 @@ pub(crate) fn build_proxy(
 /// `proxy_ssl_*` for a location that proxies over TLS: the shared client
 /// config, and the name (`proxy_ssl_name`, else `host`, the host of
 /// `proxy_pass`; empty for a URL with variables, whose host is rendered).
+/// `h2`: ALPN offers `h2` (`proxy_http_version 2`, #599).
 fn prepare_upstream_tls(
     settings: super::prepared::UpstreamTlsSettings,
     host: &[u8],
+    h2: bool,
 ) -> Result<&'static crate::upstream_tls::PreparedUpstreamTls, String> {
     // `proxy_ssl_verify on` needs the certificates to trust, as nginx's
     // ngx_http_proxy_set_ssl refuses it without them.
@@ -1751,6 +1799,7 @@ fn prepare_upstream_tls(
                 settings.server_name,
                 settings.session_reuse,
                 store.clone(),
+                h2,
                 settings.certificate_cache,
             ));
             None
@@ -1762,6 +1811,7 @@ fn prepare_upstream_tls(
         settings.session_reuse,
         store,
         client_cert,
+        h2,
     )?;
     let literal = |parts: &[PreparedValuePart]| -> Option<Vec<u8>> {
         let mut out = Vec::new();

@@ -33,7 +33,6 @@ use crate::phase::Response;
 use crate::upstream;
 use crate::upstream::LeasedPeer;
 use crate::worker::PeerAddr;
-use crate::worker::PreparedUpstream;
 use crate::worker::range::RangeAllow;
 
 // Per-worker reusable scratch buffers for proxy::attempt. The proxy hot path
@@ -79,8 +78,9 @@ pub(crate) fn return_proxy_buf(mut v: Vec<u8>) {
 /// Per-request upstream attempt plan. Built synchronously inside the
 /// location handler; consumed by `run_proxy` on the worker async task.
 pub struct ProxyPlan {
-    /// Pointer to the prepared upstream (owns peers + keepalive config).
-    pub upstream: &'static PreparedUpstream,
+    /// The prepared upstream (owns peers + keepalive config), the version
+    /// of its peers this request uses.
+    pub upstream: upstream::UpstreamRef,
     /// `proxy_pass` with variables naming an address (#100) or a host
     /// name to resolve (#133): the peers to use instead of `upstream`'s,
     /// which is then a placeholder. Boxed: only a `proxy_pass` with
@@ -192,6 +192,8 @@ pub struct ProxyPlan {
     /// `proxy_ignore_client_abort`: when off, a client that closes while
     /// the upstream is awaited ends the exchange with 499 (#136).
     pub ignore_client_abort: bool,
+    /// `proxy_http_version 2` (#599): a new connection speaks HTTP/2.
+    pub h2: bool,
 }
 
 /// The peers of one request's `proxy_pass` with variables: nginx's
@@ -510,8 +512,19 @@ async fn read_unread_hit(plan: &mut ProxyPlan) -> Result<(), Response> {
     }
     cache.request_headers = headers;
     if (cache.hit.is_none() || cache.background) && plan.initial_peer.is_none() {
-        plan.initial_peer =
-            upstream::pick_peer(plan.upstream, &Default::default(), plan.hash.as_deref_mut());
+        plan.initial_peer = match plan.sticky.as_deref() {
+            None => upstream::pick_peer(
+                &plan.upstream,
+                &Default::default(),
+                plan.hash.as_deref_mut(),
+            ),
+            Some(st) => upstream::pick_peer_sticky(
+                &plan.upstream,
+                &Default::default(),
+                plan.hash.as_deref_mut(),
+                &st.hint,
+            ),
+        };
     }
     Ok(())
 }
@@ -768,7 +781,8 @@ pub fn write_request(
     buf.extend_from_slice(method_bytes);
     buf.push(b' ');
     buf.extend_from_slice(uri);
-    buf.extend_from_slice(if http_version_minor == 1 {
+    // HTTP/2 (2) goes to `upstream_h2` as an HTTP/1.1 head.
+    buf.extend_from_slice(if http_version_minor != 0 {
         b" HTTP/1.1\r\n"
     } else {
         b" HTTP/1.0\r\n"
@@ -870,11 +884,11 @@ impl ProxyPlan {
         match self.adhoc.as_deref() {
             Some(adhoc) if adhoc.peers.len() > 1 => (0..adhoc.peers.len())
                 .find(|&i| !tried.contains(i))
-                .map(|i| LeasedPeer::adhoc(self.upstream, i)),
+                .map(|i| LeasedPeer::adhoc(&self.upstream, i)),
             _ => match self.sticky.as_deref() {
-                None => upstream::pick_peer(self.upstream, tried, self.hash.as_deref_mut()),
+                None => upstream::pick_peer(&self.upstream, tried, self.hash.as_deref_mut()),
                 Some(st) => upstream::pick_peer_sticky(
-                    self.upstream,
+                    &self.upstream,
                     tried,
                     self.hash.as_deref_mut(),
                     &st.hint,
@@ -1007,7 +1021,7 @@ pub async fn run_proxy(
     let accel = &mut report.accel;
     let states = &mut report.states;
     let attempt_started = &mut report.attempt_started;
-    let upstream = plan.upstream;
+    let upstream = plan.upstream.clone();
     if plan.adhoc.as_ref().is_some_and(|a| a.resolve.is_some())
         && let Err(response) = Box::pin(resolve_peers(&mut plan, failures)).await
     {
@@ -1078,7 +1092,7 @@ pub async fn run_proxy(
         //    a fresh connect — the pooled conn was likely stale. The
         //    stale-retry counts as part of the same `attempt` budget.
         let pooled = upstream::pool_take(
-            upstream,
+            &upstream,
             current.peer_idx,
             plan.tls.as_deref(),
             plan.pool_tag,
@@ -1183,9 +1197,9 @@ pub async fn run_proxy(
                     // max_fails (NGX_PEER_NEXT, ngx_http_upstream_next);
                     // 5xx and 429 are failures.
                     if matches!(status, 403 | 404) {
-                        upstream::report_success(upstream, current.peer_idx);
+                        upstream::report_success(&upstream, current.peer_idx);
                     } else {
-                        upstream::report_failure(upstream, current.peer_idx);
+                        upstream::report_failure(&upstream, current.peer_idx);
                     }
                     let Some(next) = plan.next_peer(&tried) else {
                         // No peer left: nginx's FT_NOLIVE, which `proxy_cache_use_stale error`
@@ -1207,7 +1221,7 @@ pub async fn run_proxy(
                 // check `proxy_intercept_errors`: an upstream status that
                 // matches a configured `error_page` rule turns into a
                 // Reroute instead of being forwarded.
-                upstream::report_success(upstream, current.peer_idx);
+                upstream::report_success(&upstream, current.peer_idx);
                 // ngx_http_upstream_test_next: a status
                 // proxy_cache_use_stale lists is answered from the cache.
                 if let Some(stale) = stale_answer(&mut plan, report, StaleCase::Status(status)) {
@@ -1292,7 +1306,7 @@ pub async fn run_proxy(
                 unreachable!("ruxen: pooled-stale outcome leaked past stale-retry collapse");
             }
             AttemptOutcome::Failed(resp, kind, error) => {
-                upstream::report_failure(upstream, current.peer_idx);
+                upstream::report_failure(&upstream, current.peer_idx);
                 let sent = !matches!(
                     *error,
                     UpstreamError::ConnectFailed(_)
@@ -2140,6 +2154,14 @@ async fn attempt(
                 }
             }
         };
+        let stream = if plan.h2 {
+            match Box::pin(h2_connect(plan, stream)).await {
+                Ok(stream) => stream,
+                Err(outcome) => return outcome,
+            }
+        } else {
+            stream
+        };
         (stream, Instant::now(), 0, slot)
     };
     state.connect_ms = Some(elapsed_ms(started));
@@ -2646,7 +2668,7 @@ async fn attempt(
         let pool =
             (plan.keepalive_eligible && status_code != 101 && !upstream_close && upstream_is_11)
                 .then_some(crate::proxy_stream::StreamPool {
-                    upstream: plan.upstream,
+                    upstream: plan.upstream.clone(),
                     peer_idx,
                     tag: plan.pool_tag,
                     opened_at,
@@ -2793,7 +2815,7 @@ async fn attempt(
         && response_framed
     {
         upstream::pool_release(
-            plan.upstream,
+            &plan.upstream,
             peer_idx,
             plan.pool_tag,
             upstream::PooledConn {
@@ -2816,6 +2838,33 @@ async fn attempt(
     return_proxy_buf(accum);
     return_proxy_buf(read_buf);
     AttemptOutcome::Ok(Response::Owned(out))
+}
+
+/// `proxy_http_version 2` (#599): HTTP/2 on a new connection, under
+/// `proxy_connect_timeout` as the TLS handshake is.
+#[cold]
+#[allow(clippy::result_large_err)] // cold: once per new connection
+async fn h2_connect(plan: &ProxyPlan, stream: UpstreamIo) -> Result<UpstreamIo, AttemptOutcome> {
+    let identity = stream.tls_identity().cloned();
+    let https = identity.is_some();
+    match timeout(
+        plan.connect_timeout,
+        crate::upstream_h2::handshake(stream, https, identity),
+    )
+    .await
+    {
+        Ok(Ok(conn)) => Ok(UpstreamIo::H2(Box::new(conn))),
+        Ok(Err(e)) => Err(AttemptOutcome::Failed(
+            Response::Prebuilt(plan.bad_gateway.pick(plan.method)),
+            FailKind::Error,
+            Box::new(UpstreamError::SendFailed(e)),
+        )),
+        Err(_) => Err(AttemptOutcome::Failed(
+            Response::Prebuilt(plan.gateway_timeout.pick(plan.method)),
+            FailKind::Timeout,
+            Box::new(UpstreamError::TimedOut(Stage::Connecting)),
+        )),
+    }
 }
 
 /// How a body that hasn't all arrived with the header (`initial`) is
