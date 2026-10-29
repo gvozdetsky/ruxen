@@ -669,11 +669,7 @@ pub(crate) fn finish_access_denial(
         rewrite_state,
         server_name_captures,
     );
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    if body_limit > 0 && req.body_len > body_limit && !in_error_page && error_page_status.is_none()
-    {
+    if req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none() {
         return entity_too_large(
             &loc,
             req,
@@ -823,13 +819,8 @@ pub(crate) fn run_location_handler(
     // nginx's default client_max_body_size is 1m; `0` turns the check off.
     // Not again on the way to an error page: nginx has discarded the body
     // by then (`!r->discard_body` in ngx_http_core_find_config_phase).
-    let body_limit = loc
-        .client_max_body_size
-        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE);
-    let too_large = body_limit > 0
-        && req.body_len > body_limit
-        && !in_error_page
-        && error_page_status.is_none();
+    let too_large =
+        req.body_len > body_threshold(&loc) && !in_error_page && error_page_status.is_none();
 
     let render_ctx_base = location_render_ctx(
         http,
@@ -1707,6 +1698,19 @@ pub(crate) fn run_location_handler(
     )
 }
 
+/// The body length past which the location refuses the request: its
+/// `client_max_body_size` (`0`: none), and always a malformed body.
+#[inline]
+fn body_threshold(loc: &MatchedLocation<'static>) -> u64 {
+    match loc
+        .client_max_body_size
+        .unwrap_or(DEFAULT_CLIENT_MAX_BODY_SIZE)
+    {
+        0 => phase::MALFORMED_BODY - 1,
+        limit => limit.min(phase::MALFORMED_BODY - 1),
+    }
+}
+
 /// A file under `gzip_static` (#760), as the `Serve` arm sends a file:
 /// `file.gz` with `Content-Encoding: gzip` (`gzip`), or the file itself,
 /// and `Vary: Accept-Encoding` with `vary` unless the gzip filter adds it.
@@ -1799,7 +1803,8 @@ fn serve_gzip_static(
 /// The 413 for a body over the location's `client_max_body_size`, sent as
 /// nginx's special response: the location's `error_page` and `add_header
 /// … always` apply (ngx_http_finalize_request(r, 413) from the find_config
-/// phase). Cold.
+/// phase); or the 400 for a malformed body, as nginx finalizes it where the
+/// location reads or discards the body (#806).
 #[cold]
 #[inline(never)]
 fn entity_too_large(
@@ -1809,12 +1814,16 @@ fn entity_too_large(
     in_error_page: bool,
     preserved_www_authenticate: &[Vec<u8>],
 ) -> Response {
-    let response = http::error_response_for_method(
-        413,
-        "Request Entity Too Large\n",
-        req.method,
-        loc.server_header,
-    );
+    let response = if req.body_len == phase::MALFORMED_BODY {
+        http::error_response_for_method(400, "Bad Request\n", req.method, loc.server_header)
+    } else {
+        http::error_response_for_method(
+            413,
+            "Request Entity Too Large\n",
+            req.method,
+            loc.server_header,
+        )
+    };
     let intercepted = maybe_intercept_error_page(
         Response::Owned(response),
         loc.error_pages,

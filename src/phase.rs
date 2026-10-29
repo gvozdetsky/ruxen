@@ -224,6 +224,10 @@ fn stops_before_slow(state: &RewriteState) -> bool {
 /// The body of a request that has none.
 pub static NO_BODY: bytes::Bytes = bytes::Bytes::new();
 
+/// `RequestCtx::body_len` of a body whose framing was bad: the location
+/// answers 400 where it would answer 413 (#806).
+pub const MALFORMED_BODY: u64 = u64::MAX;
+
 /// Per-request inputs the pipeline needs from the parser + connection.
 /// Narrow on purpose — each field added here is a new dependency between
 /// the worker's parse loop and the phase machinery.
