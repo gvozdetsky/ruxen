@@ -408,6 +408,67 @@ fn return_body_expands_variables() {
     assert_eq!(body(&r), b"uri=/p/q host=example.com");
 }
 
+// #778: empty lines before a request line are skipped, as nginx does.
+#[test]
+fn empty_lines_before_a_request_line_are_skipped() {
+    let (_guard, port, _dir) = spawn_server(
+        r#"
+            events {}
+            http {
+                server {
+                    listen 127.0.0.1:%%PORT%%;
+                    location / { return 200 "ok\n"; }
+                }
+            }
+        "#,
+    );
+    let ok = |r: &[u8]| r.windows(15).filter(|w| *w == b"HTTP/1.1 200 OK").count();
+    // A CRLF after a body, then the next request.
+    let r = request(
+        port,
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello\r\n\
+          GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(ok(&r), 2, "{}", String::from_utf8_lossy(&r));
+    let r = request(
+        port,
+        b"\r\n\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+    // The empty lines in reads of their own.
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    for part in [&b"\r\n"[..], b"\r", b"\nGET / HTTP/1.1\r\nHost: x\r\n"] {
+        s.write_all(part).unwrap();
+        sleep(Duration::from_millis(50));
+    }
+    s.write_all(b"Connection: close\r\n\r\n").unwrap();
+    let mut r = Vec::new();
+    let _ = s.read_to_end(&mut r);
+    assert_eq!(status_line(&r), "HTTP/1.1 200 OK");
+}
+
+// #784: an HTTP/0.9 request line is refused at once, not left waiting
+// for headers until client_header_timeout.
+#[test]
+fn http_09_request_line_is_refused_at_once() {
+    let (_guard, port, _dir) = spawn_server(
+        r#"
+            events {}
+            http {
+                server {
+                    listen 127.0.0.1:%%PORT%%;
+                    location / { return 200 "ok\n"; }
+                }
+            }
+        "#,
+    );
+    for line in [&b"GET /\r\n"[..], b"GET /a\n", b"HEAD /\r\n"] {
+        let r = request(port, line);
+        assert_eq!(status_line(&r), "HTTP/1.1 400 Bad Request", "{line:?}");
+    }
+}
+
 // #781: HTTP/1.1 needs `Host` whatever the target's form; HTTP/1.0 doesn't.
 #[test]
 fn absolute_form_without_host_is_a_400_on_http_11() {
