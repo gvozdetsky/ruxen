@@ -222,7 +222,8 @@ pub(crate) fn parse_map_block(args: &[String], lx: &mut Lexer) -> Result<MapBloc
             });
         }
         let (lhs, rhs) = (&line_args[0], &line_args[1]);
-        let value = parse_value_without_captures(rhs)?;
+        // `$1`…`$9`: a regex entry's own captures, else the request's.
+        let value = parse_value_with_vars(rhs)?;
 
         if lhs == "default" {
             if default.is_some() {

@@ -336,6 +336,20 @@ fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// The request's `sticky` (#600). Out of line: only upstreams with one.
+#[cold]
+#[inline(never)]
+fn sticky_for_request(
+    conf: &'static crate::upstream_sticky::Sticky,
+    ctx: &RenderCtx<'_>,
+) -> Box<crate::upstream_sticky::StickyReq> {
+    crate::upstream_sticky::StickyReq::new(conf, |parts| {
+        let mut out = Vec::new();
+        render_parts(parts, ctx, &mut out);
+        out
+    })
+}
+
 /// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
 /// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
 /// a request line split in two (#541).
@@ -985,13 +999,26 @@ pub(crate) fn run_location_handler(
             },
             render_ctx_base.remote_addr,
         );
+        let sticky = upstream
+            .sticky
+            .map(|conf| sticky_for_request(conf, &render_ctx_base));
         let initial_peer = if cache
             .as_ref()
             .is_some_and(|c| (c.hit.is_some() && !c.background) || c.unread)
         {
             None
         } else {
-            crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+            match sticky.as_deref() {
+                None => {
+                    crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+                }
+                Some(st) => crate::upstream::pick_peer_sticky(
+                    upstream,
+                    &Default::default(),
+                    hash.as_deref_mut(),
+                    &st.hint,
+                ),
+            }
         };
 
         // Build the final header set: proxy_set_header overrides first
@@ -1196,10 +1223,19 @@ pub(crate) fn run_location_handler(
             for ep in loc.error_pages {
                 let mut buf = Vec::with_capacity(64);
                 render_parts(ep.target, &proxy_render_ctx, &mut buf);
+                let named_from = (buf.first() == Some(&b'@')).then(|| {
+                    Box::new(phase::NamedFrom {
+                        uri: url_path.to_vec(),
+                        args: current_args.map(<[u8]>::to_vec),
+                        unparsed_uri: rewrite_state.unparsed_uri,
+                        internal: rewrite_state.internal,
+                    })
+                });
                 rules.push(crate::proxy::InterceptRule {
                     status: ep.status,
                     action: ep.action,
                     target: buf,
+                    named_from,
                 });
             }
             Some(rules)
@@ -1264,7 +1300,11 @@ pub(crate) fn run_location_handler(
             body_feed: body_feed.cloned(),
             keep_upstream_headers: !loc.add_headers.is_empty()
                 || !loc.add_trailers.is_empty()
-                || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
+                || loc.access_logs.iter().any(|l| l.reads_upstream_headers)
+                || sticky
+                    .as_ref()
+                    .and_then(|s| s.conf.learn())
+                    .is_some_and(|l| l.reads_upstream),
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
@@ -1275,6 +1315,7 @@ pub(crate) fn run_location_handler(
             ignore_client_abort: proxy.ignore_client_abort,
             cache,
             hash,
+            sticky,
             bind,
         }));
     }
@@ -1478,10 +1519,15 @@ pub(crate) fn run_location_handler(
                         server_bytes,
                     ))
                 }
-                fs_resolve::Outcome::Reroute(target) => {
-                    // A try_files fallback such as `/index.php?$args`
-                    // brings its own arguments: nginx's internal redirect
-                    // takes the part after `?` as the new `$args`.
+                outcome @ (fs_resolve::Outcome::Reroute(_) | fs_resolve::Outcome::Fallback(_)) => {
+                    // A try_files fallback URI brings its own arguments,
+                    // the part after `?`, and none without one
+                    // (ngx_http_try_files_module.c, ngx_http_split_args).
+                    let (target, fallback) = match outcome {
+                        fs_resolve::Outcome::Fallback(target) => (target, true),
+                        fs_resolve::Outcome::Reroute(target) => (target, false),
+                        _ => unreachable!(),
+                    };
                     let (target, args) = match target {
                         phase::RerouteTarget::Uri(mut uri) => {
                             match uri.iter().position(|&b| b == b'?') {
@@ -1490,7 +1536,7 @@ pub(crate) fn run_location_handler(
                                     uri.truncate(q);
                                     (phase::RerouteTarget::Uri(uri), Some(args))
                                 }
-                                None => (phase::RerouteTarget::Uri(uri), None),
+                                None => (phase::RerouteTarget::Uri(uri), fallback.then(Vec::new)),
                             }
                         }
                         named => (named, None),
@@ -1503,6 +1549,7 @@ pub(crate) fn run_location_handler(
                         preserved_location: None,
                         preserved_www_authenticate: Vec::new(),
                         closes: false,
+                        named_from: None,
                     });
                 }
                 fs_resolve::Outcome::NotFound => {

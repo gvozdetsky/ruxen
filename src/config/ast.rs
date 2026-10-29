@@ -686,6 +686,53 @@ pub struct UpstreamBlock {
     /// `zone name [size]` (#143): the peers' state is shared by all
     /// workers.
     pub zone: Option<String>,
+    /// `sticky` (#600): session affinity.
+    pub sticky: Option<StickyConf>,
+}
+
+/// `sticky cookie | route | learn` (ngx_http_upstream_sticky_module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickyConf {
+    /// `sticky cookie name [expires=] [domain=] [httponly] [samesite=]
+    /// [secure] [path=]`: the server's ID goes to the client in a cookie.
+    Cookie(StickyCookie),
+    /// `sticky route $var ...`: the first non-empty variable is the
+    /// server's `route=`.
+    Route { lookup: Vec<Vec<ValuePart>> },
+    /// `sticky learn create=$var lookup=$var zone=name:size [timeout=]
+    /// [header]`: sessions the server creates, kept in a zone.
+    Learn(StickyLearn),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickyCookie {
+    pub name: String,
+    pub domain: Option<Vec<ValuePart>>,
+    /// `path=`, as `; path=VALUE`.
+    pub path: Option<String>,
+    /// `expires=` in seconds; `None`: a session cookie.
+    pub expires: Option<StickyExpires>,
+    pub httponly: bool,
+    pub secure: bool,
+    pub samesite: Option<Vec<ValuePart>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickyExpires {
+    /// `expires=max`.
+    Max,
+    Secs(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickyLearn {
+    pub lookup: Vec<Vec<ValuePart>>,
+    pub create: Vec<Vec<ValuePart>>,
+    pub zone: String,
+    pub zone_size: u64,
+    pub timeout_ms: u64,
+    /// `header`: learn once the response header arrives, not at the end.
+    pub header: bool,
 }
 
 /// Load-balancing algorithm for an `upstream {}` block. Smoothed weighted
@@ -732,6 +779,10 @@ pub struct UpstreamServer {
     pub max_conns: u32,
     pub down: bool,
     pub backup: bool,
+    /// `drain`: down, except for requests bound to it by `sticky`.
+    pub drain: bool,
+    /// `route=`: the server's ID for `sticky`.
+    pub route: Option<String>,
 }
 
 /// One `listen` directive, address plus the flag bag. The current set of

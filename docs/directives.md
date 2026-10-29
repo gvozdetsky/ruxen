@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 202 implemented, 18 accepted with a difference, 68 accepted with no effect, 0 refused, 276 unknown.
+Of 564 directives: 203 implemented, 18 accepted with a difference, 68 accepted with no effect, 0 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -672,7 +672,9 @@ Not supported: `random`.
 
 ## http_upstream_sticky
 
-Not supported: `sticky`.
+| directive | ruxen | contexts | notes |
+| --- | --- | --- | --- |
+| `sticky` | yes | upstream |  |
 
 ## http_upstream_zone
 

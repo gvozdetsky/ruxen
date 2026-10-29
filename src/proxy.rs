@@ -181,6 +181,8 @@ pub struct ProxyPlan {
     /// A hash balancer's state for this request (`hash`, `ip_hash`), which
     /// `proxy_next_upstream` picks continue from.
     pub hash: Option<Box<upstream::HashPick>>,
+    /// The request's `sticky` (#600), for an upstream with one.
+    pub sticky: Option<Box<crate::upstream_sticky::StickyReq>>,
     /// `proxy_bind` for this request: the local address new upstream
     /// connections are bound to. Pooled ones are reused as they are.
     pub bind: Option<LocalBind>,
@@ -705,6 +707,8 @@ pub struct InterceptRule {
     pub status: u16,
     pub action: crate::worker::PreparedErrorPageAction,
     pub target: Vec<u8>,
+    /// For a named target: where the request was (#814).
+    pub named_from: Option<Box<crate::phase::NamedFrom>>,
 }
 
 #[allow(dead_code)] // direct callers without a plan still want hardcoded fallback constants
@@ -867,8 +871,40 @@ impl ProxyPlan {
             Some(adhoc) if adhoc.peers.len() > 1 => (0..adhoc.peers.len())
                 .find(|&i| !tried.contains(i))
                 .map(|i| LeasedPeer::adhoc(self.upstream, i)),
-            _ => upstream::pick_peer(self.upstream, tried, self.hash.as_deref_mut()),
+            _ => match self.sticky.as_deref() {
+                None => upstream::pick_peer(self.upstream, tried, self.hash.as_deref_mut()),
+                Some(st) => upstream::pick_peer_sticky(
+                    self.upstream,
+                    tried,
+                    self.hash.as_deref_mut(),
+                    &st.hint,
+                ),
+            },
         }
+    }
+}
+
+/// `sticky learn` once a response is taken from the peer: at once with
+/// `header` (nginx's NOTIFY_HEADER, not for an intercepted error), else
+/// when the peer is freed.
+#[cold]
+#[inline(never)]
+fn sticky_learn(
+    sticky: &crate::upstream_sticky::StickyReq,
+    lease: &mut LeasedPeer,
+    upstream_headers: &[u8],
+    intercepted: bool,
+) {
+    let Some(learn) = sticky.conf.learn() else {
+        return;
+    };
+    let Some(session) = sticky.session(upstream_headers) else {
+        return;
+    };
+    if !learn.header {
+        lease.learn = Some(Box::new(session));
+    } else if !intercepted {
+        session.record(sticky.conf, lease.peer_idx);
     }
 }
 
@@ -1033,6 +1069,10 @@ pub async fn run_proxy(
             plan.peer_addr(current.peer_idx),
         )));
         let state = states.last_mut().expect("just pushed");
+        if let Some(sticky) = plan.sticky.as_deref_mut() {
+            // The cookie names the peer of this attempt.
+            sticky.peer = current.peer_idx;
+        }
         // 1. Try the pool first for this peer. On any failure before the
         //    response headers parse, drop the socket and retry once with
         //    a fresh connect — the pooled conn was likely stale. The
@@ -1191,6 +1231,14 @@ pub async fn run_proxy(
                     .intercept
                     .as_ref()
                     .and_then(|rules| rules.iter().find(|r| r.status == status));
+                if let Some(sticky) = plan.sticky.as_deref() {
+                    sticky_learn(
+                        sticky,
+                        &mut current,
+                        &report.upstream_headers,
+                        intercepted.is_some(),
+                    );
+                }
                 let mut resp = resp;
                 if let Some(cache) = plan.cache.as_deref_mut() {
                     if let Some(storable) = storable.take() {
@@ -1404,17 +1452,19 @@ fn build_intercept_reroute(
             preserved_location: None,
             preserved_www_authenticate,
             closes: crate::http::closes_connection(upstream_status),
+            named_from: None,
         });
     }
     if rule.target[0] == b'@' {
         return Response::Reroute(Reroute {
             target: RerouteTarget::Named(rule.target.clone()),
-            args: None,
+            args: rule.named_from.as_ref().and_then(|from| from.args.clone()),
             error_page_status,
             enters_error_page: !recursive,
             preserved_location: None,
             preserved_www_authenticate,
             closes: crate::http::closes_connection(upstream_status),
+            named_from: rule.named_from.clone(),
         });
     }
     // An absolute URL: a redirect to it, 302 unless `=301` etc. says
@@ -2882,6 +2932,9 @@ fn client_head(
         }
     }
     out.extend_from_slice(b"\r\n");
+    if !cached && let Some(sticky) = plan.sticky.as_deref() {
+        sticky.write_cookie(&mut out);
+    }
     // An X-Accel-Redirect target reads them too: its `$upstream_http_*`,
     // and the headers nginx carries over to its response.
     let keep_upstream_headers = plan.keep_upstream_headers || skip_body;
