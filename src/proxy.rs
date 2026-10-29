@@ -507,8 +507,11 @@ async fn read_unread_hit(plan: &mut ProxyPlan) -> Result<(), Response> {
     }
     cache.request_headers = headers;
     if (cache.hit.is_none() || cache.background) && plan.initial_peer.is_none() {
-        plan.initial_peer =
-            upstream::pick_peer(plan.upstream, &Default::default(), plan.hash.as_deref_mut());
+        plan.initial_peer = upstream::pick_peer(
+            &plan.upstream,
+            &Default::default(),
+            plan.hash.as_deref_mut(),
+        );
     }
     Ok(())
 }
