@@ -3,7 +3,9 @@
 //! `/index.php?q=$uri&$args`. A fallback's `?args` become the redirected
 //! request's `$args`, as nginx's internal redirect. Before, any variable
 //! other than a bare `$uri` was refused at startup, and a literal
-//! fallback's arguments were dropped. Checked against nginx 1.24.
+//! fallback's arguments were dropped. A fallback URI without `?` has no
+//! arguments (#811), a named one keeps them; an `index` redirect keeps
+//! them too. Checked against nginx 1.24 and 1.30.
 
 mod common;
 
@@ -50,7 +52,10 @@ fn try_files_renders_variables_in_probes_and_fallback() {
                location /w/ {{ try_files $uri $uri/ /index.php?q=$uri&$args; }}\n\
                location /l/ {{ try_files $uri /index.php?fixed=1; }}\n\
                location /c/ {{ try_files /cache$uri @fb; }}\n\
-               location @fb {{ return 200 \"fb $uri\"; }}\n\
+               location /n/ {{ try_files $uri /na.php; }}\n\
+               location = /na.php {{ return 200 \"na [$args]\"; }}\n\
+               location /i/ {{ index /index.php; }}\n\
+               location @fb {{ return 200 \"fb $uri $args\"; }}\n\
                location = /index.php {{ return 200 \"idx $uri $args\"; }}\n\
              }} }}\n"
         ),
@@ -81,6 +86,9 @@ fn try_files_renders_variables_in_probes_and_fallback() {
         ("/l/zz?a=1", "200 idx /index.php fixed=1"),
         ("/c/x", "200 cached"),
         ("/c/nope", "200 fb /c/nope"),
+        ("/c/nope?a=1", "200 fb /c/nope a=1"),
+        ("/n/zz?a=1", "200 na []"),
+        ("/i/?a=1", "200 idx /index.php a=1"),
     ];
     let got: Vec<String> = cases.iter().map(|(p, _)| get(port, p)).collect();
     drop(child);

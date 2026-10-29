@@ -58,10 +58,12 @@ pub enum Outcome {
     /// 301 redirect. Value is the `Location:` header bytes (absolute path).
     /// Used only for the trailing-slash-on-directory case.
     Redirect(Vec<u8>),
-    /// Rewrite the URL to this and re-run location matching. Emitted by
-    /// `try_files` fallbacks and `index` hits; the caller loops with a hop
-    /// budget and either rematches by URI or jumps to a named location.
+    /// Rewrite the URL to this and re-run location matching, keeping the
+    /// arguments: an `index` hit. The caller loops with a hop budget.
     Reroute(RerouteTarget),
+    /// A `try_files` fallback: a URI takes the arguments after its `?`, none
+    /// without one (ngx_http_split_args); a named location keeps them.
+    Fallback(RerouteTarget),
     NotFound,
     Forbidden,
     /// Pre-rendered response for a `try_files ... =NNN` fallback.
@@ -259,11 +261,11 @@ fn apply_fallback(fallback: &'static PreparedFallback, render_ctx: &RenderCtx<'_
         PreparedFallback::UriTemplate(parts) => {
             let mut rendered = Vec::with_capacity(64);
             render_parts(parts, render_ctx, &mut rendered);
-            Outcome::Reroute(RerouteTarget::Uri(rendered))
+            Outcome::Fallback(RerouteTarget::Uri(rendered))
         }
         PreparedFallback::Status(prebuilt) => Outcome::StatusPrebuilt(prebuilt),
-        PreparedFallback::Uri(bytes) => Outcome::Reroute(RerouteTarget::Uri(bytes.to_vec())),
-        PreparedFallback::Named(name) => Outcome::Reroute(RerouteTarget::Named(name.to_vec())),
+        PreparedFallback::Uri(bytes) => Outcome::Fallback(RerouteTarget::Uri(bytes.to_vec())),
+        PreparedFallback::Named(name) => Outcome::Fallback(RerouteTarget::Named(name.to_vec())),
     }
 }
 
