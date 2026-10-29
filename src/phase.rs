@@ -386,6 +386,9 @@ pub struct ProcessMeta {
     /// its cache file, added by the worker after gzip, as nginx's chunked
     /// filter runs after its gzip filter (#793).
     pub trailers_due: bool,
+    /// A handler's `add_trailer` left to the worker, to go after gzip too
+    /// (#809): `proxy_add_trailers` holds them.
+    pub handler_trailers: bool,
     /// The matched location's gzip settings; `None` when gzip is off.
     pub gzip: Option<&'static crate::worker::PreparedGzip>,
     /// The location's `max_ranges` (`None`: no limit; 0 turns ranges off),
@@ -452,6 +455,7 @@ impl Default for ProcessMeta {
             aio: None,
             keep_upstream_date: false,
             trailers_due: false,
+            handler_trailers: false,
             gzip: None,
             max_ranges: None,
             range_allow: crate::worker::range::RangeAllow::No,
@@ -1424,6 +1428,10 @@ fn process_with_meta_inner(
             meta.proxy_host = proxy.host_header;
             meta.proxy_tls = proxy.tls.is_some() && proxy.url.is_none();
         }
+        meta.handler_trailers = false;
+        if !loc_add_trailers.is_empty() && loc.gzip.is_some() {
+            defer_handler_trailers(&mut loc, &mut meta);
+        }
         let response = match denied {
             None => run_location_handler(
                 http,
@@ -1765,6 +1773,21 @@ fn real_ip_trusted(from: &[AccessAddr], ip: IpAddr) -> bool {
         (AccessAddr::V6 { addr, mask }, IpAddr::V6(ip)) => u128::from(ip) & mask == addr,
         _ => false,
     })
+}
+
+/// `add_trailer` with gzip on (#809): the worker adds the trailers after
+/// gzip, as nginx's chunked filter runs after its gzip filter. A proxied
+/// response does that already.
+#[cold]
+#[inline(never)]
+fn defer_handler_trailers(loc: &mut MatchedLocation<'static>, meta: &mut ProcessMeta) {
+    if matches!(loc.handler, crate::worker::PreparedHandler::Proxy(_)) {
+        return;
+    }
+    meta.proxy_add_trailers = loc.add_trailers;
+    meta.proxy_chunked_transfer_encoding = loc.chunked_transfer_encoding;
+    meta.handler_trailers = true;
+    loc.add_trailers = &[];
 }
 
 /// `ngx_http_send_error_page`: an error_page that sends the request to a

@@ -1786,6 +1786,24 @@ fn trailers_due(head: &[u8], ctx: &phase::RequestCtx<'_>, meta: &phase::ProcessM
         && super::response::expects_trailers(meta.proxy_add_trailers, response_status(head))
 }
 
+/// `add_trailer` on a handler's response in memory, with gzip on (#809):
+/// due as for a proxied one, added after gzip (`trailers_in_memory`).
+#[cold]
+#[inline(never)]
+fn handler_trailers_due(
+    response: &mut Response,
+    ctx: &phase::RequestCtx<'_>,
+    meta: &mut phase::ProcessMeta,
+) {
+    meta.handler_trailers = false;
+    if let Response::Prebuilt(bytes) = *response {
+        *response = Response::Owned(bytes.to_vec());
+    }
+    if let Response::Owned(bytes) = response {
+        meta.trailers_due = trailers_due(bytes, ctx, meta);
+    }
+}
+
 /// `add_trailer` on a body sent from its file, cached (#793) or static
 /// (#844): it goes chunked, without its length, the trailers after it.
 #[cold]
@@ -5774,7 +5792,7 @@ pub(crate) async fn handle<S: ConnIo>(
                             // Only a proxied response has anything to settle;
                             // the call would move `process_meta` (~1 KB) in
                             // and out for nothing.
-                            let response = if matches!(response, Response::Proxy(_)) {
+                            let mut response = if matches!(response, Response::Proxy(_)) {
                                 let (response, settled_meta) = settle_proxy_response(
                                     http,
                                     &ctx,
@@ -5965,6 +5983,9 @@ pub(crate) async fn handle<S: ConnIo>(
 
                             // gzip (`gzip on` in the location): a body in memory
                             // is compressed here, a file on its way out below.
+                            if process_meta.handler_trailers {
+                                handler_trailers_due(&mut response, &ctx, &mut process_meta);
+                            }
                             let (mut response, gzip_stream) = match process_meta.gzip {
                                 Some(gz) => super::gzip::filter(
                                     gz,
