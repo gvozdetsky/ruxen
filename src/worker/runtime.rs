@@ -1786,11 +1786,11 @@ fn trailers_due(head: &[u8], ctx: &phase::RequestCtx<'_>, meta: &phase::ProcessM
         && super::response::expects_trailers(meta.proxy_add_trailers, response_status(head))
 }
 
-/// `add_trailer` on a cached body sent from its file (#793): it goes
-/// chunked, without its length, the trailers after it.
+/// `add_trailer` on a body sent from its file, cached (#793) or static
+/// (#844): it goes chunked, without its length, the trailers after it.
 #[cold]
 #[inline(never)]
-fn expect_file_trailers(
+pub(crate) fn expect_file_trailers(
     head: Vec<u8>,
     ctx: &phase::RequestCtx<'_>,
     meta: &mut phase::ProcessMeta,
