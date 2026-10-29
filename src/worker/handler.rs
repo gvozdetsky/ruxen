@@ -336,6 +336,20 @@ fn write_upstream_path(path: &[u8], escape: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// The request's `sticky` (#600). Out of line: only upstreams with one.
+#[cold]
+#[inline(never)]
+fn sticky_for_request(
+    conf: &'static crate::upstream_sticky::Sticky,
+    ctx: &RenderCtx<'_>,
+) -> Box<crate::upstream_sticky::StickyReq> {
+    crate::upstream_sticky::StickyReq::new(conf, |parts| {
+        let mut out = Vec::new();
+        render_parts(parts, ctx, &mut out);
+        out
+    })
+}
+
 /// A `proxy_pass` with variables whose rendered URI has a CR, LF or NUL
 /// (a decoded `$uri` or capture): a 500 with an `[error]` line, instead of
 /// a request line split in two (#541).
@@ -361,9 +375,10 @@ fn cache_plan(
     ctx: &RenderCtx<'_>,
     request_uri: &[u8],
     host_header: &[u8],
+    aio: Option<&'static crate::aio::ThreadPool>,
 ) -> Result<Option<Box<crate::proxy::CachePlan>>, ()> {
-    use crate::proxy::{CacheHit, CachePlan};
-    use crate::proxy_cache::{CacheStatus, Entry, Lookup};
+    use crate::proxy::CachePlan;
+    use crate::proxy_cache::CacheStatus;
     // proxy_cache_methods: GET and HEAD always.
     if !matches!(req.method, Method::Get | Method::Head)
         && !(conf.methods_post && req.method_bytes == b"POST")
@@ -406,8 +421,6 @@ fn cache_plan(
         }
     }
     let main = crate::proxy_cache::hash_key(&key);
-    let mut hash = main;
-    let mut secondary = false;
     // ngx_http_test_predicates: a condition holds when it renders
     // non-empty and not "0".
     let holds = |conditions: &[&[PreparedValuePart]]| {
@@ -418,186 +431,66 @@ fn cache_plan(
         })
     };
     let no_cache = holds(conf.no_cache);
-    let mut status = CacheStatus::Miss;
-    let mut hit = None;
-    let mut stale = None;
-    let mut store = !no_cache;
-    // nginx's NGX_HTTP_CACHE_SCARCE: below proxy_cache_min_uses.
-    let mut cacheable = true;
-    let mut token = None;
-    let mut wait_until = None;
-    let mut background = false;
-    let mut stale_error = false;
-    if holds(conf.bypass) {
-        // The response still refreshes the cache.
-        status = CacheStatus::Bypass;
-    } else {
-        let now = crate::proxy_cache::now_secs();
-        let headers = req.headers_raw;
-        // ngx_http_file_cache_reopen: the main key holds a response stored
-        // for another variant (its `Vary` names headers this request has
-        // other values of), so the lookup goes on at the request's own
-        // variant's key, once.
-        loop {
-            let path = || zone.file_path(&hash);
-            let mut other = None;
-            match zone.lookup(&hash, conf.min_uses, now) {
-                Lookup::Error(code) => {
-                    status = CacheStatus::Hit;
-                    hit = Some(CacheHit::Error(code));
-                }
-                Lookup::Hit => match Entry::read(&path(), &key) {
-                    Some(entry) => match entry.other_variant(&main, headers) {
-                        None => {
-                            status = CacheStatus::Hit;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                        variant => other = variant,
-                    },
-                    None => zone.forget_file(&hash),
-                },
-                Lookup::Stale {
-                    token: updater,
-                    stale_updating,
-                    stale_error: covered,
-                } => {
-                    // ngx_http_upstream_cache: STALE (this request updates)
-                    // or UPDATING (another one does).
-                    token = updater;
-                    stale_error = covered;
-                    let serve_stale = conf.use_stale.updating || stale_updating;
-                    // Read only when something may answer with it; else
-                    // only its header, for the variant.
-                    let entry = if serve_stale || covered || conf.revalidate || conf.use_stale.any()
-                    {
-                        Entry::read(&path(), &key)
-                    } else {
-                        other =
-                            crate::proxy_cache::stored_other_variant(&path(), &key, &main, headers);
-                        None
-                    };
-                    if let Some(e) = &entry {
-                        other = e.other_variant(&main, headers);
-                    }
-                    match entry {
-                        _ if other.is_some() => {}
-                        Some(entry)
-                            if serve_stale && updater.is_some() && conf.background_update =>
-                        {
-                            status = CacheStatus::Stale;
-                            hit = Some(CacheHit::Entry(entry));
-                            background = true;
-                        }
-                        Some(entry) if serve_stale && updater.is_none() => {
-                            status = CacheStatus::Updating;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                        // Fetched again; kept to revalidate with, or to
-                        // answer with if the upstream fails
-                        // (proxy_cache_use_stale).
-                        entry => {
-                            status = CacheStatus::Expired;
-                            stale = entry;
-                        }
-                    }
-                }
-                Lookup::Miss {
-                    store: enough,
-                    probe,
-                } => {
-                    store &= enough;
-                    cacheable = enough;
-                    // A file from before a restart (nginx's cold cache).
-                    if probe && let Some(entry) = Entry::read(&path(), &key) {
-                        zone.adopt(&hash, &entry);
-                        store = !no_cache;
-                        cacheable = true;
-                        other = entry.other_variant(&main, headers);
-                        if other.is_some() {
-                        } else if entry.valid_sec < now {
-                            status = CacheStatus::Expired;
-                            stale = Some(entry);
-                        } else {
-                            status = CacheStatus::Hit;
-                            hit = Some(CacheHit::Entry(entry));
-                        }
-                    }
-                    // proxy_cache_lock: one request fetches a missing
-                    // response, the others wait for it.
-                    if other.is_none() && status == CacheStatus::Miss && store && conf.lock {
-                        match zone.try_lock(&hash, conf.lock_age_ms) {
-                            Some(lock) => token = Some(lock),
-                            None if conf.lock_timeout_ms == 0 => store = false,
-                            None => {
-                                wait_until = Some(
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_millis(conf.lock_timeout_ms),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            // A variant's key holding yet another variant is a miss, as
-            // nginx's "incorrect vary hash".
-            let Some(variant) = other.filter(|_| !secondary) else {
-                break;
-            };
-            if let Some(t) = token.take() {
-                zone.release(&hash, t);
-            }
-            hash = variant;
-            secondary = true;
-            status = CacheStatus::Miss;
-            store = !no_cache;
-            cacheable = true;
-            stale_error = false;
-        }
-    }
-    // ngx_http_upstream_cache_check_range: a range from too far into the
-    // response isn't worth fetching it whole for the cache; it goes
-    // upstream as asked, and nothing is stored. A `proxy_cache_lock` taken
-    // stays with the request, released when it ends, as nginx's (#864).
-    if hit.is_none()
-        && cacheable
-        && let Some(max) = conf.max_range_offset
-        && let Some(range) = req.range
-        && range_too_far(range, max)
-    {
-        cacheable = false;
-        store = false;
-    }
-    Ok(Some(Box::new(CachePlan {
+    let mut plan = Box::new(CachePlan {
         conf,
         zone,
         main,
-        hash,
-        secondary,
-        status,
-        store,
-        cacheable,
-        // A hit needs neither, unless it is updated in the background, or
-        // the request is conditional (the not-modified check, #349).
-        request_headers: if hit.is_some()
-            && !background
-            && req.if_none_match.is_none()
-            && req.if_modified_since.is_none()
-            && req.if_match.is_none()
-            && req.if_unmodified_since.is_none()
-        {
-            Vec::new()
-        } else {
-            req.headers_raw.to_vec()
-        },
+        hash: main,
+        secondary: false,
+        status: CacheStatus::Miss,
+        store: !no_cache,
+        // nginx's NGX_HTTP_CACHE_SCARCE: below proxy_cache_min_uses.
+        cacheable: true,
+        request_headers: Vec::new(),
         key,
-        hit,
-        stale,
+        hit: None,
+        stale: None,
         head_as_get: conf.convert_head && matches!(req.method, Method::Head),
-        token,
-        wait_until,
-        background,
-        stale_error,
-    })))
+        token: None,
+        wait_until: None,
+        background: false,
+        stale_error: false,
+        aio,
+        unread: false,
+        unread_stale: None,
+    });
+    // ngx_http_upstream_cache_check_range: a range from too far into the
+    // response isn't worth fetching it whole for the cache; it goes
+    // upstream as asked, and nothing is stored.
+    let far = conf
+        .max_range_offset
+        .zip(req.range)
+        .is_some_and(|(max, range)| range_too_far(range, max));
+    if holds(conf.bypass) {
+        // The response still refreshes the cache.
+        plan.status = CacheStatus::Bypass;
+    } else {
+        // `aio threads`: the file is read in `run_proxy`, after the request
+        // is built, unless the lookup may still shape it: a stale entry's
+        // validators, a variant below `min_uses` (not cacheable: the
+        // client's conditions and range go upstream), a far range.
+        let defer = aio.is_some() && !far && !conf.revalidate && conf.min_uses <= 1;
+        plan.lookup(req.headers_raw, no_cache, defer);
+    }
+    // A `proxy_cache_lock` taken stays with the request, released when it
+    // ends, as nginx's (#864).
+    if far && plan.hit.is_none() && plan.cacheable {
+        plan.cacheable = false;
+        plan.store = false;
+    }
+    // A hit needs them only if it is updated in the background, or the
+    // request is conditional (the not-modified check, #349); an unread
+    // one, for its variant.
+    if !(plan.hit.is_some()
+        && !plan.background
+        && req.if_none_match.is_none()
+        && req.if_modified_since.is_none()
+        && req.if_match.is_none()
+        && req.if_unmodified_since.is_none())
+    {
+        plan.request_headers = req.headers_raw.to_vec();
+    }
+    Ok(Some(plan))
 }
 
 pub(crate) fn forward_client_headers<'a>(
@@ -791,7 +684,10 @@ pub(crate) fn finish_access_denial(
             preserved_www_authenticate,
         );
     }
-    let intercepted = if takes_error_page {
+    let mut response = response;
+    let precondition_failed =
+        generated_preconditions(&mut response, req, error_page_status, loc.server_header);
+    let intercepted = if takes_error_page || precondition_failed {
         maybe_intercept_error_page(
             response,
             loc.error_pages,
@@ -817,6 +713,72 @@ pub(crate) fn finish_access_denial(
         preserved_www_authenticate,
         loc.expires,
     )
+}
+
+/// nginx's not-modified filter on a 200 ruxen makes itself (`return`,
+/// autoindex, `stub_status`), which has no `Last-Modified` and no `ETag`:
+/// `If-Unmodified-Since` or an `If-Match` other than `*` turn it into a
+/// 412, `If-None-Match: *` without `If-Modified-Since` into a 304
+/// (ngx_http_not_modified_header_filter). Static files and cached
+/// responses check their own validators. True for a 412.
+#[inline]
+pub(crate) fn generated_preconditions(
+    response: &mut Response,
+    req: &phase::RequestCtx<'_>,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    server: &[u8],
+) -> bool {
+    if req.if_unmodified_since.is_none() && req.if_match.is_none() && req.if_none_match.is_none() {
+        return false;
+    }
+    generated_preconditions_slow(response, req, error_page_status, server)
+}
+
+#[cold]
+#[inline(never)]
+fn generated_preconditions_slow(
+    response: &mut Response,
+    req: &phase::RequestCtx<'_>,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    server: &[u8],
+) -> bool {
+    // The filter sees the status an error page goes out with.
+    if let Some(phase::ErrorPageStatus::Preserve(status) | phase::ErrorPageStatus::Override(status)) =
+        error_page_status
+        && status != 200
+    {
+        return false;
+    }
+    let bytes: &[u8] = match response {
+        Response::Prebuilt(b) => b,
+        Response::Owned(b) => b,
+        _ => return false,
+    };
+    if response_status(bytes) != 200 {
+        return false;
+    }
+    if req.if_unmodified_since.is_some()
+        || req
+            .if_match
+            .is_some_and(|v| !file::etag_list_matches_strong(v, None))
+    {
+        *response = Response::Owned(http::error_response_for_method(
+            412,
+            "Precondition Failed\n",
+            req.method,
+            server,
+        ));
+        return true;
+    }
+    if req.if_modified_since.is_none()
+        && req
+            .if_none_match
+            .is_some_and(|v| file::etag_list_matches(v, None))
+        && let Some((end, _)) = crate::proxy::find_head_end(bytes, 0)
+    {
+        *response = Response::Owned(crate::proxy::conditional_head(&bytes[..end], 304));
+    }
+    false
 }
 
 /// ngx_http_upstream_cache_check_range: `Range` starts at or past `max`
@@ -929,7 +891,9 @@ pub(crate) fn run_location_handler(
                 }
             },
         };
-        let upstream = variable.as_ref().map_or(proxy.upstream, |v| v.upstream);
+        let upstream = crate::upstream::UpstreamRef::current(
+            variable.as_ref().map_or(proxy.upstream, |v| v.upstream),
+        );
         let host_header: &[u8] = variable
             .as_ref()
             .map_or(proxy.host_header, |v| &v.host_header);
@@ -955,9 +919,8 @@ pub(crate) fn run_location_handler(
         // escaped (NGX_ESCAPE_URI) when the client's path had a `%` (nginx's
         // `r->quoted_uri`: a `%0D%0A` would otherwise split the line) or
         // the request is internal (`r->internal`: a rewrite of the URI or
-        // an internal redirect cleared `unparsed_uri`); otherwise nginx
-        // copies it as it is (#575).
-        let escape = || !rewrite_state.unparsed_uri || path_is_quoted(req.path);
+        // an internal redirect); otherwise nginx copies it as it is (#575).
+        let escape = || rewrite_state.internal || path_is_quoted(req.path);
         let rewritten_uri: Vec<u8>;
         let request_uri: &[u8] = if let Some(uri) = variable.as_ref().and_then(|v| v.uri.as_deref())
         {
@@ -1011,7 +974,14 @@ pub(crate) fn run_location_handler(
         // `proxy_cache` (#233): what the cache has for this request.
         let cache = match proxy.cache {
             Some(conf) => {
-                match cache_plan(conf, req, &proxy_render_ctx, request_uri, host_header) {
+                match cache_plan(
+                    conf,
+                    req,
+                    &proxy_render_ctx,
+                    request_uri,
+                    host_header,
+                    loc.aio,
+                ) {
                     Ok(cache) => cache,
                     Err(()) => return crate::worker::internal_error_response(req.method),
                 }
@@ -1023,7 +993,7 @@ pub(crate) fn run_location_handler(
         // 502 and reports `no live upstreams` for the error log. A cache
         // hit needs none.
         let mut hash = crate::upstream::HashPick::for_request(
-            upstream,
+            &upstream,
             |key| {
                 let mut out = Vec::new();
                 render_parts(key, &render_ctx_base, &mut out);
@@ -1031,13 +1001,26 @@ pub(crate) fn run_location_handler(
             },
             render_ctx_base.remote_addr,
         );
+        let sticky = upstream
+            .sticky
+            .map(|conf| sticky_for_request(conf, &render_ctx_base));
         let initial_peer = if cache
             .as_ref()
-            .is_some_and(|c| c.hit.is_some() && !c.background)
+            .is_some_and(|c| (c.hit.is_some() && !c.background) || c.unread)
         {
             None
         } else {
-            crate::upstream::pick_peer(upstream, &Default::default(), hash.as_deref_mut())
+            match sticky.as_deref() {
+                None => {
+                    crate::upstream::pick_peer(&upstream, &Default::default(), hash.as_deref_mut())
+                }
+                Some(st) => crate::upstream::pick_peer_sticky(
+                    &upstream,
+                    &Default::default(),
+                    hash.as_deref_mut(),
+                    &st.hint,
+                ),
+            }
         };
 
         // Build the final header set: proxy_set_header overrides first
@@ -1231,10 +1214,19 @@ pub(crate) fn run_location_handler(
             for ep in loc.error_pages {
                 let mut buf = Vec::with_capacity(64);
                 render_parts(ep.target, &proxy_render_ctx, &mut buf);
+                let named_from = (buf.first() == Some(&b'@')).then(|| {
+                    Box::new(phase::NamedFrom {
+                        uri: url_path.to_vec(),
+                        args: current_args.map(<[u8]>::to_vec),
+                        unparsed_uri: rewrite_state.unparsed_uri,
+                        internal: rewrite_state.internal,
+                    })
+                });
                 rules.push(crate::proxy::InterceptRule {
                     status: ep.status,
                     action: ep.action,
                     target: buf,
+                    named_from,
                 });
             }
             Some(rules)
@@ -1274,6 +1266,7 @@ pub(crate) fn run_location_handler(
                 Some(Box::new(crate::upstream_tls::TlsPlan { config, name }))
             }
         };
+        let pool_tag = proxy.pool_tag(&upstream);
         return Response::Proxy(Box::new(crate::proxy::ProxyPlan {
             upstream,
             tls,
@@ -1291,14 +1284,18 @@ pub(crate) fn run_location_handler(
             bad_gateway: &http.bad_gateway,
             gateway_timeout: &http.gateway_timeout,
             keepalive_eligible: pool_eligible,
-            pool_tag: proxy.pool_tag(upstream),
+            pool_tag,
             next_upstream: proxy.next_upstream,
             next_upstream_tries: proxy.next_upstream_tries,
             next_upstream_timeout: std::time::Duration::from_millis(proxy.next_upstream_timeout_ms),
             body_file,
             keep_upstream_headers: !loc.add_headers.is_empty()
                 || !loc.add_trailers.is_empty()
-                || loc.access_logs.iter().any(|l| l.reads_upstream_headers),
+                || loc.access_logs.iter().any(|l| l.reads_upstream_headers)
+                || sticky
+                    .as_ref()
+                    .and_then(|s| s.conf.learn())
+                    .is_some_and(|l| l.reads_upstream),
             response: proxy.response,
             method_idempotent: !matches!(req.method_bytes, b"POST" | b"LOCK" | b"PATCH"),
             in_error_page,
@@ -1309,6 +1306,7 @@ pub(crate) fn run_location_handler(
             ignore_client_abort: proxy.ignore_client_abort,
             cache,
             hash,
+            sticky,
             bind,
         }));
     }
@@ -1387,11 +1385,26 @@ pub(crate) fn run_location_handler(
             }
             let last_modified_override =
                 last_modified_override_for_conditionals(loc.add_headers, &render_ctx_base);
-            match fs_resolve::resolve(root, url_path, &render_ctx_base) {
+            match fs_resolve::resolve(root, url_path, &render_ctx_base, req.http_11) {
                 fs_resolve::Outcome::Serve(_) if !get_or_head => {
                     Response::Owned(file::method_not_allowed(req.method, server_bytes))
                 }
+                fs_resolve::Outcome::ServeGzipStatic { opened, gzip, vary } => serve_gzip_static(
+                    opened,
+                    gzip,
+                    vary,
+                    &loc,
+                    root,
+                    req,
+                    error_page_status,
+                    last_modified_override.as_deref(),
+                    server_bytes,
+                ),
                 fs_resolve::Outcome::Serve(opened) => {
+                    // `aio threads`: even a small body is read on the pool
+                    // (`file::inline_limit`), except under `add_trailer`,
+                    // which needs it in memory here.
+                    let aio_reads = loc.aio.is_some() && loc.add_trailers.is_empty();
                     // An error page that goes out with another status than
                     // 200 is sent whole: nginx's not_modified and range
                     // filters only act on a 200, so no 304, no 206 and no
@@ -1420,6 +1433,7 @@ pub(crate) fn run_location_handler(
                             },
                             server_bytes,
                             loc.sendfile,
+                            aio_reads,
                         );
                     }
                     // `max_ranges 0`: nginx's range filter declines, so
@@ -1464,6 +1478,7 @@ pub(crate) fn run_location_handler(
                         },
                         server_bytes,
                         loc.sendfile,
+                        aio_reads,
                     );
                     match vary_cut {
                         Some((gz, mime, size)) => {
@@ -1495,10 +1510,15 @@ pub(crate) fn run_location_handler(
                         server_bytes,
                     ))
                 }
-                fs_resolve::Outcome::Reroute(target) => {
-                    // A try_files fallback such as `/index.php?$args`
-                    // brings its own arguments: nginx's internal redirect
-                    // takes the part after `?` as the new `$args`.
+                outcome @ (fs_resolve::Outcome::Reroute(_) | fs_resolve::Outcome::Fallback(_)) => {
+                    // A try_files fallback URI brings its own arguments,
+                    // the part after `?`, and none without one
+                    // (ngx_http_try_files_module.c, ngx_http_split_args).
+                    let (target, fallback) = match outcome {
+                        fs_resolve::Outcome::Fallback(target) => (target, true),
+                        fs_resolve::Outcome::Reroute(target) => (target, false),
+                        _ => unreachable!(),
+                    };
                     let (target, args) = match target {
                         phase::RerouteTarget::Uri(mut uri) => {
                             match uri.iter().position(|&b| b == b'?') {
@@ -1507,7 +1527,7 @@ pub(crate) fn run_location_handler(
                                     uri.truncate(q);
                                     (phase::RerouteTarget::Uri(uri), Some(args))
                                 }
-                                None => (phase::RerouteTarget::Uri(uri), None),
+                                None => (phase::RerouteTarget::Uri(uri), fallback.then(Vec::new)),
                             }
                         }
                         named => (named, None),
@@ -1520,6 +1540,7 @@ pub(crate) fn run_location_handler(
                         preserved_location: None,
                         preserved_www_authenticate: Vec::new(),
                         closes: false,
+                        named_from: None,
                     });
                 }
                 fs_resolve::Outcome::NotFound => {
@@ -1537,87 +1558,22 @@ pub(crate) fn run_location_handler(
                     exact_size,
                     localtime,
                     format,
-                } => match format {
-                    AutoindexFormat::Html => {
-                        match autoindex::render_html(&dir_path, &uri, exact_size, localtime) {
-                            Ok(body) => {
-                                Response::Owned(http::build_response_bytes_with_content_type(
-                                    200,
-                                    &body,
-                                    b"text/html",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ruxen: autoindex render failed for {} (uri={}): {e}",
-                                    dir_path.display(),
-                                    String::from_utf8_lossy(&uri)
-                                );
-                                Response::Owned(http::error_response_for_method(
-                                    500,
-                                    "Internal Server Error\n",
-                                    req.method,
-                                    server_bytes,
-                                ))
-                            }
-                        }
-                    }
-                    AutoindexFormat::Xml => match autoindex::render_xml(&dir_path) {
-                        Ok(body) => Response::Owned(http::build_response_bytes_with_content_type(
-                            200,
-                            &body,
-                            b"text/xml; charset=utf-8",
-                            req.method,
-                            server_bytes,
-                        )),
-                        Err(e) => {
-                            eprintln!(
-                                "ruxen: autoindex xml render failed for {} (uri={}): {e}",
-                                dir_path.display(),
-                                String::from_utf8_lossy(&uri)
-                            );
-                            Response::Owned(http::error_response_for_method(
-                                500,
-                                "Internal Server Error\n",
-                                req.method,
-                                server_bytes,
-                            ))
-                        }
-                    },
-                    AutoindexFormat::Json | AutoindexFormat::Jsonp => {
-                        let callback = if format == AutoindexFormat::Jsonp {
-                            autoindex::jsonp_callback(render_ctx_base.args)
-                        } else {
-                            Ok(&[][..])
-                        };
-                        match callback {
-                            Err(()) => Response::Owned(http::error_response_for_method(
-                                400,
-                                "Bad Request\n",
-                                req.method,
-                                server_bytes,
-                            )),
-                            Ok(callback) => match autoindex::render_json(&dir_path, callback) {
-                                // ngx_http_autoindex_handler: JSONP only with a callback.
+                } => {
+                    let mut response = match format {
+                        AutoindexFormat::Html => {
+                            match autoindex::render_html(&dir_path, &uri, exact_size, localtime) {
                                 Ok(body) => {
-                                    let content_type: &[u8] = if callback.is_empty() {
-                                        b"application/json"
-                                    } else {
-                                        b"application/javascript"
-                                    };
                                     Response::Owned(http::build_response_bytes_with_content_type(
                                         200,
                                         &body,
-                                        content_type,
+                                        b"text/html",
                                         req.method,
                                         server_bytes,
                                     ))
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                        "ruxen: autoindex json render failed for {} (uri={}): {e}",
+                                        "ruxen: autoindex render failed for {} (uri={}): {e}",
                                         dir_path.display(),
                                         String::from_utf8_lossy(&uri)
                                     );
@@ -1628,10 +1584,83 @@ pub(crate) fn run_location_handler(
                                         server_bytes,
                                     ))
                                 }
-                            },
+                            }
                         }
-                    }
-                },
+                        AutoindexFormat::Xml => match autoindex::render_xml(&dir_path) {
+                            Ok(body) => {
+                                Response::Owned(http::build_response_bytes_with_content_type(
+                                    200,
+                                    &body,
+                                    b"text/xml; charset=utf-8",
+                                    req.method,
+                                    server_bytes,
+                                ))
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "ruxen: autoindex xml render failed for {} (uri={}): {e}",
+                                    dir_path.display(),
+                                    String::from_utf8_lossy(&uri)
+                                );
+                                Response::Owned(http::error_response_for_method(
+                                    500,
+                                    "Internal Server Error\n",
+                                    req.method,
+                                    server_bytes,
+                                ))
+                            }
+                        },
+                        AutoindexFormat::Json | AutoindexFormat::Jsonp => {
+                            let callback = if format == AutoindexFormat::Jsonp {
+                                autoindex::jsonp_callback(render_ctx_base.args)
+                            } else {
+                                Ok(&[][..])
+                            };
+                            match callback {
+                                Err(()) => Response::Owned(http::error_response_for_method(
+                                    400,
+                                    "Bad Request\n",
+                                    req.method,
+                                    server_bytes,
+                                )),
+                                Ok(callback) => match autoindex::render_json(&dir_path, callback) {
+                                    // ngx_http_autoindex_handler: JSONP only with a callback.
+                                    Ok(body) => {
+                                        let content_type: &[u8] = if callback.is_empty() {
+                                            b"application/json"
+                                        } else {
+                                            b"application/javascript"
+                                        };
+                                        Response::Owned(
+                                            http::build_response_bytes_with_content_type(
+                                                200,
+                                                &body,
+                                                content_type,
+                                                req.method,
+                                                server_bytes,
+                                            ),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "ruxen: autoindex json render failed for {} (uri={}): {e}",
+                                            dir_path.display(),
+                                            String::from_utf8_lossy(&uri)
+                                        );
+                                        Response::Owned(http::error_response_for_method(
+                                            500,
+                                            "Internal Server Error\n",
+                                            req.method,
+                                            server_bytes,
+                                        ))
+                                    }
+                                },
+                            }
+                        }
+                    };
+                    generated_preconditions(&mut response, req, error_page_status, server_bytes);
+                    response
+                }
                 fs_resolve::Outcome::InternalServerError => {
                     Response::Owned(http::error_response_for_method(
                         500,
@@ -1643,19 +1672,28 @@ pub(crate) fn run_location_handler(
             }
         }
     };
-    let intercepted = if matches!(loc.handler, PreparedHandler::Return(_, false)) {
-        inner
-    } else {
-        maybe_intercept_error_page(
-            inner,
-            loc.error_pages,
-            req,
-            &render_ctx_base,
-            in_error_page,
-            loc.recursive_error_pages,
-            server_bytes,
-        )
-    };
+    let mut inner = inner;
+    let precondition_failed =
+        matches!(
+            loc.handler,
+            PreparedHandler::Return(..) | PreparedHandler::StubStatus
+        ) && generated_preconditions(&mut inner, req, error_page_status, server_bytes);
+    // nginx's not-modified filter finalizes its 412 as an error, which
+    // `error_page` takes even after a `return` with text.
+    let intercepted =
+        if matches!(loc.handler, PreparedHandler::Return(_, false)) && !precondition_failed {
+            inner
+        } else {
+            maybe_intercept_error_page(
+                inner,
+                loc.error_pages,
+                req,
+                &render_ctx_base,
+                in_error_page,
+                loc.recursive_error_pages,
+                server_bytes,
+            )
+        };
     let trailers_allowed =
         req.http_11 && !matches!(req.method, Method::Head) && loc.chunked_transfer_encoding;
     finalize_location_response(
@@ -1669,6 +1707,95 @@ pub(crate) fn run_location_handler(
         preserved_www_authenticate,
         loc.expires,
     )
+}
+
+/// A file under `gzip_static` (#760), as the `Serve` arm sends a file:
+/// `file.gz` with `Content-Encoding: gzip` (`gzip`), or the file itself,
+/// and `Vary: Accept-Encoding` with `vary` unless the gzip filter adds it.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn serve_gzip_static(
+    opened: fs_resolve::Opened,
+    gzip: bool,
+    vary: bool,
+    loc: &MatchedLocation<'static>,
+    root: &PreparedRoot,
+    req: &phase::RequestCtx<'_>,
+    error_page_status: Option<phase::ErrorPageStatus>,
+    last_modified_override: Option<&[u8]>,
+    server_bytes: &[u8],
+) -> Response {
+    let (mime, size) = (opened.mime, opened.size);
+    // The filter leaves a precompressed body alone, so its ranges stay.
+    let filter = if gzip { None } else { loc.gzip };
+    let error_status = match error_page_status {
+        Some(phase::ErrorPageStatus::Preserve(s) | phase::ErrorPageStatus::Override(s))
+            if s != 200 =>
+        {
+            Some(s)
+        }
+        _ => None,
+    };
+    let accept_ranges = loc.max_ranges != Some(0) && error_status.is_none();
+    let range = match (req.range.filter(|_| accept_ranges), filter) {
+        (Some(_), Some(gz))
+            if super::gzip::would_compress(
+                gz,
+                &super::gzip::GzipRequest::from_headers(req.http_11, req.headers_raw),
+                mime,
+                size,
+            ) =>
+        {
+            None
+        }
+        (range, _) => range,
+    };
+    let conditionals = |on: bool| file::Conditionals {
+        if_modified_since: req.if_modified_since.filter(|_| on),
+        if_unmodified_since: req.if_unmodified_since.filter(|_| on),
+        if_none_match: req.if_none_match.filter(|_| on),
+        if_match: req.if_match.filter(|_| on),
+        range,
+        if_range: req.if_range.filter(|_| on),
+        last_modified_override,
+        max_ranges: if on { loc.max_ranges } else { Some(0) },
+        ims_mode: root.if_modified_since,
+        etag: root.etag,
+    };
+    let mut response = file::serve_path(
+        opened,
+        req.method,
+        conditionals(error_status.is_none()),
+        server_bytes,
+        loc.sendfile,
+        loc.aio.is_some() && loc.add_trailers.is_empty(),
+    );
+    if let (Some(_), Some(gz)) = (range, filter)
+        && gz.vary
+    {
+        response = super::gzip::vary_cut_file(gz, mime, size, response);
+    }
+    let headers = match &mut response {
+        Response::Owned(bytes) => bytes,
+        Response::File { headers, .. } => headers,
+        _ => return response,
+    };
+    let status = super::response_status(headers);
+    let filter_varies = matches!(status, 200 | 206 | 403 | 404 | 416)
+        && filter.is_some_and(|gz| super::gzip::file_varies(gz, mime, size));
+    let mut lines: Vec<u8> = Vec::new();
+    // nginx's not_modified filter drops Content-Encoding from a 304.
+    if gzip && matches!(status, 200 | 206 | 416) {
+        lines.extend_from_slice(b"Content-Encoding: gzip\r\n");
+    }
+    if vary && !filter_varies {
+        lines.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    }
+    if let Some(end) = headers.windows(4).position(|w| w == b"\r\n\r\n") {
+        headers.splice(end + 2..end + 2, lines);
+    }
+    response
 }
 
 /// The 413 for a body over the location's `client_max_body_size`, sent as

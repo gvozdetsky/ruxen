@@ -218,7 +218,7 @@ docker run --rm -p 8080:8080 \
 - `limit_req` and `limit_conn` on zones shared by the workers and kept across a reload
 - `stub_status` and the `$connections_*` variables
 - `ruxen_metrics` (ruxen's own): the same counters, per server, upstream peer, limit zone and cache zone counters in Prometheus text format ([`docs/metrics.md`](docs/metrics.md))
-- gzip compression (`gzip`, `gzip_types`, `gzip_min_length`, `gzip_comp_level`, `gzip_vary`, `gzip_http_version`, `gzip_proxied`, `gzip_disable`) of static files, `return`, error pages and proxied responses, as nginx decides it: the same statuses, types, `Accept-Encoding` q-values, weak `ETag`, no `Accept-Ranges`. A file gzip compresses is sent whole even for a `Range` request, as from nginx. Not yet: `gzip_static`, `gunzip`, `$gzip_ratio`, and gzip under `limit_rate` (such a response goes out unpaced).
+- gzip compression (`gzip`, `gzip_types`, `gzip_min_length`, `gzip_comp_level`, `gzip_vary`, `gzip_http_version`, `gzip_proxied`, `gzip_disable`) of static files, `return`, error pages and proxied responses, as nginx decides it: the same statuses, types, `Accept-Encoding` q-values, weak `ETag`, no `Accept-Ranges`. A file gzip compresses is sent whole even for a `Range` request, as from nginx. `gzip_static on|always` sends a precompressed `file.gz`. Not yet: `gunzip`, `$gzip_ratio`, and gzip under `limit_rate` (such a response goes out unpaced).
 
 ### Static files
 
@@ -232,7 +232,8 @@ Supported functionality includes:
 - conditional requests
 - byte ranges (one range per request; `max_ranges 0` turns them off)
 - streamed large files
-- zero-copy `sendfile on|off` (plain TCP)
+- zero-copy `sendfile on|off` (plain TCP, and TLS with `ssl_conf_command Options KTLS`)
+- `aio threads[=pool]` and `thread_pool`: file reads and `sendfile` on a per-worker thread pool, so a slow disk doesn't stall the worker
 - URI decoding and normalization
 - trailing-slash redirects
 - `autoindex`
@@ -279,6 +280,7 @@ Currently supported:
 - SNI, and `ssl_reject_handshake`
 - client certificates: `ssl_verify_client on|optional|optional_no_ca`, `ssl_client_certificate`, `ssl_trusted_certificate`, `ssl_verify_depth`, `ssl_crl`, per server, checked by OpenSSL's rules (AWS-LC's X.509 code); refused requests get nginx's 400 pages (495 / 496, which `error_page` can take) and a Host naming another verifying server 421; `$ssl_client_verify` and the certificate's fields (`$ssl_client_cert`, `_raw_cert`, `_escaped_cert`, `_s_dn`, `_i_dn` and their `_legacy` forms, `_serial`, `_fingerprint`, `_v_start`, `_v_end`, `_v_remain`), printed as OpenSSL prints them
 - OCSP stapling: `ssl_stapling`, `ssl_stapling_file`, `ssl_stapling_responder`, `ssl_stapling_verify`; responses fetched from the responder (`http://`, resolved at startup) in the background, verified, and refreshed as nginx does, one fetch for all workers
+- OCSP checks of client certificates: `ssl_ocsp on|leaf`, `ssl_ocsp_responder`, `ssl_ocsp_cache`; the status is read before the first request, and a certificate that isn't `good`, or whose status can't be read, is refused with 495 (`$ssl_client_verify` says why)
 - `ssl_session_cache` (in memory, shared by the workers, kept across a reload), `ssl_session_tickets`, `ssl_session_ticket_key` in nginx's ticket layout, `ssl_session_timeout`
 - nginx-style `$ssl_*` variables
 
@@ -431,12 +433,11 @@ Not implemented yet (`--compat` names the ones a configuration uses):
 - HTTP/2 to upstreams (`proxy_http_version 2`, `grpc_pass`), and HTTP/3 (`listen … quic`, `http3` and `quic_*` are accepted and have no effect: the TCP listens serve HTTP/1.1 and HTTP/2)
 - FastCGI, uwsgi, SCGI and memcached upstreams, the stream and mail modules, SSI, `sub_filter`, `geo`, the charset filter (`charset` adds nothing to `Content-Type` yet, #464; no conversion), and third-party modules
 - streaming request bodies to the upstream (`proxy_request_buffering off`); bodies are read whole, spilling to a temp file
-- OCSP checks of client certificates (#142), 0-RTT / TLS early data
+- 0-RTT / TLS early data
 - persistent TLS session caches (sessions survive a reload, not a restart)
 - nginx's binary upgrade (`SIGUSR2`)
-- variables in `root` and `alias` (#232)
 
-Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. So are `root` and `alias` with variables (`root /var/www/$host;`, `alias /srv/$1;`): ruxen would take the path literally and serve other files than nginx, until #232 renders them per request. `ssl_ciphers` is evaluated as OpenSSL would over the TLS 1.2 suites rustls has (all ECDHE with AES-GCM or ChaCha20-Poly1305; the weaker ones a list names don't exist here), and `ssl_prefer_server_ciphers` picks whose order counts. Accepted with a warning: `ssl_ecdh_curve` (rustls's modern groups are used).
+Access restrictions that ruxen can't enforce yet — `disable_symlinks … from=` with a variable other than `$document_root` — are rejected when the configuration is loaded instead of being ignored. `ssl_ciphers` is evaluated as OpenSSL would over the TLS 1.2 suites rustls has (all ECDHE with AES-GCM or ChaCha20-Poly1305; the weaker ones a list names don't exist here), and `ssl_prefer_server_ciphers` picks whose order counts. Accepted with a warning: `ssl_ecdh_curve` (rustls's modern groups are used).
 
 Before moving a site, run `ruxen --compat -c /etc/nginx/nginx.conf`: it lists what ruxen refuses and what it knowingly does differently, and [`docs/migrating.md`](docs/migrating.md) says what to do about each. Anything else that behaves unlike nginx is a bug; please report it.
 

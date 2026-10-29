@@ -15,8 +15,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
 
 use super::{PreparedPeer, PreparedUpstream};
 
@@ -61,6 +61,126 @@ struct PeerLabels {
     peer: String,
     /// The peer whose state the scrape shows.
     of: Option<(&'static PreparedUpstream, usize)>,
+    /// A slot of a pool, `peer` set at run time.
+    pooled: Option<(&'static PeerPool, usize)>,
+}
+
+/// Slots a pool has: the distinct addresses an upstream's `resolve`
+/// servers can have at once and be counted.
+const POOL_SLOTS: usize = 64;
+
+/// Slots for the peers an upstream's `resolve` servers give at run time
+/// (#879). A slot is taken by an address when a peer list with it is
+/// built, and freed when no list has it any more; counts from before it
+/// was taken are kept as a base and subtracted.
+pub struct PeerPool {
+    first: u32,
+    /// The static peers' slots, by address.
+    statics: Vec<(String, u32)>,
+    taken: Mutex<Vec<Option<Taken>>>,
+    metrics: OnceLock<&'static Metrics>,
+    /// The configured upstream, whose current peers the scrape shows.
+    of: OnceLock<&'static PreparedUpstream>,
+}
+
+impl std::fmt::Debug for PeerPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerPool")
+            .field("first", &self.first)
+            .finish_non_exhaustive()
+    }
+}
+
+struct Taken {
+    peer: String,
+    base: Counts,
+}
+
+/// A peer slot's counts, summed over the workers.
+#[derive(Default, Clone, Copy)]
+struct Counts {
+    requests: u64,
+    failures: u64,
+    buckets: [u64; BUCKETS_US.len() + 1],
+    sum_us: u64,
+}
+
+impl Counts {
+    fn of(workers: &[&'static WorkerSlots], slot: usize) -> Counts {
+        let mut c = Counts::default();
+        for w in workers {
+            let Some(p) = w.peers.get(slot) else {
+                continue;
+            };
+            c.requests = c.requests.wrapping_add(p.requests.load(Relaxed));
+            c.failures = c.failures.wrapping_add(p.failures.load(Relaxed));
+            for (b, n) in c.buckets.iter_mut().zip(&p.buckets) {
+                *b = b.wrapping_add(n.load(Relaxed));
+            }
+            c.sum_us = c.sum_us.wrapping_add(p.sum_us.load(Relaxed));
+        }
+        c
+    }
+
+    fn since(self, base: Counts) -> Counts {
+        let mut c = Counts {
+            requests: self.requests.wrapping_sub(base.requests),
+            failures: self.failures.wrapping_sub(base.failures),
+            buckets: self.buckets,
+            sum_us: self.sum_us.wrapping_sub(base.sum_us),
+        };
+        for (b, base) in c.buckets.iter_mut().zip(base.buckets) {
+            *b = b.wrapping_sub(base);
+        }
+        c
+    }
+}
+
+impl PeerPool {
+    /// The slot of a peer on `addr`: a static peer's, the one the address
+    /// has, or a free one; `u32::MAX` (not counted) when none is free.
+    pub(crate) fn slot(&self, addr: &str) -> u32 {
+        if let Some((_, slot)) = self.statics.iter().find(|(a, _)| a == addr) {
+            return *slot;
+        }
+        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = taken
+            .iter()
+            .position(|t| t.as_ref().is_some_and(|t| t.peer == addr))
+        {
+            return self.first + k as u32;
+        }
+        let Some(k) = taken.iter().position(Option::is_none) else {
+            return u32::MAX;
+        };
+        let base = match self.metrics.get() {
+            Some(m) => {
+                let workers = m.workers.lock().unwrap_or_else(|e| e.into_inner());
+                Counts::of(&workers, self.first as usize + k)
+            }
+            None => Counts::default(),
+        };
+        taken[k] = Some(Taken {
+            peer: addr.to_string(),
+            base,
+        });
+        self.first + k as u32
+    }
+
+    /// Free the slots `used` doesn't keep.
+    pub(crate) fn keep(&self, used: impl Fn(u32) -> bool) {
+        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, t) in taken.iter_mut().enumerate() {
+            if t.is_some() && !used(self.first + k as u32) {
+                *t = None;
+            }
+        }
+    }
+
+    /// `upstream`, now prepared, is the one the pool counts for.
+    pub(crate) fn note(&self, upstream: &'static PreparedUpstream) {
+        let _ = self.of.set(upstream);
+    }
 }
 
 /// A configuration's metrics: what the slots stand for, and every
@@ -159,6 +279,7 @@ struct Builder {
     server_index: HashMap<(String, String), u32>,
     peers: Vec<PeerLabels>,
     peer_index: HashMap<(String, String), u32>,
+    pools: Vec<&'static PeerPool>,
     limit_req: Vec<(String, &'static ZoneCounters<5>)>,
     limit_conn: Vec<(String, &'static ZoneCounters<3>)>,
     caches: Vec<(String, &'static ZoneCounters<7>)>,
@@ -209,12 +330,48 @@ pub(crate) fn peer_slots(upstream: &[u8], peers: &[PreparedPeer]) -> Option<&'st
                     upstream: key.0.clone(),
                     peer: key.1.clone(),
                     of: None,
+                    pooled: None,
                 });
                 b.peer_index.insert(key, i);
                 i
             })
             .collect();
         Some(&*crate::arena::leak(slots.into_boxed_slice()))
+    })
+}
+
+/// A pool for the run-time peers of upstream `upstream`, whose static
+/// peers have `slots`; `None` when metrics are off.
+pub(crate) fn peer_pool(
+    upstream: &[u8],
+    statics: &[PreparedPeer],
+    slots: Option<&[u32]>,
+) -> Option<&'static PeerPool> {
+    BUILD.with(|b| {
+        let mut b = b.borrow_mut();
+        let b = b.as_mut()?;
+        let pool: &'static PeerPool = crate::arena::leak(Box::new(PeerPool {
+            first: b.peers.len() as u32,
+            statics: statics
+                .iter()
+                .zip(slots.unwrap_or_default())
+                .map(|(p, &slot)| (p.addr.to_string(), slot))
+                .collect(),
+            taken: Mutex::new((0..POOL_SLOTS).map(|_| None).collect()),
+            metrics: OnceLock::new(),
+            of: OnceLock::new(),
+        }));
+        let name = String::from_utf8_lossy(upstream).into_owned();
+        for k in 0..POOL_SLOTS {
+            b.peers.push(PeerLabels {
+                upstream: name.clone(),
+                peer: String::new(),
+                of: None,
+                pooled: Some((pool, k)),
+            });
+        }
+        b.pools.push(pool);
+        Some(pool)
     })
 }
 
@@ -264,14 +421,18 @@ pub(crate) fn note_cache_zone(name: &str, counters: &'static ZoneCounters<7>) {
 /// The configuration's metrics, or `None` when no location reads them.
 pub(crate) fn finish() -> Option<&'static Metrics> {
     let b = BUILD.with(|b| b.borrow_mut().take())?;
-    Some(crate::arena::leak(Box::new(Metrics {
+    let m: &'static Metrics = crate::arena::leak(Box::new(Metrics {
         servers: b.servers.into_boxed_slice(),
         peers: b.peers.into_boxed_slice(),
         workers: Mutex::new(Vec::new()),
         limit_req: b.limit_req.into_boxed_slice(),
         limit_conn: b.limit_conn.into_boxed_slice(),
         caches: b.caches.into_boxed_slice(),
-    })))
+    }));
+    for pool in b.pools {
+        let _ = pool.metrics.set(m);
+    }
+    Some(m)
 }
 
 impl Metrics {
@@ -479,27 +640,62 @@ pub(crate) fn render(m: &Metrics) -> String {
     }
 
     if !m.peers.is_empty() {
-        let peer_labels: Vec<String> = m
+        // The slots shown: label, counts, and the state of the peer.
+        let mut up_of_pooled = HashMap::new();
+        for p in m
             .peers
             .iter()
-            .map(|p| {
-                let mut l = String::from("upstream=\"");
-                escape(&p.upstream, &mut l);
-                l.push_str("\",peer=\"");
-                escape(&p.peer, &mut l);
-                l.push('"');
-                l
-            })
-            .collect();
+            .filter_map(|p| p.pooled)
+            .filter(|(_, k)| *k == 0)
+        {
+            if let Some(&of) = p.0.of.get() {
+                let now = crate::upstream::UpstreamRef::current(of);
+                if let Some(slots) = now.metrics {
+                    for (i, &slot) in slots.iter().enumerate() {
+                        let up = crate::upstream::peer_up(&now, i);
+                        let was = up_of_pooled.entry(slot).or_insert(false);
+                        *was |= up;
+                    }
+                }
+            }
+        }
+        let mut rows: Vec<(String, Counts, bool)> = Vec::with_capacity(m.peers.len());
+        for (i, p) in m.peers.iter().enumerate() {
+            let (peer, base) = match p.pooled {
+                None => (p.peer.clone(), Counts::default()),
+                Some((pool, k)) => {
+                    let taken = pool.taken.lock().unwrap_or_else(|e| e.into_inner());
+                    match &taken[k] {
+                        Some(t) => (t.peer.clone(), t.base),
+                        None => continue,
+                    }
+                }
+            };
+            let mut l = String::from("upstream=\"");
+            escape(&p.upstream, &mut l);
+            l.push_str("\",peer=\"");
+            escape(&peer, &mut l);
+            l.push('"');
+            let up = match up_of_pooled.get(&(i as u32)) {
+                Some(&up) => up,
+                None => {
+                    p.of.is_none_or(|(upstream, i)| crate::upstream::peer_up(upstream, i))
+                }
+            };
+            rows.push((l, Counts::of(&workers, i).since(base), up));
+        }
         header(
             &mut out,
             "ruxen_upstream_peer_requests_total",
             "counter",
             "Attempts on an upstream peer.",
         );
-        for (i, l) in peer_labels.iter().enumerate() {
-            let n = sum(&|w| w.peers[i].requests.load(Relaxed));
-            let _ = writeln!(out, "ruxen_upstream_peer_requests_total{{{l}}} {n}");
+        for (l, c, _) in &rows {
+            let _ = writeln!(
+                out,
+                "ruxen_upstream_peer_requests_total{{{l}}} {}",
+                c.requests
+            );
         }
         header(
             &mut out,
@@ -507,9 +703,12 @@ pub(crate) fn render(m: &Metrics) -> String {
             "counter",
             "Failed attempts on an upstream peer, as max_fails counts them.",
         );
-        for (i, l) in peer_labels.iter().enumerate() {
-            let n = sum(&|w| w.peers[i].failures.load(Relaxed));
-            let _ = writeln!(out, "ruxen_upstream_peer_failures_total{{{l}}} {n}");
+        for (l, c, _) in &rows {
+            let _ = writeln!(
+                out,
+                "ruxen_upstream_peer_failures_total{{{l}}} {}",
+                c.failures
+            );
         }
         header(
             &mut out,
@@ -518,22 +717,22 @@ pub(crate) fn render(m: &Metrics) -> String {
             "Time from the start of an attempt until the upstream's response \
              was in (its head, for a streamed body).",
         );
-        for (i, l) in peer_labels.iter().enumerate() {
+        for (l, c, _) in &rows {
             let mut cumulative = 0;
             for (b, le) in BUCKETS_US.iter().enumerate() {
-                cumulative += sum(&|w| w.peers[i].buckets[b].load(Relaxed));
+                cumulative += c.buckets[b];
                 let _ = writeln!(
                     out,
                     "ruxen_upstream_peer_response_seconds_bucket{{{l},le=\"{}\"}} {cumulative}",
                     bound(*le)
                 );
             }
-            cumulative += sum(&|w| w.peers[i].buckets[BUCKETS_US.len()].load(Relaxed));
+            cumulative += c.buckets[BUCKETS_US.len()];
             let _ = writeln!(
                 out,
                 "ruxen_upstream_peer_response_seconds_bucket{{{l},le=\"+Inf\"}} {cumulative}"
             );
-            let total_us = sum(&|w| w.peers[i].sum_us.load(Relaxed));
+            let total_us = c.sum_us;
             let _ = writeln!(
                 out,
                 "ruxen_upstream_peer_response_seconds_sum{{{l}}} {}\n\
@@ -548,10 +747,8 @@ pub(crate) fn render(m: &Metrics) -> String {
             "1 if the peer can be picked, 0 if it is down or cooling off after \
              max_fails (without a zone, as the scraping worker sees it).",
         );
-        for (p, l) in m.peers.iter().zip(&peer_labels) {
-            let up =
-                p.of.is_none_or(|(upstream, i)| crate::upstream::peer_up(upstream, i));
-            let _ = writeln!(out, "ruxen_upstream_peer_up{{{l}}} {}", up as u8);
+        for (l, _, up) in &rows {
+            let _ = writeln!(out, "ruxen_upstream_peer_up{{{l}}} {}", *up as u8);
         }
     }
 

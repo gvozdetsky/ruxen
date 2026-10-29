@@ -11,7 +11,7 @@ does with it. Rendered by `scripts/directives.py` from a build of ruxen: where
 - **refused**: known, but refused at load, since ignoring it would be unsafe.
 - **no**: `unknown directive`; the configuration doesn't load.
 
-Of 564 directives: 190 implemented, 21 accepted with a difference, 72 accepted with no effect, 0 refused, 281 unknown.
+Of 564 directives: 203 implemented, 18 accepted with a difference, 68 accepted with no effect, 0 refused, 275 unknown.
 
 `ruxen --compat -c nginx.conf` checks a whole configuration against this.
 
@@ -58,7 +58,7 @@ Of 564 directives: 190 implemented, 21 accepted with a difference, 72 accepted w
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `thread_pool` | accepted, no effect | any |  |
+| `thread_pool` | yes | main |  |
 
 ## event
 
@@ -106,7 +106,7 @@ Not supported: `ssl_engine`.
 | `connection_pool_size` | accepted, no effect | any |  |
 | `request_pool_size` | accepted, no effect | any |  |
 | `client_header_timeout` | yes | any |  |
-| `client_header_buffer_size` | accepted, no effect | any |  |
+| `client_header_buffer_size` | yes | http, server |  |
 | `large_client_header_buffers` | yes | http, server |  |
 | `max_headers` | yes | http, server |  |
 | `ignore_invalid_headers` | yes | any |  |
@@ -131,8 +131,8 @@ Not supported: `ssl_engine`.
 | `sendfile` | yes | any |  |
 | `sendfile_max_chunk` | accepted, no effect | any |  |
 | `subrequest_output_buffer_size` | no |  |  |
-| `aio` | accepted, no effect | any |  |
-| `aio_write` | accepted, no effect | any |  |
+| `aio` | yes | http, server, location |  |
+| `aio_write` | accepted, differs | any | proxy_cache files are still written on the worker (#526) |
 | `read_ahead` | accepted, no effect | any |  |
 | `directio` | accepted, no effect | any |  |
 | `directio_alignment` | accepted, no effect | any |  |
@@ -145,7 +145,7 @@ Not supported: `ssl_engine`.
 | `limit_rate_after` | yes | http, server, location |  |
 | `keepalive_time` | yes | http, server, location, upstream |  |
 | `keepalive_timeout` | yes | http, server, location, upstream |  |
-| `keepalive_min_timeout` | no |  |  |
+| `keepalive_min_timeout` | yes | http, server, location |  |
 | `keepalive_requests` | yes | http, server, location, upstream |  |
 | `keepalive_disable` | yes | http, server, location |  |
 | `satisfy` | yes | http, server, location |  |
@@ -164,10 +164,10 @@ Not supported: `ssl_engine`.
 | `log_subrequest` | accepted, no effect | any |  |
 | `recursive_error_pages` | yes | http, server, location |  |
 | `server_tokens` | yes | http, server, location |  |
-| `if_modified_since` | accepted, differs | any | If-Modified-Since is still compared exactly |
+| `if_modified_since` | yes | http, server, location |  |
 | `max_ranges` | yes | http, server, location |  |
-| `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in location only) |
-| `etag` | accepted, differs | any | static responses still carry an ETag |
+| `chunked_transfer_encoding` | accepted, differs | any | not applied at this level (ruxen reads it in server and location only) |
+| `etag` | yes | http, server, location |  |
 | `early_hints` | no |  |  |
 | `error_page` | yes | http, server, location |  |
 | `post_action` | yes | http, server, location |  |
@@ -176,8 +176,8 @@ Not supported: `ssl_engine`.
 | `open_file_cache_min_uses` | accepted, no effect | any |  |
 | `open_file_cache_errors` | accepted, no effect | any |  |
 | `open_file_cache_events` | no |  |  |
-| `resolver` | yes | http, server, location |  |
-| `resolver_timeout` | yes | http, server, location |  |
+| `resolver` | yes | http, server, location, upstream |  |
+| `resolver_timeout` | yes | http, server, location, upstream |  |
 | `gzip_vary` | yes | any |  |
 | `gzip_http_version` | yes | any |  |
 | `gzip_proxied` | yes | any |  |
@@ -342,7 +342,7 @@ Not supported: `gunzip`, `gunzip_buffers`.
 
 | directive | ruxen | contexts | notes |
 | --- | --- | --- | --- |
-| `gzip_static` | accepted, differs | any | precompressed .gz files are not served (#93) |
+| `gzip_static` | yes | http, server, location |  |
 
 ## http_headers_filter
 
@@ -483,7 +483,7 @@ Not supported: `mp4`, `mp4_buffer_size`, `mp4_max_buffer_size`, `mp4_start_key_f
 | `proxy_ssl_crl` | yes | http, server, location |  |
 | `proxy_ssl_certificate` | yes | http, server, location |  |
 | `proxy_ssl_certificate_key` | yes | http, server, location |  |
-| `proxy_ssl_certificate_cache` | no |  |  |
+| `proxy_ssl_certificate_cache` | yes | http, server, location |  |
 | `proxy_ssl_password_file` | yes | http, server, location |  |
 | `proxy_ssl_conf_command` | no |  |  |
 
@@ -615,15 +615,15 @@ Not supported: `slice`.
 | `ssl_session_ticket_key` | yes | http, server |  |
 | `ssl_session_timeout` | yes | http, server |  |
 | `ssl_crl` | yes | http, server |  |
-| `ssl_ocsp` | no |  |  |
-| `ssl_ocsp_responder` | no |  |  |
-| `ssl_ocsp_cache` | no |  |  |
+| `ssl_ocsp` | yes | http, server |  |
+| `ssl_ocsp_responder` | yes | http, server |  |
+| `ssl_ocsp_cache` | yes | http, server |  |
 | `ssl_stapling` | yes | http, server |  |
 | `ssl_stapling_file` | yes | http, server |  |
 | `ssl_stapling_responder` | yes | http, server |  |
 | `ssl_stapling_verify` | yes | http, server |  |
 | `ssl_early_data` | accepted, differs | http, server | TLS 1.3 early data is not accepted |
-| `ssl_conf_command` | accepted, differs | http, server | OpenSSL commands are not applied: ruxen's TLS is rustls |
+| `ssl_conf_command` | yes | http, server |  |
 | `ssl_reject_handshake` | yes | http, server |  |
 
 ## http_stub_status
@@ -672,7 +672,9 @@ Not supported: `random`.
 
 ## http_upstream_sticky
 
-Not supported: `sticky`.
+| directive | ruxen | contexts | notes |
+| --- | --- | --- | --- |
+| `sticky` | yes | upstream |  |
 
 ## http_upstream_zone
 

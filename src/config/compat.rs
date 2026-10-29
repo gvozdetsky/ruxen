@@ -155,11 +155,8 @@ pub(crate) fn unenforced(lx: &Lexer, args: &[String], err: Error) -> Result<(), 
         }
         other => other.to_string(),
     };
-    let section = match args[0].as_str() {
-        "location" => "location-var",
-        _ => "root-or-alias-with-variables",
-    };
-    record(lx, Severity::Unsupported, args, note, section);
+    // `location $var` is the only one left (#596).
+    record(lx, Severity::Unsupported, args, note, "location-var");
     Ok(())
 }
 
@@ -272,12 +269,6 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "gzip-in-if",
     ),
     (
-        "gzip_static",
-        Some("off"),
-        "precompressed .gz files are not served (#760)",
-        "gzip_static-on",
-    ),
-    (
         "ssi",
         Some("off"),
         "server-side includes are not processed",
@@ -319,6 +310,19 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
         "request bodies are still read whole before they are proxied (#134)",
         "proxy_request_buffering-off",
     ),
+    // `aio threads` is implemented and not a finding.
+    (
+        "aio",
+        Some("off"),
+        "no Linux native AIO: file reads block the worker, as with `aio off`; `aio threads` moves them off it",
+        "aio-on-and-aio_write-on",
+    ),
+    (
+        "aio_write",
+        Some("off"),
+        "proxy_cache files are still written on the worker (#526)",
+        "aio-on-and-aio_write-on",
+    ),
     (
         "proxy_store",
         Some("off"),
@@ -335,7 +339,7 @@ const DIFFERS: &[(&str, Option<&str>, &str, &str)] = &[
     (
         "ssl_conf_command",
         None,
-        "OpenSSL commands are not applied: ruxen's TLS is rustls",
+        "OpenSSL commands are not applied, but for `Options KTLS`: ruxen's TLS is rustls",
         "ssl_conf_command",
     ),
     ("http3", None, NO_HTTP3, "http3-and-quic"),
@@ -609,11 +613,32 @@ mod tests {
     }
 
     #[test]
+    fn aio_threads_is_honoured_and_aio_on_differs() {
+        let (found, res) = findings(
+            "thread_pool p threads=2; http { aio threads=p; aio_write on; server { aio on; \
+             location / { aio off; } } }",
+        );
+        assert!(res.is_ok(), "{res:?}");
+        let got: Vec<(Severity, &str)> = found
+            .iter()
+            .map(|f| (f.severity, f.directive.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Severity::Differs, "aio_write on"),
+                (Severity::Differs, "aio on"),
+                (Severity::Ignored, "aio off"),
+            ]
+        );
+    }
+
+    #[test]
     fn unenforced_restrictions_are_unsupported() {
-        let (found, _) = findings("http { server { root /srv/$host; } }");
+        let (found, _) = findings("http { server { location $arg_x { return 403; } } }");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].severity, Severity::Unsupported);
-        assert_eq!(found[0].directive, "root /srv/$host");
+        assert_eq!(found[0].directive, "location $arg_x");
     }
 
     #[test]
@@ -720,11 +745,11 @@ mod tests {
         // The other findings, as the parser records them.
         let (found, _) = findings(
             "http { ssl_protocols TLSv1; include /nonexistent/x.conf; server { \
-             root /srv/$host; location $x { } location /a { alias /srv/$1; } \
+             location $x { } \
              no_such_directive; fastcgi_pass a; grpc_pass b; sub_filter c d; ssi_value_length 9; \
              mirror /m; } } stream { } mail { }",
         );
-        assert_eq!(found.len(), 13, "{found:?}");
+        assert_eq!(found.len(), 11, "{found:?}");
         sections.extend(found.iter().map(|f| f.section));
         for s in sections {
             assert!(

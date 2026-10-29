@@ -29,12 +29,10 @@ Checked against ruxen 0.2.2 and nginx 1.30.6.
 ```text
 $ ruxen --compat -c /etc/nginx/nginx.conf
 ruxen 0.2.2: checking /etc/nginx/nginx.conf
-/etc/nginx/sites-enabled/mastodon:74: differs: gzip_static on — precompressed .gz files are not served (#760)
 /etc/nginx/sites-enabled/mastodon:141: differs: proxy_buffering off — ruxen relays a response as it arrives either way, except where it still reads it whole (…: #463)
 ignored: 4 tuning directives with no effect in ruxen: gzip_buffers, proxy_buffering, tcp_nodelay
-what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#gzip_static-on
 what to do: https://github.com/gvozdetsky/ruxen/blob/v0.2.2/docs/migrating.md#proxy_buffering-off
-ruxen starts with this configuration; 2 directives behave differently from nginx
+ruxen starts with this configuration; 1 directive behaves differently from nginx
 ```
 
 - **unsupported**: ruxen refuses to start with it.
@@ -69,24 +67,6 @@ directive of these modules (`fastcgi_param` from `fastcgi_params`, …).
   TCP proxy) of its own, on its own ports, and run ruxen with the `http {}`
   part. Both can read the same `include` files.
 - **Issue:** none; out of scope for now ([`ROADMAP.md`](../ROADMAP.md)).
-
-### `root` or `alias` with variables
-
-`root /var/www/$host;`, `alias /srv/$1;`.
-
-- **ruxen:** refuses them. Taken literally, the path would point at a
-  directory named `$host` and serve other files than nginx serves.
-- **Do:** a literal `root` and `try_files` with the variable:
-  ```nginx
-  root /var/www;
-  location / {
-      try_files /$host$uri /$host$uri/index.html =404;
-  }
-  ```
-  ruxen refuses a `Host` with `/`, `..` or a leading `.` (400), as nginx
-  does, so `$host` can't leave the root. For `alias` with captures, one
-  `location` per directory with a literal `alias`.
-- **Issue:** [#232] (open).
 
 ### `grpc_pass`
 
@@ -148,9 +128,6 @@ too, the line only differs.
 (`error: … the check stopped here`), as `-t` does. The ones real
 configurations hit:
 
-- `bad value for upstream server param: resolve`: `server … resolve` in an
-  `upstream` (nginx 1.27.3). ruxen resolves upstream names once, at start
-  and reload. [#597] (open).
 - `bad value for disable_symlinks from=`: `from=` with a variable other
   than `$document_root`. ruxen refuses it rather than not enforce it; use
   `$document_root` or a literal path.
@@ -190,18 +167,6 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
 - **Do:** `ssl_protocols TLSv1.2 TLSv1.3;`. Keep nginx for a server whose
   clients need TLS 1.0.
 - **Issue:** none; [#36] (closed) made the old names a warning.
-
-### `gzip_static on`
-
-- **ruxen:** doesn't look for `file.gz`; it sends `file`, compressed per
-  request when `gzip on` and `gzip_types` cover it.
-- **Matters:** CPU per request instead of once at build time, and the
-  compressed response is chunked, with a weak `ETag`. With `gzip_static
-  always`, clients without gzip get the plain file, which is what they can
-  read anyway.
-- **Do:** `gzip on;` with the types in `gzip_types` (`text/html` is always
-  included).
-- **Issue:** [#760] (open).
 
 ### `proxy_request_buffering off`
 
@@ -290,10 +255,15 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
 
 ### `ssl_conf_command`
 
-- **ruxen:** its TLS is rustls; OpenSSL commands aren't applied.
-- **Do:** check what the command set. `Options KTLS`: kernel TLS is [#673]
-  (open). `Ciphersuites`: rustls's TLS 1.3 suites are AES-GCM and
-  ChaCha20-Poly1305.
+- **ruxen:** its TLS is rustls; OpenSSL commands aren't applied, except
+  `Options KTLS` (and `-KTLS`): as in nginx, the kernel then encrypts the
+  records after the handshake, and `sendfile` works over TLS. It needs the
+  `tls` kernel module (`modprobe tls`; ruxen started as root loads it);
+  without it ruxen warns at startup and serves TLS in userspace. TLS 1.3
+  key updates need Linux 6.14 or later; on older kernels a client's
+  KeyUpdate closes a kTLS connection.
+- **Do:** check what the other commands set. `Ciphersuites`: rustls's
+  TLS 1.3 suites are AES-GCM and ChaCha20-Poly1305.
 
 ### `ssi`
 
@@ -325,6 +295,19 @@ opened, a port that can't be bound. Run `--compat` where ruxen will run.
   nginx.
 - **Issue:** none.
 
+### `aio on` and `aio_write on`
+
+- **ruxen:** has no Linux native AIO: with `aio on`, file reads block the
+  worker as with `aio off`. `aio threads` (and `thread_pool`) works as in
+  nginx: file reads and `sendfile` run on a pool of threads, so a slow disk
+  stalls a pool thread, not every connection of the worker. `aio_write on`
+  doesn't move `proxy_cache` writes off the worker yet. Opening and
+  `stat`ing a file stay on the worker, as in nginx.
+- **Matters:** with files on slow or network storage (NFS, FUSE, a cold
+  volume).
+- **Do:** `aio threads;` instead of `aio on;`.
+- **Issue:** [#526] (open: `aio_write`).
+
 ### `gzip` in `if`
 
 - **ruxen:** applies `gzip` in a location's `if`, not in a server's.
@@ -346,14 +329,12 @@ among the `differs` lines, but nginx warns and behaves the same.
 
 `ignored: N tuning directives with no effect in ruxen: …`: accepted and
 ignored, since they tune nginx's own machinery (`tcp_nopush`,
-`types_hash_max_size`, `proxy_buffers`, `open_file_cache`, `aio`, `*_temp_path`
+`types_hash_max_size`, `proxy_buffers`, `open_file_cache`, `directio`, `*_temp_path`
 of modules ruxen doesn't have, …). Nothing to do. Some notes:
 
 - `daemon`, `master_process`: ruxen stays in the foreground, one process.
 - `worker_cpu_affinity`, `worker_priority`: use the service manager
   (`CPUAffinity=`, `Nice=` in systemd).
-- `aio`, `thread_pool`: file reads run on the worker; a slow disk stalls
-  its connections ([#526], open).
 - `env`: ruxen has no embedded languages to pass variables to.
 
 ## Running ruxen in place of nginx
@@ -468,16 +449,12 @@ start without it.
 
 [#36]: https://github.com/gvozdetsky/ruxen/issues/36
 [#134]: https://github.com/gvozdetsky/ruxen/issues/134
-[#232]: https://github.com/gvozdetsky/ruxen/issues/232
 [#337]: https://github.com/gvozdetsky/ruxen/issues/337
 [#463]: https://github.com/gvozdetsky/ruxen/issues/463
 [#464]: https://github.com/gvozdetsky/ruxen/issues/464
 [#526]: https://github.com/gvozdetsky/ruxen/issues/526
 [#596]: https://github.com/gvozdetsky/ruxen/issues/596
-[#597]: https://github.com/gvozdetsky/ruxen/issues/597
 [#599]: https://github.com/gvozdetsky/ruxen/issues/599
-[#673]: https://github.com/gvozdetsky/ruxen/issues/673
 [#757]: https://github.com/gvozdetsky/ruxen/issues/757
-[#760]: https://github.com/gvozdetsky/ruxen/issues/760
 [#764]: https://github.com/gvozdetsky/ruxen/issues/764
 [#774]: https://github.com/gvozdetsky/ruxen/issues/774

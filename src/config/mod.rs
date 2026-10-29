@@ -38,7 +38,7 @@ mod values;
 
 pub use ast::*;
 pub use error::*;
-pub use parse_gzip::{GzipConf, proxied as gzip_proxied};
+pub use parse_gzip::{GzipConf, GzipStatic, proxied as gzip_proxied};
 pub use parse_http2::Http2Conf;
 pub use parse_limit_conn::{LimitConnConf, LimitConnZoneDef};
 pub use parse_limit_req::{LimitReqConf, LimitReqZoneDef};
@@ -93,6 +93,7 @@ pub(crate) fn parse_lexer(mut lx: Lexer) -> Result<HttpConfig, Error> {
 
 fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     reset_variable_registry();
+    AIO_POOLS_USED.with(|u| u.borrow_mut().clear());
     let mut runtime = RuntimeOpts::default();
     let mut http: Option<HttpConfig> = None;
 
@@ -249,6 +250,16 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     ctx: "top-level",
                 });
             }
+            ("thread_pool", Terminator::Semi) => {
+                let def = parse_thread_pool_args(&args)?;
+                if runtime.thread_pools.iter().any(|p| p.name == def.name) {
+                    return Err(Error::Text(format!(
+                        "duplicate thread pool \"{}\"",
+                        def.name
+                    )));
+                }
+                runtime.thread_pools.push(def);
+            }
             (n, Terminator::Semi) if is_ignored_stmt(n) => check_ignored_args(lx, &args)?,
             (n, Terminator::BlockOpen) if is_ignored_block(n) => {
                 compat::ignored_block(lx, &args);
@@ -261,6 +272,7 @@ fn parse_lexer_inner(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     }
 
     let mut http = http.ok_or(Error::UnexpectedEof)?;
+    check_thread_pools(&mut runtime.thread_pools)?;
     http.warnings.extend(lx.take_warnings());
     http.uses_request_body_file = values::request_body_file_used();
     http.uses_request_body = values::request_body_used();
@@ -306,6 +318,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut client_body_buffer_size: Option<u64> = None;
     let mut client_body_temp_path: Option<TempPath> = None;
     let mut sendfile: Option<bool> = None;
+    let mut aio: Option<Aio> = None;
     let mut http2: Option<bool> = None;
     let mut disable_symlinks: Option<DisableSymlinks> = None;
     let mut limit_rate: Option<Vec<ValuePart>> = None;
@@ -313,6 +326,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut keepalive_timeout: Option<KeepaliveTimeout> = None;
     let mut keepalive_requests: Option<u64> = None;
     let mut keepalive_time_ms: Option<u64> = None;
+    let mut keepalive_min_timeout_ms: Option<u64> = None;
     let mut keepalive_disable: Option<KeepaliveDisable> = None;
     let mut client_timeouts = ClientTimeouts::default();
     let mut error_logs: Option<Vec<ErrorLog>> = None;
@@ -350,6 +364,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
     let mut client_verify = ClientVerifyConf::default();
     let mut stapling = StaplingConf::default();
     let mut ssl_password_file: Option<PathBuf> = None;
+    let mut ssl_conf_commands: Option<Vec<(String, String)>> = None;
     let mut warnings: Vec<String> = Vec::new();
     loop {
         let (args, term) = lx.read_directive()?;
@@ -366,6 +381,21 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                              no connections will be accepted"
                                 .into(),
                         );
+                    }
+                    // `resolve` servers take http's resolver unless their
+                    // block has one (ngx_http_upstream_init_round_robin).
+                    for u in &mut upstreams {
+                        if u.resolver.is_none() {
+                            u.resolver.clone_from(&proxy.resolver);
+                        }
+                        u.resolver_timeout_ms = u.resolver_timeout_ms.or(proxy.resolver_timeout_ms);
+                        if u.resolver.is_none() && u.servers.iter().any(|s| s.resolve.is_some()) {
+                            return Err(Error::Text(format!(
+                                "no resolver defined to resolve names at run time \
+                                 in upstream \"{}\"",
+                                u.name
+                            )));
+                        }
                     }
                     // After the whole block: an http-level proxy_* line
                     // below a server still applies to it, as in nginx.
@@ -425,6 +455,8 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         server.keepalive_requests =
                             server.keepalive_requests.or(keepalive_requests);
                         server.keepalive_time_ms = server.keepalive_time_ms.or(keepalive_time_ms);
+                        server.keepalive_min_timeout_ms =
+                            server.keepalive_min_timeout_ms.or(keepalive_min_timeout_ms);
                         server.keepalive_disable = server.keepalive_disable.or(keepalive_disable);
                         server.client_timeouts = server.client_timeouts.inherit(client_timeouts);
                         server.client_timeouts.check_large_header_buffers()?;
@@ -452,6 +484,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                             ssl.password_file.clone_from(&ssl_password_file);
                         }
                         ssl.stapling = std::mem::take(&mut ssl.stapling).inherit(&stapling);
+                        if ssl.conf_commands.is_none() {
+                            ssl.conf_commands.clone_from(&ssl_conf_commands);
+                        }
                     }
                     Ok(HttpConfig {
                         runtime: RuntimeOpts::default(),
@@ -484,6 +519,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                         uses_metrics: false,
                         client_body_temp_path,
                         sendfile,
+                        aio,
                         http2,
                         http2_conf,
                         disable_symlinks,
@@ -525,7 +561,7 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             }
             ("root", Terminator::Semi) => {
                 let path = args.get(1).ok_or(Error::MissingArg("root path"))?;
-                root = Some(PathBuf::from(path));
+                root = Some(parse_root_path(false, path)?);
             }
             ("root", _) => {
                 return Err(Error::WrongTerminator {
@@ -757,9 +793,22 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
             (name, Terminator::Semi) if StaplingConf::takes(name) => {
                 stapling.parse(&args, lx.conf_prefix())?
             }
+            ("ssl_conf_command", Terminator::Semi) => {
+                let [_, name, value] = args.as_slice() else {
+                    return Err(Error::BadValue {
+                        what: "ssl_conf_command (invalid number of arguments)",
+                        got: args[1..].join(" "),
+                    });
+                };
+                if !conf_command_applied(name, value) {
+                    compat::ignored(lx, &args);
+                }
+                ssl_conf_commands
+                    .get_or_insert_with(Vec::new)
+                    .push((name.clone(), value.clone()));
+            }
             (
-                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data"
-                | "ssl_conf_command",
+                "ssl_buffer_size" | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_early_data",
                 Terminator::Semi,
             ) => {
                 warn_ignored_tls_policy(&args, &mut warnings);
@@ -800,6 +849,9 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 | "ssl_client_certificate"
                 | "ssl_trusted_certificate"
                 | "ssl_crl"
+                | "ssl_ocsp"
+                | "ssl_ocsp_responder"
+                | "ssl_ocsp_cache"
                 | "ssl_password_file"
                 | "ssl_early_data"
                 | "ssl_reject_handshake"
@@ -907,6 +959,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                 }
                 sendfile = Some(parse_on_off_args(&args[1..], "sendfile")?);
             }
+            ("aio", Terminator::Semi) => {
+                if aio.is_some() {
+                    return Err(Error::Duplicate("aio"));
+                }
+                aio = Some(parse_aio_args(lx, &args)?);
+            }
             ("post_action", Terminator::Semi) => {
                 if post_action.is_some() {
                     return Err(Error::Duplicate("post_action"));
@@ -986,6 +1044,12 @@ pub(crate) fn parse_http_block(lx: &mut Lexer) -> Result<HttpConfig, Error> {
                     return Err(Error::Duplicate("keepalive_time"));
                 }
                 keepalive_time_ms = Some(parse_keepalive_time_args(&args[1..])?);
+            }
+            ("keepalive_min_timeout", Terminator::Semi) => {
+                if keepalive_min_timeout_ms.is_some() {
+                    return Err(Error::Duplicate("keepalive_min_timeout"));
+                }
+                keepalive_min_timeout_ms = Some(parse_keepalive_min_timeout_args(&args[1..])?);
             }
             ("keepalive_disable", Terminator::Semi) => {
                 if keepalive_disable.is_some() {
@@ -1076,7 +1140,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "error_log",
     "timer_resolution",
     "pcre_jit",
-    "thread_pool",
     "lock_file",
     "working_directory",
     "debug_points",
@@ -1146,8 +1209,8 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "proxy_socket_keepalive",
     "proxy_store",
     "proxy_store_access",
-    // File I/O knobs (we use std::fs; these are nginx-only tuning)
-    "aio",
+    // File I/O knobs: nginx-only tuning. `aio_write`: temp-file writes
+    // stay on the worker (#526).
     "aio_write",
     "directio",
     "directio_alignment",
@@ -1166,7 +1229,6 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "gzip_min_length",
     "gzip_buffers",
     "gzip_disable",
-    "gzip_static",
     "ssi",
     "ssi_silent_errors",
     "ssi_types",
@@ -1185,6 +1247,114 @@ pub(crate) const IGNORED_STMT: &[&str] = &[
     "quic_host_key",
     "quic_retry",
 ];
+
+thread_local! {
+    /// The pools `aio threads` names, with where: checked against the
+    /// `thread_pool`s once the whole configuration is read, which may
+    /// define them after the `http` block.
+    static AIO_POOLS_USED: std::cell::RefCell<Vec<(String, Option<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `aio off|on|threads[=pool]` (ngx_http_core_set_aio). `on` is Linux
+/// native AIO, which ruxen doesn't have: accepted, a `--compat` finding.
+pub(crate) fn parse_aio_args(lx: &Lexer, args: &[String]) -> Result<Aio, Error> {
+    let [_, value] = args else {
+        return Err(Error::BadValue {
+            what: "aio",
+            got: args[1..].join(" "),
+        });
+    };
+    let aio = match value.as_str() {
+        "off" => Aio::Off,
+        "on" => Aio::On,
+        "threads" => Aio::Threads("default".to_string()),
+        v => match v.strip_prefix("threads=") {
+            Some(name) if name.contains('$') => {
+                return Err(Error::Directive {
+                    name: "aio",
+                    msg: "with a variable in the thread pool name is not supported".to_string(),
+                });
+            }
+            Some(name) => Aio::Threads(name.to_string()),
+            None => {
+                return Err(Error::BadValue {
+                    what: "aio",
+                    got: v.to_string(),
+                });
+            }
+        },
+    };
+    match &aio {
+        Aio::Threads(name) => {
+            AIO_POOLS_USED.with(|u| u.borrow_mut().push((name.clone(), lx.position())));
+        }
+        _ => compat::ignored(lx, args),
+    }
+    Ok(aio)
+}
+
+/// `thread_pool name threads=N [max_queue=M];` (ngx_thread_pool): other
+/// parameters are ignored, as nginx does.
+fn parse_thread_pool_args(args: &[String]) -> Result<ThreadPoolDef, Error> {
+    if !(3..=4).contains(&args.len()) {
+        return Err(Error::Text(
+            "invalid number of arguments in \"thread_pool\" directive".to_string(),
+        ));
+    }
+    let mut threads = 0;
+    let mut max_queue = crate::aio::DEFAULT_MAX_QUEUE;
+    for arg in &args[2..] {
+        if let Some(n) = arg.strip_prefix("threads=") {
+            threads = match n.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => return Err(Error::Text(format!("invalid threads value \"{arg}\""))),
+            };
+        } else if let Some(n) = arg.strip_prefix("max_queue=") {
+            max_queue = n
+                .parse::<usize>()
+                .map_err(|_| Error::Text(format!("invalid max_queue value \"{arg}\"")))?;
+        }
+    }
+    if threads == 0 {
+        return Err(Error::Text(
+            "\"thread_pool\" must have \"threads\" parameter".to_string(),
+        ));
+    }
+    Ok(ThreadPoolDef {
+        name: args[1].clone(),
+        threads,
+        max_queue,
+    })
+}
+
+/// Every pool an `aio threads` names is defined; `default` is when it
+/// isn't (ngx_thread_pool_init_conf).
+fn check_thread_pools(pools: &mut Vec<ThreadPoolDef>) -> Result<(), Error> {
+    let used = AIO_POOLS_USED.with(|u| std::mem::take(&mut *u.borrow_mut()));
+    for (name, position) in used {
+        if pools.iter().any(|p| p.name == name) {
+            continue;
+        }
+        if name == "default" {
+            pools.push(ThreadPoolDef {
+                name,
+                threads: crate::aio::DEFAULT_THREADS,
+                max_queue: crate::aio::DEFAULT_MAX_QUEUE,
+            });
+            continue;
+        }
+        let error = Error::Text(format!("unknown thread pool \"{name}\""));
+        return Err(match position {
+            Some(position) => Error::At {
+                error: Box::new(error),
+                position,
+            },
+            None => error,
+        });
+    }
+    Ok(())
+}
 
 /// Block directives whose body we swallow wholesale (no inner parsing).
 pub(crate) const IGNORED_BLOCK: &[&str] = &["events", "charset_map"];
@@ -1439,6 +1609,29 @@ pub(crate) fn parse_mime(
     }
 }
 
+/// A `root` or `alias` path. With variables it is rendered per request
+/// (#232), but it may not read `$document_root` or `$realpath_root`, its
+/// own value (ngx_http_core_root).
+pub(crate) fn parse_root_path(alias: bool, path: &str) -> Result<PathBuf, Error> {
+    let has =
+        |name: &str| path.contains(&format!("${name}")) || path.contains(&format!("${{{name}}}"));
+    let refused = match (has("document_root"), has("realpath_root"), alias) {
+        (true, _, false) => "the $document_root variable cannot be used in the \"root\" directive",
+        (true, _, true) => "the $document_root variable cannot be used in the \"alias\" directive",
+        (_, true, false) => "the $realpath_root variable cannot be used in the \"root\" directive",
+        (_, true, true) => "the $realpath_root variable cannot be used in the \"alias\" directive",
+        _ => "",
+    };
+    if !refused.is_empty() {
+        return Err(Error::Message(refused));
+    }
+    if path.contains('$') {
+        // Notes the references for the unknown-variable check.
+        parse_value_with_vars(path)?;
+    }
+    Ok(PathBuf::from(path))
+}
+
 /// Fail closed on directives that restrict access, when ruxen can't
 /// enforce them yet. The allowlist above is for tuning knobs; silently
 /// dropping one of these would serve what the config says to protect.
@@ -1447,14 +1640,6 @@ pub(crate) fn parse_mime(
 pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<(), Error> {
     let value = args.get(1).map(String::as_str);
     let consequence = match args.first().map(String::as_str) {
-        // Taken literally, `root /var/www/$host` or `alias /srv/$1` looks
-        // for a directory named `$host` (#232). Until the path is rendered
-        // per request, such a configuration is refused rather than served
-        // from the wrong place. nginx refuses a `$` that doesn't start a
-        // variable, so any `$` here is one.
-        Some("root" | "alias") if value.is_some_and(|v| v.contains('$')) => {
-            "variables in the path aren't expanded yet (#232), so other files would be served than nginx serves"
-        }
         // `location $var` (one argument, a leading `$`) is a predicate
         // location since nginx 1.31.5: it matches when the variable is
         // non-empty and not "0" (ngx_http_core_location). Read as a prefix,
@@ -1472,10 +1657,10 @@ pub(crate) fn reject_unenforced(args: &[String], term: &Terminator) -> Result<()
         }
         _ => return Ok(()),
     };
-    // For a path or a location, the whole directive: "root" alone isn't
-    // what's missing.
+    // For a location, the whole directive: "location" alone isn't what's
+    // missing.
     let name = match args.first().map(String::as_str) {
-        Some("root" | "alias" | "location") => args.join(" "),
+        Some("location") => args.join(" "),
         _ => args[0].clone(),
     };
     Err(Error::Unenforced { name, consequence })
@@ -2494,6 +2679,50 @@ mod tests {
         }
     }
 
+    /// `proxy_ssl_certificate_cache` (#601), parsed as nginx's
+    /// ngx_http_proxy_ssl_certificate_cache: seconds, `off` winning.
+    #[test]
+    fn proxy_ssl_certificate_cache_directive() {
+        let cfg = parse(
+            "http { server { listen 80; proxy_ssl_certificate_cache max=4 valid=2s;\n\
+             location /a { proxy_ssl_certificate_cache max=1 inactive=1m; }\n\
+             location /b { proxy_ssl_certificate_cache max=1 off; } } }",
+        )
+        .unwrap();
+        let server = &cfg.servers[0];
+        let Some(Some(cache)) = server.proxy.ssl_certificate_cache else {
+            panic!("{:?}", server.proxy.ssl_certificate_cache);
+        };
+        assert_eq!(
+            (cache.max, cache.inactive_secs, cache.valid_secs),
+            (4, 10, 2)
+        );
+        let loc = |p: &str| {
+            server
+                .locations
+                .iter()
+                .find(|l| l.pattern == p)
+                .unwrap()
+                .proxy
+                .ssl_certificate_cache
+        };
+        let Some(Some(a)) = loc("/a") else { panic!() };
+        assert_eq!((a.max, a.inactive_secs, a.valid_secs), (1, 60, 60));
+        assert_ne!(a.id, cache.id);
+        assert_eq!(loc("/b"), Some(None));
+        for bad in [
+            "http { proxy_ssl_certificate_cache inactive=20s; }",
+            "http { proxy_ssl_certificate_cache max=0; }",
+            "http { proxy_ssl_certificate_cache max=-1; }",
+            "http { proxy_ssl_certificate_cache max=1 valid=500ms; }",
+            "http { proxy_ssl_certificate_cache max=1 foo; }",
+            "http { proxy_ssl_certificate_cache; }",
+            "http { proxy_ssl_certificate_cache off; proxy_ssl_certificate_cache off; }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn ssl_protocols_accepts_tls12_tls13_and_rejects_insecure() {
         let src = r#"
@@ -2583,24 +2812,34 @@ mod tests {
     }
 
     #[test]
-    fn variables_in_root_and_alias_are_refused() {
-        // #232: taken literally they serve other files than nginx does.
+    fn variables_in_root_and_alias() {
+        // #232: rendered per request.
         for src in [
             "http { root /var/www/$host; server { listen 80; } }",
             "http { server { listen 80; root /srv/$server_name; } }",
-            "http { server { listen 80; location / { root $document_root/x; } } }",
             "http { server { listen 80; location ~ ^/i/(.+)$ { alias /srv/img/$1; } } }",
+            "http { server { listen 80; location /a/ { alias /srv/${host}/; } } }",
         ] {
-            let e = unenforced_err(src);
-            assert!(e.contains("(#232)"), "{src}: {e}");
+            parse(src).unwrap();
         }
-        let e = unenforced_err("http { server { listen 80; root /var/www/$host; } }");
-        assert!(
-            e.starts_with("\"root /var/www/$host\" is not supported yet"),
-            "{e}"
-        );
-        // Without variables, as before.
-        parse("http { server { listen 80; root /srv; location /a/ { alias /srv/a/; } } }").unwrap();
+        // Not their own value (ngx_http_core_root), nor an unknown one.
+        for (src, want) in [
+            (
+                "http { server { listen 80; location / { root $document_root/x; } } }",
+                "the $document_root variable cannot be used in the \"root\" directive",
+            ),
+            (
+                "http { server { listen 80; location / { alias /x/${realpath_root}; } } }",
+                "the $realpath_root variable cannot be used in the \"alias\" directive",
+            ),
+            (
+                "http { server { listen 80; root /srv/$nosuch; } }",
+                "unknown \"nosuch\" variable",
+            ),
+        ] {
+            let e = parse(src).unwrap_err().to_string();
+            assert!(e.starts_with(want), "{src}: {e}");
+        }
     }
 
     #[test]
@@ -3294,6 +3533,31 @@ mod tests {
         let cfg = parse(src).unwrap();
         // Directives parsed without error and didn't disturb the populated SSL state.
         assert_eq!(cfg.servers[0].ssl.certs.len(), 1);
+    }
+
+    #[test]
+    fn ssl_conf_command_options_ktls() {
+        let cfg = parse(
+            "http { ssl_conf_command Options KTLS; \
+             server { listen 443 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; } \
+             server { listen 444 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_conf_command Options KTLS; ssl_conf_command Options -KTLS; } \
+             server { listen 445 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256; } \
+             server { listen 446 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; \
+             ssl_conf_command options ServerPreference,ktls; } }",
+        )
+        .unwrap();
+        let ktls: Vec<bool> = cfg.servers.iter().map(|s| s.ssl.ktls()).collect();
+        // A server's own lines replace the http level's, as nginx merges.
+        assert_eq!(ktls, [true, false, false, true]);
+        assert!(conf_command_applied("Options", "KTLS"));
+        assert!(!conf_command_applied("Options", "KTLS,ServerPreference"));
+        assert!(!conf_command_applied("Ciphersuites", "KTLS"));
+        assert!(matches!(
+            parse("http { ssl_conf_command Options; }"),
+            Err(Error::BadValue { .. })
+        ));
     }
 
     #[test]
@@ -4484,6 +4748,49 @@ mod tests {
         assert_eq!(loc.keepalive_time_ms, Some(100));
     }
 
+    /// `keepalive_min_timeout` (#601): http, server and location.
+    #[test]
+    fn keepalive_min_timeout_parses_and_inherits() {
+        let src = r#"
+            http {
+                keepalive_min_timeout 2s;
+                server {
+                    listen 80;
+                    location / { return 200 "ok"; }
+                    location = /loc {
+                        keepalive_min_timeout 100ms;
+                        return 200 "l";
+                    }
+                }
+                server { listen 81; keepalive_min_timeout 0; }
+            }
+        "#;
+        let cfg = parse(src).unwrap();
+        let server = &cfg.servers[0];
+        assert_eq!(server.keepalive_min_timeout_ms, Some(2_000));
+        let loc = |pattern: &str| {
+            server
+                .locations
+                .iter()
+                .find(|l| l.pattern == pattern)
+                .unwrap()
+                .keepalive_min_timeout_ms
+        };
+        // The server's applies to its locations in `resolve_keepalive`.
+        assert_eq!(loc("/"), None);
+        assert_eq!(loc("/loc"), Some(100));
+        assert_eq!(cfg.servers[1].keepalive_min_timeout_ms, Some(0));
+        for bad in [
+            "http { keepalive_min_timeout 1s; keepalive_min_timeout 2s; }",
+            "http { keepalive_min_timeout; }",
+            "http { keepalive_min_timeout 1s 2s; }",
+            "http { keepalive_min_timeout x; }",
+            "keepalive_min_timeout 1s; http { }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn keepalive_disable_parses_and_rejects_bad_values() {
         let src = r#"
@@ -5473,6 +5780,61 @@ mod tests {
                 what: "autoindex_format",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn thread_pools_and_aio_threads_as_nginx() {
+        let cfg = parse(
+            "thread_pool big threads=4 max_queue=10; \
+             http { aio threads=big; server { aio off; location / { aio threads; } \
+             location /n { location /n/x { } } } } thread_pool late foo=1 threads=2;",
+        )
+        .unwrap();
+        let pools: Vec<(&str, usize, usize)> = cfg
+            .runtime
+            .thread_pools
+            .iter()
+            .map(|p| (p.name.as_str(), p.threads, p.max_queue))
+            .collect();
+        // `default` is added for the bare `aio threads`.
+        assert_eq!(
+            pools,
+            [("big", 4, 10), ("late", 2, 65536), ("default", 32, 65536)]
+        );
+        assert_eq!(cfg.aio, Some(Aio::Threads("big".into())));
+        let server = &cfg.servers[0];
+        assert_eq!(server.aio, Some(Aio::Off));
+        assert_eq!(
+            server.locations[0].aio,
+            Some(Aio::Threads("default".into()))
+        );
+        assert_eq!(server.locations[1].aio, None);
+
+        let err = |src: &str| parse(src).unwrap_err().to_string();
+        assert_eq!(
+            err("http { server { aio threads=nope; } }"),
+            "unknown thread pool \"nope\""
+        );
+        assert_eq!(
+            err("thread_pool a threads=1; thread_pool a threads=2; http { }"),
+            "duplicate thread pool \"a\""
+        );
+        assert_eq!(
+            err("thread_pool a max_queue=1; http { }"),
+            "\"thread_pool\" must have \"threads\" parameter"
+        );
+        assert_eq!(
+            err("thread_pool a threads=0; http { }"),
+            "invalid threads value \"threads=0\""
+        );
+        assert!(err("http { aio threads=$x; }").contains("variable"));
+        assert!(err("http { aio maybe; }").contains("aio"));
+        assert!(err("http { aio on; aio off; }").contains("duplicate"));
+        // Not a main-context directive.
+        assert!(matches!(
+            parse("aio threads; http { }"),
+            Err(Error::UnknownDirective { .. })
         ));
     }
 }

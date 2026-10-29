@@ -270,6 +270,8 @@ pub struct ProxyConf {
     pub ssl_certificate_key: Option<Option<CertPath>>,
     /// `proxy_ssl_password_file` (#139).
     pub ssl_password_file: Option<std::path::PathBuf>,
+    /// `proxy_ssl_certificate_cache` (#601); `Some(None)` is `off`.
+    pub ssl_certificate_cache: Option<Option<SslCertificateCache>>,
     /// `resolver` and `resolver_timeout` (#133), core directives in nginx;
     /// only `proxy_pass` with variables uses them here.
     pub resolver: Option<ResolverConf>,
@@ -384,6 +386,11 @@ pub struct ProxyCachePath {
     pub inactive_secs: u64,
     pub max_size: Option<u64>,
     pub min_free: Option<u64>,
+    /// `manager_files`, `manager_sleep`, `manager_threshold` (nginx's
+    /// 100, 50ms, 200ms when unset).
+    pub manager_files: u64,
+    pub manager_sleep_ms: u64,
+    pub manager_threshold_ms: u64,
 }
 
 /// `proxy_bind address [transparent] | off`.
@@ -449,6 +456,7 @@ impl ProxyConf {
             ssl_password_file: self
                 .ssl_password_file
                 .or_else(|| parent.ssl_password_file.clone()),
+            ssl_certificate_cache: self.ssl_certificate_cache.or(parent.ssl_certificate_cache),
             resolver: self.resolver.or_else(|| parent.resolver.clone()),
             resolver_timeout_ms: self.resolver_timeout_ms.or(parent.resolver_timeout_ms),
         }
@@ -505,6 +513,9 @@ pub struct RuntimeOpts {
     /// waits for in-flight connections, in ms. `None` (and nginx's `0`)
     /// waits without limit.
     pub worker_shutdown_timeout_ms: Option<u64>,
+    /// `thread_pool` definitions, with nginx's `default` added when an
+    /// `aio threads` uses it undefined.
+    pub thread_pools: Vec<ThreadPoolDef>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -586,6 +597,8 @@ pub struct HttpConfig {
     pub client_body_temp_path: Option<TempPath>,
     /// http-scope `sendfile on|off`. `None` means "not set" (nginx: off).
     pub sendfile: Option<bool>,
+    /// http-scope `aio`. `None`: not set (off).
+    pub aio: Option<Aio>,
     /// http-scope `http2 on|off` (nginx 1.25.1+). `None`: not set (off).
     pub http2: Option<bool>,
     /// http-scope `http2_*` settings (#346).
@@ -670,6 +683,57 @@ pub struct UpstreamBlock {
     /// `zone name [size]` (#143): the peers' state is shared by all
     /// workers.
     pub zone: Option<String>,
+    /// `resolver` / `resolver_timeout` in the block (#597), else http's,
+    /// filled in once the http block is read.
+    pub resolver: Option<ResolverConf>,
+    pub resolver_timeout_ms: Option<u64>,
+    /// `sticky` (#600): session affinity.
+    pub sticky: Option<StickyConf>,
+}
+
+/// `sticky cookie | route | learn` (ngx_http_upstream_sticky_module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickyConf {
+    /// `sticky cookie name [expires=] [domain=] [httponly] [samesite=]
+    /// [secure] [path=]`: the server's ID goes to the client in a cookie.
+    Cookie(StickyCookie),
+    /// `sticky route $var ...`: the first non-empty variable is the
+    /// server's `route=`.
+    Route { lookup: Vec<Vec<ValuePart>> },
+    /// `sticky learn create=$var lookup=$var zone=name:size [timeout=]
+    /// [header]`: sessions the server creates, kept in a zone.
+    Learn(StickyLearn),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickyCookie {
+    pub name: String,
+    pub domain: Option<Vec<ValuePart>>,
+    /// `path=`, as `; path=VALUE`.
+    pub path: Option<String>,
+    /// `expires=` in seconds; `None`: a session cookie.
+    pub expires: Option<StickyExpires>,
+    pub httponly: bool,
+    pub secure: bool,
+    pub samesite: Option<Vec<ValuePart>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickyExpires {
+    /// `expires=max`.
+    Max,
+    Secs(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickyLearn {
+    pub lookup: Vec<Vec<ValuePart>>,
+    pub create: Vec<Vec<ValuePart>>,
+    pub zone: String,
+    pub zone_size: u64,
+    pub timeout_ms: u64,
+    /// `header`: learn once the response header arrives, not at the end.
+    pub header: bool,
 }
 
 /// Load-balancing algorithm for an `upstream {}` block. Smoothed weighted
@@ -697,15 +761,19 @@ pub enum UpstreamAddr {
 }
 
 /// One `server <host:port> [weight=N] [max_fails=N] [fail_timeout=Ts]
-/// [down] [backup];` entry inside an `upstream {}` block. The host+port
-/// is resolved at parse time via `to_socket_addrs` — we don't carry a
-/// runtime resolver. Hostname-only resolution picks the first address.
+/// [down] [backup] [resolve];` entry inside an `upstream {}` block. The
+/// host+port is resolved at parse time via `to_socket_addrs`, unless the
+/// name is `resolve`d at run time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamServer {
     /// Resolved peer address. A `server` whose name resolves to several
     /// addresses is one `UpstreamServer` per address, as nginx makes a
-    /// peer of each (#330).
+    /// peer of each (#330). For a `resolve` name, only its port counts.
     pub addr: UpstreamAddr,
+    /// `resolve` with a name (#597): the name, asked at run time.
+    pub resolve: Option<String>,
+    /// `service=`: the name's SRV records give the addresses and ports.
+    pub service: Option<String>,
     /// Original `host:port` string as written. Used for the upstream
     /// `Host:` header default and for diagnostics.
     pub display: String,
@@ -716,6 +784,10 @@ pub struct UpstreamServer {
     pub max_conns: u32,
     pub down: bool,
     pub backup: bool,
+    /// `drain`: down, except for requests bound to it by `sticky`.
+    pub drain: bool,
+    /// `route=`: the server's ID for `sticky`.
+    pub route: Option<String>,
 }
 
 /// One `listen` directive, address plus the flag bag. The current set of
@@ -867,6 +939,41 @@ pub struct ServerSsl {
     pub password_file: Option<PathBuf>,
     /// `ssl_stapling` and its companions (#141), merged with http scope.
     pub stapling: StaplingConf,
+    /// `ssl_conf_command NAME VALUE` lines, in order; a server's own
+    /// replace the http level's, as nginx merges the array.
+    pub conf_commands: Option<Vec<(String, String)>>,
+}
+
+impl ServerSsl {
+    /// `ssl_conf_command Options KTLS` (#673), the one command applied:
+    /// later `Options` items override earlier ones, as OpenSSL sets and
+    /// clears SSL_OP_ENABLE_KTLS in order.
+    pub fn ktls(&self) -> bool {
+        let mut on = false;
+        for (name, value) in self.conf_commands.iter().flatten() {
+            if !name.eq_ignore_ascii_case("Options") {
+                continue;
+            }
+            for item in value.split(',').map(str::trim) {
+                if item.eq_ignore_ascii_case("KTLS") {
+                    on = true;
+                } else if item.eq_ignore_ascii_case("-KTLS") {
+                    on = false;
+                }
+            }
+        }
+        on
+    }
+}
+
+/// Whether an `ssl_conf_command` is applied in full: `Options` with
+/// only `KTLS` / `-KTLS` items. Anything else is accepted and not applied.
+pub(crate) fn conf_command_applied(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("Options")
+        && value
+            .split(',')
+            .map(str::trim)
+            .all(|item| item.eq_ignore_ascii_case("KTLS") || item.eq_ignore_ascii_case("-KTLS"))
 }
 
 /// `ssl_verify_client`'s modes (ngx_http_ssl_verify).
@@ -881,7 +988,8 @@ pub enum VerifyClient {
 }
 
 /// `ssl_verify_client`, `ssl_client_certificate`, `ssl_trusted_certificate`,
-/// `ssl_verify_depth` and `ssl_crl` of one level (#113); paths resolved
+/// `ssl_verify_depth` and `ssl_crl` of one level (#113), and `ssl_ocsp`,
+/// `ssl_ocsp_responder` and `ssl_ocsp_cache` (#142); paths resolved
 /// against the config directory. `None` until set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientVerifyConf {
@@ -890,6 +998,26 @@ pub struct ClientVerifyConf {
     pub trusted_certificate: Option<PathBuf>,
     pub depth: Option<u32>,
     pub crl: Option<PathBuf>,
+    pub ocsp: Option<OcspMode>,
+    pub ocsp_responder: Option<String>,
+    /// `Some(None)`: `ssl_ocsp_cache off`.
+    pub ocsp_cache: Option<Option<OcspCacheZone>>,
+}
+
+/// `ssl_ocsp`'s values (ngx_http_ssl_ocsp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcspMode {
+    Off,
+    /// Every certificate of the chain but the last.
+    On,
+    Leaf,
+}
+
+/// `ssl_ocsp_cache shared:NAME:SIZE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcspCacheZone {
+    pub name: String,
+    pub size: u64,
 }
 
 impl ClientVerifyConf {
@@ -901,6 +1029,9 @@ impl ClientVerifyConf {
                 | "ssl_trusted_certificate"
                 | "ssl_verify_depth"
                 | "ssl_crl"
+                | "ssl_ocsp"
+                | "ssl_ocsp_responder"
+                | "ssl_ocsp_cache"
         )
     }
 
@@ -916,6 +1047,9 @@ impl ClientVerifyConf {
             "ssl_client_certificate" => "ssl_client_certificate",
             "ssl_trusted_certificate" => "ssl_trusted_certificate",
             "ssl_verify_depth" => "ssl_verify_depth",
+            "ssl_ocsp" => "ssl_ocsp",
+            "ssl_ocsp_responder" => "ssl_ocsp_responder",
+            "ssl_ocsp_cache" => "ssl_ocsp_cache",
             _ => "ssl_crl",
         };
         let [_, value] = args else {
@@ -950,6 +1084,28 @@ impl ClientVerifyConf {
                 })?;
                 self.depth.replace(depth).is_some()
             }
+            "ssl_ocsp" => {
+                let mode = match value.as_str() {
+                    "off" => OcspMode::Off,
+                    "on" => OcspMode::On,
+                    "leaf" => OcspMode::Leaf,
+                    _ => {
+                        return Err(Error::BadValue {
+                            what: name,
+                            got: value.clone(),
+                        });
+                    }
+                };
+                self.ocsp.replace(mode).is_some()
+            }
+            "ssl_ocsp_responder" => self.ocsp_responder.replace(value.clone()).is_some(),
+            "ssl_ocsp_cache" => {
+                if self.ocsp_cache.is_some() {
+                    return Err(Error::Duplicate(name));
+                }
+                self.ocsp_cache = Some(parse_ocsp_cache(value)?);
+                false
+            }
             _ => self.crl.replace(path()).is_some(),
         };
         if duplicate {
@@ -971,8 +1127,38 @@ impl ClientVerifyConf {
                 .or_else(|| parent.trusted_certificate.clone()),
             depth: self.depth.or(parent.depth),
             crl: self.crl.or_else(|| parent.crl.clone()),
+            ocsp: self.ocsp.or(parent.ocsp),
+            ocsp_responder: self
+                .ocsp_responder
+                .or_else(|| parent.ocsp_responder.clone()),
+            ocsp_cache: self.ocsp_cache.or_else(|| parent.ocsp_cache.clone()),
         }
     }
+}
+
+/// `ssl_ocsp_cache`'s value, as ngx_http_ssl_ocsp_cache reads it: `off`,
+/// or `shared:NAME:SIZE` of at least 8 pages.
+fn parse_ocsp_cache(value: &str) -> Result<Option<OcspCacheZone>, super::error::Error> {
+    use super::error::Error;
+    if value == "off" {
+        return Ok(None);
+    }
+    // Error::Message is static; a configuration error is made once.
+    let message = |text: String| Error::Message(Box::leak(text.into_boxed_str()));
+    let invalid = || message(format!("invalid OCSP cache \"{value}\""));
+    let rest = value.strip_prefix("shared:").ok_or_else(invalid)?;
+    let (name, size) = rest.split_once(':').ok_or_else(invalid)?;
+    if name.is_empty() {
+        return Err(invalid());
+    }
+    let size = super::parse_location::parse_size(size.as_bytes()).ok_or_else(invalid)?;
+    if size < 8 * 4096 {
+        return Err(message(format!("OCSP cache \"{value}\" is too small")));
+    }
+    Ok(Some(OcspCacheZone {
+        name: name.to_string(),
+        size,
+    }))
 }
 
 /// `ssl_stapling`, `ssl_stapling_file`, `ssl_stapling_responder` and
@@ -1190,6 +1376,8 @@ pub struct Server {
     pub keepalive_requests: Option<u64>,
     /// Server-scope maximum keepalive connection lifetime.
     pub keepalive_time_ms: Option<u64>,
+    /// Server-scope `keepalive_min_timeout` (#601).
+    pub keepalive_min_timeout_ms: Option<u64>,
     /// Server-scope `keepalive_disable` policy.
     pub keepalive_disable: Option<KeepaliveDisable>,
     /// `client_header_timeout` / `client_body_timeout` / `send_timeout`,
@@ -1254,6 +1442,8 @@ pub struct Server {
     pub client_body_temp_path: Option<TempPath>,
     /// Server-scope `sendfile on|off`. `None` inherits from http.
     pub sendfile: Option<bool>,
+    /// Server-scope `aio`. `None` inherits from http.
+    pub aio: Option<Aio>,
     /// Server-scope `http2 on|off`. `None` inherits from http.
     pub http2: Option<bool>,
     /// Server-scope `http2_*` settings; unset ones inherit from http.
@@ -1487,6 +1677,8 @@ pub struct Location {
     pub keepalive_requests: Option<u64>,
     /// Location-scope keepalive lifetime cap. `None` inherits from server.
     pub keepalive_time_ms: Option<u64>,
+    /// Location-scope `keepalive_min_timeout`. `None` inherits from server.
+    pub keepalive_min_timeout_ms: Option<u64>,
     /// Location-scope keepalive-disable policy. `None` inherits from server.
     pub keepalive_disable: Option<KeepaliveDisable>,
     /// Location-scope `error_log` sinks. `None` inherits from server.
@@ -1541,6 +1733,8 @@ pub struct Location {
     /// Location-scope `sendfile on|off`, inherited through nested locations
     /// at parse time. `None` inherits from server/http at prepare time.
     pub sendfile: Option<bool>,
+    /// Location-scope `aio`, inherited like `sendfile`.
+    pub aio: Option<Aio>,
     /// Location-scope `client_body_temp_path`, inherited like `sendfile`.
     pub client_body_temp_path: Option<TempPath>,
     /// Location-scope `disable_symlinks`, inherited through nested
@@ -2128,6 +2322,24 @@ pub fn limit_except_method_bit(method: &[u8]) -> u16 {
         .map_or(0, |i| 1 << i)
 }
 
+/// `aio off|on|threads[=pool]` (#526). `On` (Linux native AIO) is
+/// accepted and reads stay on the worker, as with `Off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Aio {
+    Off,
+    On,
+    /// The pool's name, `default` when none is given.
+    Threads(String),
+}
+
+/// `thread_pool name threads=N [max_queue=M];` (main context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPoolDef {
+    pub name: String,
+    pub threads: usize,
+    pub max_queue: usize,
+}
+
 /// `client_body_temp_path path [level1 [level2 [level3]]]`: the directory
 /// for request-body temp files, and the digits of the file number that
 /// name each level of subdirectories (`0` = no such level).
@@ -2446,6 +2658,17 @@ pub enum FileTestKind {
     Dir,
     Exists,
     Exec,
+}
+
+/// `ssl_certificate_cache` / `proxy_ssl_certificate_cache max=N
+/// [inactive=time] [valid=time]` (#601); times in seconds, as nginx's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SslCertificateCache {
+    /// The declaration's: levels that inherit it share one cache.
+    pub id: u64,
+    pub max: usize,
+    pub inactive_secs: u64,
+    pub valid_secs: u64,
 }
 
 /// A `proxy_ssl_certificate` / `_key` value: a file, resolved against the

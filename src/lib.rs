@@ -7,15 +7,18 @@
 #![cfg(feature = "fuzzing")]
 #![allow(dead_code, unused_imports, unused_variables, unused_macros, unused_mut)]
 
+mod aio;
 mod arena;
 mod auth;
 mod autoindex;
 mod client_verify;
 mod config;
+mod duplex;
 mod file;
 mod fs_resolve;
 mod http;
 mod http_date;
+mod ktls;
 mod ocsp;
 mod phase;
 mod privileges;
@@ -33,6 +36,8 @@ mod tls_stream;
 mod tls_ticket;
 mod upstream;
 mod upstream_io;
+mod upstream_resolve;
+mod upstream_sticky;
 mod upstream_tls;
 mod uri;
 mod worker;

@@ -20,8 +20,9 @@
 // #116): `TlsStream<IO, ClientConnection>`, made by `connect`. What is
 // server-only (the session id, `connection()`) is on `TlsStream<IO>`.
 
-use std::io::{self, BufRead, IoSlice, Write};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::mem;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use monoio::BufResult;
@@ -30,6 +31,8 @@ use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, ServerConfig, ServerConnection, SideData,
 };
+
+use crate::duplex::Duplex;
 
 /// Socket read size: one maximum-size TLS record (16 KiB of plaintext plus
 /// record overhead) fits in a single read.
@@ -186,7 +189,11 @@ impl TlsAcceptor {
             return Ok(Accepted::Plain(io, first));
         }
         let conn = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
-        self.handshake_with(io, conn, first)
+        let records = self
+            .config
+            .enable_secret_extraction
+            .then(crate::ktls::RecordCursor::default);
+        self.handshake_with(io, conn, first, records)
             .await
             .map(|s| Accepted::Tls(s, self.verify.clone()))
     }
@@ -214,6 +221,8 @@ impl TlsAcceptor {
             return Ok(Accepted::Plain(io, buf));
         }
         let mut first = true;
+        // Every byte given to rustls, for a switch to kTLS (#673).
+        let mut records = crate::ktls::RecordCursor::default();
         let accepted = loop {
             if !mem::take(&mut first) {
                 buf.clear();
@@ -223,6 +232,7 @@ impl TlsAcceptor {
                     return Err(handshake_eof());
                 }
             }
+            records.feed(&buf);
             let mut pending = &buf[..];
             // rustls documents `Ok(0)` as EOF (or a close_notify already
             // received); without this check the loop, which never awaits,
@@ -269,6 +279,7 @@ impl TlsAcceptor {
             _ => config.clone(),
         };
         let verify = verify.clone();
+        let records = config.enable_secret_extraction.then_some(records);
         let conn = match accepted.into_connection(config) {
             Ok(conn) => conn,
             Err((e, mut alert)) => {
@@ -278,7 +289,7 @@ impl TlsAcceptor {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
         };
-        self.handshake_with(io, conn, Vec::new())
+        self.handshake_with(io, conn, Vec::new(), records)
             .await
             .map(|s| Accepted::Tls(s, verify))
     }
@@ -289,6 +300,7 @@ impl TlsAcceptor {
         io: IO,
         mut conn: ServerConnection,
         rbuf: Vec<u8>,
+        records: Option<crate::ktls::RecordCursor>,
     ) -> io::Result<TlsStream<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent + 'static,
@@ -312,7 +324,7 @@ impl TlsAcceptor {
             rpos: 0,
             wbuf: Vec::new(),
             session_id,
-            tunnel: false,
+            records,
         };
         stream.handshake().await?;
         Ok(stream)
@@ -332,9 +344,9 @@ pub struct TlsStream<IO, C = ServerConnection> {
     wbuf: Vec<u8>,
     /// The session's `$ssl_session_id` bytes, with `with_session_ids`.
     session_id: Option<[u8; 32]>,
-    /// Carrying a tunnel: a read and a write may be in flight at once, so
-    /// only writes put records on the socket (`begin_tunnel`).
-    tunnel: bool,
+    /// Where the records of what rustls was given end, with kTLS on
+    /// (#673): the kernel can take over only at a record boundary.
+    records: Option<crate::ktls::RecordCursor>,
 }
 
 impl<IO> TlsStream<IO> {
@@ -356,6 +368,100 @@ impl<IO> TlsStream<IO> {
     }
 }
 
+/// What `TlsStream::into_ktls` made of a stream.
+#[allow(clippy::large_enum_variant)] // once per connection, not kept
+pub(crate) enum IntoKtls<IO> {
+    /// For the kernel: the traffic secrets, and the plaintext rustls had
+    /// already decrypted, then whether a close_notify followed it.
+    Kernel {
+        io: IO,
+        secrets: rustls::ExtractedSecrets,
+        read: Vec<u8>,
+        closed: bool,
+        /// The ClientHello's random, for the logged secrets (#852).
+        random: Option<[u8; 32]>,
+    },
+    /// Not switched, nothing changed: serve it in userspace.
+    Userspace(TlsStream<IO>),
+    /// Rustls refused what it was given, or the secrets weren't there.
+    Failed(io::Error),
+}
+
+impl<IO> TlsStream<IO> {
+    /// Whether the config asked for kTLS (`ssl_conf_command Options KTLS`).
+    pub(crate) fn wants_ktls(&self) -> bool {
+        self.records.is_some()
+    }
+
+    /// The ClientHello's random, with kTLS on (#852).
+    pub(crate) fn client_random(&self) -> Option<[u8; 32]> {
+        self.records.and_then(|r| r.client_random())
+    }
+
+    /// Hand the session to the kernel (#673), after the handshake.
+    /// `attach` checks the cipher suite and sets the TLS ULP on the
+    /// socket; `false` keeps the stream in userspace, as does ciphertext
+    /// read that ends mid-record (rustls's deframer would keep the rest).
+    pub(crate) fn into_ktls(
+        mut self,
+        attach: impl FnOnce(&IO, rustls::ProtocolVersion, rustls::SupportedCipherSuite) -> bool,
+    ) -> IntoKtls<IO> {
+        let Some(mut records) = self.records else {
+            return IntoKtls::Userspace(self);
+        };
+        records.feed(&self.rbuf[self.rpos..]);
+        let (Some(version), Some(suite)) = (
+            self.conn.protocol_version(),
+            self.conn.negotiated_cipher_suite(),
+        ) else {
+            return IntoKtls::Userspace(self);
+        };
+        if !records.at_boundary() || self.conn.wants_write() || !attach(&self.io, version, suite) {
+            return IntoKtls::Userspace(self);
+        }
+        // The rest of the ciphertext through rustls; the socket's queue
+        // starts at a record now.
+        let mut read = Vec::new();
+        let closed = loop {
+            match self.conn.reader().read_to_end(&mut read) {
+                Ok(_) => break true,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return IntoKtls::Failed(e),
+            }
+            if self.rpos == self.rbuf.len() {
+                break false;
+            }
+            let mut pending = &self.rbuf[self.rpos..];
+            match self.conn.read_tls(&mut pending) {
+                Ok(0) => return IntoKtls::Failed(handshake_eof()),
+                Ok(n) => self.rpos += n,
+                Err(e) => return IntoKtls::Failed(e),
+            }
+            if let Err(e) = self.conn.process_new_packets() {
+                return IntoKtls::Failed(io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        };
+        // Rustls answers a KeyUpdate request or a renegotiation; the
+        // kernel can't, with keys rustls would change.
+        if self.conn.wants_write() {
+            return IntoKtls::Failed(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake message right after the handshake",
+            ));
+        }
+        match self.conn.dangerous_extract_secrets() {
+            Ok(secrets) => IntoKtls::Kernel {
+                io: self.io,
+                secrets,
+                read,
+                closed,
+                random: records.client_random(),
+            },
+            Err(e) => IntoKtls::Failed(io::Error::other(e)),
+        }
+    }
+}
+
 /// A TLS client connection to `name` over `io`, handshaken: an HTTPS
 /// upstream (#116). `name` is what the certificate is checked against
 /// and, with SNI on in `config`, what the ClientHello names.
@@ -373,7 +479,7 @@ pub async fn connect<IO: AsyncReadRent + AsyncWriteRent + 'static>(
         rpos: 0,
         wbuf: Vec::new(),
         session_id: None,
-        tunnel: false,
+        records: None,
     };
     loop {
         stream.write_tls().await?;
@@ -391,16 +497,6 @@ where
     C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
     D: SideData,
 {
-    /// From now on a read may run while a write is in flight (the tunnel
-    /// after a proxied 101). Both touch the session only between awaits;
-    /// the socket write is the one thing that can't happen twice at once.
-    /// So a read no longer flushes what rustls queued in answer (an alert,
-    /// a KeyUpdate): the next write sends it, as `write_tls` drains the
-    /// queue until it is empty.
-    pub fn begin_tunnel(&mut self) {
-        self.tunnel = true;
-    }
-
     /// The underlying transport, for waiting on the socket directly.
     pub fn io(&self) -> &IO {
         &self.io
@@ -429,156 +525,77 @@ where
         self.rpos = 0;
     }
 
-    /// Whether the next `read` can make progress without new bytes from
-    /// the socket: ciphertext already read but not yet handed to rustls, or
-    /// plaintext (or a close_notify) rustls hasn't returned yet. TLS 1.3
-    /// clients often send the first request in the same flight as their
-    /// Finished, so it is already here when the handshake completes.
-    pub fn has_buffered_input(&self) -> bool {
-        // After the handshake `wants_read` is false exactly when rustls
-        // holds unread plaintext or has seen close_notify.
-        self.rpos < self.rbuf.len() || !self.conn.wants_read()
+    /// `take_read_buf`, when the socket is to be read: everything read so
+    /// far went to rustls.
+    #[inline]
+    fn read_buf_if_drained(&mut self) -> Option<Vec<u8>> {
+        (self.rpos == self.rbuf.len()).then(|| self.take_read_buf())
     }
-}
 
-impl<IO: AsyncReadRent + AsyncWriteRent + 'static> TlsStream<IO> {
-    async fn handshake(&mut self) -> io::Result<()> {
-        loop {
-            // The final pass also flushes what rustls queues right after the
-            // handshake (TLS 1.3 session tickets).
-            self.write_tls().await?;
-            if !self.conn.is_handshaking() {
-                return Ok(());
-            }
-            if self.read_tls().await? == 0 {
-                return Err(handshake_eof());
-            }
-            // A resumed TLS 1.3 session keeps its id, also in the tickets
-            // issued now (after the client's Finished, a later flight).
-            if let Some(id) = &mut self.session_id
-                && let Some(Ok(received)) = self
-                    .conn
-                    .received_resumption_data()
-                    .map(<[u8; 32]>::try_from)
-                && received != *id
-            {
-                *id = received;
-                self.conn.set_resumption_data(&received);
-            }
-        }
-    }
-}
-
-impl<IO, C, D> TlsStream<IO, C>
-where
-    IO: AsyncReadRent + AsyncWriteRent + 'static,
-    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
-    D: SideData,
-{
-    /// Hand rustls the next chunk of ciphertext, reading from the socket
-    /// first when nothing is buffered, and process it. Returns 0 at EOF:
-    /// TCP FIN, or a close_notify already received.
-    async fn read_tls(&mut self) -> io::Result<usize> {
-        if self.rpos == self.rbuf.len() {
-            let mut buf = mem::take(&mut self.rbuf);
-            self.rpos = 0;
-            buf.clear();
-            buf.reserve(READ_BUF_SIZE);
-            let (res, buf) = self.io.read(buf).await;
-            self.rbuf = buf;
-            res?;
-        }
-        // At EOF the slice is empty: rustls records the TCP EOF, so its
-        // plaintext reader reports `UnexpectedEof` instead of `WouldBlock`.
+    /// Hand rustls the ciphertext read and not yet handed, and process it.
+    /// At EOF the slice is empty: rustls records the TCP EOF, so its
+    /// plaintext reader reports `UnexpectedEof` instead of `WouldBlock`.
+    #[inline]
+    fn process_read(&mut self) -> io::Result<usize> {
         let mut pending = &self.rbuf[self.rpos..];
         let n = self.conn.read_tls(&mut pending)?;
         self.rpos += n;
-        if let Err(e) = self.conn.process_new_packets() {
-            // Best effort: get the alert rustls queued out to the peer.
-            if !self.tunnel {
-                let _ = self.write_tls().await;
-            }
-            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-        }
-        // What rustls queued in answer (the `no_renegotiation` alert for a
-        // TLS 1.2 ClientHello after the handshake, the KeyUpdate a TLS 1.3
-        // `update_requested` asks for) goes out now: the server may be
-        // waiting for request bytes and not write anything else. OpenSSL
-        // writes these from inside SSL_read. The handshake loop flushes on
-        // its own.
-        if self.conn.wants_write() && !self.conn.is_handshaking() && !self.tunnel {
-            self.write_tls().await?;
-        }
+        self.conn
+            .process_new_packets()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(n)
     }
 
-    /// Move everything rustls has queued for the peer onto the socket.
-    async fn write_tls(&mut self) -> io::Result<()> {
-        // Again after each write: in a tunnel, a read may queue records
-        // while the write is in flight.
+    /// What rustls has queued for the peer, as ciphertext for the socket;
+    /// `None` when nothing is queued.
+    // Inline, as it was in `write_tls`: out of line it cost ~90
+    // instructions per TLS response (callgrind).
+    #[inline(always)]
+    fn take_ciphertext(&mut self) -> io::Result<Option<Vec<u8>>>
+    where
+        IO: 'static,
+    {
+        if !self.conn.wants_write() {
+            return Ok(None);
+        }
+        let mut buf = mem::take(&mut self.wbuf);
+        buf.clear();
+        // A `Vec` sink never pushes back, so this drains the whole queue.
         while self.conn.wants_write() {
-            let mut buf = mem::take(&mut self.wbuf);
-            buf.clear();
-            // A `Vec` sink never pushes back, so this drains the whole queue.
-            while self.conn.wants_write() {
-                self.conn.write_tls(&mut buf)?;
-            }
-            // A large run of records over plain TCP goes out at once, while
-            // it is still in the cache from being encrypted (#247); what
-            // the socket doesn't take goes through io_uring.
-            if buf.len() >= DIRECT_SEND_MIN
-                && let Some(tcp) =
-                    (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = tcp.as_raw_fd();
-                let mut sent = 0usize;
-                while sent < buf.len() {
-                    // SAFETY: the pointer/len pair stays within `buf`.
-                    let r = unsafe {
-                        libc::send(
-                            fd,
-                            buf[sent..].as_ptr().cast(),
-                            buf.len() - sent,
-                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                        )
-                    };
-                    if r > 0 {
-                        sent += r as usize;
-                        continue;
-                    }
-                    if r < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-                    {
-                        continue;
-                    }
-                    break;
-                }
-                buf.drain(..sent);
-            }
-            let (res, buf) = if buf.is_empty() {
-                (Ok(()), buf)
-            } else {
-                let (res, buf) = self.io.write_all(buf).await;
-                (res.map(|_| ()), buf)
-            };
-            if buf.capacity() <= WRITE_BUF_KEEP {
-                self.wbuf = buf;
-            }
-            res?;
+            self.conn.write_tls(&mut buf)?;
         }
-        Ok(())
-    }
-
-    /// Encrypt as much of `bufs` as rustls accepts (its outgoing limit is
-    /// 64 KiB) as one run of records and write it out.
-    async fn write_plaintext(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        // Normally a no-op; clears anything left by an earlier failed write
-        // or queued by the read side (alerts, key updates) so the limit
-        // applies to this write alone.
-        self.write_tls().await?;
-        let n = self.conn.writer().write_vectored(bufs)?;
-        self.write_tls().await?;
-        Ok(n)
+        // A large run of records over plain TCP goes out at once, while
+        // it is still in the cache from being encrypted (#247); what
+        // the socket doesn't take goes through io_uring.
+        if buf.len() >= DIRECT_SEND_MIN
+            && let Some(tcp) =
+                (&self.io as &dyn std::any::Any).downcast_ref::<monoio::net::TcpStream>()
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = tcp.as_raw_fd();
+            let mut sent = 0usize;
+            while sent < buf.len() {
+                // SAFETY: the pointer/len pair stays within `buf`.
+                let r = unsafe {
+                    libc::send(
+                        fd,
+                        buf[sent..].as_ptr().cast(),
+                        buf.len() - sent,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if r > 0 {
+                    sent += r as usize;
+                    continue;
+                }
+                if r < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            buf.drain(..sent);
+        }
+        Ok(Some(buf))
     }
 
     /// Copy decrypted bytes out of rustls into `dst`. `Ok(0)` for an empty
@@ -606,6 +623,218 @@ where
             n += k;
         }
         Ok(n)
+    }
+
+    /// Back from the socket write of `take_ciphertext`'s buffer.
+    #[inline]
+    fn put_write_buf(&mut self, buf: Vec<u8>) {
+        if buf.capacity() <= WRITE_BUF_KEEP {
+            self.wbuf = buf;
+        }
+    }
+
+    /// Whether the next `read` can make progress without new bytes from
+    /// the socket: ciphertext already read but not yet handed to rustls, or
+    /// plaintext (or a close_notify) rustls hasn't returned yet. TLS 1.3
+    /// clients often send the first request in the same flight as their
+    /// Finished, so it is already here when the handshake completes.
+    pub fn has_buffered_input(&self) -> bool {
+        // After the handshake `wants_read` is false exactly when rustls
+        // holds unread plaintext or has seen close_notify.
+        self.rpos < self.rbuf.len() || !self.conn.wants_read()
+    }
+}
+
+impl<IO: AsyncReadRent + AsyncWriteRent + 'static> TlsStream<IO> {
+    async fn handshake(&mut self) -> io::Result<()> {
+        loop {
+            // The final pass also flushes what rustls queues right after the
+            // handshake (TLS 1.3 session tickets).
+            self.write_tls().await?;
+            if !self.conn.is_handshaking() {
+                return Ok(());
+            }
+            let n = self.read_tls().await?;
+            if n == 0 {
+                return Err(handshake_eof());
+            }
+            if let Some(records) = &mut self.records {
+                records.feed(&self.rbuf[self.rpos - n..self.rpos]);
+            }
+            // A resumed TLS 1.3 session keeps its id, also in the tickets
+            // issued now (after the client's Finished, a later flight).
+            if let Some(id) = &mut self.session_id
+                && let Some(Ok(received)) = self
+                    .conn
+                    .received_resumption_data()
+                    .map(<[u8; 32]>::try_from)
+                && received != *id
+            {
+                *id = received;
+                self.conn.set_resumption_data(&received);
+            }
+        }
+    }
+}
+
+impl<IO, C, D> TlsStream<IO, C>
+where
+    IO: AsyncReadRent + AsyncWriteRent + 'static,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>>,
+    D: SideData,
+{
+    /// Hand rustls the next chunk of ciphertext, reading from the socket
+    /// first when nothing is buffered, and process it. Returns 0 at EOF:
+    /// TCP FIN, or a close_notify already received.
+    async fn read_tls(&mut self) -> io::Result<usize> {
+        if let Some(buf) = self.read_buf_if_drained() {
+            let (res, buf) = self.io.read(buf).await;
+            self.rbuf = buf;
+            res?;
+        }
+        let res = self.process_read();
+        // What rustls queued in answer goes out now: the alert for an
+        // error (best effort), the `no_renegotiation` alert for a TLS 1.2
+        // ClientHello after the handshake, the KeyUpdate a TLS 1.3
+        // `update_requested` asks for. The server may be waiting for
+        // request bytes and not write anything else. OpenSSL writes these
+        // from inside SSL_read. The handshake loop flushes on its own.
+        if res.is_err() {
+            let _ = self.write_tls().await;
+        } else if self.conn.wants_write() && !self.conn.is_handshaking() {
+            self.write_tls().await?;
+        }
+        res
+    }
+
+    /// Move everything rustls has queued for the peer onto the socket.
+    async fn write_tls(&mut self) -> io::Result<()> {
+        while let Some(buf) = self.take_ciphertext()? {
+            let (res, buf) = if buf.is_empty() {
+                (Ok(()), buf)
+            } else {
+                let (res, buf) = self.io.write_all(buf).await;
+                (res.map(|_| ()), buf)
+            };
+            self.put_write_buf(buf);
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Encrypt as much of `bufs` as rustls accepts (its outgoing limit is
+    /// 64 KiB) as one run of records and write it out.
+    async fn write_plaintext(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        // Normally a no-op; clears anything left by an earlier failed write
+        // or queued by the read side (alerts, key updates) so the limit
+        // applies to this write alone.
+        self.write_tls().await?;
+        let n = self.conn.writer().write_vectored(bufs)?;
+        self.write_tls().await?;
+        Ok(n)
+    }
+}
+
+/// For the `Duplex` side, as `write_tls` and its socket.
+impl<IO, C, D> TlsStream<IO, C>
+where
+    IO: Duplex,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>> + 'static,
+    D: SideData + 'static,
+{
+    /// The transport, projected without a reference to the stream.
+    fn io_ptr(this: NonNull<Self>) -> NonNull<IO> {
+        // SAFETY: a field of a valid pointer.
+        unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).io) }
+    }
+
+    /// # Safety
+    ///
+    /// As `Duplex::write_raw`.
+    async unsafe fn duplex_write_tls(this: NonNull<Self>) -> io::Result<()> {
+        // Again after each write: the read side may queue records (an
+        // alert, a KeyUpdate) while one is in flight.
+        // SAFETY: as in `read_raw`, here and below.
+        while let Some(buf) = unsafe { &mut *this.as_ptr() }.take_ciphertext()? {
+            let (res, buf) = if buf.is_empty() {
+                (Ok(0), buf)
+            } else {
+                unsafe { crate::duplex::write_all_raw(Self::io_ptr(this), buf) }.await
+            };
+            unsafe { &mut *this.as_ptr() }.put_write_buf(buf);
+            res?;
+        }
+        Ok(())
+    }
+}
+
+/// An HTTP/2 connection, a tunnel (#501): a read and a write in flight at
+/// once, each with a reference to the stream only between awaits. A read
+/// doesn't write to the socket: what rustls queues in answer goes with the
+/// next write.
+// SAFETY: as just said; `io` is reached through `io_ptr`.
+unsafe impl<IO, C, D> Duplex for TlsStream<IO, C>
+where
+    IO: Duplex,
+    C: std::ops::DerefMut<Target = ConnectionCommon<D>> + 'static,
+    D: SideData + 'static,
+{
+    async unsafe fn read_raw<T: IoBufMut>(this: NonNull<Self>, mut buf: T) -> BufResult<usize, T> {
+        let (dst, cap) = (buf.write_ptr(), buf.bytes_total());
+        loop {
+            let socket_read = {
+                // SAFETY: valid, and no other reference to it is live (the
+                // caller's); this one ends before the await.
+                let s = unsafe { &mut *this.as_ptr() };
+                match s.read_plaintext(dst, cap) {
+                    Ok(n) => {
+                        // SAFETY: `read_plaintext` initialized the first `n` bytes.
+                        unsafe { buf.set_init(n) };
+                        return (Ok(n), buf);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return (Err(e), buf),
+                }
+                s.read_buf_if_drained()
+            };
+            if let Some(rbuf) = socket_read {
+                // SAFETY: valid; the other operation on `io` is at most the
+                // write side's.
+                let (res, rbuf) = unsafe { IO::read_raw(Self::io_ptr(this), rbuf) }.await;
+                // SAFETY: as above, here and below.
+                unsafe { (*this.as_ptr()).rbuf = rbuf };
+                if let Err(e) = res {
+                    return (Err(e), buf);
+                }
+            }
+            if let Err(e) = unsafe { &mut *this.as_ptr() }.process_read() {
+                return (Err(e), buf);
+            }
+        }
+    }
+
+    /// As `write_plaintext`.
+    async unsafe fn write_raw<T: IoBuf>(this: NonNull<Self>, buf: T) -> BufResult<usize, T> {
+        // SAFETY: `IoBuf` guarantees `bytes_init` initialized bytes at
+        // `read_ptr`, and `buf` is owned here until we return it.
+        let src = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
+        // SAFETY: as in `read_raw`, here and below.
+        if let Err(e) = unsafe { Self::duplex_write_tls(this) }.await {
+            return (Err(e), buf);
+        }
+        let n = match unsafe { &mut *this.as_ptr() }.conn.writer().write(src) {
+            Ok(n) => n,
+            Err(e) => return (Err(e), buf),
+        };
+        let res = unsafe { Self::duplex_write_tls(this) }.await;
+        (res.map(|()| n), buf)
+    }
+
+    async unsafe fn shutdown_raw(this: NonNull<Self>) -> io::Result<()> {
+        // SAFETY: as in `read_raw`, here and below.
+        unsafe { (*this.as_ptr()).conn.send_close_notify() };
+        unsafe { Self::duplex_write_tls(this) }.await?;
+        unsafe { IO::shutdown_raw(Self::io_ptr(this)) }.await
     }
 }
 
@@ -815,6 +1044,40 @@ mod tests {
                 c.write_all(&buf).unwrap();
                 c.flush().unwrap();
                 c.sock.shutdown(std::net::Shutdown::Both).unwrap();
+            },
+        );
+    }
+
+    /// A read in flight while a large write goes out, on the `Duplex`
+    /// halves (an HTTP/2 connection, a tunnel, #501).
+    #[test]
+    fn halves_read_while_writing() {
+        const LEN: usize = 200 * 1024;
+        run(
+            |acceptor, sock| async move {
+                let s = tls(acceptor.accept(sock).await.unwrap());
+                let (mut r, mut w, _) = crate::duplex::into_split(s);
+                let read = async {
+                    let (res, buf) = r.read(Vec::with_capacity(64)).await;
+                    assert_eq!(res.unwrap(), 4);
+                    assert_eq!(buf, b"done");
+                };
+                let write = async {
+                    let (res, _) = w.write_all(vec![7u8; LEN]).await;
+                    assert_eq!(res.unwrap(), LEN);
+                };
+                monoio::join!(read, write);
+                w.shutdown().await.unwrap();
+            },
+            |mut c| {
+                let mut buf = vec![0; LEN];
+                c.read_exact(&mut buf).unwrap();
+                assert!(buf.iter().all(|&b| b == 7));
+                c.write_all(b"done").unwrap();
+                let mut rest = Vec::new();
+                // `read_to_end` only succeeds on a clean close_notify.
+                c.read_to_end(&mut rest).unwrap();
+                assert!(rest.is_empty());
             },
         );
     }

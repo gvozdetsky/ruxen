@@ -92,6 +92,39 @@ pub(crate) fn leak<T: ?Sized + Send + 'static>(value: Box<T>) -> &'static mut T 
     unsafe { &mut *ptr }
 }
 
+/// Leaks a value of the generation makes after `prepare` (an upstream's
+/// resolved peer sets, #597), freed when that value is dropped, which
+/// `Arena::free` does.
+pub(crate) struct Owner(Vec<Free>);
+
+impl Owner {
+    /// # Safety
+    /// The `Owner` is dropped only under `Arena::free`'s contract: it
+    /// lives in something an arena frees, or nothing it leaked is used
+    /// after it goes.
+    pub(crate) unsafe fn new() -> Owner {
+        Owner(Vec::new())
+    }
+
+    /// `Box::leak`, freed with the `Owner`.
+    pub(crate) fn leak<T: ?Sized + Send + 'static>(&mut self, value: Box<T>) -> &'static mut T {
+        let ptr = Box::into_raw(value);
+        let owned = Owned(ptr);
+        // SAFETY: run once, when the `Owner` drops, under `new`'s contract.
+        self.0.push(Box::new(move || unsafe { owned.free() }));
+        // SAFETY: from `Box::into_raw` just above; freed only on drop.
+        unsafe { &mut *ptr }
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        while let Some(free) = self.0.pop() {
+            free();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

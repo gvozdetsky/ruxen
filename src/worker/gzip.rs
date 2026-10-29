@@ -27,6 +27,9 @@ pub(crate) struct GzipRequest<'a> {
     pub user_agent: Option<&'a [u8]>,
     pub via: bool,
     pub authorization: bool,
+    /// `aio threads`: a file is streamed, its reads on the pool, never
+    /// read whole here on the worker.
+    pub aio: bool,
 }
 
 impl<'a> GzipRequest<'a> {
@@ -39,6 +42,7 @@ impl<'a> GzipRequest<'a> {
             user_agent: h(headers_raw, b"user-agent"),
             via: h(headers_raw, b"via").is_some(),
             authorization: h(headers_raw, b"authorization").is_some(),
+            aio: false,
         }
     }
 }
@@ -187,14 +191,15 @@ fn parse_head(head: &[u8]) -> Option<Head<'_>> {
 }
 
 /// `ngx_http_test_content_type`: the type without parameters, matched
-/// case-insensitively against `gzip_types`.
+/// case-insensitively against `gzip_types`. `*` matches before a missing
+/// type is checked (an empty types hash, #808).
 fn type_matches(gz: &PreparedGzip, content_type: Option<&[u8]>) -> bool {
-    let Some(ct) = content_type else {
-        return false;
-    };
     if gz.any_type {
         return true;
     }
+    let Some(ct) = content_type else {
+        return false;
+    };
     let base = ct.split(|&b| b == b';').next().unwrap_or(ct).trim_ascii();
     gz.types
         .iter()
@@ -360,6 +365,27 @@ fn gzip_ok(gz: &PreparedGzip, req: &GzipRequest<'_>, head: &Head<'_>) -> bool {
     true
 }
 
+/// `ngx_http_gzip_ok` as `gzip_static` calls it, in the content phase:
+/// the response has no headers yet.
+pub(crate) fn static_ok(gz: &PreparedGzip, req: &GzipRequest<'_>) -> bool {
+    gzip_ok(gz, req, &Head::default())
+}
+
+/// The filter adds `Vary` to a static file's response of this type and
+/// size (a 200, 403 or 404 here, a 206 or 416 in `vary_cut_file`).
+pub(crate) fn file_varies(gz: &PreparedGzip, content_type: &[u8], size: u64) -> bool {
+    gz.vary
+        && candidate(
+            gz,
+            &Head {
+                status: 200,
+                content_type: Some(content_type),
+                content_length: Some(size),
+                ..Head::default()
+            },
+        )
+}
+
 /// nginx's `ngx_http_gzip_filter_memory`: a smaller window for a short
 /// known length ("the actual zlib window size is smaller by 262 bytes").
 fn window_bits(content_length: Option<u64>) -> u8 {
@@ -388,6 +414,11 @@ pub(crate) fn filter(
             Some(out) => (Response::Owned(out), None),
             None => (Response::Owned(bytes), None),
         },
+        // Multipart parts (a 206, or a status `error_page` set): never
+        // compressed, as nginx's range filter runs after gzip.
+        Response::File { headers, body } if body.parts.is_some() => {
+            (Response::File { headers, body }, None)
+        }
         Response::File { headers, body } => {
             let Some(head) = parse_head(&headers) else {
                 return (Response::File { headers, body }, None);
@@ -398,7 +429,7 @@ pub(crate) fn filter(
                     let out = rewrite_head(&headers, gz.vary, None);
                     (Response::File { headers: out, body }, None)
                 }
-                Decision::Compress if body.len <= WHOLE_FILE_MAX => {
+                Decision::Compress if body.len <= WHOLE_FILE_MAX && !req.aio => {
                     match compress_file(gz, req.http_11, &headers, body) {
                         Ok(out) => (Response::Owned(out), None),
                         // A read error: the plain path reports it.
@@ -490,6 +521,7 @@ fn compress_file(
             fd: file.into(),
             offset: body.offset,
             len: body.len,
+            parts: None,
         })
     };
     BUFFER_POOL.with(|p| {
@@ -848,6 +880,7 @@ mod tests {
             user_agent: None,
             via: false,
             authorization: false,
+            aio: false,
         }
     }
 
@@ -978,6 +1011,27 @@ mod tests {
             let (out, _) = filter(&conf, &req(Some(b"gzip")), Response::Prebuilt(leaked));
             assert!(matches!(out, Response::Prebuilt(_)));
         }
+    }
+
+    /// `gzip_types *` takes a response without `Content-Type` (#808);
+    /// a list doesn't.
+    #[test]
+    fn any_type_takes_a_response_without_content_type() {
+        const NO_TYPE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n\
+            XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let listed = gz(&["text/html"]);
+        let (out, _) = filter(&listed, &req(Some(b"gzip")), Response::Prebuilt(NO_TYPE));
+        assert!(matches!(out, Response::Prebuilt(_)));
+        let any = PreparedGzip {
+            any_type: true,
+            ..gz(&[])
+        };
+        let (out, _) = filter(&any, &req(Some(b"gzip")), Response::Prebuilt(NO_TYPE));
+        let Response::Owned(bytes) = out else {
+            panic!("compressed response expected");
+        };
+        let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        assert!(String::from_utf8_lossy(&bytes[..end]).contains("Content-Encoding: gzip"));
     }
 
     #[test]
