@@ -12,4 +12,5 @@ targets = [
 [advisories]
 ignore = [
     { id = "RUSTSEC-2025-0057", reason = "fxhash (unmaintained) comes in through monoio 0.2.4 only and goes with a monoio release that drops it; ruxen's own FxHash maps are local code" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils (unmaintained) comes in through monoio 0.2.4 only (nix default feature `aio`) and goes with a monoio release that drops nix default features" },
 ]
