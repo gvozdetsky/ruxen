@@ -41,6 +41,36 @@ Both servers are started with the config's own directory as the prefix
 (`-p bench/<config-dir>/`), so relative `root` and `auth_basic_user_file`
 paths in the configs work from any checkout location.
 
+### Kernel TLS
+
+`tls_static_1k_ktls` and `tls_static_1m_ktls` use the same files, TLS 1.3
+certificate and load shape as `tls_static_1k` and `tls_static_1m`, with
+`ssl_conf_command Options KTLS` on both servers. They listen on port 8460.
+They require the kernel's `tls` module and an nginx linked to OpenSSL built
+with kTLS support. Selecting the option alone does not prove it is in use:
+nginx can silently keep encrypting in userspace.
+
+Before measuring, on an otherwise idle machine:
+
+```bash
+sudo modprobe tls
+bench/tls_ktls/check.sh
+bench/scripts/pair.sh tls_static_1k_ktls --pairs 6
+bench/scripts/pair.sh tls_static_1m_ktls --pairs 6
+```
+
+The check prepares the existing `tls2` fixtures, checks both URLs on each
+server separately after startup, and requires `TlsTxSw` + `TlsTxDevice` in
+`/proc/net/tls_stat` to increase. These are cumulative TX session counters
+([kernel documentation](https://www.kernel.org/doc/html/latest/networking/tls.html#statistics));
+other kTLS traffic in the same network namespace would confound the check.
+Startup capability probes are excluded from the measurement.
+Use `RUXEN_BIN=/path/to/ruxen` to check a saved binary, and select the nginx
+build through `PATH`. A failed check means the run must not be reported as
+a kTLS comparison. Run the corresponding non-kTLS scenarios too when
+reporting the gain from enabling it, and record the kernel and OpenSSL
+versions with the results.
+
 ---
 
 ## Day-to-day workflow
