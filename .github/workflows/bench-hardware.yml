@@ -95,6 +95,7 @@ jobs:
             echo "kernel: $(uname -r)"
             echo "distro: $(. /etc/os-release && echo "$PRETTY_NAME")"
             echo "nginx: $(nginx -v 2>&1)"
+            echo "openssl: $(openssl version)"
             echo "rustc: $(rustc -V)"
             echo "ruxen: $(git rev-parse --short HEAD)"
             echo "wrk: $(wrk -v 2>&1 | head -1)"
@@ -106,6 +107,11 @@ jobs:
           lscpu > out/lscpu.txt
       - name: Fixtures
         run: bench/scripts/prepare_fixtures.sh
+      - name: Verify kernel TLS
+        if: contains(inputs.scenarios, 'tls_static_1k_ktls') || contains(inputs.scenarios, 'tls_static_1m_ktls')
+        run: |
+          sudo modprobe tls
+          bench/tls_ktls/check.sh 2>&1 | tee out/ktls-check.txt
       - name: A/A calibration
         run: |
           cp target/release/ruxen "$RUNNER_TEMP/ruxen-copy"
