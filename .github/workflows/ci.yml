@@ -140,6 +140,24 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+  musl:
+    # Catch target-specific type errors before a release tag (#896).
+    # Match release.yml: monoio needs libc's musl statx declarations,
+    # and aws-lc's C code needs musl-gcc even for cargo check.
+    runs-on: ubuntu-22.04
+    env:
+      RUST_LIBC_UNSTABLE_MUSL_V1_2_3: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --all-targets --locked --target x86_64-unknown-linux-musl
+
   msrv:
     # Keeps `rust-version` in Cargo.toml honest.
     runs-on: ubuntu-24.04

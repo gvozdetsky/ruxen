@@ -87,7 +87,7 @@ jobs:
 
       # The tagged commit is released as tested here, whether or not it
       # went through CI (a fix-up pushed with the tag, an amended commit),
-      # and on every target: CI runs on x86_64 glibc only.
+      # and on every target: CI tests on x86_64 glibc and checks musl.
       - name: Format
         run: cargo fmt --check
 
