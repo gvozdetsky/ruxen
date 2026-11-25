@@ -60,10 +60,11 @@ bench/scripts/pair.sh tls_static_1m_ktls --pairs 6
 ```
 
 The check prepares the existing `tls2` fixtures, checks both URLs on each
-server separately, and requires `TlsTxSw` + `TlsTxDevice` in
+server separately after startup, and requires `TlsTxSw` + `TlsTxDevice` in
 `/proc/net/tls_stat` to increase. These are cumulative TX session counters
 ([kernel documentation](https://www.kernel.org/doc/html/latest/networking/tls.html#statistics));
 other kTLS traffic in the same network namespace would confound the check.
+Startup capability probes are excluded from the measurement.
 Use `RUXEN_BIN=/path/to/ruxen` to check a saved binary, and select the nginx
 build through `PATH`. A failed check means the run must not be reported as
 a kTLS comparison. Run the corresponding non-kTLS scenarios too when
